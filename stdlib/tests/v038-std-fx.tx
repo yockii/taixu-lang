@@ -1,0 +1,271 @@
+// ============================================================================
+// stdlib 用例：V0.38 大补总轮——S1 文本/S2 系统 IO/S3 编码（STD-06/07/08）。
+// 运行：taixu test tests/v038-std-fx.tx
+// 注：本文件含泛型消费（collect）——parser.tx 镜像滞后受控排除面（v0.39 首位）。
+// ============================================================================
+
+import { toUpper, toLower, trim } from "std/string";
+import { count, decode, seqLen, codepoints, fromCodepoints, byteLenOf } from "std/utf8";
+import { format, d, s, f, x } from "std/fmt";
+import { newBuilder, writeString, writeInt, writeByte, build, builderLen, reset, hexEncode, hexDecode } from "std/bytes";
+import { getenv, getenvOr, setenv, argsLen, argAt } from "std/os";
+import { fsExists, fsMkdirs, fsRemove, fsRename, statSize, statIsDir, readDir, cwd, fsWriteAll, fsReadAll } from "std/fs";
+import { b64Encode, b64Decode, b64EncodeUrl, b64DecodeUrl } from "std/base64";
+import { parseRows, serializeRows } from "std/csv";
+import { sha256Hex, sha256Bytes } from "std/hash";
+import { matches, findGroups } from "std/regexp";
+import { map, filter, fold, sortBy, binarySearch, take, drop, reverse, heapPush, heapPop } from "std/collect";
+
+// —— S1：string Unicode（范围表覆盖面锚）——
+
+test "string：Unicode 大小写（ASCII/Latin-1/Greek/Cyrillic 主区间）" {
+    assert(toUpper("hello") == "HELLO", "ASCII 大写");
+    assert(toLower("WÖRLD") == "wörld", "Latin-1 Ö→ö");
+    assert(toUpper("αβγ") == "ΑΒΓ", "Greek 小→大");
+    assert(toLower("ЖД") == "жд", "Cyrillic 大→小");
+    assert(toUpper("太虛tai") == "太虛TAI", "CJK 原样＋拉丁转换");
+    assert(toLower("ß1") == "ß1", "表外码点原样（特例折叠不在表——如实）");
+    assert(toUpper("abc123!@") == "ABC123!@", "非字母不动");
+}
+
+test "string：Unicode 空白 trim（NBSP/全角空格）" {
+    assert(trim("  x  ") == "x", "ASCII 两侧");
+    assert(trim("\u{00A0}太虛\u{3000}") == "太虛", "NBSP/全角空格");
+    assert(trim("") == "", "空串");
+    assert(trim("  ") == "", "全空白");
+}
+
+// —— S1：std/utf8 ——
+
+test "utf8：count/seqLen/decode 码点面" {
+    assert(count("太虛t") == 3, "码点数（非字节）");
+    assert(count("") == 0, "空串");
+    assert(seqLen("太", 0) == 3, "三字节序列");
+    assert((decode("太", 0) catch -1) == 22826, "太 U+592A=22826");
+    assert(byteLenOf("a太b", 1) == 3, "码点 1 字节长为 3");
+    assert(byteLenOf("a太b", 9) == -1, "越界 −1");
+}
+
+test "utf8：codepoints/fromCodepoints 往返" {
+    const cps = codepoints("a太9");
+    assert(listLen(cps) == 3, "三码点");
+    assert((listGet(cps, 1) catch 0) == 22826, "太码位");
+    assert(fromCodepoints(cps) == "a太9", "往返恒等");
+}
+
+// —— S1：std/fmt ——
+
+test "fmt：占位符/型别/对齐/精度" {
+    assert(format("a{}b", [d(7)]) == "a7b", "自动占位");
+    assert(format("{:>4}", [d(7)]) == "   7", "右对齐宽 4");
+    assert(format("{:<4}|", [d(7)]) == "7   |", "左对齐宽 4");
+    assert(format("{:.2}", [f(3.14159, 2)]) == "3.14", "浮点精度透传");
+    assert(format("{:x}", [x(255)]) == "ff", "十六进制");
+    assert(format("{{}}", []) == "{}", "花括号转义对");
+    assert(format("{}-{}", [d(1), d(2)]) == "1-2", "两实参");
+}
+
+// —— S1：std/bytes ——
+
+test "bytes：Builder 累积与 hex" {
+    const b = newBuilder();
+    writeString(b, "a=");
+    writeInt(b, 42);
+    writeByte(b, 33);
+    assert(build(b) == "a=42!", "累积拼接");
+    assert(builderLen(b) == 5, "长度累计");
+    reset(b);
+    assert(builderLen(b) == 0 && build(b) == "", "reset 清空");
+    assert(hexEncode("AB") == "4142", "hex 编码");
+    assert((hexDecode("4142") catch "?") == "AB", "hex 解码");
+    const bad = hexDecode("414") catch "ERR";
+    assert(bad == "ERR", "奇长 Error");
+}
+
+// —— S2：std/os（宿主 txp_os_* 双路面）——
+
+test "os：env 与 args 面" {
+    setenv("TX_V038_TEST", "1") catch panic("setenv 失败");
+    let emptyNameRejected: bool = false;
+    setenv("", "x") catch (e) {
+        emptyNameRejected = true;
+    };
+    assert(emptyNameRejected, "空名字 setenv 为 Error");
+    assert(getenv("TX_V038_TEST") == "1", "getenv 回读");
+    assert(getenv("TX_V038_MISSING_ZZ") == "", "未设置为空串语义");
+    assert(getenvOr("TX_V038_MISSING_ZZ", "fb") == "fb", "getenvOr 兜底");
+    assert(argsLen() >= 0, "参数个数非负");
+    assert(argAt(9999) == "", "越界空串");
+}
+
+// —— S2：std/fs 扩全（临时文件面；收尾删除）——
+
+// statIsDir 的三态：1 目录、0 非目录、−1 Error（路径不存在）。
+function dirState(p: string): int {
+    const d: bool = statIsDir(p) catch (e) {
+        return -1;
+    };
+    if (d) {
+        return 1;
+    }
+    return 0;
+}
+
+test "fs：扩全操作链（write/stat/rename/readDir/remove）" {
+    fsWriteAll("tx-v038-fx.tmp", "hello") catch panic("write 失败");
+    assert(fsExists("tx-v038-fx.tmp"), "exists 真");
+    assert((statSize("tx-v038-fx.tmp") catch -1) == 5, "size=5");
+    assert((statSize("tx-v038-missing.tmp") catch -1) == -1, "不存在的文件 statSize 为 Error");
+    assert(dirState("tx-v038-fx.tmp") == 0, "文件非目录");
+    assert(dirState("tx-v038-missing.tmp") == -1, "不存在的路径 statIsDir 为 Error");
+    assert(len(cwd() catch "") > 0, "cwd 非空");
+    fsMkdirs("tx-v038-d1/d2") catch panic("mkdirs 失败");
+    assert(dirState("tx-v038-d1/d2") == 1, "目录判定");
+    fsWriteAll("tx-v038-d1/d2/f.tmp", "x") catch panic("write2 失败");
+    const none: List<string> = listNew();
+    const names = readDir("tx-v038-d1/d2") catch none;
+    assert(listLen(names) == 1, "readDir 单条目");
+    assert((listGet(names, 0) catch "?") == "f.tmp", "条目名");
+    fsRename("tx-v038-d1/d2/f.tmp", "tx-v038-d1/d2/g.tmp") catch panic("rename 失败");
+    assert(fsExists("tx-v038-d1/d2/g.tmp"), "改名后存在");
+    fsRemove("tx-v038-d1/d2/g.tmp") catch panic("删文件失败");
+    let nonEmptyRejected: bool = false;
+    fsRemove("tx-v038-d1") catch (e) {
+        nonEmptyRejected = true;
+    };
+    assert(nonEmptyRejected, "非空目录拒绝（Error）");
+    assert((fsReadAll("tx-v038-fx.tmp") catch "err") == "hello", "读回一致");
+    fsRemove("tx-v038-fx.tmp") catch panic("清理失败");
+    const gone: bool = fsExists("tx-v038-fx.tmp");
+    assert(!gone, "清理确认");
+    fsRemove("tx-v038-d1/d2") catch panic("清理子目录失败");
+    fsRemove("tx-v038-d1") catch panic("清理父目录失败");
+}
+
+// —— S3：base64（RFC 4648 §10 向量）——
+
+test "base64：官方向量与 URL-safe" {
+    assert(b64Encode("") == "", "空串");
+    assert(b64Encode("f") == "Zg==", "RFC 向量 1");
+    assert(b64Encode("fo") == "Zm8=", "RFC 向量 2");
+    assert(b64Encode("foo") == "Zm9v", "RFC 向量 3");
+    assert(b64Encode("foob") == "Zm9vYg==", "RFC 向量 4");
+    assert(b64Encode("fooba") == "Zm9vYmE=", "RFC 向量 5");
+    assert(b64Encode("foobar") == "Zm9vYmFy", "RFC 向量 6");
+    assert((b64Decode("Zm9vYmFy") catch "?") == "foobar", "解码往返");
+    assert((b64Decode("Zm9v") catch "?") == "foo", "无 padding 容忍");
+    assert((b64Decode("Z") catch "ERR") == "ERR", "奇组 Error");
+    assert(b64EncodeUrl("foobar") == "Zm9vYmFy", "URL-safe 同文");
+}
+
+// —— S3：csv（RFC 4180 子集）——
+
+test "csv：解析与序列化往返" {
+    const rows = parseRows("a,b,c\n1,\"2,3\",x\n\"he said \"\"hi\"\"\",y");
+    assert(listLen(rows) == 3, "三行");
+    const r0 = listGet(rows, 0) catch panic("行 0");
+    assert(listLen(r0) == 3 && (listGet(r0, 2) catch "") == "c", "行 0 列");
+    const r1 = listGet(rows, 1) catch panic("行 1");
+    assert((listGet(r1, 1) catch "") == "2,3", "引号域含逗号");
+    const r2 = listGet(rows, 2) catch panic("行 2");
+    assert((listGet(r2, 0) catch "") == "he said \"hi\"", "引号转义");
+    // 序列化往返。
+    const one: List<List<string>> = listNew();
+    const line: List<string> = listNew();
+    listPush(line, "a,b");
+    listPush(line, "c");
+    listPush(one, line);
+    const text = serializeRows(one);
+    assert(text == "\"a,b\",c\r\n", "需引号化＋CRLF");
+}
+
+// —— S3：hash（FIPS 180-4 官方向量）——
+
+test "hash：sha256 官方向量" {
+    assert(sha256Hex("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "空串向量");
+    assert(sha256Hex("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "abc 向量");
+    assert(sha256Hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq") == "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1", "两块向量");
+    const d4 = sha256Bytes("abc");
+    assert(listLen(d4) == 32, "摘要 32 字节");
+    assert((listGet(d4, 0) catch 0) == 0xba, "首字节");
+}
+
+// —— S3：regexp（D84 回溯引擎）——
+
+test "regexp：字面/类/量词/锚/选择" {
+    assert(matches("abc", "xxabcyy") catch false, "字面搜索");
+    assert(!(matches("^abc", "xxabc") catch true), "首锚拒");
+    assert(matches("^abc$", "abc") catch false, "双锚全匹配");
+    assert(matches("[0-9]+", "ab12cd") catch false, "类＋加量词");
+    assert(matches("[^0-9]+", "abc") catch false, "否定类");
+    assert(matches("colou?r", "color") catch false, "问号量词");
+    assert(matches("a{2,3}", "aaa") catch false, "区间量词");
+    assert(matches("cat|dog", "hotdog") catch false, "选择");
+    assert(matches("a.c", "abc") catch false, "点通配");
+    assert(matches("\\d{3}-\\d{4}", "call 555-1234") catch false, "转义类＋区间");
+}
+
+test "regexp：捕获组与回溯" {
+    const empty: List<string> = listNew();
+    const g1 = findGroups("([a-z]+)([0-9]+)", "ab12cd34") catch empty;
+    assert(listLen(g1) == 3, "整匹配＋两组");
+    assert((listGet(g1, 0) catch "?") == "ab12", "整匹配");
+    assert((listGet(g1, 1) catch "?") == "ab", "组 1");
+    assert((listGet(g1, 2) catch "?") == "12", "组 2");
+    const g2 = findGroups("(a|b)+x", "abax") catch empty;
+    assert(listLen(g2) == 2 && (listGet(g2, 0) catch "?") == "abax", "选择回溯＋组");
+    const g3 = findGroups("(z)", "abc") catch empty;
+    assert(listLen(g3) == 0, "未命中空表");
+    const g4 = findGroups("a*", "aaab") catch empty;
+    assert((listGet(g4, 0) catch "?") == "aaa", "贪婪量词");
+}
+
+// —— S3：collect（泛型单态化 dogfood——G1 消费面）——
+
+function dbl(n: int): int {
+    return n * 2;
+}
+function add(a: int, b: int): int {
+    return a + b;
+}
+function cmpInt(a: int, b: int): int {
+    return a - b;
+}
+function gt3(n: int): bool {
+    return n > 3;
+}
+
+test "collect：泛型高阶族（map/filter/fold）" {
+    const xs: List<int> = listNew();
+    listPush(xs, 1);
+    listPush(xs, 2);
+    listPush(xs, 3);
+    const ds = map(xs, dbl);
+    assert((listGet(ds, 2) catch 0) == 6, "map 倍增");
+    const fs = filter(xs, gt3);
+    assert(listLen(fs) == 0, "filter 全滤");
+    assert(fold(xs, 0, add) == 6, "fold 求和");
+    const words: List<string> = listNew();
+    listPush(words, "b");
+    listPush(words, "a");
+    const rs = reverse(words);
+    assert((listGet(rs, 0) catch "?") == "a", "reverse 泛型（string 实例）");
+}
+
+test "collect：sortBy 稳定序＋binarySearch＋heap" {
+    const xs: List<int> = listNew();
+    listPush(xs, 3);
+    listPush(xs, 1);
+    listPush(xs, 2);
+    const sorted = sortBy(xs, cmpInt);
+    assert((listGet(sorted, 0) catch 0) == 1 && (listGet(sorted, 2) catch 0) == 3, "升序");
+    assert(binarySearch(sorted, 2, cmpInt) == 1, "二分命中");
+    assert(binarySearch(sorted, 9, cmpInt) == -1, "二分未命中");
+    assert(listLen(take(sorted, 2)) == 2 && listLen(drop(sorted, 5)) == 0, "take/drop 泛型");
+    const h: List<int> = listNew();
+    heapPush(h, 3, cmpInt);
+    heapPush(h, 1, cmpInt);
+    heapPush(h, 2, cmpInt);
+    assert((heapPop(h, cmpInt) catch 0) == 1, "堆弹最小");
+    assert((heapPop(h, cmpInt) catch 0) == 2, "堆弹次小");
+}

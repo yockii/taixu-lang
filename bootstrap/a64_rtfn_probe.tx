@@ -1,0 +1,212 @@
+// rtfn 的 A64 底层探针（macOS 适配 M4b，设计 A4、A5、A8）：用 rtfn 在 A64 缓冲里写一个小程序，链接成 Mach-O arm64。
+// 在 Apple Silicon 上运行：逐项核对 rtfn 原语，全部相符打印 “a64 rtfn ok” 并 exit(0)；第 k 项不符即 exit(k)。
+// 第二个映像做除零，须被 brk 终止（SIGTRAP）。用法：a64_rtfn_probe <输出目录>。
+import { RtFn, RtOp, L, I, A, G } from "./selfhost/rtfn_base";
+import { rtBegin, rtFailed, rtEnd, rtSet, rtSetGlobal, rtOp, rtShift, rtDivMod, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtIf32, rtCall2, rtCallList, rtCallC, rtF64ToF32Bits, rtF32BitsToF64, rtFop, rtFIf, rtIntToF64, rtLoadAcq, rtStoreRel, rtAtomicAdd, rtAtomicCas, rtAtomicXchg, rtRet, rtRetVoid, rtRdataBytes } from "./selfhost/rtfn";
+import { StructuredBuffer, asBufferNewA64, asBufferSection, asBufferLabel, asBufferQuad, asBufferZero, asStructuredBegin, asFailedAs, asLastErrAs } from "./selfhost/assemble";
+import { a64BufferSubmit } from "./selfhost/a64_asm";
+import { elfWriteObject, elfObjectOk, elfObjectBytes, elfObjectError } from "./selfhost/emit_elf_object";
+import { linkMachO, machoBytes, machoError, machoImportReset, machoIdentifierFor } from "./selfhost/link_macho";
+
+const MODULE: string = "bootstrap/a64_rtfn_probe.tx";
+let failures: List<string> = listNew();
+
+function done(f: Ref<RtFn>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// check(k)：x 与 want 不等时 exit(k)。
+function check(f: Ref<RtFn>, k: int, x: Ref<RtOp>, want: Ref<RtOp>): void {
+    const ok = "ok" + toStr(k);
+    rtIf(f, x, "eq", want, ok);
+    rtSet(f, "fp", G("__imp_exit"));
+    const args: List<Ref<RtOp>> = listNew(); listPush(args, I(k));
+    const cls: List<int> = listNew(); listPush(cls, 0);
+    rtCallC(f, "", "", "fp", args, cls, false);
+    rtLabel(f, ok);
+}
+
+// x（局部）cc 立即数 v 按 32 位比较，须得 want；不符以 k 退出。
+function if32(f: Ref<RtFn>, k: int, x: int, cc: string, v: int, want: bool): void {
+    const taken = "t" + toStr(k);
+    const after = "a" + toStr(k);
+    rtSet(f, "x", I(x));
+    rtIf32(f, L("x"), cc, I(v), taken);
+    if (want) { check(f, k, I(0), I(1)); }
+    rtJump(f, after);
+    rtLabel(f, taken);
+    if (!want) { check(f, k, I(0), I(1)); }
+    rtLabel(f, after);
+}
+
+// 十个参数求加权和：a0 + 2·a1 + … + 10·a9（第 9、10 个在栈上）。
+function sum10(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "p_sum10", "a0 a1 a2 a3 a4 a5 a6 a7 a8 a9", "s t", 0, MODULE);
+    rtSet(f, "s", I(0));
+    let k = 0;
+    while (k < 10) {
+        rtOp(f, "t", L("a" + toStr(k)), "imul", I(k + 1));
+        rtOp(f, "s", L("s"), "add", L("t"));
+        k = k + 1;
+    }
+    rtRet(f, L("s"));
+    done(f);
+}
+
+// 大帧：4200 个局部（帧超过 32760 字节），最后一个局部的读写要走偏移合法化。
+function bigFrame(b: Ref<StructuredBuffer>): void {
+    let names = "";
+    let k = 0;
+    while (k < 4200) { names = names + " v" + toStr(k); k = k + 1; }
+    const f = rtBegin(b, "p_big", "x", names, 0, MODULE);
+    rtSet(f, "v4199", L("x"));
+    rtSet(f, "v0", I(5));
+    rtOp(f, "v4198", L("v4199"), "add", L("v0"));
+    rtRet(f, L("v4198"));
+    done(f);
+}
+
+function mainFn(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "a64_main", "argc argv", "fp r q m x y p buf0 buf1 h d e g", 10, MODULE);
+    // 1..6 运算与移位
+    rtOp(f, "x", I(40), "add", I(2)); check(f, 1, L("x"), I(42));
+    rtOp(f, "x", I(5), "sub", I(9)); check(f, 2, L("x"), I(-4));
+    rtOp(f, "x", I(-1), "imul", I(-7)); check(f, 3, L("x"), I(7));
+    rtOp(f, "x", I(12), "and", I(10)); rtOp(f, "x", L("x"), "or", I(1)); rtOp(f, "x", L("x"), "xor", I(16)); check(f, 4, L("x"), I(25));
+    rtShift(f, "x", I(-8), "sar", 2); check(f, 5, L("x"), I(-2));
+    rtShift(f, "x", I(-8), "shr", 60); rtShift(f, "y", I(3), "shl", 62); rtOp(f, "x", L("x"), "add", L("y")); check(f, 6, L("x"), I(-4611686018427387889));
+    // 7..8 除法与取余（有符号）
+    rtDivMod(f, "q", "m", I(-17), I(5)); check(f, 7, L("q"), I(-3)); check(f, 8, L("m"), I(-2));
+    // 9..12 读写各宽度（栈上缓冲），读为零扩展
+    rtAddrOf(f, "p", "buf0");
+    rtStore(f, L("p"), 0, I(-1), 8);
+    rtStore(f, L("p"), 1, I(0), 1);
+    rtLoad(f, "x", L("p"), 0, 8); check(f, 9, L("x"), I(-65281));
+    rtLoad(f, "x", L("p"), 2, 2); check(f, 10, L("x"), I(65535));
+    rtStore(f, L("p"), 4, I(305419896), 4);
+    rtLoad(f, "x", L("p"), 4, 4); check(f, 11, L("x"), I(305419896));
+    rtLoad(f, "x", L("p"), 7, 1); check(f, 12, L("x"), I(18));
+    // 13..14 全局：地址、读、写
+    rtLoad(f, "x", A("p_cell"), 0, 8); check(f, 13, L("x"), I(123456789));
+    rtSetGlobal(f, "p_cell", I(-5)); rtSet(f, "x", G("p_cell")); check(f, 14, L("x"), I(-5));
+    // 15 十参数调用（栈上实参）
+    const args: List<Ref<RtOp>> = listNew();
+    let k = 0;
+    while (k < 10) { listPush(args, I(k + 1)); k = k + 1; }
+    rtCallList(f, "x", "p_sum10", args); check(f, 15, L("x"), I(385));
+    // 16 间接调用
+    rtSet(f, "h", A("p_sum10"));
+    rtCallList(f, "x", "*h", args); check(f, 16, L("x"), I(385));
+    // 17 大帧
+    rtCall2(f, "x", "p_big", I(100), I(0)); check(f, 17, L("x"), I(105));
+    // 18..19 C 调用：ldexp(1.5, 3) = 12.0（浮点实参与结果、整数实参）
+    rtSet(f, "fp", G("__imp_ldexp"));
+    const cargs: List<Ref<RtOp>> = listNew(); listPush(cargs, I(4609434218613702656)); listPush(cargs, I(3));
+    const ccls: List<int> = listNew(); listPush(ccls, 1); listPush(ccls, 0);
+    rtCallC(f, "", "d", "fp", cargs, ccls, false); check(f, 18, L("d"), I(4622945017495814144));
+    // f32：12.0 → 0x41400000 → 12.0
+    rtF64ToF32Bits(f, "e", L("d")); check(f, 19, L("e"), I(1094713344));
+    rtF32BitsToF64(f, "g", L("e")); check(f, 20, L("g"), L("d"));
+    // 21 循环与 32 位比较：数到 1000
+    rtSet(f, "x", I(0));
+    rtLabel(f, "loop");
+    rtOp(f, "x", L("x"), "add", I(1));
+    rtIf32(f, L("x"), "ult", I(1000), "loop");
+    check(f, 21, L("x"), I(1000));
+    rtIf(f, I(-1), "ult", I(1), "bad"); rtIf(f, I(1), "gt", I(-1), "good"); rtJump(f, "bad");
+    rtLabel(f, "bad"); check(f, 22, I(0), I(1));
+    rtLabel(f, "good");
+    // 23..27 浮点：1.5+2.25、7.5−2.5、1.5×2.5、7.5÷2.5、(double)−3
+    rtFop(f, "x", I(4609434218613702656), "fadd", I(4612248968380809216)); check(f, 23, L("x"), I(4615626668101337088));
+    rtFop(f, "x", I(4620130267728707584), "fsub", I(4612811918334230528)); check(f, 24, L("x"), I(4617315517961601024));
+    rtFop(f, "x", I(4609434218613702656), "fmul", I(4612811918334230528)); check(f, 25, L("x"), I(4615626668101337088));
+    rtFop(f, "x", I(4620130267728707584), "fdiv", I(4612811918334230528)); check(f, 26, L("x"), I(4613937818241073152));
+    rtIntToF64(f, "x", I(-3)); check(f, 27, L("x"), I(-4609434218613702656));
+    // 28 比较：NaN 与 1.0 只有 ne 成立；1.5 < 2.5、2.5 >= 2.5
+    rtSet(f, "x", I(0));
+    for (cc in ["lt", "le", "gt", "ge", "eq"]) {
+        rtFIf(f, I(9221120237041090560), cc, I(4607182418800017408), "nanbad");
+    }
+    rtFIf(f, I(9221120237041090560), "ne", I(4607182418800017408), "nanok");
+    rtLabel(f, "nanbad"); check(f, 28, I(0), I(1));
+    rtLabel(f, "nanok");
+    rtFIf(f, I(4612811918334230528), "lt", I(4609434218613702656), "fbad");
+    rtFIf(f, I(4609434218613702656), "lt", I(4612811918334230528), "f1");
+    rtJump(f, "fbad");
+    rtLabel(f, "f1");
+    rtFIf(f, I(4612811918334230528), "ge", I(4612811918334230528), "f2");
+    rtLabel(f, "fbad"); check(f, 29, I(0), I(1));
+    rtLabel(f, "f2");
+    // 30..35 原子与内存序（p_cell 现为 −5）
+    rtAtomicAdd(f, "x", A("p_cell"), 0, I(12)); check(f, 30, L("x"), I(-5));
+    rtLoadAcq(f, "x", A("p_cell"), 0); check(f, 31, L("x"), I(7));
+    rtAtomicCas(f, "x", A("p_cell"), 0, I(7), I(70)); check(f, 32, L("x"), I(7));
+    rtAtomicCas(f, "x", A("p_cell"), 0, I(7), I(700)); check(f, 33, L("x"), I(70));
+    rtAtomicXchg(f, "x", A("p_cell"), 0, I(1)); check(f, 34, L("x"), I(70));
+    rtStoreRel(f, A("p_cell"), 0, I(99)); rtSet(f, "x", G("p_cell")); check(f, 35, L("x"), I(99));
+    // 36..43 32 位比较的 le（有符号）与 ule（运行时加固 H1 的引用计数下溢检测用）：只看低 32 位。
+    if32(f, 36, 4294967295, "le", 0, true); // −1 ≤ 0
+    if32(f, 37, 4294967296, "le", 0, true); // 高位不计：0 ≤ 0
+    if32(f, 38, 1, "le", 0, false);
+    if32(f, 39, 2147483648, "le", 0, true); // INT32_MIN
+    if32(f, 40, 1, "ule", 1, true);
+    if32(f, 41, 0, "ule", 1, true);
+    if32(f, 42, 2, "ule", 1, false);
+    if32(f, 43, 4294967295, "ule", 1, false); // 无符号 0xFFFFFFFF
+    // 打印并退出
+    rtSet(f, "fp", G("__imp_write"));
+    const wargs: List<Ref<RtOp>> = listNew(); listPush(wargs, I(1)); listPush(wargs, A("p_msg")); listPush(wargs, I(12));
+    const wcls: List<int> = listNew(); listPush(wcls, 0); listPush(wcls, 0); listPush(wcls, 0);
+    rtCallC(f, "r", "", "fp", wargs, wcls, false);
+    rtRet(f, I(0));
+    done(f);
+}
+
+function divZeroFn(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "a64_main", "argc argv", "q d", 0, MODULE);
+    rtOp(f, "d", L("argc"), "sub", I(1));
+    rtDivMod(f, "q", "", I(7), L("d"));
+    rtRet(f, L("q"));
+    done(f);
+}
+
+function link(b: Ref<StructuredBuffer>, path: string): int {
+    asStructuredBegin();
+    a64BufferSubmit(b);
+    if (asFailedAs() != 0) { eprint("asm: " + asLastErrAs()); return 65; }
+    const exports: List<string> = listNew(); listPush(exports, "a64_main");
+    const r = elfWriteObject(exports);
+    if (elfObjectOk(r) != 1) { eprint("elf: " + elfObjectError(r)); return 66; }
+    const objects: List<Bytes> = listNew(); listPush(objects, elfObjectBytes(r));
+    machoImportReset();
+    machoIdentifierFor(path);
+    if (linkMachO(objects, "a64_main") != 0) { eprint("link: " + machoError()); return 67; }
+    writeFileBytes(path, machoBytes()) catch (e) { eprint(e.message); return 68; };
+    return 0;
+}
+
+function main(args: []string): int {
+    if (len(args) < 1) { eprint("usage: a64_rtfn_probe <outdir>"); return 64; }
+    const b = asBufferNewA64();
+    asBufferSection(b, 0, 1);
+    sum10(b);
+    bigFrame(b);
+    mainFn(b);
+    rtRdataBytes(b, "p_msg", "a64 rtfn ok\n");
+    asBufferSection(b, 2, 1);
+    asBufferLabel(b, "p_cell", 1);
+    asBufferQuad(b, 123456789, 1);
+    asBufferSection(b, 0, 1);
+    if (listLen(failures) > 0) { eprint("rtfn: " + (listGet(failures, 0) catch "")); return 69; }
+    const c1 = link(b, args[0] + "/rtfn_ok");
+    if (c1 != 0) { return c1; }
+    const z = asBufferNewA64();
+    asBufferSection(z, 0, 1);
+    divZeroFn(z);
+    if (listLen(failures) > 0) { eprint("rtfn: " + (listGet(failures, 0) catch "")); return 69; }
+    const c2 = link(z, args[0] + "/rtfn_divzero");
+    if (c2 != 0) { return c2; }
+    print("PASS_A64_RTFN");
+    return 0;
+}

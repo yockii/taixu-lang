@@ -1,0 +1,547 @@
+// 公开仓导出（docs/design/v052-public-release-v0.1-20261026.md §二）：按清单 release/export.txt，从本仓与 taixu-stdlib 的
+// 已提交内容（git archive，不读工作树）生成公开仓 taixu-lang 的树——同 Copybara 的白名单加确定性变换。标准库整体放到 stdlib/；
+// 指向未导出文件的 Markdown 链接改为纯文本；另生成前端冻结测试的历史输入 tests/frozen/pinned-bootstrap.tar。
+// 目标目录整体替换（只保留 .git），不提交、不推送；自检不过即以 1 退出。
+// 用法（在本仓根运行）：taixu run --toolchain scripts/export.tx --out <目录> [--stdlib <taixu-stdlib 仓>] [--commit <提交>]
+//   [--stdlib-commit <提交>] [--manifest <清单>]
+import { absolute, byteSub, deleteTree, dirOf, findInPath, join, kindOf, list1, mkdirs, nat, nothing, paxPath, plus, readBytes, runIn, safeRel,
+    startsWith, tarField, tarOctal, trimLine } from "./build_lib";
+import { osRealPath, osWriteFile } from "./build_os";
+
+// 单个文件的上限（GitHub 对 50 MB 以上告警；公开仓不该有这么大的文件）。
+const MAX_FILE: int = 10485760;
+
+struct Opts {
+    root: string,
+    out: string,
+    stdlib: string,
+    commit: string,
+    stdlibCommit: string,
+    manifest: string,
+}
+
+struct Rule {
+    source: string,
+    verb: string,
+    path: string,
+    to: string,
+}
+
+struct Report {
+    files: int,
+    executables: List<string>,
+    rewritten: int,
+    problems: List<string>,
+}
+
+function usage(): int {
+    eprint("用法：taixu run --toolchain scripts/export.tx --out <目录> [--stdlib <taixu-stdlib 仓>] [--commit <提交>] [--stdlib-commit <提交>] [--manifest <清单>]");
+    return 64;
+}
+
+function parseOpts(args: []string): Ref<Opts> | Error {
+    const o = new Opts { root: osRealPath(currentDir() catch "."), out: "", stdlib: "", commit: "HEAD", stdlibCommit: "HEAD", manifest: "release/export.txt" };
+    let i = 0;
+    while (i < len(args)) {
+        if (i + 1 >= len(args)) {
+            return err("选项缺少值：" + args[i]);
+        }
+        const a = args[i];
+        const v = args[i + 1];
+        if (a == "--out") {
+            o.out = absolute(v);
+        } else if (a == "--stdlib") {
+            o.stdlib = absolute(v);
+        } else if (a == "--commit") {
+            o.commit = v;
+        } else if (a == "--stdlib-commit") {
+            o.stdlibCommit = v;
+        } else if (a == "--manifest") {
+            o.manifest = v;
+        } else {
+            return err("不认识的选项：" + a);
+        }
+        i = i + 2;
+    }
+    if (len(o.out) == 0) {
+        return err("请给出 --out <目录>");
+    }
+    if (kindOf(join(o.root, "scripts/export.tx")) != 1) {
+        return err("请在本仓根运行（找不到 scripts/export.tx）");
+    }
+    if (len(o.stdlib) == 0) {
+        o.stdlib = join(dirOf(o.root), "taixu-stdlib");
+    }
+    return o;
+}
+
+// 清单：逐行“<源> include|exclude <路径>”或“<源> map <源路径> <目的路径>”，另有“forbid <字样>”（不得出现在公开内容里的
+// 本机痕迹：开发机与测试机的路径、用户名、主机名；写在不导出的清单里，导出器源码自己不含它们）；# 起注释。
+function parseManifest(text: string): List<Ref<Rule>> | Error {
+    const out: List<Ref<Rule>> = listNew();
+    let n = 0;
+    for (raw in strSplit(text, "\n")) {
+        n = n + 1;
+        const line = trimLine(raw);
+        if (len(line) == 0 || startsWith(line, "#")) {
+            continue;
+        }
+        const w: List<string> = listNew();
+        for (part in strSplit(line, " ")) {
+            if (len(part) > 0) {
+                listPush(w, part);
+            }
+        }
+        const src = listGet(w, 0) catch "";
+        if (src == "forbid") {
+            if (listLen(w) != 2) {
+                return err("清单第 " + toStr(n) + " 行看不懂：" + line);
+            }
+            listPush(out, new Rule { source: "forbid", verb: "forbid", path: listGet(w, 1) catch "", to: "" });
+            continue;
+        }
+        const verb = listGet(w, 1) catch "";
+        const path = listGet(w, 2) catch "";
+        const want = if_(verb == "map", 4, 3);
+        if ((src != "core" && src != "stdlib") || (verb != "include" && verb != "exclude" && verb != "map") || listLen(w) != want || !safeRel(path)) {
+            return err("清单第 " + toStr(n) + " 行看不懂：" + line);
+        }
+        const to = listGet(w, 3) catch "";
+        if (verb == "map" && !safeRel(to)) {
+            return err("清单第 " + toStr(n) + " 行的目的路径不安全：" + to);
+        }
+        listPush(out, new Rule { source: src, verb: verb, path: path, to: to });
+    }
+    return out;
+}
+
+function if_(c: bool, a: int, b: int): int {
+    if (c) {
+        return a;
+    }
+    return b;
+}
+
+function git(exe: string, repo: string, args: List<string>, work: string): Bytes | Error {
+    const r = runIn(exe, plus(plus(list1("-C"), list1(repo)), args), work, true, false) catch (e) {
+        return e;
+    };
+    if (r.code != 0) {
+        return err("git 失败（" + repo + "）：" + (bytesToStr(r.tail) catch "?"));
+    }
+    return r.out;
+}
+
+// 把 git archive 的 tar 解到 dest/prefix 下：同 build_lib 的 untar，另按头里的权限位保留可执行文件，并记下它们的相对路径。
+function extract(t: Bytes, dest: string, prefix: string, rep: Ref<Report>): void | Error {
+    let off = 0;
+    let pending = "";
+    while (off + 512 <= bytesLen(t)) {
+        if ((bytesGet(t, off) ?? 0) == 0 && len(tarField(t, off, 100)) == 0) {
+            return nothing();
+        }
+        let name = tarField(t, off, 100);
+        const mode = tarOctal(t, off + 100, 8);
+        const size = tarOctal(t, off + 124, 12);
+        const kind = bytesGet(t, off + 156) ?? 0;
+        if (startsWith(tarField(t, off + 257, 6), "ustar")) {
+            const pre = tarField(t, off + 345, 155);
+            if (len(pre) > 0) {
+                name = pre + "/" + name;
+            }
+        }
+        const data = off + 512;
+        if (size < 0 || data + size > bytesLen(t)) {
+            return err("tar 头损坏：" + name);
+        }
+        if (kind == 120) {
+            pending = paxPath(t, data, size);
+        } else if (kind == 48 || kind == 0) {
+            let path = name;
+            if (len(pending) > 0) {
+                path = pending;
+            }
+            pending = "";
+            if (!safeRel(path)) {
+                return err("tar 里有不安全的路径：" + path);
+            }
+            const rel = prefix + path;
+            const target = join(dest, rel);
+            const exec = mode > 0 && (mode & 73) != 0;
+            if (!mkdirs(dirOf(target)) || !osWriteFile(target, bytesSlice(t, data, size), exec)) {
+                return err("写不了：" + target);
+            }
+            rep.files = rep.files + 1;
+            if (exec) {
+                listPush(rep.executables, rel);
+            }
+        } else if (kind != 53 && kind != 103) {
+            return err("tar 里有不支持的条目（类型 " + toStr(kind) + "）：" + name);
+        } else {
+            pending = "";
+        }
+        off = data + ((size + 511) / 512) * 512;
+    }
+    return nothing();
+}
+
+// 目标目录整体替换：删掉 .git 以外的一切。
+function clearOut(out: string): void | Error {
+    if (kindOf(out) == 0) {
+        if (!mkdirs(out)) {
+            return err("建不了：" + out);
+        }
+        return nothing();
+    }
+    const names = localListDir(nat(out), "") catch (e) {
+        return err("列不了：" + out);
+    };
+    for (n in names) {
+        if (n == ".git") {
+            continue;
+        }
+        const p = join(out, n);
+        if (localEntryKind(nat(out), n) == 2) {
+            if (!deleteTree(p)) {
+                return err("删不掉：" + p);
+            }
+        } else {
+            removeFile(p) catch (e) {
+                return err("删不掉：" + p);
+            };
+        }
+    }
+    return nothing();
+}
+
+function archive(gitExe: string, repo: string, commit: string, paths: List<string>, dest: string, prefix: string, work: string,
+    rep: Ref<Report>): void | Error {
+    if (listLen(paths) == 0) {
+        return nothing();
+    }
+    const tar = git(gitExe, repo, plus(plus(list1("archive"), list1("--format=tar")), plus(list1(commit), paths)), work) catch (e) {
+        return e;
+    };
+    return extract(tar, dest, prefix, rep);
+}
+
+function removePath(out: string, rel: string): void | Error {
+    const p = join(out, rel);
+    const k = kindOf(p);
+    if (k == 2) {
+        if (!deleteTree(p)) {
+            return err("删不掉：" + p);
+        }
+    } else if (k == 1) {
+        removeFile(p) catch (e) {
+            return err("删不掉：" + p);
+        };
+    } else {
+        return err("exclude 没有命中：" + rel);
+    }
+    return nothing();
+}
+
+// 递归列出 dir 之下的文件（相对路径，正斜杠）；不跟随链接。
+function walk(root: string, rel: string, out: List<string>): void {
+    const dir = join(root, rel);
+    const names = localListDir(nat(dir), "") catch (e) {
+        return;
+    };
+    for (n in names) {
+        if (len(rel) == 0 && n == ".git") {
+            continue;
+        }
+        let child = n;
+        if (len(rel) > 0) {
+            child = rel + "/" + n;
+        }
+        const k = localEntryKind(nat(dir), n);
+        if (k == 2) {
+            walk(root, child, out);
+        } else if (k == 1) {
+            listPush(out, child);
+        }
+    }
+}
+
+// 规范化仓内相对路径：去掉 . 段、按 .. 回退；越出根得空串。
+function normRel(p: string): string {
+    const parts: List<string> = listNew();
+    for (c in strSplit(p, "/")) {
+        if (len(c) == 0 || c == ".") {
+            continue;
+        }
+        if (c == "..") {
+            if (listLen(parts) == 0) {
+                return "";
+            }
+            const dropped = listPop(parts) catch "";
+        } else {
+            listPush(parts, c);
+        }
+    }
+    let s = "";
+    for (c in parts) {
+        if (len(s) > 0) {
+            s = s + "/";
+        }
+        s = s + c;
+    }
+    return s;
+}
+
+function relDir(rel: string): string {
+    let cut = -1;
+    let k = 0;
+    while (k < len(rel)) {
+        if ((byteAt(rel, k) ?? 0) == 47) {
+            cut = k;
+        }
+        k = k + 1;
+    }
+    if (cut < 0) {
+        return "";
+    }
+    return byteSub(rel, 0, cut);
+}
+
+// 链接目标是否留着：外链、页内锚点留；仓内路径在导出树里存在才留。
+function keepTarget(out: string, fileRel: string, target: string): bool {
+    if (len(target) == 0 || startsWith(target, "http:") || startsWith(target, "https:") || startsWith(target, "mailto:") || startsWith(target, "#")) {
+        return true;
+    }
+    let path = target;
+    const tb = bytesFromStr(target);
+    let hash = 0;
+    while (hash < bytesLen(tb) && (bytesGet(tb, hash) ?? 0) != 35) {
+        hash = hash + 1;
+    }
+    if (hash < bytesLen(tb)) {
+        path = bytesToStr(bytesSlice(tb, 0, hash)) catch "";
+    }
+    let base = relDir(fileRel);
+    if (len(base) > 0) {
+        base = base + "/";
+    }
+    const rel = normRel(base + path);
+    return len(rel) > 0 && kindOf(join(out, rel)) != 0;
+}
+
+// 一个 Markdown 文件里指向未导出文件的 [文字](目标) 改为“文字”（图片 ![替代](目标) 改为替代文字）。全程按字节
+// （strIndexOf 得的是码点下标，不能与按字节的切片混用）；记下改了几处。
+function rewriteFile(out: string, rel: string, text: string, rep: Ref<Report>): string {
+    const b = bytesFromStr(text);
+    const n = bytesLen(b);
+    const res = bytesNew(0);
+    let pos = 0;
+    let changed = 0;
+    let mid = pos;
+    while (mid + 1 < n) {
+        if ((bytesGet(b, mid) ?? 0) != 93 || (bytesGet(b, mid + 1) ?? 0) != 40) {
+            mid = mid + 1;
+            continue;
+        }
+        // 向左找配对的 [（同一行内），向右找配对的 )（不跨行、不含空格）。
+        let open = -1;
+        let depth = 0;
+        let k = mid - 1;
+        while (k >= pos) {
+            const c = bytesGet(b, k) ?? 0;
+            if (c == 10) {
+                break;
+            }
+            if (c == 93) {
+                depth = depth + 1;
+            } else if (c == 91) {
+                if (depth == 0) {
+                    open = k;
+                    break;
+                }
+                depth = depth - 1;
+            }
+            k = k - 1;
+        }
+        let close = -1;
+        let pd = 0;
+        let j = mid + 2;
+        while (j < n) {
+            const c = bytesGet(b, j) ?? 0;
+            if (c == 10 || c == 32) {
+                break;
+            }
+            if (c == 40) {
+                pd = pd + 1;
+            } else if (c == 41) {
+                if (pd == 0) {
+                    close = j;
+                    break;
+                }
+                pd = pd - 1;
+            }
+            j = j + 1;
+        }
+        if (open < 0 || close < 0) {
+            mid = mid + 2;
+            continue;
+        }
+        const target = bytesToStr(bytesSlice(b, mid + 2, close - mid - 2)) catch "";
+        if (!keepTarget(out, rel, target)) {
+            let start = open;
+            if (open > pos && (bytesGet(b, open - 1) ?? 0) == 33) {
+                start = open - 1;
+            }
+            bytesAppend(res, bytesSlice(b, pos, start - pos));
+            bytesAppend(res, bytesSlice(b, open + 1, mid - open - 1));
+            pos = close + 1;
+            changed = changed + 1;
+        }
+        mid = close + 1;
+    }
+    bytesAppend(res, bytesSlice(b, pos, n - pos));
+    rep.rewritten = rep.rewritten + changed;
+    return bytesToStr(res) catch text;
+}
+
+function endsWith(s: string, suffix: string): bool {
+    return len(s) >= len(suffix) && byteSub(s, len(s) - len(suffix), len(suffix)) == suffix;
+}
+
+// 变换与自检：改写 Markdown 链接；查本机痕迹与超大文件。
+function finish(out: string, rep: Ref<Report>, forbid: List<string>): void {
+    const files: List<string> = listNew();
+    walk(out, "", files);
+    for (rel in files) {
+        const p = join(out, rel);
+        const b = readBytes(p) catch bytesNew(0);
+        if (bytesLen(b) > MAX_FILE) {
+            listPush(rep.problems, "文件超过 10 MB：" + rel);
+        }
+        if (endsWith(rel, ".tar") || endsWith(rel, ".o") || endsWith(rel, ".obj")) {
+            continue;
+        }
+        const text = bytesToStr(b) catch "";
+        if (len(text) == 0) {
+            continue;
+        }
+        for (needle in forbid) {
+            if (strIndexOf(text, needle) >= 0) {
+                listPush(rep.problems, "含本机痕迹 " + needle + "：" + rel);
+            }
+        }
+        if (endsWith(rel, ".md")) {
+            const fixed = rewriteFile(out, rel, text, rep);
+            if (fixed != text && !osWriteFile(p, bytesFromStr(fixed), false)) {
+                listPush(rep.problems, "写不了：" + rel);
+            }
+        }
+    }
+}
+
+function run(args: []string): int | Error {
+    const o = parseOpts(args) catch (e) {
+        return e;
+    };
+    const gitExe = findInPath("git");
+    if (len(gitExe) == 0) {
+        return err("PATH 上找不到 git");
+    }
+    const raw = readBytes(join(o.root, o.manifest)) catch (e) {
+        return e;
+    };
+    const text = bytesToStr(raw) catch (e) {
+        return err("清单不是 UTF-8：" + o.manifest);
+    };
+    const rules = parseManifest(text) catch (e) {
+        return e;
+    };
+    const work = o.root;
+    clearOut(o.out) catch (e) {
+        return e;
+    };
+    const rep = new Report { files: 0, executables: listNew(), rewritten: 0, problems: listNew() };
+    for (src in strSplit("core stdlib", " ")) {
+        let repo = o.root;
+        let commit = o.commit;
+        let prefix = "";
+        if (src == "stdlib") {
+            repo = o.stdlib;
+            commit = o.stdlibCommit;
+            prefix = "stdlib/";
+        }
+        const inc: List<string> = listNew();
+        for (r in rules) {
+            if (r.source == src && r.verb == "include") {
+                listPush(inc, r.path);
+            }
+        }
+        archive(gitExe, repo, commit, inc, o.out, prefix, work, rep) catch (e) {
+            return e;
+        };
+        for (r in rules) {
+            if (r.source == src && r.verb == "exclude") {
+                removePath(o.out, prefix + r.path) catch (e) {
+                    return e;
+                };
+            } else if (r.source == src && r.verb == "map") {
+                // 单个文件搬到别处：先解到 .export-map 下，再写到目的路径。
+                const tmp = join(o.out, ".export-map");
+                archive(gitExe, repo, commit, list1(r.path), tmp, "", work, rep) catch (e) {
+                    return e;
+                };
+                const b = readBytes(join(tmp, r.path)) catch (e) {
+                    return err("map 的源不是文件：" + r.path);
+                };
+                if (!mkdirs(dirOf(join(o.out, prefix + r.to))) || !osWriteFile(join(o.out, prefix + r.to), b, false)) {
+                    return err("写不了：" + r.to);
+                }
+                if (!deleteTree(tmp)) {
+                    return err("删不掉：" + tmp);
+                }
+            }
+        }
+    }
+    // 前端冻结测试的历史输入：ZIG_SEED 提交的 bootstrap/（公开仓取不到那段历史，§二-5）。
+    const pinRaw = readBytes(join(o.out, "bootstrap/ZIG_SEED")) catch (e) {
+        return e;
+    };
+    const pin = trimLine(bytesToStr(pinRaw) catch "");
+    const pinned = git(gitExe, o.root, plus(plus(list1("archive"), list1("--format=tar")), plus(list1(pin), list1("bootstrap"))), work) catch (e) {
+        return e;
+    };
+    if (!mkdirs(join(o.out, "tests/frozen")) || !osWriteFile(join(o.out, "tests/frozen/pinned-bootstrap.tar"), pinned, false)) {
+        return err("写不了 tests/frozen/pinned-bootstrap.tar");
+    }
+    const forbid: List<string> = listNew();
+    for (r in rules) {
+        if (r.source == "forbid") {
+            listPush(forbid, r.path);
+        }
+    }
+    if (listLen(forbid) == 0) {
+        return err("清单里没有 forbid 行（本机痕迹检查不能为空）");
+    }
+    finish(o.out, rep, forbid);
+    print("导出：" + toStr(rep.files) + " 个文件 → " + o.out);
+    print("改为纯文本的仓内链接：" + toStr(rep.rewritten) + " 处");
+    for (x in rep.executables) {
+        print("可执行：" + x);
+    }
+    for (p in rep.problems) {
+        eprint("问题：" + p);
+    }
+    if (listLen(rep.problems) > 0) {
+        return 1;
+    }
+    return 0;
+}
+
+function main(args: []string): int {
+    if (len(args) == 0) {
+        return usage();
+    }
+    return run(args) catch (e) {
+        eprint("export: " + e.message);
+        return 1;
+    };
+}

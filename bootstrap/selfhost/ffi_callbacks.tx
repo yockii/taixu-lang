@@ -1,0 +1,353 @@
+// 外部函数的回调蹦床（D3 v0.23 FFI，去 Zig 第 5 轮第 2 步第三次提交；docs/design/v052-ffi-platform-v0.1-20261015.md
+// §四-7、§五-3）。程序里每个作回调实参的（顶层函数, 回调签名）对生成一个 C 可调用的蹦床
+// __tx_ffi_cb_<函数序>_<签名序>，分两层：
+//   外壳（按目标的原始汇编）：保存 C 约定的被调方保存寄存器，按 Win64／SysV／Apple arm64 把 C 实参收进
+//     栈上的 8 字节数组，调用内层，浮点返回值放回 xmm0／d0。Win64 的 xmm6..15 为非易失，保存完整 128 位；
+//     向量保存／恢复位于正文，TXFN 的 GPR／栈事件不宣称支持向量或系统异常展开。
+//   内层（rtfn，与目标无关）__tx_ffi_cbb_<函数序>_<签名序>(实参数组)：检查“在外部函数调用期间、
+//     在太虚运行时所在的线程上”（否则 trap 4020），在调用桩登记的回调窗口开窗（同 __tx_nrt_call_fn：
+//     slot 0 写模块状态、实参从 slot 1 起、其余填 None；越过值槽栈上界 trap 4003），把 C 实参转成
+//     值槽、经 rt_table 调用目标函数，再把 slot 0 的结果转回 C 返回值。
+// 回调窗口由调用桩在每次外部调用前设为自己实参之后的位置、调用后恢复（ffi_stubs.tx）；嵌套的外部
+// 调用（回调里再调外部函数）各自登记更深的窗口。
+import { StructuredBuffer, asStructuredMissing, asBufferLabel, asBufferFunctionBegin, asBufferFunctionEnd, asBufferFunctionPrologueEnd, asBufferFunctionEpilogueStart, asBufferFrame } from "./assemble";
+import { a64Emit, a64B, a64Mem, a64AddImm, a64Frame, a64FrameAlloc } from "./a64_asm";
+import { a64AddSubImm, a64LdStPair, a64FpInt, a64BranchReg } from "./a64_encode";
+import { nr, nx, ni, nm, no, nt, nmov, nl, nc, nret } from "./native_emit";
+import { RtFn, RtOp, L, I, A, G } from "./rtfn_base";
+import { rtBegin, rtFailed, rtEnd, rtLabel, rtIf, rtSet, rtSetGlobal, rtSetRbx, rtOp, rtShift, rtLoad, rtStore, rtCall0, rtCall2, rtCall1, rtCall5, rtRet, rtRetVoid, rtRdataBytes, rtCallC, rtSyscall, rtF64ToF32Bits, rtF32BitsToF64 } from "./rtfn";
+import { ProgramContext } from "./program_context";
+import { TB_OS_TID, TB_FFI_CB_WIN } from "./thread_block_abi";
+import { tWin64, tRawSyscall, tMacos, tUnix } from "./target";
+
+let cbFail: string = "";
+let cbTextCount: int = 0;
+
+export function cbError(): string { return cbFail; }
+
+function check(f: Ref<RtFn>): void { rtEnd(f); if (len(rtFailed(f)) > 0 && len(cbFail) == 0) { cbFail = rtFailed(f); } }
+
+/// 蹦床符号（调用桩取它的地址作 C 函数指针）。
+export function cbName(fnIdx: int, sig: int): string { return "__tx_ffi_cb_" + toStr(fnIdx) + "_" + toStr(sig); }
+
+/// 程序里作回调实参的（函数序, 回调签名序）对，去重、保持出现序；扁平成对。
+export function cbPairs(p: Ref<ProgramContext>): List<int> {
+    const out: List<int> = listNew();
+    let i = 0;
+    while (i + 1 < listLen(p.ffiCbFn)) {
+        const fn = listGet(p.ffiCbFn, i) catch 0;
+        const sig = listGet(p.ffiCbFn, i + 1) catch 0;
+        let seen = false;
+        let j = 0;
+        while (j + 1 < listLen(out)) {
+            if ((listGet(out, j) catch -1) == fn && (listGet(out, j + 1) catch -1) == sig) { seen = true; }
+            j = j + 2;
+        }
+        if (!seen) { listPush(out, fn); listPush(out, sig); }
+        i = i + 2;
+    }
+    return out;
+}
+
+// 正在生成的程序映像的目标（由各例程的发射入口设定；−1 未设定）。
+let winImportTarget: int = -1;
+/// 设定 callWinImport 所服务的目标：Unix 目标上任何 Win32 调用都在生成期报错（M3 设计 G1），macOS 不会悄悄落进 Windows 分支。
+export function setWinImportTarget(t: int): void { winImportTarget = t; }
+
+/// 程序映像经导入槽调用 Win32（直接 call <名> 要求内核恰好也导入了该名，桩与蹦床不依赖这一点）。
+export function callWinImport(f: Ref<RtFn>, dst: string, name: string, args: List<Ref<RtOp>>): void {
+    if (tUnix(winImportTarget)) {
+        if (len(f.failed) == 0) { f.failed = f.name + ": Win32ImportOnUnixTarget:" + name; }
+        return;
+    }
+    rtSet(f, "gp", G("__imp_" + name));
+    const cls: List<int> = listNew();
+    let i = 0;
+    while (i < listLen(args)) { listPush(cls, 0); i = i + 1; }
+    rtCallC(f, dst, "ef", "gp", args, cls, false);
+}
+
+/// 当前线程号（低 32 位）：Windows GetCurrentThreadId，Linux gettid，macOS 内核的 __tx_mac_gettid（pthread_threadid_np）。
+/// 与 __tx_nrt_thread_bind 记下的值同口径。
+export function currentThread(f: Ref<RtFn>, dst: string, t: int): void {
+    const none: List<Ref<RtOp>> = listNew();
+    if (tRawSyscall(t)) { rtSyscall(f, dst, 186, none); } else if (tMacos(t)) { rtCall0(f, dst, "__tx_mac_gettid"); } else { callWinImport(f, dst, "GetCurrentThreadId", none); }
+    rtOp(f, dst, L(dst), "and", I(4294967295));
+}
+
+function sigRow(p: Ref<ProgramContext>, sig: int): List<int> {
+    const empty: List<int> = listNew();
+    return listGet(p.ffiCb, sig) catch empty;
+}
+
+function isFloatKind(k: int): bool { return k == 10 || k == 12; }
+
+/// 生成全部蹦床（外壳＋内层）。返回空串＝成功，否则为失败描述。
+export function cbEmitAll(b: Ref<StructuredBuffer>, p: Ref<ProgramContext>, t: int): string {
+    cbFail = "";
+    setWinImportTarget(t);
+    const pairs = cbPairs(p);
+    let i = 0;
+    while (i + 1 < listLen(pairs)) {
+        const fn = listGet(pairs, i) catch 0;
+        const sig = listGet(pairs, i + 1) catch 0;
+        const row = sigRow(p, sig);
+        const rk = listGet(row, 0) catch 0;
+        const np = listGet(row, 1) catch 0;
+        const kinds: List<int> = listNew();
+        let k = 0;
+        while (k < np) { listPush(kinds, listGet(row, 2 + k) catch 0); k = k + 1; }
+        const body = "__tx_ffi_cbb_" + toStr(fn) + "_" + toStr(sig);
+        if (b.a64) { cbShellA64(b, cbName(fn, sig), body, kinds, rk); } else { cbShell(b, cbName(fn, sig), body, kinds, rk, t); }
+        cbBody(b, body, fn, kinds, rk, t);
+        i = i + 2;
+    }
+    return cbFail;
+}
+
+function push(b: Ref<StructuredBuffer>, r: int): void { asBufferFrame(b, "push-nonvolatile", r, 8); }
+function pop(b: Ref<StructuredBuffer>, r: int): void { asBufferFrame(b, "pop-nonvolatile", r, 8); }
+
+/// 外壳：保存 rbx rbp rsi rdi r12..r15（两个目标的被调方保存寄存器之并），把 C 实参收进
+/// [rsp+32+8i]（低 32 字节留作内层调用的影子空间），rcx＝数组地址调用内层。
+function cbShell(b: Ref<StructuredBuffer>, name: string, body: string, kinds: List<int>, rk: int, t: int): void {
+    const saved: List<int> = listNew();
+    listPush(saved, 3); listPush(saved, 5); listPush(saved, 6); listPush(saved, 7);
+    listPush(saved, 12); listPush(saved, 13); listPush(saved, 14); listPush(saved, 15);
+    asBufferFunctionBegin(b, "bootstrap/selfhost/ffi_callbacks.tx", name, "ffi-callback-shell");
+    nl(b, name);
+    let i = 0;
+    while (i < listLen(saved)) { push(b, listGet(saved, i) catch 3); i = i + 1; }
+    const np = listLen(kinds);
+    // 入口 rsp≡8 (mod 16)，8 次 push 后仍≡8；减去≡8 的量使调用内层时 16 字节对齐。
+    const vectorBase = 32 + 8 * np;
+    let frame = vectorBase;
+    if (tWin64(t)) { frame = frame + 160; }
+    if (frame % 16 == 0) { frame = frame + 8; }
+    asBufferFrame(b, "allocate-stack", 4, frame);
+    asBufferFunctionPrologueEnd(b);
+    if (tWin64(t)) {
+        i = 6;
+        while (i < 16) { nt(b, "movupd", nm(4, vectorBase + 16 * (i - 6)), nx(i)); i = i + 1; }
+    }
+    // 调用方栈上实参的起点（相对当前 rsp）：本帧＋8 次 push＋返回地址；Win64 另有 32 字节影子空间。
+    let incoming = frame + 64 + 8;
+    if (tWin64(t)) { incoming = incoming + 32; }
+    const winRegs: List<int> = listNew();
+    listPush(winRegs, 1); listPush(winRegs, 2); listPush(winRegs, 8); listPush(winRegs, 9);
+    const sysvRegs: List<int> = listNew();
+    listPush(sysvRegs, 7); listPush(sysvRegs, 6); listPush(sysvRegs, 2); listPush(sysvRegs, 1); listPush(sysvRegs, 8); listPush(sysvRegs, 9);
+    let gi = 0;
+    let fi = 0;
+    let si = 0;
+    i = 0;
+    while (i < np) {
+        const k = listGet(kinds, i) catch 0;
+        const dst = nm(4, 32 + 8 * i);
+        if (tWin64(t)) {
+            if (i < 4) {
+                if (isFloatKind(k)) { nt(b, "movq", nr(0), nx(i)); nmov(b, dst, nr(0)); }
+                else { nmov(b, dst, nr(listGet(winRegs, i) catch 1)); }
+            } else {
+                nmov(b, nr(0), nm(4, incoming + 8 * (i - 4)));
+                nmov(b, dst, nr(0));
+            }
+        } else if (isFloatKind(k) && fi < 8) {
+            nt(b, "movq", nr(0), nx(fi));
+            nmov(b, dst, nr(0));
+            fi = fi + 1;
+        } else if (!isFloatKind(k) && gi < 6) {
+            nmov(b, dst, nr(listGet(sysvRegs, gi) catch 7));
+            gi = gi + 1;
+        } else {
+            nmov(b, nr(0), nm(4, incoming + 8 * si));
+            nmov(b, dst, nr(0));
+            si = si + 1;
+        }
+        i = i + 1;
+    }
+    nt(b, "lea", nr(1), nm(4, 32));
+    nc(b, body);
+    if (isFloatKind(rk)) { nt(b, "movq", nx(0), nr(0)); }
+    if (tWin64(t)) {
+        i = 6;
+        while (i < 16) { nt(b, "movupd", nx(i), nm(4, vectorBase + 16 * (i - 6))); i = i + 1; }
+    }
+    asBufferFunctionEpilogueStart(b);
+    asBufferFrame(b, "release-stack", 4, frame);
+    i = listLen(saved) - 1;
+    while (i >= 0) { pop(b, listGet(saved, i) catch 3); i = i - 1; }
+    asBufferFrame(b, "return", -1, 8);
+    asBufferFunctionEnd(b);
+}
+
+// A64 的外壳（macOS 适配 M4d，Apple arm64 约定）：与其余函数同一帧形状（M4 设计 §A5）——先压帧记录、设 x29，x19–x28
+// 逐对压入，再分配 d8–d15（被调方保存的低 64 位，序言之后存取，同 x86 外壳的 xmm6–15）与实参数组：C 实参收进 [sp+64+8i]
+// ——整数类依次取 x0..x7、浮点类依次取 d0..d7，其余在调用方的栈上（[x29+16] 起）按自然大小紧排（Apple 的约定，与 AAPCS64
+// 每个占 8 字节不同）；x0＝数组地址调用内层，浮点返回值放回 d0。窄于 32 位的整数由 C 调用方扩展，内层只看低位并自行扩展。
+// x9 作临时。
+function cbShellA64(b: Ref<StructuredBuffer>, name: string, body: string, kinds: List<int>, rk: int): void {
+    const np = listLen(kinds);
+    const frame = 64 + (8 * np + 15) / 16 * 16;
+    asBufferFunctionBegin(b, "bootstrap/selfhost/ffi_callbacks.tx", name, "ffi-callback-shell");
+    asBufferLabel(b, name, 1);
+    let first = listLen(b.entries);
+    a64Emit(b, a64LdStPair(2, 0, 0, 29, 30, 31, -16, 3), "stp x29, x30");
+    a64Frame(b, first, "push-nonvolatile", 30, 8); a64Frame(b, first, "push-nonvolatile", 29, 8);
+    first = listLen(b.entries);
+    a64Emit(b, a64AddSubImm(1, 0, 0, 29, 31, 0, 0), "mov x29, sp");
+    a64Frame(b, first, "set-frame-pointer", 29, 0);
+    let r = 0;
+    while (r < 5) {
+        first = listLen(b.entries);
+        a64Emit(b, a64LdStPair(2, 0, 0, 19 + 2 * r, 20 + 2 * r, 31, -16, 3), "stp x19..x28");
+        a64Frame(b, first, "push-nonvolatile", 20 + 2 * r, 8); a64Frame(b, first, "push-nonvolatile", 19 + 2 * r, 8);
+        r = r + 1;
+    }
+    a64FrameAlloc(b, frame);
+    asBufferFunctionPrologueEnd(b);
+    r = 0;
+    while (r < 4) { a64Emit(b, a64LdStPair(1, 1, 0, 8 + 2 * r, 9 + 2 * r, 31, 16 * r, 2), "stp d8..d15"); r = r + 1; }
+    let gi = 0;
+    let fi = 0;
+    let so = 0;
+    let i = 0;
+    while (i < np) {
+        const k = listGet(kinds, i) catch 0;
+        const dst = 64 + 8 * i;
+        if (isFloatKind(k) && fi < 8) {
+            a64Emit(b, a64FpInt(1, 1, 0, 6, 9, fi), "fmov x9, d");
+            a64Mem(b, 3, 0, 9, 31, dst);
+            fi = fi + 1;
+        } else if (!isFloatKind(k) && gi < 8) {
+            a64Mem(b, 3, 0, gi, 31, dst);
+            gi = gi + 1;
+        } else {
+            const size = cArgBytes(k);
+            so = (so + size - 1) / size * size;
+            let lg = 3;
+            if (size == 1) { lg = 0; }
+            if (size == 2) { lg = 1; }
+            if (size == 4) { lg = 2; }
+            a64Mem(b, lg, 1, 9, 29, 16 + so);
+            a64Mem(b, 3, 0, 9, 31, dst);
+            so = so + size;
+        }
+        i = i + 1;
+    }
+    a64AddImm(b, 0, 31, 64);
+    a64B(b, 1, body);
+    if (isFloatKind(rk)) { a64Emit(b, a64FpInt(1, 1, 0, 7, 0, 0), "fmov d0, x0"); }
+    r = 0;
+    while (r < 4) { a64Emit(b, a64LdStPair(1, 1, 1, 8 + 2 * r, 9 + 2 * r, 31, 16 * r, 2), "ldp d8..d15"); r = r + 1; }
+    // 尾声：sp 回到 x19–x28 压完处（x29 − 80），逐对弹出，再弹帧记录。
+    asBufferFunctionEpilogueStart(b);
+    first = listLen(b.entries);
+    a64Emit(b, a64AddSubImm(1, 1, 0, 31, 29, 80, 0), "sub sp, x29, #80");
+    a64Frame(b, first, "release-stack", 31, frame);
+    r = 4;
+    while (r >= 0) {
+        first = listLen(b.entries);
+        a64Emit(b, a64LdStPair(2, 0, 1, 19 + 2 * r, 20 + 2 * r, 31, 16, 1), "ldp x19..x28");
+        a64Frame(b, first, "pop-nonvolatile", 19 + 2 * r, 8); a64Frame(b, first, "pop-nonvolatile", 20 + 2 * r, 8);
+        r = r - 1;
+    }
+    first = listLen(b.entries);
+    a64Emit(b, a64LdStPair(2, 0, 1, 29, 30, 31, 16, 1), "ldp x29, x30");
+    a64Frame(b, first, "pop-nonvolatile", 29, 8); a64Frame(b, first, "pop-nonvolatile", 30, 8);
+    first = listLen(b.entries);
+    a64Emit(b, a64BranchReg(2, 30), "ret");
+    a64Frame(b, first, "return", -1, 0);
+    asBufferFunctionEnd(b);
+}
+
+// C 实参的字节数（栈上按自然大小紧排时用）：i8 u8 bool 1、i16 u16 2、i32 u32 f32 4，其余 8。
+function cArgBytes(k: int): int {
+    if (k == 1 || k == 4 || k == 13) { return 1; }
+    if (k == 2 || k == 5) { return 2; }
+    if (k == 3 || k == 6 || k == 10) { return 4; }
+    return 8;
+}
+
+function cbText(b: Ref<StructuredBuffer>, value: string): string {
+    const label = "__tx_ffi_cbt_" + toStr(cbTextCount);
+    cbTextCount = cbTextCount + 1;
+    rtRdataBytes(b, label, value);
+    return label;
+}
+
+function cbTrap(b: Ref<StructuredBuffer>, f: Ref<RtFn>, label: string, trap: string, fn: int, code: int, message: string): void {
+    rtLabel(f, label);
+    const t = cbText(b, message);
+    rtCall5(f, "", trap, I(fn), I(0), I(code), A(t), I(len(message)));
+    rtRet(f, I(0));
+}
+
+/// 内层：开窗、转换实参、调用、转换结果（rax；浮点为位模式，f32 为单精度位）。
+function cbBody(b: Ref<StructuredBuffer>, name: string, fn: int, kinds: List<int>, rk: int, t: int): void {
+    const f = rtBegin(b, name, "args", "tb w tid e fp reg st end v r gp ef", 6, "bootstrap/selfhost/ffi_callbacks.tx");
+    // 先确认在太虚线程上：本线程的 TLS 槽有线程块（外来线程为 0），且线程块的主人就是当前线程
+    // （Linux 不带 CLONE_SETTLS 的裸 clone 线程与父线程共用 fs）；再确认在外部调用期间。
+    rtCall0(f, "tb", "__tx_tls_tb_get");
+    rtIf(f, L("tb"), "eq", I(0), "thread");
+    currentThread(f, "tid", t);
+    rtLoad(f, "e", L("tb"), TB_OS_TID, 8);
+    rtIf(f, L("tid"), "ne", L("e"), "thread");
+    // 回调窗口在本线程的线程块里；此时 rbx 还是外部代码的值，经 TLS 得到的 tb 取。
+    rtLoad(f, "w", L("tb"), TB_FFI_CB_WIN, 8);
+    rtIf(f, L("w"), "eq", I(0), "outside");
+    // 此后线程块由发起这次外部调用的太虚线程的窗口经 rbx 求出（外壳已保存 rbx）；此前不得经 rbx 访问线程块。
+    rtSetRbx(f, L("w"));
+    rtSet(f, "e", I(fn * 16));
+    rtOp(f, "e", L("e"), "add", G("__tx_rt_table_ptr"));
+    rtLoad(f, "fp", L("e"), 0, 8);
+    rtLoad(f, "reg", L("e"), 8, 4);
+    rtLoad(f, "st", L("e"), 12, 4);
+    rtShift(f, "end", L("reg"), "shl", 4);
+    rtOp(f, "end", L("end"), "add", L("w"));
+    rtIf(f, L("end"), "le", G("__tx_stack_limit"), "room");
+    rtCall1(f, "end", "__tx_stack_more", L("end"));
+    rtIf(f, L("end"), "eq", I(0), "overflow");
+    rtLabel(f, "room");
+    rtCall2(f, "", "__tx_nrt_window", L("w"), L("reg"));
+    rtStore(f, L("w"), 0, I(9), 8);
+    rtStore(f, L("w"), 8, L("st"), 8);
+    const np = listLen(kinds);
+    let i = 0;
+    while (i < np) {
+        const k = listGet(kinds, i) catch 0;
+        rtLoad(f, "v", L("args"), 8 * i, 8);
+        let tag = 1;
+        if (k == 1) { rtShift(f, "v", L("v"), "shl", 56); rtShift(f, "v", L("v"), "sar", 56); }
+        if (k == 2) { rtShift(f, "v", L("v"), "shl", 48); rtShift(f, "v", L("v"), "sar", 48); }
+        if (k == 3) { rtShift(f, "v", L("v"), "shl", 32); rtShift(f, "v", L("v"), "sar", 32); }
+        if (k == 4) { rtOp(f, "v", L("v"), "and", I(255)); }
+        if (k == 5) { rtOp(f, "v", L("v"), "and", I(65535)); }
+        if (k == 6) { rtOp(f, "v", L("v"), "and", I(4294967295)); }
+        if (k == 10) { rtF32BitsToF64(f, "v", L("v")); tag = 2; }
+        if (k == 12) { tag = 2; }
+        if (k == 13) {
+            tag = 3;
+            const bl = "b" + toStr(i);
+            rtOp(f, "v", L("v"), "and", I(255));
+            rtIf(f, L("v"), "eq", I(0), bl);
+            rtSet(f, "v", I(1));
+            rtLabel(f, bl);
+        }
+        rtStore(f, L("w"), 16 * (i + 1), I(tag), 8);
+        rtStore(f, L("w"), 16 * (i + 1) + 8, L("v"), 8);
+        i = i + 1;
+    }
+    rtCall1(f, "", "*fp", L("w"));
+    if (rk == 0) {
+        rtRet(f, I(0));
+    } else {
+        rtLoad(f, "r", L("w"), 8, 8);
+        if (rk == 10) { rtF64ToF32Bits(f, "r", L("r")); }
+        rtRet(f, L("r"));
+    }
+    cbTrap(b, f, "outside", "__tx_trap_bare", fn, 4020, "回调只能在外部函数调用期间被调用");
+    cbTrap(b, f, "thread", "__tx_trap_bare", fn, 4020, "回调只能在太虚运行时所在的线程上被调用");
+    cbTrap(b, f, "overflow", "__tx_trap", fn, 4003, "回调窗口超出值槽栈");
+    check(f);
+}

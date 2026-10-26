@@ -1,0 +1,363 @@
+// lsp_scope.tx —— 按记号求的局部作用域与某处可见的名字（第 6 轮 6d-3b2，LSP 与 MCP 实施设计 §四-5）。
+//
+// 声明的位置来自同步分析后的出现（与当前文本一致），作用域按当前文本的词法记号求：let/const 从所在语句结束（深度 0
+// 的 `;`）到所在 `{…}` 的末尾（不含自己的初值，同 Go 与 TS；for-in 变量为循环体）；函数形参为函数体；箭头函数形参为
+// 其块体或表达式体（到所在括号组的末尾或深度 0 的 `,`、`;`）；catch 绑定、模式绑定为其后的块或表达式。顶层的函数、
+// struct、enum、外部函数、绑定与导入名全模块可见。signatureHelp 按名字找被调者与 completion 共用。
+import { Root } from "./lsp_diag";
+import { AnaOcc } from "./ana_index";
+import { nextToken, Cur, Tok, Out, K_EOF, K_IDENT, K_COMMENT, K_FUNCTION, K_FOR, K_IMPORT, K_LPAREN, K_RPAREN, K_LBRACE, K_RBRACE, K_LBRACKET, K_RBRACKET, K_LT, K_GT, K_STAR, K_COMMA, K_SEMI, K_FATARROW } from "../lexer";
+
+const AT_EXACT: int = 0;
+const AT_BIND: int = 1;
+const AT_PARAM: int = 2;
+const AT_CATCH: int = 3;
+const AT_PAT: int = 4;
+
+// 文档的词法记号（含注释）：起点的字节偏移、长度、配对的括号与包住它的最内层开括号（都是下标，没有为 -1；注释不参与
+// 配对）。parent 让“包住某处的开括号”沿链走 O(深度)，不必往左逐个跳过兄弟语句（大文件上局部声明多时是平方级）。
+export struct DocToks {
+    kinds: List<int>,
+    texts: List<string>,
+    starts: List<int>,
+    match: List<int>,
+    parent: List<int>,
+}
+
+// 上一次的文本与记号：同一版本上的几个请求（completion、signatureHelp）共用一次词法。
+let lastText: string = "";
+let lastToks: Ref<DocToks> = new DocToks { kinds: listNew(), texts: listNew(), starts: listNew(), match: listNew(), parent: listNew() };
+
+// 一个可见的名字：local 为局部（否则全模块）；from 为作用域起点（同名取起点最大即最内层）。
+export struct Visible {
+    name: string,
+    key: string,
+    tt: int,
+    kh: int,
+    local: bool,
+    from: int,
+}
+
+function lineStarts(text: string): List<int> {
+    const s: List<int> = listNew();
+    listPush(s, 0);
+    let i = 0;
+    const n = len(text);
+    while (i < n) {
+        if ((byteAt(text, i) catch 0) == 10) { listPush(s, i + 1); }
+        i = i + 1;
+    }
+    return s;
+}
+
+function closerOf(k: int): int {
+    if (k == K_LPAREN) { return K_RPAREN; }
+    if (k == K_LBRACKET) { return K_RBRACKET; }
+    if (k == K_LBRACE) { return K_RBRACE; }
+    return -1;
+}
+
+export function docToks(text: string): Ref<DocToks> {
+    if (listLen(lastToks.kinds) > 0 && text == lastText) { return lastToks; }
+    const t = new DocToks { kinds: listNew(), texts: listNew(), starts: listNew(), match: listNew(), parent: listNew() };
+    const ls = lineStarts(text);
+    const out: Ref<Out> = new Out { lines: "", errors: "", failed: false, coded: true };
+    const c: Ref<Cur> = new Cur { pos: 0, line: 1, col: 1 };
+    const stack: List<int> = listNew();
+    while (true) {
+        const k: Tok = nextToken(text, c, out);
+        if (k.kind == K_EOF) { break; }
+        const i = listLen(t.kinds);
+        listPush(t.kinds, k.kind);
+        listPush(t.texts, k.text);
+        listPush(t.starts, (listGet(ls, k.line - 1) catch 0) + k.col - 1);
+        listPush(t.match, -1);
+        // 入栈之前的栈顶即包住它的开括号（闭括号的为它配对的开括号，同往左跳组的取法）。
+        listPush(t.parent, listGet(stack, listLen(stack) - 1) catch -1);
+        if (k.kind == K_LPAREN || k.kind == K_LBRACKET || k.kind == K_LBRACE) {
+            listPush(stack, i);
+        } else if (k.kind == K_RPAREN || k.kind == K_RBRACKET || k.kind == K_RBRACE) {
+            const n = listLen(stack);
+            if (n > 0) {
+                const o = listGet(stack, n - 1) catch -1;
+                // 不配对的闭括号（编辑中的代码）不出栈，留给外层。
+                if (closerOf(listGet(t.kinds, o) catch -1) == k.kind) {
+                    listRemoveAt(stack, n - 1);
+                    listSet(t.match, o, i);
+                    listSet(t.match, i, o);
+                }
+            }
+        }
+    }
+    lastText = text;
+    lastToks = t;
+    return t;
+}
+
+export function tokKind(t: Ref<DocToks>, i: int): int { return listGet(t.kinds, i) catch -1; }
+
+export function tokStart(t: Ref<DocToks>, i: int): int { return listGet(t.starts, i) catch 0; }
+
+export function tokEnd(t: Ref<DocToks>, i: int): int { return tokStart(t, i) + len(listGet(t.texts, i) catch ""); }
+
+export function tokMatch(t: Ref<DocToks>, i: int): int { return listGet(t.match, i) catch -1; }
+
+export function tokCount(t: Ref<DocToks>): int { return listLen(t.kinds); }
+
+// 起点正好在 off 的记号（没有为 -1）。
+export function tokStartingAt(t: Ref<DocToks>, off: int): int {
+    let lo = 0;
+    let hi = listLen(t.starts);
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        const s = tokStart(t, mid);
+        if (s == off) { return mid; }
+        if (s < off) { lo = mid + 1; } else { hi = mid; }
+    }
+    return -1;
+}
+
+// 起点在 off 之前的最后一个记号（没有为 -1）。
+export function tokBefore(t: Ref<DocToks>, off: int): int {
+    let lo = 0;
+    let hi = listLen(t.starts);
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (tokStart(t, mid) < off) { lo = mid + 1; } else { hi = mid; }
+    }
+    return lo - 1;
+}
+
+function isOpener(k: int): bool { return k == K_LPAREN || k == K_LBRACKET || k == K_LBRACE; }
+
+function isCloser(k: int): bool { return k == K_RPAREN || k == K_RBRACKET || k == K_RBRACE; }
+
+// 包住记号 i 的最内层 kind 开括号（没有为 -1）：沿 parent 链往外走（即往左跳过 i 之前已闭合的括号组所遇到的第一个）。
+export function enclosing(t: Ref<DocToks>, i: int, kind: int): int {
+    let j = tokParent(t, i);
+    while (j >= 0 && tokKind(t, j) != kind) { j = tokParent(t, j); }
+    return j;
+}
+
+function tokParent(t: Ref<DocToks>, i: int): int { return listGet(t.parent, i) catch -1; }
+
+// 从记号 i 起深度 0 的第一个 kind 记号（跳过括号组；遇到闭合外层的闭括号即停，没有为 -1）。
+function nextAtDepth0(t: Ref<DocToks>, i: int, kind: int, stopAtSemi: bool): int {
+    let j = i;
+    const n = tokCount(t);
+    while (j < n) {
+        const k = tokKind(t, j);
+        if (k == kind) { return j; }
+        if (stopAtSemi && k == K_SEMI) { return -1; }
+        if (isOpener(k)) {
+            const m = tokMatch(t, j);
+            if (m < 0) { return -1; }
+            j = m + 1;
+        } else if (isCloser(k)) {
+            return -1;
+        } else {
+            j = j + 1;
+        }
+    }
+    return -1;
+}
+
+// 表达式体从记号 i 起到哪里结束（字节偏移）：深度 0 的 `,`、`;` 或闭合外层的闭括号之前，文末为文本长度。
+function exprEnd(t: Ref<DocToks>, i: int, textLen: int): int {
+    let j = i;
+    const n = tokCount(t);
+    while (j < n) {
+        const k = tokKind(t, j);
+        if (k == K_COMMA || k == K_SEMI || isCloser(k)) { return tokStart(t, j); }
+        if (isOpener(k) && tokMatch(t, j) > j) {
+            j = tokMatch(t, j) + 1;
+        } else {
+            j = j + 1;
+        }
+    }
+    return textLen;
+}
+
+// 记号 a 之后的体：`{…}` 为其范围，否则为表达式（`=>` 之后）。返回 [起, 止) 的两个偏移，取不到为空表。
+function bodyAfter(t: Ref<DocToks>, a: int, textLen: int): List<int> {
+    const out: List<int> = listNew();
+    let j = a;
+    if (tokKind(t, j) == K_FATARROW) { j = j + 1; }
+    if (j >= tokCount(t)) { return out; }
+    if (tokKind(t, j) == K_LBRACE) {
+        const m = tokMatch(t, j);
+        listPush(out, tokEnd(t, j));
+        if (m < 0) { listPush(out, textLen); } else { listPush(out, tokStart(t, m)); }
+        return out;
+    }
+    listPush(out, tokStart(t, j));
+    listPush(out, exprEnd(t, j, textLen));
+    return out;
+}
+
+// `(` 在函数声明的名字之后（`function f(`、`function* f(`、`function f<T>(`）。
+function fnDeclParen(t: Ref<DocToks>, p: int): bool {
+    let j = p - 1;
+    if (tokKind(t, j) == K_GT) {
+        let depth = 0;
+        while (j >= 0) {
+            const k = tokKind(t, j);
+            if (k == K_GT) { depth = depth + 1; }
+            if (k == K_LT) {
+                depth = depth - 1;
+                if (depth == 0) { break; }
+            }
+            j = j - 1;
+        }
+        j = j - 1;
+    }
+    if (tokKind(t, j) != K_IDENT) { return false; }
+    const k = tokKind(t, j - 1);
+    return k == K_FUNCTION || (k == K_STAR && tokKind(t, j - 2) == K_FUNCTION);
+}
+
+// 声明出现 o（名字为记号 i）的作用域 [起, 止)；顶层为 [0, 文本长度)，取不到（外部函数的形参等）为空表。
+function scopeOf(t: Ref<DocToks>, o: Ref<AnaOcc>, i: int, textLen: int): List<int> {
+    const out: List<int> = listNew();
+    const b = enclosing(t, i, K_LBRACE);
+    if (o.kh == AT_EXACT || (o.kh == AT_BIND && b < 0)) {
+        listPush(out, 0);
+        listPush(out, textLen);
+        return out;
+    }
+    if (o.kh == AT_BIND) {
+        // 名字在括号里：for 的头（for-in 与 C 式 for 的变量，从头起到循环体末尾）或解构（`const (a, b) = …;`）。
+        const p = enclosing(t, i, K_LPAREN);
+        let from = i;
+        if (p > b && tokMatch(t, p) > p) {
+            if (p > 0 && tokKind(t, p - 1) == K_FOR) {
+                const body = bodyAfter(t, tokMatch(t, p) + 1, textLen);
+                if (listLen(body) == 2) {
+                    listPush(out, tokEnd(t, p));
+                    listPush(out, listGet(body, 1) catch textLen);
+                }
+                return out;
+            }
+            from = tokMatch(t, p) + 1;
+        }
+        const semi = nextAtDepth0(t, from, K_SEMI, false);
+        if (semi < 0) { return out; }
+        listPush(out, tokEnd(t, semi));
+        const m = tokMatch(t, b);
+        if (m < 0) { listPush(out, textLen); } else { listPush(out, tokStart(t, m)); }
+        return out;
+    }
+    const p = enclosing(t, i, K_LPAREN);
+    if (p < 0 || tokMatch(t, p) < 0) { return out; }
+    const q = tokMatch(t, p);
+    if (o.kh == AT_PARAM) {
+        if (fnDeclParen(t, p)) {
+            const body = nextAtDepth0(t, q + 1, K_LBRACE, true);
+            if (body < 0) { return out; }
+            return bodyAfter(t, body, textLen);
+        }
+        const arrow = nextAtDepth0(t, q + 1, K_FATARROW, true);
+        if (arrow < 0) { return out; }
+        return bodyAfter(t, arrow, textLen);
+    }
+    if (o.kh == AT_CATCH || o.kh == AT_PAT) { return bodyAfter(t, q + 1, textLen); }
+    return out;
+}
+
+// 已排序的出现里第一个模块 ≥ m 的下标。
+function modLow(occs: List<Ref<AnaOcc>>, m: int): int {
+    let lo = 0;
+    let hi = listLen(occs);
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        const o = listGet(occs, mid) catch new AnaOcc { mod: -1, line: 0, col: 0, len: 0, tt: 0, decl: false, km: 0, kl: 0, kc: 0, kh: -1, key: "", name: "", guess: false };
+        if (o.mod < m) { lo = mid + 1; } else { hi = mid; }
+    }
+    return lo;
+}
+
+// 模块 m 里位于（行，字节列）的出现中带身份的那个（没有为 None）。
+export function occAt(occs: List<Ref<AnaOcc>>, m: int, line: int, col: int): Ref<AnaOcc>? {
+    let k = modLow(occs, m);
+    while (k < listLen(occs)) {
+        const o = listGet(occs, k) catch new AnaOcc { mod: -1, line: 0, col: 0, len: 0, tt: 0, decl: false, km: 0, kl: 0, kc: 0, kh: -1, key: "", name: "", guess: false };
+        if (o.mod != m || o.line > line) { return None; }
+        if (o.line == line && o.col == col && len(o.key) > 0) { return o; }
+        k = k + 1;
+    }
+    return None;
+}
+
+function addVisible(xs: List<Ref<Visible>>, v: Ref<Visible>): void {
+    let i = 0;
+    while (i < listLen(xs)) {
+        const x = listGet(xs, i) catch v;
+        if (x.name == v.name) {
+            // 同名取作用域起点最大的（最内层）；局部遮蔽全模块的。
+            if (v.from > x.from || (v.local && !x.local)) { listSet(xs, i, v); }
+            return;
+        }
+        i = i + 1;
+    }
+    listPush(xs, v);
+}
+
+// 模块 m（文本 text，记号 t）里偏移 off 处可见的名字：局部、顶层声明与导入名。
+export function visibleAt(r: Ref<Root>, m: int, text: string, t: Ref<DocToks>, off: int): List<Ref<Visible>> {
+    const out: List<Ref<Visible>> = listNew();
+    const ls = lineStarts(text);
+    const textLen = len(text);
+    let k = modLow(r.occs, m);
+    while (k < listLen(r.occs)) {
+        const o = listGet(r.occs, k) catch new AnaOcc { mod: -1, line: 0, col: 0, len: 0, tt: 0, decl: false, km: 0, kl: 0, kc: 0, kh: -1, key: "", name: "", guess: false };
+        if (o.mod != m) { break; }
+        k = k + 1;
+        if (o.decl && o.kh >= AT_EXACT && o.kh <= AT_PAT) {
+            const i = tokStartingAt(t, (listGet(ls, o.line - 1) catch 0) + o.col - 1);
+            if (i >= 0) {
+                const sc = scopeOf(t, o, i, textLen);
+                if (listLen(sc) == 2) {
+                    const from = listGet(sc, 0) catch 0;
+                    const to = listGet(sc, 1) catch 0;
+                    if (off >= from && off <= to) {
+                        addVisible(out, new Visible { name: o.name, key: o.key, tt: o.tt, kh: o.kh, local: from > 0, from: from });
+                    }
+                }
+            }
+        }
+    }
+    // 导入名：顶层 import 的 `{…}` 里的名字，身份取该处的出现。
+    let i = 0;
+    const n = tokCount(t);
+    while (i < n) {
+        if (tokKind(t, i) == K_IMPORT && enclosing(t, i, K_LBRACE) < 0 && tokKind(t, i + 1) == K_LBRACE) {
+            const close = tokMatch(t, i + 1);
+            let j = i + 2;
+            while (close > 0 && j < close) {
+                if (tokKind(t, j) == K_IDENT) {
+                    const s = tokStart(t, j);
+                    const line = lineOf(ls, s);
+                    const ov = occAt(r.occs, m, line + 1, s - (listGet(ls, line) catch 0) + 1);
+                    if (ov != None) {
+                        const o = ov catch new AnaOcc { mod: -1, line: 0, col: 0, len: 0, tt: 0, decl: false, km: 0, kl: 0, kc: 0, kh: -1, key: "", name: "", guess: false };
+                        addVisible(out, new Visible { name: o.name, key: o.key, tt: o.tt, kh: o.kh, local: false, from: 0 });
+                    }
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// 偏移 s 所在的行（0 起）。
+function lineOf(ls: List<int>, s: int): int {
+    let lo = 0;
+    let hi = listLen(ls);
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if ((listGet(ls, mid) catch 0) <= s) { lo = mid + 1; } else { hi = mid; }
+    }
+    return lo - 1;
+}

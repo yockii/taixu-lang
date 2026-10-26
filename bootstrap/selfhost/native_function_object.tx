@@ -1,0 +1,85 @@
+// Locate the standard non-loadable .txfn section in a specific object, then
+// validate its facts against that object's exact text bytes before linking.
+import { NativeFunctionImage } from "./native_function_data";
+import { nativeFunctionDecode } from "./native_function_codec";
+import { tElf, tMacos, tA64 } from "./target";
+
+export struct NativeObjectFunctions { present: bool, inputSection: int, image: Ref<NativeFunctionImage> }
+function invalid(message: string): Ref<NativeObjectFunctions> {
+    return new NativeObjectFunctions { present: false, inputSection: -1,
+        image: new NativeFunctionImage { ok: false, error: message, isa: "", functions: listNew() } };
+}
+function inside(data: Bytes, at: int, size: int): bool { return at >= 0 && size >= 0 && at <= bytesLen(data) && size <= bytesLen(data) - at; }
+function rd(data: Bytes, at: int, width: int): int {
+    if (!inside(data, at, width)) { return -1; }
+    let value = 0; let i = 0;
+    while (i < width) { value = value | ((bytesGet(data, at + i) catch 0) << (8 * i)); i = i + 1; } return value;
+}
+function same(data: Bytes, at: int, size: int, name: string): bool {
+    if (size < len(name) + 1 || !inside(data, at, len(name) + 1)) { return false; }
+    let i = 0; while (i < len(name)) { if ((bytesGet(data, at + i) catch -1) != (byteAt(name, i) catch -2)) { return false; } i = i + 1; }
+    return (bytesGet(data, at + i) catch -1) == 0;
+}
+export function nativeObjectFunctions(data: Bytes, t: int): Ref<NativeObjectFunctions> {
+    // 目标文件的格式：Linux 与 macOS 为 ELF（机器号与目标一致：x86_64 为 62，aarch64 为 183），Windows 为 COFF。
+    // 目录里的寄存器号按这个机器解释。
+    const elf = tElf(t) || tMacos(t);
+    let isa = "x86_64"; let machine = 62;
+    if (tA64(t)) { isa = "aarch64"; machine = 183; }
+    let headers = 20; let width = 40; let count = rd(data, 2, 2); let namesAt = 0; let namesSize = 0;
+    if (elf) {
+        if (!inside(data, 0, 64) || rd(data, 0, 4) != 1179403647 || rd(data, 4, 2) != 258 || rd(data, 16, 2) != 1 || rd(data, 18, 2) != machine || rd(data, 58, 2) != 64) { return invalid("BadFunctionMetadataElf"); }
+        headers = rd(data, 40, 8); width = 64; count = rd(data, 60, 2);
+        const strings = rd(data, 62, 2);
+        if (strings <= 0 || strings >= count || !inside(data, headers, count * width)) { return invalid("BadFunctionMetadataSections"); }
+        namesAt = rd(data, headers + strings * width + 24, 8); namesSize = rd(data, headers + strings * width + 32, 8);
+        if (!inside(data, namesAt, namesSize)) { return invalid("BadFunctionMetadataNames"); }
+    } else {
+        if (!inside(data, 0, 20) || rd(data, 0, 2) != 34404 || rd(data, 16, 2) != 0) { return invalid("BadFunctionMetadataCoff"); }
+        namesAt = rd(data, 8, 4) + rd(data, 12, 4) * 18; namesSize = rd(data, namesAt, 4);
+        if (namesSize < 4 || !inside(data, namesAt, namesSize)) { return invalid("BadFunctionMetadataNames"); }
+    }
+    if (count <= 0 || !inside(data, headers, count * width)) { return invalid("BadFunctionMetadataSections"); }
+    let payloadAt = -1; let payloadSize = 0; let i = 0;
+    while (i < count) {
+        const h = headers + i * width; let match = same(data, h, 8, ".txfn");
+        if (elf) {
+            const name = rd(data, h, 4); match = name >= 0 && name < namesSize && same(data, namesAt + name, namesSize - name, ".txfn");
+        } else if (rd(data, h, 1) == 47) {
+            let offset = 0; let k = 1; let valid = true;
+            while (k < 8 && rd(data, h + k, 1) != 0) {
+                const digit = rd(data, h + k, 1); if (digit < 48 || digit > 57) { valid = false; break; }
+                offset = offset * 10 + digit - 48; k = k + 1;
+            }
+            if (!valid || k == 1 || offset < 4 || offset >= namesSize) { return invalid("BadFunctionMetadataNames"); }
+            match = same(data, namesAt + offset, namesSize - offset, ".txfn");
+        }
+        if (match) {
+            if (payloadAt >= 0) { return invalid("DuplicateFunctionMetadataSection"); }
+            if (elf) {
+                if (rd(data, h + 4, 4) != 1 || rd(data, h + 8, 8) != 0 || rd(data, h + 44, 4) != 0) { return invalid("LoadableFunctionMetadata"); }
+                payloadAt = rd(data, h + 24, 8); payloadSize = rd(data, h + 32, 8);
+            } else {
+                if (rd(data, h + 36, 4) != 1051136 || rd(data, h + 32, 2) != 0) { return invalid("LoadableFunctionMetadata"); }
+                payloadAt = rd(data, h + 20, 4); payloadSize = rd(data, h + 16, 4);
+            }
+            if (!inside(data, payloadAt, payloadSize) || payloadSize < 88) { return invalid("TruncatedFunctionMetadataSection"); }
+        }
+        i = i + 1;
+    }
+    const out = new NativeObjectFunctions { present: false, inputSection: -1,
+        image: new NativeFunctionImage { ok: true, error: "", isa: isa, functions: listNew() } };
+    if (payloadAt < 0) { return out; }
+    const section = rd(data, payloadAt + 8, 4);
+    if (section < 0 || section >= count || (elf && section == 0)) { return invalid("InvalidFunctionMetadataTextSection"); }
+    const h = headers + section * width;
+    let codeAt = rd(data, h + 20, 4); let codeSize = rd(data, h + 16, 4);
+    if (elf) {
+        if (rd(data, h + 4, 4) != 1 || (rd(data, h + 8, 8) & 6) != 6) { return invalid("NonCodeFunctionMetadataTarget"); }
+        codeAt = rd(data, h + 24, 8); codeSize = rd(data, h + 32, 8);
+    } else if ((rd(data, h + 36, 4) & 0x20000020) != 0x20000020) { return invalid("NonCodeFunctionMetadataTarget"); }
+    if (!inside(data, codeAt, codeSize)) { return invalid("InvalidFunctionMetadataTextRange"); }
+    out.present = true; out.inputSection = section;
+    out.image = nativeFunctionDecode(bytesSlice(data, payloadAt, payloadSize), bytesSlice(data, codeAt, codeSize), section, isa);
+    return out;
+}

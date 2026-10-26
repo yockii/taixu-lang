@@ -1,0 +1,402 @@
+// A64 汇编层（macOS 适配 M4 设计 A2、A3，docs/design/v052-macos-m4-arm64-v0.1-20261024.md）：A64 代码写进 asBufferNewA64 建的
+// StructuredBuffer（数据、标号、节切换照常用 asBuffer*），提交时做跨度定长再写进当前汇编映像。
+// - 指令字由 a64_encode 的纯函数编好再交进来；本层只管标号、跳转与符号修补。编码函数拒绝的指令（-1）记成失败条目，
+//   提交时报出（缓冲常在 asStructuredBegin 之前填好，那时还没有映像可记失败）。
+// - 缓冲内跳转（目标标号定义在本缓冲的代码节里）：先按短形式排，b.cond／cbz／cbnz／tbz／tbnz 越界的换成“取反条件跳过下一条＋
+//   b 目标”，重算偏移直到不再变化（LLVM BranchRelaxation 的做法）。只会由短变长，所以一定收敛。
+// - 目标不在本缓冲的 b／bl 交给修补（JUMP26／CALL26），由 ELF 写出或链接器定；条件跳转只许跳到本缓冲里的标号。
+// - 符号地址：adrp＋add（PAGE21＋ADD_LO12）、adrp＋读写（PAGE21＋LDSTn_LO12）。x16／x17 留给这里与链接器，不分配给值。
+import { StructuredBuffer, StructuredEntry, asStructuredImm, asStructuredSection, asStructuredLabel, asStructuredAlign, asStructuredByte, asStructuredQuad, asStructuredAddress, asStructuredZero, asStructuredAddressAddend } from "./assemble";
+import { asA64Word, asA64Here, asImgA64, asSetA64, asFailWith, asFailedAs, FIX_A64_CALL26, FIX_A64_JUMP26, FIX_A64_PAGE21, FIX_A64_ADD_LO12, FIX_A64_LDST8 } from "./assemble";
+import { nativeFunctionsActive, nativeFunctionsIsa, nativeFunctionBegin, nativeFunctionOwnedBegin, nativeFunctionBoundaryBegin, nativeFunctionEnd, nativeFunctionPrologueEnd, nativeFunctionEpilogueStart, nativeFunctionEvent } from "./native_function_data";
+import { a64Adr, a64AddSubImm, a64AddSubExt, a64LdStUImm, a64LdStImm9, a64LdStReg, a64Branch, a64BranchCond, a64CompareBranch, a64TestBranch, a64InvertCond, a64MoveWide, a64LogicalImm } from "./a64_encode";
+import { asListingActive, asListingA64 } from "./assemble";
+import { a64Disasm } from "./a64_disasm";
+
+const K_WORD: int = 20;
+const K_FIX: int = 21;
+const K_BRANCH: int = 22;
+const K_COND: int = 23;
+const K_CBZ: int = 24;
+const K_TBZ: int = 25;
+const K_FAIL: int = 26;
+const K_FRAME: int = 27;
+
+export const A64_IP0: int = 16;
+export const A64_IP1: int = 17;
+
+function add(buf: Ref<StructuredBuffer>, kind: int, nops: int, value: int, name: string, addend: int): void {
+    const m = buf.missing;
+    let a = m;
+    if (addend != 0) { a = asStructuredImm(addend); }
+    listPush(buf.entries, new StructuredEntry { kind: kind, mnemonic: "", nops: nops, a: a, b: m, c: m, value: value, name: name, line: buf.line });
+}
+function fail(buf: Ref<StructuredBuffer>, why: string): void { add(buf, K_FAIL, 0, 0, why, 0); }
+
+/// 帧事件（函数目录，M4 设计 §A5）：描述从 first 号条目（发射前记下的条目数）起到此为止的指令，不占字节；提交时按两端的
+/// 偏移记进目录。只记往回数的条目数，缓冲拼接后仍然成立。一条指令的几个事件（stp 的两个寄存器）依次跟在它后面。
+export function a64Frame(buf: Ref<StructuredBuffer>, first: int, kind: string, reg: int, bytes: int): void {
+    if (!nativeFunctionsActive()) { return; }
+    const m = buf.missing;
+    listPush(buf.entries, new StructuredEntry { kind: K_FRAME, mnemonic: "", nops: listLen(buf.entries) - first, a: asStructuredImm(bytes),
+            b: asStructuredImm(reg), c: m, value: 0, name: kind, line: buf.line });
+}
+/// sp -= bytes（序言的分配）：与 a64AddImm 同样的指令，每条一个分配事件；超过 24 位时按 lsl #12 的最大块逐条减（每条都是 16 的
+/// 倍数，中间状态也对齐），不经 x17。
+export function a64FrameAlloc(buf: Ref<StructuredBuffer>, bytes: int): void {
+    if (bytes < 0 || bytes % 16 != 0) { fail(buf, "BadFrameAllocation"); return; }
+    let v = bytes;
+    while (v >= 4096) {
+        let chunk = v >>> 12;
+        if (chunk > 4095) { chunk = 4095; }
+        const first = listLen(buf.entries);
+        a64Emit(buf, a64AddSubImm(1, 1, 0, 31, 31, chunk, 1), "sub sp");
+        a64Frame(buf, first, "allocate-stack", 31, chunk << 12);
+        v = v - (chunk << 12);
+    }
+    if (v > 0) {
+        const first = listLen(buf.entries);
+        a64Emit(buf, a64AddSubImm(1, 1, 0, 31, 31, v, 0), "sub sp");
+        a64Frame(buf, first, "allocate-stack", 31, v);
+    }
+}
+/// 一条编好的指令；word 为 -1（编码函数拒绝）时记失败并说明是哪条。
+export function a64Emit(buf: Ref<StructuredBuffer>, word: int, what: string): void {
+    if (!buf.a64) { fail(buf, "NotA64Buffer"); return; }
+    if (word < 0) { fail(buf, "UnencodableInstruction:" + what); return; }
+    add(buf, K_WORD, 0, word, "", 0);
+}
+/// b（link＝0）／bl（link＝1）到标号或符号。
+export function a64B(buf: Ref<StructuredBuffer>, link: int, target: string): void {
+    if (len(target) == 0 || (link != 0 && link != 1)) { fail(buf, "BadBranch"); return; }
+    add(buf, K_BRANCH, link, 0, target, 0);
+}
+/// b.cond 到本缓冲的标号。
+export function a64BCond(buf: Ref<StructuredBuffer>, cond: int, target: string): void {
+    if (a64InvertCond(cond) < 0 || len(target) == 0) { fail(buf, "BadCondition"); return; }
+    add(buf, K_COND, cond, 0, target, 0);
+}
+/// cbz（nz＝0）／cbnz（nz＝1）到本缓冲的标号。
+export function a64Cbz(buf: Ref<StructuredBuffer>, sf: int, nz: int, rt: int, target: string): void {
+    if (a64CompareBranch(sf, nz, rt, 0) < 0 || len(target) == 0) { fail(buf, "BadBranch"); return; }
+    add(buf, K_CBZ, sf * 2 + nz, rt, target, 0);
+}
+/// tbz（nz＝0）／tbnz（nz＝1）：测 rt 的第 bit 位，跳到本缓冲的标号。
+export function a64Tbz(buf: Ref<StructuredBuffer>, nz: int, rt: int, bit: int, target: string): void {
+    if (a64TestBranch(nz, rt, bit, 0) < 0 || len(target) == 0) { fail(buf, "BadBranch"); return; }
+    add(buf, K_TBZ, nz, rt * 64 + bit, target, 0);
+}
+
+function fixWord(buf: Ref<StructuredBuffer>, word: int, kind: int, symbol: string, addend: int, what: string): void {
+    if (word < 0) { fail(buf, "UnencodableInstruction:" + what); return; }
+    if (len(symbol) == 0) { fail(buf, "BadSymbol"); return; }
+    add(buf, K_FIX, kind, word, symbol, addend);
+}
+/// rd = 符号地址＋addend（adrp＋add）。
+export function a64AddrOf(buf: Ref<StructuredBuffer>, rd: int, symbol: string, addend: int): void {
+    fixWord(buf, a64Adr(1, rd, 0), FIX_A64_PAGE21, symbol, addend, "adrp");
+    fixWord(buf, a64AddSubImm(1, 0, 0, rd, rd, 0, 0), FIX_A64_ADD_LO12, symbol, addend, "add");
+}
+/// 读写符号处的数据：size 0..3（浮点 v＝1 时 2、3），opc 同 a64LdStUImm；地址的页经 tmp（常用 x16）。
+export function a64SymAccess(buf: Ref<StructuredBuffer>, size: int, v: int, opc: int, rt: int, tmp: int, symbol: string, addend: int): void {
+    fixWord(buf, a64Adr(1, tmp, 0), FIX_A64_PAGE21, symbol, addend, "adrp");
+    fixWord(buf, a64LdStUImm(size, v, opc, rt, tmp, 0), FIX_A64_LDST8 + size, symbol, addend, "ldst");
+}
+/// 64 位常数进 rd：能编成逻辑立即数的用一条 orr，否则 movz（或 movn）加若干 movk，取条数少的一种。
+export function a64MovImm(buf: Ref<StructuredBuffer>, rd: int, value: int): void {
+    const orr = a64LogicalImm(1, 1, rd, 31, value);
+    let zeros = 0;
+    let ones = 0;
+    let k = 0;
+    while (k < 4) {
+        const part = (value >>> (k * 16)) & 65535;
+        if (part == 0) { zeros = zeros + 1; }
+        if (part == 65535) { ones = ones + 1; }
+        k = k + 1;
+    }
+    if (orr >= 0 && zeros < 3 && ones < 3) { a64Emit(buf, orr, "orr"); return; }
+    // movn 起手时，各片以全 1 为底。
+    const inverted = ones > zeros;
+    let first = true;
+    k = 0;
+    while (k < 4) {
+        const part = (value >>> (k * 16)) & 65535;
+        const skip = (inverted && part == 65535) || (!inverted && part == 0);
+        if (!skip) {
+            if (first) {
+                if (inverted) { a64Emit(buf, a64MoveWide(1, 0, rd, (~part) & 65535, k), "movn"); }
+                else { a64Emit(buf, a64MoveWide(1, 2, rd, part, k), "movz"); }
+                first = false;
+            } else {
+                a64Emit(buf, a64MoveWide(1, 3, rd, part, k), "movk");
+            }
+        }
+        k = k + 1;
+    }
+    if (first) {
+        // 全 0 或全 1。
+        if (inverted) { a64Emit(buf, a64MoveWide(1, 0, rd, 0, 0), "movn"); } else { a64Emit(buf, a64MoveWide(1, 2, rd, 0, 0), "movz"); }
+    }
+}
+
+/// rd = rn + imm（rn、rd 可为 sp；imm 可为负）：12 位以内一条，24 位以内两条，否则 imm 进 x17 再加。
+export function a64AddImm(buf: Ref<StructuredBuffer>, rd: int, rn: int, imm: int): void {
+    let op = 0;
+    let v = imm;
+    if (v < 0) { op = 1; v = -v; }
+    if (v < 4096) { a64Emit(buf, a64AddSubImm(1, op, 0, rd, rn, v, 0), "add"); return; }
+    if (v < 16777216) {
+        a64Emit(buf, a64AddSubImm(1, op, 0, rd, rn, v >>> 12, 1), "add");
+        if ((v & 4095) != 0) { a64Emit(buf, a64AddSubImm(1, op, 0, rd, rd, v & 4095, 0), "add"); }
+        return;
+    }
+    a64MovImm(buf, 17, imm);
+    a64Emit(buf, a64AddSubExt(1, 0, 0, rd, rn, 17, 3, 0), "add");
+}
+/// [base + off] 的读写：size 0..3，opc 0 写、1 读。偏移能直接编的用缩放形或未缩放形，否则偏移进 x17 走寄存器偏移形。
+export function a64Mem(buf: Ref<StructuredBuffer>, size: int, opc: int, rt: int, base: int, off: int): void {
+    const unit = 1 << size;
+    if (off >= 0 && off % unit == 0 && off / unit < 4096) { a64Emit(buf, a64LdStUImm(size, 0, opc, rt, base, off), "ldst"); return; }
+    if (off >= -256 && off <= 255) { a64Emit(buf, a64LdStImm9(size, 0, opc, rt, base, off, 0), "ldur"); return; }
+    a64MovImm(buf, 17, off);
+    a64Emit(buf, a64LdStReg(size, 0, opc, rt, base, 17, 3, 0), "ldst");
+}
+
+// ---------------------------------------------------------------------------
+// 提交
+// ---------------------------------------------------------------------------
+
+function entryAt(buf: Ref<StructuredBuffer>, i: int): Ref<StructuredEntry> { return listGet(buf.entries, i) catch buf.invalid; }
+
+function isCond(kind: int): bool { return kind == K_COND || kind == K_CBZ || kind == K_TBZ; }
+
+function shortRange(kind: int): int {
+    if (kind == K_TBZ) { return 32768; }
+    return 1048576;
+}
+
+// 代码节里各条目的绝对偏移（非代码节的条目为 -1），末尾多一项为代码节终点。起点是映像代码节的当前长度。
+function textOffsets(buf: Ref<StructuredBuffer>, long: List<int>, start: int, startSec: int): List<int> {
+    const at: List<int> = listNew();
+    let pos = start;
+    let sec = startSec;
+    let i = 0;
+    while (i < listLen(buf.entries)) {
+        const e = entryAt(buf, i);
+        if (e.kind == 1) { sec = e.value; }
+        if (sec != 0) { listPush(at, -1); }
+        else {
+            if (e.kind == 3 && e.value < 32) {
+                const al = 1 << e.value;
+                pos = pos + (al - pos % al) % al;
+            }
+            listPush(at, pos);
+            if (e.kind >= K_WORD && e.kind <= K_TBZ) {
+                pos = pos + 4;
+                if ((listGet(long, i) catch 0) == 1) { pos = pos + 4; }
+            }
+        }
+        i = i + 1;
+    }
+    listPush(at, pos);
+    return at;
+}
+
+/// 提交 A64 缓冲：在 asStructuredBegin 之后调用（映像随之标为 A64）。失败记在映像上（asFailedAs／asLastErrAs）。
+/// 缓冲里 x86 指令条目所在的标号（去重，按出现次序）：A64 内核生成时据此一次报出全部未移植的手写例程。
+export function a64BufferX86Sites(buf: Ref<StructuredBuffer>): List<string> {
+    const out: List<string> = listNew();
+    let last = "(缓冲开头)";
+    let i = 0;
+    while (i < listLen(buf.entries)) {
+        const e = entryAt(buf, i);
+        if (e.kind == 2) { last = e.name; }
+        if (e.kind == 0 || e.kind == 13) {
+            let seen = false;
+            for (x in out) { if (x == last) { seen = true; } }
+            if (!seen) { listPush(out, last); }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// 函数清单（设计 A11，disasm 与 profile compile）：每写出一个字记一行，a64Disasm 的文本拆成助记符与操作数（方括号里的逗号不拆）。
+// target 非空时改写最后一个操作数：本缓冲内的跳转写目标标号；修补处写符号，按 Apple 汇编的写法——adrp 写 sym@PAGE，
+// add 与读写的低 12 位写 sym@PAGEOFF（读写的 [x16, #0] 改成 [x16, sym@PAGEOFF]），b／bl 写 sym。
+function listWord(fn: int, line: int, word: int, fix: int, target: string): void {
+    const t = a64Disasm(word);
+    let sp = 0;
+    while (sp < len(t) && (byteAt(t, sp) catch 0) != 32) { sp = sp + 1; }
+    const ops: List<string> = listNew();
+    let depth = 0;
+    let from = sp + 1;
+    let i = sp + 1;
+    while (i < len(t)) {
+        const ch = byteAt(t, i) catch 0;
+        if (ch == 91) { depth = depth + 1; }
+        if (ch == 93) { depth = depth - 1; }
+        if (ch == 44 && depth == 0) {
+            listPush(ops, strSub(t, from, i - from));
+            from = i + 2;
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    if (from < len(t)) { listPush(ops, strSub(t, from, len(t) - from)); }
+    const n = listLen(ops);
+    if (len(target) > 0 && n > 0) {
+        let last = target;
+        if (fix == FIX_A64_PAGE21) { last = target + "@PAGE"; }
+        else if (fix == FIX_A64_ADD_LO12) { last = target + "@PAGEOFF"; }
+        else if (fix >= FIX_A64_LDST8) {
+            const m = listGet(ops, n - 1) catch "";
+            last = strSub(m, 0, len(m) - 3) + target + "@PAGEOFF]";
+        }
+        listSet(ops, n - 1, last);
+    }
+    asListingA64(fn, 0, strSub(t, 0, sp), ops, line);
+}
+function symText(sym: string, addend: int): string {
+    if (addend > 0) { return sym + "+" + toStr(addend); }
+    if (addend < 0) { return sym + "-" + toStr(-addend); }
+    return sym;
+}
+
+export function a64BufferSubmit(buf: Ref<StructuredBuffer>): void {
+    if (asFailedAs() != 0) { return; }
+    if (!buf.a64) { asFailWith("NotA64Buffer", 1); return; }
+    if (asImgA64() != 1) {
+        if (asA64Here() != 0) { asFailWith("MixedArchitectureImage", 1); return; }
+        asSetA64();
+    }
+    nativeFunctionsIsa("aarch64");
+    asStructuredSection(0);
+    // 代码节里的标号 → 条目号；同时报出缓冲里记下的失败。
+    const labels: Map<string, int> = mapNew();
+    let sec = 0;
+    let i = 0;
+    while (i < listLen(buf.entries)) {
+        const e = entryAt(buf, i);
+        if (e.kind == K_FAIL) { asFailWith(e.name, i + 1); return; }
+        if (e.kind == 1) { sec = e.value; }
+        if (e.kind == 2 && sec == 0) { mapSet(labels, e.name, i); }
+        if (e.kind == 0 || e.kind == 13) { asFailWith("X86InstructionInA64Buffer:" + (listGet(a64BufferX86Sites(buf), 0) catch ""), i + 1); return; }
+        i = i + 1;
+    }
+    const long: List<int> = listNew();
+    i = 0;
+    while (i < listLen(buf.entries)) { listPush(long, 0); i = i + 1; }
+    const start = asA64Here();
+    let changed = true;
+    while (changed) {
+        changed = false;
+        const at = textOffsets(buf, long, start, 0);
+        i = 0;
+        while (i < listLen(buf.entries)) {
+            const e = entryAt(buf, i);
+            if (isCond(e.kind) && (listGet(long, i) catch 0) == 0) {
+                if (!mapHas(labels, e.name)) { asFailWith("ConditionalBranchTargetNotLocal:" + e.name, i + 1); return; }
+                const d = (listGet(at, mapGet(labels, e.name) catch 0) catch 0) - (listGet(at, i) catch 0);
+                const r = shortRange(e.kind);
+                if (d < -r || d >= r) { listSet(long, i, 1); changed = true; }
+            }
+            i = i + 1;
+        }
+    }
+    const at = textOffsets(buf, long, start, 0);
+    const listing = asListingActive() && buf.listFn >= 0;
+    const fn = buf.listFn;
+    sec = 0;
+    i = 0;
+    while (i < listLen(buf.entries)) {
+        if (asFailedAs() != 0) { return; }
+        const e = entryAt(buf, i);
+        const line = i + 1;
+        if (e.kind == 1) { asStructuredSection(e.value); sec = e.value; }
+        else if (e.kind == 2) {
+            asStructuredLabel(e.name);
+            if (listing && sec == 0) { asListingA64(fn, 2, e.name, listNew(), e.line); }
+        }
+        else if (e.kind == 3) { asStructuredAlign(e.value); }
+        else if (e.kind == 4) { asStructuredByte(e.value); }
+        else if (e.kind == 5) { asStructuredQuad(e.value); }
+        else if (e.kind == 6) { asStructuredAddress(e.name); }
+        else if (e.kind == 7) { asStructuredZero(e.value); }
+        else if (e.kind == 8) { asStructuredAddressAddend(e.name, e.value); }
+        else if (e.kind == 9 || e.kind == 14) {
+            if (sec != 0) { asFailWith("FunctionOutsideText", line); return; }
+            if (e.kind == 14) { nativeFunctionBoundaryBegin(e.mnemonic, e.name, e.b.label, asA64Here()); }
+            else { nativeFunctionOwnedBegin(e.mnemonic, e.name, e.a.label, asA64Here()); }
+        }
+        else if (e.kind == 10) { nativeFunctionEnd(asA64Here()); }
+        else if (e.kind == 11) { nativeFunctionPrologueEnd(asA64Here()); }
+        else if (e.kind == 12) { nativeFunctionEpilogueStart(asA64Here()); }
+        else if (e.kind == K_FRAME) {
+            if (sec != 0 || e.nops < 1 || i < e.nops) { asFailWith("BadFrameEntry", line); return; }
+            nativeFunctionEvent(listGet(at, i - e.nops) catch -1, asA64Here(), e.name, e.b.imm, e.a.imm);
+        }
+        else if (e.kind == 15) {
+            if (sec != 0) { asFailWith("FunctionOutsideText", line); return; }
+            nativeFunctionBegin(e.value, e.name, asA64Here());
+        }
+        else if (e.kind >= K_WORD && e.kind <= K_TBZ) {
+            if (sec != 0) { asFailWith("InstructionOutsideText", line); return; }
+            const here = listGet(at, i) catch 0;
+            if (asA64Here() != here) { asFailWith("A64LayoutMismatch", line); return; }
+            const local = mapHas(labels, e.name);
+            let d = 0;
+            if (local) { d = (listGet(at, mapGet(labels, e.name) catch 0) catch 0) - here; }
+            if (e.kind == K_WORD) {
+                asA64Word(e.value, -1, "", 0);
+                if (listing) { listWord(fn, e.line, e.value, -1, ""); }
+            } else if (e.kind == K_FIX) {
+                asA64Word(e.value, e.nops, e.name, e.a.imm);
+                if (listing) { listWord(fn, e.line, e.value, e.nops, symText(e.name, e.a.imm)); }
+            } else if (e.kind == K_BRANCH) {
+                if (local) {
+                    const w = a64Branch(e.nops, d);
+                    if (w < 0) { asFailWith("BranchOutOfRange:" + e.name, line); return; }
+                    asA64Word(w, -1, "", 0);
+                    if (listing) { listWord(fn, e.line, w, -1, e.name); }
+                } else {
+                    let fk = FIX_A64_JUMP26;
+                    if (e.nops == 1) { fk = FIX_A64_CALL26; }
+                    asA64Word(a64Branch(e.nops, 0), fk, e.name, 0);
+                    if (listing) { listWord(fn, e.line, a64Branch(e.nops, 0), fk, e.name); }
+                }
+            } else {
+                const long1 = (listGet(long, i) catch 0) == 1;
+                let w = -1;
+                // 长形式：取反的短跳转跳过下一条（偏移 8），下一条 b 到目标（距离按 b 自己的位置算）。
+                if (e.kind == K_COND) {
+                    if (long1) { w = a64BranchCond(a64InvertCond(e.nops), 8); } else { w = a64BranchCond(e.nops, d); }
+                } else if (e.kind == K_CBZ) {
+                    const sf = e.nops / 2;
+                    const nz = e.nops % 2;
+                    if (long1) { w = a64CompareBranch(sf, 1 - nz, e.value, 8); } else { w = a64CompareBranch(sf, nz, e.value, d); }
+                } else {
+                    const rt = e.value / 64;
+                    const bit = e.value % 64;
+                    if (long1) { w = a64TestBranch(1 - e.nops, rt, bit, 8); } else { w = a64TestBranch(e.nops, rt, bit, d); }
+                }
+                if (w < 0) { asFailWith("BranchOutOfRange:" + e.name, line); return; }
+                asA64Word(w, -1, "", 0);
+                // 长形式的第一条只跳过下一条（#8），清单照原样写；目标标号写在第二条 b 上。
+                if (listing) {
+                    let shown = e.name;
+                    if (long1) { shown = ""; }
+                    listWord(fn, e.line, w, -1, shown);
+                }
+                if (long1) {
+                    const far = a64Branch(0, d - 4);
+                    if (far < 0) { asFailWith("BranchOutOfRange:" + e.name, line); return; }
+                    asA64Word(far, -1, "", 0);
+                    if (listing) { listWord(fn, e.line, far, -1, e.name); }
+                }
+            }
+        } else { asFailWith("BadInstruction", line); return; }
+        i = i + 1;
+    }
+    if (asFailedAs() == 0 && sec == 0 && asA64Here() != (listGet(at, listLen(buf.entries)) catch -1)) { asFailWith("A64LayoutMismatch", listLen(buf.entries)); }
+}

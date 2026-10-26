@@ -1,0 +1,230 @@
+// NRT program image v3 (docs/design/v052-native-runtime-nrt-v0.1-20261013.md §二.2;
+// v2 adds the test table for native `taixu test`, docs/design/v052-native-run-test-async-v0.1-20261014.md §七;
+// v3 adds the sendable table, one byte per runtime type id, docs/design/v052-threads-v0.1-20261015.md §十八).
+// Emitted from ProgramContext into .rdata so the native runtime needs no .txc
+// deserialization at startup. Layout constants are shared with ./nrt.
+import { ProgramContext, programStringBytes, programStringLength } from "./program_context";
+import { asStructuredSection, asStructuredAlign, asStructuredLabel, asStructuredByte, asStructuredQuad, asStructuredAddress } from "./assemble";
+// Must equal NRT_IMAGE_MAGIC/NRT_IMAGE_VERSION in ./nrt (kept local so the compiler
+// does not import the runtime generator).
+const NRT_IMAGE_MAGIC: int = 5642816553436332081;
+const NRT_IMAGE_VERSION: int = 3;
+
+const TY_NAMED_STRUCT: int = 12;
+
+function noInts(): List<int> { return listNew(); }
+
+// Test-mode builds list every test block in the image; other builds keep the table empty.
+let nrtImageTests: bool = false;
+
+export function nrtImageSetTests(on: bool): void { nrtImageTests = on; }
+
+// --leak-check：版本字的高 32 位是构建标志，位 0 让内核在退出时做泄漏检查（nrt_leak.tx）；不带时版本字不变。
+let nrtImageLeak: bool = false;
+
+export function nrtImageSetLeak(on: bool): void { nrtImageLeak = on; }
+
+// --debug（第 6 轮 6c）：构建标志位 1 标记插桩调试构建；内核只核对低 32 位与位 0，不看这一位。
+let nrtImageDebug: bool = false;
+
+export function nrtImageSetDebug(on: bool): void { nrtImageDebug = on; }
+
+// Constant kinds (bytecode.Const tag order + 1).
+const K_JUMP_TABLE: int = 5;
+const K_TY: int = 6;
+const K_VARIANT: int = 7;
+const K_ARR_DESC: int = 8;
+
+/// First named_struct/named_enum type index referring to decl (typeIndexOfDecl).
+function typeIndexOfDecl(p: Ref<ProgramContext>, decl: int): int {
+    let i = 0;
+    while (i < listLen(p.cgTysK)) {
+        const k = listGet(p.cgTysK, i) catch 0;
+        if ((k == 12 || k == 13) && (listGet(p.cgTysA, i) catch -1) == decl) { return i; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// Field count of variant idx of enum decl (declVarFCnt is flat over enum decls).
+function variantFieldCount(p: Ref<ProgramContext>, decl: int, idx: int): int {
+    let start = 0; let d = 0;
+    while (d < decl && d < listLen(p.declIsEnum)) {
+        if ((listGet(p.declIsEnum, d) catch 0) != 0) { start = start + listLen(listGet(p.declVariantNames, d) catch noInts()); }
+        d = d + 1;
+    }
+    return listGet(p.declVarFCnt, start + idx) catch 0;
+}
+
+function moduleFieldCount(p: Ref<ProgramContext>, ty: int): int {
+    if (ty < 0 || ty >= listLen(p.cgTysK)) { return 0; }
+    if ((listGet(p.cgTysK, ty) catch 0) != TY_NAMED_STRUCT) { return 0; }
+    const decl = listGet(p.cgTysA, ty) catch -1;
+    if (decl < 0 || decl >= listLen(p.declIsEnum)) { return 0; }
+    if ((listGet(p.declIsEnum, decl) catch 1) != 0) { return 0; }
+    return listLen(listGet(p.declFieldNames, decl) catch noInts());
+}
+
+/// Emit `__tx_nrt_image` and its tables. String indices are the raw cgStrings
+/// indices used by the record stream; duplicates intern to one runtime object.
+export function emitNrtImage(p: Ref<ProgramContext>): void {
+    const nfn = listLen(p.fnNameIdx);
+    const nmod = listLen(p.modOutPath);
+    const nstr = listLen(p.cgStrings);
+    let entry = p.entry;
+    if (entry < 0 || entry >= nfn) { entry = -1; }
+    asStructuredSection(1);
+    asStructuredAlign(3);
+    asStructuredLabel("__tx_nrt_image");
+    asStructuredQuad(NRT_IMAGE_MAGIC);
+    let version = NRT_IMAGE_VERSION;
+    if (nrtImageLeak) { version = version + 4294967296; }
+    if (nrtImageDebug) { version = version + 8589934592; }
+    asStructuredQuad(version);
+    asStructuredQuad(nfn);
+    asStructuredQuad(nmod);
+    asStructuredQuad(nstr);
+    asStructuredQuad(entry);
+    asStructuredAddress("__tx_nrt_funcs");
+    asStructuredAddress("__tx_nrt_modules");
+    asStructuredAddress("__tx_nrt_strings");
+    let ntests = 0;
+    if (nrtImageTests) { ntests = listLen(p.testOutFunc); }
+    asStructuredQuad(ntests);
+    asStructuredAddress("__tx_nrt_tests");
+    // v3: sendable table (count, pointer to bytes); empty unless the program uses threadSpawn and some type is not sendable.
+    let ntypes = 0;
+    if (listLen(p.sendBad) > 0) { ntypes = listLen(p.cgTysK); }
+    asStructuredQuad(ntypes);
+    asStructuredAddress("__tx_nrt_sendable");
+    asStructuredLabel("__tx_nrt_tests");
+    let ti = 0;
+    while (ti < ntests) { asStructuredQuad(listGet(p.testOutFunc, ti) catch 0); ti = ti + 1; }
+    asStructuredLabel("__tx_nrt_funcs");
+    let i = 0;
+    while (i < nfn) {
+        const lines = listGet(p.fnLinesL, i) catch noInts();
+        asStructuredQuad(listGet(p.fnReg, i) catch 0);
+        asStructuredQuad(listGet(p.fnModule, i) catch 0);
+        asStructuredQuad(listGet(p.fnNparams, i) catch 0);
+        asStructuredQuad(listLen(lines));
+        if (listLen(lines) > 0) { asStructuredAddress(".Lnrt_lines_" + toStr(i)); } else { asStructuredQuad(0); }
+        const kinds = listGet(p.fnConstsK, i) catch noInts();
+        asStructuredQuad(listLen(kinds));
+        if (listLen(kinds) > 0) { asStructuredAddress(".Lnrt_consts_" + toStr(i)); } else { asStructuredQuad(0); }
+        asStructuredQuad(listLen(listGet(p.fnCode, i) catch noInts()));
+        i = i + 1;
+    }
+    asStructuredLabel("__tx_nrt_modules");
+    i = 0;
+    while (i < nmod) {
+        const ty = listGet(p.modOutState, i) catch 0;
+        asStructuredQuad(moduleFieldCount(p, ty));
+        asStructuredQuad(ty);
+        asStructuredQuad(listGet(p.modOutInit, i) catch 0);
+        asStructuredQuad(listGet(p.modOutPath, i) catch 0);
+        i = i + 1;
+    }
+    asStructuredLabel("__tx_nrt_strings");
+    i = 0;
+    while (i < nstr) {
+        const size = programStringLength(p, i);
+        asStructuredQuad(size);
+        if (size > 0) { asStructuredAddress(".Lnrt_str_" + toStr(i)); } else { asStructuredQuad(0); }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < nfn) {
+        const lines = listGet(p.fnLinesL, i) catch noInts();
+        const cols = listGet(p.fnLinesC, i) catch noInts();
+        if (listLen(lines) > 0) {
+            asStructuredLabel(".Lnrt_lines_" + toStr(i));
+            let k = 0;
+            while (k < listLen(lines)) {
+                const line = (listGet(lines, k) catch 0) & 0xFFFFFFFF;
+                const col = (listGet(cols, k) catch 0) & 0xFFFFFFFF;
+                asStructuredQuad(line | (col << 32));
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    // Constant facts: per constant {kind, a, b, c}; jump tables as u32 runs.
+    i = 0;
+    while (i < nfn) {
+        const kinds = listGet(p.fnConstsK, i) catch noInts();
+        const values = listGet(p.fnConstsI, i) catch noInts();
+        const table = listGet(p.fnConstsTbl, i) catch noInts();
+        const sizes = listGet(p.fnConstsTblLen, i) catch noInts();
+        if (listLen(kinds) > 0) {
+            asStructuredLabel(".Lnrt_consts_" + toStr(i));
+            let j = 0; let at = 0;
+            while (j < listLen(kinds)) {
+                const kind = listGet(kinds, j) catch 0; const value = listGet(values, j) catch 0; const size = listGet(sizes, j) catch 0;
+                asStructuredQuad(kind);
+                if (kind == K_TY) { asStructuredQuad(value); asStructuredQuad(moduleFieldCount(p, value)); asStructuredQuad(0); }
+                else if (kind == K_VARIANT) {
+                    const vidx = listGet(table, at + 1) catch 0;
+                    asStructuredQuad(typeIndexOfDecl(p, value)); asStructuredQuad(variantFieldCount(p, value, vidx)); asStructuredQuad(vidx);
+                }
+                else if (kind == K_ARR_DESC) { asStructuredQuad(value); asStructuredQuad(listGet(table, at + 1) catch 0); asStructuredQuad(0); }
+                else if (kind == K_JUMP_TABLE) {
+                    asStructuredQuad(size);
+                    if (size > 0) { asStructuredAddress(".Lnrt_jt_" + toStr(i) + "_" + toStr(j)); } else { asStructuredQuad(0); }
+                    asStructuredQuad(0);
+                }
+                else { asStructuredQuad(value); asStructuredQuad(0); asStructuredQuad(0); }
+                at = at + size; j = j + 1;
+            }
+            j = 0; at = 0;
+            while (j < listLen(kinds)) {
+                const kind = listGet(kinds, j) catch 0; const size = listGet(sizes, j) catch 0;
+                if (kind == K_JUMP_TABLE && size > 0) {
+                    asStructuredLabel(".Lnrt_jt_" + toStr(i) + "_" + toStr(j));
+                    let k = 0;
+                    while (k < size) {
+                        const target = listGet(table, at + k) catch 0;
+                        asStructuredByte(target & 255); asStructuredByte((target >> 8) & 255); asStructuredByte((target >> 16) & 255); asStructuredByte((target >> 24) & 255);
+                        k = k + 1;
+                    }
+                    asStructuredAlign(3);
+                }
+                at = at + size; j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    // Sendable table: 1 = may be sent, 0 = not (closure environments by captures, interface boxes by concrete type,
+    // other structs and enums by fields); the sender traps 4021 on a 0 entry. 2 = may only be shared (holds an
+    // Atomic, threads step 4c): sharedNew accepts it, sending traps like 0.
+    asStructuredLabel("__tx_nrt_sendable");
+    if (ntypes > 0) {
+        const send: List<int> = listNew();
+        i = 0;
+        while (i < ntypes) { listPush(send, 1); i = i + 1; }
+        i = 0;
+        while (i < listLen(p.sendBad)) {
+            const t = listGet(p.sendBad, i) catch -1;
+            if (t >= 0 && t < ntypes) { listSet(send, t, 2); }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < listLen(p.shareBad)) {
+            const t = listGet(p.shareBad, i) catch -1;
+            if (t >= 0 && t < ntypes) { listSet(send, t, 0); }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < ntypes) { asStructuredByte(listGet(send, i) catch 1); i = i + 1; }
+    }
+    i = 0;
+    while (i < nstr) {
+        const data = programStringBytes(p, i);
+        if (bytesLen(data) > 0) {
+            asStructuredLabel(".Lnrt_str_" + toStr(i));
+            let k = 0;
+            while (k < bytesLen(data)) { asStructuredByte(bytesGet(data, k) catch 0); k = k + 1; }
+        }
+        i = i + 1;
+    }
+}

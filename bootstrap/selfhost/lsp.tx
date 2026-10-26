@@ -1,0 +1,759 @@
+// lsp.tx —— 原生 `taixu lsp`（第 6 轮 6d-2，LSP 与 MCP 实施设计 §四-1；对照 Zig 版 src/tools/lsp.zig，有意差别见 §五）。
+//
+// stdin/stdout 上的 JSON-RPC（Content-Length 分帧，正文上限 32 MiB）。单线程：逐条处理消息；文档打开、变更、关闭
+// 之后 300 ms 内没有新输入才分析（lsp_diag.tx，每个入口一次 drvCheck），入口之间有新输入就先处理输入。
+// 只读（§三-9）：不运行程序、不起进程、不访问网络、不写文件。
+// 6d-3a 起：definition、references、rename（lsp_refs.tx，§四-3）与 semanticTokens/full（lsp_tokens.tx，§四-4），
+// 6d-3b 起 hover（lsp_hover.tx）、signatureHelp（lsp_sig.tx）与 completion（lsp_complete.tx，§四-5）；请求前含该文档的
+// 入口为脏就先同步分析。
+// 资源预算与背压（安全审查攻关第 5 项，设计 v052-lsp-resources）：打开文档的个数、总字节与单文档字节，一条 didChange 的
+// range 编辑工作量，超出的文档按未打开处理并发说明诊断、其上的请求回 -32803；去抖带最长等待；同步分析在入口之间是取消
+// 点（收下输入进有界队列，$/cancelRequest 当场生效，回 -32800）；回复超过消息上限改回 -32803。写 stdout 保持阻塞：客户端
+// 停读时整个服务停住、不再读入（同 rust-analyzer 的 lsp-server），内存不涨。预算在 initialize 结果里宣告，客户端只能收紧。
+import { JsonValue, jsonParse, jsonGet, JSON_NULL, JSON_BOOL, JSON_INT, JSON_NUM, JSON_STR, JSON_ARR, JSON_OBJ } from "./json_parse";
+import { dbgStr } from "./dbg_out";
+import { fioRead, fioTake, fioAtEof, fioError, fioSend } from "./frame_io";
+import { LspDoc, newDoc, docKey, uriToPath, applyRange, setText, ENC_UTF8, ENC_UTF16 } from "./lsp_docs";
+import { diagTouch, diagPending, diagStep, diagPublish, diagSync, diagBudget, diagDocsChanged, diagHold, diagNote, diagOverOnly, diagOverCount } from "./lsp_diag";
+import { lspSymbols, lspFormat } from "./lsp_sym";
+import { refsDefinition, refsReferences, refsRename, REQUEST_FAILED } from "./lsp_refs";
+import { semTokens, SEM_LEGEND } from "./lsp_tokens";
+import { hoverAt } from "./lsp_hover";
+import { signatureAt } from "./lsp_sig";
+import { completeAt } from "./lsp_complete";
+import { serviceAllows, serviceRootsJson, serviceRootAliasesJson, serviceMountTypesJson } from "./service_files";
+import { jsonEnvelopeWithin } from "./json_envelope";
+import { T_X64_WINDOWS } from "./target";
+import { hostTargetId } from "./target_host";
+
+const MSG_MAX: int = 33554432;
+const DEBOUNCE_MS: int = 300;
+const REQUEST_CANCELLED: int = -32800;
+
+// 资源预算的缺省值（设计 §三）；客户端 initializationOptions.taixuResources 只能收紧（取 min），放宽被忽略。
+let maxDocument: int = 33554432; // 单文档字节（同编译器读源码的上限 SOURCE_MAX）
+let maxOpenBytes: int = 268435456; // 打开文档合计字节
+let maxOpenDocs: int = 1024; // 打开文档个数
+let maxChangeWork: int = 67108864; // 一条 didChange 里 range 编辑按“编辑前全文字节”累计的工作量
+let maxAnalysis: int = 33554432; // 全部入口的程序源码字节（lsp_diag）
+let maxHot: int = 4194304; // 持有检查缓存的入口的程序源码字节（lsp_diag）
+let maxDiags: int = 1000; // 单文件诊断条数（lsp_diag）
+let maxDiagBytes: int = 1048576; // 单文件诊断数组字节（lsp_diag）
+let maxDebounce: int = 2000; // 从第一次未分析的变更算起的最长等待（ms）
+let maxResponse: int = 33554432; // 单条回复字节（同输入的消息上限）
+
+let docs: List<Ref<LspDoc>> = listNew();
+let nextSeq: int = 1;
+let initialized: bool = false;
+let shutdownSeen: bool = false;
+let exitNow: bool = false;
+let writeFailed: bool = false;
+let enc: int = 16;
+// 宿主的路径规则（windows）与分析用的编译目标（targetId）是两个量；LSP 在宿主上分析，目标取宿主。
+let windows: bool = false;
+let targetId: int = T_X64_WINDOWS;
+let serverVersion: string = "";
+let wantAnalysis: bool = false;
+let deadline: int = 0;
+let pendingSince: int = -1; // 第一次未分析的变更的时刻；-1 为没有
+let semRefresh: bool = false; // 客户端宣告了 workspace.semanticTokens.refreshSupport（§四-4）
+let refreshSeq: int = 0;
+let hoverMarkdown: bool = true; // 客户端 hover.contentFormat 的首选（§四-5；不宣告时 markdown，同 Zig 版）
+
+// 超预算的文档：文本已丢，只留 URI、版本与原因（码），分析按未打开处理。
+struct HeldDoc {
+    uri: string,
+    key: string,
+    version: int,
+    code: string,
+    message: string,
+}
+
+let held: Map<string, Ref<HeldDoc>> = mapNew();
+
+// 取消点收下的消息：正文、请求的 id 文本（通知为空串）、是否已被取消。
+struct QMsg {
+    body: Bytes,
+    id: string,
+    cancelled: bool,
+}
+
+let queue: List<Ref<QMsg>> = listNew();
+let queued: int = 0; // 排队正文的字节数（至多约 MSG_MAX）
+let current: string = ""; // 正在处理的请求的 id 文本
+let currentCancelled: bool = false;
+
+function nowMs(): int { return monoNs() / 1000000; }
+
+// 服务主循环；返回进程退出码：exit 时收过 shutdown 为 0，否则 1；分帧错误、超长消息或写失败为 3。
+export function lspServe(version: string): int {
+    serverVersion = version;
+    windows = hostTarget() == "windows";
+    targetId = hostTargetId();
+    while (true) {
+        const q = nextMsg();
+        if (q != None) {
+            const m = q catch new QMsg { body: bytesNew(0), id: "", cancelled: false };
+            if (m.cancelled) {
+                replyError(m.id, REQUEST_CANCELLED, "RequestCancelled");
+            } else {
+                handle(m.body);
+            }
+            if (writeFailed) { return 3; }
+            if (exitNow) {
+                if (shutdownSeen) { return 0; }
+                return 1;
+            }
+        } else if (len(fioError()) > 0) {
+            eprint("taixu lsp: " + fioError());
+            return 3;
+        } else if (fioAtEof()) {
+            if (shutdownSeen) { return 0; }
+            return 1;
+        } else if (wantAnalysis && nowMs() >= deadline) {
+            analyze();
+            if (writeFailed) { return 3; }
+        } else if (wantAnalysis) {
+            fioRead(deadline - nowMs());
+        } else {
+            fioRead(-1);
+        }
+    }
+    return 1;
+}
+
+// 下一条消息：先取排队的，再从输入缓冲里分帧。
+function nextMsg(): Ref<QMsg>? {
+    if (listLen(queue) > 0) {
+        const m = listGet(queue, 0) catch new QMsg { body: bytesNew(0), id: "", cancelled: false };
+        listRemoveAt(queue, 0);
+        queued = queued - bytesLen(m.body);
+        return m;
+    }
+    const msg = fioTake(MSG_MAX);
+    if (bytesLen(msg) == 0) { return None; }
+    return new QMsg { body: msg, id: "", cancelled: false };
+}
+
+// 取消点：把已到的输入分帧收进队列（正文累计至多约 MSG_MAX，满了不再读——仍是背压），$/cancelRequest 当场生效：
+// 指向正在处理的请求就记下，指向排队中的请求就标记，其余忽略。消息仍按到达顺序处理。
+function drain(): void {
+    while (queued < MSG_MAX && len(fioError()) == 0) {
+        const msg = fioTake(MSG_MAX);
+        if (bytesLen(msg) > 0) {
+            const cid = cancelTarget(msg);
+            if (len(cid) > 0) {
+                cancel(cid);
+            } else {
+                listPush(queue, new QMsg { body: msg, id: requestId(msg), cancelled: false });
+                queued = queued + bytesLen(msg);
+            }
+        } else if (!fioAtEof() && ioWait(0, 1, 0) == 1) {
+            fioRead(0);
+        } else {
+            return;
+        }
+    }
+}
+
+function cancel(cid: string): void {
+    if (cid == current) {
+        currentCancelled = true;
+        return;
+    }
+    for (q in queue) {
+        if (q.id == cid) { q.cancelled = true; }
+    }
+}
+
+// 同步分析的取消点（diagSync 在每个入口之前调）：收下输入，当前请求被取消了就停。
+function stopNow(): bool {
+    drain();
+    return currentCancelled;
+}
+
+function peekParse(msg: Bytes): Ref<JsonValue>? {
+    if (!jsonEnvelopeWithin(msg, 32768)) { return None; }
+    const v = jsonParse(msg) catch (e) { return None; };
+    if (v.kind != JSON_OBJ) { return None; }
+    return v;
+}
+
+// $/cancelRequest 通知所指的 id 文本；不是取消通知时为空串。
+function cancelTarget(msg: Bytes): string {
+    const v = peekParse(msg);
+    if (v == None) { return ""; }
+    const o = v catch jsonNullValue();
+    if (jsonGet(o, "id") != None || strOf(jsonGet(o, "method")) != "$/cancelRequest") { return ""; }
+    const cid = getObj(jsonGet(o, "params"), "id");
+    if (cid == None) { return ""; }
+    return idText(cid catch jsonNullValue());
+}
+
+// 请求的 id 文本；通知或无法解析时为空串。
+function requestId(msg: Bytes): string {
+    const v = peekParse(msg);
+    if (v == None) { return ""; }
+    const o = v catch jsonNullValue();
+    const idv = jsonGet(o, "id");
+    if (idv == None || jsonGet(o, "method") == None) { return ""; }
+    return idText(idv catch jsonNullValue());
+}
+
+// 分析到做完或有新输入为止，然后发布有变化的诊断。做完且确有入口重查过时，客户端宣告了 refreshSupport 就请它重取
+// 语义着色（依赖的文件改了，其它打开的编辑器里的身份与补面会变，§四-4）。
+function analyze(): void {
+    let more = true;
+    let did = false;
+    while (more) {
+        more = diagStep(docs, targetId);
+        if (more) { did = true; }
+        if (more && ioWait(0, 1, 0) == 1) {
+            // 有新输入：先发已有的结果，收下输入，主循环处理完再接着分析（剩下的入口仍待分析）。
+            publish();
+            fioRead(0);
+            return;
+        }
+    }
+    publish();
+    wantAnalysis = diagPending(docs);
+    if (!wantAnalysis) { pendingSince = -1; }
+    if (did && semRefresh && !wantAnalysis) {
+        refreshSeq = refreshSeq + 1;
+        emit("{\"jsonrpc\":\"2.0\",\"id\":\"taixu-refresh-" + toStr(refreshSeq) + "\",\"method\":\"workspace/semanticTokens/refresh\"}");
+    }
+}
+
+function publish(): void {
+    diagPublish(docs, enc, windows, sendNote);
+}
+
+// 一条诊断通知（单文件诊断已有上限，这里只兜底消息上限）。
+function sendNote(body: string): void {
+    if (len(body) > maxResponse) {
+        notify("window/logMessage", "{\"type\":2,\"message\":\"publishDiagnostics 超出单条消息上限，未发\"}");
+        return;
+    }
+    emit(body);
+}
+
+// 去抖：最后一次变更后 DEBOUNCE_MS，但不晚于第一次未分析的变更后 maxDebounce（连续输入时仍定期分析、发布）。
+function schedule(): void {
+    wantAnalysis = true;
+    const now = nowMs();
+    if (pendingSince < 0) { pendingSince = now; }
+    deadline = now + DEBOUNCE_MS;
+    if (deadline > pendingSince + maxDebounce) { deadline = pendingSince + maxDebounce; }
+}
+
+// —— JSON-RPC ——
+
+function notify(method: string, params: string): void { emit("{\"jsonrpc\":\"2.0\",\"method\":" + dbgStr(method) + ",\"params\":" + params + "}"); }
+
+function emit(body: string): void {
+    if (fioSend(body) < 0) { writeFailed = true; }
+}
+
+function idText(v: Ref<JsonValue>): string {
+    if (v.kind == JSON_STR) { return dbgStr(v.s); }
+    if (v.kind == JSON_INT) { return toStr(v.i); }
+    if (v.kind == JSON_NUM) { return v.s; }
+    return "null";
+}
+
+// 回复超过单条回复上限（缺省同输入的消息上限 32 MiB）时改回 -32803，reason 为 response_too_large。
+function reply(id: string, result: string): void {
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":" + result + "}";
+    if (len(body) > maxResponse) {
+        replyFail(id, "response_too_large", "回复 " + toStr(len(body)) + " 字节，超出单条回复上限 " + toStr(maxResponse) + " 字节");
+        return;
+    }
+    emit(body);
+}
+
+function replyError(id: string, code: int, message: string): void {
+    emit("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":{\"code\":" + toStr(code) + ",\"message\":" + dbgStr(message) + "}}");
+}
+
+// RequestFailed（-32803）带机器可读的原因：data.reason。
+function replyFail(id: string, reason: string, message: string): void {
+    emit("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":{\"code\":" + toStr(REQUEST_FAILED) + ",\"message\":" + dbgStr(message) + ",\"data\":{\"reason\":" + dbgStr(reason) + "}}}");
+}
+
+function getObj(v: Ref<JsonValue>?, key: string): Ref<JsonValue>? {
+    if (v == None) { return None; }
+    const o = v catch jsonNullValue();
+    if (o.kind != JSON_OBJ) { return None; }
+    return jsonGet(o, key);
+}
+
+function jsonNullValue(): Ref<JsonValue> {
+    return new JsonValue { kind: JSON_NULL, i: 0, s: "", items: listNew(), keys: listNew() };
+}
+
+function strOf(v: Ref<JsonValue>?): string {
+    if (v == None) { return ""; }
+    const o = v catch jsonNullValue();
+    if (o.kind != JSON_STR) { return ""; }
+    return o.s;
+}
+
+function intOf(v: Ref<JsonValue>?, dflt: int): int {
+    if (v == None) { return dflt; }
+    const o = v catch jsonNullValue();
+    if (o.kind != JSON_INT) { return dflt; }
+    return o.i;
+}
+
+function startsWith(s: string, p: string): bool {
+    return len(s) >= len(p) && strIndexOf(s, p) == 0;
+}
+
+// 一条消息（§五：解析失败、非对象都带 "id":null；带 id 缺 method 的回 -32600；initialize 之前 -32002；再次 initialize
+// 与 shutdown 之后 -32600；带 id 的 $/ 请求 -32601——依据 JSON-RPC 2.0 与 LSP 3.17 的规定）。
+function handle(body: Bytes): void {
+    if (!jsonEnvelopeWithin(body, 32768)) { replyError("null", -32600, "RequestTooComplex"); return; }
+    const parsed = jsonParse(body) catch (e) {
+        replyError("null", -32700, "Parse error");
+        return;
+    };
+    if (parsed.kind != JSON_OBJ) {
+        replyError("null", -32600, "Invalid Request");
+        return;
+    }
+    const idv = jsonGet(parsed, "id");
+    const mv = jsonGet(parsed, "method");
+    const params = jsonGet(parsed, "params");
+    let id = "null";
+    if (idv != None) { id = idText(idv catch jsonNullValue()); }
+    if (mv == None) {
+        // 带 result 或 error 的是客户端对我们的请求（semanticTokens/refresh）的响应，静默收下（JSON-RPC 2.0，§五）。
+        if (jsonGet(parsed, "result") != None || jsonGet(parsed, "error") != None) { return; }
+        if (idv != None) { replyError(id, -32600, "Invalid Request"); }
+        return;
+    }
+    const method = strOf(mv);
+    if (idv == None) {
+        notification(method, params);
+        return;
+    }
+    current = id;
+    currentCancelled = false;
+    request(id, method, params);
+    current = "";
+    currentCancelled = false;
+}
+
+function request(id: string, method: string, params: Ref<JsonValue>?): void {
+    if (method == "initialize") {
+        // LSP 3.17：initialize 只能发一次；再发回 InvalidRequest（同 gopls；Zig 版重新协商，§五）。
+        if (initialized) {
+            replyError(id, -32600, "Invalid Request");
+            return;
+        }
+        initialize(id, params);
+        return;
+    }
+    if (!initialized) {
+        replyError(id, -32002, "Server not initialized");
+        return;
+    }
+    if (shutdownSeen) {
+        replyError(id, -32600, "Invalid Request");
+        return;
+    }
+    if (method == "shutdown") {
+        shutdownSeen = true;
+        reply(id, "null");
+        return;
+    }
+    if (method == "textDocument/definition" || method == "textDocument/references" || method == "textDocument/rename" || method == "textDocument/hover" || method == "textDocument/signatureHelp" || method == "textDocument/completion") {
+        positional(id, method, params);
+        return;
+    }
+    if (method == "textDocument/semanticTokens/full") {
+        // 同 definition 等：含该文档的入口为脏先同步分析，结果对应当前文本（§四-4）。
+        const sd = docAt(params);
+        if (sd == None) {
+            if (!heldFail(id, params)) { reply(id, "{\"data\":[]}"); }
+            return;
+        }
+        const d = sd catch emptyDoc();
+        if (!synced(id, d)) { return; }
+        reply(id, semTokens(d, enc));
+        return;
+    }
+    if (method == "textDocument/formatting") {
+        const d = docAt(params);
+        if (d == None) {
+            if (!heldFail(id, params)) { reply(id, "null"); }
+        } else {
+            reply(id, lspFormat(d catch emptyDoc(), enc));
+        }
+        return;
+    }
+    if (method == "textDocument/documentSymbol") {
+        const d = docAt(params);
+        if (d == None) {
+            if (!heldFail(id, params)) { reply(id, "[]"); }
+        } else {
+            reply(id, lspSymbols(d catch emptyDoc(), enc));
+        }
+        return;
+    }
+    replyError(id, -32601, "Method not found");
+}
+
+// 请求前的同步分析（含该文档的脏入口）：入口之间是取消点。被取消回 -32800；文档只被超预算的入口包含回 -32803。
+// 能接着回答时得 true。
+function synced(id: string, d: Ref<LspDoc>): bool {
+    if (diagSync(docs, targetId, d.key, stopNow)) { publish(); }
+    if (currentCancelled) {
+        replyError(id, REQUEST_CANCELLED, "RequestCancelled");
+        return false;
+    }
+    if (diagOverOnly(d.key)) {
+        replyFail(id, "analysis_budget", "以该文档为入口的程序超出分析预算，未分析");
+        return false;
+    }
+    return true;
+}
+
+// definition、references、rename（§四-3）与 hover、signatureHelp、completion（§四-5）：文档须打开；含它的入口为脏时先同步分析（结果对应当前文本），再按光标取身份。
+function positional(id: string, method: string, params: Ref<JsonValue>?): void {
+    const found = docAt(params);
+    if (found == None) {
+        if (heldFail(id, params)) { return; }
+        if (method == "textDocument/references") { reply(id, "[]"); } else { reply(id, "null"); }
+        return;
+    }
+    const d = found catch emptyDoc();
+    if (!synced(id, d)) { return; }
+    const pos = getObj(params, "position");
+    const line = intOf(getObj(pos, "line"), 0);
+    const ch = intOf(getObj(pos, "character"), 0);
+    if (method == "textDocument/definition") {
+        reply(id, refsDefinition(docs, d, line, ch, enc, windows));
+        return;
+    }
+    if (method == "textDocument/hover") {
+        reply(id, hoverAt(d, line, ch, enc, hoverMarkdown));
+        return;
+    }
+    if (method == "textDocument/signatureHelp") {
+        reply(id, signatureAt(d, line, ch, enc));
+        return;
+    }
+    if (method == "textDocument/completion") {
+        reply(id, completeAt(docs, d, line, ch, enc, targetId));
+        return;
+    }
+    const over = diagOverCount();
+    if (method == "textDocument/references") {
+        const inc = getObj(getObj(params, "context"), "includeDeclaration");
+        let withDecl = false;
+        if (inc != None) {
+            const v = inc catch jsonNullValue();
+            withDecl = v.kind == JSON_BOOL && v.i == 1;
+        }
+        if (over > 0) { notify("window/logMessage", "{\"type\":2,\"message\":" + dbgStr("references 不含 " + toStr(over) + " 个超出分析预算、未分析的入口") + "}"); }
+        reply(id, refsReferences(docs, d, line, ch, enc, windows, withDecl));
+        return;
+    }
+    const nv = getObj(params, "newName");
+    if (nv == None || (nv catch jsonNullValue()).kind != JSON_STR) {
+        replyError(id, -32602, "Invalid params: newName");
+        return;
+    }
+    if (over > 0) {
+        replyFail(id, "analysis_budget", "有 " + toStr(over) + " 个入口超出分析预算、未分析，改名可能漏改，未改");
+        return;
+    }
+    const r = refsRename(docs, d, line, ch, enc, windows, targetId, strOf(nv));
+    if (r.ok) {
+        reply(id, r.body);
+    } else {
+        replyError(id, REQUEST_FAILED, r.message);
+    }
+}
+
+function notification(method: string, params: Ref<JsonValue>?): void {
+    if (method == "exit") {
+        exitNow = true;
+        return;
+    }
+    if (method == "$/cancelRequest") {
+        // 按顺序到达时被取消的请求已答复；只有取消点收进队列、尚未处理的请求还能取消。
+        const cid = getObj(params, "id");
+        if (cid != None) { cancel(idText(cid catch jsonNullValue())); }
+        return;
+    }
+    if (!initialized || shutdownSeen) { return; }
+    if (method == "textDocument/didOpen") { didOpen(params); }
+    if (method == "textDocument/didChange") { didChange(params); }
+    if (method == "textDocument/didClose") { didClose(params); }
+}
+
+// 客户端在 initializationOptions.taixuResources 里给的值只用来收紧：比当前小（且不低于下限）才采用。
+function tighten(o: Ref<JsonValue>?, key: string, cur: int, floor: int): int {
+    const v = getObj(o, key);
+    if (v == None) { return cur; }
+    const x = v catch jsonNullValue();
+    if (x.kind != JSON_INT || x.i >= cur) { return cur; }
+    if (x.i < floor) { return floor; }
+    return x.i;
+}
+
+function resourcesJson(): string {
+    return "{\"max_message_bytes\":" + toStr(MSG_MAX) + ",\"max_response_bytes\":" + toStr(maxResponse) + ",\"max_document_bytes\":" + toStr(maxDocument) + ",\"max_open_bytes\":" + toStr(maxOpenBytes)
+    + ",\"max_open_documents\":" + toStr(maxOpenDocs) + ",\"max_change_work_bytes\":" + toStr(maxChangeWork) + ",\"max_analysis_source_bytes\":" + toStr(maxAnalysis)
+    + ",\"max_hot_cache_source_bytes\":" + toStr(maxHot) + ",\"max_diagnostics_per_file\":" + toStr(maxDiags) + ",\"max_diagnostics_bytes_per_file\":" + toStr(maxDiagBytes)
+    + ",\"debounce_ms\":" + toStr(DEBOUNCE_MS) + ",\"max_debounce_ms\":" + toStr(maxDebounce) + ",\"cancellation\":\"between_roots\",\"client_stdout_write_nonblocking\":false,\"client_stdout_write_deadline_ms\":null}";
+}
+
+// 编码：客户端宣告的列表含 utf-8 时选 utf-8（同 Zig 版），否则 utf-16；不宣告时 utf-16（LSP 3.17，§三-3）。
+function initialize(id: string, params: Ref<JsonValue>?): void {
+    enc = ENC_UTF16;
+    const list = getObj(getObj(getObj(params, "capabilities"), "general"), "positionEncodings");
+    if (list != None) {
+        const l = list catch jsonNullValue();
+        if (l.kind == JSON_ARR) {
+            for (x in l.items) {
+                if (x.kind == JSON_STR && x.s == "utf-8") { enc = ENC_UTF8; }
+            }
+        }
+    }
+    // hover.contentFormat 的顺序即偏好（LSP 3.17）：首项为 plaintext 时给纯文本，否则 markdown。
+    hoverMarkdown = true;
+    const cf = getObj(getObj(getObj(getObj(params, "capabilities"), "textDocument"), "hover"), "contentFormat");
+    if (cf != None) {
+        const l = cf catch jsonNullValue();
+        if (l.kind == JSON_ARR && listLen(l.items) > 0) {
+            const first = listGet(l.items, 0) catch jsonNullValue();
+            hoverMarkdown = !(first.kind == JSON_STR && first.s == "plaintext");
+        }
+    }
+    semRefresh = false;
+    const rs = getObj(getObj(getObj(params, "capabilities"), "workspace"), "semanticTokens");
+    const rv = getObj(rs, "refreshSupport");
+    if (rv != None) {
+        const v = rv catch jsonNullValue();
+        semRefresh = v.kind == JSON_BOOL && v.i == 1;
+    }
+    const res = getObj(getObj(params, "initializationOptions"), "taixuResources");
+    maxDocument = tighten(res, "max_document_bytes", maxDocument, 1);
+    maxOpenBytes = tighten(res, "max_open_bytes", maxOpenBytes, 1);
+    maxOpenDocs = tighten(res, "max_open_documents", maxOpenDocs, 1);
+    maxChangeWork = tighten(res, "max_change_work_bytes", maxChangeWork, 1);
+    maxAnalysis = tighten(res, "max_analysis_source_bytes", maxAnalysis, 1);
+    maxHot = tighten(res, "max_hot_cache_source_bytes", maxHot, 0);
+    maxDiags = tighten(res, "max_diagnostics_per_file", maxDiags, 1);
+    maxDiagBytes = tighten(res, "max_diagnostics_bytes_per_file", maxDiagBytes, 4096);
+    maxDebounce = tighten(res, "max_debounce_ms", maxDebounce, DEBOUNCE_MS);
+    maxResponse = tighten(res, "max_response_bytes", maxResponse, 4096);
+    diagBudget(maxAnalysis, maxHot, maxDiags, maxDiagBytes);
+    initialized = true;
+    let name = "utf-16";
+    if (enc == ENC_UTF8) { name = "utf-8"; }
+    reply(id, "{\"capabilities\":{\"positionEncoding\":\"" + name + "\",\"textDocumentSync\":{\"openClose\":true,\"change\":1},\"documentFormattingProvider\":true,\"documentSymbolProvider\":true,\"hoverProvider\":true,\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"],\"retriggerCharacters\":[\")\"]},\"completionProvider\":{},\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":true,\"semanticTokensProvider\":{\"legend\":" + SEM_LEGEND + ",\"full\":true},\"experimental\":{\"taixuFileAccess\":{\"policy\":\"local_roots\",\"network_paths\":false,\"host_share_mount_types\":" + serviceMountTypesJson() + ",\"roots\":" + serviceRootsJson() + ",\"root_aliases\":" + serviceRootAliasesJson() + "},\"taixuResources\":" + resourcesJson() + "}},\"serverInfo\":{\"name\":\"taixu\",\"title\":\"太虚工具链 LSP\",\"version\":" + dbgStr(serverVersion) + "}}");
+}
+
+// —— 文档 ——
+
+function emptyDoc(): Ref<LspDoc> {
+    return newDoc("", "", "", 0, 0);
+}
+
+function docByKey(key: string): Ref<LspDoc>? {
+    for (d in docs) {
+        if (d.key == key) { return d; }
+    }
+    return None;
+}
+
+// params.textDocument.uri 的键（按路径，URI 写法不同也能对上）；URI 超长、不是本地文件或不在授权根内时为空串。
+function keyAt(params: Ref<JsonValue>?): string {
+    const uri = strOf(getObj(getObj(params, "textDocument"), "uri"));
+    if (len(uri) > 98304) { return ""; }
+    const path = uriToPath(uri, windows);
+    if (len(path) == 0 || !serviceAllows(path)) { return ""; }
+    return docKey(path);
+}
+
+// params.textDocument.uri 对应的打开文档。
+function docAt(params: Ref<JsonValue>?): Ref<LspDoc>? {
+    const key = keyAt(params);
+    if (len(key) == 0) { return None; }
+    return docByKey(key);
+}
+
+function heldAt(params: Ref<JsonValue>?): Ref<HeldDoc>? {
+    const key = keyAt(params);
+    if (len(key) == 0) { return None; }
+    return mapGet(held, key);
+}
+
+// 请求落在超预算的文档上：回 -32803（reason 为它的原因码），得 true。
+function heldFail(id: string, params: Ref<JsonValue>?): bool {
+    const h = heldAt(params);
+    if (h == None) { return false; }
+    const x = h catch new HeldDoc { uri: "", key: "", version: 0, code: "document_budget", message: "" };
+    replyFail(id, x.code, x.message);
+    return true;
+}
+
+function openBytes(): int {
+    let n = 0;
+    for (d in docs) { n = n + len(d.text); }
+    return n;
+}
+
+// 文本为 size 字节、其余打开文档合计 others 字节、连同它共 count 个时超出的预算说明；不超出为空串。
+function overBudget(size: int, others: int, count: int): string {
+    if (size > maxDocument) { return "文档 " + toStr(size) + " 字节，超出单文档上限 " + toStr(maxDocument) + " 字节"; }
+    if (others + size > maxOpenBytes) { return "打开文档合计 " + toStr(others + size) + " 字节，超出上限 " + toStr(maxOpenBytes) + " 字节"; }
+    if (count > maxOpenDocs) { return "打开文档 " + toStr(count) + " 个，超出上限 " + toStr(maxOpenDocs) + " 个"; }
+    return "";
+}
+
+// 文档转为超预算：丢文本（打开着的同关闭一样移出，导入它的入口改按磁盘内容重查），为它发说明诊断；其上的请求回 -32803。
+function hold(key: string, uri: string, version: int, code: string, message: string): void {
+    if (docByKey(key) != None) {
+        removeDoc(key);
+        diagTouch(key, true);
+    }
+    const text = message + "；按未打开处理（分析取磁盘内容）";
+    mapSet(held, key, new HeldDoc { uri: uri, key: key, version: version, code: code, message: text });
+    diagHold(key, uri, diagNote(code, text));
+    diagDocsChanged();
+    schedule();
+}
+
+function release(key: string): void {
+    if (mapHas(held, key)) {
+        mapRemove(held, key);
+        diagHold(key, "", "");
+    }
+}
+
+function removeDoc(key: string): void {
+    const keep: List<Ref<LspDoc>> = listNew();
+    for (d in docs) {
+        if (d.key != key) { listPush(keep, d); }
+    }
+    docs = keep;
+}
+
+function didOpen(params: Ref<JsonValue>?): void {
+    const td = getObj(params, "textDocument");
+    const uri = strOf(getObj(td, "uri"));
+    if (len(uri) > 98304) { notify("window/logMessage", "{\"type\":1,\"message\":\"path_not_trusted: URI 超过服务路径预算\"}"); return; }
+    const path = uriToPath(uri, windows);
+    if (len(path) == 0 || !serviceAllows(path)) {
+        notify("window/logMessage", "{\"type\":1,\"message\":\"path_not_trusted: 只允许已授权的本地工作区与库目录\"}"); return;
+    }
+    const text = strOf(getObj(td, "text"));
+    const version = intOf(getObj(td, "version"), 0);
+    const key = docKey(path);
+    const old = docByKey(key);
+    let others = openBytes();
+    let count = listLen(docs) + 1;
+    if (old != None) {
+        others = others - len((old catch emptyDoc()).text);
+        count = count - 1;
+    }
+    const why = overBudget(len(text), others, count);
+    if (len(why) > 0) {
+        hold(key, uri, version, "document_budget", why);
+        return;
+    }
+    release(key);
+    if (old != None) {
+        const d = old catch emptyDoc();
+        d.uri = uri;
+        setText(d, text, version);
+    } else {
+        listPush(docs, newDoc(uri, path, text, version, nextSeq));
+        nextSeq = nextSeq + 1;
+    }
+    diagDocsChanged();
+    diagTouch(key, false);
+    schedule();
+}
+
+// 按序应用每个变更：没有 range 的是全文，有 range 的按协商的编码替换（§五：Zig 版静默丢弃）。range 编辑按编辑前的全文
+// 字节累计工作量，超出即停（文本已不可信，转为超预算）；应用后超出单文档或合计预算同样转为超预算。超预算的文档只有
+// 最后一个变更是全文、且回到预算内时恢复。
+function didChange(params: Ref<JsonValue>?): void {
+    const changes = getObj(params, "contentChanges");
+    if (changes == None) { return; }
+    const cs = changes catch jsonNullValue();
+    if (cs.kind != JSON_ARR) { return; }
+    const found = docAt(params);
+    if (found == None) {
+        heldChange(params, cs);
+        return;
+    }
+    const d = found catch emptyDoc();
+    const version = intOf(getObj(getObj(params, "textDocument"), "version"), d.version);
+    let work = 0;
+    for (c in cs.items) {
+        const text = strOf(jsonGet(c, "text"));
+        const r = jsonGet(c, "range");
+        if (r == None) {
+            setText(d, text, version);
+        } else {
+            work = work + len(d.text);
+            if (work > maxChangeWork) {
+                hold(d.key, d.uri, version, "change_budget", "一条 didChange 的 range 编辑累计处理 " + toStr(work) + " 字节，超出编辑工作量上限 " + toStr(maxChangeWork) + " 字节（文本已不可信，请发全文变更或重新打开）");
+                return;
+            }
+            const st = getObj(r, "start");
+            const en = getObj(r, "end");
+            const nt = applyRange(d, intOf(getObj(st, "line"), 0), intOf(getObj(st, "character"), 0), intOf(getObj(en, "line"), 0), intOf(getObj(en, "character"), 0), text, enc);
+            setText(d, nt, version);
+        }
+    }
+    const why = overBudget(len(d.text), openBytes() - len(d.text), listLen(docs));
+    if (len(why) > 0) {
+        hold(d.key, d.uri, version, "document_budget", why);
+        return;
+    }
+    diagDocsChanged();
+    diagTouch(d.key, false);
+    schedule();
+}
+
+function heldChange(params: Ref<JsonValue>?, cs: Ref<JsonValue>): void {
+    const h = heldAt(params);
+    if (h == None || listLen(cs.items) == 0) { return; }
+    const x = h catch new HeldDoc { uri: "", key: "", version: 0, code: "", message: "" };
+    x.version = intOf(getObj(getObj(params, "textDocument"), "version"), x.version);
+    const last = listGet(cs.items, listLen(cs.items) - 1) catch jsonNullValue();
+    if (jsonGet(last, "range") != None) { return; }
+    const text = strOf(jsonGet(last, "text"));
+    if (len(overBudget(len(text), openBytes(), listLen(docs) + 1)) > 0) { return; }
+    const path = uriToPath(x.uri, windows);
+    release(x.key);
+    listPush(docs, newDoc(x.uri, path, text, x.version, nextSeq));
+    nextSeq = nextSeq + 1;
+    diagDocsChanged();
+    diagTouch(x.key, false);
+    schedule();
+}
+
+function didClose(params: Ref<JsonValue>?): void {
+    const h = heldAt(params);
+    if (h != None) {
+        release((h catch new HeldDoc { uri: "", key: "", version: 0, code: "", message: "" }).key);
+        schedule();
+        return;
+    }
+    const found = docAt(params);
+    if (found == None) { return; }
+    const key = (found catch emptyDoc()).key;
+    removeDoc(key);
+    diagDocsChanged();
+    diagTouch(key, true);
+    schedule();
+}

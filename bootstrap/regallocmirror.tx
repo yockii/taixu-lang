@@ -1,0 +1,611 @@
+// bootstrap/regallocmirror —— AOT 段内寄存器分配 .tx 镜像（V0.42-B2；
+// BOOT-29——D82 分柱二：只镜像不切换，柱切换＝D82 §二门制另行判据）。
+//
+// 镜像对象＝src/tools/aot/regalloc.zig planRun（线性扫描贪心分配纯算法面：
+// 首扫 last_use/def 标记＋hold-adjust〔段界物化槽持到段尾〕→ 主扫逐位置
+// 装填〔类冲突降级粘滞内存／池耗尽降级／寄存器继承臂当前禁用＝`if false`
+// 死码不镜像〕→ 位置末释放 → 计划装配＋段界物化清单）。
+// oracle＝zig planRun（`taixu dev-regalloc-dump` 结构化用例族——全
+// NativeKind 面／池耗尽／类冲突／融合分支／伪随机扫窗，真值 E 行随行）；
+// 本文件逐例复算 E 行自校（scripts/regalloc-probe.sh diff 双侧 E 行——
+// 逐槽恒等）。
+//
+// 用法：taixu run bootstrap/regallocmirror.tx <cases 文件>
+// 输出＝全对齐 "regalloc-probe: N/N identical" 退出 0；否则逐例 MISMATCH 退出 1。
+
+// —— Loc 编码（regalloc.Loc 镜像：0=none 1=mem 2=gp 3=xmm）；GP 池 8／
+// XMM 池 6（分配只产下标，寄存器名表留在发射侧）。NO＝maxInt(u32) 哨兵
+//（last_use/no_touch/no_owner 共用语义）。
+
+const NO: int = 2147483647;
+
+struct Ctx {
+    noSlot: int, // “无槽”哨兵：载荷带 "V 3" 行时为 65535（原生链，C3b），否则 255（冻结 Zig 桥与探针）
+    rcnt: int,
+    fused: int,
+    len: int,
+    // 逐指令面（K 行展平；u1/t1＝第二操作数槽位/tag）。
+    nuses: List<int>,
+    u0: List<int>,
+    u1: List<int>,
+    t0: List<int>,
+    t1: List<int>,
+    defs: List<int>,
+    dtags: List<int>,
+    live: List<int>,
+}
+
+function allocFor(owners: List<int>, slot: int): int {
+    // 已持有优先（def 重定义／重复 use）→ 空闲位（zig 逐位同构）。
+    const n = listLen(owners);
+    let i: int = 0;
+    while (i < n) {
+        if ((listGet(owners, i) catch NO) == slot) { return i; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n) {
+        if ((listGet(owners, i) catch NO) == NO) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+function releaseOwner(owners: List<int>, slot: int): void {
+    const n = listLen(owners);
+    let i: int = 0;
+    while (i < n) {
+        if ((listGet(owners, i) catch NO) == slot) {
+            listSet(owners, i, NO);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+function locTok(code: int, idx: int): string {
+    if (code == 2) { return "g" + toStr(idx); }
+    if (code == 3) { return "x" + toStr(idx); }
+    if (code == 1) { return "m"; }
+    return "n";
+}
+
+function toInt(s: string): int {
+    let v: int = 0;
+    let i: int = 0;
+    const n = len(s);
+    let neg = 0;
+    if (n > 0) {
+        const c0 = byteAt(s, 0) catch 48;
+        if (c0 == 45) { neg = 1; i = 1; }
+    }
+    while (i < n) {
+        const ch = byteAt(s, i) catch 0;
+        if (ch >= 48 && ch <= 57) { v = v * 10 + (ch - 48); }
+        i = i + 1;
+    }
+    if (neg == 1) { return -v; }
+    return v;
+}
+
+// 平衡拼接（O(总长×log 段数)）：s = s + t 逐段累加每次整串复制，大函数单段的 E 行
+// 可达十余万 token，逐段累加为平方级（C3c）。产出与逐段累加逐字节相同。
+function joinSep(parts: List<string>, lo: int, hi: int, sep: string): string {
+    if (hi <= lo) { return ""; }
+    if (hi - lo == 1) { return listGet(parts, lo) catch ""; }
+    const mid = lo + (hi - lo) / 2;
+    return joinSep(parts, lo, mid, sep) + sep + joinSep(parts, mid, hi, sep);
+}
+
+/// planRun 镜像主体：ctx 输入 → E 行 token 串（与 oracle E 行逐字节同形，
+// 尾随单空格由调用方对齐）。
+function planRun(c: Ref<Ctx>): string {
+    const rcnt = c.rcnt;
+    const len = c.len;
+    const fused = c.fused;
+
+    let last_use: List<int> = listNew();
+    let slot_cls: List<int> = listNew();
+    let def_happened: List<int> = listNew();
+    let last_def_tag: List<int> = listNew();
+    let loc_code: List<int> = listNew();
+    let loc_idx: List<int> = listNew();
+    let i: int = 0;
+    while (i < rcnt) {
+        listPush(last_use, NO);
+        listPush(slot_cls, 0);
+        listPush(def_happened, 0);
+        listPush(last_def_tag, 0);
+        listPush(loc_code, 0);
+        listPush(loc_idx, 0);
+        i = i + 1;
+    }
+
+    // —— 首扫：末触位置＋def 标记 ——
+    let p: int = 0;
+    while (p < len) {
+        const nu = listGet(c.nuses, p) catch 0;
+        let ui: int = 0;
+        while (ui < nu) {
+            let sl: int = c.noSlot;
+            if (ui == 0) { sl = listGet(c.u0, p) catch c.noSlot; } else { sl = listGet(c.u1, p) catch c.noSlot; }
+            if (sl != c.noSlot && sl < rcnt) {
+                listSet(last_use, sl, p);
+            }
+            ui = ui + 1;
+        }
+        let fused_cmp0: int = 0;
+        if (fused == 1 && p + 1 == len - 1) { fused_cmp0 = 1; }
+        const dv0 = listGet(c.defs, p) catch c.noSlot;
+        if (dv0 != c.noSlot && fused_cmp0 == 0 && dv0 < rcnt) {
+            listSet(last_use, dv0, p);
+            listSet(def_happened, dv0, 1);
+            listSet(last_def_tag, dv0, listGet(c.dtags, p) catch 0);
+        }
+        p = p + 1;
+    }
+    // hold-adjust（V0.22-P1 执行发现③镜像——首扫后整体一次：段界需物化的
+    // def 槽位寄存器持到段尾）。
+    let i2: int = 0;
+    while (i2 < rcnt) {
+        if ((listGet(def_happened, i2) catch 0) == 1 && i2 < rcnt && (listGet(c.live, i2) catch 0) != 0) {
+            listSet(last_use, i2, len - 1);
+        }
+        i2 = i2 + 1;
+    }
+
+    // —— 主扫：GP/XMM 占用表＋逐位置装填 ——
+    let gp_owner: List<int> = listNew();
+    let xmm_owner: List<int> = listNew();
+    i = 0;
+    while (i < 8) { listPush(gp_owner, NO); i = i + 1; }
+    i = 0;
+    while (i < 6) { listPush(xmm_owner, NO); i = i + 1; }
+
+    p = 0;
+    while (p < len) {
+        const nu = listGet(c.nuses, p) catch 0;
+        let fused_cmp: int = 0;
+        if (fused == 1 && p + 1 == len - 1) { fused_cmp = 1; }
+        let ui: int = 0;
+        while (ui < nu) {
+            let sl: int = c.noSlot;
+            if (ui == 0) { sl = listGet(c.u0, p) catch c.noSlot; } else { sl = listGet(c.u1, p) catch c.noSlot; }
+            if (sl == c.noSlot || sl >= rcnt) { ui = ui + 1; continue; }
+            let stag: int = 0;
+            if (ui == 0) { stag = listGet(c.t0, p) catch 0; } else { stag = listGet(c.t1, p) catch 0; }
+            let ucls: int = 1;
+            if (stag == 2) { ucls = 2; }
+            if ((listGet(slot_cls, sl) catch 0) == 3) {
+                if ((listGet(loc_code, sl) catch 0) == 0) { listSet(loc_code, sl, 1); }
+                ui = ui + 1;
+                continue;
+            }
+            if ((listGet(slot_cls, sl) catch 0) != 0 && (listGet(slot_cls, sl) catch 0) != ucls) {
+                listSet(slot_cls, sl, 3);
+                const lc0 = listGet(loc_code, sl) catch 0;
+                if (lc0 == 2) { releaseOwner(gp_owner, sl); }
+                if (lc0 == 3) { releaseOwner(xmm_owner, sl); }
+                listSet(loc_code, sl, 1);
+                ui = ui + 1;
+                continue;
+            }
+            listSet(slot_cls, sl, ucls);
+            if ((listGet(loc_code, sl) catch 0) != 0) { ui = ui + 1; continue; }
+            let want_xmm: int = 0;
+            if (ucls == 2) { want_xmm = 1; }
+            let got: int = -1;
+            if (want_xmm == 1) { got = allocFor(xmm_owner, sl); } else { got = allocFor(gp_owner, sl); }
+            if (got >= 0) {
+                if (want_xmm == 1) {
+                    listSet(xmm_owner, got, sl);
+                    listSet(loc_code, sl, 3);
+                    listSet(loc_idx, sl, got);
+                } else {
+                    listSet(gp_owner, got, sl);
+                    listSet(loc_code, sl, 2);
+                    listSet(loc_idx, sl, got);
+                }
+            } else {
+                listSet(loc_code, sl, 1);
+            }
+            ui = ui + 1;
+        }
+        const dv = listGet(c.defs, p) catch c.noSlot;
+        if (dv != c.noSlot && fused_cmp == 0 && dv < rcnt) {
+            const dtag = listGet(c.dtags, p) catch 0;
+            let dcls: int = 1;
+            if (dtag == 2) { dcls = 2; }
+            if ((listGet(slot_cls, dv) catch 0) == 3) {
+                if ((listGet(loc_code, dv) catch 0) == 0) { listSet(loc_code, dv, 1); }
+            } else {
+                if ((listGet(slot_cls, dv) catch 0) != 0 && (listGet(slot_cls, dv) catch 0) != dcls) {
+                    listSet(slot_cls, dv, 3);
+                    const lc1 = listGet(loc_code, dv) catch 0;
+                    if (lc1 == 2) { releaseOwner(gp_owner, dv); }
+                    if (lc1 == 3) { releaseOwner(xmm_owner, dv); }
+                    listSet(loc_code, dv, 1);
+                } else {
+                    if ((listGet(slot_cls, dv) catch 0) == 0) { listSet(slot_cls, dv, dcls); }
+                    if ((listGet(loc_code, dv) catch 0) == 0) {
+                        let want2: int = 0;
+                        if (dcls == 2) { want2 = 1; }
+                        let got2: int = -1;
+                        if (want2 == 1) { got2 = allocFor(xmm_owner, dv); } else { got2 = allocFor(gp_owner, dv); }
+                        if (got2 >= 0) {
+                            if (want2 == 1) {
+                                listSet(xmm_owner, got2, dv);
+                                listSet(loc_code, dv, 3);
+                                listSet(loc_idx, dv, got2);
+                            } else {
+                                listSet(gp_owner, got2, dv);
+                                listSet(loc_code, dv, 2);
+                                listSet(loc_idx, dv, got2);
+                            }
+                        } else {
+                            listSet(loc_code, dv, 1);
+                        }
+                    }
+                }
+            }
+        }
+        // 位置末：末触已过的槽释放寄存器。
+        i = 0;
+        while (i < 8) {
+            const ow = listGet(gp_owner, i) catch NO;
+            if (ow != NO && (listGet(last_use, ow) catch NO) <= p) { listSet(gp_owner, i, NO); }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < 6) {
+            const ow = listGet(xmm_owner, i) catch NO;
+            if (ow != NO && (listGet(last_use, ow) catch NO) <= p) { listSet(xmm_owner, i, NO); }
+            i = i + 1;
+        }
+        p = p + 1;
+    }
+
+    // —— E 行装配（b/c/def 逐指令＋段界物化清单）——
+    let out: List<string> = listNew(); // token 流（join 面留给调用前）
+    p = 0;
+    while (p < len) {
+        const nu = listGet(c.nuses, p) catch 0;
+        let ui: int = 0;
+        while (ui < 2) {
+            let code: int = 0;
+            let idx: int = 0;
+            if (ui < nu) {
+                let sl: int = c.noSlot;
+                if (ui == 0) { sl = listGet(c.u0, p) catch c.noSlot; } else { sl = listGet(c.u1, p) catch c.noSlot; }
+                if (sl != c.noSlot && sl < rcnt) {
+                    code = listGet(loc_code, sl) catch 0;
+                    idx = listGet(loc_idx, sl) catch 0;
+                }
+            }
+            listPush(out, locTok(code, idx));
+            ui = ui + 1;
+        }
+        const dv = listGet(c.defs, p) catch c.noSlot;
+        let fused_cmp2: int = 0;
+        if (fused == 1 && p + 1 == len - 1) { fused_cmp2 = 1; }
+        if (dv != c.noSlot && fused_cmp2 == 0 && dv < rcnt) {
+            listPush(out, locTok(listGet(loc_code, dv) catch 0, listGet(loc_idx, dv) catch 0));
+        } else {
+            listPush(out, "n");
+        }
+        p = p + 1;
+    }
+    let stores: List<string> = listNew();
+    i = 0;
+    while (i < rcnt) {
+        if ((listGet(def_happened, i) catch 0) == 1) {
+            const lc = listGet(loc_code, i) catch 0;
+            if (lc == 2 || lc == 3) {
+                if ((listGet(c.live, i) catch 0) != 0) {
+                    listPush(stores, toStr(i));
+                    listPush(stores, locTok(lc, listGet(loc_idx, i) catch 0));
+                    listPush(stores, toStr(listGet(last_def_tag, i) catch 0));
+                }
+            }
+        }
+        i = i + 1;
+    }
+    listPush(out, toStr(listLen(stores) / 3));
+    i = 0;
+    while (i < listLen(stores)) {
+        listPush(out, listGet(stores, i) catch "");
+        i = i + 1;
+    }
+
+    // token 流 → 空格拼接（尾随单空格由调用方对齐面处理）。
+    return joinSep(out, 0, listLen(out), " ");
+}
+
+// —— 计算态批入口（V0.49-S4-③ 柱二生产桥接；D82 §二切换面）——
+// 输入＝I/K 行用例批（生产 Ir run 序列化——无 E 行）；输出＝逐 case
+// "E <id> <plan 体>" 行（\n 连接；体与 oracle 同 token 序）。解析块与
+// main 文件模式逐行同构（同协议同格式——5719 探针自校语义不变）。
+export function planPayload(payload: string): string {
+    const lines = strSplit(payload, "\n");
+    const ln = listLen(lines);
+    const outs: List<string> = listNew(); // 逐段 E 行，末尾以换行平衡拼接
+    let noSlot: int = 255;
+    let have: int = 0;
+    let cur_id: int = -1;
+    let cur_rcnt: List<int> = listNew();
+    let cur_fused: List<int> = listNew();
+    let cur_len: List<int> = listNew();
+    let cur_nuses: List<int> = listNew();
+    let cur_u0: List<int> = listNew();
+    let cur_u1: List<int> = listNew();
+    let cur_t0: List<int> = listNew();
+    let cur_t1: List<int> = listNew();
+    let cur_defs: List<int> = listNew();
+    let cur_dtags: List<int> = listNew();
+    let cur_live: List<int> = listNew();
+    let li: int = 0;
+    while (li <= ln) {
+        let line = "";
+        if (li < ln) { line = listGet(lines, li) catch ""; }
+        let isI: int = 0;
+        if (len(line) > 1 && (byteAt(line, 0) catch 0) == 73) { isI = 1; }
+        if (have == 1 && (li == ln || isI == 1)) {
+            const c: Ref<Ctx> = new Ctx {
+                noSlot: noSlot,
+                rcnt: (listGet(cur_rcnt, 0) catch 0),
+                fused: (listGet(cur_fused, 0) catch 0),
+                len: (listGet(cur_len, 0) catch 0),
+                nuses: cur_nuses,
+                u0: cur_u0,
+                u1: cur_u1,
+                t0: cur_t0,
+                t1: cur_t1,
+                defs: cur_defs,
+                dtags: cur_dtags,
+                live: cur_live,
+            };
+            listPush(outs, "E " + toStr(cur_id) + " " + planRun(c));
+            have = 0;
+        }
+        if (li == ln) { break; }
+        if (len(line) > 0) {
+            const c0 = byteAt(line, 0) catch 0;
+            if (c0 == 86) { noSlot = 65535; } // "V 3"：原生链载荷（C3b）
+            if (c0 == 73) {
+                // "I" 行（解析与 main 同构——id rcnt fused len live*）。
+                const toks = strSplit(line, " ");
+                cur_id = toInt(listGet(toks, 1) catch "0");
+                cur_rcnt = listNew();
+                cur_fused = listNew();
+                cur_len = listNew();
+                cur_nuses = listNew();
+                cur_u0 = listNew();
+                cur_u1 = listNew();
+                cur_t0 = listNew();
+                cur_t1 = listNew();
+                cur_defs = listNew();
+                cur_dtags = listNew();
+                cur_live = listNew();
+                listPush(cur_rcnt, toInt(listGet(toks, 2) catch "0"));
+                listPush(cur_fused, toInt(listGet(toks, 3) catch "0"));
+                listPush(cur_len, toInt(listGet(toks, 4) catch "0"));
+                const rcnt = listGet(cur_rcnt, 0) catch 0;
+                const live_tok = listGet(toks, 5) catch "0";
+                let k: int = 0;
+                while (k < rcnt) {
+                    const ch = byteAt(live_tok, k) catch 48;
+                    if (ch == 49) { listPush(cur_live, 1); } else { listPush(cur_live, 0); }
+                    k = k + 1;
+                }
+                have = 1;
+            }
+            if (c0 == 75 && have == 1) {
+                // "K" 行（解析与 main 同构——kind nuses (u)* def dtag npairs (slot tag)*）。
+                const toks = strSplit(line, " ");
+                const nu = toInt(listGet(toks, 2) catch "0");
+                listPush(cur_nuses, nu);
+                let u0v: int = noSlot;
+                let u1v: int = noSlot;
+                if (nu >= 1) { u0v = toInt(listGet(toks, 3) catch toStr(noSlot)); }
+                if (nu >= 2) { u1v = toInt(listGet(toks, 4) catch toStr(noSlot)); }
+                listPush(cur_u0, u0v);
+                listPush(cur_u1, u1v);
+                const dv = toInt(listGet(toks, 3 + nu * 1) catch toStr(noSlot));
+                const dt = toInt(listGet(toks, 4 + nu * 1) catch "0");
+                listPush(cur_defs, dv);
+                listPush(cur_dtags, dt);
+                const np = toInt(listGet(toks, 5 + nu * 1) catch "0");
+                let pairs: List<int> = listNew();
+                let k2: int = 0;
+                while (k2 < np * 2) {
+                    listPush(pairs, toInt(listGet(toks, 6 + nu + k2) catch "0"));
+                    k2 = k2 + 1;
+                }
+                let t0v: int = 0;
+                let t1v: int = 0;
+                let q: int = 0;
+                while (q < np) {
+                    const ps = listGet(pairs, q * 2) catch 0;
+                    const pt = listGet(pairs, q * 2 + 1) catch 0;
+                    if (ps == u0v) { t0v = pt; }
+                    if (ps == u1v) { t1v = pt; }
+                    q = q + 1;
+                }
+                listPush(cur_t0, t0v);
+                listPush(cur_t1, t1v);
+            }
+        }
+        li = li + 1;
+    }
+    return joinSep(outs, 0, listLen(outs), "\n");
+}
+
+export function main(args: []string): int {
+    if (len(args) < 1) {
+        print("用法: taixu run bootstrap/regallocmirror.tx <cases 文件>");
+        return 64;
+    }
+    const data = readFile(args[0]) catch (e) {
+        print("readfail: " + e.message);
+        return 1;
+    };
+    const lines = strSplit(data, "\n");
+    const ln = listLen(lines);
+    let li: int = 0;
+    let total: int = 0;
+    let badc: int = 0;
+    let have: int = 0;
+    let cur_id: int = -1;
+    let cur_rcnt: List<int> = listNew();
+    let cur_fused: List<int> = listNew();
+    let cur_len: List<int> = listNew();
+    let cur_nuses: List<int> = listNew();
+    let cur_u0: List<int> = listNew();
+    let cur_u1: List<int> = listNew();
+    let cur_t0: List<int> = listNew();
+    let cur_t1: List<int> = listNew();
+    let cur_defs: List<int> = listNew();
+    let cur_dtags: List<int> = listNew();
+    let cur_live: List<int> = listNew();
+
+    while (li <= ln) {
+        let line = "";
+        if (li < ln) { line = listGet(lines, li) catch ""; }
+        if (li == ln || (len(line) > 1 && (byteAt(line, 0) catch 0) == 69)) {
+            // "E" 行（或文件尾）：先复算上一 case（若有）。
+            if (have == 1) {
+                const v_rcnt: int = listGet(cur_rcnt, 0) catch 0;
+                const v_fused: int = listGet(cur_fused, 0) catch 0;
+                const v_len: int = listGet(cur_len, 0) catch 0;
+                const c: Ref<Ctx> = new Ctx {
+                    noSlot: 255,
+                    rcnt: v_rcnt,
+                    fused: v_fused,
+                    len: v_len,
+                    nuses: cur_nuses,
+                    u0: cur_u0,
+                    u1: cur_u1,
+                    t0: cur_t0,
+                    t1: cur_t1,
+                    defs: cur_defs,
+                    dtags: cur_dtags,
+                    live: cur_live,
+                };
+                total = total + 1;
+                // 首拼 "E <id> " 头＋体；尾随空格对齐（oracle E 行恒以单
+                // 空格收尾）。
+                let got = "E " + toStr(cur_id) + " " + planRun(c);
+                const want = "E " + toStr(cur_id) + eRest(line);
+                if (got != want) {
+                    if (got + " " == want) { got = want; }
+                }
+                if (got != want) {
+                    badc = badc + 1;
+                    if (badc <= 3) {
+                        print("MISMATCH case " + toStr(cur_id) + ":");
+                        print("  got:  [" + got + "]");
+                        print("  want: [" + want + "]");
+                    }
+                }
+                have = 0;
+            }
+            if (li == ln) { break; }
+        }
+        if (len(line) > 0) {
+            const c0 = byteAt(line, 0) catch 0;
+            if (c0 == 73) {
+                // "I" 行：新 case 头（id rcnt fused len live*）。
+                const toks = strSplit(line, " ");
+                cur_id = toInt(listGet(toks, 1) catch "0");
+                cur_rcnt = listNew();
+                cur_fused = listNew();
+                cur_len = listNew();
+                cur_nuses = listNew();
+                cur_u0 = listNew();
+                cur_u1 = listNew();
+                cur_t0 = listNew();
+                cur_t1 = listNew();
+                cur_defs = listNew();
+                cur_dtags = listNew();
+                cur_live = listNew();
+                listPush(cur_rcnt, toInt(listGet(toks, 2) catch "0"));
+                listPush(cur_fused, toInt(listGet(toks, 3) catch "0"));
+                listPush(cur_len, toInt(listGet(toks, 4) catch "0"));
+                const rcnt = listGet(cur_rcnt, 0) catch 0;
+                // live 位面＝单 token（"0100" 形）逐字符解析。
+                const live_tok = listGet(toks, 5) catch "0";
+                let k: int = 0;
+                while (k < rcnt) {
+                    const ch = byteAt(live_tok, k) catch 48;
+                    if (ch == 49) { listPush(cur_live, 1); } else { listPush(cur_live, 0); }
+                    k = k + 1;
+                }
+                have = 1;
+            }
+            if (c0 == 75 && have == 1) {
+                // "K" 行：kind nuses (u)* def dtag npairs (slot tag)*——
+                // tag 语义＝按槽号索引（ins_tags[slot]）；同槽多用同 tag，
+                // 解析期把 t0/t1 依槽查表解出（与 zig 数组语义同构）。
+                const toks = strSplit(line, " ");
+                const nu = toInt(listGet(toks, 2) catch "0");
+                listPush(cur_nuses, nu);
+                let u0v: int = 255;
+                let u1v: int = 255;
+                if (nu >= 1) { u0v = toInt(listGet(toks, 3) catch "255"); }
+                if (nu >= 2) { u1v = toInt(listGet(toks, 4) catch "255"); }
+                listPush(cur_u0, u0v);
+                listPush(cur_u1, u1v);
+                const dv = toInt(listGet(toks, 3 + nu * 1) catch "255");
+                const dt = toInt(listGet(toks, 4 + nu * 1) catch "0");
+                listPush(cur_defs, dv);
+                listPush(cur_dtags, dt);
+                // 槽-tag 对。
+                const np = toInt(listGet(toks, 5 + nu * 1) catch "0");
+                let pairs: List<int> = listNew();
+                let k: int = 0;
+                while (k < np * 2) {
+                    listPush(pairs, toInt(listGet(toks, 6 + nu + k) catch "0"));
+                    k = k + 1;
+                }
+                // 解析期 t0/t1 依槽查表（缺席＝0——ins_tags 零缺省同形）。
+                let t0v: int = 0;
+                let t1v: int = 0;
+                let q: int = 0;
+                while (q < np) {
+                    const ps = listGet(pairs, q * 2) catch 0;
+                    const pt = listGet(pairs, q * 2 + 1) catch 0;
+                    if (ps == u0v) { t0v = pt; }
+                    if (ps == u1v) { t1v = pt; }
+                    q = q + 1;
+                }
+                listPush(cur_t0, t0v);
+                listPush(cur_t1, t1v);
+            }
+        }
+        li = li + 1;
+    }
+    if (badc == 0) {
+        print("regalloc-probe: " + toStr(total) + "/" + toStr(total) + " identical");
+        return 0;
+    }
+    print("regalloc-probe: " + toStr(badc) + " mismatches of " + toStr(total));
+    return 1;
+}
+
+// E 行期望侧截取（剥 "E <id>" 头——含前置空格；与镜像 got 拼接面对齐）。
+function eRest(line: string): string {
+    const n = len(line);
+    let sp: int = 0;
+    let i: int = 0;
+    while (i < n) {
+        if ((byteAt(line, i) catch 32) == 32) {
+            sp = sp + 1;
+            if (sp == 2) {
+                // strSub(s, start, len)——start＝第二空格位（返回 plain string）。
+                return strSub(line, i, n - i);
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}

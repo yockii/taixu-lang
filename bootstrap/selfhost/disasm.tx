@@ -1,0 +1,182 @@
+// 原生函数汇编清单（6d-5，LSP 与 MCP 实施设计 §四-8）。CLI 与 MCP 同引擎；
+// 只格式化实际提交的原生指令，不运行旧文本发射路径，不依赖外部反汇编器。
+import { jsonStart } from "./toolchain";
+import { Operand, AsListingRow, asStructuredMissing, asListingGet, asListingTruncated } from "./assemble";
+import { ProgramContext } from "./program_context";
+import { drvDisasm, drvDisasmRelease, drvLastContext, drvDiagOut, drvSetToolchain } from "./driver";
+import { jsonQuote } from "./json_text";
+import { diagsDoc } from "./cli_json";
+import { targetName } from "./target";
+import { targetFlagHost } from "./target_host";
+
+export struct DisasmOut {
+    ok: bool, text: string, json: string, functions: string, truncated: bool, diags: string,
+}
+const R64: List<string> = strSplit("rax rcx rdx rbx rsp rbp rsi rdi r8 r9 r10 r11 r12 r13 r14 r15", " ");
+const R32: List<string> = strSplit("eax ecx edx ebx esp ebp esi edi r8d r9d r10d r11d r12d r13d r14d r15d", " ");
+const R8: List<string> = strSplit("al cl dl bl spl bpl sil dil r8b r9b r10b r11b r12b r13b r14b r15b", " ");
+const NO_ROW: Ref<AsListingRow> = new AsListingRow { fnIdx: -1, pc: -1, kind: 2, name: "", nops: 0,
+    a: asStructuredMissing(), b: asStructuredMissing(), c: asStructuredMissing(), ops: listNew() };
+
+function join(xs: List<string>, sep: string): string {
+    let out = ""; let i = 0;
+    while (i < listLen(xs)) {
+        if (i > 0) { out = out + sep; }
+        out = out + strAt(xs, i); i = i + 1;
+    }
+    return out;
+}
+function intAt(xs: List<int>, i: int): int { return listGet(xs, i) catch -1; }
+function emptyInts(): List<int> { return listNew(); }
+function strAt(xs: List<string>, i: int): string { return listGet(xs, i) catch ""; }
+function rowAt(xs: List<Ref<AsListingRow>>, i: int): Ref<AsListingRow> { return listGet(xs, i) catch NO_ROW; }
+function regText(cls: int, n: int): string {
+    if (cls == 0) { return strAt(R64, n); }
+    if (cls == 1) { return strAt(R32, n); }
+    if (cls == 2) { return strAt(R8, n); }
+    if (cls == 3) { return "xmm" + toStr(n); }
+    return "ymm" + toStr(n);
+}
+function operandText(o: Ref<Operand>, vector: bool): string {
+    if (o.kind == 0) { return regText(o.cls, o.num); }
+    if (o.kind == 1) { return toStr(o.imm); }
+    if (o.kind == 3) { return o.label; }
+    let addr = "";
+    if (o.hasRip == 1) { addr = "rip + " + o.ripSym; }
+    else if (o.memBase >= 0) { addr = regText(0, o.memBase); }
+    if (o.memIndex >= 0) {
+        if (len(addr) > 0) { addr = addr + " + "; }
+        addr = addr + regText(0, o.memIndex);
+        if (o.scale > 0) { addr = addr + "*" + toStr(1 << o.scale); }
+    }
+    if (o.disp != 0 || len(addr) == 0) {
+        if (len(addr) == 0) { addr = toStr(o.disp); }
+        else { addr = addr + " + " + toStr(o.disp); }
+    }
+    if (o.label == "fs" || o.label == "gs") { addr = o.label + ":[" + addr + "]"; }
+    else { addr = "[" + addr + "]"; }
+    // SSE/AVX 指令的内存宽度由助记符和向量寄存器决定；不要把内部缺省 q 误写成 128/256 位宽。
+    if (vector) { return addr; }
+    if (o.memSize == 0) { return "byte ptr " + addr; }
+    if (o.memSize == 1) { return "dword ptr " + addr; }
+    if (o.memSize == 3) { return "word ptr " + addr; }
+    return "qword ptr " + addr;
+}
+function operandsOf(r: Ref<AsListingRow>): List<string> {
+    const out: List<string> = listNew();
+    if (r.kind == 2) { listPush(out, r.name); return out; }
+    // A64 的行（asListingA64）已是反汇编文本。
+    if (listLen(r.ops) > 0) { return r.ops; }
+    const vector = (r.a.kind == 0 && r.a.cls >= 3) || (r.b.kind == 0 && r.b.cls >= 3) || (r.c.kind == 0 && r.c.cls >= 3);
+    if (r.nops > 0) { listPush(out, operandText(r.a, vector)); }
+    if (r.nops > 1) { listPush(out, operandText(r.b, vector)); }
+    if (r.nops > 2) { listPush(out, operandText(r.c, vector)); }
+    return out;
+}
+function operandsJson(xs: List<string>): string {
+    const parts: List<string> = listNew(); let i = 0;
+    while (i < listLen(xs)) { listPush(parts, jsonQuote(strAt(xs, i))); i = i + 1; }
+    return "[" + join(parts, ",") + "]";
+}
+function sourceLine(ctx: Ref<ProgramContext>, r: Ref<AsListingRow>): int {
+    const lines: List<int> = listGet(ctx.fnLinesL, r.fnIdx) catch emptyInts();
+    if (r.pc < 0 || r.pc >= listLen(lines)) { return 0; }
+    const line = intAt(lines, r.pc);
+    if (line < 0) { return 0; }
+    return line;
+}
+function fnName(ctx: Ref<ProgramContext>, fi: int): string { return strAt(ctx.cgStrings, intAt(ctx.fnNameIdx, fi)); }
+function fnModule(ctx: Ref<ProgramContext>, fi: int): string {
+    return strAt(ctx.cgStrings, intAt(ctx.modOutPath, intAt(ctx.fnModule, fi)));
+}
+
+function render(ctx: Ref<ProgramContext>, rows: List<Ref<AsListingRow>>, t: int, maxBytes: int): Ref<DisasmOut> {
+    const text: List<string> = listNew();
+    const parts: List<string> = listNew(); listPush(parts, "[");
+    let fi = -1; let inFn = false; let first = true; let size = 2;
+    let cut = asListingTruncated(); let i = 0;
+    while (i < listLen(rows)) {
+        const r = rowAt(rows, i);
+        const name = fnName(ctx, r.fnIdx);
+        const module = fnModule(ctx, r.fnIdx);
+        const ops = operandsOf(r);
+        const line = sourceLine(ctx, r);
+        let op = r.name; let kind = "instruction";
+        if (r.kind == 2) { op = ".label"; kind = "label"; }
+        const row = "{\"fn\":" + jsonQuote(name) + ",\"op\":" + jsonQuote(op) + ",\"operands\":" + operandsJson(ops)
+        + ",\"line\":" + toStr(line) + ",\"pc\":" + toStr(r.pc) + ",\"kind\":" + jsonQuote(kind) + "}";
+        let prefix = "";
+        if (r.fnIdx != fi) {
+            if (inFn) { prefix = "]},"; }
+            prefix = prefix + "{\"index\":" + toStr(r.fnIdx) + ",\"name\":" + jsonQuote(name)
+            + ",\"module\":" + jsonQuote(module) + ",\"instructions\":[";
+        } else if (!first) { prefix = ","; }
+        if (maxBytes > 0 && size + len(prefix) + len(row) + 2 > maxBytes) { cut = true; break; }
+        listPush(parts, prefix); listPush(parts, row); size = size + len(prefix) + len(row);
+        if (r.fnIdx != fi) {
+            listPush(text, "function " + name + " (idx " + toStr(r.fnIdx) + ", module " + module + ")\n");
+            fi = r.fnIdx; inFn = true;
+        }
+        if (r.kind == 2) { listPush(text, r.name + ":\n"); }
+        else { listPush(text, "  " + toStr(line) + "  " + r.name + " " + join(ops, ", ") + "\n"); }
+        first = false; i = i + 1;
+    }
+    if (inFn) { listPush(parts, "]}"); }
+    listPush(parts, "]");
+    const functions = join(parts, "");
+    const target = targetName(t);
+    return new DisasmOut { ok: true, text: join(text, ""), functions: functions, truncated: cut, diags: "",
+        json: jsonStart("disasm/1") + ",\"target\":" + jsonQuote(target) + ",\"functions\":" + functions + ",\"truncated\":" + toStr(cut) + "}" };
+}
+
+export function disasmList(path: string, t: int, maxRows: int, maxBytes: int): Ref<DisasmOut> {
+    if (drvDisasm(path, t, maxRows) != 0) {
+        return new DisasmOut { ok: false, text: "", json: "", functions: "[]", truncated: false, diags: drvDiagOut() };
+    }
+    const ctx = drvLastContext() catch (e) {
+        drvDisasmRelease();
+        return new DisasmOut { ok: false, text: "", json: "", functions: "[]", truncated: false, diags: e.message };
+    };
+    const out = render(ctx, asListingGet(), t, maxBytes);
+    drvDisasmRelease();
+    return out;
+}
+
+// 验证用：清单操作数送回文本汇编器，必须与原生结构化编码逐字节一致。
+export function disasmAssembly(rows: List<Ref<AsListingRow>>): string {
+    const parts: List<string> = listNew(); listPush(parts, ".intel_syntax noprefix\n.text\n");
+    let i = 0;
+    while (i < listLen(rows)) {
+        const r = rowAt(rows, i);
+        if (r.kind == 2) { listPush(parts, r.name + ":\n"); }
+        else { listPush(parts, "  " + r.name + " " + join(operandsOf(r), ", ") + "\n"); }
+        i = i + 1;
+    }
+    return join(parts, "");
+}
+
+/// defaultTarget：未给 --target 时的目标（CLI 传宿主）。
+export function disasmCommand(args: []string, defaultTarget: int): int {
+    let path = ""; let t = defaultTarget; let json = false; let tool = false; let i = 1;
+    while (i < len(args)) {
+        const arg = args[i];
+        if (arg == "--toolchain") { tool = true; }
+        else if (arg == "--format=json") { json = true; }
+        else if (arg == "--format=text") { json = false; }
+        else if (targetFlagHost(arg) >= 0) { t = targetFlagHost(arg); }
+        else if (len(arg) > 0 && (byteAt(arg, 0) catch 0) != 45 && len(path) == 0) { path = arg; }
+        else { return -64; }
+        i = i + 1;
+    }
+    if (len(path) == 0) { return -64; }
+    drvSetToolchain(tool);
+    const r = disasmList(path, t, 0, 0);
+    if (!r.ok) {
+        if (json) { eprint(diagsDoc(r.diags)); } else { eprint(r.diags); }
+        return 1;
+    }
+    let out = r.text;
+    if (json) { out = r.json + "\n"; }
+    if (stdoutWrite(bytesFromStr(out)) < 0) { return 3; }
+    return 0;
+}

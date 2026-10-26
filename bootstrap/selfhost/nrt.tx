@@ -1,0 +1,1521 @@
+// Native runtime (NRT) M1: process state, program image, Store core, entry,
+// callbi/print, trap and OS output. Contract: docs/design/v052-native-runtime-nrt-v0.1-20261013.md.
+// Provides, under their existing names, the host symbols that generated code
+// and the generated kernel previously took from the Zig execution host.
+import { StructuredBuffer, asBufferLabel, asBufferSection, asBufferAlign, asBufferByte, asBufferQuad, asBufferZero, asBufferAddress, asBufferInstruction, asBufferBoundaryBegin, asBufferFunctionEnd, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem } from "./assemble";
+import { ARITY, check, text, memcpyName, fatal, trapText, arity, argTag, nrtBaseReset, nrtTarget, nrtLastError } from "./nrt_base";
+import { tElf, tSysV, tKernel32, tRawSyscall, tUnix, tMacos, tLinux, tPe } from "./target";
+import { uxSys, uxMac, macSysEmit } from "./unix_sys";
+import { emitNrtErrors, NRT_ERROR_EXPORTS } from "./nrt_errors";
+import { emitNrtLists, NRT_LIST_EXPORTS } from "./nrt_lists";
+import { emitNrtBytes, NRT_BYTES_EXPORTS } from "./nrt_bytes";
+import { emitNrtText, NRT_TEXT_EXPORTS } from "./nrt_text";
+import { emitNrtSys, NRT_SYS_EXPORTS } from "./nrt_sys";
+import { emitNrtProc, NRT_PROC_EXPORTS } from "./nrt_proc";
+import { emitNrtAsync, NRT_ASYNC_EXPORTS } from "./nrt_async";
+import { emitNrtGen, NRT_GEN_EXPORTS } from "./nrt_gen";
+import { emitNrtFloat } from "./nrt_float";
+import { nrtFfiEmit, nrtFfiBss, nrtFfiExports } from "./nrt_ffi";
+import { RtFn, RtOp, L, I, A, G } from "./rtfn_base";
+import { rtBegin, rtFailed, rtSet, rtSetGlobal, rtOp, rtShift, rtDivMod, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtIf32, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtCall5, rtCall6, rtCallList, rtCallC, rtSyscall, rtRet, rtRetVoid, rtRdataBytes, rtF64ToF32Bits } from "./rtfn";
+import { TB_MASK, TB_SLOTS, TB_HEADER, TB_STACK_INIT, TB_REGION, TB_ZERO_DEPTH, TB_ZERO_PENDING } from "./thread_block_abi";
+import { EXTERN_ID_BASE, BI_TABLE_LEN, RT_BI_BASE } from "./builtin_names";
+import { emitNrtRt, nrtRtBss, nrtRtDispatch } from "./nrt_rt";
+import { emitNrtRegion, emitNrtStack, emitNrtTls, emitNrtDie, nrtThreadBss, NRT_THREAD_EXPORTS } from "./nrt_thread";
+import { emitNrtSpawn, nrtSpawnBss, nrtSpawnExports } from "./nrt_spawn";
+import { emitNrtSend, nrtSendBss } from "./nrt_send";
+import { emitNrtShared, NRT_SHARED_EXPORTS } from "./nrt_shared";
+import { emitNrtLeak, nrtLeakBss, leakStamp } from "./nrt_leak";
+
+export const NRT_IMAGE_MAGIC: int = 5642816553436332081;
+export const NRT_IMAGE_VERSION: int = 3;
+// Image header offsets (quads).
+export const NRT_IMG_NFUNCS: int = 16;
+export const NRT_IMG_NMODULES: int = 24;
+export const NRT_IMG_NSTRINGS: int = 32;
+export const NRT_IMG_ENTRY: int = 40;
+export const NRT_IMG_FUNCS: int = 48;
+export const NRT_IMG_MODULES: int = 56;
+export const NRT_IMG_STRINGS: int = 64;
+// v2: test table (count, pointer to function indices), non-empty only in test-mode builds.
+export const NRT_IMG_NTESTS: int = 72;
+export const NRT_IMG_TESTS: int = 80;
+// v3: sendable table (count, pointer to one byte per runtime type id; threads §十八). The kernel also accepts v2
+// images (no table, everything sendable) so that a compiler one step older can still link against it.
+export const NRT_IMG_NTYPES: int = 88;
+export const NRT_IMG_SENDABLE: int = 96;
+// Per-function record (8 quads): reg_count, module, nparams, nlines, lines_ptr,
+// nconsts, consts_ptr (4 quads each: kind, a, b, c), code_len.
+export const NRT_FN_STRIDE: int = 64;
+// Per-module record (4 quads): nfields, state_ty, init_fn, path_string.
+export const NRT_MOD_STRIDE: int = 32;
+
+const OBJ_SIZE: int = 72;
+// __tx_nrt_die_wide：致命输出的 UTF-16 缓冲（单位数；trap 文本不超过 1000 字节）。
+const DIE_WIDE_UNITS: int = 2048;
+// 标准输出、标准错误逐块写出的块长（容量批 C4b）：Windows 的长度参数是 DWORD／int，控制台另需宽字符缓冲。
+const WRITE_CHUNK: int = 4194304;
+const RC_IMMORTAL: int = 4294967295;
+const INVALID: int = 4294967295;
+
+function raw(b: Ref<StructuredBuffer>, name: string, n: int, a: int, aw: int, c: int, cw: int): void {
+    // Tiny helper for the few hand-written hot leaf functions.
+    let x = asStructuredMissing(); let y = asStructuredMissing();
+    if (aw > 0) { x = asStructuredReg(aw - 1, a); }
+    if (cw > 0) { y = asStructuredReg(cw - 1, c); }
+    asBufferInstruction(b, name, n, x, y, asStructuredMissing(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// OS layer
+// ---------------------------------------------------------------------------
+
+function emitWrite(b: Ref<StructuredBuffer>, name: string, die: bool): void {
+    // __tx_nrt_write(fd 1|2, ptr, len): console → UTF-16 WriteConsoleW (invalid
+    // UTF-8 falls back to raw bytes); otherwise raw bytes, unchanged.
+    // __tx_nrt_write_die: same output, but the UTF-16 buffer is the process-level
+    // __tx_nrt_die_wide (held only by the fatal-lock winner) instead of the thread's
+    // heap: fatal paths may run with no usable thread block (threads §十三).
+    // Capacity batch C4b: Windows writes in WRITE_CHUNK pieces (the length arguments are
+    // DWORD/int; a single call used to truncate at 4 GiB); a console piece ends on a UTF-8
+    // sequence boundary. Linux retries a write interrupted by a signal (EINTR) instead of
+    // dropping the rest.
+    let locals = "h mode wide wn written ok k c";
+    if (tMacos(nrtTarget())) { locals = locals + " sa0 sa1"; }
+    const f = rtBegin(b, name, "fd ptr n", locals, 6, "bootstrap/selfhost/nrt.tx");
+    rtIf(f, L("n"), "le", I(0), "done");
+    if (tUnix(nrtTarget())) {
+        rtLabel(f, "again");
+        const xs: List<Ref<RtOp>> = listNew(); listPush(xs, L("fd")); listPush(xs, L("ptr")); listPush(xs, L("n"));
+        uxSys(f, nrtTarget(), "written", 1, xs);
+        rtIf(f, L("written"), "eq", I(-4), "again");
+        if (tMacos(nrtTarget())) { rtIf(f, L("written"), "eq", I(-32), "epipe"); } // −EPIPE
+        rtIf(f, L("written"), "le", I(0), "done");
+        rtOp(f, "ptr", L("ptr"), "add", L("written"));
+        rtOp(f, "n", L("n"), "sub", L("written"));
+        rtIf(f, L("n"), "gt", I(0), "again");
+        rtJump(f, "done");
+        if (tMacos(nrtTarget())) {
+            // macOS（M3 设计 G5）：工具链例程给 SIGPIPE 装了空处理函数（__tx_nrt_nopipe 为 2）时，写坏管道只得 EPIPE。
+            // 标准输出／错误遇坏管道仍按 SIGPIPE 结束，与 Linux 一致（同 Go 的 sigpipe()）：复位为缺省后向本进程重发。
+            // 处置是父进程交下的 SIG_IGN 或程序自装的处理函数时（状态不为 2），同 Linux 只得 EPIPE、继续执行。
+            rtLabel(f, "epipe");
+            rtSet(f, "k", G("__tx_nrt_nopipe"));
+            rtIf(f, L("k"), "ne", I(2), "done");
+            rtSet(f, "sa0", I(0)); rtSet(f, "sa1", I(0));
+            rtAddrOf(f, "k", "sa0");
+            const da: List<Ref<RtOp>> = listNew(); listPush(da, I(13)); listPush(da, L("k")); listPush(da, I(0));
+            uxMac(f, "", "sigaction", da);
+            const none: List<Ref<RtOp>> = listNew();
+            uxMac(f, "c", "getpid", none);
+            const ka: List<Ref<RtOp>> = listNew(); listPush(ka, L("c")); listPush(ka, I(13));
+            uxMac(f, "", "kill", ka);
+            rtJump(f, "done");
+        }
+    } else {
+        rtSet(f, "h", G("__tx_nrt_out"));
+        rtIf(f, L("fd"), "eq", I(1), "have");
+        rtSet(f, "h", G("__tx_nrt_err"));
+        rtLabel(f, "have");
+        rtIf(f, L("h"), "eq", I(0), "done");
+        rtIf(f, L("h"), "eq", I(-1), "done");
+        rtSet(f, "mode", I(0));
+        rtAddrOf(f, "ok", "mode");
+        rtCall2(f, "c", "GetConsoleMode", L("h"), L("ok"));
+        rtOp(f, "c", L("c"), "and", I(4294967295));
+        rtLabel(f, "chunk");
+        rtIf(f, L("n"), "le", I(0), "done");
+        rtSet(f, "k", L("n"));
+        rtIf(f, L("k"), "le", I(WRITE_CHUNK), "sized");
+        rtSet(f, "k", I(WRITE_CHUNK));
+        // Do not split a UTF-8 sequence between pieces: back off while the next piece would
+        // start with a continuation byte (at most three; malformed input is cut as is).
+        rtLabel(f, "back");
+        rtOp(f, "ok", L("ptr"), "add", L("k")); rtLoad(f, "ok", L("ok"), 0, 1);
+        rtOp(f, "ok", L("ok"), "and", I(192));
+        rtIf(f, L("ok"), "ne", I(128), "sized");
+        rtOp(f, "k", L("k"), "sub", I(1));
+        rtIf(f, L("k"), "gt", I(WRITE_CHUNK - 4), "back");
+        rtSet(f, "k", I(WRITE_CHUNK));
+        rtLabel(f, "sized");
+        rtIf(f, L("c"), "eq", I(0), "bytes");
+        // Count UTF-16 units; MB_ERR_INVALID_CHARS=8 rejects malformed input.
+        rtCall6Win(f, "wn", "MultiByteToWideChar", I(65001), I(8), L("ptr"), L("k"), I(0), I(0));
+        rtIf32(f, L("wn"), "le", I(0), "bytes");
+        if (die) {
+            rtIf(f, L("wn"), "gt", I(DIE_WIDE_UNITS), "bytes");
+            rtSet(f, "wide", A("__tx_nrt_die_wide"));
+        } else {
+            rtOp(f, "wide", L("wn"), "add", L("wn"));
+            rtCall2(f, "wide", "__tx_native_mem_alloc", L("wide"), I(2));
+            rtIf(f, L("wide"), "eq", I(0), "bytes");
+        }
+        rtCall6Win(f, "ok", "MultiByteToWideChar", I(65001), I(8), L("ptr"), L("k"), L("wide"), L("wn"));
+        rtSet(f, "written", I(0));
+        rtAddrOf(f, "ok", "written");
+        rtCall5(f, "", "WriteConsoleW", L("h"), L("wide"), L("wn"), L("ok"), I(0));
+        if (!die) { rtCall1(f, "", "__tx_native_mem_free", L("wide")); }
+        rtJump(f, "advance");
+        rtLabel(f, "bytes");
+        rtSet(f, "written", I(0));
+        rtAddrOf(f, "ok", "written");
+        rtCall5(f, "ok", "WriteFile", L("h"), L("ptr"), L("k"), L("ok"), I(0));
+        rtIf32(f, L("ok"), "eq", I(0), "done");
+        rtIf(f, L("written"), "le", I(0), "done");
+        rtSet(f, "k", L("written"));
+        rtLabel(f, "advance");
+        rtOp(f, "ptr", L("ptr"), "add", L("k"));
+        rtOp(f, "n", L("n"), "sub", L("k"));
+        rtJump(f, "chunk");
+    }
+    rtLabel(f, "done");
+    rtRetVoid(f);
+    check(f);
+}
+
+// __tx_nrt_write_line(fd, ptr, len)：正文加换行一次写出（print/eprint）。多个线程同时打印时行不交错；
+// 分配失败时退回分两次写。
+function emitWriteLine(b: Ref<StructuredBuffer>): void {
+    const newline = text(b, "\n");
+    const f = rtBegin(b, "__tx_nrt_write_line", "fd ptr n", "buf m q", 4, "bootstrap/selfhost/nrt.tx");
+    rtOp(f, "m", L("n"), "add", I(1));
+    rtCall2(f, "buf", "__tx_native_mem_alloc", L("m"), I(1));
+    rtIf(f, L("buf"), "eq", I(0), "split");
+    rtCall3(f, "", memcpyName(), L("buf"), L("ptr"), L("n"));
+    rtOp(f, "q", L("buf"), "add", L("n")); rtStore(f, L("q"), 0, I(10), 1);
+    rtCall3(f, "", "__tx_nrt_write", L("fd"), L("buf"), L("m"));
+    rtCall1(f, "", "__tx_native_mem_free", L("buf"));
+    rtRetVoid(f);
+    rtLabel(f, "split");
+    rtCall3(f, "", "__tx_nrt_write", L("fd"), L("ptr"), L("n"));
+    rtCall3(f, "", "__tx_nrt_write", L("fd"), A(newline), I(1));
+    rtRetVoid(f);
+    check(f);
+}
+
+function rtCall6Win(f: Ref<RtFn>, result: string, target: string, a: Ref<RtOp>, c: Ref<RtOp>, d: Ref<RtOp>, e: Ref<RtOp>, g: Ref<RtOp>, h: Ref<RtOp>): void {
+    const xs: List<Ref<RtOp>> = listNew(); listPush(xs, a); listPush(xs, c); listPush(xs, d); listPush(xs, e); listPush(xs, g); listPush(xs, h);
+    rtCallList(f, result, target, xs);
+}
+
+function emitExit(b: Ref<StructuredBuffer>): void {
+    // 系统接口决定退出方式：不经 kernel32 的目标先试 libc 的 exit 钩子（动态产物；按 C 约定调用），再 exit_group。
+    const t = nrtTarget();
+    let locals = "";
+    if (tRawSyscall(t)) { locals = "hook r rf"; }
+    const f = rtBegin(b, "__tx_nrt_exit", "code", locals, 1, "bootstrap/selfhost/nrt.tx");
+    if (tRawSyscall(t)) {
+        const xs: List<Ref<RtOp>> = listNew(); listPush(xs, L("code"));
+        // D3 v0.23 FFI：动态产物经 libc 的 exit 退出（atexit、stdio 缓冲照常收尾），不返回。
+        rtSet(f, "hook", G("__tx_libc_exit"));
+        rtIf(f, L("hook"), "eq", I(0), "direct");
+        const cls: List<int> = listNew(); listPush(cls, 0);
+        rtCallC(f, "r", "rf", "hook", xs, cls, tSysV(t));
+        rtLabel(f, "direct");
+        rtSyscall(f, "", 231, xs);
+    } else if (tMacos(t)) {
+        // macOS 产物总经 libSystem 动态链接：同 Linux 动态产物，经 exit 退出（atexit 照常收尾），不返回。
+        const xs: List<Ref<RtOp>> = listNew(); listPush(xs, L("code"));
+        uxMac(f, "", "exit", xs);
+    } else {
+        rtCall1(f, "", "ExitProcess", L("code"));
+    }
+    rtRetVoid(f);
+    check(f);
+}
+
+// ---------------------------------------------------------------------------
+// Store core
+// ---------------------------------------------------------------------------
+
+// 可移植版（macOS 适配 M4 设计 A8）：内核生成器的 --generic=leaves 让热叶与 __tx_strb_stat 改由 nrt_leaves_generic.tx 发出，
+// 这里不再发手写版。缺省不选，产物逐字节不变。
+let genericLeaves = false;
+export function nrtGenericLeaves(on: bool): void { genericLeaves = on; }
+
+function emitHotLeaves(b: Ref<StructuredBuffer>): void {
+    // __tx_rc_base: rc_ptr of the native slot state (may move on growth); the slot
+    // state pointer is a thread-block field (TB = rbx & TB_MASK).
+    asBufferLabel(b, "__tx_rc_base", 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(0, 0), asStructuredReg(0, 3), asStructuredMissing(), 1);
+    asBufferInstruction(b, "and", 2, asStructuredReg(0, 0), asStructuredImm(TB_MASK), asStructuredMissing(), 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(0, 0), asStructuredMem(2, 0, -1, 0, TB_SLOTS, 0, ""), asStructuredMissing(), 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(0, 0), asStructuredMem(2, 0, -1, 0, 0, 0, ""), asStructuredMissing(), 1);
+    asBufferInstruction(b, "ret", 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1);
+    // __tx_rc_scalar_flag: bit0 scalar arm, bit1 probe counting. The NRT always reports the scalar arm
+    // (threads step 4a: every object belongs to one thread; shared blocks count atomically on their own),
+    // so the generic paths (list push retain, zero cascade, probe counting) count with plain adds too.
+    asBufferLabel(b, "__tx_rc_scalar_flag", 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(1, 0), asStructuredMem(1, -1, -1, 0, 0, 1, "__tx_nrt_rc_flags"), asStructuredMissing(), 1);
+    asBufferInstruction(b, "or", 2, asStructuredReg(1, 0), asStructuredImm(1), asStructuredMissing(), 1);
+    asBufferInstruction(b, "ret", 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1);
+    asBufferLabel(b, "__tx_rc_probe_counts", 1);
+    asBufferInstruction(b, "lea", 2, asStructuredReg(0, 0), asStructuredMem(2, -1, -1, 0, 0, 1, "__tx_nrt_probe_counts"), asStructuredMissing(), 1);
+    asBufferInstruction(b, "ret", 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1);
+    // __tx_native_object_address_v1(idx) = objects_ptr + idx * 72.
+    asBufferLabel(b, "__tx_native_object_address_v1", 1);
+    // idx * 72 = (idx * 8) + (idx * 64), u32 index zero-extended first.
+    asBufferInstruction(b, "mov", 2, asStructuredReg(1, 0), asStructuredReg(1, 1), asStructuredMissing(), 1);
+    asBufferInstruction(b, "shl", 2, asStructuredReg(0, 0), asStructuredImm(3), asStructuredMissing(), 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(0, 11), asStructuredReg(0, 0), asStructuredMissing(), 1);
+    asBufferInstruction(b, "shl", 2, asStructuredReg(0, 0), asStructuredImm(3), asStructuredMissing(), 1);
+    asBufferInstruction(b, "add", 2, asStructuredReg(0, 0), asStructuredReg(0, 11), asStructuredMissing(), 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(0, 10), asStructuredReg(0, 3), asStructuredMissing(), 1);
+    asBufferInstruction(b, "and", 2, asStructuredReg(0, 10), asStructuredImm(TB_MASK), asStructuredMissing(), 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(0, 10), asStructuredMem(2, 10, -1, 0, TB_SLOTS, 0, ""), asStructuredMissing(), 1);
+    asBufferInstruction(b, "add", 2, asStructuredReg(0, 0), asStructuredMem(2, 10, -1, 0, 48, 0, ""), asStructuredMissing(), 1);
+    asBufferInstruction(b, "ret", 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1);
+    // __tx_site_of(fn, pc) → 分配点：未开泄漏检查时为 0（只多一次标志读取）；开启时转 __tx_leak_site_of（nrt_leak.tx）。
+    asBufferLabel(b, "__tx_site_of", 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(1, 0), asStructuredMem(1, -1, -1, 0, 0, 1, "__tx_leak_on"), asStructuredMissing(), 1);
+    asBufferInstruction(b, "test", 2, asStructuredReg(1, 0), asStructuredReg(1, 0), asStructuredMissing(), 1);
+    asBufferInstruction(b, "jne", 1, asStructuredTarget("__tx_leak_site_of"), asStructuredMissing(), asStructuredMissing(), 1);
+    asBufferInstruction(b, "ret", 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1);
+    asBufferLabel(b, "__tx_native_construct_stat_v1", 1);
+    asBufferInstruction(b, "ret", 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1);
+}
+
+function emitStore(b: Ref<StructuredBuffer>): void {
+    // __tx_native_object_create_v1(spec*) → idx: native slot + native Obj72 init.
+    let f = rtBegin(b, "__tx_native_object_create_v1", "spec", "idx obj ok", 2, "bootstrap/selfhost/nrt.tx");
+    rtCall1(f, "idx", "__tx_native_slots_acquire_v2", G("__tx_nrt_slots"));
+    rtIf32(f, L("idx"), "eq", I(-1), "oom");
+    rtCall1(f, "obj", "__tx_native_object_address_v1", L("idx"));
+    rtCall2(f, "ok", "__tx_native_object_init_v1", L("obj"), L("spec"));
+    rtIf32(f, L("ok"), "eq", I(0), "bad");
+    rtOp(f, "idx", L("idx"), "and", I(4294967295));
+    rtRet(f, L("idx"));
+    rtLabel(f, "oom");
+    rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtLabel(f, "bad");
+    fatal(b, f, "taixu NRT: 对象规格被原生初始化拒绝\n", 70);
+    rtRetVoid(f);
+    check(f);
+
+    asBufferLabel(b, "__tx_native_object_oom_v1", 1);
+    f = rtBegin(b, "__tx_nrt_oom", "", "", 3, "bootstrap/selfhost/nrt.tx");
+    fatal(b, f, "taixu: 内存不足\n", 3);
+    rtRetVoid(f);
+    check(f);
+
+    // __tx_nrt_set_immortal(idx)
+    f = rtBegin(b, "__tx_nrt_set_immortal", "idx", "p", 1, "bootstrap/selfhost/nrt.tx");
+    rtCall0(f, "p", "__tx_rc_base");
+    rtShift(f, "idx", L("idx"), "shl", 2);
+    rtOp(f, "p", L("p"), "add", L("idx"));
+    rtStore(f, L("p"), 0, I(RC_IMMORTAL), 4);
+    rtRetVoid(f);
+    check(f);
+
+    // __tx_nrt_new_bytes(kind, ptr, len, site) → idx; kind 1 str / 2 err.
+    f = rtBegin(b, "__tx_nrt_new_bytes", "kind ptr n site", "s0 s1 s2 s3 s4 s5 s6 s7 sp", 1, "bootstrap/selfhost/nrt.tx");
+    rtSet(f, "s0", L("kind"));
+    rtSet(f, "s1", L("site"));
+    rtSet(f, "s2", L("ptr")); rtSet(f, "s3", L("n")); rtSet(f, "s4", I(0)); rtSet(f, "s5", I(0)); rtSet(f, "s6", I(4)); rtSet(f, "s7", I(0));
+    rtOp(f, "s1", L("s1"), "and", I(4294967295));
+    rtAddrOf(f, "sp", "s0");
+    rtCall1(f, "s0", "__tx_native_object_create_v1", L("sp"));
+    rtRet(f, L("s0"));
+    check(f);
+
+    // __tx_nrt_new_u8list(ptr, n, cap) → idx：Bytes 与紧凑 List<u8> 共用的对象形态（kind 10、pk 7、form 3、elem 4；
+    // O4 第二步 2c2）。cap 按字节计且 ≥ n；cap≠0 当且仅当 ptr 是本对象独占的块。
+    f = rtBegin(b, "__tx_nrt_new_u8list", "ptr n cap", "s0 s1 s2 s3 s4 s5 s6 s7 sp", 1, "bootstrap/selfhost/nrt.tx");
+    rtSet(f, "s0", I(10)); rtSet(f, "s1", I(30064771072)); rtSet(f, "s2", L("ptr")); rtSet(f, "s3", L("n")); rtSet(f, "s4", L("cap"));
+    rtSet(f, "s5", I(12884901892)); rtSet(f, "s6", I(4)); rtSet(f, "s7", I(0));
+    rtAddrOf(f, "sp", "s0");
+    rtCall1(f, "s0", "__tx_native_object_create_v1", L("sp"));
+    rtRet(f, L("s0"));
+    check(f);
+
+    // __tx_nrt_u8_take(ptr, n) → idx：接管 n 字节的 mem_alloc 块；n 为 0 时不持有块（哨兵指针 1，cap 0）。
+    f = rtBegin(b, "__tx_nrt_u8_take", "ptr n", "c", 3, "bootstrap/selfhost/nrt.tx");
+    rtSet(f, "c", L("n"));
+    rtIf(f, L("n"), "ne", I(0), "take");
+    rtSet(f, "ptr", I(1));
+    rtLabel(f, "take");
+    rtCall3(f, "c", "__tx_nrt_new_u8list", L("ptr"), L("n"), L("c"));
+    rtRet(f, L("c"));
+    check(f);
+
+    // __tx_nrt_u8_copy(ptr, n) → idx：n 字节的拷贝（列表形态）。
+    f = rtBegin(b, "__tx_nrt_u8_copy", "ptr n", "q", 3, "bootstrap/selfhost/nrt.tx");
+    rtSet(f, "q", I(0));
+    rtIf(f, L("n"), "eq", I(0), "make");
+    rtCall2(f, "q", "__tx_native_mem_alloc", L("n"), I(1));
+    rtIf(f, L("q"), "eq", I(0), "oom");
+    rtCall3(f, "", memcpyName(), L("q"), L("ptr"), L("n"));
+    rtLabel(f, "make");
+    rtCall2(f, "q", "__tx_nrt_u8_take", L("q"), L("n"));
+    rtRet(f, L("q"));
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRetVoid(f); check(f);
+
+    // __tx_store_new_str_take(ptr, len, site): kernel-owned bytes move into a str.
+    f = rtBegin(b, "__tx_store_new_str_take", "ptr n site", "", 4, "bootstrap/selfhost/nrt.tx");
+    rtIf(f, L("n"), "ne", I(0), "take");
+    rtIf(f, L("ptr"), "eq", I(0), "empty");
+    rtCall1(f, "", "__tx_native_mem_free", L("ptr"));
+    rtLabel(f, "empty");
+    rtSet(f, "ptr", I(1));
+    rtLabel(f, "take");
+    rtCall4(f, "n", "__tx_nrt_new_bytes", I(1), L("ptr"), L("n"), L("site"));
+    rtRet(f, L("n"));
+    check(f);
+
+    // __tx_nrt_intern(ptr, len) → immortal str idx (bytes are image constants).
+    f = rtBegin(b, "__tx_nrt_intern", "ptr n", "found ok idx state e0 e1 e2 e3 ep", 4, "bootstrap/selfhost/nrt.tx");
+    rtSet(f, "state", A("__tx_nrt_intern_state"));
+    rtCall3(f, "found", "__tx_native_intern_find_v1", L("state"), L("ptr"), L("n"));
+    rtIf32(f, L("found"), "ne", I(-1), "hit");
+    rtCall1(f, "ok", "__tx_native_intern_prepare_v1", L("state"));
+    rtIf32(f, L("ok"), "eq", I(0), "oom");
+    rtSet(f, "idx", L("ptr"));
+    rtIf(f, L("n"), "ne", I(0), "make");
+    rtSet(f, "idx", I(1));
+    rtLabel(f, "make");
+    rtCall4(f, "idx", "__tx_nrt_new_bytes", I(1), L("idx"), L("n"), I(0));
+    rtCall1(f, "", "__tx_nrt_set_immortal", L("idx"));
+    rtSet(f, "e0", I(0)); rtSet(f, "e1", L("ptr")); rtSet(f, "e2", L("n")); rtSet(f, "e3", L("idx"));
+    rtAddrOf(f, "ep", "e0");
+    rtCall2(f, "ok", "__tx_native_intern_insert_v1", L("state"), L("ep"));
+    rtIf32(f, L("ok"), "eq", I(0), "oom");
+    rtRet(f, L("idx"));
+    rtLabel(f, "hit");
+    rtOp(f, "found", L("found"), "and", I(4294967295));
+    rtRet(f, L("found"));
+    rtLabel(f, "oom");
+    rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRetVoid(f);
+    check(f);
+
+    // String span hooks (Obj72: flags@0, ptr@32, len@40).
+    f = rtBegin(b, "__tx_store_str_ptr", "idx", "o", 1, "bootstrap/selfhost/nrt.tx");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("idx")); rtLoad(f, "o", L("o"), 32, 8); rtRet(f, L("o")); check(f);
+    f = rtBegin(b, "__tx_store_str_len", "idx", "o", 1, "bootstrap/selfhost/nrt.tx");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("idx")); rtLoad(f, "o", L("o"), 40, 8); rtRet(f, L("o")); check(f);
+    // 换缓冲即清容量 cap@48（字符串原地追加设计 §四-A 硬约束：旧容量大于新缓冲时下一次追加越界写）。
+    f = rtBegin(b, "__tx_store_str_set_span", "idx ptr n", "o fl", 1, "bootstrap/selfhost/nrt.tx");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("idx"));
+    rtStore(f, L("o"), 32, L("ptr"), 8); rtStore(f, L("o"), 40, L("n"), 8); rtStore(f, L("o"), 48, I(0), 8);
+    rtLoad(f, "fl", L("o"), 0, 4); rtOp(f, "fl", L("fl"), "and", I(-9)); rtStore(f, L("o"), 0, L("fl"), 4);
+    rtRetVoid(f); check(f);
+    // reuse_ok: rc == 1, not a frame string, not frozen and not borrowed from a shared block (threads step 4b: an
+    // in-place append would write into memory other threads read).
+    f = rtBegin(b, "__tx_store_str_reuse_ok", "idx", "o p", 1, "bootstrap/selfhost/nrt.tx");
+    rtCall0(f, "p", "__tx_rc_base"); rtShift(f, "o", L("idx"), "shl", 2); rtOp(f, "p", L("p"), "add", L("o"));
+    rtLoad(f, "p", L("p"), 0, 4); rtIf(f, L("p"), "ne", I(1), "no");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("idx")); rtLoad(f, "o", L("o"), 0, 4); rtOp(f, "o", L("o"), "and", I(52));
+    rtIf(f, L("o"), "ne", I(0), "no");
+    rtRet(f, I(1));
+    rtLabel(f, "no"); rtRet(f, I(0)); check(f);
+
+    // Payload/equal/weak views forward straight to the native object algorithms.
+    f = rtBegin(b, "__tx_store_payload_view", "idx out", "o", 2, "bootstrap/selfhost/nrt.tx");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("idx"));
+    rtCall2(f, "", "__tx_native_object_payload_v1", L("o"), L("out"));
+    rtRetVoid(f); check(f);
+    f = rtBegin(b, "__tx_store_equal_view_v1", "vp out", "tag o", 3, "bootstrap/selfhost/nrt.tx");
+    rtLoad(f, "tag", L("vp"), 0, 1);
+    rtIf(f, L("tag"), "eq", I(5), "err"); rtIf(f, L("tag"), "eq", I(6), "obj"); rtIf(f, L("tag"), "eq", I(7), "obj");
+    rtIf(f, L("tag"), "eq", I(8), "obj"); rtIf(f, L("tag"), "eq", I(10), "obj");
+    rtStore(f, L("out"), 0, I(0), 8); rtStore(f, L("out"), 8, I(0), 8); rtStore(f, L("out"), 16, I(0), 8); rtStore(f, L("out"), 24, I(0), 8);
+    rtRetVoid(f);
+    rtLabel(f, "obj");
+    rtLoad(f, "o", L("vp"), 8, 4);
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("o"));
+    rtCall3(f, "", "__tx_native_object_equal_view_v1", L("o"), L("tag"), L("out"));
+    rtRetVoid(f);
+    // Error 按 message 比较（D3 §6.3-5）；富错误（D3 v0.19）取其 message 串对象。其余标签的路径与原来逐条相同。
+    rtLabel(f, "err");
+    rtLoad(f, "o", L("vp"), 8, 4);
+    rtCall1(f, "o", "__tx_nrt_err_msgobj", L("o"));
+    rtCall3(f, "", "__tx_native_object_equal_view_v1", L("o"), L("tag"), L("out"));
+    rtRetVoid(f); check(f);
+    f = rtBegin(b, "__tx_store_weak_dead_v1", "target box", "o p n", 3, "bootstrap/selfhost/nrt.tx");
+    rtSet(f, "p", G("__tx_nrt_slots")); rtLoad(f, "n", L("p"), 16, 8);
+    rtIf(f, L("box"), "uge", L("n"), "done");
+    rtCall0(f, "p", "__tx_rc_base"); rtShift(f, "o", L("box"), "shl", 2); rtOp(f, "p", L("p"), "add", L("o")); rtLoad(f, "p", L("p"), 0, 4);
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("box"));
+    rtCall3(f, "", "__tx_native_object_weak_dead_v1", L("o"), L("p"), L("target"));
+    rtLabel(f, "done"); rtRetVoid(f); check(f);
+
+    // Release-to-zero dispatch (native values configuration): 3 container,
+    // 1 bytes, 2 empty bytes, 0 weakbox, thread handle, Shared handle, Atomic and
+    // objects whose payload is borrowed from a shared block (header bit 32; threads
+    // step 4c) — all handled by __tx_rc_zero_cascade. One header test covers the
+    // frame (4) and borrowed (32) bits.
+    f = rtBegin(b, "__tx_store_zero_kind", "idx", "o fl pk n", 1, "bootstrap/selfhost/nrt.tx");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("idx"));
+    rtLoad(f, "fl", L("o"), 0, 4); rtOp(f, "fl", L("fl"), "and", I(36)); rtIf(f, L("fl"), "ne", I(0), "flagged");
+    rtLoad(f, "pk", L("o"), 16, 4);
+    rtIf(f, L("pk"), "ne", I(0), "notbytes");
+    rtLoad(f, "n", L("o"), 40, 8); rtIf(f, L("n"), "eq", I(0), "two");
+    rtRet(f, I(1));
+    rtLabel(f, "two"); rtRet(f, I(2));
+    rtLabel(f, "notbytes"); rtIf(f, L("pk"), "eq", I(6), "zero"); rtIf(f, L("pk"), "ugt", I(9), "zero");
+    rtLabel(f, "three"); rtRet(f, I(3));
+    rtLabel(f, "flagged"); rtIf(f, L("fl"), "ne", I(32), "three");
+    rtLabel(f, "zero"); rtRet(f, I(0)); check(f);
+
+    // __tx_nrt_free_slot(idx): poison Data, mark payload kind, return the slot.
+    f = rtBegin(b, "__tx_nrt_free_slot", "idx", "o k ok", 2, "bootstrap/selfhost/nrt.tx");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("idx"));
+    // Data bytes 24..72 become 0xAB (six unrolled qword stores).
+    let pk = 24;
+    while (pk < 72) { rtStore(f, L("o"), pk, I(-6076574518398440533), 8); pk = pk + 8; }
+    rtStore(f, L("o"), 16, I(2880154539), 4);
+    rtCall2(f, "ok", "__tx_native_slots_free_v2", G("__tx_nrt_slots"), L("idx"));
+    rtIf32(f, L("ok"), "eq", I(0), "bad");
+    rtRetVoid(f);
+    rtLabel(f, "bad");
+    fatal(b, f, "taixu NRT: 槽位归还失败\n", 70);
+    rtRetVoid(f); check(f);
+
+    // __tx_store_zero_tail(idx): weak death notice, then slot release.
+    f = rtBegin(b, "__tx_store_zero_tail", "idx", "o fl", 2, "bootstrap/selfhost/nrt.tx");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("idx"));
+    rtLoad(f, "fl", L("o"), 0, 4); rtOp(f, "fl", L("fl"), "and", I(1));
+    rtIf(f, L("fl"), "eq", I(0), "free");
+    rtCall2(f, "", "__tx_native_weak_notify_v1", A("__tx_nrt_weak_state"), L("idx"));
+    rtLabel(f, "free");
+    rtCall1(f, "", "__tx_nrt_free_slot", L("idx"));
+    rtRetVoid(f); check(f);
+
+    // __tx_rc_zero_cascade(idx): the non-native arms are the weakbox (unregister
+    // from its target, then the common tail), the thread handle (payload kind
+    // 10: let go of the process-level thread record, threads step 2) and the
+    // threads step 4c objects (nrt_shared.tx): a borrowed payload (header bit 32)
+    // lets go of its shared block, a Shared handle (payload kind 11) of its cached
+    // root and block, an Atomic (payload kind 12) frees its cell. The last arm is
+    // the deep-chain fallback: __tx_zero_container hands over a container whose
+    // count reached zero beyond the 8192-level guard; it goes onto this thread's
+    // pending table and the outermost release frame drains it.
+    f = rtBegin(b, "__tx_rc_zero_cascade", "idx", "o pk target", 3, "bootstrap/selfhost/nrt.tx");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("idx"));
+    rtLoad(f, "pk", L("o"), 0, 4); rtOp(f, "pk", L("pk"), "and", I(32)); rtIf(f, L("pk"), "ne", I(0), "borrowed");
+    rtLoad(f, "pk", L("o"), 16, 4);
+    rtIf(f, L("pk"), "eq", I(10), "thread");
+    rtIf(f, L("pk"), "eq", I(11), "shared");
+    rtIf(f, L("pk"), "eq", I(12), "atomic");
+    rtIf(f, L("pk"), "ne", I(6), "other");
+    rtLoad(f, "target", L("o"), 24, 4);
+    rtCall3(f, "", "__tx_native_weak_unlink_v1", A("__tx_nrt_weak_state"), L("target"), L("idx"));
+    rtCall1(f, "", "__tx_store_zero_tail", L("idx"));
+    rtRetVoid(f);
+    rtLabel(f, "thread");
+    rtLoad(f, "target", L("o"), 32, 8);
+    rtCall1(f, "", "__tx_thread_drop", L("target"));
+    rtCall1(f, "", "__tx_store_zero_tail", L("idx"));
+    rtRetVoid(f);
+    rtLabel(f, "borrowed"); rtCall1(f, "", "__tx_shared_unborrow", L("idx")); rtRetVoid(f);
+    rtLabel(f, "shared"); rtCall1(f, "", "__tx_shared_drop", L("idx")); rtRetVoid(f);
+    rtLabel(f, "atomic"); rtCall1(f, "", "__tx_atomic_drop", L("idx")); rtRetVoid(f);
+    rtLabel(f, "other");
+    rtCall1(f, "pk", "__tx_store_zero_kind", L("idx"));
+    rtIf(f, L("pk"), "ne", I(3), "bad");
+    rtSet(f, "target", A("__tx_nrt_tb")); rtOp(f, "target", L("target"), "add", I(TB_ZERO_PENDING));
+    rtCall2(f, "", "__tx_task_vpush", L("target"), L("idx"));
+    rtRetVoid(f);
+    rtLabel(f, "bad");
+    fatal(b, f, "taixu NRT: 释放回退收到非容器对象\n", 70);
+    rtRetVoid(f); check(f);
+
+    // __tx_zero_drain(): only the outermost release frame (depth 1) drains the
+    // pending table, so draining never nests; containers released while draining
+    // may push more entries, and the loop runs until the table is empty.
+    f = rtBegin(b, "__tx_zero_drain", "", "t d n p idx", 1, "bootstrap/selfhost/nrt.tx");
+    rtSet(f, "t", A("__tx_nrt_tb"));
+    rtLoad(f, "d", L("t"), TB_ZERO_DEPTH, 4);
+    rtIf(f, L("d"), "ne", I(1), "done");
+    rtLabel(f, "loop");
+    rtLoad(f, "n", L("t"), TB_ZERO_PENDING + 8, 8);
+    rtIf(f, L("n"), "eq", I(0), "done");
+    rtOp(f, "n", L("n"), "sub", I(1)); rtStore(f, L("t"), TB_ZERO_PENDING + 8, L("n"), 8);
+    rtLoad(f, "p", L("t"), TB_ZERO_PENDING, 8);
+    rtShift(f, "idx", L("n"), "shl", 3); rtOp(f, "p", L("p"), "add", L("idx"));
+    rtLoad(f, "idx", L("p"), 0, 8);
+    rtCall1(f, "", "__tx_zero_container", L("idx"));
+    rtJump(f, "loop");
+    rtLabel(f, "done");
+    rtRetVoid(f); check(f);
+}
+
+// ---------------------------------------------------------------------------
+// Program setup and entry
+// ---------------------------------------------------------------------------
+
+function emitEntry(b: Ref<StructuredBuffer>): void {
+    // __tx_nrt_call_fn(fn_idx): window at stack base, all None, R0 = state ref.
+    let f = rtBegin(b, "__tx_nrt_call_fn", "fn", "e fp reg state win w p", 1, "bootstrap/selfhost/nrt.tx");
+    rtShift(f, "e", L("fn"), "shl", 4); rtOp(f, "e", L("e"), "add", G("__tx_rt_table_ptr"));
+    rtLoad(f, "fp", L("e"), 0, 8); rtLoad(f, "reg", L("e"), 8, 4); rtLoad(f, "state", L("e"), 12, 4);
+    rtSet(f, "win", G("__tx_nrt_stack"));
+    rtCall2(f, "", "__tx_nrt_window", L("win"), L("reg"));
+    rtStore(f, L("win"), 0, I(9), 8); rtStore(f, L("win"), 8, L("state"), 8);
+    rtCall1(f, "", "*fp", L("win"));
+    rtRetVoid(f); check(f);
+
+    // __tx_nrt_window(win, count): None-fill the first count slots. A window on this thread's value
+    // stack is committed first when it reaches past the committed end (threads §十七); windows
+    // elsewhere (a generator's heap buffer) are filled as they are.
+    f = rtBegin(b, "__tx_nrt_window", "win n", "w p", 1, "bootstrap/selfhost/nrt.tx");
+    rtOp(f, "w", L("win"), "sub", A("__tx_nrt_tb"));
+    rtIf(f, L("w"), "uge", I(TB_REGION), "filled");
+    rtShift(f, "p", L("n"), "shl", 4); rtOp(f, "p", L("p"), "add", L("win"));
+    rtCall1(f, "", "__tx_stack_ensure", L("p"));
+    rtLabel(f, "filled");
+    rtSet(f, "w", I(0));
+    rtLabel(f, "loop");
+    rtIf(f, L("w"), "ge", L("n"), "done");
+    rtShift(f, "p", L("w"), "shl", 4); rtOp(f, "p", L("p"), "add", L("win"));
+    rtStore(f, L("p"), 0, I(4), 8); rtStore(f, L("p"), 8, I(0), 8);
+    rtOp(f, "w", L("w"), "add", I(1));
+    rtJump(f, "loop");
+    rtLabel(f, "done"); rtRetVoid(f); check(f);
+
+    // __tx_nrt_state_object(nfields, ty) → immortal module state Ref.
+    f = rtBegin(b, "__tx_nrt_state_object", "nf ty", "fields s0 s1 s2 s3 s4 s5 s6 s7 sp", 1, "bootstrap/selfhost/nrt.tx");
+    rtCall1(f, "fields", "__tx_native_values_alloc_v1", L("nf"));
+    rtIf(f, L("fields"), "eq", I(0), "oom");
+    rtShift(f, "s0", L("ty"), "shl", 32); rtOp(f, "s0", L("s0"), "or", I(5));
+    rtSet(f, "s1", I(4294967296));
+    rtSet(f, "s2", L("fields")); rtSet(f, "s3", L("nf")); rtSet(f, "s4", I(0)); rtSet(f, "s5", I(0)); rtSet(f, "s6", I(4)); rtSet(f, "s7", I(0));
+    rtAddrOf(f, "sp", "s0");
+    rtCall1(f, "s0", "__tx_native_object_create_v1", L("sp"));
+    rtCall1(f, "", "__tx_nrt_set_immortal", L("s0"));
+    rtRet(f, L("s0"));
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRetVoid(f); check(f);
+
+    // __tx_nrt_std_init: process-level output handles (no thread block needed).
+    f = rtBegin(b, "__tx_nrt_std_init", "", "v", 1, "bootstrap/selfhost/nrt.tx");
+    if (tUnix(nrtTarget())) {
+        rtSetGlobal(f, "__tx_nrt_out", I(1)); rtSetGlobal(f, "__tx_nrt_err", I(2));
+    } else {
+        rtCall1(f, "v", "GetStdHandle", I(-11)); rtSetGlobal(f, "__tx_nrt_out", L("v"));
+        rtCall1(f, "v", "GetStdHandle", I(-12)); rtSetGlobal(f, "__tx_nrt_err", L("v"));
+    }
+    rtRetVoid(f); check(f);
+
+    // __tx_nrt_thread_state(main): the per-thread part of startup on the thread block in
+    // rbx — Store, string constants, module states, value stack fields, native stack
+    // guard. Every thread creates the same startup objects in the same order, so the
+    // module state object numbers in the process-level rt table are the same in every
+    // thread (threads §十三-1); a non-main thread checks that against the main thread's
+    // table and stops the process if they differ.
+    f = rtBegin(b, "__tx_nrt_thread_state", "main", "img v n i p q x y z strs mods probe", 4, "bootstrap/selfhost/nrt.tx");
+    rtSet(f, "img", A("__tx_nrt_image"));
+    rtCall1(f, "v", "__tx_native_slots_create_v2", I(OBJ_SIZE));
+    rtIf(f, L("v"), "eq", I(0), "oom");
+    rtSetGlobal(f, "__tx_nrt_slots", L("v"));
+    // String constants → immortal interned objects.
+    rtLoad(f, "n", L("img"), NRT_IMG_NSTRINGS, 8);
+    rtShift(f, "x", L("n"), "shl", 2); rtOp(f, "x", L("x"), "add", I(4));
+    rtCall2(f, "strs", "__tx_native_mem_alloc", L("x"), I(4)); rtIf(f, L("strs"), "eq", I(0), "oom");
+    rtSetGlobal(f, "__tx_str_objs_ptr", L("strs"));
+    rtLoad(f, "p", L("img"), NRT_IMG_STRINGS, 8);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "strloop");
+    rtIf(f, L("i"), "ge", L("n"), "strdone");
+    rtShift(f, "q", L("i"), "shl", 4); rtOp(f, "q", L("q"), "add", L("p"));
+    rtLoad(f, "x", L("q"), 0, 8); rtLoad(f, "y", L("q"), 8, 8);
+    rtCall2(f, "z", "__tx_nrt_intern", L("y"), L("x"));
+    rtShift(f, "q", L("i"), "shl", 2); rtOp(f, "q", L("q"), "add", L("strs")); rtStore(f, L("q"), 0, L("z"), 4);
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "strloop");
+    rtLabel(f, "strdone");
+    // Module states (immortal Refs).
+    rtLoad(f, "n", L("img"), NRT_IMG_NMODULES, 8);
+    rtShift(f, "x", L("n"), "shl", 2); rtOp(f, "x", L("x"), "add", I(4));
+    rtCall2(f, "mods", "__tx_native_mem_alloc", L("x"), I(4)); rtIf(f, L("mods"), "eq", I(0), "oom");
+    rtSetGlobal(f, "__tx_nrt_module_states", L("mods"));
+    rtLoad(f, "p", L("img"), NRT_IMG_MODULES, 8);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "modloop");
+    rtIf(f, L("i"), "ge", L("n"), "moddone");
+    rtShift(f, "q", L("i"), "shl", 5); rtOp(f, "q", L("q"), "add", L("p"));
+    rtLoad(f, "x", L("q"), 0, 8); rtLoad(f, "y", L("q"), 8, 8);
+    rtCall2(f, "z", "__tx_nrt_state_object", L("x"), L("y"));
+    rtShift(f, "q", L("i"), "shl", 2); rtOp(f, "q", L("q"), "add", L("mods")); rtStore(f, L("q"), 0, L("z"), 4);
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "modloop");
+    rtLabel(f, "moddone");
+    // Value stack right after the thread block: only its first TB_STACK_INIT bytes are committed
+    // (None-filled by __tx_nrt_region_new); __tx_stack_more commits more on demand (threads §十七).
+    rtSet(f, "v", A("__tx_nrt_tb")); rtOp(f, "v", L("v"), "add", I(TB_HEADER));
+    rtSetGlobal(f, "__tx_nrt_stack", L("v"));
+    rtOp(f, "v", L("v"), "add", I(TB_STACK_INIT)); rtSetGlobal(f, "__tx_stack_limit", L("v"));
+    // Native stack guard from this thread's real stack bounds (threads §十七-4).
+    rtAddrOf(f, "probe", "probe");
+    rtCall2(f, "probe", "__tx_nrt_native_limit", L("probe"), L("main"));
+    rtSetGlobal(f, "__tx_native_stack_limit", L("probe"));
+    rtIf(f, L("main"), "ne", I(0), "mainmods");
+    rtLoad(f, "n", L("img"), NRT_IMG_NMODULES, 8);
+    rtSet(f, "p", G("__tx_nrt_main_mods"));
+    rtShift(f, "n", L("n"), "shl", 2);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "cmploop");
+    rtIf(f, L("i"), "ge", L("n"), "cmpslots");
+    rtOp(f, "q", L("mods"), "add", L("i")); rtLoad(f, "x", L("q"), 0, 4);
+    rtOp(f, "q", L("p"), "add", L("i")); rtLoad(f, "y", L("q"), 0, 4);
+    rtIf(f, L("x"), "ne", L("y"), "mismatch");
+    rtOp(f, "i", L("i"), "add", I(4));
+    rtJump(f, "cmploop");
+    // 启动对象界（线程间发送按序号传启动对象，线程设计 §十八）：各线程启动后的槽表长度须与主线程相同。
+    rtLabel(f, "cmpslots");
+    rtSet(f, "x", G("__tx_nrt_slots")); rtLoad(f, "x", L("x"), 16, 8);
+    rtIf(f, L("x"), "ne", G("__tx_nrt_startup_slots"), "mismatch");
+    rtJump(f, "done");
+    rtLabel(f, "mainmods");
+    rtSetGlobal(f, "__tx_nrt_main_mods", L("mods"));
+    rtSet(f, "x", G("__tx_nrt_slots")); rtLoad(f, "x", L("x"), 16, 8);
+    rtSetGlobal(f, "__tx_nrt_startup_slots", L("x"));
+    rtLabel(f, "done");
+    rtRetVoid(f);
+    rtLabel(f, "mismatch");
+    fatal(b, f, "taixu NRT: 线程启动对象的序号与主线程不一致\n", 70);
+    rtLabel(f, "oom");
+    rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRetVoid(f); check(f);
+
+    // __tx_nrt_module_inits: module initializers in dependency order (each thread
+    // runs them once: module-level `let` is per thread, threads §四-3).
+    f = rtBegin(b, "__tx_nrt_module_inits", "", "img n p i q x", 1, "bootstrap/selfhost/nrt.tx");
+    rtSet(f, "img", A("__tx_nrt_image"));
+    rtLoad(f, "n", L("img"), NRT_IMG_NMODULES, 8);
+    rtLoad(f, "p", L("img"), NRT_IMG_MODULES, 8);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "initloop");
+    rtIf(f, L("i"), "ge", L("n"), "initdone");
+    rtShift(f, "q", L("i"), "shl", 5); rtOp(f, "q", L("q"), "add", L("p")); rtLoad(f, "x", L("q"), 16, 8);
+    rtCall1(f, "", "__tx_nrt_call_fn", L("x"));
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "initloop");
+    rtLabel(f, "initdone");
+    rtRetVoid(f); check(f);
+
+    // __tx_host_entry_setup: image check, output handles, the main thread's startup
+    // objects (__tx_nrt_thread_state), the process-level runtime function table, module
+    // inits. The entry stub has already made rbx the main thread's block.
+    f = rtBegin(b, "__tx_host_entry_setup", "", "img v n i p q x y z mods rt", 4, "bootstrap/selfhost/nrt.tx");
+    rtSet(f, "img", A("__tx_nrt_image"));
+    rtLoad(f, "v", L("img"), 0, 8); rtIf(f, L("v"), "ne", I(NRT_IMAGE_MAGIC), "badimg");
+    // 版本字：低 32 位为版本，高 32 位为构建标志（位 0＝--leak-check，见 nrt_leak.tx）。
+    rtLoad(f, "v", L("img"), 8, 8);
+    rtShift(f, "x", L("v"), "shr", 32); rtOp(f, "x", L("x"), "and", I(1)); rtSetGlobal(f, "__tx_leak_on", L("x"));
+    rtOp(f, "v", L("v"), "and", I(4294967295));
+    rtIf(f, L("v"), "eq", I(NRT_IMAGE_VERSION), "imgok");
+    rtIf(f, L("v"), "ne", I(2), "badimg");
+    rtLabel(f, "imgok");
+    rtCall0(f, "", "__tx_nrt_std_init");
+    rtCall1(f, "", "__tx_nrt_thread_state", I(1));
+    rtSet(f, "mods", G("__tx_nrt_main_mods"));
+    // Runtime function table: {fn_ptr, reg_count u32, state_obj u32}.
+    rtLoad(f, "n", L("img"), NRT_IMG_NFUNCS, 8);
+    rtShift(f, "x", L("n"), "shl", 4); rtOp(f, "x", L("x"), "add", I(16));
+    rtCall2(f, "rt", "__tx_native_mem_alloc", L("x"), I(8)); rtIf(f, L("rt"), "eq", I(0), "oom");
+    rtLoad(f, "p", L("img"), NRT_IMG_FUNCS, 8);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "fnloop");
+    rtIf(f, L("i"), "ge", L("n"), "fndone");
+    rtShift(f, "q", L("i"), "shl", 3); rtOp(f, "q", L("q"), "add", A("__tx_fn_table_data")); rtLoad(f, "x", L("q"), 0, 8);
+    rtShift(f, "z", L("i"), "shl", 4); rtOp(f, "z", L("z"), "add", L("rt")); rtStore(f, L("z"), 0, L("x"), 8);
+    rtOp(f, "q", L("i"), "imul", I(NRT_FN_STRIDE)); rtOp(f, "q", L("q"), "add", L("p"));
+    rtLoad(f, "x", L("q"), 0, 8); rtStore(f, L("z"), 8, L("x"), 4);
+    rtLoad(f, "y", L("q"), 8, 8); rtShift(f, "y", L("y"), "shl", 2); rtOp(f, "y", L("y"), "add", L("mods")); rtLoad(f, "y", L("y"), 0, 4);
+    rtStore(f, L("z"), 12, L("y"), 4);
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "fnloop");
+    rtLabel(f, "fndone");
+    rtSetGlobal(f, "__tx_rt_table_ptr", L("rt"));
+    rtSetGlobal(f, "__tx_rt_table_len", L("n"));
+    rtCall0(f, "", "__tx_nrt_module_inits");
+    rtRetVoid(f);
+    rtLabel(f, "badimg");
+    fatal(b, f, "taixu NRT: 程序映像版本不匹配\n", 70);
+    rtLabel(f, "oom");
+    rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRetVoid(f); check(f);
+
+    // __tx_entry_stage(elems, count) → entry code address; window kept for finish.
+    f = rtBegin(b, "__tx_entry_stage", "elems count", "img entry e np reg st win vals arr sl s0 s1 s2 s3 s4 s5 s6 s7 sp nt", 5, "bootstrap/selfhost/nrt.tx");
+    rtSet(f, "img", A("__tx_nrt_image"));
+    // Test-mode image (native `taixu test`): the first program argument is the
+    // decimal index of the test block to run; it takes the place of main.
+    rtLoad(f, "nt", L("img"), NRT_IMG_NTESTS, 8);
+    rtIf(f, L("nt"), "eq", I(0), "bymain");
+    rtIf(f, L("count"), "lt", I(1), "badtest");
+    rtLoad(f, "s0", L("elems"), 8, 4);
+    rtCall1(f, "s0", "__tx_native_object_address_v1", L("s0"));
+    rtLoad(f, "s1", L("s0"), 32, 8); rtLoad(f, "s2", L("s0"), 40, 8);
+    rtIf(f, L("s2"), "eq", I(0), "badtest");
+    rtSet(f, "entry", I(0)); rtSet(f, "s3", I(0));
+    rtLabel(f, "digit");
+    rtIf(f, L("s3"), "ge", L("s2"), "parsed");
+    rtOp(f, "s4", L("s1"), "add", L("s3")); rtLoad(f, "s4", L("s4"), 0, 1);
+    rtIf(f, L("s4"), "lt", I(48), "badtest"); rtIf(f, L("s4"), "gt", I(57), "badtest");
+    rtOp(f, "entry", L("entry"), "imul", I(10)); rtOp(f, "entry", L("entry"), "add", L("s4")); rtOp(f, "entry", L("entry"), "sub", I(48));
+    rtIf(f, L("entry"), "ge", L("nt"), "badtest");
+    rtOp(f, "s3", L("s3"), "add", I(1)); rtJump(f, "digit");
+    rtLabel(f, "parsed");
+    rtLoad(f, "e", L("img"), NRT_IMG_TESTS, 8);
+    rtShift(f, "s0", L("entry"), "shl", 3); rtOp(f, "e", L("e"), "add", L("s0"));
+    rtLoad(f, "entry", L("e"), 0, 8);
+    rtJump(f, "chosen");
+    rtLabel(f, "bymain");
+    rtLoad(f, "entry", L("img"), NRT_IMG_ENTRY, 8);
+    rtSetGlobal(f, "__tx_task_main", I(1));
+    rtLabel(f, "chosen");
+    rtIf(f, L("entry"), "lt", I(0), "nomain");
+    rtIf(f, L("entry"), "uge", G("__tx_rt_table_len"), "range");
+    rtLoad(f, "e", L("img"), NRT_IMG_FUNCS, 8);
+    rtOp(f, "s0", L("entry"), "imul", I(NRT_FN_STRIDE)); rtOp(f, "e", L("e"), "add", L("s0"));
+    rtLoad(f, "reg", L("e"), 0, 8); rtLoad(f, "np", L("e"), 16, 8);
+    rtShift(f, "st", L("entry"), "shl", 4); rtOp(f, "st", L("st"), "add", G("__tx_rt_table_ptr")); rtLoad(f, "st", L("st"), 12, 4);
+    rtIf(f, L("np"), "eq", I(1), "argvmain");
+    // main 不带参数（及测试入口）：命令行参数的字符串对象交不出去，在此释放；装参数的原生数组随即归还
+    // （此前两者都不释放，泄漏检查设计 §三-5）。
+    rtSet(f, "s0", I(0));
+    rtLabel(f, "argvrel");
+    rtIf(f, L("s0"), "ge", L("count"), "argvdone");
+    rtShift(f, "s1", L("s0"), "shl", 4); rtOp(f, "s1", L("s1"), "add", L("elems"));
+    rtCall1(f, "", "__tx_release", L("s1"));
+    rtOp(f, "s0", L("s0"), "add", I(1)); rtJump(f, "argvrel");
+    rtLabel(f, "argvdone");
+    rtCall1(f, "", "__tx_native_mem_free", L("elems"));
+    rtJump(f, "window");
+    rtLabel(f, "argvmain");
+    rtCall1(f, "vals", "__tx_native_values_alloc_v1", L("count")); rtIf(f, L("vals"), "eq", I(0), "oom");
+    rtShift(f, "s0", L("count"), "shl", 4);
+    rtCall3(f, "", memcpyName(), L("vals"), L("elems"), L("s0"));
+    rtCall1(f, "", "__tx_native_mem_free", L("elems"));
+    // arr: kind 6, payload_kind arr 3, elems span, meta = count.
+    rtSet(f, "s0", I(6)); rtSet(f, "s1", I(12884901888)); rtSet(f, "s2", L("vals")); rtSet(f, "s3", L("count"));
+    rtSet(f, "s4", I(0)); rtSet(f, "s5", L("count")); rtOp(f, "s5", L("s5"), "and", I(4294967295)); rtSet(f, "s6", I(4)); rtSet(f, "s7", I(0));
+    rtAddrOf(f, "sp", "s0"); rtCall1(f, "arr", "__tx_native_object_create_v1", L("sp"));
+    // slice: kind 7, payload_kind slice 4, meta = arr, aux = count.
+    rtSet(f, "s0", I(7)); rtSet(f, "s1", I(17179869184)); rtSet(f, "s2", I(0)); rtSet(f, "s3", I(0)); rtSet(f, "s4", I(0));
+    rtShift(f, "s5", L("count"), "shl", 32); rtOp(f, "s5", L("s5"), "or", L("arr")); rtSet(f, "s6", I(4)); rtSet(f, "s7", I(0));
+    rtAddrOf(f, "sp", "s0"); rtCall1(f, "sl", "__tx_native_object_create_v1", L("sp"));
+    rtLabel(f, "window");
+    rtSet(f, "win", G("__tx_nrt_stack"));
+    rtCall2(f, "", "__tx_nrt_window", L("win"), L("reg"));
+    rtStore(f, L("win"), 0, I(9), 8); rtStore(f, L("win"), 8, L("st"), 8);
+    rtIf(f, L("np"), "ne", I(1), "staged");
+    rtStore(f, L("win"), 16, I(11), 8); rtStore(f, L("win"), 24, L("sl"), 8);
+    rtLabel(f, "staged");
+    rtSetGlobal(f, "__tx_nrt_entry_win", L("win"));
+    rtShift(f, "e", L("entry"), "shl", 4); rtOp(f, "e", L("e"), "add", G("__tx_rt_table_ptr")); rtLoad(f, "e", L("e"), 0, 8);
+    rtRet(f, L("e"));
+    const noMain = text(b, "程序没有 main 入口");
+    const badIdx = text(b, "函数索引越界");
+    const badTest = text(b, "测试序号无效");
+    rtLabel(f, "nomain");
+    rtCall5(f, "", "__tx_trap", L("entry"), I(0), I(4012), A(noMain), I(len("程序没有 main 入口")));
+    rtLabel(f, "range");
+    rtCall5(f, "", "__tx_trap", L("entry"), I(0), I(4012), A(badIdx), I(len("函数索引越界")));
+    rtLabel(f, "badtest");
+    rtCall5(f, "", "__tx_trap", I(0), I(0), I(4012), A(badTest), I(len("测试序号无效")));
+    rtLabel(f, "oom");
+    rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRetVoid(f); check(f);
+
+    f = rtBegin(b, "__tx_entry_win_ptr", "", "", 0, "bootstrap/selfhost/nrt.tx");
+    rtRet(f, G("__tx_nrt_entry_win")); check(f);
+
+    // __tx_entry_result → process exit code: int result clamped to 1..255, else 0.
+    // main 返回 int | Error 的失败值（D3 v0.19）：toStr 文本写 stderr，退出码 1。
+    // 入口调用的 __tx_entry_finish 在 nrt_leak.tx：先调本例程，开启泄漏检查时再扫描。
+    const failNl = text(b, "\n");
+    f = rtBegin(b, "__tx_entry_result", "", "win tag v s o p n bt bp", 3, "bootstrap/selfhost/nrt.tx");
+    // 调度泵（原生异步）：main 同步体排空后 FIFO 跑完就绪任务；任务窗口从
+    // main 结果槽之后开始，main 的结果原样留到这里取用。测试入口不进泵（同 VM）。
+    rtIf(f, G("__tx_task_main"), "eq", I(0), "test_tasks");
+    rtCall0(f, "", "__tx_task_pump");
+    rtJump(f, "pumped");
+    rtLabel(f, "test_tasks");
+    rtCall0(f, "", "__tx_task_discard_tests");
+    rtLabel(f, "pumped");
+    // main 返回后等全部线程结束再退出（线程设计 §十三-4；没有线程时只读一次计数）。
+    rtCall0(f, "", "__tx_thread_wait_all");
+    rtSet(f, "win", G("__tx_nrt_entry_win"));
+    rtLoad(f, "tag", L("win"), 0, 1); rtLoad(f, "v", L("win"), 8, 8);
+    rtIf(f, L("tag"), "eq", I(5), "failed");
+    rtCall1(f, "", "__tx_release", L("win"));
+    rtIf(f, L("tag"), "ne", I(1), "zero");
+    rtIf(f, L("v"), "eq", I(0), "zero");
+    rtIf(f, L("v"), "lt", I(1), "one");
+    rtIf(f, L("v"), "gt", I(255), "max");
+    rtRet(f, L("v"));
+    rtLabel(f, "one"); rtRet(f, I(1));
+    rtLabel(f, "max"); rtRet(f, I(255));
+    rtLabel(f, "zero"); rtRet(f, I(0));
+    rtLabel(f, "failed");
+    rtOp(f, "v", L("v"), "and", I(4294967295));
+    rtCall1(f, "s", "__tx_nrt_err_text", L("v"));
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("s"));
+    rtLoad(f, "p", L("o"), 32, 8); rtLoad(f, "n", L("o"), 40, 8);
+    rtCall3(f, "", "__tx_nrt_write", I(2), L("p"), L("n"));
+    rtCall3(f, "", "__tx_nrt_write", I(2), A(failNl), I(1));
+    rtSet(f, "bt", I(6)); rtSet(f, "bp", L("s")); rtAddrOf(f, "o", "bt");
+    rtCall1(f, "", "__tx_release", L("o"));
+    rtCall1(f, "", "__tx_release", L("win"));
+    rtRet(f, I(1)); check(f);
+
+    // 取参数表时内存不足（状态 2：拆分命令行或转 UTF-8 时自己的分配失败）与其他分配失败
+    // 同归致命 OOM（退出码 3、“taixu: 内存不足”），不报成用法错误 64；坏的 UTF-16 与其他系统失败照旧 64。
+    // 状态 1：参数不是合法的 UTF-8／UTF-16，各目标都拒绝启动（D3 v0.41，string 恒为合法 UTF-8）。
+    f = rtBegin(b, "__tx_host_argv_fail", "status", "", 3, "bootstrap/selfhost/nrt.tx");
+    rtIf(f, L("status"), "eq", I(2), "memory");
+    if (tLinux(nrtTarget())) {
+        rtIf(f, L("status"), "eq", I(1), "unicode");
+        fatal(b, f, "taixu aot: Linux argv acquisition failed: SystemArgs\n", 64);
+        rtLabel(f, "unicode"); fatal(b, f, "taixu aot: Linux argv acquisition failed: InvalidUnicode\n", 64);
+    } else if (tMacos(nrtTarget())) {
+        rtIf(f, L("status"), "eq", I(1), "unicode");
+        fatal(b, f, "taixu aot: macOS argv acquisition failed: SystemArgs\n", 64);
+        rtLabel(f, "unicode"); fatal(b, f, "taixu aot: macOS argv acquisition failed: InvalidUnicode\n", 64);
+    } else {
+        rtIf(f, L("status"), "eq", I(1), "unicode");
+        fatal(b, f, "taixu aot: Windows UTF-8 argv acquisition failed: SystemArgs\n", 64);
+        rtLabel(f, "unicode"); fatal(b, f, "taixu aot: Windows UTF-8 argv acquisition failed: InvalidUnicode\n", 64);
+    }
+    rtLabel(f, "memory"); rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRetVoid(f); check(f);
+}
+
+// ---------------------------------------------------------------------------
+// Trap reporting: `module:line:col: [runtime:name] msg\n` to stderr, exit 3.
+// ---------------------------------------------------------------------------
+
+const RUNTIME_NAMES: string = "div_by_zero out_of_bounds stack_overflow int_overflow f2i_overflow bad_opcode resource_depth panicked assert_failed bad_type not_exhaustive corrupt_code extern sched_deadlock exit_pending shift_count gen_running narrow_range ffi_arg ffi_callback unsendable frozen_write leak ffi_buffer_borrow";
+
+function emitTrap(b: Ref<StructuredBuffer>): void {
+    // Name table: {ptr, len} for codes 4001..4024 (4017 gen_running, D3 v0.22; 4018 narrow_range, fixed-width as;
+    // 4019 ffi_arg, D3 v0.23 FFI argument marshaling; 4020 ffi_callback, callback outside a call or thread;
+    // 4021 unsendable, threads §十八、§二十; 4022 frozen_write, threads §二十一-2; 4023 leak, 泄漏检查设计 §三-4，
+    // 只用于泄漏报告的首行，不是 trap; 4024 ffi_buffer_borrow).
+    const names = strSplit(RUNTIME_NAMES, " ");
+    const labels: List<string> = listNew();
+    let k = 0;
+    while (k < listLen(names)) { listPush(labels, text(b, listGet(names, k) catch "")); k = k + 1; }
+    const fallback = text(b, "runtime_error");
+    asBufferSection(b, 1, 1);
+    asBufferAlign(b, 3, 1);
+    asBufferLabel(b, "__tx_nrt_code_names", 1);
+    k = 0;
+    while (k < listLen(names)) { asBufferAddress(b, listGet(labels, k) catch "", 1); asBufferQuad(b, len(listGet(names, k) catch ""), 1); k = k + 1; }
+    asBufferSection(b, 0, 1);
+
+    // __tx_nrt_put(buf, pos, ptr, n) → new pos (bounded by 1000).
+    let f = rtBegin(b, "__tx_nrt_put", "buf pos ptr n", "i c d", 0, "bootstrap/selfhost/nrt.tx");
+    rtSet(f, "i", I(0));
+    rtLabel(f, "loop");
+    rtIf(f, L("i"), "ge", L("n"), "done");
+    rtIf(f, L("pos"), "ge", I(1000), "done");
+    rtOp(f, "c", L("ptr"), "add", L("i")); rtLoad(f, "c", L("c"), 0, 1);
+    rtOp(f, "d", L("buf"), "add", L("pos")); rtStore(f, L("d"), 0, L("c"), 1);
+    rtOp(f, "i", L("i"), "add", I(1)); rtOp(f, "pos", L("pos"), "add", I(1));
+    rtJump(f, "loop");
+    rtLabel(f, "done"); rtRet(f, L("pos")); check(f);
+
+    // __tx_nrt_put_udec(buf, pos, value) → new pos.
+    f = rtBegin(b, "__tx_nrt_put_udec", "buf pos v", "t0 t1 t2 n q r p", 4, "bootstrap/selfhost/nrt.tx");
+    rtSet(f, "n", I(0));
+    rtAddrOf(f, "p", "t0");
+    rtIf(f, L("v"), "ne", I(0), "digits");
+    rtStore(f, L("p"), 0, I(48), 1); rtSet(f, "n", I(1)); rtJump(f, "emit");
+    rtLabel(f, "digits");
+    // Fill t0..t2 (24 bytes) from the right.
+    rtSet(f, "n", I(24));
+    rtLabel(f, "dloop");
+    rtIf(f, L("v"), "eq", I(0), "shift");
+    rtDivMod(f, "v", "r", L("v"), I(10));
+    rtOp(f, "n", L("n"), "sub", I(1));
+    rtOp(f, "r", L("r"), "add", I(48)); rtOp(f, "q", L("p"), "add", L("n")); rtStore(f, L("q"), 0, L("r"), 1);
+    rtJump(f, "dloop");
+    rtLabel(f, "shift");
+    rtOp(f, "q", L("p"), "add", L("n"));
+    rtOp(f, "r", I(24), "sub", L("n"));
+    rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), L("q"), L("r"));
+    rtRet(f, L("pos"));
+    rtLabel(f, "emit");
+    rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), L("p"), L("n"));
+    rtRet(f, L("pos")); check(f);
+
+    // __tx_trap(fn_idx, pc, code, msg_ptr, msg_len)
+    const unknown = text(b, "<unknown>");
+    const colon = text(b, ":");
+    const open = text(b, ": [runtime:");
+    const close = text(b, "] ");
+    const nl = text(b, "\n");
+    const pendA = "；另有 ";
+    const pendB = " 个未决任务（结构化出口守护——发后即忘任务未 join/未取消）";
+    const pendAL = text(b, pendA);
+    const pendBL = text(b, pendB);
+    // __tx_trap(fn, pc, code, mp, ml): the pending-task count of the structured-exit
+    // guard (D26 §三-7) comes from the thread block; formatting and exit are in the core.
+    f = rtBegin(b, "__tx_trap", "fn pc code mp ml", "x", 6, "bootstrap/selfhost/nrt.tx");
+    rtSet(f, "x", I(0));
+    rtIf(f, G("__tx_task_main"), "eq", I(0), "go");
+    rtOp(f, "x", L("code"), "and", I(4294967295));
+    rtIf(f, L("x"), "eq", I(4014), "none");
+    rtCall0(f, "x", "__tx_task_pending");
+    rtJump(f, "go");
+    rtLabel(f, "none"); rtSet(f, "x", I(0));
+    rtLabel(f, "go");
+    rtCall6(f, "", "__tx_trap_core", L("fn"), L("pc"), L("code"), L("mp"), L("ml"), L("x"));
+    rtRetVoid(f); check(f);
+    // __tx_trap_bare: no thread block (FFI callback entered on a foreign thread or outside a call).
+    f = rtBegin(b, "__tx_trap_bare", "fn pc code mp ml", "", 6, "bootstrap/selfhost/nrt.tx");
+    rtCall6(f, "", "__tx_trap_core", L("fn"), L("pc"), L("code"), L("mp"), L("ml"), I(0));
+    rtRetVoid(f); check(f);
+    // __tx_trap_core(fn, pc, code, mp, ml, pending): touches only the image and process state;
+    // the process-level fatal lock keeps concurrent traps from interleaving (threads §十一-4).
+    f = rtBegin(b, "__tx_trap_core", "fn pc code mp ml pending", "buf pos img e mod line col lp nl x y", 4, "bootstrap/selfhost/nrt.tx");
+    rtCall0(f, "", "__tx_nrt_die_enter");
+    rtSet(f, "buf", A("__tx_nrt_trap_buf"));
+    rtSet(f, "pos", I(0));
+    rtSet(f, "img", A("__tx_nrt_image"));
+    rtSet(f, "mod", I(-1)); rtSet(f, "line", I(0)); rtSet(f, "col", I(0));
+    rtOp(f, "fn", L("fn"), "and", I(4294967295)); rtOp(f, "pc", L("pc"), "and", I(4294967295));
+    rtLoad(f, "x", L("img"), NRT_IMG_NFUNCS, 8);
+    rtIf(f, L("fn"), "uge", L("x"), "nameit");
+    rtLoad(f, "e", L("img"), NRT_IMG_FUNCS, 8); rtOp(f, "x", L("fn"), "imul", I(NRT_FN_STRIDE)); rtOp(f, "e", L("e"), "add", L("x"));
+    rtLoad(f, "mod", L("e"), 8, 8);
+    rtLoad(f, "nl", L("e"), 24, 8);
+    rtIf(f, L("pc"), "uge", L("nl"), "nameit");
+    rtLoad(f, "lp", L("e"), 32, 8); rtShift(f, "x", L("pc"), "shl", 3); rtOp(f, "lp", L("lp"), "add", L("x"));
+    rtLoad(f, "line", L("lp"), 0, 4); rtLoad(f, "col", L("lp"), 4, 4);
+    rtLabel(f, "nameit");
+    rtLoad(f, "x", L("img"), NRT_IMG_NMODULES, 8);
+    rtIf(f, L("mod"), "uge", L("x"), "unknown");
+    rtLoad(f, "x", L("img"), NRT_IMG_MODULES, 8); rtShift(f, "y", L("mod"), "shl", 5); rtOp(f, "x", L("x"), "add", L("y"));
+    rtLoad(f, "y", L("x"), 24, 8);
+    rtLoad(f, "x", L("img"), NRT_IMG_STRINGS, 8); rtShift(f, "y", L("y"), "shl", 4); rtOp(f, "x", L("x"), "add", L("y"));
+    rtLoad(f, "y", L("x"), 8, 8); rtLoad(f, "x", L("x"), 0, 8);
+    rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), L("y"), L("x"));
+    rtJump(f, "located");
+    rtLabel(f, "unknown");
+    rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), A(unknown), I(9));
+    rtLabel(f, "located");
+    rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), A(colon), I(1));
+    rtCall3(f, "pos", "__tx_nrt_put_udec", L("buf"), L("pos"), L("line"));
+    rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), A(colon), I(1));
+    rtCall3(f, "pos", "__tx_nrt_put_udec", L("buf"), L("pos"), L("col"));
+    rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), A(open), I(len(": [runtime:")));
+    rtOp(f, "x", L("code"), "and", I(4294967295)); rtOp(f, "x", L("x"), "sub", I(4001));
+    rtIf(f, L("x"), "uge", I(listLen(strSplit(RUNTIME_NAMES, " "))), "fallback");
+    rtShift(f, "x", L("x"), "shl", 4); rtOp(f, "x", L("x"), "add", A("__tx_nrt_code_names"));
+    rtLoad(f, "y", L("x"), 8, 8); rtLoad(f, "x", L("x"), 0, 8);
+    rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), L("x"), L("y"));
+    rtJump(f, "named");
+    rtLabel(f, "fallback");
+    rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), A(fallback), I(len("runtime_error")));
+    rtLabel(f, "named");
+    rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), A(close), I(2));
+    rtOp(f, "ml", L("ml"), "and", I(4294967295));
+    rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), L("mp"), L("ml"));
+    // 结构化出口守护（D26 §三-7）：main 或任务以 trap 结束时附未决任务计数。
+    rtIf(f, L("pending"), "eq", I(0), "annotated");
+    rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), A(pendAL), I(len(pendA)));
+    rtCall3(f, "pos", "__tx_nrt_put_udec", L("buf"), L("pos"), L("pending"));
+    rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), A(pendBL), I(len(pendB)));
+    rtLabel(f, "annotated");
+    rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), A(nl), I(1));
+    rtCall3(f, "", "__tx_nrt_write_die", I(2), L("buf"), L("pos"));
+    rtCall1(f, "", "__tx_nrt_exit", I(3));
+    rtRetVoid(f); check(f);
+}
+
+// ---------------------------------------------------------------------------
+// Builtins (M1: dispatcher + print)
+// ---------------------------------------------------------------------------
+
+function emitBuiltins(b: Ref<StructuredBuffer>): void {
+    // __tx_callbi(win, fn_idx, pc, a, id, nargs)
+    let f = rtBegin(b, "__tx_callbi", "win fn pc a id nargs", "h", 5, "bootstrap/selfhost/nrt.tx");
+    rtOp(f, "id", L("id"), "and", I(4294967295));
+    // 编号空间（TXC v6）：外部函数从 EXTERN_ID_BASE 起；__rt 内部内建从 RT_BI_BASE 起、按编号直接分派；内建表只有
+    // BI_TABLE_LEN 项，越表即未知内建。
+    rtIf(f, L("id"), "uge", I(EXTERN_ID_BASE), "extern");
+    rtIf(f, L("id"), "uge", I(RT_BI_BASE), "rt");
+    rtIf(f, L("id"), "uge", I(BI_TABLE_LEN), "unknown");
+    rtShift(f, "h", L("id"), "shl", 3); rtOp(f, "h", L("h"), "add", A("__tx_bi_table")); rtLoad(f, "h", L("h"), 0, 8);
+    rtIf(f, L("h"), "eq", I(0), "unknown");
+    const xs: List<Ref<RtOp>> = listNew(); listPush(xs, L("win")); listPush(xs, L("fn")); listPush(xs, L("pc")); listPush(xs, L("a")); listPush(xs, L("nargs"));
+    rtCallList(f, "", "*h", xs);
+    rtRetVoid(f);
+    rtLabel(f, "rt");
+    nrtRtDispatch(f, xs);
+    rtLabel(f, "unknown");
+    trapText(b, f, 4006, "未知内建函数");
+    rtLabel(f, "extern");
+    trapText(b, f, 4013, "NRT 不支持宿主 extern 函数");
+    rtRetVoid(f); check(f);
+
+    // __tx_bi_print(win, fn, pc, a, nargs)
+    f = rtBegin(b, "__tx_bi_print", "win fn pc a nargs", "v tag o p n", 5, "bootstrap/selfhost/nrt.tx");
+    rtIf32(f, L("nargs"), "ne", I(1), "arity");
+    rtCall3(f, "v", "__tx_nrt_arg", L("win"), L("a"), I(0));
+    rtLoad(f, "tag", L("v"), 0, 1);
+    rtIf(f, L("tag"), "ne", I(6), "type");
+    rtLoad(f, "o", L("v"), 8, 4);
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("o"));
+    rtLoad(f, "p", L("o"), 32, 8); rtLoad(f, "n", L("o"), 40, 8);
+    rtCall3(f, "", "__tx_nrt_write_line", I(1), L("p"), L("n"));
+    rtRetVoid(f);
+    rtLabel(f, "arity");
+    trapText(b, f, 4010, ARITY);
+    rtLabel(f, "type");
+    trapText(b, f, 4010, "print 的实参不是 string");
+    rtRetVoid(f); check(f);
+    emitBuiltins2(b);
+}
+
+function emitBuiltins2(b: Ref<StructuredBuffer>): void {
+    // __tx_nrt_arg(win, a, k) → address of argument k (window slot a + 1 + k).
+    let f = rtBegin(b, "__tx_nrt_arg", "win a k", "v", 0, "bootstrap/selfhost/nrt.tx");
+    rtOp(f, "v", L("a"), "and", I(4294967295)); rtOp(f, "v", L("v"), "add", L("k")); rtOp(f, "v", L("v"), "add", I(1));
+    rtShift(f, "v", L("v"), "shl", 4); rtOp(f, "v", L("v"), "add", L("win"));
+    rtRet(f, L("v")); check(f);
+
+    // __tx_nrt_set_new(win, a, tag, payload): write an owned value, release the old one.
+    f = rtBegin(b, "__tx_nrt_set_new", "win a tag pay", "p ot op oa", 1, "bootstrap/selfhost/nrt.tx");
+    rtOp(f, "p", L("a"), "and", I(4294967295)); rtShift(f, "p", L("p"), "shl", 4); rtOp(f, "p", L("p"), "add", L("win"));
+    rtLoad(f, "ot", L("p"), 0, 8); rtLoad(f, "op", L("p"), 8, 8);
+    rtStore(f, L("p"), 0, L("tag"), 8); rtStore(f, L("p"), 8, L("pay"), 8);
+    rtAddrOf(f, "oa", "ot");
+    rtCall1(f, "", "__tx_release", L("oa"));
+    rtRetVoid(f); check(f);
+
+    // __tx_nrt_str_copy(ptr, n, kind) → new str (1) / err (2) object owning a copy.
+    f = rtBegin(b, "__tx_nrt_str_copy", "ptr n kind", "q", 4, "bootstrap/selfhost/nrt.tx");
+    rtSet(f, "q", I(0));
+    rtIf(f, L("n"), "eq", I(0), "make");
+    rtCall2(f, "q", "__tx_native_mem_alloc", L("n"), I(1));
+    rtIf(f, L("q"), "eq", I(0), "oom");
+    rtCall3(f, "", memcpyName(), L("q"), L("ptr"), L("n"));
+    rtLabel(f, "make");
+    rtIf(f, L("kind"), "ne", I(1), "bytes");
+    rtCall3(f, "q", "__tx_store_new_str_take", L("q"), L("n"), I(0));
+    rtRet(f, L("q"));
+    rtLabel(f, "bytes");
+    rtIf(f, L("q"), "ne", I(0), "have");
+    rtSet(f, "q", I(1));
+    rtLabel(f, "have");
+    rtCall4(f, "q", "__tx_nrt_new_bytes", L("kind"), L("q"), L("n"), I(0));
+    rtRet(f, L("q"));
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRetVoid(f); check(f);
+
+    // listNew(): empty generic list (kind 10, payload list 7, form 1). With one argument — a fixed-width
+    // kind code (1..6 i8..u32, 10 f32), emitted by codegen from the static List<T> — the list is compact
+    // (form 3, elem = kind; O4 step 2, list_compact.tx).
+    f = rtBegin(b, "__tx_bi_list_new", "win fn pc a nargs", "s0 s1 s2 s3 s4 s5 s6 s7 sp k t", 5, "bootstrap/selfhost/nrt.tx");
+    rtSet(f, "s5", I(4294967296));
+    rtIf32(f, L("nargs"), "eq", I(0), "make");
+    arity(b, f, 1);
+    argTag(f, 0, "k", "t", 1, "kind");
+    rtLoad(f, "k", L("k"), 8, 8);
+    rtIf(f, L("k"), "lt", I(1), "kind"); rtIf(f, L("k"), "le", I(6), "compact"); rtIf(f, L("k"), "ne", I(10), "kind");
+    rtLabel(f, "compact"); rtOp(f, "s5", L("k"), "or", I(12884901888));
+    rtLabel(f, "make");
+    rtSet(f, "s0", I(10)); rtSet(f, "s1", I(30064771072)); rtSet(f, "s2", I(0)); rtSet(f, "s3", I(0)); rtSet(f, "s4", I(0));
+    rtSet(f, "s6", I(4)); rtSet(f, "s7", I(0));
+    rtAddrOf(f, "sp", "s0"); rtCall1(f, "s0", "__tx_native_object_create_v1", L("sp"));
+    leakStamp(f, "s0", "stamped");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(15), L("s0"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY); rtRetVoid(f);
+    rtLabel(f, "kind"); trapText(b, f, 4010, "listNew 的元素种类码非法"); rtRetVoid(f); check(f);
+
+    // errf(msg): Error value owning a copy of the message.
+    f = rtBegin(b, "__tx_bi_errf", "win fn pc a nargs", "v o", 5, "bootstrap/selfhost/nrt.tx");
+    arity(b, f, 1);
+    rtCall3(f, "v", "__tx_nrt_arg", L("win"), L("a"), I(0));
+    rtLoad(f, "o", L("v"), 0, 1); rtIf(f, L("o"), "ne", I(6), "type");
+    rtLoad(f, "o", L("v"), 8, 4); rtCall1(f, "o", "__tx_native_object_address_v1", L("o"));
+    rtLoad(f, "v", L("o"), 32, 8); rtLoad(f, "o", L("o"), 40, 8);
+    rtCall3(f, "o", "__tx_nrt_str_copy", L("v"), L("o"), I(2));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(5), L("o"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    rtLabel(f, "type"); trapText(b, f, 4010, "err 的实参不是 string");
+    rtRetVoid(f); check(f);
+
+    // assert(cond, msg): assert_failed with msg (or 断言失败).
+    const failed = text(b, "断言失败");
+    f = rtBegin(b, "__tx_bi_assertf", "win fn pc a nargs", "v w t o", 5, "bootstrap/selfhost/nrt.tx");
+    arity(b, f, 2);
+    rtCall3(f, "v", "__tx_nrt_arg", L("win"), L("a"), I(0));
+    rtLoad(f, "t", L("v"), 0, 1); rtIf(f, L("t"), "ne", I(3), "type");
+    rtLoad(f, "t", L("v"), 8, 1); rtIf(f, L("t"), "ne", I(0), "ok");
+    rtCall3(f, "w", "__tx_nrt_arg", L("win"), L("a"), I(1));
+    rtLoad(f, "t", L("w"), 0, 1); rtIf(f, L("t"), "ne", I(6), "plain");
+    rtLoad(f, "o", L("w"), 8, 4); rtCall1(f, "o", "__tx_native_object_address_v1", L("o"));
+    rtLoad(f, "t", L("o"), 32, 8); rtLoad(f, "o", L("o"), 40, 8);
+    rtCall5(f, "", "__tx_trap", L("fn"), L("pc"), I(4009), L("t"), L("o"));
+    rtLabel(f, "plain");
+    rtCall5(f, "", "__tx_trap", L("fn"), L("pc"), I(4009), A(failed), I(len("断言失败")));
+    rtLabel(f, "ok"); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    rtLabel(f, "type"); trapText(b, f, 4010, "assert 的第一实参不是 bool");
+    rtRetVoid(f); check(f);
+
+    // panic(msg): panicked with msg (or "panic").
+    const panicText = text(b, "panic");
+    f = rtBegin(b, "__tx_bi_panicf", "win fn pc a nargs", "v t o", 5, "bootstrap/selfhost/nrt.tx");
+    arity(b, f, 1);
+    rtCall3(f, "v", "__tx_nrt_arg", L("win"), L("a"), I(0));
+    rtLoad(f, "t", L("v"), 0, 1); rtIf(f, L("t"), "ne", I(6), "plain");
+    rtLoad(f, "o", L("v"), 8, 4); rtCall1(f, "o", "__tx_native_object_address_v1", L("o"));
+    rtLoad(f, "t", L("o"), 32, 8); rtLoad(f, "o", L("o"), 40, 8);
+    rtCall5(f, "", "__tx_trap", L("fn"), L("pc"), I(4008), L("t"), L("o"));
+    rtLabel(f, "plain");
+    rtCall5(f, "", "__tx_trap", L("fn"), L("pc"), I(4008), A(panicText), I(5));
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    rtRetVoid(f); check(f);
+
+    // strConcat(s...): one allocation for all string arguments. 首叶唯一持有（rc==1、非帧、非驻留）、
+    // 非空且至少两叶时改为在首叶对象上按容量追加其余各叶（字符串原地追加设计 §四-C）：结果与首叶
+    // 同一对象，结果槽另持一个引用；rc==1 意味着别的叶不可能是同一对象。
+    f = rtBegin(b, "__tx_bi_str_concat", "win fn pc a nargs", "i v t o total q at n", 5, "bootstrap/selfhost/nrt.tx");
+    rtIf32(f, L("nargs"), "lt", I(1), "few");
+    rtOp(f, "nargs", L("nargs"), "and", I(4294967295));
+    rtSet(f, "total", I(0)); rtSet(f, "i", I(0));
+    rtLabel(f, "sum");
+    rtIf(f, L("i"), "ge", L("nargs"), "summed");
+    rtCall3(f, "v", "__tx_nrt_arg", L("win"), L("a"), L("i"));
+    rtLoad(f, "t", L("v"), 0, 1); rtIf(f, L("t"), "ne", I(6), "type");
+    rtLoad(f, "o", L("v"), 8, 4); rtCall1(f, "o", "__tx_native_object_address_v1", L("o")); rtLoad(f, "n", L("o"), 40, 8);
+    rtOp(f, "total", L("total"), "add", L("n")); rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "sum");
+    rtLabel(f, "summed");
+    rtIf32(f, L("nargs"), "lt", I(2), "fresh");
+    rtCall3(f, "v", "__tx_nrt_arg", L("win"), L("a"), I(0));
+    rtLoad(f, "t", L("v"), 8, 4); rtCall1(f, "o", "__tx_native_object_address_v1", L("t"));
+    rtLoad(f, "n", L("o"), 40, 8); rtIf(f, L("n"), "eq", I(0), "fresh");
+    rtCall1(f, "q", "__tx_store_str_reuse_ok", L("t")); rtIf(f, L("q"), "eq", I(0), "fresh");
+    rtCall2(f, "", "__tx_nrt_bytes_reserve", L("o"), L("total"));
+    rtSet(f, "at", L("n")); rtSet(f, "i", I(1));
+    rtLabel(f, "app");
+    rtIf(f, L("i"), "ge", L("nargs"), "appended");
+    rtCall3(f, "v", "__tx_nrt_arg", L("win"), L("a"), L("i"));
+    rtLoad(f, "q", L("v"), 8, 4); rtCall1(f, "q", "__tx_native_object_address_v1", L("q"));
+    rtLoad(f, "n", L("q"), 40, 8); rtLoad(f, "q", L("q"), 32, 8);
+    rtLoad(f, "t", L("o"), 32, 8); rtOp(f, "t", L("t"), "add", L("at"));
+    rtCall3(f, "", memcpyName(), L("t"), L("q"), L("n"));
+    rtOp(f, "at", L("at"), "add", L("n")); rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "app");
+    rtLabel(f, "appended");
+    rtStore(f, L("o"), 40, L("total"), 8);
+    rtLoad(f, "t", L("o"), 0, 4); rtOp(f, "t", L("t"), "and", I(-9)); rtStore(f, L("o"), 0, L("t"), 4);
+    rtCall3(f, "v", "__tx_nrt_arg", L("win"), L("a"), I(0));
+    rtCall1(f, "", "__tx_retain", L("v"));
+    rtLoad(f, "t", L("v"), 8, 4);
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(6), L("t"));
+    rtRetVoid(f);
+    rtLabel(f, "fresh");
+    rtSet(f, "q", I(0));
+    rtIf(f, L("total"), "eq", I(0), "make");
+    rtCall2(f, "q", "__tx_native_mem_alloc", L("total"), I(1)); rtIf(f, L("q"), "eq", I(0), "oom");
+    rtSet(f, "at", I(0)); rtSet(f, "i", I(0));
+    rtLabel(f, "copy");
+    rtIf(f, L("i"), "ge", L("nargs"), "make");
+    rtCall3(f, "v", "__tx_nrt_arg", L("win"), L("a"), L("i"));
+    rtLoad(f, "o", L("v"), 8, 4); rtCall1(f, "o", "__tx_native_object_address_v1", L("o"));
+    rtLoad(f, "n", L("o"), 40, 8); rtLoad(f, "o", L("o"), 32, 8);
+    rtOp(f, "t", L("q"), "add", L("at"));
+    rtCall3(f, "", memcpyName(), L("t"), L("o"), L("n"));
+    rtOp(f, "at", L("at"), "add", L("n")); rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "copy");
+    rtLabel(f, "make");
+    rtCall3(f, "q", "__tx_store_new_str_take", L("q"), L("total"), I(0));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(6), L("q"));
+    rtRetVoid(f);
+    rtLabel(f, "few"); trapText(b, f, 4010, "strConcat 需要至少 1 个实参");
+    rtLabel(f, "type"); trapText(b, f, 4010, "strConcat 实参须为 string");
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRetVoid(f); check(f);
+
+    // toStr(x): int/float/bool/string/Error → string.
+    const trueText = text(b, "true");
+    const falseText = text(b, "false");
+    const minText = text(b, "-9223372036854775808");
+    f = rtBegin(b, "__tx_bi_to_str", "win fn pc a nargs", "v t x o n q t0 t1 t2 p r neg", 5, "bootstrap/selfhost/nrt.tx");
+    arity(b, f, 1);
+    rtCall3(f, "v", "__tx_nrt_arg", L("win"), L("a"), I(0));
+    rtLoad(f, "t", L("v"), 0, 1); rtLoad(f, "x", L("v"), 8, 8);
+    rtIf(f, L("t"), "eq", I(6), "string");
+    rtIf(f, L("t"), "eq", I(1), "int");
+    rtIf(f, L("t"), "eq", I(3), "bool");
+    rtIf(f, L("t"), "eq", I(5), "err");
+    rtIf(f, L("t"), "eq", I(2), "float");
+    trapText(b, f, 4010, "toStr 的实参不是 int/float/bool/string/Error");
+    rtLabel(f, "string");
+    // Identity with a new reference (same RC discipline as the interpreter).
+    rtCall1(f, "", "__tx_retain", L("v"));
+    rtLoad(f, "x", L("v"), 8, 8);
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(6), L("x"));
+    rtRetVoid(f);
+    rtLabel(f, "bool");
+    rtOp(f, "x", L("x"), "and", I(255));
+    rtIf(f, L("x"), "eq", I(0), "false");
+    rtCall3(f, "o", "__tx_nrt_str_copy", A(trueText), I(4), I(1)); rtJump(f, "set");
+    rtLabel(f, "false");
+    rtCall3(f, "o", "__tx_nrt_str_copy", A(falseText), I(5), I(1)); rtJump(f, "set");
+    rtLabel(f, "err");
+    // "Error: 消息"；富错误为 "种类名: 消息[；原因：…]"（D3 v0.19）。
+    rtOp(f, "x", L("x"), "and", I(4294967295));
+    rtCall1(f, "o", "__tx_nrt_err_text", L("x"));
+    rtJump(f, "set");
+    rtLabel(f, "int");
+    // Decimal into t0..t2 (24 bytes) from the right; i64 min is a literal.
+    rtAddrOf(f, "p", "t0"); rtSet(f, "n", I(24)); rtSet(f, "neg", I(0));
+    rtIf(f, L("x"), "ne", I(-9223372036854775807 - 1), "notmin");
+    rtCall3(f, "o", "__tx_nrt_str_copy", A(minText), I(20), I(1)); rtJump(f, "set");
+    rtLabel(f, "notmin");
+    rtIf(f, L("x"), "ge", I(0), "digits");
+    rtSet(f, "neg", I(1)); rtOp(f, "x", I(0), "sub", L("x"));
+    rtLabel(f, "digits");
+    rtDivMod(f, "x", "r", L("x"), I(10));
+    rtOp(f, "n", L("n"), "sub", I(1)); rtOp(f, "r", L("r"), "add", I(48)); rtOp(f, "q", L("p"), "add", L("n")); rtStore(f, L("q"), 0, L("r"), 1);
+    rtIf(f, L("x"), "ne", I(0), "digits");
+    rtIf(f, L("neg"), "eq", I(0), "emit");
+    rtOp(f, "n", L("n"), "sub", I(1)); rtOp(f, "q", L("p"), "add", L("n")); rtStore(f, L("q"), 0, I(45), 1);
+    rtLabel(f, "emit");
+    rtOp(f, "q", L("p"), "add", L("n")); rtOp(f, "r", I(24), "sub", L("n"));
+    rtCall3(f, "o", "__tx_nrt_str_copy", L("q"), L("r"), I(1));
+    rtLabel(f, "set");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(6), L("o"));
+    rtRetVoid(f);
+    rtLabel(f, "float");
+    rtCall1(f, "o", "__tx_nrt_float_str", L("x"));
+    rtJump(f, "set");
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRetVoid(f); check(f);
+
+    // toStr(f32)（O4 第二步，BuiltinId 70）：实参是能精确表示为 f32 的 float，按 f32 的最短往返表示。
+    f = rtBegin(b, "__tx_bi_f32_str", "win fn pc a nargs", "v t x o", 5, "bootstrap/selfhost/nrt.tx");
+    arity(b, f, 1);
+    rtCall3(f, "v", "__tx_nrt_arg", L("win"), L("a"), I(0));
+    rtLoad(f, "t", L("v"), 0, 1); rtLoad(f, "x", L("v"), 8, 8);
+    rtIf(f, L("t"), "ne", I(2), "type");
+    rtF64ToF32Bits(f, "x", L("x"));
+    rtCall1(f, "o", "__tx_nrt_float32_str", L("x"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(6), L("o"));
+    rtRetVoid(f);
+    rtLabel(f, "type"); trapText(b, f, 4010, "toStr(f32) 的实参不是 float");
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    rtRetVoid(f); check(f);
+
+    // strb_stat: development counters only; NRT carries no strb report.
+    if (!genericLeaves) {
+        asBufferLabel(b, "__tx_strb_stat", 1);
+        asBufferInstruction(b, "ret", 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1);
+    }
+
+    // __tx_nrt_const(fn, bx) → address of the {kind,a,b,c} record, or 0.
+    f = rtBegin(b, "__tx_nrt_const", "fn bx", "img e n", 0, "bootstrap/selfhost/nrt.tx");
+    rtSet(f, "img", A("__tx_nrt_image"));
+    rtOp(f, "fn", L("fn"), "and", I(4294967295)); rtOp(f, "bx", L("bx"), "and", I(4294967295));
+    rtLoad(f, "n", L("img"), NRT_IMG_NFUNCS, 8); rtIf(f, L("fn"), "uge", L("n"), "none");
+    rtLoad(f, "e", L("img"), NRT_IMG_FUNCS, 8); rtOp(f, "n", L("fn"), "imul", I(NRT_FN_STRIDE)); rtOp(f, "e", L("e"), "add", L("n"));
+    rtLoad(f, "n", L("e"), 40, 8); rtIf(f, L("bx"), "uge", L("n"), "none");
+    rtLoad(f, "e", L("e"), 48, 8); rtShift(f, "n", L("bx"), "shl", 5); rtOp(f, "e", L("e"), "add", L("n"));
+    rtRet(f, L("e"));
+    rtLabel(f, "none"); rtRet(f, I(0)); check(f);
+
+    // __tx_native_construct_facts_v1(fn, pc, bx, mode, out): ObjectSpec64 from
+    // compile-time constant facts (newstruct/newenum/newref/newarr).
+    f = rtBegin(b, "__tx_native_construct_facts_v1", "fn pc bx mode out", "c k x y z kind", 5, "bootstrap/selfhost/nrt.tx");
+    rtCall2(f, "c", "__tx_nrt_const", L("fn"), L("bx"));
+    rtSet(f, "k", I(0));
+    rtIf(f, L("c"), "eq", I(0), "known");
+    rtLoad(f, "k", L("c"), 0, 8); rtLoad(f, "x", L("c"), 8, 8); rtLoad(f, "y", L("c"), 16, 8); rtLoad(f, "z", L("c"), 24, 8);
+    rtLabel(f, "known");
+    rtOp(f, "mode", L("mode"), "and", I(4294967295));
+    // Zero the whole spec, result = None.
+    rtStore(f, L("out"), 0, I(0), 8); rtStore(f, L("out"), 8, I(0), 8); rtStore(f, L("out"), 16, I(0), 8); rtStore(f, L("out"), 24, I(0), 8);
+    rtStore(f, L("out"), 32, I(0), 8); rtStore(f, L("out"), 40, I(0), 8); rtStore(f, L("out"), 48, I(4), 8); rtStore(f, L("out"), 56, I(0), 8);
+    rtIf(f, L("mode"), "ne", I(3), "notarr");
+    rtIf(f, L("k"), "ne", I(8), "badarr");
+    rtStore(f, L("out"), 0, I(6), 4); rtStore(f, L("out"), 4, L("x"), 4); rtStore(f, L("out"), 12, I(3), 4);
+    rtStore(f, L("out"), 24, L("y"), 8); rtStore(f, L("out"), 40, L("y"), 4);
+    rtRetVoid(f);
+    rtLabel(f, "notarr");
+    rtIf(f, L("mode"), "eq", I(0), "struct");
+    rtIf(f, L("mode"), "ne", I(2), "variant");
+    rtIf(f, L("k"), "ne", I(6), "variant");
+    rtLabel(f, "struct");
+    rtIf(f, L("k"), "ne", I(6), "badstruct");
+    rtSet(f, "kind", I(3)); rtIf(f, L("mode"), "ne", I(2), "skind"); rtSet(f, "kind", I(5)); rtLabel(f, "skind");
+    rtStore(f, L("out"), 0, L("kind"), 4); rtStore(f, L("out"), 4, L("x"), 4); rtStore(f, L("out"), 12, I(1), 4);
+    rtStore(f, L("out"), 24, L("y"), 8);
+    rtRetVoid(f);
+    rtLabel(f, "variant");
+    rtIf(f, L("k"), "ne", I(7), "badvariant");
+    rtSet(f, "kind", I(4)); rtIf(f, L("mode"), "ne", I(2), "vkind"); rtSet(f, "kind", I(5)); rtLabel(f, "vkind");
+    rtStore(f, L("out"), 0, L("kind"), 4); rtStore(f, L("out"), 4, L("x"), 4); rtStore(f, L("out"), 12, I(2), 4);
+    rtStore(f, L("out"), 24, L("y"), 8); rtStore(f, L("out"), 40, L("z"), 4);
+    rtRetVoid(f);
+    rtLabel(f, "badarr"); trapText(b, f, 4012, "newarr/newslice 常量种类错误");
+    rtLabel(f, "badstruct"); trapText(b, f, 4012, "newstruct 常量种类错误");
+    rtLabel(f, "badvariant");
+    rtIf(f, L("mode"), "eq", I(2), "badref");
+    trapText(b, f, 4012, "newenum 常量种类错误");
+    rtLabel(f, "badref"); trapText(b, f, 4012, "newref 常量种类错误");
+    rtRetVoid(f); check(f);
+
+    // __tx_switch_tag(win, fn, pc, a, bx) → enum tag after table checks.
+    f = rtBegin(b, "__tx_switch_tag", "win fn pc a bx", "v t tag c n tbl e", 5, "bootstrap/selfhost/nrt.tx");
+    rtOp(f, "v", L("a"), "and", I(4294967295)); rtShift(f, "v", L("v"), "shl", 4); rtOp(f, "v", L("v"), "add", L("win"));
+    rtLoad(f, "t", L("v"), 0, 1);
+    rtIf(f, L("t"), "eq", I(8), "enum"); rtIf(f, L("t"), "eq", I(9), "enum");
+    trapText(b, f, 4010, "switch 的 scrutinee 不是 enum");
+    rtLabel(f, "enum");
+    rtLoad(f, "t", L("v"), 8, 4); rtCall1(f, "t", "__tx_native_object_address_v1", L("t")); rtLoad(f, "tag", L("t"), 24, 4);
+    rtCall2(f, "c", "__tx_nrt_const", L("fn"), L("bx"));
+    rtIf(f, L("c"), "eq", I(0), "badkind");
+    rtLoad(f, "t", L("c"), 0, 8); rtIf(f, L("t"), "ne", I(5), "badkind");
+    rtLoad(f, "n", L("c"), 8, 8); rtIf(f, L("tag"), "uge", L("n"), "uncovered");
+    rtLoad(f, "tbl", L("c"), 16, 8); rtShift(f, "t", L("tag"), "shl", 2); rtOp(f, "tbl", L("tbl"), "add", L("t")); rtLoad(f, "t", L("tbl"), 0, 4);
+    rtSet(f, "e", A("__tx_nrt_image")); rtLoad(f, "e", L("e"), NRT_IMG_FUNCS, 8);
+    rtOp(f, "n", L("fn"), "and", I(4294967295)); rtOp(f, "n", L("n"), "imul", I(NRT_FN_STRIDE)); rtOp(f, "e", L("e"), "add", L("n"));
+    rtLoad(f, "n", L("e"), 56, 8); rtIf(f, L("t"), "uge", L("n"), "badtarget");
+    rtRet(f, L("tag"));
+    rtLabel(f, "badkind"); trapText(b, f, 4012, "switch 常量种类错误");
+    rtLabel(f, "uncovered"); trapText(b, f, 4011, "switch 跳转表未覆盖该变体");
+    rtLabel(f, "badtarget"); trapText(b, f, 4012, "switch 跳转目标越界");
+    rtRetVoid(f); check(f);
+}
+
+/// Process state; must be placed inside the kernel's single .bss block. Per-thread
+/// state (slots, value stack, strings, module states, weak/intern tables, async and
+/// generator state, float scratch) lives in the thread block (thread_block_abi.tx).
+export function nrtBss(b: Ref<StructuredBuffer>): void {
+    const names = strSplit("__tx_rt_table_ptr __tx_rt_table_len __tx_nrt_rc_flags __tx_nrt_out __tx_nrt_err __tx_nrt_envp", " ");
+    let k = 0;
+    while (k < listLen(names)) { asBufferLabel(b, listGet(names, k) catch "", 1); asBufferZero(b, 8, 1); k = k + 1; }
+    // macOS：SIGPIPE 处置的状态字（工具链例程 __tx_tool_nopipe 写，内核写标准输出／错误遇 EPIPE 时读；M3 设计 G5）。
+    if (tMacos(nrtTarget())) { asBufferLabel(b, "__tx_nrt_nopipe", 1); asBufferZero(b, 8, 1); }
+    // macOS：fork 锁的锁字（nrt_proc.tx 的 __tx_nrt_fork_lock）。
+    if (tMacos(nrtTarget())) { asBufferLabel(b, "__tx_nrt_fork_flag", 1); asBufferZero(b, 8, 1); }
+    nrtFfiBss(b);
+    nrtThreadBss(b, nrtTarget());
+    nrtSpawnBss(b);
+    nrtSendBss(b);
+    nrtRtBss(b);
+    nrtLeakBss(b);
+    asBufferLabel(b, "__tx_nrt_probe_counts", 1); asBufferZero(b, 64, 1);
+    asBufferLabel(b, "__tx_nrt_main_mods", 1); asBufferZero(b, 8, 1);
+    asBufferLabel(b, "__tx_nrt_trap_buf", 1); asBufferZero(b, 1024, 1);
+    // 致命输出的 UTF-16 缓冲只给经 kernel32 写控制台（WriteConsoleW）的路径用。
+    if (tKernel32(nrtTarget())) { asBufferLabel(b, "__tx_nrt_die_wide", 1); asBufferZero(b, DIE_WIDE_UNITS * 2, 1); }
+}
+
+/// Exported NRT symbols (for the kernel export list).
+export function nrtExports(): List<string> {
+    const out: List<string> = listNew();
+    const fixed = strSplit("__tx_nrt_str_copy __tx_host_entry_setup __tx_entry_stage __tx_entry_win_ptr __tx_entry_finish __tx_host_argv_fail __tx_native_object_address_v1 __tx_native_object_create_v1 __tx_native_object_oom_v1 __tx_native_construct_stat_v1 __tx_rc_base __tx_rc_scalar_flag __tx_rc_probe_counts __tx_rc_zero_cascade __tx_site_of __tx_store_new_str_take __tx_store_str_ptr __tx_store_str_len __tx_store_str_set_span __tx_store_str_reuse_ok __tx_store_payload_view __tx_store_equal_view_v1 __tx_store_weak_dead_v1 __tx_store_zero_kind __tx_store_zero_tail __tx_trap __tx_callbi __tx_bi_print __tx_native_handler_error_v1 __tx_native_object_handler_error_v1 __tx_native_error_message_v1 __tx_store_clone_materialize __tx_store_clone_view __tx_store_clone_depth __tx_clone __tx_native_construct_facts_v1 __tx_strb_stat __tx_bi_errf __tx_bi_to_str __tx_bi_f32_str __tx_bi_assertf __tx_bi_panicf __tx_bi_list_new __tx_bi_str_concat __tx_switch_tag __tx_rt_table_ptr __tx_rt_table_len __tx_trap_bare", " ");
+    let k = 0;
+    while (k < listLen(fixed)) { listPush(out, listGet(fixed, k) catch ""); k = k + 1; }
+    // 链接器据此建立平台 TLS：Windows 的 TLS 目录（数据目录 9）、Linux 的 PT_TLS 模板。
+    // macOS 的 TLV 描述符由链接器合成（link_macho.tx），内核不带模板。
+    if (tElf(nrtTarget())) { listPush(out, "__tx_tls_template"); } else if (tPe(nrtTarget())) { listPush(out, "__tx_tls_directory"); }
+    const more = strSplit(NRT_THREAD_EXPORTS + " " + NRT_ASYNC_EXPORTS + " " + NRT_GEN_EXPORTS + " " + nrtSpawnExports() + " " + NRT_SHARED_EXPORTS + " " + NRT_LIST_EXPORTS + " " + NRT_TEXT_EXPORTS + " " + NRT_SYS_EXPORTS + " " + NRT_PROC_EXPORTS + " " + NRT_BYTES_EXPORTS + " " + NRT_ERROR_EXPORTS + " " + nrtFfiExports(), " ");
+    k = 0;
+    while (k < listLen(more)) { listPush(out, listGet(more, k) catch ""); k = k + 1; }
+    if (tElf(nrtTarget())) { listPush(out, "_start"); }
+    // 程序映像里的工具链例程（procSpawn 的子进程环境）取当前环境的快照（nrt_rt.tx，D3 v0.39）。
+    if (tUnix(nrtTarget())) { listPush(out, "__tx_rt_env_block"); }
+    return out;
+}
+
+/// Linux process entry without libc: (argc, argv) from the initial stack into
+/// the kernel's C-shaped `__tx_native_entry`, which ends in exit_group.
+/// 按文件格式发射（ELF 的 e_entry）；其中 arch_prctl 与 exit_group 是 Linux 的原始系统调用——目前唯一的 ELF 目标就是 Linux。
+function emitLinuxStart(b: Ref<StructuredBuffer>): void {
+    const none = asStructuredMissing();
+    asBufferBoundaryBegin(b, "bootstrap/selfhost/nrt.tx", "_start", "process-entry");
+    asBufferLabel(b, "_start", 1);
+    asBufferInstruction(b, "xor", 2, asStructuredReg(1, 5), asStructuredReg(1, 5), none, 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(0, 7), asStructuredMem(2, 4, -1, 0, 0, 0, ""), none, 1);
+    asBufferInstruction(b, "lea", 2, asStructuredReg(0, 6), asStructuredMem(2, 4, -1, 0, 8, 0, ""), none, 1);
+    // envp = argv + (argc + 1) * 8, kept for getEnv/tempDir/runProcess.
+    asBufferInstruction(b, "lea", 2, asStructuredReg(0, 0), asStructuredMem(2, 6, 7, 3, 8, 0, ""), none, 1);
+    asBufferInstruction(b, "mov", 2, asStructuredMem(2, -1, -1, 0, 0, 1, "__tx_nrt_envp"), asStructuredReg(0, 0), none, 1);
+    // Platform TLS (threads §十二): a dynamic product's loader has already set the fs base
+    // (the TLS slot is fs:[-8], from PT_TLS); a static product starts with fs base 0, so
+    // the main thread's TLS area is __tx_tls_static (slot, then the self-pointing thread
+    // pointer). arch_prctl(ARCH_GET_FS / ARCH_SET_FS); argc/argv kept in r12/r13.
+    asBufferInstruction(b, "mov", 2, asStructuredReg(0, 12), asStructuredReg(0, 7), none, 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(0, 13), asStructuredReg(0, 6), none, 1);
+    asBufferInstruction(b, "sub", 2, asStructuredReg(0, 4), asStructuredImm(16), none, 1);
+    asBufferInstruction(b, "mov", 2, asStructuredMem(2, 4, -1, 0, 0, 0, ""), asStructuredImm(0), none, 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(1, 7), asStructuredImm(4099), none, 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(0, 6), asStructuredReg(0, 4), none, 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(1, 0), asStructuredImm(158), none, 1);
+    asBufferInstruction(b, "syscall", 0, none, none, none, 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(0, 0), asStructuredMem(2, 4, -1, 0, 0, 0, ""), none, 1);
+    asBufferInstruction(b, "test", 2, asStructuredReg(0, 0), asStructuredReg(0, 0), none, 1);
+    asBufferInstruction(b, "jne", 1, asStructuredTarget("__tx_start_tls_ready"), none, none, 1);
+    asBufferInstruction(b, "lea", 2, asStructuredReg(0, 6), asStructuredMem(2, -1, -1, 0, 0, 1, "__tx_tls_static"), none, 1);
+    asBufferInstruction(b, "add", 2, asStructuredReg(0, 6), asStructuredImm(8), none, 1);
+    asBufferInstruction(b, "mov", 2, asStructuredMem(2, 6, -1, 0, 0, 0, ""), asStructuredReg(0, 6), none, 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(1, 7), asStructuredImm(4098), none, 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(1, 0), asStructuredImm(158), none, 1);
+    asBufferInstruction(b, "syscall", 0, none, none, none, 1);
+    asBufferInstruction(b, "test", 2, asStructuredReg(0, 0), asStructuredReg(0, 0), none, 1);
+    asBufferInstruction(b, "je", 1, asStructuredTarget("__tx_start_tls_ready"), none, none, 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(1, 7), asStructuredImm(70), none, 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(1, 0), asStructuredImm(231), none, 1);
+    asBufferInstruction(b, "syscall", 0, none, none, none, 1);
+    asBufferLabel(b, "__tx_start_tls_ready", 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(0, 7), asStructuredReg(0, 12), none, 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(0, 6), asStructuredReg(0, 13), none, 1);
+    asBufferInstruction(b, "and", 2, asStructuredReg(0, 4), asStructuredImm(-16), none, 1);
+    asBufferInstruction(b, "call", 1, asStructuredTarget("__tx_native_entry"), none, none, 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(1, 7), asStructuredReg(1, 0), none, 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(1, 0), asStructuredImm(231), none, 1);
+    asBufferInstruction(b, "syscall", 0, none, none, none, 1);
+    asBufferFunctionEnd(b);
+}
+
+/// Emit all NRT code (text). Returns 0 on success; nrtLastError() otherwise.
+export function nrtEmit(b: Ref<StructuredBuffer>, t: int): int {
+    nrtBaseReset(t);
+    asBufferSection(b, 0, 1);
+    if (tElf(t)) { emitLinuxStart(b); }
+    if (tMacos(t)) { macSysEmit(b); }
+    emitWrite(b, "__tx_nrt_write", false);
+    emitWrite(b, "__tx_nrt_write_die", true);
+    emitWriteLine(b);
+    emitExit(b);
+    if (!genericLeaves) { emitHotLeaves(b); }
+    emitStore(b);
+    emitEntry(b);
+    emitNrtRegion(b, t);
+    emitNrtStack(b, t);
+    emitNrtTls(b, t);
+    emitNrtDie(b, t);
+    emitTrap(b);
+    emitBuiltins(b);
+    emitNrtErrors(b);
+    emitNrtLists(b);
+    emitNrtText(b);
+    emitNrtSys(b);
+    emitNrtProc(b);
+    emitNrtAsync(b);
+    emitNrtGen(b);
+    emitNrtSpawn(b);
+    emitNrtSend(b);
+    emitNrtShared(b);
+    emitNrtRt(b);
+    emitNrtFloat(b);
+    emitNrtBytes(b);
+    emitNrtLeak(b);
+    nrtFfiEmit(b);
+    if (len(nrtLastError()) > 0) { return 1; }
+    return 0;
+}

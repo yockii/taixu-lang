@@ -1,0 +1,167 @@
+// std/fs 系统面的 macOS 目标文件（D3 v0.35 按目标选择文件；导出面同 fs_sys_linux.tx）：经 libSystem（D3 §6.8-7），语义同
+// Linux 版（stat 跟随符号链接、mkdir 权限 0755、remove 先 unlink 再 rmdir）；文件名按字节取回，非法 UTF-8 替换为 U+FFFD。
+// 含 NUL 的路径按失败处理（不交给库函数，免得 trap 4019）。
+// 结构按 64 位 inode 布局（arm64 只有这一种；x86_64 上 stat、opendir、readdir_r 由编译器链接到 $INODE64 版，D3 §6.8-7）：
+// struct stat 144 字节，st_mode 为偏移 4 的 u16、st_size 为偏移 96 的 i64；struct dirent 1048 字节，d_namlen 为偏移 18 的
+// u16、d_name 从 21 起。目录经 opendir＋readdir_r 读（太虚没有原始指针，readdir 返回的指针读不了；readdir_r 写进调用方
+// 给的缓冲，Go 在 macOS 上同样用它）。
+import { lossyStr, nulFree, bytePrefix } from "./sys_text";
+
+declare type DIR;
+declare function stat(path: string, st: Bytes): i32 from "libSystem";
+declare function mkdir(path: string, mode: u16): i32 from "libSystem";
+declare function unlink(path: string): i32 from "libSystem";
+declare function rmdir(path: string): i32 from "libSystem";
+declare function rename(src: string, dst: string): i32 from "libSystem";
+declare function getcwd(buf: Bytes, n: usize): usize from "libSystem";
+declare function opendir(path: string): DIR? from "libSystem";
+declare function readdir_r(dir: DIR, entry: Bytes, result: Bytes): i32 from "libSystem";
+declare function closedir(dir: DIR): i32 from "libSystem";
+
+const STAT_SIZE: int = 144;
+const S_IFMT: int = 61440;
+const S_IFDIR: int = 16384;
+const DIRENT_SIZE: int = 1048;
+const ERANGE: int = 34;
+
+function pathOk(path: string): bool {
+    return nulFree(path) && len(path) > 0;
+}
+
+// stat 结果；失败（不存在、无权限、路径不可用）返回空 Bytes。
+function statOf(path: string): Bytes {
+    if (!pathOk(path)) {
+        return bytesNew(0);
+    }
+    const st = bytesNew(STAT_SIZE);
+    if (stat(path, st) != 0) {
+        return bytesNew(0);
+    }
+    return st;
+}
+
+export function sysExists(path: string): bool {
+    return bytesLen(statOf(path)) > 0;
+}
+
+export function sysMkdir(path: string): int {
+    if (!pathOk(path)) {
+        return -1;
+    }
+    if (mkdir(path, 493) == 0) {
+        return 0;
+    }
+    return -1;
+}
+
+// 逐级建目录：已存在且是目录视为成功；途经的 `/` 前缀不存在就建。
+export function sysMkdirs(path: string): int {
+    if (sysExists(path)) {
+        if (sysStatIsDir(path) == 1) {
+            return 0;
+        }
+        return -1;
+    }
+    let i: int = 1;
+    while (i < len(path)) {
+        if ((byteAt(path, i) catch 0) == 47) {
+            const pre = bytePrefix(path, i);
+            if (!sysExists(pre) && sysMkdir(pre) != 0) {
+                return -1;
+            }
+        }
+        i = i + 1;
+    }
+    return sysMkdir(path);
+}
+
+export function sysRemove(path: string): int {
+    if (!pathOk(path)) {
+        return -1;
+    }
+    if (unlink(path) == 0) {
+        return 0;
+    }
+    if (rmdir(path) == 0) {
+        return 0;
+    }
+    return -1;
+}
+
+export function sysRename(from: string, to: string): int {
+    if (!pathOk(from) || !pathOk(to)) {
+        return -1;
+    }
+    if (rename(from, to) == 0) {
+        return 0;
+    }
+    return -1;
+}
+
+export function sysStatSize(path: string): int {
+    const st = statOf(path);
+    if (bytesLen(st) == 0) {
+        return -1;
+    }
+    return bytesGetLE<int>(st, 96) ?? -1;
+}
+
+export function sysStatIsDir(path: string): int {
+    const st = statOf(path);
+    if (bytesLen(st) == 0) {
+        return -1;
+    }
+    if (((bytesGetLE<u16>(st, 4) ?? 0) & S_IFMT) == S_IFDIR) {
+        return 1;
+    }
+    return 0;
+}
+
+// getcwd 成功时返回 buf 的地址、失败返回空指针；缓冲不够时 errno 为 ERANGE，加大再取。
+export function sysCwd(): string {
+    let cap: int = 4096;
+    while (cap <= 1048576) {
+        const buf = bytesNew(cap);
+        if (getcwd(buf, wrapTo<usize>(cap)) != 0) {
+            let n: int = 0;
+            while (n < cap && (bytesGet(buf, n) catch 0) != 0) {
+                n = n + 1;
+            }
+            return lossyStr(bytesSlice(buf, 0, n));
+        }
+        if (ffiLastError() != ERANGE) {
+            return "";
+        }
+        cap = cap * 4;
+    }
+    return "";
+}
+
+export function sysListDir(path: string): List<string> | Error {
+    if (!pathOk(path)) {
+        return err("cannot open: " + path);
+    }
+    const d = opendir(path) ?? handleFromBits<DIR>(0);
+    if (handleBits(d) == 0) {
+        return err("cannot open: " + path);
+    }
+    const names: List<string> = listNew();
+    const entry = bytesNew(DIRENT_SIZE);
+    const result = bytesNew(8);
+    while (true) {
+        // 读到末尾时 readdir_r 返回 0 且 *result 为空指针；出错返回错误码（不经 errno）。
+        if (readdir_r(d, entry, result) != 0 || (bytesGetLE<int>(result, 0) ?? 0) == 0) {
+            break;
+        }
+        let n: int = bytesGetLE<u16>(entry, 18) ?? 0;
+        if (n > DIRENT_SIZE - 21) {
+            n = DIRENT_SIZE - 21;
+        }
+        const name = lossyStr(bytesSlice(entry, 21, n));
+        if (name != "." && name != "..") {
+            listPush(names, name);
+        }
+    }
+    closedir(d);
+    return names;
+}

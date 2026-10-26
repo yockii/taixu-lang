@@ -1,0 +1,703 @@
+// ============================================================================
+// std/regexp —— 正则匹配（V0.38-S3；STD-08；D84 设计单——自研回溯引擎）。
+//
+// 语法面（D84 §二冻结）：字面字符／`.`（除换行任意码点）／`[class]`（区间
+// 与 `^` 否定）／量词 `* + ? {m} {m,} {m,n}`（贪婪）／锚 `^ $`／分组 `()`
+// （捕获）与 `(?:)` 非捕获／选择 `|`／转义 `\\d \\w \\s \\. …`。
+//
+// **确定性红线（D84 §四）**：纯 .tx 回溯状态机——零平台差异面；**回溯步数
+// 上限 100000**（灾难性回溯护栏——超限结构化 Error，结果可复现）。编译错
+// （括号不配对/量词无主体等）同样 Error。
+// ============================================================================
+
+// —— 语法树（编译期节点，运行期解释执行）——
+
+struct Node {
+    kind: int, // 0=char 1=any 2=class 3=group 4=anchor^ 5=anchor$ 6=alt
+    cp: int, // kind=0 字面码点
+    negate: bool, // kind=2 类否定
+    items: List<int>, // kind=2：[cp,cp,..] 区间对展开；kind=6：分支节点序号表
+    children: List<Ref<Node>>, // kind=3：子链；kind=6：各分支子链
+    min: int,
+    max: int, // kind=3 量词域（max −1=无上界）
+    capture: int, // kind=3 捕获号（0＝非捕获）
+}
+
+struct Prog {
+    root: Ref<Node>,
+    ngroups: int,
+}
+
+struct MatchState {
+    input: string,
+    pos: int, // 当前匹配位（S1 无指针参数——位置经状态对象承载）
+    groups: List<int>, // 捕获起止对（2×ngroups；−1 未命中）
+    steps: int,
+    overflow: bool,
+}
+
+const STEP_LIMIT: int = 100000;
+
+// matches：是否命中（search 语义＝任意位置子匹配）。
+export function matches(pattern: string, text: string): bool | Error {
+    const list = findGroups(pattern, text)?;
+    return listLen(list) > 0;
+}
+
+// findGroups：首处匹配的捕获列表（[0]=整匹配，[1..]=捕获组；未命中空表；
+// 编译错/步数超限 Error）。
+export function findGroups(pattern: string, text: string): List<string> | Error {
+    const p = compile(pattern) catch (ce) {
+        return err("bad pattern");
+    };
+    const st: Ref<MatchState> = new MatchState {
+        input: text,
+        pos: 0,
+        groups: listNew(),
+        steps: 0,
+        overflow: false,
+    };
+    let gi: int = 0;
+    while (gi < p.ngroups * 2) {
+        listPush(st.groups, -1);
+        gi = gi + 1;
+    }
+    // search：从每个起点尝试锚定匹配。
+    let start: int = 0;
+    const n = len(text);
+    while (start <= n) {
+        resetGroups(st);
+        st.pos = start;
+        if (matchNode(p, p.root, st)) {
+            if (st.overflow) {
+                return err("step limit exceeded");
+            }
+            // [0]＝整匹配（start..st.pos），[1..]＝捕获组。
+            const out: List<string> = listNew();
+            listPush(out, sliceUtf8(text, start, st.pos));
+            let gi2: int = 0;
+            while (gi2 < p.ngroups) {
+                const open = listGet(st.groups, gi2 * 2) catch -1;
+                const close = listGet(st.groups, gi2 * 2 + 1) catch -1;
+                if (open >= 0 && close >= open) {
+                    listPush(out, sliceUtf8(text, open, close));
+                } else {
+                    listPush(out, "");
+                }
+                gi2 = gi2 + 1;
+            }
+            return out;
+        }
+        if (st.overflow) {
+            return err("step limit exceeded");
+        }
+        let adv = seqLen(text, start);
+        if (adv == 0) {
+            adv = 1;
+        }
+        start = start + adv;
+    }
+    const empty: List<string> = listNew();
+    return empty;
+}
+
+// —— 编译（递归下降：alt → concat → repeat → atom）——
+
+struct Parser {
+    pat: string,
+    pos: int,
+    ngroups: int,
+    failed: bool,
+}
+
+function compile(pattern: string): Ref<Prog> | Error {
+    const p: Ref<Parser> = new Parser { pat: pattern, pos: 0, ngroups: 0, failed: false };
+    const node = parseAlt(p);
+    if (p.failed || p.pos != len(pattern) || node == None) {
+        return err("compile");
+    }
+    const pr: Ref<Prog> = new Prog { root: node catch panic("regexp: 不可达"), ngroups: p.ngroups };
+    return pr;
+}
+
+function parseAlt(p: Ref<Parser>): Ref<Node>? {
+    const first = parseConcat(p);
+    if (first == None) {
+        return None;
+    }
+    if ((peekChar(p) catch -1) != 124) {
+        return first;
+    }
+    // `|` 选择链。
+    const node: Ref<Node> = newNode(6);
+    listPush(node.items, 0);
+    listPush(node.children, first catch panic("regexp: 不可达"));
+    let idx: int = 1;
+    while ((peekChar(p) catch -1) == 124) {
+        advance(p);
+        const branch = parseConcat(p);
+        if (branch == None) {
+            p.failed = true;
+            return None;
+        }
+        listPush(node.items, idx);
+        listPush(node.children, branch catch panic("regexp: 不可达"));
+        idx = idx + 1;
+    }
+    return node;
+}
+
+function parseConcat(p: Ref<Parser>): Ref<Node>? {
+    const parts: List<Ref<Node>> = listNew();
+    while (true) {
+        const c = peekChar(p) catch -1;
+        if (c < 0 || c == 124 || c == 41) {
+            break;
+        }
+        const part = parseRepeat(p);
+        if (part == None) {
+            return None;
+        }
+        listPush(parts, part catch panic("regexp: 不可达"));
+    }
+    if (listLen(parts) == 0) {
+        // 空串节点（恒命中）。
+        return newNode(3);
+    }
+    if (listLen(parts) == 1) {
+        return listGet(parts, 0) catch panic("regexp: 不可达");
+    }
+    const seq: Ref<Node> = newNode(3);
+    let i: int = 0;
+    while (i < listLen(parts)) {
+        listPush(seq.children, listGet(parts, i) catch panic("regexp: 不可达"));
+        i = i + 1;
+    }
+    return seq;
+}
+
+function parseRepeat(p: Ref<Parser>): Ref<Node>? {
+    const atom = parseAtom(p);
+    if (atom == None) {
+        return None;
+    }
+    const c = peekChar(p) catch -1;
+    if (c != 42 && c != 43 && c != 63 && c != 123) {
+        return atom;
+    }
+    const node: Ref<Node> = newNode(3);
+    listPush(node.children, atom catch panic("regexp: 不可达"));
+    node.capture = 0;
+    if (c == 42) {
+        node.min = 0;
+        node.max = -1;
+        advance(p);
+    } else if (c == 43) {
+        node.min = 1;
+        node.max = -1;
+        advance(p);
+    } else if (c == 63) {
+        node.min = 0;
+        node.max = 1;
+        advance(p);
+    } else {
+        // {m} {m,} {m,n}。
+        advance(p);
+        const m = parseNumber(p);
+        if (m < 0) {
+            p.failed = true;
+            return None;
+        }
+        node.min = m;
+        node.max = m;
+        if ((peekChar(p) catch -1) == 44) {
+            advance(p);
+            if ((peekChar(p) catch -1) == 125) {
+                node.max = -1;
+            } else {
+                const mx = parseNumber(p);
+                if (mx < 0) {
+                    p.failed = true;
+                    return None;
+                }
+                node.max = mx;
+            }
+        }
+        if ((peekChar(p) catch -1) != 125) {
+            p.failed = true;
+            return None;
+        }
+        advance(p);
+    }
+    // {0} 化简＝空节点（恒命中）。
+    if (node.min == 0 && node.max == 0 && !isQuant(node)) {
+        return newNode(3);
+    }
+    return node;
+}
+
+function parseAtom(p: Ref<Parser>): Ref<Node>? {
+    const c = peekChar(p) catch -1;
+    if (c == 40) {
+        advance(p);
+        const node: Ref<Node> = newNode(3);
+        // 非捕获组 (?:...)。
+        if ((peekChar(p) catch -1) == 63 && (peekChar2(p) catch -1) == 58) {
+            advance(p);
+            advance(p);
+            node.capture = 0;
+        } else {
+            p.ngroups = p.ngroups + 1;
+            node.capture = p.ngroups;
+        }
+        const inner = parseAlt(p);
+        if (inner == None) {
+            return None;
+        }
+        listPush(node.children, inner catch panic("regexp: 不可达"));
+        if ((peekChar(p) catch -1) != 41) {
+            p.failed = true;
+            return None;
+        }
+        advance(p);
+        return node;
+    }
+    if (c == 91) {
+        return parseClass(p);
+    }
+    if (c == 46) {
+        advance(p);
+        return newNode(1);
+    }
+    if (c == 94) {
+        advance(p);
+        return newNode(4);
+    }
+    if (c == 36) {
+        advance(p);
+        return newNode(5);
+    }
+    if (c == 92) {
+        advance(p);
+        const e = peekChar(p) catch -1;
+        if (e < 0) {
+            p.failed = true;
+            return None;
+        }
+        advance(p);
+        if (e == 100 || e == 119 || e == 115) {
+            // \d \w \s → 内建类（class 节点＋标志码点：−1=digit −2=word −3=space）。
+            const node: Ref<Node> = newNode(2);
+            node.negate = false;
+            let tag: int = -3;
+            if (e == 100) {
+                tag = -1;
+            } else if (e == 119) {
+                tag = -2;
+            }
+            listPush(node.items, tag);
+            listPush(node.items, tag);
+            return node;
+        }
+        if (e == 68 || e == 87 || e == 83) {
+            const node: Ref<Node> = newNode(2);
+            node.negate = true;
+            let tag: int = -3;
+            if (e == 68) {
+                tag = -1;
+            } else if (e == 87) {
+                tag = -2;
+            }
+            listPush(node.items, tag);
+            listPush(node.items, tag);
+            return node;
+        }
+        const node: Ref<Node> = newNode(0);
+        node.cp = escapeChar(e);
+        return node;
+    }
+    if (c == 41 || c == 124) {
+        // parseConcat 已停——不可达（防御）。
+        return None;
+    }
+    advance(p);
+    const node: Ref<Node> = newNode(0);
+    node.cp = c;
+    return node;
+}
+
+function parseClass(p: Ref<Parser>): Ref<Node>? {
+    advance(p); // [
+    const node: Ref<Node> = newNode(2);
+    if ((peekChar(p) catch -1) == 94) {
+        node.negate = true;
+        advance(p);
+    }
+    let first = true;
+    while (true) {
+        let c = peekChar(p) catch -1;
+        if (c < 0) {
+            p.failed = true;
+            return None;
+        }
+        if (c == 93 && !first) {
+            advance(p);
+            break;
+        }
+        first = false;
+        let lo: int = 0;
+        if (c == 92) {
+            advance(p);
+            const e = peekChar(p) catch -1;
+            if (e < 0) {
+                p.failed = true;
+                return None;
+            }
+            advance(p);
+            if (e == 100 || e == 119 || e == 115 || e == 68 || e == 87 || e == 83) {
+                // 类内简写：展开为标志对（negate 交互面从简——仅独立 \d 系）。
+                let tag: int = -3;
+                if (e == 100 || e == 68) {
+                    tag = -1;
+                } else if (e == 119 || e == 87) {
+                    tag = -2;
+                }
+                listPush(node.items, tag);
+                listPush(node.items, tag);
+                continue;
+            }
+            lo = escapeChar(e);
+        } else {
+            advance(p);
+            lo = c;
+        }
+        // 区间？
+        if ((peekChar(p) catch -1) == 45 && (peekChar2(p) catch -1) != 93 && (peekChar2(p) catch -1) >= 0) {
+            advance(p); // -
+            const hiC = peekChar(p) catch -1;
+            advance(p);
+            listPush(node.items, lo);
+            listPush(node.items, hiC);
+        } else {
+            listPush(node.items, lo);
+            listPush(node.items, lo);
+        }
+    }
+    return node;
+}
+
+function parseNumber(p: Ref<Parser>): int {
+    let v: int = 0;
+    let saw = false;
+    while (true) {
+        const c = peekChar(p) catch -1;
+        if (c < 48 || c > 57) {
+            break;
+        }
+        v = v * 10 + (c - 48);
+        saw = true;
+        advance(p);
+    }
+    if (!saw) {
+        return -1;
+    }
+    return v;
+}
+
+function escapeChar(e: int): int {
+    // \n \t \r 与恒等转义（\. 等——取字符本体）。
+    if (e == 110) {
+        return 10;
+    }
+    if (e == 116) {
+        return 9;
+    }
+    if (e == 114) {
+        return 13;
+    }
+    return e;
+}
+
+function peekChar(p: Ref<Parser>): int? {
+    if (p.pos >= len(p.pat)) {
+        return None;
+    }
+    return seqDecode(p.pat, p.pos);
+}
+
+function peekChar2(p: Ref<Parser>): int? {
+    const first = peekChar(p);
+    if (first == None) {
+        return None;
+    }
+    const save = p.pos;
+    p.pos = p.pos + seqLen(p.pat, p.pos);
+    const second = peekChar(p);
+    p.pos = save;
+    return second;
+}
+
+function advance(p: Ref<Parser>): void {
+    p.pos = p.pos + seqLen(p.pat, p.pos);
+}
+
+function newNode(kind: int): Ref<Node> {
+    return new Node {
+        kind: kind,
+        cp: 0,
+        negate: false,
+        items: listNew(),
+        children: listNew(),
+        min: 0,
+        max: 0,
+        capture: 0,
+    };
+}
+
+// seqDecode：i 处码点（UTF-8 掩码算术——json.tx 同源）。
+function seqDecode(s: string, i: int): int {
+    const b = byteAt(s, i) catch 0;
+    if (b < 128) {
+        return b;
+    }
+    let n: int = 2;
+    let cp: int = b - 192;
+    if (b >= 240) {
+        n = 4;
+        cp = b - 240;
+    } else if (b >= 224) {
+        n = 3;
+        cp = b - 224;
+    }
+    let k: int = 1;
+    while (k < n) {
+        const bx = byteAt(s, i + k) catch 128;
+        cp = cp * 64 + (bx % 64);
+        k = k + 1;
+    }
+    return cp;
+}
+
+function seqLen(s: string, i: int): int {
+    const b = byteAt(s, i) catch 0;
+    if (b < 128) {
+        return 1;
+    }
+    if (b >= 192 && b < 224) {
+        return 2;
+    }
+    if (b >= 224 && b < 240) {
+        return 3;
+    }
+    if (b >= 240 && b < 248) {
+        return 4;
+    }
+    return 1;
+}
+
+// —— 匹配（回溯状态机；位置经 st.pos 承载——S1 无指针参数）——
+
+function matchNode(p: Ref<Prog>, node: Ref<Node>, st: Ref<MatchState>): bool {
+    st.steps = st.steps + 1;
+    if (st.steps > STEP_LIMIT) {
+        st.overflow = true;
+        return false;
+    }
+    if (node.kind == 4) {
+        // ^：文本首（锚）。
+        return st.pos == 0;
+    }
+    if (node.kind == 5) {
+        // $：文本尾。
+        return st.pos == len(st.input);
+    }
+    if (node.kind == 0) {
+        if (st.pos >= len(st.input)) {
+            return false;
+        }
+        if (seqDecode(st.input, st.pos) != node.cp) {
+            return false;
+        }
+        st.pos = st.pos + seqLen(st.input, st.pos);
+        return true;
+    }
+    if (node.kind == 1) {
+        if (st.pos >= len(st.input)) {
+            return false;
+        }
+        if ((byteAt(st.input, st.pos) catch 10) == 10) {
+            return false;
+        }
+        st.pos = st.pos + seqLen(st.input, st.pos);
+        return true;
+    }
+    if (node.kind == 2) {
+        if (st.pos >= len(st.input)) {
+            return false;
+        }
+        const c = seqDecode(st.input, st.pos);
+        let hit = classHit(node, c);
+        if (node.negate) {
+            hit = !hit;
+        }
+        if (!hit) {
+            return false;
+        }
+        st.pos = st.pos + seqLen(st.input, st.pos);
+        return true;
+    }
+    if (node.kind == 6) {
+        // 选择：依序尝试（回溯经恢复 pos/groups）。
+        let i: int = 0;
+        while (i < listLen(node.children)) {
+            const branch = listGet(node.children, i) catch panic("regexp: 分支越界（不可达）");
+            const save = st.pos;
+            const saved = saveGroups(st);
+            if (matchNode(p, branch, st)) {
+                return true;
+            }
+            st.pos = save;
+            restoreGroups(st, saved);
+            i = i + 1;
+        }
+        return false;
+    }
+    // kind==3：组/量词/顺序链——按 capture/min/max 分派。
+    if (node.capture > 0) {
+        const open = st.pos;
+        const kid = listGet(node.children, 0) catch panic("regexp: 组子越界（不可达）");
+        if (!matchNode(p, kid, st)) {
+            return false;
+        }
+        setGroup(st, node.capture, open, st.pos);
+        return true;
+    }
+    if (isQuant(node)) {
+        return matchQuantFrom(p, node, node, st, 0);
+    }
+    return matchSeqFrom(p, node, st, 0);
+}
+
+// isQuant：量词节点判定（min/max 域非零——{0} 编译期已化简为空节点）。
+function isQuant(node: Ref<Node>): bool {
+    return node.min > 0 || node.max != 0;
+}
+
+// matchSeqFrom：顺序子链自 idx 起匹配（全链回溯——续传形态）。
+function matchSeqFrom(p: Ref<Prog>, seq: Ref<Node>, st: Ref<MatchState>, idx: int): bool {
+    if (idx >= listLen(seq.children)) {
+        return true;
+    }
+    const kid = listGet(seq.children, idx) catch panic("regexp: 子越界（不可达）");
+    if (kid.capture == 0 && isQuant(kid)) {
+        return matchQuantFrom(p, seq, kid, st, idx);
+    }
+    if (!matchNode(p, kid, st)) {
+        return false;
+    }
+    return matchSeqFrom(p, seq, st, idx + 1);
+}
+
+// matchQuantFrom：贪婪量词吃满后自长至短回溯，续传链尾（idx+1）。
+function matchQuantFrom(p: Ref<Prog>, seq: Ref<Node>, q: Ref<Node>, st: Ref<MatchState>, idx: int): bool {
+    const kid = listGet(q.children, 0) catch panic("regexp: 量词子越界（不可达）");
+    const ends: List<int> = listNew();
+    listPush(ends, st.pos);
+    let count: int = 0;
+    while (q.max < 0 || count < q.max) {
+        const before = st.pos;
+        if (!matchNode(p, kid, st)) {
+            break;
+        }
+        count = count + 1;
+        listPush(ends, st.pos);
+        if (st.pos == before) {
+            break; // 空匹配——不再重复
+        }
+    }
+    if (count < q.min) {
+        return false;
+    }
+    // 自长至短回溯（贪婪）；每档恢复捕获快照。
+    let keep = listLen(ends) - 1;
+    while (keep >= 0) {
+        const at = listGet(ends, keep) catch panic("regexp: ends 越界（不可达）");
+        const save = st.pos;
+        const saved = saveGroups(st);
+        st.pos = at;
+        if (matchSeqFrom(p, seq, st, idx + 1)) {
+            return true;
+        }
+        st.pos = save;
+        restoreGroups(st, saved);
+        keep = keep - 1;
+    }
+    return false;
+}
+
+function classHit(node: Ref<Node>, c: int): bool {
+    let i: int = 0;
+    while (i + 1 < listLen(node.items)) {
+        const lo = listGet(node.items, i) catch 0;
+        const hi = listGet(node.items, i + 1) catch 0;
+        if (lo < 0) {
+            // 简写类：-1=digit -2=word -3=space。
+            if (lo == -1 && c >= 48 && c <= 57) {
+                return true;
+            }
+            if (lo == -2 && (c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 95)) {
+                return true;
+            }
+            if (lo == -3 && (c == 32 || c >= 9 && c <= 13)) {
+                return true;
+            }
+        } else if (c >= lo && c <= hi) {
+            return true;
+        }
+        i = i + 2;
+    }
+    return false;
+}
+
+// —— 捕获面 ——
+
+function resetGroups(st: Ref<MatchState>): void {
+    let i: int = 0;
+    while (i < listLen(st.groups)) {
+        listSet(st.groups, i, -1);
+        i = i + 1;
+    }
+}
+
+function setGroup(st: Ref<MatchState>, gi: int, open: int, close: int): void {
+    listSet(st.groups, (gi - 1) * 2, open);
+    listSet(st.groups, (gi - 1) * 2 + 1, close);
+}
+
+function saveGroups(st: Ref<MatchState>): List<int> {
+    const copy: List<int> = listNew();
+    let i: int = 0;
+    while (i < listLen(st.groups)) {
+        listPush(copy, listGet(st.groups, i) catch -1);
+        i = i + 1;
+    }
+    return copy;
+}
+
+function restoreGroups(st: Ref<MatchState>, saved: List<int>): void {
+    let i: int = 0;
+    while (i < listLen(saved)) {
+        listSet(st.groups, i, listGet(saved, i) catch -1);
+        i = i + 1;
+    }
+}
+
+function sliceUtf8(s: string, from: int, to: int): string {
+    let out: string = "";
+    let i = from;
+    while (i < to && i < len(s)) {
+        out = out + (utf8Encode(seqDecode(s, i)) catch "");
+        i = i + seqLen(s, i);
+    }
+    return out;
+}

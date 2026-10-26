@@ -1,0 +1,98 @@
+// NRT shared emission helpers: compile target, first-failure record, static
+// .rdata text, fatal/trap tails and builtin argument checks. Every nrt_*
+// module emits through these so failures and text labels stay in one place.
+import { StructuredBuffer } from "./assemble";
+import { RtFn, RtOp, L, I, A } from "./rtfn_base";
+import { rtFailed, rtEnd, rtLabel, rtIf, rtIf32, rtLoad, rtOp, rtCall0, rtCall1, rtCall3, rtCall5, rtRdataBytes } from "./rtfn";
+import { T_X64_WINDOWS, tSysV } from "./target";
+
+// 内核的编译目标（selfhost/target.tx 的目标编号）；各 nrt_* 模块按判断点所属的维度取谓词。
+let nrtT: int = T_X64_WINDOWS;
+let nrtFail: string = "";
+let nrtTextCount: int = 0;
+
+export const ARITY: string = "内建函数实参数目错误";
+
+export function nrtBaseReset(t: int): void {
+    nrtT = t;
+    nrtFail = "";
+}
+
+export function nrtTarget(): int { return nrtT; }
+
+export function nrtLastError(): string { return nrtFail; }
+
+/// Records the first builder failure; nrtEmit reports it.
+export function check(f: Ref<RtFn>): void { rtEnd(f); if (len(rtFailed(f)) > 0 && len(nrtFail) == 0) { nrtFail = rtFailed(f); } }
+
+export function nrtFailWith(message: string): void { if (len(nrtFail) == 0) { nrtFail = message; } }
+
+/// Static text in .rdata; returns its label. Length is len(text).
+export function text(b: Ref<StructuredBuffer>, value: string): string {
+    const label = "__tx_nrt_text_" + toStr(nrtTextCount);
+    nrtTextCount = nrtTextCount + 1;
+    rtRdataBytes(b, label, value);
+    return label;
+}
+
+// 导出的 memcpy 是给 C 用的 SysV 包装（runtime_linux.tx），内核内部按私有约定直接调 __tx_linux_memcpy。
+export function memcpyName(): string { if (tSysV(nrtT)) { return "__tx_linux_memcpy"; } return "memcpy"; }
+
+/// Write static text then exit (used by stubs and fatal paths).
+export function fatal(b: Ref<StructuredBuffer>, f: Ref<RtFn>, message: string, code: int): void {
+    const label = text(b, message);
+    // 进程级致命锁：多个线程同时致命时只有第一个输出并退出（线程设计 §十一-4）。
+    rtCall0(f, "", "__tx_nrt_die_enter");
+    rtCall3(f, "", "__tx_nrt_write_die", I(2), A(label), I(len(message)));
+    rtCall1(f, "", "__tx_nrt_exit", I(code));
+}
+
+/// 线程第 4b 步：值槽 slot（地址）里的堆引用指向的对象若已冻结（对象头 flags 位 16，来自 Shared）就跳 frozen；
+/// tmp 是可写的临时局部。
+export function frozenGuard(f: Ref<RtFn>, slot: string, tmp: string, frozen: string): void {
+    rtLoad(f, tmp, L(slot), 8, 4);
+    rtCall1(f, tmp, "__tx_native_object_address_v1", L(tmp));
+    rtLoad(f, tmp, L(tmp), 0, 4);
+    rtOp(f, tmp, L(tmp), "and", I(16));
+    rtIf(f, L(tmp), "ne", I(0), frozen);
+}
+
+/// D3 v0.34 §6.8-16：对象（地址在 obj）正被外部调用借用（对象头 flags 位 64）就跳 pinned——借用期内任何改变长度的
+/// 操作都在修改之前由调用处报 4024。tmp 是可写的临时局部。
+export function pinGuard(f: Ref<RtFn>, obj: string, tmp: string, pinned: string): void {
+    rtLoad(f, tmp, L(obj), 0, 4);
+    rtOp(f, tmp, L(tmp), "and", I(64));
+    rtIf(f, L(tmp), "ne", I(0), pinned);
+}
+
+/// Trap with fixed text; the function must hold fn/pc in locals "fn"/"pc".
+export function trapText(b: Ref<StructuredBuffer>, f: Ref<RtFn>, code: int, message: string): void {
+    const label = text(b, message);
+    rtCall5(f, "", "__tx_trap", L("fn"), L("pc"), I(code), A(label), I(len(message)));
+}
+
+export function trapAt(b: Ref<StructuredBuffer>, f: Ref<RtFn>, label: string, code: int, message: string): void {
+    rtLabel(f, label);
+    trapText(b, f, code, message);
+}
+
+/// Builtin shells take (win fn pc a nargs); a count mismatch jumps to "arity".
+export function arity(b: Ref<StructuredBuffer>, f: Ref<RtFn>, count: int): void {
+    rtIf32(f, L("nargs"), "ne", I(count), "arity");
+}
+
+/// Load argument k's slot address into `slot`, its tag into `tag`; a tag
+/// other than `expected` (when >= 0) jumps to `bad`.
+export function argTag(f: Ref<RtFn>, k: int, slot: string, tag: string, expected: int, bad: string): void {
+    rtCall3(f, slot, "__tx_nrt_arg", L("win"), L("a"), I(k));
+    rtLoad(f, tag, L(slot), 0, 1);
+    if (expected >= 0) { rtIf(f, L(tag), "ne", I(expected), bad); }
+}
+
+/// From a str/err slot address: object payload pointer and length.
+export function strSpan(f: Ref<RtFn>, slot: string, p: string, n: string): void {
+    rtLoad(f, p, L(slot), 8, 4);
+    rtCall1(f, p, "__tx_native_object_address_v1", L(p));
+    rtLoad(f, n, L(p), 40, 8);
+    rtLoad(f, p, L(p), 32, 8);
+}

@@ -1,0 +1,390 @@
+// ELF64 x86-64 linker over relocatable objects (NRT on Linux: the program
+// object plus the generated kernel object). Input sections are grouped into
+// text/rodata/data/bss by flags, laid out like link_elf.tx (headers page, then
+// one PT_LOAD per group), symbols resolved globally, RELA applied
+// (R_X86_64_64/PC32/PLT32/32/32S). Static unless the driver registers shared
+// libraries (D3 v0.23 FFI `from "库"`, docs/design/v052-ffi-platform-v0.1-20261015.md
+// §五-4): then the image also gets PT_INTERP, PT_DYNAMIC, DT_NEEDED, a symbol
+// table of the imported functions and one GOT slot per import (`__imp_<名>`,
+// R_X86_64_GLOB_DAT, bound at load time: DF_BIND_NOW). The entry stays the
+// kernel's own `_start`; the dynamic loader maps the libraries first.
+// 读入、放置、符号解析、拷节与重定位在公共核心 link_objects.tx（与 Mach-O 写出器共用）；本文件只管 ELF 的布局、头与动态段。
+// 函数符号（v052-image-symbols）：可装载内容之后追加 .symtab、.strtab、.shstrtab 与节头表（不在任何 PT_LOAD 里）；
+// --strip 时不写，e_shnum 为 0。
+
+import { PTHREAD_HOOKS } from "./thread_block_abi";
+import { rawNameOf } from "./binary_name";
+import { linkMapSymbolsEnabled, linkMapEnabled, linkMapDone, linkMapSynthetic } from "./link_map_data";
+import { ImageSymbol, linkSymbolsCollect, linkSymbolsStripped } from "./link_symbols";
+import { LKO_IMAGE_LIMIT, lkoReject, lkoFailure, lkoAlignUp, lkoLookup, lkoAddress, lkoAddGlobal, lkoGlobalCount, lkoGlobalName, lkoGlobalKind, lkoBegin, lkoPlace, lkoGroupSize, lkoGroupAlign, lkoSetGroupSize, lkoSetGroupAlign, lkoSetGroupBase, lkoDefineGlobals, lkoCacheSymbols, lkoCopySections, lkoRelocate, lkoCollectMap } from "./link_objects";
+
+const BASE: int = 4194304;
+const PAGE: int = 4096;
+const INTERP: string = "/lib64/ld-linux-x86-64.so.2";
+
+let out: Bytes = bytesNew(0);
+struct Shdr { name: string, kind: int, flags: int, off: int, size: int, link: int, info: int, align: int, entsize: int }
+
+// Dynamic linking inputs (driver, before each link; empty = static product).
+const dynNeeded: List<string> = listNew();
+const dynImports: List<string> = listNew();
+const dynHookSyms: List<string> = listNew();
+const dynHookSlots: List<string> = listNew();
+
+export function elfDynReset(): void {
+    while (listLen(dynNeeded) > 0) { listRemoveAt(dynNeeded, listLen(dynNeeded) - 1); }
+    while (listLen(dynImports) > 0) { listRemoveAt(dynImports, listLen(dynImports) - 1); }
+    while (listLen(dynHookSyms) > 0) { listRemoveAt(dynHookSyms, listLen(dynHookSyms) - 1); }
+    while (listLen(dynHookSlots) > 0) { listRemoveAt(dynHookSlots, listLen(dynHookSlots) - 1); }
+}
+
+function hasText(xs: List<string>, x: string): bool {
+    let i = 0;
+    while (i < listLen(xs)) {
+        if ((listGet(xs, i) catch "") == x) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// DT_NEEDED entry (in registration order, duplicates ignored).
+export function elfDynNeeded(lib: string): void { if (!hasText(dynNeeded, lib)) { listPush(dynNeeded, lib); } }
+/// Imported function: GOT slot `__imp_<name>` bound to `name` at load time.
+export function elfDynImport(name: string): void { if (!hasText(dynImports, name)) { listPush(dynImports, name); } }
+/// Bind an existing 8-byte data symbol (e.g. a kernel hook slot) to the address of `sym` at load time.
+export function elfDynHook(sym: string, slot: string): void { listPush(dynHookSyms, sym); listPush(dynHookSlots, slot); }
+
+/// 程序用到线程的动态产物：pthread 函数（PTHREAD_HOOKS）逐个登记到内核的 __tx_libc_<名> 槽；旧 glibc 的
+/// pthread 在 libpthread.so.0（2.34 起并入 libc，该库仍作为兼容空壳存在）。
+export function elfDynThreadHooks(): void {
+    elfDynNeeded("libpthread.so.0");
+    const names = strSplit(PTHREAD_HOOKS, " ");
+    let k = 0;
+    while (k < listLen(names)) { elfDynHook(listGet(names, k) catch "", "__tx_libc_" + (listGet(names, k) catch "")); k = k + 1; }
+}
+
+function reject(message: string): int {
+    lkoReject(message);
+    out = bytesNew(0);
+    return 1;
+}
+
+// 核心步骤失败：原因已记在核心里，这里只清空产物。
+function failed(): int {
+    out = bytesNew(0);
+    return 1;
+}
+
+function emit(value: int, width: int): void {
+    let i = 0;
+    while (i < width) { bytesPush(out, (value >>> (i * 8)) & 255); i = i + 1; }
+}
+
+function patch(at: int, value: int, width: int): void {
+    let i = 0;
+    while (i < width) { bytesSet(out, at + i, (value >>> (i * 8)) & 255); i = i + 1; }
+}
+
+function segment(kind: int, flags: int, off: int, fileSize: int, memSize: int, alignment: int): void {
+    emit(kind, 4); emit(flags, 4); emit(off, 8);
+    emit(BASE + off, 8); emit(BASE + off, 8);
+    emit(fileSize, 8); emit(memSize, 8); emit(alignment, 8);
+}
+
+/// Link objects into a static executable; `entry` names the process entry symbol.
+export function linkElfObjects(objects: List<Bytes>, entry: string): int {
+    out = bytesNew(0);
+    if (lkoBegin(objects, "x86_64-linux") != 0) { return failed(); }
+    if (lkoPlace() != 0) { return failed(); }
+    const roSize = lkoGroupSize(1); const dataSize = lkoGroupSize(2);
+    // Dynamic structures: .interp .hash .dynsym .dynstr .rela.dyn after rodata,
+    // .dynamic and the GOT after data (both groups 8-aligned).
+    const dynamic = listLen(dynNeeded) > 0;
+    const dynSyms: List<string> = listNew();
+    let q = 0;
+    while (q < listLen(dynImports)) { listPush(dynSyms, listGet(dynImports, q) catch ""); q = q + 1; }
+    q = 0;
+    while (q < listLen(dynHookSyms)) {
+        const hs = listGet(dynHookSyms, q) catch "";
+        if (!hasText(dynSyms, hs)) { listPush(dynSyms, hs); }
+        q = q + 1;
+    }
+    const nsym = listLen(dynSyms) + 1;
+    const strtab = bytesNew(0);
+    bytesPush(strtab, 0);
+    const neededAt: List<int> = listNew();
+    q = 0;
+    while (q < listLen(dynNeeded)) { listPush(neededAt, bytesLen(strtab)); appendText(strtab, listGet(dynNeeded, q) catch ""); q = q + 1; }
+    const symAtStr: List<int> = listNew();
+    q = 0;
+    while (q < listLen(dynSyms)) { listPush(symAtStr, bytesLen(strtab)); appendText(strtab, listGet(dynSyms, q) catch ""); q = q + 1; }
+    const nrel = listLen(dynImports) + listLen(dynHookSyms);
+    let roBlock = 0;
+    let interpAt = 0;
+    let hashAt = 0;
+    let symtabAt = 0;
+    let strtabAt = 0;
+    let relaAt = 0;
+    let dynamicAt = 0;
+    let gotAt = 0;
+    const ndyn = listLen(dynNeeded) + 12;
+    if (dynamic) {
+        if (lkoGroupAlign(1) < 8) { lkoSetGroupAlign(1, 8); }
+        if (lkoGroupAlign(2) < 8) { lkoSetGroupAlign(2, 8); }
+        roBlock = lkoAlignUp(lkoGroupSize(1), 8);
+        interpAt = roBlock;
+        hashAt = lkoAlignUp(interpAt + len(INTERP) + 1, 8);
+        symtabAt = lkoAlignUp(hashAt + 4 * (3 + nsym), 8);
+        strtabAt = symtabAt + 24 * nsym;
+        relaAt = lkoAlignUp(strtabAt + bytesLen(strtab), 8);
+        lkoSetGroupSize(1, relaAt + 24 * nrel);
+        dynamicAt = lkoAlignUp(lkoGroupSize(2), 8);
+        gotAt = dynamicAt + 16 * ndyn;
+        lkoSetGroupSize(2, gotAt + 8 * listLen(dynImports));
+    }
+    const textOff = lkoAlignUp(PAGE, lkoGroupAlign(0));
+    const roOff = lkoAlignUp(textOff + lkoGroupSize(0), PAGE);
+    const dataOff = lkoAlignUp(roOff + lkoGroupSize(1), PAGE);
+    const bssOff = lkoAlignUp(dataOff + lkoGroupSize(2), lkoGroupAlign(3));
+    if (bssOff + lkoGroupSize(3) > LKO_IMAGE_LIMIT) { return reject("ImageTooLarge"); }
+    lkoSetGroupBase(0, BASE + textOff); lkoSetGroupBase(1, BASE + roOff);
+    lkoSetGroupBase(2, BASE + dataOff); lkoSetGroupBase(3, BASE + bssOff);
+    if (lkoDefineGlobals() != 0) { return failed(); }
+    q = 0;
+    while (dynamic && q < listLen(dynImports)) {
+        const slotName = "__imp_" + (listGet(dynImports, q) catch "");
+        if (lkoLookup(slotName) >= 0) { return reject("DuplicateSymbol:" + slotName); }
+        lkoAddGlobal(slotName, BASE + dataOff + gotAt + 8 * q);
+        if (linkMapSymbolsEnabled()) { linkMapSynthetic(rawNameOf(slotName), "got-slot", 2, BASE + dataOff + gotAt + 8 * q); }
+        q = q + 1;
+    }
+    lkoCacheSymbols();
+    const entryIndex = lkoLookup(entry);
+    if (entryIndex < 0) { return reject("MissingEntry:" + entry); }
+    const entryAddress = lkoAddress(entryIndex);
+    const symbols = linkSymbolsCollect();
+    if (!symbols.ok) { return reject(symbols.error); }
+    // Headers: ELF64 executable, five program headers (as link_elf.tx); a
+    // dynamic product adds PT_PHDR and PT_INTERP in front and PT_DYNAMIC. The NRT
+    // kernel's TLS template (__tx_tls_template: 8 bytes, aligned 8, in .rdata) adds
+    // PT_TLS: the executable's TLS block then sits right below the thread pointer,
+    // so the slot is fs:[-8] (threads design §十二; a static product's _start sets fs).
+    const tlsIndex = lkoLookup("__tx_tls_template");
+    let tlsAt = 0;
+    if (tlsIndex >= 0) {
+        tlsAt = lkoAddress(tlsIndex) - BASE;
+        if (tlsAt % 8 != 0) { return reject("MisalignedTlsTemplate"); }
+    }
+    let phnum = 5;
+    if (dynamic) { phnum = 8; }
+    if (tlsIndex >= 0) { phnum = phnum + 1; }
+    const headerSize = 64 + 56 * phnum;
+    emit(127, 1); emit(69, 1); emit(76, 1); emit(70, 1);
+    emit(2, 1); emit(1, 1); emit(1, 1); emit(0, 1); emit(0, 8);
+    emit(2, 2); emit(62, 2); emit(1, 4); emit(entryAddress, 8);
+    emit(64, 8); emit(0, 8); emit(0, 4);
+    emit(64, 2); emit(56, 2); emit(phnum, 2); emit(0, 2); emit(0, 2); emit(0, 2);
+    if (dynamic) {
+        segment(6, 4, 64, 56 * phnum, 56 * phnum, 8);
+        segment(3, 4, roOff + interpAt, len(INTERP) + 1, len(INTERP) + 1, 1);
+    }
+    segment(1, 4, 0, headerSize, headerSize, PAGE);
+    segment(1, 5, textOff, lkoGroupSize(0), lkoGroupSize(0), PAGE);
+    segment(1, 4, roOff, lkoGroupSize(1), lkoGroupSize(1), PAGE);
+    segment(1, 6, dataOff, lkoGroupSize(2), bssOff - dataOff + lkoGroupSize(3), PAGE);
+    if (dynamic) { segment(2, 6, dataOff + dynamicAt, 16 * ndyn, 16 * ndyn, 8); }
+    if (tlsIndex >= 0) { segment(7, 4, tlsAt, 8, 8, 8); }
+    emit(1685382481, 4); emit(6, 4); emit(0, 8); emit(0, 8);
+    emit(0, 8); emit(0, 8); emit(0, 8); emit(16, 8);
+    const fileEnd = dataOff + lkoGroupSize(2);
+    if (bytesLen(out) < fileEnd) { bytesAppend(out, bytesNew(fileEnd - bytesLen(out))); }
+    lkoCopySections(out, BASE);
+    if (dynamic) {
+        const ro = roOff;
+        const dd = dataOff;
+        // .interp
+        let c = 0;
+        while (c < len(INTERP)) { bytesSet(out, ro + interpAt + c, byteAt(INTERP, c) catch 0); c = c + 1; }
+        // .hash: one bucket, every chain empty (an executable exports nothing).
+        patch(ro + hashAt, 1, 4); patch(ro + hashAt + 4, nsym, 4);
+        // .dynsym: [0] null; imports and hook targets are global functions, undefined.
+        q = 0;
+        while (q < listLen(dynSyms)) {
+            const at = ro + symtabAt + 24 * (q + 1);
+            patch(at, listGet(symAtStr, q) catch 0, 4);
+            patch(at + 4, 18, 1);
+            q = q + 1;
+        }
+        c = 0;
+        while (c < bytesLen(strtab)) { bytesSet(out, ro + strtabAt + c, bytesGet(strtab, c) catch 0); c = c + 1; }
+        // .rela.dyn: R_X86_64_GLOB_DAT per GOT slot, then per hook slot.
+        let r = 0;
+        q = 0;
+        while (q < listLen(dynImports)) {
+            const at = ro + relaAt + 24 * r;
+            patch(at, BASE + dd + gotAt + 8 * q, 8);
+            patch(at + 8, ((dynSymIndex(dynSyms, listGet(dynImports, q) catch "") + 1) << 32) | 6, 8);
+            r = r + 1;
+            q = q + 1;
+        }
+        q = 0;
+        while (q < listLen(dynHookSyms)) {
+            const slot = lkoLookup(listGet(dynHookSlots, q) catch "");
+            if (slot < 0) { return reject("MissingSymbol:" + (listGet(dynHookSlots, q) catch "")); }
+            const at = ro + relaAt + 24 * r;
+            patch(at, lkoAddress(slot), 8);
+            patch(at + 8, ((dynSymIndex(dynSyms, listGet(dynHookSyms, q) catch "") + 1) << 32) | 6, 8);
+            r = r + 1;
+            q = q + 1;
+        }
+        // .dynamic
+        let dp = dd + dynamicAt;
+        q = 0;
+        while (q < listLen(dynNeeded)) { patch(dp, 1, 8); patch(dp + 8, listGet(neededAt, q) catch 0, 8); dp = dp + 16; q = q + 1; }
+        const tags: List<int> = listNew();
+        const vals: List<int> = listNew();
+        listPush(tags, 4); listPush(vals, BASE + ro + hashAt);
+        listPush(tags, 5); listPush(vals, BASE + ro + strtabAt);
+        listPush(tags, 6); listPush(vals, BASE + ro + symtabAt);
+        listPush(tags, 10); listPush(vals, bytesLen(strtab));
+        listPush(tags, 11); listPush(vals, 24);
+        listPush(tags, 7); listPush(vals, BASE + ro + relaAt);
+        listPush(tags, 8); listPush(vals, 24 * nrel);
+        listPush(tags, 9); listPush(vals, 24);
+        listPush(tags, 30); listPush(vals, 8);
+        listPush(tags, 1879048187); listPush(vals, 1);
+        listPush(tags, 21); listPush(vals, 0);
+        listPush(tags, 0); listPush(vals, 0);
+        q = 0;
+        while (q < listLen(tags)) { patch(dp, listGet(tags, q) catch 0, 8); patch(dp + 8, listGet(vals, q) catch 0, 8); dp = dp + 16; q = q + 1; }
+    }
+    // 静态 ELF 不需要加载期 rebase：64 位绝对地址按链接地址写死，位置表不用。
+    const absSites: List<int> = listNew();
+    if (lkoRelocate(out, BASE, absSites) != 0) { return failed(); }
+    if (!linkSymbolsStripped()) {
+        // 节头描述已有内容（地址＝BASE＋文件偏移），再加符号表；节号按地址次序。
+        const secs: List<Ref<Shdr>> = listNew();
+        addSection(secs, "", 0, 0, 0, 0, 0, 0);
+        const text = addSection(secs, ".text", 1, 6, textOff, lkoGroupSize(0), lkoGroupAlign(0), 0);
+        addSection(secs, ".rodata", 1, 2, roOff, roSize, lkoGroupAlign(1), 0);
+        let dynstr = 0;
+        if (dynamic) {
+            addSection(secs, ".interp", 1, 2, roOff + interpAt, len(INTERP) + 1, 1, 0);
+            const hash = addSection(secs, ".hash", 5, 2, roOff + hashAt, 4 * (3 + nsym), 8, 4);
+            const dynsym = addSection(secs, ".dynsym", 11, 2, roOff + symtabAt, 24 * nsym, 8, 24);
+            dynstr = addSection(secs, ".dynstr", 3, 2, roOff + strtabAt, bytesLen(strtab), 1, 0);
+            const rela = addSection(secs, ".rela.dyn", 4, 2, roOff + relaAt, 24 * nrel, 8, 24);
+            linkSection(secs, hash, dynsym, 0); linkSection(secs, dynsym, dynstr, 1); linkSection(secs, rela, dynsym, 0);
+        }
+        addSection(secs, ".data", 1, 3, dataOff, dataSize, lkoGroupAlign(2), 0);
+        if (dynamic) {
+            linkSection(secs, addSection(secs, ".dynamic", 6, 3, dataOff + dynamicAt, 16 * ndyn, 8, 16), dynstr, 0);
+            addSection(secs, ".got", 1, 3, dataOff + gotAt, 8 * listLen(dynImports), 8, 8);
+        }
+        addSection(secs, ".bss", 8, 3, bssOff, lkoGroupSize(3), lkoGroupAlign(3), 0);
+        writeSymbols(secs, text, symbols.list);
+    }
+    if (linkMapEnabled()) { lkoCollectMap(BASE, entryAddress); linkMapDone(); }
+    return 0;
+}
+
+function noShdr(): Ref<Shdr> { return new Shdr { name: "", kind: 0, flags: 0, off: 0, size: 0, link: 0, info: 0, align: 0, entsize: 0 }; }
+function addSection(secs: List<Ref<Shdr>>, name: string, kind: int, flags: int, off: int, size: int, alignment: int, entsize: int): int {
+    listPush(secs, new Shdr { name: name, kind: kind, flags: flags, off: off, size: size, link: 0, info: 0, align: alignment, entsize: entsize });
+    return listLen(secs) - 1;
+}
+function linkSection(secs: List<Ref<Shdr>>, index: int, link: int, info: int): void {
+    const s = listGet(secs, index) catch noShdr(); s.link = link; s.info = info;
+}
+// 地址所在的可装载节（先半开、再闭区间，同 Mach-O 写出器）；没有为 SHN_ABS。
+function sectionAt(secs: List<Ref<Shdr>>, va: int): int {
+    let pass = 0;
+    while (pass < 2) {
+        let k = 1;
+        while (k < listLen(secs)) {
+            const s = listGet(secs, k) catch noShdr(); const lo = BASE + s.off;
+            if ((s.flags & 2) != 0 && va >= lo && (va < lo + s.size || (pass == 1 && va == lo + s.size))) { return k; }
+            k = k + 1;
+        }
+        pass = pass + 1;
+    }
+    return 65521;
+}
+function putIn(b: Bytes, at: int, value: int, width: int): void {
+    let i = 0;
+    while (i < width) { bytesSet(b, at + i, (value >>> (i * 8)) & 255); i = i + 1; }
+}
+function symbol(table: Bytes, names: Bytes, name: string, info: int, section: int, value: int, size: int): void {
+    const at = bytesLen(table);
+    bytesAppend(table, bytesNew(24));
+    putIn(table, at, bytesLen(names), 4); putIn(table, at + 4, info, 1); putIn(table, at + 6, section, 2);
+    putIn(table, at + 8, value, 8); putIn(table, at + 16, size, 8);
+    appendText(names, name);
+}
+// .symtab 全为本地符号：函数（STT_FUNC，带大小），再是函数表以外的链接全局符号——.text 里的记 STT_FUNC、大小 0（未知，
+// 手写的运行时例程；同 Go 的链接器把代码里的符号都记为函数），其余 STT_NOTYPE，节按地址，绝对值记 SHN_ABS。
+function writeSymbols(secs: List<Ref<Shdr>>, text: int, functions: List<Ref<ImageSymbol>>): void {
+    const table = bytesNew(24); const names = bytesNew(1);
+    const covered: List<int> = listNew();
+    let k = 0;
+    while (k < lkoGlobalCount()) { listPush(covered, 0); k = k + 1; }
+    for (f in functions) {
+        symbol(table, names, f.name, 2, text, f.va, f.size);
+        const g = lkoLookup(f.link);
+        if (g >= 0 && lkoGlobalKind(g) == 0 && lkoAddress(g) == f.va) { listSet(covered, g, 1); }
+    }
+    k = 0;
+    while (k < lkoGlobalCount()) {
+        const name = lkoGlobalName(k);
+        if (len(name) > 0 && (listGet(covered, k) catch 0) == 0) {
+            let section = 65521; let kind = 0;
+            if (lkoGlobalKind(k) == 0) { section = sectionAt(secs, lkoAddress(k)); }
+            if (section == text) { kind = 2; }
+            symbol(table, names, name, kind, section, lkoAddress(k), 0);
+        }
+        k = k + 1;
+    }
+    while (bytesLen(out) % 8 != 0) { bytesPush(out, 0); }
+    const symtab = addSection(secs, ".symtab", 2, 0, bytesLen(out), bytesLen(table), 8, 24);
+    bytesAppend(out, table);
+    const strings = addSection(secs, ".strtab", 3, 0, bytesLen(out), bytesLen(names), 1, 0);
+    bytesAppend(out, names);
+    linkSection(secs, symtab, strings, bytesLen(table) / 24);
+    const shstrtab = addSection(secs, ".shstrtab", 3, 0, 0, 0, 1, 0);
+    const shnames = bytesNew(1); const nameAt: List<int> = listNew();
+    for (s in secs) {
+        if (len(s.name) == 0) { listPush(nameAt, 0); } else { listPush(nameAt, bytesLen(shnames)); appendText(shnames, s.name); }
+    }
+    const own = listGet(secs, shstrtab) catch noShdr();
+    own.off = bytesLen(out); own.size = bytesLen(shnames);
+    bytesAppend(out, shnames);
+    while (bytesLen(out) % 8 != 0) { bytesPush(out, 0); }
+    const shoff = bytesLen(out);
+    let i = 0;
+    for (s in secs) {
+        let addr = 0;
+        if ((s.flags & 2) != 0) { addr = BASE + s.off; }
+        emit(listGet(nameAt, i) catch 0, 4); emit(s.kind, 4); emit(s.flags, 8); emit(addr, 8); emit(s.off, 8); emit(s.size, 8);
+        emit(s.link, 4); emit(s.info, 4); emit(s.align, 8); emit(s.entsize, 8);
+        i = i + 1;
+    }
+    patch(40, shoff, 8); patch(58, 64, 2); patch(60, listLen(secs), 2); patch(62, shstrtab, 2);
+}
+
+function appendText(b: Bytes, s: string): void {
+    let i = 0;
+    while (i < len(s)) { bytesPush(b, byteAt(s, i) catch 0); i = i + 1; }
+    bytesPush(b, 0);
+}
+
+function dynSymIndex(syms: List<string>, name: string): int {
+    let i = 0;
+    while (i < listLen(syms)) {
+        if ((listGet(syms, i) catch "") == name) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+export function elfObjectsBytes(): Bytes { return out; }
+export function elfObjectsError(): string { return lkoFailure(); }

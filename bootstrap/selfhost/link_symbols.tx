@@ -1,0 +1,142 @@
+// 产物函数符号（docs/design/v052-image-symbols-v0.1-20261025.md）：链接放置之后按映像地址列出全部函数，ELF 写出器据此写
+// .symtab，Mach-O 写出器据此写本地符号与 function starts。来源按对象：
+// - 程序对象（最后一个输入）：驱动汇编时记下的名字与范围（native_function_data 的 NativeSymbol）；
+// - 带函数目录（.txfn，内核对象总带）的：目录里的名字与起止——只读这两项，帧事实的校验归 --map；
+// - 其余：对象符号表里定义在已放置代码节上的 STT_FUNC 符号。
+import { NativeSymbol } from "./native_function_data";
+import { lkoObjectCount, lkoSectionNamed, lkoSectionName, lkoSectionCount, lkoSectionIsCode, lkoSectionAddress, lkoSectionSize, lkoSectionBytes, lkoObjectFunctions } from "./link_objects";
+
+export struct ImageSymbol { name: string, link: string, va: int, size: int }
+export struct ImageSymbols { ok: bool, error: string, list: List<Ref<ImageSymbol>> }
+struct Cursor { data: Bytes, at: int, error: string }
+
+let program: List<Ref<NativeSymbol>> = listNew();
+let stripped: bool = false;
+
+/// 程序函数的符号名 <模块>.<函数>：模块取入口的显示名或导入说明符，去掉开头的 ./ 与结尾的 .tx；预置库记作 prelude。
+export function imageSymbolName(module: string, name: string): string {
+    if (module == "<prelude>") { return "prelude." + name; }
+    let b = bytesFromStr(module);
+    while (bytesLen(b) >= 2 && (bytesGet(b, 0) catch 0) == 46 && (bytesGet(b, 1) catch 0) == 47) { b = bytesSlice(b, 2, bytesLen(b) - 2); }
+    const n = bytesLen(b);
+    if (n > 3 && (bytesGet(b, n - 3) catch 0) == 46 && (bytesGet(b, n - 2) catch 0) == 116 && (bytesGet(b, n - 1) catch 0) == 120) { b = bytesSlice(b, 0, n - 3); }
+    const m = bytesToStr(b) catch (e) { return module + "." + name; };
+    return m + "." + name;
+}
+
+/// 每次 ELF／Mach-O 链接前由驱动给出：程序函数（nativeSymbolsTake）与是否去掉函数符号（--strip）。
+export function linkSymbolsSet(rows: List<Ref<NativeSymbol>>, strip: bool): void { program = rows; stripped = strip; }
+export function linkSymbolsStripped(): bool { return stripped; }
+
+function fail(message: string): Ref<ImageSymbols> { return new ImageSymbols { ok: false, error: message, list: listNew() }; }
+
+/// 放置（lkoDefineGlobals）之后调用：全部函数按地址升序（同址保持来源次序）。去掉符号（--strip）只去名字：Mach-O 的
+/// function starts 照旧用这张表。
+export function linkSymbolsCollect(): Ref<ImageSymbols> {
+    const out = new ImageSymbols { ok: true, error: "", list: listNew() };
+    const rows = program; program = listNew();
+    const n = lkoObjectCount(); let o = 0;
+    while (o < n) {
+        let problem = "";
+        if (o == n - 1 && listLen(rows) > 0) { problem = programRows(o, rows, out.list); }
+        else if (lkoSectionNamed(o, ".txfn") >= 0) { problem = directoryRows(o, out.list); }
+        else { for (f in lkoObjectFunctions(o)) { listPush(out.list, new ImageSymbol { name: f.name, link: f.name, va: f.va, size: f.size }); } }
+        if (len(problem) > 0) { return fail(problem); }
+        o = o + 1;
+    }
+    out.list = sortByVa(out.list);
+    return out;
+}
+
+function programRows(o: int, rows: List<Ref<NativeSymbol>>, list: List<Ref<ImageSymbol>>): string {
+    const text = lkoSectionNamed(o, ".text");
+    const base = lkoSectionAddress(o, text);
+    if (text < 0 || base < 0) { return "UnplacedFunctionSymbols"; }
+    const size = lkoSectionSize(o, text); let previous = 0;
+    for (r in rows) {
+        if (len(r.name) == 0 || r.begin < previous || r.end <= r.begin || r.end > size) { return "BadFunctionSymbol:" + r.link; }
+        listPush(list, new ImageSymbol { name: r.name, link: r.link, va: base + r.begin, size: r.end - r.begin }); previous = r.end;
+    }
+    return "";
+}
+
+// 读目录的游标；第一处错误记下原因，此后的读取都不再前进（原因名同 native_function_codec.tx 的完整解码）。
+function bad(c: Ref<Cursor>, why: string): void { if (len(c.error) == 0) { c.error = why; } }
+function take(c: Ref<Cursor>, width: int): int {
+    if (len(c.error) > 0) { return 0; }
+    if (width > bytesLen(c.data) - c.at) { bad(c, "TruncatedFunctionMetadata"); return 0; }
+    let value = 0; let i = width - 1;
+    while (i >= 0) { value = (value << 8) | (bytesGet(c.data, c.at + i) catch 0); i = i - 1; }
+    c.at = c.at + width;
+    if (value < 0) { bad(c, "FunctionMetadataIntegerOverflow"); return 0; }
+    return value;
+}
+function skip(c: Ref<Cursor>, size: int): void {
+    if (len(c.error) > 0) { return; }
+    if (size > bytesLen(c.data) - c.at) { bad(c, "TruncatedFunctionMetadata"); return; }
+    c.at = c.at + size;
+}
+// 计数不得超过剩余字节按每项最小长度能容下的个数。
+function count(c: Ref<Cursor>, minimum: int): int {
+    const n = take(c, 4);
+    if (n > (bytesLen(c.data) - c.at) / minimum) { bad(c, "InvalidFunctionMetadataCount"); return 0; }
+    return n;
+}
+function text(c: Ref<Cursor>): string {
+    const size = take(c, 4);
+    if (len(c.error) > 0) { return ""; }
+    if (size > bytesLen(c.data) - c.at) { bad(c, "TruncatedFunctionMetadata"); return ""; }
+    const value = bytesToStr(bytesSlice(c.data, c.at, size)) catch (e) { bad(c, "InvalidFunctionMetadataUtf8"); return ""; };
+    c.at = c.at + size; return value;
+}
+
+// 函数目录 txfn/3（native_function_codec.tx）：头为 "TXFN"、版本、代码节号、代码长、代码摘要；逐函数四个串、起止、序言末，
+// 再是尾声与帧事件（这里跳过）。只取名字与起止：结构按完整解码的同一套规则与次序核对、拒绝原因同名，代码摘要与帧事实的校验
+// 归 --map（native_function_object.tx）。
+function directoryRows(o: int, list: List<Ref<ImageSymbol>>): string {
+    const at = lkoSectionNamed(o, ".txfn");
+    let i = at + 1;
+    while (i < lkoSectionCount(o)) { if (lkoSectionName(o, i) == ".txfn") { return "DuplicateFunctionMetadataSection"; } i = i + 1; }
+    const c = new Cursor { data: lkoSectionBytes(o, at), at: 0, error: "" };
+    if (bytesLen(c.data) < 88) { return "TruncatedFunctionMetadataSection"; }
+    const declared = (bytesGet(c.data, 8) catch 0) | ((bytesGet(c.data, 9) catch 0) << 8) | ((bytesGet(c.data, 10) catch 0) << 16) | ((bytesGet(c.data, 11) catch 0) << 24);
+    if (declared <= 0 || declared >= lkoSectionCount(o)) { return "InvalidFunctionMetadataTextSection"; }
+    if (!lkoSectionIsCode(o, declared)) { return "NonCodeFunctionMetadataTarget"; }
+    if (take(c, 4) != 0x4E465854 || take(c, 4) != 3) { return "UnknownFunctionMetadataVersion"; }
+    const section = take(c, 4); const codeSize = take(c, 8); skip(c, 64);
+    if (len(c.error) > 0 || section != declared || codeSize != lkoSectionSize(o, section)) { return "FunctionMetadataTextMismatch"; }
+    const base = lkoSectionAddress(o, section);
+    const n = count(c, 48); let k = 0; let previous = 0;
+    while (k < n && len(c.error) == 0) {
+        const module = text(c); const name = text(c); text(c); text(c);
+        const begin = take(c, 8); const end = take(c, 8); const prologueEnd = take(c, 8);
+        skip(c, 16 * count(c, 16)); skip(c, 26 * count(c, 26));
+        if (len(c.error) > 0) { break; }
+        if (len(module) == 0 || len(name) == 0 || end <= begin || prologueEnd < begin || prologueEnd > end) { return "InvalidObjectFunction:BadFunctionRange"; }
+        if (begin < previous || end > codeSize) { return "InvalidObjectFunction:"; }
+        listPush(list, new ImageSymbol { name: name, link: name, va: base + begin, size: end - begin }); previous = end;
+        k = k + 1;
+    }
+    if (len(c.error) == 0 && c.at != bytesLen(c.data)) { bad(c, "TrailingFunctionMetadata"); }
+    return c.error;
+}
+
+// 自底向上归并排序，稳定。
+function sortByVa(xs: List<Ref<ImageSymbol>>): List<Ref<ImageSymbol>> {
+    let src = xs; const n = listLen(xs); let width = 1;
+    const missing = new ImageSymbol { name: "", link: "", va: 0, size: 0 };
+    while (width < n) {
+        const dst: List<Ref<ImageSymbol>> = listNew(); let lo = 0;
+        while (lo < n) {
+            let i = lo; let mid = lo + width; if (mid > n) { mid = n; }
+            let j = mid; let hi = lo + 2 * width; if (hi > n) { hi = n; }
+            while (i < mid || j < hi) {
+                if (j >= hi || (i < mid && (listGet(src, i) catch missing).va <= (listGet(src, j) catch missing).va)) { listPush(dst, listGet(src, i) catch missing); i = i + 1; }
+                else { listPush(dst, listGet(src, j) catch missing); j = j + 1; }
+            }
+            lo = hi;
+        }
+        src = dst; width = width * 2;
+    }
+    return src;
+}

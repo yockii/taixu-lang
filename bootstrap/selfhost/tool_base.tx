@@ -1,0 +1,111 @@
+// 工具链进程与标准输入例程的公共件（第 6 轮 6c-3，TOOL-103，docs/design/v052-round6-debug-v0.1-20261018.md §四-6）：
+// 失败记录、只读文本、陷阱、实参读取与句柄表的布局。例程进程序对象，只调用内核导出表里的符号
+// （__tx_nrt_arg、__tx_nrt_set_new、__tx_native_object_address_v1、__tx_store_file_err、__tx_trap、
+// __tx_native_mem_alloc/free，Windows 另有 __tx_file_wpath）；Windows 的 kernel32 一律经 __imp_<名>。
+//
+// 句柄表（bss __tx_tool_recs，REC_COUNT 项，每项 REC_BYTES 字节）：
+//   代数@0（≥1）、状态@8（0 空闲、1 领取中、2 使用中）、所属线程块@16、进程@24（Windows 进程句柄，Linux pid）、
+//   父进程这端的 stdin 写端@32、stdout 读端@40、stderr 读端@48、控制通道写端@56、控制通道读端@64（没有或已关闭为 −1）、
+//   已回收@72、退出码@80。
+// 句柄＝代数×REC_COUNT＋槽号，恒为正；关闭后状态归 0，下次领取时代数加一，旧句柄随即失效。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, RtOp, L, I, A } from "./rtfn_base";
+import { rtFailed, rtEnd, rtLabel, rtLoad, rtIf, rtOp, rtCall1, rtCall3, rtCall5, rtRdataBytes } from "./rtfn";
+
+export const REC_COUNT: int = 64;
+export const REC_SHIFT: int = 6;
+export const REC_BYTES: int = 96;
+export const R_GEN: int = 0;
+export const R_STATE: int = 8;
+export const R_OWNER: int = 16;
+export const R_PROC: int = 24;
+export const R_IN: int = 32;
+export const R_OUT: int = 40;
+export const R_ERR: int = 48;
+export const R_CW: int = 56;
+export const R_CR: int = 64;
+export const R_DONE: int = 72;
+export const R_CODE: int = 80;
+export const R_JOB: int = 88;
+
+export const TAG_INT: int = 1;
+export const TAG_NONE: int = 4;
+export const TAG_ERR: int = 5;
+export const TAG_STR: int = 6;
+export const TAG_LIST: int = 15;
+export const TAG_BYTES: int = 17;
+export const CHANNEL_VAR: string = "TAIXU_DEBUG_CHANNEL";
+// macOS 受限子进程的回收 cookie（M3 设计 G9）：procSpawnLimited 写进子进程环境，宿主服务按它找回脱离进程树的后代。
+export const REAP_COOKIE_VAR: string = "TAIXU_REAP_COOKIE";
+
+let toolFail: string = "";
+let toolTextCount: int = 0;
+
+export function toolFailReset(): void { toolFail = ""; }
+export function toolLastError(): string { return toolFail; }
+export function toolCheck(f: Ref<RtFn>): void { rtEnd(f); if (len(rtFailed(f)) > 0 && len(toolFail) == 0) { toolFail = rtFailed(f); } }
+
+export function xs0(): List<Ref<RtOp>> { return listNew(); }
+export function xs1(a: Ref<RtOp>): List<Ref<RtOp>> { const l = xs0(); listPush(l, a); return l; }
+export function xs2(a: Ref<RtOp>, b: Ref<RtOp>): List<Ref<RtOp>> { const l = xs1(a); listPush(l, b); return l; }
+export function xs3(a: Ref<RtOp>, b: Ref<RtOp>, c: Ref<RtOp>): List<Ref<RtOp>> { const l = xs2(a, b); listPush(l, c); return l; }
+export function xs4(a: Ref<RtOp>, b: Ref<RtOp>, c: Ref<RtOp>, d: Ref<RtOp>): List<Ref<RtOp>> { const l = xs3(a, b, c); listPush(l, d); return l; }
+export function xs5(a: Ref<RtOp>, b: Ref<RtOp>, c: Ref<RtOp>, d: Ref<RtOp>, e: Ref<RtOp>): List<Ref<RtOp>> {
+    const l = xs4(a, b, c, d); listPush(l, e); return l;
+}
+export function xs6(a: Ref<RtOp>, b: Ref<RtOp>, c: Ref<RtOp>, d: Ref<RtOp>, e: Ref<RtOp>, g: Ref<RtOp>): List<Ref<RtOp>> {
+    const l = xs5(a, b, c, d, e); listPush(l, g); return l;
+}
+export function xs7(a: Ref<RtOp>, b: Ref<RtOp>, c: Ref<RtOp>, d: Ref<RtOp>, e: Ref<RtOp>, g: Ref<RtOp>, h: Ref<RtOp>): List<Ref<RtOp>> {
+    const l = xs6(a, b, c, d, e, g); listPush(l, h); return l;
+}
+
+/// 只读文本（不补终结符），返回标号；长度即 len(value)。
+export function toolText(b: Ref<StructuredBuffer>, value: string): string {
+    const label = "__tx_tool_text_" + toStr(toolTextCount);
+    toolTextCount = toolTextCount + 1;
+    rtRdataBytes(b, label, value);
+    return label;
+}
+
+/// label 处陷入运行期错误 code（例程须有局部 fn、pc）。
+export function toolTrap(b: Ref<StructuredBuffer>, f: Ref<RtFn>, label: string, code: int, message: string): void {
+    rtLabel(f, label);
+    const t = toolText(b, message);
+    rtCall5(f, "", "__tx_trap", L("fn"), L("pc"), I(code), A(t), I(len(message)));
+}
+
+/// 内建外壳的参数为 (win fn pc a bi nargs)：nargs 只看低 32 位。实参数目不对跳 "arity"。
+export function toolArity(f: Ref<RtFn>, count: int): void {
+    rtOp(f, "s", L("nargs"), "and", I(4294967295));
+    rtIf(f, L("s"), "ne", I(count), "arity");
+}
+
+/// 实参 k 的槽址到 s、标签到 t；标签不是 tag 跳 bad。
+export function toolArg(f: Ref<RtFn>, k: int, tag: int, bad: string): void {
+    rtCall3(f, "s", "__tx_nrt_arg", L("win"), L("a"), I(k));
+    rtLoad(f, "t", L("s"), 0, 1);
+    rtIf(f, L("t"), "ne", I(tag), bad);
+}
+
+/// int 实参 k 到 dst。
+export function toolArgInt(f: Ref<RtFn>, k: int, dst: string, bad: string): void {
+    toolArg(f, k, TAG_INT, bad);
+    rtLoad(f, dst, L("s"), 8, 8);
+}
+
+/// string 或 Bytes 实参 k：对象地址到 obj、数据区到 p、长度到 n；对象下标留在 t。
+export function toolArgSpan(f: Ref<RtFn>, k: int, tag: int, obj: string, p: string, n: string, bad: string): void {
+    toolArg(f, k, tag, bad);
+    rtLoad(f, "t", L("s"), 8, 4);
+    rtCall1(f, obj, "__tx_native_object_address_v1", L("t"));
+    rtLoad(f, p, L(obj), 32, 8);
+    rtLoad(f, n, L(obj), 40, 8);
+}
+
+/// 写入目标 obj 若已冻结（来自 Shared，对象头标志位 16）跳 frozen。
+export function toolFrozen(f: Ref<RtFn>, obj: string, frozen: string): void {
+    rtLoad(f, "t", L(obj), 0, 4);
+    rtOp(f, "t", L("t"), "and", I(16));
+    rtIf(f, L("t"), "ne", I(0), frozen);
+}

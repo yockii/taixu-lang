@@ -1,0 +1,595 @@
+// lsp_refs.tx —— 原生 LSP 的 definition、references、rename（第 6 轮 6d-3a2，LSP 与 MCP 实施设计 §四-3）。
+//
+// 身份取自入口的分析节（lsp_diag 的 Root.occs，由 ana_index 解析）。同一身份在不同入口里键的模块序不同，跨入口时按
+// （声明模块的键，行，列，锚类[，名字]）比较。改名先校验新名、声明是否在库里、模板插值，再把编辑虚拟应用到覆盖层上、
+// 对受影响的入口各重查一次：诊断按码计数不得增加，被改身份的出现位置须正好是编辑后的位置。覆盖层只在内存里（§三-9）。
+import { Root, lspEmptyRoot, diagRoots, setOverlay } from "./lsp_diag";
+import { AnaOcc, anaResolve } from "./ana_index";
+import { LspDoc, docKey, keyPath, pathToUri, colUnits, posToOffset, lineStart, joinComma } from "./lsp_docs";
+import { drvCheck, drvCheckDiags, drvSetOverlay, drvAnaInts, drvAnaNames, drvLibRoots } from "./driver";
+import { DrvDiag } from "./check_diag";
+import { nextToken, Cur, Tok, Out, K_EOF, K_IDENT, K_TEMPLATE } from "../lexer";
+import { dbgStr } from "./dbg_out";
+
+// LSP 3.17 RequestFailed：请求合法但做不到（改名的新名无效、不能改名，§四-2）。
+export const REQUEST_FAILED: int = -32803;
+
+// 请求的结果：ok 时 body 为 result 的 JSON 文本，否则 message 为错误说明（码为 REQUEST_FAILED）。
+export struct RefsReply {
+    ok: bool,
+    body: string,
+    message: string,
+}
+
+// 一个身份（跨入口的形）：声明模块的键、键行、键列、锚类、名字（锚类为 0 时不比名字）。
+struct Ident {
+    modKey: string,
+    kl: int,
+    kc: int,
+    kh: int,
+    name: string,
+}
+
+export struct Hit {
+    root: Ref<Root>,
+    occ: Ref<AnaOcc>,
+}
+
+// 一个文件的出现取自哪个入口的哪个模块。
+struct FileSrc {
+    key: string,
+    root: Ref<Root>,
+    mod: int,
+    occs: List<Ref<AnaOcc>>,
+}
+
+function ok(body: string): Ref<RefsReply> { return new RefsReply { ok: true, body: body, message: "" }; }
+
+function fail(msg: string): Ref<RefsReply> { return new RefsReply { ok: false, body: "", message: msg }; }
+
+function pathOf(r: Ref<Root>, m: int): string { return listGet(r.paths, m) catch "<prelude>"; }
+
+function keyOfMod(r: Ref<Root>, m: int): string {
+    const p = pathOf(r, m);
+    if (p == "<prelude>") { return p; }
+    return docKey(p);
+}
+
+function modIndex(r: Ref<Root>, key: string): int {
+    let i = 0;
+    while (i < listLen(r.paths)) {
+        if (keyOfMod(r, i) == key) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+function identOf(r: Ref<Root>, o: Ref<AnaOcc>): Ref<Ident> {
+    return new Ident { modKey: keyOfMod(r, o.km), kl: o.kl, kc: o.kc, kh: o.kh, name: o.name };
+}
+
+function sameIdent(a: Ref<Ident>, b: Ref<Ident>): bool {
+    return a.modKey == b.modKey && a.kl == b.kl && a.kc == b.kc && a.kh == b.kh && (a.kh == 0 || a.name == b.name);
+}
+
+// o 在入口里是否属于身份 t（mi 为 t 的声明模块在该入口里的模块序）。
+function occIs(o: Ref<AnaOcc>, t: Ref<Ident>, mi: int): bool {
+    return len(o.key) > 0 && o.km == mi && o.kl == t.kl && o.kc == t.kc && o.kh == t.kh && (t.kh == 0 || o.name == t.name);
+}
+
+// 光标处的出现：取第一个含该文档的入口；名字之内的优先，其次光标正好在名字末尾的（§四-3）。没有身份的不算。
+export function hitsAt(d: Ref<LspDoc>, line: int, ch: int, enc: int): List<Ref<Hit>> {
+    const inside: List<Ref<Hit>> = listNew();
+    const atEnd: List<Ref<Hit>> = listNew();
+    const bc = posToOffset(d, line, ch, enc) - lineStart(d, line);
+    for (r in diagRoots()) {
+        const m = modIndex(r, d.key);
+        if (m >= 0) {
+            for (o in r.occs) {
+                if (o.mod == m && o.line == line + 1 && len(o.key) > 0) {
+                    const s = o.col - 1;
+                    if (bc >= s && bc < s + o.len) {
+                        listPush(inside, new Hit { root: r, occ: o });
+                    } else if (bc == s + o.len) {
+                        listPush(atEnd, new Hit { root: r, occ: o });
+                    }
+                }
+            }
+            if (listLen(inside) > 0) { return inside; }
+            return atEnd;
+        }
+    }
+    return atEnd;
+}
+
+// 命中里不同的身份。
+function identsOf(hits: List<Ref<Hit>>): List<Ref<Ident>> {
+    const out: List<Ref<Ident>> = listNew();
+    for (h in hits) {
+        const t = identOf(h.root, h.occ);
+        let seen = false;
+        for (x in out) {
+            if (sameIdent(x, t)) { seen = true; }
+        }
+        if (!seen) { listPush(out, t); }
+    }
+    return out;
+}
+
+// —— 位置与 JSON ——
+
+export function startsOf(text: string): List<int> {
+    const s: List<int> = listNew();
+    listPush(s, 0);
+    let i = 0;
+    const n = len(text);
+    while (i < n) {
+        if ((byteAt(text, i) catch 0) == 10) { listPush(s, i + 1); }
+        i = i + 1;
+    }
+    return s;
+}
+
+export function rangeJson(text: string, starts: List<int>, line: int, col: int, n: int, enc: int): string {
+    const ls = listGet(starts, line - 1) catch len(text);
+    const sc = colUnits(text, ls, col - 1, enc);
+    const ec = colUnits(text, ls, col - 1 + n, enc);
+    return "{\"start\":{\"line\":" + toStr(line - 1) + ",\"character\":" + toStr(sc) + "},\"end\":{\"line\":" + toStr(line - 1) + ",\"character\":" + toStr(ec) + "}}";
+}
+
+function uriOf(docs: List<Ref<LspDoc>>, key: string, windows: bool): string {
+    for (d in docs) {
+        if (d.key == key) { return d.uri; }
+    }
+    return pathToUri(keyPath(key, windows), windows);
+}
+
+function locJson(docs: List<Ref<LspDoc>>, r: Ref<Root>, o: Ref<AnaOcc>, enc: int, windows: bool): string {
+    const text = listGet(r.texts, o.mod) catch "";
+    return "{\"uri\":" + dbgStr(uriOf(docs, keyOfMod(r, o.mod), windows)) + ",\"range\":" + rangeJson(text, startsOf(text), o.line, o.col, o.len, enc) + "}";
+}
+
+// —— definition ——
+
+export function refsDefinition(docs: List<Ref<LspDoc>>, d: Ref<LspDoc>, line: int, ch: int, enc: int, windows: bool): string {
+    const locs: List<string> = listNew();
+    for (h in hitsAt(d, line, ch, enc)) {
+        const t = identOf(h.root, h.occ);
+        const mi = modIndex(h.root, t.modKey);
+        for (o in h.root.occs) {
+            if (o.decl && occIs(o, t, mi) && pathOf(h.root, o.mod) != "<prelude>") {
+                const j = locJson(docs, h.root, o, enc, windows);
+                let seen = false;
+                for (x in locs) {
+                    if (x == j) { seen = true; }
+                }
+                if (!seen) { listPush(locs, j); }
+            }
+        }
+    }
+    if (listLen(locs) == 0) { return "null"; }
+    if (listLen(locs) == 1) { return listGet(locs, 0) catch "null"; }
+    return "[" + joinComma(locs) + "]";
+}
+
+// —— 身份的全部出现（references 与 rename 共用）——
+
+function strLess(a: string, b: string): bool {
+    const n = len(a);
+    const m = len(b);
+    let i = 0;
+    while (i < n && i < m) {
+        const x = byteAt(a, i) catch 0;
+        const y = byteAt(b, i) catch 0;
+        if (x != y) { return x < y; }
+        i = i + 1;
+    }
+    return n < m;
+}
+
+// 含声明模块的全部入口里，身份 ts 的出现按文件分组：每个文件取第一个同时含它与声明模块的入口；文件按键排序，
+// 文件内按位置（入口的出现本已按位置排序）。
+function collect(ts: List<Ref<Ident>>): List<Ref<FileSrc>> {
+    const files: List<Ref<FileSrc>> = listNew();
+    for (r in diagRoots()) {
+        const mis: List<int> = listNew();
+        let any = false;
+        for (t in ts) {
+            const mi = modIndex(r, t.modKey);
+            listPush(mis, mi);
+            if (mi >= 0) { any = true; }
+        }
+        if (!any) { continue; }
+        const mine: List<Ref<FileSrc>> = listNew();
+        let m = 0;
+        while (m < listLen(r.paths)) {
+            const k = keyOfMod(r, m);
+            let seen = k == "<prelude>";
+            for (f in files) {
+                if (f.key == k) { seen = true; }
+            }
+            if (!seen) {
+                const f = new FileSrc { key: k, root: r, mod: m, occs: listNew() };
+                listPush(files, f);
+                listPush(mine, f);
+            }
+            m = m + 1;
+        }
+        if (listLen(mine) == 0) { continue; }
+        for (o in r.occs) {
+            let hit = false;
+            let i = 0;
+            while (i < listLen(ts)) {
+                if (occIs(o, listGet(ts, i) catch identNone(), listGet(mis, i) catch -1)) { hit = true; }
+                i = i + 1;
+            }
+            if (hit) {
+                for (f in mine) {
+                    if (f.mod == o.mod) { listPush(f.occs, o); }
+                }
+            }
+        }
+    }
+    // 按文件键排序（插入排序：文件数不多）。
+    const out: List<Ref<FileSrc>> = listNew();
+    for (f in files) {
+        if (listLen(f.occs) == 0) { continue; }
+        let i = listLen(out);
+        listPush(out, f);
+        while (i > 0 && strLess(f.key, (listGet(out, i - 1) catch f).key)) {
+            listSet(out, i, listGet(out, i - 1) catch f);
+            i = i - 1;
+        }
+        listSet(out, i, f);
+    }
+    return out;
+}
+
+function identNone(): Ref<Ident> { return new Ident { modKey: "", kl: 0, kc: 0, kh: -1, name: "" }; }
+
+export function refsReferences(docs: List<Ref<LspDoc>>, d: Ref<LspDoc>, line: int, ch: int, enc: int, windows: bool, withDecl: bool): string {
+    const ts = identsOf(hitsAt(d, line, ch, enc));
+    if (listLen(ts) == 0) { return "[]"; }
+    const locs: List<string> = listNew();
+    for (f in collect(ts)) {
+        const text = listGet(f.root.texts, f.mod) catch "";
+        const starts = startsOf(text);
+        const uri = dbgStr(uriOf(docs, f.key, windows));
+        let pl = -1;
+        let pc = -1;
+        for (o in f.occs) {
+            if ((withDecl || !o.decl) && !(o.line == pl && o.col == pc)) {
+                listPush(locs, "{\"uri\":" + uri + ",\"range\":" + rangeJson(text, starts, o.line, o.col, o.len, enc) + "}");
+                pl = o.line;
+                pc = o.col;
+            }
+        }
+    }
+    return "[" + joinComma(locs) + "]";
+}
+
+// —— rename ——
+
+function lexOne(s: string): Tok {
+    const out: Ref<Out> = new Out { lines: "", errors: "", failed: false, coded: true };
+    const c: Ref<Cur> = new Cur { pos: 0, line: 1, col: 1 };
+    const t: Tok = nextToken(s, c, out);
+    if (c.pos != len(s) || out.failed) { return Tok { kind: K_EOF, text: "", line: 0, col: 0 }; }
+    return t;
+}
+
+// 整串正好是一个标识符记号（关键字的记号种类不是标识符）。
+function isIdent(s: string): bool {
+    if (len(s) == 0) { return false; }
+    const t = lexOne(s);
+    return t.kind == K_IDENT && t.text == s;
+}
+
+function bytesSub(s: string, from: int, n: int): string {
+    if (n <= 0) { return ""; }
+    return bytesToStr(bytesSlice(bytesFromStr(s), from, n)) catch "";
+}
+
+function startsWithB(s: string, p: string): bool {
+    if (len(s) < len(p)) { return false; }
+    let i = 0;
+    while (i < len(p)) {
+        if ((byteAt(s, i) catch 0) != (byteAt(p, i) catch 1)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+function endsWithB(s: string, p: string): bool {
+    if (len(s) < len(p)) { return false; }
+    return bytesSub(s, len(s) - len(p), len(p)) == p;
+}
+
+function isLower(c: int): bool { return c >= 97 && c <= 122; }
+
+function isUpper(c: int): bool { return c >= 65 && c <= 90; }
+
+// 同 semamirror 的 upperFirst、lowerFirst（只改 ASCII 首字母）。
+function upperFirst(s: string): string {
+    const c = byteAt(s, 0) catch 0;
+    if (!isLower(c)) { return s; }
+    return (utf8Encode(c - 32) catch "") + bytesSub(s, 1, len(s) - 1);
+}
+
+function lowerFirst(s: string): string {
+    const c = byteAt(s, 0) catch 0;
+    if (!isUpper(c)) { return s; }
+    return (utf8Encode(c + 32) catch "") + bytesSub(s, 1, len(s) - 1);
+}
+
+// 模板串插值（`${…}`）里是否有名为 name 的标识符记号。插值里的名字没有真实位置（§四-2），改名会漏改。
+function templateHas(text: string, name: string): bool {
+    const out: Ref<Out> = new Out { lines: "", errors: "", failed: false, coded: true };
+    const c: Ref<Cur> = new Cur { pos: 0, line: 1, col: 1 };
+    while (true) {
+        const t: Tok = nextToken(text, c, out);
+        if (t.kind == K_EOF) { return false; }
+        if (t.kind == K_TEMPLATE && segmentsHave(t.text, name)) { return true; }
+    }
+    return false;
+}
+
+function segmentsHave(raw: string, name: string): bool {
+    let i = 0;
+    const n = len(raw);
+    while (i + 1 < n) {
+        if ((byteAt(raw, i) catch 0) == 36 && (byteAt(raw, i + 1) catch 0) == 123) {
+            let depth = 1;
+            let j = i + 2;
+            while (j < n && depth > 0) {
+                const b = byteAt(raw, j) catch 0;
+                if (b == 123) { depth = depth + 1; }
+                if (b == 125) { depth = depth - 1; }
+                j = j + 1;
+            }
+            const seg = bytesSub(raw, i + 2, j - i - 3);
+            const out: Ref<Out> = new Out { lines: "", errors: "", failed: false, coded: true };
+            const c: Ref<Cur> = new Cur { pos: 0, line: 1, col: 1 };
+            while (true) {
+                const t: Tok = nextToken(seg, c, out);
+                if (t.kind == K_EOF) { break; }
+                if (t.kind == K_IDENT && t.text == name) { return true; }
+            }
+            i = j;
+        } else {
+            i = i + 1;
+        }
+    }
+    return false;
+}
+
+// 一处编辑：文件、行、列（1 起字节列）、旧长度、新文本。
+struct Edit {
+    key: string,
+    line: int,
+    col: int,
+    oldLen: int,
+    text: string,
+}
+
+// 方法糖调用点的新方法名（§四-3）：声明名 decl＝P＋upperFirst(m)，新名须为 P＋R、upperFirst 不改 R。无解为空串。
+function sugarName(decl: string, m: string, newName: string): string {
+    const up = upperFirst(m);
+    if (!endsWithB(decl, up)) { return ""; }
+    const p = bytesSub(decl, 0, len(decl) - len(up));
+    if (!startsWithB(newName, p) || len(newName) <= len(p)) { return ""; }
+    const r = bytesSub(newName, len(p), len(newName) - len(p));
+    const c = byteAt(r, 0) catch 0;
+    if (isLower(c)) { return ""; }
+    let name = r;
+    if (isUpper(c) && isLower(byteAt(m, 0) catch 0)) { name = lowerFirst(r); }
+    if (!isIdent(name)) { return ""; }
+    return name;
+}
+
+// 文件 key 里各编辑之后的新列（同一行里前面的编辑改变长度）。
+function newCol(edits: List<Ref<Edit>>, key: string, line: int, col: int): int {
+    let shift = 0;
+    for (e in edits) {
+        if (e.key == key && e.line == line && e.col < col) { shift = shift + len(e.text) - e.oldLen; }
+    }
+    return col + shift;
+}
+
+function applyEdits(text: string, edits: List<Ref<Edit>>, key: string): string {
+    const starts = startsOf(text);
+    let out = "";
+    let pos = 0;
+    for (e in edits) {
+        if (e.key == key) {
+            const off = (listGet(starts, e.line - 1) catch len(text)) + e.col - 1;
+            out = out + bytesSub(text, pos, off - pos) + e.text;
+            pos = off + e.oldLen;
+        }
+    }
+    return out + bytesSub(text, pos, len(text) - pos);
+}
+
+function underLib(path: string): bool {
+    for (root in drvLibRoots()) {
+        if (startsWithB(path, root + "/")) { return true; }
+    }
+    return false;
+}
+
+function codeCounts(ds: List<Ref<DrvDiag>>, codes: List<int>, counts: List<int>): void {
+    for (d in ds) {
+        let i = 0;
+        let found = false;
+        while (i < listLen(codes)) {
+            if ((listGet(codes, i) catch -1) == d.code) {
+                listSet(counts, i, (listGet(counts, i) catch 0) + 1);
+                found = true;
+            }
+            i = i + 1;
+        }
+        if (!found) {
+            listPush(codes, d.code);
+            listPush(counts, 1);
+        }
+    }
+}
+
+function countOf(codes: List<int>, counts: List<int>, code: int): int {
+    let i = 0;
+    while (i < listLen(codes)) {
+        if ((listGet(codes, i) catch -1) == code) { return listGet(counts, i) catch 0; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 重查入口 r（覆盖层已设好、新文本 texts 按 r 的模块序）：返回空串为通过，否则为说明。
+function verifyRoot(r: Ref<Root>, targetId: int, texts: List<string>, edits: List<Ref<Edit>>, t: Ref<Ident>, newName: string, declLine: int, declCol: int): string {
+    drvCheck(r.path, targetId, true);
+    const oc: List<int> = listNew();
+    const on: List<int> = listNew();
+    codeCounts(r.diags, oc, on);
+    const nc: List<int> = listNew();
+    const nn: List<int> = listNew();
+    const nds = drvCheckDiags();
+    codeCounts(nds, nc, nn);
+    for (d in nds) {
+        if (countOf(nc, nn, d.code) > countOf(oc, on, d.code)) { return "改名后程序出现新的诊断（" + toStr(d.code) + "：" + d.msg + "）"; }
+    }
+    const occs = anaResolve(drvAnaInts(), drvAnaNames(), texts);
+    // 改后的声明在原声明处（列随同一行前面的编辑移动）。
+    const dl = declLine;
+    const dc = newCol(edits, t.modKey, declLine, declCol);
+    const dm = modIndex(r, t.modKey);
+    let nt: Ref<Ident>? = None;
+    for (o in occs) {
+        if (o.decl && o.mod == dm && o.line == dl && o.col == dc && o.name == newName && len(o.key) > 0) { nt = identOf(r, o); }
+    }
+    if (nt == None) { return "改名后找不到改过的声明"; }
+    const target = nt catch identNone();
+    const mi = modIndex(r, target.modKey);
+    // 改后同一身份的出现位置须正好是编辑后的位置（只看这个入口的模块）。
+    const got: List<string> = listNew();
+    for (o in occs) {
+        if (occIs(o, target, mi)) {
+            const s = keyOfMod(r, o.mod) + ":" + toStr(o.line) + ":" + toStr(o.col);
+            let seen = false;
+            for (x in got) {
+                if (x == s) { seen = true; }
+            }
+            if (!seen) { listPush(got, s); }
+        }
+    }
+    const want: List<string> = listNew();
+    for (e in edits) {
+        if (modIndex(r, e.key) >= 0) { listPush(want, e.key + ":" + toStr(e.line) + ":" + toStr(newCol(edits, e.key, e.line, e.col))); }
+    }
+    for (w in want) {
+        let found = false;
+        for (g in got) {
+            if (g == w) { found = true; }
+        }
+        if (!found) { return "改名后有一处不再指向同一个声明（遮蔽或捕获冲突）：" + w; }
+    }
+    for (g in got) {
+        let found = false;
+        for (w in want) {
+            if (g == w) { found = true; }
+        }
+        if (!found) { return "改名后别处的同名引用会改指这个声明（遮蔽冲突）：" + g; }
+    }
+    return "";
+}
+
+export function refsRename(docs: List<Ref<LspDoc>>, d: Ref<LspDoc>, line: int, ch: int, enc: int, windows: bool, targetId: int, newName: string): Ref<RefsReply> {
+    if (!isIdent(newName)) { return fail("新名须为一个标识符且不是关键字：" + newName); }
+    const hits = hitsAt(d, line, ch, enc);
+    const ts = identsOf(hits);
+    if (listLen(ts) == 0) { return fail("光标处没有可改名的名字"); }
+    if (listLen(ts) > 1) { return fail("该处的名字随泛型实例指向不同的声明，不能改名"); }
+    const t = listGet(ts, 0) catch identNone();
+    // 声明：在命中的入口里找。
+    const h = listGet(hits, 0) catch new Hit { root: listGet(diagRoots(), 0) catch lspEmptyRoot(), occ: new AnaOcc { mod: -1, line: 0, col: 0, len: 0, tt: 0, decl: false, km: 0, kl: 0, kc: 0, kh: -1, key: "", name: "", guess: false } };
+    const hmi = modIndex(h.root, t.modKey);
+    let decl: Ref<AnaOcc>? = None;
+    for (o in h.root.occs) {
+        if (decl == None && o.decl && occIs(o, t, hmi)) { decl = o; }
+    }
+    if (decl == None) { return fail("找不到这个名字的声明"); }
+    const dcl = decl catch h.occ;
+    const dpath = pathOf(h.root, dcl.mod);
+    if (dpath == "<prelude>" || underLib(dpath)) { return fail("声明在标准库、gui 库或 prelude 里，不能改名：" + dcl.name); }
+    const oldName = dcl.name;
+    if (newName == oldName) { return ok("null"); }
+    const files = collect(ts);
+    // 模板插值里的同名标识符没有位置，改名会漏改（§四-2）。
+    for (r in diagRoots()) {
+        if (modIndex(r, t.modKey) < 0) { continue; }
+        let m = 0;
+        while (m < listLen(r.texts)) {
+            if (templateHas(listGet(r.texts, m) catch "", oldName)) { return fail("模板串插值里有名字 " + oldName + "（" + keyOfMod(r, m) + "）：插值里的名字没有位置，改名会漏改，未改"); }
+            m = m + 1;
+        }
+    }
+    const edits: List<Ref<Edit>> = listNew();
+    for (f in files) {
+        let pl = -1;
+        let pc = -1;
+        for (o in f.occs) {
+            if (o.line == pl && o.col == pc) { continue; }
+            pl = o.line;
+            pc = o.col;
+            let text = newName;
+            if (t.kh == 0 && dcl.tt == 0 && o.name != oldName) {
+                text = sugarName(oldName, o.name, newName);
+                if (len(text) == 0) { return fail("方法糖调用 ." + o.name + "() 解析到函数 " + oldName + "：新名须保留接收者类型前缀、其后首字母大写，才能改写调用处的方法名"); }
+            }
+            listPush(edits, new Edit { key: f.key, line: o.line, col: o.col, oldLen: o.len, text: text });
+        }
+    }
+    // 编辑虚拟应用到覆盖层，对含声明模块的每个入口重查。
+    const ovPaths: List<string> = listNew();
+    const ovTexts: List<string> = listNew();
+    for (doc in docs) {
+        listPush(ovPaths, doc.path);
+        listPush(ovTexts, applyEdits(doc.text, edits, doc.key));
+    }
+    for (f in files) {
+        let open = false;
+        for (doc in docs) {
+            if (doc.key == f.key) { open = true; }
+        }
+        if (!open) {
+            listPush(ovPaths, pathOf(f.root, f.mod));
+            listPush(ovTexts, applyEdits(listGet(f.root.texts, f.mod) catch "", edits, f.key));
+        }
+    }
+    drvSetOverlay(ovPaths, ovTexts);
+    let why = "";
+    for (r in diagRoots()) {
+        if (len(why) == 0 && modIndex(r, t.modKey) >= 0) {
+            const texts: List<string> = listNew();
+            let m = 0;
+            while (m < listLen(r.texts)) {
+                listPush(texts, applyEdits(listGet(r.texts, m) catch "", edits, keyOfMod(r, m)));
+                m = m + 1;
+            }
+            why = verifyRoot(r, targetId, texts, edits, t, newName, dcl.line, dcl.col);
+        }
+    }
+    setOverlay(docs);
+    if (len(why) > 0) { return fail(why + "，未改"); }
+    // WorkspaceEdit.changes：每个文件的编辑按位置（collect 已排序）。
+    const changes: List<string> = listNew();
+    for (f in files) {
+        const text = listGet(f.root.texts, f.mod) catch "";
+        const starts = startsOf(text);
+        const arr: List<string> = listNew();
+        for (e in edits) {
+            if (e.key == f.key) { listPush(arr, "{\"range\":" + rangeJson(text, starts, e.line, e.col, e.oldLen, enc) + ",\"newText\":" + dbgStr(e.text) + "}"); }
+        }
+        if (listLen(arr) > 0) { listPush(changes, dbgStr(uriOf(docs, f.key, windows)) + ":[" + joinComma(arr) + "]"); }
+    }
+    return ok("{\"changes\":{" + joinComma(changes) + "}}");
+}

@@ -1,0 +1,191 @@
+// memcpy／memset／memmove 的可移植版（rtfn 写，macOS 适配 M4 设计 A8）：语义与导出名同 runtime_memory_gen.tx 的 copy、fill、move。
+// SysV 目标上内核里的名字是 __tx_linux_*（导出的 memcpy 等是 runtime_linux.tx 给 C 的包装，转调这里），同手写版。
+// 入口约定同手写版：实参 dst／c／n 在 rcx、rdx、r8（A64 为 x0..x2），结果为 dst。三个都是叶函数（只有致命出口有调用），
+// x86 上只改写 rax、rcx：手写的 memcpy／memset 另改写 r10、r11，手写的 memmove 保留 rcx、改写 r9–r11——内核里没有依赖这一差别的调用方。
+// - memcpy：n 为 0 时不检查；否则先查 dst、再查 src 的跨度（地址非零、末字节不越过地址空间末端），不符即 __tx_native_memory_span_panic。
+//   拷贝照 rep movsb 的语义逐字节前向：重叠时结果与手写版逐字节相同。dst 在 src 之后 1..7 字节时 8 字节块会读到刚写的字节，
+//   整段逐字节；其余按 8 字节块前向，再逐字节补尾。
+// - memset：只取 c 的低 8 位；跨度检查同上（只查 dst）。
+// - memmove：方向与检查同手写版（dst < src 或 dst ≥ src+n 前向，否则后向；后向先查 src+n 不溢出；每个字节先算并检查 dst+i、
+//   再 src+i：溢出 → __tx_native_move_overflow，为零 → __tx_native_move_null）。确定没有字节会触发检查时按 8 字节块拷
+//  （前向从低到高、后向从高到低，与逐字节同结果）；否则逐字节照手写版的求值序，出错前已写的字节与手写版相同。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, L, I } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtLoad, rtStore, rtLabel, rtJump, rtIf, rtCall0, rtRet } from "./rtfn";
+import { tSysV } from "./target";
+
+const MODULE: string = "bootstrap/selfhost/kernel_copy_generic.tx";
+// 8 个字节都是 1 的模式：v * BYTE_ONES 把低 8 位的 v 铺满 8 字节。
+const BYTE_ONES: int = 72340172838076673;
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// SysV 目标上内核内部的拷贝例程带 __tx_linux_ 前缀（同 runtime_memory_gen.tx 的 nativeName）。
+function copyName(t: int, name: string): string {
+    if (tSysV(t)) { return "__tx_linux_" + name; }
+    return name;
+}
+
+// 跨度检查（n ≠ 0，局部 m ＝ n−1）：addr 为 0，或 m > UINT64_MAX−addr 时跳 panic。只写局部 x。
+function span(f: Ref<RtFn>, addr: string): void {
+    rtIf(f, L(addr), "eq", I(0), "panic");
+    rtOp(f, "x", I(-1), "sub", L(addr));
+    rtIf(f, L("m"), "ugt", L("x"), "panic");
+}
+
+// 第 i 个字节（或 8 字节块）：dst[i..] = src[i..]。只写局部 p、x。
+function copyAt(f: Ref<RtFn>, width: int): void {
+    rtOp(f, "p", L("src"), "add", L("i"));
+    rtLoad(f, "x", L("p"), 0, width);
+    rtOp(f, "p", L("dst"), "add", L("i"));
+    rtStore(f, L("p"), 0, L("x"), width);
+}
+
+// memcpy(dst, src, n) → dst
+function copyFn(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    const f = rtBegin(b, copyName(t, "memcpy"), "dst src n", "m x d i end p", 0, MODULE);
+    rtIf(f, L("n"), "eq", I(0), "done");
+    rtOp(f, "m", L("n"), "sub", I(1));
+    span(f, "dst");
+    span(f, "src");
+    rtSet(f, "i", I(0));
+    rtOp(f, "d", L("dst"), "sub", L("src"));
+    rtIf(f, L("d"), "ugt", I(7), "blocks");
+    rtIf(f, L("d"), "ne", I(0), "bytes");
+    rtLabel(f, "blocks");
+    rtOp(f, "end", L("n"), "and", I(-8));
+    rtLabel(f, "block");
+    rtIf(f, L("i"), "uge", L("end"), "bytes");
+    copyAt(f, 8);
+    rtOp(f, "i", L("i"), "add", I(8));
+    rtJump(f, "block");
+    rtLabel(f, "bytes");
+    rtIf(f, L("i"), "uge", L("n"), "done");
+    copyAt(f, 1);
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "bytes");
+    rtLabel(f, "done");
+    rtRet(f, L("dst"));
+    rtLabel(f, "panic");
+    rtCall0(f, "", "__tx_native_memory_span_panic");
+    rtRet(f, L("dst"));
+    done(f, failures);
+}
+
+// memset(dst, c, n) → dst
+function fillFn(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    const f = rtBegin(b, copyName(t, "memset"), "dst c n", "m x v i end p", 0, MODULE);
+    rtIf(f, L("n"), "eq", I(0), "done");
+    rtOp(f, "m", L("n"), "sub", I(1));
+    span(f, "dst");
+    rtOp(f, "v", L("c"), "and", I(255));
+    rtOp(f, "x", L("v"), "imul", I(BYTE_ONES));
+    rtSet(f, "i", I(0));
+    rtOp(f, "end", L("n"), "and", I(-8));
+    rtLabel(f, "block");
+    rtIf(f, L("i"), "uge", L("end"), "bytes");
+    rtOp(f, "p", L("dst"), "add", L("i"));
+    rtStore(f, L("p"), 0, L("x"), 8);
+    rtOp(f, "i", L("i"), "add", I(8));
+    rtJump(f, "block");
+    rtLabel(f, "bytes");
+    rtIf(f, L("i"), "uge", L("n"), "done");
+    rtOp(f, "p", L("dst"), "add", L("i"));
+    rtStore(f, L("p"), 0, L("v"), 1);
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "bytes");
+    rtLabel(f, "done");
+    rtRet(f, L("dst"));
+    rtLabel(f, "panic");
+    rtCall0(f, "", "__tx_native_memory_span_panic");
+    rtRet(f, L("dst"));
+    done(f, failures);
+}
+
+// 手写版 moveByte 的逐字节形（第 i 个字节）：先算 dst+i（进位 → overflow，为零 → null），再 src+i，读 src 后写 dst。
+function checkedByte(f: Ref<RtFn>): void {
+    rtOp(f, "p", L("dst"), "add", L("i"));
+    rtIf(f, L("p"), "ult", L("dst"), "overflow");
+    rtIf(f, L("p"), "eq", I(0), "null");
+    rtOp(f, "q", L("src"), "add", L("i"));
+    rtIf(f, L("q"), "ult", L("src"), "overflow");
+    rtIf(f, L("q"), "eq", I(0), "null");
+    rtLoad(f, "x", L("q"), 0, 1);
+    rtStore(f, L("p"), 0, L("x"), 1);
+}
+
+// memmove(dst, src, n) → dst
+function moveFn(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    const f = rtBegin(b, copyName(t, "memmove"), "dst src n", "e m x i end p q", 0, MODULE);
+    rtIf(f, L("dst"), "ult", L("src"), "forward");
+    rtOp(f, "e", L("src"), "add", L("n"));
+    rtIf(f, L("e"), "ult", L("src"), "overflow");
+    rtIf(f, L("dst"), "uge", L("e"), "forward");
+    // 后向：src ≤ dst < src+n（故 n ≥ 1），src+i 不会溢出；dst、src 非零且 dst+n−1 不溢出时没有字节会触发检查。
+    rtSet(f, "i", L("n"));
+    rtIf(f, L("dst"), "eq", I(0), "back_checked");
+    rtIf(f, L("src"), "eq", I(0), "back_checked");
+    rtOp(f, "m", L("n"), "sub", I(1));
+    rtOp(f, "x", I(-1), "sub", L("dst"));
+    rtIf(f, L("m"), "ugt", L("x"), "back_checked");
+    rtLabel(f, "back_block");
+    rtIf(f, L("i"), "ult", I(8), "back_byte");
+    rtOp(f, "i", L("i"), "sub", I(8));
+    copyAt(f, 8);
+    rtJump(f, "back_block");
+    rtLabel(f, "back_byte");
+    rtIf(f, L("i"), "eq", I(0), "done");
+    rtOp(f, "i", L("i"), "sub", I(1));
+    copyAt(f, 1);
+    rtJump(f, "back_byte");
+    rtLabel(f, "back_checked");
+    rtIf(f, L("i"), "eq", I(0), "done");
+    rtOp(f, "i", L("i"), "sub", I(1));
+    checkedByte(f);
+    rtJump(f, "back_checked");
+    // 前向：dst、src 非零且两端的 +n−1 都不溢出时没有字节会触发检查；dst < src 时 8 字节块读在写之前，与逐字节同结果。
+    rtLabel(f, "forward");
+    rtIf(f, L("n"), "eq", I(0), "done");
+    rtSet(f, "i", I(0));
+    rtIf(f, L("dst"), "eq", I(0), "fwd_checked");
+    rtIf(f, L("src"), "eq", I(0), "fwd_checked");
+    rtOp(f, "m", L("n"), "sub", I(1));
+    rtOp(f, "x", I(-1), "sub", L("dst"));
+    rtIf(f, L("m"), "ugt", L("x"), "fwd_checked");
+    rtOp(f, "x", I(-1), "sub", L("src"));
+    rtIf(f, L("m"), "ugt", L("x"), "fwd_checked");
+    rtOp(f, "end", L("n"), "and", I(-8));
+    rtLabel(f, "fwd_block");
+    rtIf(f, L("i"), "uge", L("end"), "fwd_byte");
+    copyAt(f, 8);
+    rtOp(f, "i", L("i"), "add", I(8));
+    rtJump(f, "fwd_block");
+    rtLabel(f, "fwd_byte");
+    rtIf(f, L("i"), "uge", L("n"), "done");
+    copyAt(f, 1);
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "fwd_byte");
+    rtLabel(f, "fwd_checked");
+    checkedByte(f);
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtIf(f, L("i"), "ult", L("n"), "fwd_checked");
+    rtLabel(f, "done");
+    rtRet(f, L("dst"));
+    rtLabel(f, "overflow");
+    rtCall0(f, "", "__tx_native_move_overflow");
+    rtRet(f, L("dst"));
+    rtLabel(f, "null");
+    rtCall0(f, "", "__tx_native_move_null");
+    rtRet(f, L("dst"));
+    done(f, failures);
+}
+
+/// 发出 memcpy／memset／memmove（NRT 内核恒带 memmove）；rtfn 的失败记进 failures。t 为目标编号（决定 SysV 上的内部名）。
+export function copyGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    copyFn(b, failures, t);
+    fillFn(b, failures, t);
+    moveFn(b, failures, t);
+}

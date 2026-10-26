@@ -1,0 +1,866 @@
+// bootstrap/lexer —— S1 自举词法器（BOOT-03；D11 §3–4）。
+//
+// 与引导版（src/compiler/lexer/lexer.zig）行为同构：token 流文本形态
+// `kindId text line col` 逐行输出，词法错误输出 `! line col msg` 并退出 1。
+// 差异测试（build_tools/diff_lexer.zig）对全部仓库 .tx 比对本实现与
+// `taixu lex` 的输出（TEST-05 / SRS §5.4 固定点）。
+//
+// 自举前置内建：byteAt（逐字节访问，D3 v0.3）、utf8Encode（码点编码）。
+// 流式设计：每产一个 token 立即拼接输出，不物化列表（D11 §3）。
+
+// —— kindId 冻结映射（与 taixu lex 的表逐名一致；tools/main.zig kindId）——
+// 全套导出：parser.tx 复用同一份映射（单一事实源，D13 §3）。
+export const K_EOF: int = 0;
+export const K_IDENT: int = 1;
+export const K_INT: int = 2;
+export const K_FLOAT: int = 3;
+export const K_STR: int = 4;
+export const K_TEMPLATE: int = 5; // 模板串（V0.8-D1；D3 v0.6 §6.10——解析期解糖为拼接）
+export const K_EXPORT: int = 10;
+export const K_FUNCTION: int = 11;
+export const K_STRUCT: int = 12;
+export const K_ENUM: int = 13;
+export const K_LET: int = 14;
+export const K_CONST: int = 15;
+export const K_IF: int = 16;
+export const K_ELSE: int = 17;
+export const K_WHILE: int = 18;
+export const K_FOR: int = 19;
+export const K_BREAK: int = 20;
+export const K_CONTINUE: int = 21;
+export const K_RETURN: int = 22;
+export const K_SWITCH: int = 23;
+export const K_CASE: int = 24;
+export const K_TEST: int = 25;
+export const K_IMPORT: int = 26;
+export const K_TRUE: int = 27;
+export const K_FALSE: int = 28;
+export const K_NEW: int = 29;
+export const K_CATCH: int = 30;
+export const K_AS: int = 31;
+export const K_PLUS: int = 40;
+export const K_MINUS: int = 41;
+export const K_STAR: int = 42;
+export const K_SLASH: int = 43;
+export const K_PERCENT: int = 44;
+export const K_EQEQ: int = 45;
+export const K_BANGEQ: int = 46;
+export const K_LT: int = 47;
+export const K_LTEQ: int = 48;
+export const K_GT: int = 49;
+export const K_GTEQ: int = 50;
+export const K_ANDAND: int = 51;
+export const K_OROR: int = 52;
+export const K_BANG: int = 53;
+export const K_QUESTION: int = 54;
+export const K_ASSIGN: int = 55;
+export const K_FATARROW: int = 56;
+export const K_DOT: int = 57;
+export const K_COMMA: int = 58;
+export const K_SEMI: int = 59;
+export const K_COLON: int = 60;
+export const K_LPAREN: int = 61;
+export const K_RPAREN: int = 62;
+export const K_LBRACE: int = 63;
+export const K_RBRACE: int = 64;
+export const K_LBRACKET: int = 65;
+export const K_RBRACKET: int = 66;
+export const K_PIPE: int = 67;
+// 位运算三 token（V0.39-G0；D3 v0.14——`& ^ ~` 词法器变更加尾段 ID；位移
+// `<< >> >>>` 词法器零变更＝解析器零空白邻接组合；70＝comment 既有占用，
+// tilde 跳至 71）。
+export const K_AMP: int = 68;
+export const K_CARET: int = 69;
+export const K_TILDE: int = 71;
+// 字符字面量（LANG-16；D3 v0.15——kindId 尾段追加 72，与 taixu lex 同表）。
+export const K_CHAR: int = 72;
+// D3 v0.19：defer 关键字（追加编号，既有记号编号不变）。
+export const K_DEFER: int = 73;
+// D3 v0.20：interface 关键字（追加编号）。
+export const K_INTERFACE: int = 74;
+export const K_COMMENT: int = 70;
+
+// —— 游标（字节列；advance 语义与引导版一致：'\n' → line+1/col=1，否则 col+1）——
+export struct Cur {
+    pos: int,
+    line: int,
+    col: int,
+}
+
+// —— 词法产物（流式：kind/text/line/col 四元组）——
+export struct Tok {
+    kind: int,
+    text: string,
+    line: int,
+    col: int,
+}
+
+// —— 输出累积（流式拼接；错误行混入同一段输出）——
+// coded：错误行形态开关（V0.11-B1；D31 §三-4 结构化诊断记录）——
+// false＝diff 面 `! line col msg`（taixu lex 冻结行形态）；true＝管线面
+// `! code line col msg`（诊断码即事实源，Zig 侧转既有诊断通道）。
+export struct Out {
+    lines: string,
+    errors: string,
+    failed: bool,
+    coded: bool,
+}
+
+// —— 诊断码（1xxx 词法分段；与 src/compiler/diag.zig Code 对齐——单一事实源在引导侧）——
+export const C_ILLEGAL: int = 1001;
+export const C_UNTERM: int = 1002;
+export const C_BAD_ESC: int = 1003;
+export const C_BAD_NUM: int = 1004;
+export const C_BAD_CHAR: int = 1005; // 字符字面量无效（LANG-16；D3 v0.15 §6.14）
+
+/// 记一条词法错误（两面共用单一消息源；failed 置位）。
+function emitErr(out: Ref<Out>, code: int, line: int, col: int, msg: string): void {
+    if (out.coded) {
+        out.errors = out.errors + "!" + " " + toStr(code) + " " + toStr(line) + " " + toStr(col) + " " + msg + "\n";
+    } else {
+        out.errors = out.errors + "!" + " " + toStr(line) + " " + toStr(col) + " " + msg + "\n";
+    }
+    out.failed = true;
+}
+
+// —— 字符分类（ASCII 区间判断；非 ASCII 字节按引导版行为进入非法字符路径）——
+function isDigit(c: int): bool {
+    return c >= 48 && c <= 57;
+}
+
+function isHexDigit(c: int): bool {
+    return isDigit(c) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
+}
+
+function isIdentStart(c: int): bool {
+    return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95;
+}
+
+function isIdentPart(c: int): bool {
+    return isIdentStart(c) || isDigit(c);
+}
+
+// —— 源访问（byteAt 越界得 None → 0，即引导版 peek 的 EOF 哨兵）——
+function peek(src: string, c: Ref<Cur>): int {
+    return byteAt(src, c.pos) catch 0;
+}
+
+function peekAt(src: string, c: Ref<Cur>, off: int): int {
+    return byteAt(src, c.pos + off) catch 0;
+}
+
+/// 消费一个字节（advance）：返回该字节并推进 line/col。
+function advance(src: string, c: Ref<Cur>): int {
+    const ch: int = byteAt(src, c.pos) catch 0;
+    c.pos = c.pos + 1;
+    if (ch == 10) {
+        c.line = c.line + 1;
+        c.col = 1;
+    } else {
+        c.col = c.col + 1;
+    }
+    return ch;
+}
+
+// —— 关键字表（23 个全集，D3 §3；v0.19 增 defer，v0.20 增 interface）——
+function keywordOf(text: string): int {
+    if (text == "export") { return K_EXPORT; }
+    if (text == "function") { return K_FUNCTION; }
+    if (text == "struct") { return K_STRUCT; }
+    if (text == "enum") { return K_ENUM; }
+    if (text == "let") { return K_LET; }
+    if (text == "const") { return K_CONST; }
+    if (text == "if") { return K_IF; }
+    if (text == "else") { return K_ELSE; }
+    if (text == "while") { return K_WHILE; }
+    if (text == "for") { return K_FOR; }
+    if (text == "break") { return K_BREAK; }
+    if (text == "continue") { return K_CONTINUE; }
+    if (text == "return") { return K_RETURN; }
+    if (text == "switch") { return K_SWITCH; }
+    if (text == "case") { return K_CASE; }
+    if (text == "test") { return K_TEST; }
+    if (text == "import") { return K_IMPORT; }
+    if (text == "true") { return K_TRUE; }
+    if (text == "false") { return K_FALSE; }
+    if (text == "new") { return K_NEW; }
+    if (text == "catch") { return K_CATCH; }
+    if (text == "as") { return K_AS; }
+    if (text == "defer") { return K_DEFER; }
+    if (text == "interface") { return K_INTERFACE; }
+    return K_IDENT;
+}
+
+// —— 空白与注释（emit_trivia 语义：注释是 token）——
+/// 跳过空白；若当前位置是注释起点则返回其首字节，否则返回 -1。
+function skipWs(src: string, c: Ref<Cur>): int {
+    while (true) {
+        const ch = peek(src, c);
+        if (ch == 32 || ch == 9 || ch == 13 || ch == 10) {
+            advance(src, c);
+            continue;
+        }
+        if (ch == 47) {
+            return 47;
+        }
+        return -1;
+    }
+    return -1; // 不可达：满足返回路径检查
+}
+
+/// 行注释（// 到行尾，不含 \n）：返回 token。
+function lexLineComment(src: string, c: Ref<Cur>): Tok {
+    const line = c.line;
+    const col = c.col;
+    const start = c.pos;
+    while (c.pos < len(src) && peek(src, c) != 10) {
+        advance(src, c);
+    }
+    return Tok { kind: K_COMMENT, text: sliceText(src, start, c.pos), line: line, col: col };
+}
+
+/// 块注释（/* */，不嵌套）：未闭合输出诊断行并返回。
+function lexBlockComment(src: string, c: Ref<Cur>, out: Ref<Out>): Tok {
+    const line = c.line;
+    const col = c.col;
+    const start = c.pos;
+    advance(src, c);
+    advance(src, c);
+    let closed: bool = false;
+    while (c.pos < len(src)) {
+        if (peek(src, c) == 42 && peekAt(src, c, 1) == 47) {
+            advance(src, c);
+            advance(src, c);
+            closed = true;
+            break;
+        }
+        advance(src, c);
+    }
+    if (!closed) {
+        emitErr(out, C_UNTERM, line, col, "块注释未闭合");
+    }
+    return Tok { kind: K_COMMENT, text: sliceText(src, start, c.pos), line: line, col: col };
+}
+
+/// 取源切片（无索引语法——byteAt 逐字节重建；token 边界保证切片是完整 UTF-8
+/// 子序列，多字节序列按码点透传以还原原始字节）。
+export function sliceText(src: string, start: int, end: int): string {
+    if (end - start > 256) { return sliceTextLarge(src, start, end); }
+    let out: string = "";
+    let i: int = start;
+    while (i < end) {
+        const b = byteAt(src, i) catch 0;
+        if (b < 128) {
+            out = out + (utf8Encode(b) catch "");
+            i = i + 1;
+            continue;
+        }
+        // 多字节头（0xC0..0xF7）：收集 continuation 并重组码点。
+        let cp: int = 0;
+        let n: int = 0;
+        if (b >= 240) {
+            n = 4;
+            cp = b - 240;
+        } else if (b >= 224) {
+            n = 3;
+            cp = b - 224;
+        } else {
+            n = 2;
+            cp = b - 192;
+        }
+        i = i + 1;
+        let k: int = 1;
+        while (k < n && i < end) {
+            const cc = byteAt(src, i) catch 0;
+            if (cc < 128 || cc >= 192) {
+                break;
+            }
+            cp = cp * 64 + (cc - 128);
+            i = i + 1;
+            k = k + 1;
+        }
+        out = out + (utf8Encode(cp) catch "");
+    }
+    return out;
+}
+
+// 长token在完整解码步骤之间分块，避免切开UTF-8或改变错误恢复。
+function lexJoinChunks(parts: List<string>, lo: int, hi: int): string {
+    if (hi - lo == 1) { return listGet(parts, lo) catch ""; }
+    const mid = lo + (hi - lo) / 2;
+    return lexJoinChunks(parts, lo, mid) + lexJoinChunks(parts, mid, hi);
+}
+
+function sliceTextLarge(src: string, start: int, end: int): string {
+    const parts: List<string> = listNew();
+    let out: string = "";
+    let i: int = start;
+    while (i < end) {
+        if (len(out) >= 256) { listPush(parts, out); out = ""; }
+        const b = byteAt(src, i) catch 0;
+        if (b < 128) {
+            out = out + (utf8Encode(b) catch "");
+            i = i + 1;
+            continue;
+        }
+        // 多字节头（0xC0..0xF7）：收集 continuation 并重组码点。
+        let cp: int = 0;
+        let n: int = 0;
+        if (b >= 240) {
+            n = 4;
+            cp = b - 240;
+        } else if (b >= 224) {
+            n = 3;
+            cp = b - 224;
+        } else {
+            n = 2;
+            cp = b - 192;
+        }
+        i = i + 1;
+        let k: int = 1;
+        while (k < n && i < end) {
+            const cc = byteAt(src, i) catch 0;
+            if (cc < 128 || cc >= 192) {
+                break;
+            }
+            cp = cp * 64 + (cc - 128);
+            i = i + 1;
+            k = k + 1;
+        }
+        out = out + (utf8Encode(cp) catch "");
+    }
+    listPush(parts, out);
+    return lexJoinChunks(parts, 0, listLen(parts));
+}
+
+// —— 数字词法（0x/0o/0b、十进制、float；与引导版分支同构）——
+/// 无符号整数值累积（base 进制），溢出返回 -1（服务诊断路径）。
+function accumValue(src: string, start: int, end: int, base: int, skipPrefix: int): int {
+    let v: int = 0;
+    let i: int = start + skipPrefix;
+    const maxSafe: int = 9223372036854775807; // maxInt(i64)——逐步检查防溢出
+    while (i < end) {
+        const b = byteAt(src, i) catch 0;
+        if (b == 95) {
+            i = i + 1;
+            continue;
+        }
+        const d = digitVal(b);
+        if (v > (maxSafe - d) / base) {
+            return -1;
+        }
+        v = v * base + d;
+        i = i + 1;
+    }
+    return v;
+}
+
+/// 整数字面量的值不超过 2^64−1（定宽数值 O4 第二步：超过 int 上限而不超过它的不在词法报错，交 sema 按期望型判定）。
+export function fitsU64(src: string, start: int, end: int, base: int, skipPrefix: int): bool {
+    let i: int = start + skipPrefix;
+    while (i < end && ((byteAt(src, i) catch 0) == 48 || (byteAt(src, i) catch 0) == 95)) {
+        i = i + 1;
+    }
+    let n: int = 0;
+    let k: int = i;
+    while (k < end) {
+        if ((byteAt(src, k) catch 0) != 95) {
+            n = n + 1;
+        }
+        k = k + 1;
+    }
+    if (base == 2) {
+        return n <= 64;
+    }
+    if (base == 16) {
+        return n <= 16;
+    }
+    if (base == 8) {
+        return n < 22 || (n == 22 && (byteAt(src, i) catch 0) == 49);
+    }
+    if (n != 20) {
+        return n < 20;
+    }
+    const lim = "18446744073709551615";
+    let j: int = 0;
+    while (i < end) {
+        const b = byteAt(src, i) catch 0;
+        i = i + 1;
+        if (b == 95) {
+            continue;
+        }
+        const m = byteAt(lim, j) catch 0;
+        if (b != m) {
+            return b < m;
+        }
+        j = j + 1;
+    }
+    return true;
+}
+
+function digitVal(b: int): int {
+    if (b >= 48 && b <= 57) { return b - 48; }
+    if (b >= 97 && b <= 102) { return b - 97 + 10; }
+    return b - 65 + 10;
+}
+
+function lexNumber(src: string, c: Ref<Cur>, out: Ref<Out>): Tok {
+    const line = c.line;
+    const col = c.col;
+    const start = c.pos;
+    const p0 = peek(src, c);
+    const p1 = peekAt(src, c, 1);
+
+    if (p0 == 48 && (p1 == 120 || p1 == 88)) {
+        return lexRadix(src, c, out, line, col, start, 16, "十六进制", 2, true);
+    }
+    if (p0 == 48 && (p1 == 111 || p1 == 79)) {
+        return lexRadix(src, c, out, line, col, start, 8, "八进制", 2, false);
+    }
+    if (p0 == 48 && (p1 == 98 || p1 == 66)) {
+        return lexRadix(src, c, out, line, col, start, 2, "二进制", 2, false);
+    }
+
+    // 十进制 / float：digits [. digits] [e[±]digits（无数字则回退）]
+    let isFloat: bool = false;
+    while (isDigit(peek(src, c)) || peek(src, c) == 95) {
+        advance(src, c);
+    }
+    if (peek(src, c) == 46 && isDigit(peekAt(src, c, 1))) {
+        isFloat = true;
+        advance(src, c);
+        while (isDigit(peek(src, c)) || peek(src, c) == 95) {
+            advance(src, c);
+        }
+    }
+    if (peek(src, c) == 101 || peek(src, c) == 69) {
+        const savePos = c.pos;
+        const saveLine = c.line;
+        const saveCol = c.col;
+        advance(src, c);
+        if (peek(src, c) == 43 || peek(src, c) == 45) {
+            advance(src, c);
+        }
+        if (isDigit(peek(src, c))) {
+            isFloat = true;
+            while (isDigit(peek(src, c)) || peek(src, c) == 95) {
+                advance(src, c);
+            }
+        } else {
+            c.pos = savePos;
+            c.line = saveLine;
+            c.col = saveCol;
+        }
+    }
+    const text = sliceText(src, start, c.pos);
+    if (isFloat) {
+        return Tok { kind: K_FLOAT, text: text, line: line, col: col };
+    }
+    if (accumValue(src, start, c.pos, 10, 0) == -1 && !fitsU64(src, start, c.pos, 10, 0)) {
+        emitErr(out, C_BAD_NUM, c.line, c.col, "整数字面量超出 int（64 位有符号）范围: " + text);
+    }
+    return Tok { kind: K_INT, text: text, line: line, col: col };
+}
+
+/// 0x/0o/0b 分支（digits==0 与越界两条诊断路径；越界消息仅十六进制带 text）。
+function lexRadix(src: string, c: Ref<Cur>, out: Ref<Out>, line: int, col: int, start: int, base: int, name: string, prefix: int, textInMsg: bool): Tok {
+    advance(src, c);
+    advance(src, c);
+    let digits: int = 0;
+    while (radixDigitOk(peek(src, c), base) || peek(src, c) == 95) {
+        if (peek(src, c) != 95) {
+            digits = digits + 1;
+        }
+        advance(src, c);
+    }
+    if (digits == 0) {
+        emitErr(out, C_BAD_NUM, c.line, c.col, name + "字面量缺少数字");
+        return Tok { kind: K_INT, text: "0", line: line, col: col };
+    }
+    const text = sliceText(src, start, c.pos);
+    if (accumValue(src, start, c.pos, base, prefix) == -1 && !fitsU64(src, start, c.pos, base, prefix)) {
+        if (textInMsg) {
+            emitErr(out, C_BAD_NUM, c.line, c.col, "整数字面量超出 int（64 位有符号）范围: " + text);
+        } else {
+            emitErr(out, C_BAD_NUM, c.line, c.col, "整数字面量超出 int 范围");
+        }
+        return Tok { kind: K_INT, text: "0", line: line, col: col };
+    }
+    return Tok { kind: K_INT, text: text, line: line, col: col };
+}
+
+function radixDigitOk(ch: int, base: int): bool {
+    if (base == 16) { return isHexDigit(ch); }
+    if (base == 8) { return ch >= 48 && ch <= 55; }
+    return ch == 48 || ch == 49;
+}
+
+// —— 字符串词法（转义全集；\u{...} 的诊断路径与引导版同构）——
+function lexString(src: string, c: Ref<Cur>, out: Ref<Out>): Tok {
+    const line = c.line;
+    const col = c.col;
+    const start = c.pos;
+    advance(src, c); // 开引号
+    while (true) {
+        if (c.pos >= len(src) || peek(src, c) == 10) {
+            emitErr(out, C_UNTERM, line, col, "字符串未闭合");
+            return Tok { kind: K_STR, text: sliceText(src, start, c.pos), line: line, col: col };
+        }
+        const ch = advance(src, c);
+        if (ch == 34) {
+            break;
+        }
+        if (ch != 92) {
+            continue;
+        }
+        // 转义
+        if (c.pos >= len(src)) {
+            emitErr(out, C_BAD_ESC, line, c.col, "转义序列不完整");
+            break;
+        }
+        const esc = advance(src, c);
+        if (esc == 110 || esc == 116 || esc == 114 || esc == 92 || esc == 34 || esc == 48) {
+            continue;
+        }
+        if (esc == 117) {
+            if (peek(src, c) != 123) {
+                emitErr(out, C_BAD_ESC, line, c.col, "Unicode 转义应写作 \\u{XXXX}");
+            } else {
+                advance(src, c);
+                let cp: int = 0;
+                let n: int = 0;
+                while (isHexDigit(peek(src, c)) && n < 6) {
+                    cp = cp * 16 + digitVal(advance(src, c));
+                    n = n + 1;
+                }
+                if (peek(src, c) != 125 || n == 0) {
+                    emitErr(out, C_BAD_ESC, line, c.col, "Unicode 转义格式错误（应为 1-4 位十六进制）");
+                } else {
+                    advance(src, c);
+                    if (cp > 1114111 || (cp >= 55296 && cp <= 57343)) {
+                        emitErr(out, C_BAD_ESC, line, c.col, "Unicode 码点越界: U+" + hexUpper(cp));
+                    }
+                }
+            }
+            continue;
+        }
+        emitErr(out, C_BAD_ESC, line, c.col, "未知转义 '\\" + sliceText(src, c.pos - 1, c.pos) + "'");
+    }
+    return Tok { kind: K_STR, text: sliceText(src, start, c.pos), line: line, col: col };
+}
+
+/// 模板串定界（`a=${x}`；与引导版 lexTemplate 同构）：词法只定界，
+/// \` 转义对不闭合判定；${…} 段切分与转义解码在 parser 解糖中完成。
+function lexTemplate(src: string, c: Ref<Cur>, out: Ref<Out>): Tok {
+    const line = c.line;
+    const col = c.col;
+    const start = c.pos;
+    advance(src, c); // 开反引号
+    while (true) {
+        if (c.pos >= len(src) || peek(src, c) == 10) {
+            emitErr(out, C_UNTERM, line, col, "模板串未闭合");
+            return Tok { kind: K_TEMPLATE, text: sliceText(src, start, c.pos), line: line, col: col };
+        }
+        const ch = advance(src, c);
+        if (ch == 96) {
+            break;
+        }
+        if (ch == 92 && c.pos < len(src)) {
+            advance(src, c); // 转义对整体跳过（\` 不闭合）
+        }
+    }
+    return Tok { kind: K_TEMPLATE, text: sliceText(src, start, c.pos), line: line, col: col };
+}
+
+// —— 字符字面量定界（LANG-16；D3 v0.15 §6.14——与引导版 lexChar 同构）：
+// 词法负责定界＋转义面校验；值解码在 parser 侧（decodeChar 同表）。转义集
+// \n \t \r \\ \' \0；\u{...} 评估位拒绝；空/多字符/多字节/未知转义/未闭合
+// 均带位置诊断（C_BAD_CHAR 1005／未闭合 C_UNTERM——与模板串同款）。
+function lexChar(src: string, c: Ref<Cur>, out: Ref<Out>): Tok {
+    const line = c.line;
+    const col = c.col;
+    const start = c.pos;
+    advance(src, c); // 开引号
+    let closed: bool = false;
+    let escBad: bool = false;
+    while (c.pos < len(src)) {
+        if (peek(src, c) == 10) {
+            break; // 未闭合（换行收口——不消费，text 不含换行）
+        }
+        const ch = advance(src, c);
+        if (ch == 39) {
+            closed = true;
+            break;
+        }
+        if (ch != 92) {
+            continue;
+        }
+        if (c.pos >= len(src) || peek(src, c) == 10) {
+            emitErr(out, C_BAD_CHAR, line, c.col, "字符字面量转义序列不完整");
+            escBad = true;
+            break;
+        }
+        const esc = advance(src, c);
+        if (esc == 110 || esc == 116 || esc == 114 || esc == 92 || esc == 39 || esc == 48) {
+            continue;
+        }
+        if (esc == 117) {
+            // \u{...}（评估位在册）：消费至 '}' 或行收口后整体拒绝。
+            while (c.pos < len(src) && peek(src, c) != 125 && peek(src, c) != 10) {
+                advance(src, c);
+            }
+            if (peek(src, c) == 125) {
+                advance(src, c);
+            }
+            emitErr(out, C_BAD_CHAR, c.line, c.col, "字符字面量不支持 \\u{...} 转义（评估位在册——D3 v0.15 §6.14）");
+            escBad = true;
+            continue;
+        }
+        emitErr(out, C_BAD_CHAR, line, c.col, "字符字面量未知转义 '\\" + sliceText(src, c.pos - 1, c.pos) + "'");
+        escBad = true;
+    }
+    const raw = sliceText(src, start, c.pos);
+    if (!closed) {
+        emitErr(out, C_UNTERM, line, col, "字符字面量未闭合");
+        return Tok { kind: K_CHAR, text: raw, line: line, col: col };
+    }
+    if (!escBad && !charValueOk(sliceText(src, start + 1, c.pos - 1))) {
+        if (c.pos - start == 2) {
+            emitErr(out, C_BAD_CHAR, c.line, c.col, "字符字面量为空");
+        } else {
+            emitErr(out, C_BAD_CHAR, c.line, c.col, "字符字面量应为单字节字符（多字符/多字节拒绝）");
+        }
+    }
+    return Tok { kind: K_CHAR, text: raw, line: line, col: col };
+}
+
+/// 字符字面量内容合法性（LANG-16 单一约定——与引导版 charValue 同表：
+/// 单字节或六转义对；镜像面只判合法，值解码在 parser decodeChar）。
+function charValueOk(content: string): bool {
+    if (len(content) == 1) {
+        return (byteAt(content, 0) catch 0) < 128;
+    }
+    if (len(content) == 2 && (byteAt(content, 0) catch 0) == 92) {
+        const e: int = byteAt(content, 1) catch 0;
+        return e == 110 || e == 116 || e == 114 || e == 92 || e == 39 || e == 48;
+    }
+    return false;
+}
+
+/// 大写十六进制（无前导零；引导版 fmt "{X}" 同形态）。
+function hexUpper(v: int): string {
+    if (v == 0) {
+        return "0";
+    }
+    let digits: string = "";
+    let x: int = v;
+    while (x > 0) {
+        const d: int = x - (x / 16) * 16;
+        digits = sliceText("0123456789ABCDEF", d, d + 1) + digits;
+        x = x / 16;
+    }
+    return digits;
+}
+
+// —— 主词法循环（nextToken + 流式拼接）——
+/// 产下一个 token（跳过空白；注释/标识符/数字/字符串/标点/非法字符）。
+export function nextToken(src: string, c: Ref<Cur>, out: Ref<Out>): Tok {
+    const maybeComment = skipWs(src, c);
+    if (maybeComment == 47 && peekAt(src, c, 1) == 47) {
+        return lexLineComment(src, c);
+    }
+    if (maybeComment == 47 && peekAt(src, c, 1) == 42) {
+        return lexBlockComment(src, c, out);
+    }
+
+    const line = c.line;
+    const col = c.col;
+    if (c.pos >= len(src)) {
+        return Tok { kind: K_EOF, text: "", line: line, col: col };
+    }
+    const start = c.pos;
+    const ch = peek(src, c);
+
+    if (isIdentStart(ch)) {
+        while (isIdentPart(peek(src, c))) {
+            advance(src, c);
+        }
+        const text = sliceText(src, start, c.pos);
+        return Tok { kind: keywordOf(text), text: text, line: line, col: col };
+    }
+
+    if (isDigit(ch)) {
+        return lexNumber(src, c, out);
+    }
+
+    if (ch == 34) {
+        return lexString(src, c, out);
+    }
+
+    if (ch == 96) {
+        return lexTemplate(src, c, out);
+    }
+
+    if (ch == 39) {
+        return lexChar(src, c, out);
+    }
+
+    advance(src, c);
+    if (ch == 43) { return punct1(K_PLUS, src, start, c, line, col); }
+    if (ch == 45) { return punct1(K_MINUS, src, start, c, line, col); }
+    if (ch == 42) { return punct1(K_STAR, src, start, c, line, col); }
+    if (ch == 37) { return punct1(K_PERCENT, src, start, c, line, col); }
+    if (ch == 47) { return punct1(K_SLASH, src, start, c, line, col); }
+    if (ch == 46) { return punct1(K_DOT, src, start, c, line, col); }
+    if (ch == 44) { return punct1(K_COMMA, src, start, c, line, col); }
+    if (ch == 59) { return punct1(K_SEMI, src, start, c, line, col); }
+    if (ch == 58) { return punct1(K_COLON, src, start, c, line, col); }
+    if (ch == 40) { return punct1(K_LPAREN, src, start, c, line, col); }
+    if (ch == 41) { return punct1(K_RPAREN, src, start, c, line, col); }
+    if (ch == 123) { return punct1(K_LBRACE, src, start, c, line, col); }
+    if (ch == 125) { return punct1(K_RBRACE, src, start, c, line, col); }
+    if (ch == 91) { return punct1(K_LBRACKET, src, start, c, line, col); }
+    if (ch == 93) { return punct1(K_RBRACKET, src, start, c, line, col); }
+    if (ch == 63) { return punct1(K_QUESTION, src, start, c, line, col); }
+
+    if (ch == 61) {
+        if (peek(src, c) == 61) {
+            advance(src, c);
+            return Tok { kind: K_EQEQ, text: sliceText(src, start, c.pos), line: line, col: col };
+        }
+        if (peek(src, c) == 62) {
+            advance(src, c);
+            return Tok { kind: K_FATARROW, text: sliceText(src, start, c.pos), line: line, col: col };
+        }
+        return Tok { kind: K_ASSIGN, text: sliceText(src, start, c.pos), line: line, col: col };
+    }
+    if (ch == 33) {
+        if (peek(src, c) == 61) {
+            advance(src, c);
+            return Tok { kind: K_BANGEQ, text: sliceText(src, start, c.pos), line: line, col: col };
+        }
+        return Tok { kind: K_BANG, text: sliceText(src, start, c.pos), line: line, col: col };
+    }
+    if (ch == 60) {
+        if (peek(src, c) == 61) {
+            advance(src, c);
+            return Tok { kind: K_LTEQ, text: sliceText(src, start, c.pos), line: line, col: col };
+        }
+        return Tok { kind: K_LT, text: sliceText(src, start, c.pos), line: line, col: col };
+    }
+    if (ch == 62) {
+        if (peek(src, c) == 61) {
+            advance(src, c);
+            return Tok { kind: K_GTEQ, text: sliceText(src, start, c.pos), line: line, col: col };
+        }
+        return Tok { kind: K_GT, text: sliceText(src, start, c.pos), line: line, col: col };
+    }
+    if (ch == 38) {
+        if (peek(src, c) == 38) {
+            advance(src, c);
+            return Tok { kind: K_ANDAND, text: sliceText(src, start, c.pos), line: line, col: col };
+        }
+        return Tok { kind: K_AMP, text: sliceText(src, start, c.pos), line: line, col: col };
+    }
+    if (ch == 124) {
+        if (peek(src, c) == 124) {
+            advance(src, c);
+            return Tok { kind: K_OROR, text: sliceText(src, start, c.pos), line: line, col: col };
+        }
+        return Tok { kind: K_PIPE, text: sliceText(src, start, c.pos), line: line, col: col };
+    }
+    if (ch == 94) {
+        // 位异或 `^`（V0.39-G0；D3 v0.14）。
+        return Tok { kind: K_CARET, text: sliceText(src, start, c.pos), line: line, col: col };
+    }
+    if (ch == 126) {
+        // 位非 `~`（V0.39-G0；D3 v0.14）。
+        return Tok { kind: K_TILDE, text: sliceText(src, start, c.pos), line: line, col: col };
+    }
+
+    // 非法字符：诊断（U+XXXX 大写 4 位前导零）后继续
+    emitErr(out, C_ILLEGAL, line, c.col, "非法字符 '" + sliceText(src, start, c.pos) + "' (U+" + hexPad4(ch) + ")");
+    return nextToken(src, c, out);
+}
+
+function punct1(kind: int, src: string, start: int, c: Ref<Cur>, line: int, col: int): Tok {
+    return Tok { kind: kind, text: sliceText(src, start, c.pos), line: line, col: col };
+}
+
+function hexPad4(v: int): string {
+    const h = hexUpper(v);
+    if (len(h) >= 4) {
+        return h;
+    }
+    if (len(h) == 3) {
+        return "0" + h;
+    }
+    if (len(h) == 2) {
+        return "00" + h;
+    }
+    return "000" + h;
+}
+
+// —— 入口：读被测源 → 流式词法 → 输出（错误行混在 token 流后；与 taixu lex 同序）——
+export function main(args: []string): int {
+    if (len(args) < 1) {
+        print("用法: taixu run bootstrap/lexer.tx <被测源.tx>");
+        return 64;
+    }
+    const src = readFile(args[0]) catch (e) {
+        print("无法读取 " + args[0] + ": " + e.message);
+        return 1;
+    };
+    let c: Ref<Cur> = new Cur { pos: 0, line: 1, col: 1 };
+    const out: Ref<Out> = new Out { lines: "", errors: "", failed: false, coded: false };
+    while (true) {
+        const t = nextToken(src, c, out);
+        if (t.kind == K_EOF) {
+            break;
+        }
+        out.lines = out.lines + toStr(t.kind) + " " + t.text + " " + toStr(t.line) + " " + toStr(t.col) + "\n";
+    }
+    const full: string = out.lines + out.errors;
+    if (len(full) == 0) {
+        return 0;
+    }
+    print(sliceText(full, 0, len(full) - 1));
+    if (out.failed) {
+        return 1;
+    }
+    return 0;
+}
+
+// —— 管线 egress（V0.11-B1；D31 §三-1/§三-2）：源文本入参，token 流文本经
+// 返回值回传（egress 主路＝VM 返回值直读；禁二进制走 string 通道——本返回
+// 值即既有文本形态）。错误行带诊断码：`! code line col msg`（coded 面）。
+// 与 main 的差异四：coded=true、分块累积、注释 trivia 不入管线（编译路径
+// emit_trivia=false 同款）、eof 收尾行 `0  <line> <col>`（Zig 读取器 eof 定位
+// 依据——诊断面零损失）。token 流逐字节同由 diff 双扫＋恒等单测守护。
+// 分块累积：`acc = acc + cur` 每 token 全量重拼为 O(n²)，chunk（8KB 视界）
+// 把复制量压回近线性——.tx 无字节缓冲类型，chunk 即缓冲（D31 §五处置①）。
+const chunkLimit: int = 8192;
+
+export function lexSource(src: string): string {
+    let c: Ref<Cur> = new Cur { pos: 0, line: 1, col: 1 };
+    const out: Ref<Out> = new Out { lines: "", errors: "", failed: false, coded: true };
+    let acc: string = "";
+    let cur: string = "";
+    while (true) {
+        const t = nextToken(src, c, out);
+        if (t.kind == K_EOF) {
+            break;
+        }
+        if (t.kind == K_COMMENT) {
+            continue;
+        }
+        cur = cur + toStr(t.kind) + " " + t.text + " " + toStr(t.line) + " " + toStr(t.col) + "\n";
+        if (len(cur) >= chunkLimit) {
+            acc = acc + cur;
+            cur = "";
+        }
+    }
+    cur = cur + toStr(K_EOF) + " " + " " + toStr(c.line) + " " + toStr(c.col) + "\n";
+    acc = acc + cur + out.errors;
+    return acc;
+}

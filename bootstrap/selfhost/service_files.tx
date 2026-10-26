@@ -1,0 +1,289 @@
+// 服务的输入读取策略；启动操作者授权根，协议请求不能扩大。普通 CLI 默认未启用。
+import { filePath } from "./file_path";
+import { dbgStr } from "./dbg_out";
+import { serviceMountTable } from "./service_mounts";
+import { pathIsSep } from "./path_sep";
+import { realPath } from "./real_path";
+
+const SOURCE_MAX: int = 33554432;
+let enabled: bool = false;
+let baseDir: string = "";
+let roots: List<string> = listNew();
+let workspaceRoots: List<string> = listNew();
+// 启动操作者写的根与解析出的真实根不同时（路径里有符号链接，如 macOS 的 /tmp）：写法 aliases[k] 对应真实根 aliasRoots[k]。
+// 只在启动时解析一次；请求里落在写法之下的路径改写到真实根，访问仍经真实根与 local* 原语（根之下照样不许链接）。
+let aliases: List<string> = listNew();
+let aliasRoots: List<string> = listNew();
+// 挂载表：挂载点与各自的核验结果（空串可作信任根的祖先，否则为接在“挂载点 M”之后的原因）。
+struct MountTable { ok: bool, paths: List<string>, why: List<string> }
+let mounts: Ref<MountTable> = new MountTable { ok: false, paths: listNew(), why: listNew() };
+let mountTypes: List<string> = listNew();
+let why: string = "";
+let warnings: List<string> = listNew();
+
+function starts(s: string, prefix: string): bool {
+    if (len(s) < len(prefix)) { return false; }
+    let i = 0; while (i < len(prefix)) { if ((byteAt(s, i) catch -1) != (byteAt(prefix, i) catch -2)) { return false; } i = i + 1; }
+    return true;
+}
+function fold(s: string): string {
+    if (hostTarget() != "windows") { return s; }
+    const b = bytesFromStr(s); let i = 0;
+    while (i < bytesLen(b)) { const c = bytesGet(b, i) catch 0; if (c >= 65 && c <= 90) { bytesSet(b, i, c + 32); } i = i + 1; }
+    return bytesToStr(b) catch "";
+}
+function under(path: string, root: string): bool {
+    const p = fold(path); const r = fold(root);
+    if (p == r) { return true; }
+    if (r == "/") { return starts(p, "/"); }
+    if ((byteAt(r, len(r) - 1) catch 0) == 47) { return starts(p, r); }
+    return starts(p, r + "/");
+}
+function absolute(path: string): bool {
+    if (hostTarget() != "windows") { return starts(path, "/"); }
+    if (len(path) < 3) { return false; }
+    const d = byteAt(path, 0) catch 0;
+    return ((d >= 65 && d <= 90) || (d >= 97 && d <= 122)) && (byteAt(path, 1) catch 0) == 58 && (byteAt(path, 2) catch 0) == 47;
+}
+export function serviceCanonical(path: string): string {
+    if (len(path) > 32760) { return ""; }
+    let p = filePath(path);
+    if (starts(p, "//") || len(p) == 0) { return ""; }
+    let i = 0;
+    while (i < len(p)) { const c = byteAt(p, i) catch 0; if (c == 0 || (hostTarget() == "windows" && c == 58 && i != 1)) { return ""; } i = i + 1; }
+    if (!absolute(p)) {
+        if (hostTarget() == "windows" && strIndexOf(p, ":") >= 0) { return ""; }
+        if (len(baseDir) == 0 || (hostTarget() == "windows" && starts(p, "/"))) { return ""; }
+        p = baseDir + "/" + p;
+    }
+    const parts = strSplit(p, "/"); const kept: List<string> = listNew();
+    i = 0;
+    while (i < listLen(parts)) {
+        const part = listGet(parts, i) catch ""; i = i + 1;
+        if (part == "" || part == ".") { continue; }
+        if (part == "..") {
+            let floor = 0; if (hostTarget() == "windows") { floor = 1; }
+            if (listLen(kept) <= floor) { return ""; }
+            listRemoveAt(kept, listLen(kept) - 1);
+        } else { listPush(kept, part); }
+    }
+    let out = ""; if (hostTarget() != "windows") { out = "/"; }
+    i = 0;
+    while (i < listLen(kept)) { if (i > 0) { out = out + "/"; } out = out + (listGet(kept, i) catch ""); i = i + 1; }
+    if (hostTarget() == "windows" && listLen(kept) == 1) { out = out + "/"; }
+    return out;
+}
+
+function mountDecode(s: string): string {
+    const b = bytesNew(0); let i = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) catch 0;
+        if (c == 92) {
+            if (i + 3 >= len(s)) { return ""; }
+            const a = byteAt(s, i + 1) catch 0; const d = byteAt(s, i + 2) catch 0; const e = byteAt(s, i + 3) catch 0;
+            if (a < 48 || a > 55 || d < 48 || d > 55 || e < 48 || e > 55) { return ""; }
+            bytesPush(b, (a - 48) * 64 + (d - 48) * 8 + e - 48); i = i + 4;
+        } else { bytesPush(b, c); i = i + 1; }
+    }
+    return bytesToStr(b) catch "";
+}
+function knownLocal(fs: string): bool {
+    // 后三项为 macOS 的本地类型（macOS 的挂载表另把没有 MNT_LOCAL 的类型写成 nonlocal.<类型>，M3 设计 G8）。
+    const allowed = strSplit("ext2 ext3 ext4 xfs btrfs f2fs zfs tmpfs ramfs overlay aufs squashfs iso9660 udf vfat exfat ntfs3 apfs hfs msdos", " ");
+    for (x in allowed) { if (x == fs) { return true; } } return false;
+}
+// 主机共享挂载（WSL drvfs、虚拟机与 Docker Desktop 的共享目录）：缺省拒绝，启动操作者以 --allow-mount-type 逐类开启
+//（docs/design/v052-host-share-roots-v0.1-20261023.md §三）。网络文件系统不在此列，开启也不放行。
+export const HOST_SHARE_TYPES: string = "9p drvfs virtiofs fuse.grpcfuse fakeowner";
+export function serviceHostShareType(fs: string): bool {
+    for (x in strSplit(HOST_SHARE_TYPES, " ")) { if (x == fs) { return true; } } return false;
+}
+function mountWhy(fs: string, options: string, types: List<string>): string {
+    if (knownLocal(fs)) { return ""; }
+    if (!serviceHostShareType(fs)) { return " 的类型 " + fs + " 不是已识别的本地文件系统"; }
+    // 9p 也可以走网络（trans=tcp／rdma）；WSL 为 trans=fd，虚拟机为 trans=virtio。
+    if (fs == "9p") { for (o in strSplit(options, ",")) { if (o == "trans=tcp" || o == "trans=rdma") { return " 是网络 9p（" + o + "），不能作信任根"; } } }
+    for (x in types) { if (x == fs) { return ""; } }
+    return " 的类型 " + fs + " 属主机共享挂载，缺省拒绝；启动操作者可加 --allow-mount-type " + fs;
+}
+function mountsParse(info: string, types: List<string>): Ref<MountTable> {
+    const t = new MountTable { ok: false, paths: listNew(), why: listNew() };
+    if (len(info) == 0 || len(info) > 1048576) { return t; }
+    for (line in strSplit(info, "\n")) {
+        if (len(line) == 0) { continue; }
+        const fields = strSplit(line, " "); if (listLen(fields) < 10) { return t; }
+        let at = 6; while (at < listLen(fields) && (listGet(fields, at) catch "") != "-") { at = at + 1; }
+        if (at + 3 >= listLen(fields)) { return t; }
+        const path = mountDecode(listGet(fields, 4) catch ""); if (len(path) == 0) { return t; }
+        listPush(t.paths, path); listPush(t.why, mountWhy(listGet(fields, at + 1) catch "", listGet(fields, at + 3) catch "", types));
+    }
+    t.ok = listLen(t.paths) > 0; return t;
+}
+// path 所在的挂载（最长挂载点；同一挂载点后挂的遮住先挂的）能否作祖先：空串可以，否则为括注的拒绝原因。
+function mountWhyAt(t: Ref<MountTable>, path: string): string {
+    let best = -1; let at = -1; let i = 0;
+    while (i < listLen(t.paths)) {
+        const m = listGet(t.paths, i) catch "";
+        if (under(path, m) && len(m) >= best) { best = len(m); at = i; }
+        i = i + 1;
+    }
+    if (at < 0) { return "（找不到 " + path + " 所在的挂载）"; }
+    const reason = listGet(t.why, at) catch "?"; if (len(reason) == 0) { return ""; }
+    return "（挂载点 " + (listGet(t.paths, at) catch "") + reason + "）";
+}
+function ancestorsWhy(t: Ref<MountTable>, path: string): string {
+    if (!t.ok) { return "（无法核验本地挂载表）"; }
+    let reason = mountWhyAt(t, "/"); if (len(reason) > 0) { return reason; }
+    let current = "";
+    for (part in strSplit(path, "/")) {
+        if (len(part) == 0) { continue; }
+        current = current + "/" + part; reason = mountWhyAt(t, current); if (len(reason) > 0) { return reason; }
+    }
+    return "";
+}
+/// 按给定 mountinfo 文本与开启的主机共享类型核验 path 的根目录与各级祖先：空串可作信任根，否则为括注的拒绝原因。
+/// 服务启动用本进程的挂载表（service_mounts：Linux 的 /proc/self/mountinfo，macOS 由 getfsstat 写成同形）；导出供夹具在任何宿主上覆盖判定。
+export function serviceMountReason(info: string, types: List<string>, path: string): string {
+    return ancestorsWhy(mountsParse(info, types), path);
+}
+function rootWhy(path: string): string {
+    if (hostTarget() == "windows") { return ""; }
+    return ancestorsWhy(mounts, path);
+}
+// 启动操作者给的根解析为真实路径（用户裁决 2026-10-26）：挂载与目录核验都对真实路径做，链接指向的挂载照样核验。
+function realRoot(given: string): string {
+    if (len(given) == 0) { return ""; }
+    return serviceCanonical(realPath(given));
+}
+function addRoot(path: string, workspace: bool): bool {
+    const given = serviceCanonical(path); const p = realRoot(given);
+    let reason = ""; if (len(p) > 0) { reason = rootWhy(p); }
+    if (len(p) == 0 || len(reason) > 0 || localEntryKind(p, "") != 2) { why = "拒绝无法核验的本地信任根：" + path + reason; return false; }
+    listPush(roots, p); if (workspace) { listPush(workspaceRoots, p); }
+    if (fold(given) != fold(p)) { listPush(aliases, given); listPush(aliasRoots, p); }
+    return true;
+}
+// 按原样核验（不解析链接）：worker 暂存区等非操作者给的路径用它。
+export function serviceLocalRoot(path: string): bool {
+    const p = serviceCanonical(path);
+    return len(p) > 0 && len(rootWhy(p)) == 0 && localEntryKind(p, "") == 2;
+}
+/// types：启动操作者开启的主机共享挂载类型（--allow-mount-type，已校验）；只在类 Unix 宿主上起作用。
+export function serviceConfigure(workspaces: List<string>, libraries: List<string>, types: List<string>): bool {
+    enabled = true; why = ""; warnings = listNew(); roots = listNew(); workspaceRoots = listNew(); mountTypes = listNew();
+    aliases = listNew(); aliasRoots = listNew();
+    baseDir = currentDir() catch "";
+    if (len(baseDir) == 0) { why = "无法确定服务当前目录"; return false; }
+    baseDir = serviceCanonical(baseDir);
+    if (hostTarget() != "windows") {
+        for (x in types) { listPush(mountTypes, x); }
+        mounts = mountsParse(serviceMountTable(), mountTypes);
+        if (!mounts.ok) { why = "无法核验本地挂载表"; return false; }
+    } else if (listLen(types) > 0) {
+        listPush(warnings, "忽略 --allow-mount-type：Windows 宿主不按挂载类型核验（网络映射盘、SUBST 仍由句柄原语拒绝）");
+    }
+    if (listLen(workspaces) == 0) { if (!addRoot(baseDir, true)) { return false; } }
+    else { for (path in workspaces) { if (!addRoot(path, true)) { return false; } } }
+    for (path in libraries) { if (!addRoot(path, false)) { return false; } }
+    // 环境变量给的库根失效（常见的配置残留）只告警、不授权，不让整个服务起不来；用到它的 std/ 导入照常报诊断。
+    for (name in strSplit("TAIXU_STDLIB TAIXU_GUI_ROOT", " ")) {
+        const path = getEnv(name) catch "";
+        if (len(path) > 0 && !addRoot(path, false)) { listPush(warnings, "忽略 " + name + "：" + why); why = ""; }
+    }
+    // 与可执行文件同目录的 taixu-stdlib/src、stdlib/src（发布包与公开仓的布局）、taixu-gui/src 和二进制同属一个信任域（能改
+    // 它们的也能换掉二进制），存在且可核验时自动授权，缺省安装的 std/ 导入因此可用；驱动按同一位置找库（driver.tx 的 libRoot）。
+    const exe = bytesFromStr(selfExePath());
+    let cut = -1; let i = 0;
+    while (i < bytesLen(exe)) { const c = bytesGet(exe, i) catch 0; if (pathIsSep(c)) { cut = i; } i = i + 1; }
+    if (cut > 0) {
+        const dir = bytesToStr(bytesSlice(exe, 0, cut)) catch "";
+        let sep = "\\"; if (hostTarget() != "windows") { sep = "/"; }
+        for (repo in strSplit("taixu-stdlib stdlib taixu-gui", " ")) {
+            const lib = dir + sep + repo + sep + "src";
+            const real = realRoot(serviceCanonical(lib));
+            if (len(dir) > 0 && len(real) > 0 && serviceLocalRoot(real) && rootFor(real) < 0) { addRoot(lib, false); }
+        }
+    }
+    return true;
+}
+export function serviceWarnings(): List<string> { return warnings; }
+export function serviceError(): string { return why; }
+export function serviceRestricted(): bool { return enabled; }
+function rootFor(path: string): int {
+    let i = 0; let best = -1; let size = -1;
+    while (i < listLen(roots)) { const root = listGet(roots, i) catch ""; if (under(path, root) && len(root) > size) { best = i; size = len(root); } i = i + 1; }
+    return best;
+}
+/// 请求路径的规范形，落在启动操作者写的根之下时改写到真实根（按最长前缀，真实根与写法一起比）；不能规范化为空串。
+function servicePath(path: string): string {
+    const p = serviceCanonical(path); if (len(p) == 0) { return ""; }
+    let best = -1; let size = -1;
+    for (root in roots) { if (under(p, root) && len(root) > size) { size = len(root); } }
+    let i = 0;
+    while (i < listLen(aliases)) { const a = listGet(aliases, i) catch ""; if (under(p, a) && len(a) > size) { best = i; size = len(a); } i = i + 1; }
+    if (best < 0) { return p; }
+    const real = listGet(aliasRoots, best) catch ""; const rest = relative(p, listGet(aliases, best) catch "");
+    if (len(rest) == 0) { return real; }
+    if ((byteAt(real, len(real) - 1) catch 0) == 47) { return real + rest; }
+    return real + "/" + rest;
+}
+export function serviceAllows(path: string): bool {
+    if (!enabled) { return true; }
+    const p = servicePath(path); return len(p) > 0 && rootFor(p) >= 0;
+}
+export function serviceWorkspace(path: string): bool {
+    const p = servicePath(path); if (len(p) == 0) { return false; }
+    for (root in workspaceRoots) { if (under(p, root)) { return true; } } return false;
+}
+function relative(path: string, root: string): string {
+    if (fold(path) == fold(root)) { return ""; }
+    let skip = len(bytesFromStr(root)); if ((byteAt(root, len(root) - 1) catch 0) != 47) { skip = skip + 1; }
+    const b = bytesFromStr(path); return bytesToStr(bytesSlice(b, skip, bytesLen(b) - skip)) catch "";
+}
+export function serviceKind(path: string): int {
+    if (!enabled) { return entryKind(filePath(path)); }
+    const p = servicePath(path); const at = rootFor(p); if (len(p) == 0 || at < 0) { return 0; }
+    const root = listGet(roots, at) catch ""; return localEntryKind(root, relative(p, root));
+}
+export function serviceSize(path: string): int | Error {
+    if (!enabled) { return fileSize(filePath(path)); }
+    const p = servicePath(path); const at = rootFor(p); if (len(p) == 0 || at < 0) { return err("path_not_trusted: " + path); }
+    const root = listGet(roots, at) catch ""; return localFileSize(root, relative(p, root));
+}
+export function serviceReadBytes(path: string, max: int): Bytes | Error {
+    if (!enabled) { return readFileBytes(filePath(path)); }
+    const p = servicePath(path); const at = rootFor(p); if (len(p) == 0 || at < 0) { return err("path_not_trusted: " + path); }
+    const root = listGet(roots, at) catch ""; return readLocalFileBytes(root, relative(p, root), max);
+}
+/// 目录项名（按字节排序）：普通模式经 listDir，服务模式经受根约束的 localListDir——不先检查再按路径重开（D3 v0.35，
+/// 导入写法与磁盘逐字节核对）。
+export function serviceListDir(path: string): List<string> | Error {
+    if (!enabled) { return listDir(filePath(path)); }
+    const p = servicePath(path); const at = rootFor(p); if (len(p) == 0 || at < 0) { return err("path_not_trusted: " + path); }
+    const root = listGet(roots, at) catch ""; return localListDir(root, relative(p, root));
+}
+export function serviceReadSource(path: string): string | Error {
+    if (!enabled) { return readFile(filePath(path)); }
+    const b = serviceReadBytes(path, SOURCE_MAX) catch (e) { return e; }; return bytesToStr(b);
+}
+/// 实际生效的主机共享挂载类型（discover／initialize 报告；Windows 上恒为空）。
+export function serviceMountTypesJson(): string {
+    let out = "["; let first = true;
+    for (x in mountTypes) { if (!first) { out = out + ","; } first = false; out = out + dbgStr(x); }
+    return out + "]";
+}
+export function serviceRootsJson(): string {
+    let out = "["; let first = true;
+    for (root in roots) { if (!first) { out = out + ","; } first = false; out = out + dbgStr(root); }
+    return out + "]";
+}
+/// 启动操作者写的根与解析出的真实根（discover／initialize 报告；roots 里是真实根）。
+export function serviceRootAliasesJson(): string {
+    let out = "["; let i = 0;
+    while (i < listLen(aliases)) {
+        if (i > 0) { out = out + ","; }
+        out = out + "{\"given\":" + dbgStr(listGet(aliases, i) catch "") + ",\"real\":" + dbgStr(listGet(aliasRoots, i) catch "") + "}";
+        i = i + 1;
+    }
+    return out + "]";
+}

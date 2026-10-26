@@ -1,0 +1,490 @@
+// Unix 系统接口的按目标分派（macOS 适配 M1 设计 E8，docs/design/v052-macos-m1-macho-v0.1-20261024.md）。
+// 内核里 Linux 与 macOS 共用同一段 POSIX 逻辑时，经这里发出系统调用：
+// - Linux：原样发裸系统调用（rtSyscall，产物逐字节不变）；
+// - macOS：调 libSystem 的同名函数。每个函数一个蹦床 `__tx_mac_<名>`（按内核私有约定被调用：实参在 rcx rdx r8 r9
+//   及栈上，rbx rbp rsi rdi r12–r15 与 xmm6–15 由被调方保存），蹦床保存 rsi rdi 与 xmm6–15，把实参换到 SysV 寄存器，
+//   经导入槽 `__imp_<名>` 调用；按函数的返回约定把“−1 且置 errno”换成负的 errno（本机编号），同 Go 运行时的 darwin 蹦床。
+// 结果约定因此与 Linux 裸系统调用一致：非负成功，负值为 −errno。errno 的数值按目标不同，共享代码比较具体 errno 时经 uxErrno。
+// 没有同语义 libSystem 函数的系统调用号不在映射表里，uxSys 记失败，迫使调用点按目标单独实现（clone、futex、wait4 等）。
+// A64（macOS 适配 M4 设计 A5）：蹦床用 rtfn 写。私有约定的实参寄存器 x0..x7 与被调方保存集（x19–x28；x29、x30 由帧记录保存）
+// 都与 AAPCS64 相同，蹦床不另存寄存器，只做变参放栈、经导入槽调用、按返回约定换成 −errno。A64 上没有手写汇编的调用点，
+// 系统调用形的蹦床不发。
+import { StructuredBuffer, asBufferLabel, asBufferSection, asBufferInstruction, asBufferByte, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem, Operand } from "./assemble";
+import { RtFn, RtOp, L, I, G } from "./rtfn_base";
+import { rtBegin, rtSet, rtOp, rtShift, rtIf, rtLabel, rtLoad, rtStore, rtAddrOf, rtSyscall, rtCallList, rtCallC, rtTrap, rtRet } from "./rtfn";
+import { tLinux, tMacos } from "./target";
+import { check, nrtFailWith, nrtTarget } from "./nrt_base";
+import { macLinkName } from "./macos_symbols";
+
+const MODULE: string = "bootstrap/selfhost/unix_sys.tx";
+// read／write 单次请求的上限：macOS 上字节数超过 INT_MAX 即 EINVAL（man 2 read、man 2 write），蹦床把请求封顶为 1 GiB，
+// 结果是短读短写（POSIX 允许，调用方本就循环；Linux 单次最多约 2 GiB 同样返回短计数）。同 Go 的 darwin（internal/poll
+// 的 maxRW = 1<<30）。
+const MAX_RW: int = 1073741824;
+
+// 蹦床的返回约定。
+const RET_I64: int = 0; // ssize_t／指针：−1 即失败
+const RET_I32: int = 1; // int：先符号扩展，−1 即失败
+const RET_RAW64: int = 2; // 不涉及 errno 的 64 位结果
+const RET_RAW32: int = 3; // 不涉及 errno 的 int（符号扩展）
+const RET_NONE: int = 4; // 不返回（exit、_exit），调用后接 ud2；返回 void 的函数写 raw64（返回值不用）
+const RET_PTR: int = 5; // 指针，NULL 兼表“读完”与“失败”：调用前清 errno，NULL 时结果为 −errno（读完即 0）
+
+// libSystem 函数表：每项“C 名/实参个数/返回约定[/定参个数]”（i64 i32 raw64 raw32 none ptr，见上；第四段只给变参函数，
+// 其后的实参在变参位置上：Apple arm64 经栈传，x86_64 与定参相同）。蹦床按表全部生成（未用到的只多一个导入槽与一项绑定）。
+// pthread_*、posix_spawn* 直接返回错误号（不置 errno），按 raw32 取。
+const MAC_TABLE: string = "read/3/i64 write/3/i64 close/1/i32 mmap/6/i64 mprotect/3/i32 munmap/2/i32 sched_yield/0/i32 pause/0/i32 nanosleep/2/i32 getpid/0/raw32 kill/2/i32 clock_gettime/2/i32 _exit/1/none exit/1/none pthread_self/0/raw64 pthread_get_stackaddr_np/1/raw64 pthread_get_stacksize_np/1/raw64 pthread_create/4/raw32 pthread_join/2/raw32 pthread_detach/1/raw32 pthread_attr_init/1/raw32 pthread_attr_setstacksize/2/raw32 pthread_attr_destroy/1/raw32 openat/4/i32/3 unlinkat/3/i32 fstatat/4/i32 mkdirat/3/i32 access/2/i32 wait4/4/i32 opendir/1/ptr readdir/1/ptr closedir/1/i32 realpath/2/ptr _NSGetExecutablePath/2/raw32 posix_spawn/6/raw32 posix_spawn_file_actions_init/1/raw32 posix_spawn_file_actions_adddup2/3/raw32 posix_spawn_file_actions_destroy/1/raw32 open/3/i32/2 fstat/2/i32 poll/3/i32 dup/1/i32 dup2/2/i32 fcntl/3/i32/2 getcwd/2/ptr chdir/1/i32 setpgid/2/i32 waitid/4/i32 getrlimit/2/i32 setrlimit/2/i32 pipe/1/i32 fork/0/i32 execve/3/i32 killpg/2/i32 sigaction/3/i32 fdopendir/1/ptr posix_spawn_file_actions_addchdir_np/2/raw32 posix_spawn_file_actions_addinherit_np/2/raw32 posix_spawnattr_init/1/raw32 posix_spawnattr_setflags/2/raw32 posix_spawnattr_destroy/1/raw32 proc_pid_rusage/3/i32 proc_listpids/4/i32 arc4random_buf/2/raw64";
+// 系统调用形的蹦床（手写汇编的调用点用）：每项“C 名/实参个数/返回约定”，Linux 号经 macNameOf 对应。
+const SC_TABLE: string = "read/3/i64 write/3/i64 close/1/i32 openat/4/i32 unlinkat/3/i32";
+
+/// Linux 系统调用号 → 同语义的 libSystem 函数名；没有对等函数为空串。
+function macNameOf(nr: int): string {
+    if (nr == 0) { return "read"; }
+    if (nr == 1) { return "write"; }
+    if (nr == 3) { return "close"; }
+    if (nr == 9) { return "mmap"; }
+    if (nr == 10) { return "mprotect"; }
+    if (nr == 11) { return "munmap"; }
+    if (nr == 24) { return "sched_yield"; }
+    if (nr == 34) { return "pause"; }
+    if (nr == 35) { return "nanosleep"; }
+    if (nr == 39) { return "getpid"; }
+    if (nr == 62) { return "kill"; }
+    if (nr == 228) { return "clock_gettime"; }
+    if (nr == 231) { return "_exit"; }
+    if (nr == 257) { return "openat"; }
+    if (nr == 263) { return "unlinkat"; }
+    if (nr == 262) { return "fstatat"; }
+    if (nr == 258) { return "mkdirat"; }
+    if (nr == 21) { return "access"; }
+    if (nr == 61) { return "wait4"; }
+    if (nr == 2) { return "open"; }
+    if (nr == 5) { return "fstat"; }
+    if (nr == 7) { return "poll"; }
+    if (nr == 32) { return "dup"; }
+    if (nr == 33) { return "dup2"; }
+    if (nr == 72) { return "fcntl"; }
+    if (nr == 80) { return "chdir"; }
+    if (nr == 109) { return "setpgid"; }
+    if (nr == 247) { return "waitid"; }
+    return "";
+}
+
+/// 内核导出的蹦床（macOS）：程序映像里的工具链例程、调试运行时与外部函数回调经它们调 libSystem（M3 设计 G2）。
+export function macKernelExports(): List<string> {
+    const out: List<string> = listNew();
+    for (item in strSplit(MAC_TABLE, " ")) { listPush(out, "__tx_mac_" + tableName(item)); }
+    listPush(out, "__tx_mac_gettid");
+    listPush(out, "__tx_mac_page_alloc");
+    listPush(out, "__tx_mac_page_free");
+    // 启动环境（main 存下的 envp）：调试运行时读它（dbg_rt.tx）；子进程的环境改由 __tx_rt_env_block 取当前环境（D3 v0.39）。
+    listPush(out, "__tx_nrt_envp");
+    listPush(out, "__tx_nrt_nopipe");
+    listPush(out, "__tx_nrt_fork_lock");
+    listPush(out, "__tx_nrt_fork_unlock");
+    return out;
+}
+
+/// 按名字取共享代码里因目标而异的常量（M3 设计 G2）：调用方不写数值。不认识的名字在生成期报错。
+export function uxConst(t: int, name: string): int {
+    const mac = tMacos(t);
+    if (name == "O_NONBLOCK") { if (mac) { return 4; } return 0x800; }
+    if (name == "O_DIRECTORY") { if (mac) { return 0x100000; } return 0x10000; }
+    if (name == "O_CLOEXEC") { if (mac) { return 0x1000000; } return 0x80000; }
+    if (name == "F_DUPFD_CLOEXEC") { if (mac) { return 67; } return 1030; }
+    if (name == "F_GETFL") { return 3; }
+    if (name == "F_SETFL") { return 4; }
+    if (name == "F_SETFD") { return 2; }
+    if (name == "WEXITED") { return 4; }
+    if (name == "WNOHANG") { return 1; }
+    if (name == "WNOWAIT") { if (mac) { return 0x20; } return 0x1000000; }
+    if (name == "SI_PID") { if (mac) { return 12; } return 16; }
+    if (name == "ST_SIZE") { if (mac) { return 96; } return 48; }
+    if (name == "SIGKILL") { return 9; }
+    nrtFailWith("UnknownUnixConstant:" + name);
+    return 0;
+}
+
+/// 链接符号名（不含前导下划线）：x86_64 上 stat 与目录族等按 Apple 头文件改名（macos_symbols.tx，M2 设计 E3）。
+function macSymbol(name: string): string { return macLinkName(name, nrtTarget()); }
+
+/// sym（导入槽名去掉 __imp_）是不是内核经 libSystem 导入的符号：外部函数从别的库导入同名符号会与之争用同一个导入槽
+/// （M2 设计 F2），由 ffiPrepare 报错。
+export function macKernelImports(sym: string, t: int): bool {
+    if (sym == "__error" || sym == "pthread_threadid_np") { return true; }
+    for (item in strSplit(MAC_TABLE, " ")) { if (macLinkName(tableName(item), t) == sym) { return true; } }
+    return false;
+}
+
+/// 手写汇编里的一次系统调用：调用方已按 Linux 系统调用的寄存器放好实参（rdi rsi rdx r10 r8 r9；rax 里的调用号在 macOS 上
+/// 无用）。Linux 发 syscall；macOS 调系统调用形的蹦床 `__tx_mac_sc_<名>`——与 syscall 指令同样只改 rax、rcx、r11，结果同为 −errno。
+export function uxRawSys(b: Ref<StructuredBuffer>, t: int, nr: int): void {
+    if (tLinux(t)) { ins0(b, "syscall"); return; }
+    const name = macNameOf(nr);
+    if (!tMacos(t) || len(name) == 0) { nrtFailWith("UnsupportedRawSyscall:" + toStr(nr)); return; }
+    ins1(b, "call", asStructuredTarget("__tx_mac_sc_" + name));
+}
+
+/// open／openat 的标志位与 AT_FDCWD（按目标）：调用方按 Linux 的值写。
+export function uxOpenFlags(t: int, linuxFlags: int): int {
+    if (!tMacos(t)) { return linuxFlags; }
+    // O_ACCMODE 0..2 相同；O_CREAT 0x40→0x200、O_TRUNC 0x200→0x400、O_CLOEXEC 0x80000→0x1000000；其余位在生成期报错。
+    if ((linuxFlags & ~(0x3 | 0x40 | 0x200 | 0x80000)) != 0) { nrtFailWith("UnsupportedOpenFlags:" + toStr(linuxFlags)); return 0; }
+    let out = linuxFlags & 0x3;
+    if ((linuxFlags & 0x40) != 0) { out = out | 0x200; }
+    if ((linuxFlags & 0x200) != 0) { out = out | 0x400; }
+    if ((linuxFlags & 0x80000) != 0) { out = out | 0x1000000; }
+    return out;
+}
+export function uxAtFdcwd(t: int): int { if (tMacos(t)) { return -2; } return -100; }
+/// fstatat 的“不跟随符号链接”标志。
+export function uxAtNoFollow(t: int): int { if (tMacos(t)) { return 0x20; } return 0x100; }
+/// dst = struct stat 的 st_mode（st 为结构地址）。两个目标的结构都是 144 字节；st_mode 在 Linux x86_64 偏移 24、
+/// 4 字节，在 macOS 的 64 位 inode 结构偏移 4、2 字节。文件类型位（S_IFMT 等）数值相同。
+export function uxStatMode(f: Ref<RtFn>, t: int, dst: string, st: Ref<RtOp>): void {
+    if (tMacos(t)) { rtLoad(f, dst, st, 4, 2); return; }
+    rtLoad(f, dst, st, 24, 4);
+}
+
+/// 发一次系统调用（结果：非负成功，负为 −errno）。Linux 为裸系统调用；macOS 调同语义的 libSystem 函数。
+/// 标志位、时钟号等常量由调用方先经 uxMapFlags／uxClock 换成目标的数值。
+export function uxSys(f: Ref<RtFn>, t: int, result: string, nr: int, args: List<Ref<RtOp>>): void {
+    if (tLinux(t)) { rtSyscall(f, result, nr, args); return; }
+    const name = macNameOf(nr);
+    if (!tMacos(t) || len(name) == 0) {
+        if (len(f.failed) == 0) { f.failed = f.name + ": UnsupportedUnixSyscall:" + toStr(nr); }
+        return;
+    }
+    rtCallList(f, result, "__tx_mac_" + name, args);
+}
+
+/// 直接调表里的 libSystem 函数（没有对应 Linux 系统调用号的，如 exit、pthread_self）；只用于 macOS 分支。
+export function uxMac(f: Ref<RtFn>, result: string, name: string, args: List<Ref<RtOp>>): void {
+    rtCallList(f, result, "__tx_mac_" + name, args);
+}
+
+/// mmap 的 flags：调用方按 Linux 的位写，macOS 换成本机的位（PRIVATE 0x2、FIXED 0x10 相同；ANONYMOUS 0x20→0x1000；
+/// NORESERVE 0x4000→0x40；POPULATE 0x8000 没有对等，去掉——只影响缺页次数，不影响语义）。其余位在生成期报错。
+export function uxMapFlags(t: int, linuxFlags: int): int {
+    if (!tMacos(t)) { return linuxFlags; }
+    if ((linuxFlags & ~(0x2 | 0x10 | 0x20 | 0x4000 | 0x8000)) != 0) { nrtFailWith("UnsupportedMapFlags:" + toStr(linuxFlags)); return 0; }
+    let out = linuxFlags & (0x2 | 0x10);
+    if ((linuxFlags & 0x20) != 0) { out = out | 0x1000; }
+    if ((linuxFlags & 0x4000) != 0) { out = out | 0x40; }
+    return out;
+}
+
+/// clock_gettime 的时钟号：REALTIME 0 两边相同。Linux 的 MONOTONIC（1）在系统挂起时不走；macOS 与之一致的是
+/// CLOCK_UPTIME_RAW（8，睡眠时不走，同 mach_absolute_time；Go 与 Rust 在 macOS 上的单调钟同源，上位稿 D8 同定），
+/// macOS 的 CLOCK_MONOTONIC（6）睡眠时照走，对应的是 Linux 的 BOOTTIME。其余时钟号在生成期报错。
+export function uxClock(t: int, linuxClock: int): int {
+    if (!tMacos(t)) { return linuxClock; }
+    if (linuxClock == 0) { return 0; }
+    if (linuxClock == 1) { return 8; }
+    nrtFailWith("UnsupportedClock:" + toStr(linuxClock));
+    return 0;
+}
+
+/// errno 的本机数值（按名字）；共享代码比较具体 errno 时用 0 − uxErrno(t, 名)。
+export function uxErrno(t: int, name: string): int {
+    const mac = tMacos(t);
+    if (name == "EINTR") { return 4; }
+    if (name == "ENOENT") { return 2; }
+    if (name == "EBADF") { return 9; }
+    if (name == "ENOMEM") { return 12; }
+    if (name == "EACCES") { return 13; }
+    if (name == "EEXIST") { return 17; }
+    if (name == "EINVAL") { return 22; }
+    if (name == "EPIPE") { return 32; }
+    if (name == "EAGAIN") { if (mac) { return 35; } return 11; }
+    if (name == "ENAMETOOLONG") { if (mac) { return 63; } return 36; }
+    if (name == "ENOTDIR") { return 20; }
+    if (name == "EISDIR") { return 21; }
+    if (name == "EPERM") { return 1; }
+    if (name == "EROFS") { return 30; }
+    if (name == "EFBIG") { return 27; }
+    if (name == "ENOSYS") { if (mac) { return 78; } return 38; }
+    if (name == "ELOOP") { if (mac) { return 62; } return 40; }
+    if (name == "ESRCH") { return 3; }
+    if (name == "ECHILD") { return 10; }
+    nrtFailWith("UnknownErrno:" + name);
+    return -1;
+}
+
+function r64(n: int): Ref<Operand> { return asStructuredReg(0, n); }
+function r32(n: int): Ref<Operand> { return asStructuredReg(1, n); }
+function xmm(n: int): Ref<Operand> { return asStructuredReg(3, n); }
+function imm(n: int): Ref<Operand> { return asStructuredImm(n); }
+function stack(off: int): Ref<Operand> { return asStructuredMem(2, 4, -1, 0, off, 0, ""); }
+function frame(off: int): Ref<Operand> { return asStructuredMem(2, 5, -1, 0, off, 0, ""); }
+function ins2(b: Ref<StructuredBuffer>, mn: string, x: Ref<Operand>, y: Ref<Operand>): void { asBufferInstruction(b, mn, 2, x, y, asStructuredMissing(), 1); }
+function ins1(b: Ref<StructuredBuffer>, mn: string, x: Ref<Operand>): void { asBufferInstruction(b, mn, 1, x, asStructuredMissing(), asStructuredMissing(), 1); }
+function ins0(b: Ref<StructuredBuffer>, mn: string): void { asBufferInstruction(b, mn, 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1); }
+function label(b: Ref<StructuredBuffer>, n: string): void { asBufferLabel(b, n, 1); }
+
+// 蹦床的序言与尾声：push rbp; mov rbp, rsp; push rsi; push rdi; 再把 rsp 按 16 字节对齐、留 160 + extra 字节，
+// xmm6–15 存在 [rsp + extra ...]。自己对齐栈：手写汇编的调用点（页适配器、致命路径）不必保证对齐，libSystem 照样
+// 得到 16 字节对齐的调用点；extra 须为 16 的倍数。尾声经 rbp 复原 rsp。
+function enter(b: Ref<StructuredBuffer>, extra: int): void {
+    ins1(b, "push", r64(5)); ins2(b, "mov", r64(5), r64(4));
+    ins1(b, "push", r64(6)); ins1(b, "push", r64(7));
+    ins2(b, "and", r64(4), imm(-16));
+    ins2(b, "sub", r64(4), imm(160 + extra));
+    let k = 0;
+    while (k < 10) { ins2(b, "movupd", stack(extra + 16 * k), xmm(6 + k)); k = k + 1; }
+}
+function leave(b: Ref<StructuredBuffer>, extra: int): void {
+    let k = 0;
+    while (k < 10) { ins2(b, "movupd", xmm(6 + k), stack(extra + 16 * k)); k = k + 1; }
+    ins2(b, "lea", r64(4), frame(-16));
+    ins1(b, "pop", r64(7)); ins1(b, "pop", r64(6)); ins1(b, "pop", r64(5));
+    ins0(b, "ret");
+}
+// 经导入槽调用（r11 不是 SysV 的实参寄存器；al = 0 表示没有向量实参，变参函数也安全）。
+function callImport(b: Ref<StructuredBuffer>, name: string): void {
+    ins2(b, "mov", r64(11), asStructuredMem(2, -1, -1, 0, 0, 1, "__imp_" + macSymbol(name)));
+    ins2(b, "xor", r32(0), r32(0));
+    ins1(b, "call", r64(11));
+}
+// rax = −errno（本机编号）。
+function negErrno(b: Ref<StructuredBuffer>): void {
+    callImport(b, "__error");
+    ins2(b, "mov", r32(0), asStructuredMem(1, 0, -1, 0, 0, 0, ""));
+    ins1(b, "neg", r64(0));
+}
+// errno = 0（RET_PTR 用）。私有约定的前 4 个实参先存进调用方的影子区（[rbp+16..48)），清完再取回：__error 按 SysV 可改 rcx rdx r8 r9。
+function clearErrno(b: Ref<StructuredBuffer>, nargs: int): void {
+    const regs: []int = [1, 2, 8, 9];
+    let k = 0;
+    while (k < nargs && k < 4) { ins2(b, "mov", frame(16 + 8 * k), r64(regs[k])); k = k + 1; }
+    callImport(b, "__error");
+    ins2(b, "xor", r32(1), r32(1));
+    ins2(b, "mov", asStructuredMem(1, 0, -1, 0, 0, 0, ""), r32(1));
+    k = 0;
+    while (k < nargs && k < 4) { ins2(b, "mov", r64(regs[k]), frame(16 + 8 * k)); k = k + 1; }
+}
+// 表项“名/实参个数/返回约定”的三个字段。
+function tableName(item: string): string { return listGet(strSplit(item, "/"), 0) catch ""; }
+function tableArgs(item: string): int {
+    const s = listGet(strSplit(item, "/"), 1) catch "";
+    let n = 0;
+    let k = 0;
+    while (k < len(s)) { n = n * 10 + ((byteAt(s, k) catch 48) - 48); k = k + 1; }
+    return n;
+}
+// 变参函数的定参个数（表项第四段）；不是变参函数为 −1。
+function tableFixed(item: string): int {
+    const s = listGet(strSplit(item, "/"), 3) catch "";
+    if (len(s) == 0) { return -1; }
+    let n = 0;
+    let k = 0;
+    while (k < len(s)) { n = n * 10 + ((byteAt(s, k) catch 48) - 48); k = k + 1; }
+    return n;
+}
+function tableRet(item: string): int {
+    const s = listGet(strSplit(item, "/"), 2) catch "";
+    if (s == "i64") { return RET_I64; }
+    if (s == "i32") { return RET_I32; }
+    if (s == "raw64") { return RET_RAW64; }
+    if (s == "raw32") { return RET_RAW32; }
+    if (s == "none") { return RET_NONE; }
+    if (s == "ptr") { return RET_PTR; }
+    nrtFailWith("BadMacTableReturn:" + item);
+    return RET_NONE;
+}
+
+// rdx（SysV 的第三个实参，read／write 的字节数，无符号）封顶为 MAX_RW。
+function capCount(b: Ref<StructuredBuffer>, entry: string): void {
+    ins2(b, "cmp", r64(2), imm(MAX_RW));
+    ins1(b, "jbe", asStructuredTarget(entry + "_rw"));
+    ins2(b, "mov", r32(2), imm(MAX_RW));
+    label(b, entry + "_rw");
+}
+
+function trampoline(b: Ref<StructuredBuffer>, name: string, nargs: int, ret: int): void {
+    const entry = "__tx_mac_" + name;
+    label(b, entry);
+    enter(b, 0);
+    if (ret == RET_PTR) { clearErrno(b, nargs); }
+    // 私有约定 → SysV：rcx→rdi、rdx→rsi、r8→rdx、r9→rcx、第 5、6 个实参在调用方的栈上（影子区 32 字节之后）。
+    if (nargs >= 1) { ins2(b, "mov", r64(7), r64(1)); }
+    if (nargs >= 2) { ins2(b, "mov", r64(6), r64(2)); }
+    if (nargs >= 3) { ins2(b, "mov", r64(2), r64(8)); }
+    if (nargs >= 4) { ins2(b, "mov", r64(1), r64(9)); }
+    if (nargs >= 5) { ins2(b, "mov", r64(8), frame(48)); }
+    if (nargs >= 6) { ins2(b, "mov", r64(9), frame(56)); }
+    if (name == "read" || name == "write") { capCount(b, entry); }
+    callImport(b, name);
+    if (ret == RET_NONE) { ins0(b, "ud2"); return; }
+    if (ret == RET_I32 || ret == RET_RAW32) { ins2(b, "shl", r64(0), imm(32)); ins2(b, "sar", r64(0), imm(32)); }
+    if (ret == RET_I64 || ret == RET_I32 || ret == RET_PTR) {
+        if (ret == RET_PTR) { ins2(b, "cmp", r64(0), imm(0)); } else { ins2(b, "cmp", r64(0), imm(-1)); }
+        ins1(b, "jne", asStructuredTarget(entry + "_done"));
+        negErrno(b);
+        label(b, entry + "_done");
+    }
+    leave(b, 0);
+}
+
+// A64 蹦床：变参位置上的实参经 rtCallC 的类别 2 放栈；RET_PTR 调用前清 errno；失败时 r = −*__error()。
+function errnoAddr(f: Ref<RtFn>, dst: string): void {
+    rtSet(f, "fp", G("__imp___error"));
+    rtCallC(f, dst, "", "fp", listNew(), listNew(), true);
+}
+function trampolineA64(b: Ref<StructuredBuffer>, name: string, nargs: int, nfixed: int, ret: int): void {
+    let params = "";
+    const args: List<Ref<RtOp>> = listNew();
+    const cls: List<int> = listNew();
+    let nvar = 0;
+    let k = 0;
+    while (k < nargs) {
+        params = params + " a" + toStr(k);
+        listPush(args, L("a" + toStr(k)));
+        if (nfixed >= 0 && k >= nfixed) { listPush(cls, 2); nvar = nvar + 1; } else { listPush(cls, 0); }
+        k = k + 1;
+    }
+    const f = rtBegin(b, "__tx_mac_" + name, params, "fp r e", 8 + nvar, MODULE);
+    if (ret == RET_PTR) {
+        errnoAddr(f, "e");
+        rtStore(f, L("e"), 0, I(0), 4);
+    }
+    if (name == "read" || name == "write") {
+        rtIf(f, L("a2"), "ule", I(MAX_RW), "rw");
+        rtSet(f, "a2", I(MAX_RW));
+        rtLabel(f, "rw");
+    }
+    rtSet(f, "fp", G("__imp_" + macSymbol(name)));
+    rtCallC(f, "r", "", "fp", args, cls, true);
+    if (ret == RET_NONE) { rtTrap(f); check(f); return; }
+    if (ret == RET_I32 || ret == RET_RAW32) { rtShift(f, "r", L("r"), "shl", 32); rtShift(f, "r", L("r"), "sar", 32); }
+    if (ret == RET_I64 || ret == RET_I32 || ret == RET_PTR) {
+        let failValue = -1;
+        if (ret == RET_PTR) { failValue = 0; }
+        rtIf(f, L("r"), "ne", I(failValue), "done");
+        errnoAddr(f, "e");
+        rtLoad(f, "r", L("e"), 0, 4);
+        rtOp(f, "r", I(0), "sub", L("r"));
+        rtLabel(f, "done");
+    }
+    rtRet(f, L("r"));
+    check(f);
+}
+// __tx_mac_gettid（A64）：同 x86 版，pthread_threadid_np(NULL, &id)。
+function gettidA64(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "__tx_mac_gettid", "", "fp id p", 2, MODULE);
+    rtSet(f, "id", I(0));
+    rtAddrOf(f, "p", "id");
+    rtSet(f, "fp", G("__imp_pthread_threadid_np"));
+    const args: List<Ref<RtOp>> = listNew(); listPush(args, I(0)); listPush(args, L("p"));
+    const cls: List<int> = listNew(); listPush(cls, 0); listPush(cls, 0);
+    rtCallC(f, "", "", "fp", args, cls, true);
+    rtRet(f, L("id"));
+    check(f);
+}
+
+/// 内存生成器的页适配器（macOS）：__tx_mac_page_alloc(_, size, _, _) → 全零可读写页，失败为 0；
+/// __tx_mac_page_free(p, size)。调用约定同 Linux 的 __tx_linux_page_alloc/free（VirtualAlloc/VirtualFree 的替身，
+/// 只用第二个实参）；经蹦床调 mmap/munmap，蹦床已保存私有约定的被调方保存寄存器。
+export function macPageAdapters(b: Ref<StructuredBuffer>): void {
+    asBufferSection(b, 0, 1);
+    label(b, "__tx_mac_page_alloc");
+    // mmap(0, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0)；第 5、6 个实参在 [rsp+32]、[rsp+40]。
+    ins2(b, "sub", r64(4), imm(56));
+    ins2(b, "mov", stack(32), imm(-1));
+    ins2(b, "mov", stack(40), imm(0));
+    ins2(b, "xor", r32(1), r32(1));
+    ins2(b, "mov", r32(8), imm(3));
+    ins2(b, "mov", r32(9), imm(4098));
+    ins1(b, "call", asStructuredTarget("__tx_mac_mmap"));
+    ins2(b, "cmp", r64(0), imm(-4095));
+    ins1(b, "jb", asStructuredTarget("__tx_mac_page_ok"));
+    ins2(b, "xor", r32(0), r32(0));
+    label(b, "__tx_mac_page_ok");
+    ins2(b, "add", r64(4), imm(56));
+    ins0(b, "ret");
+    label(b, "__tx_mac_page_free");
+    ins2(b, "sub", r64(4), imm(40));
+    ins1(b, "call", asStructuredTarget("__tx_mac_munmap"));
+    ins2(b, "add", r64(4), imm(40));
+    ins0(b, "ret");
+}
+
+/// 致命终局（macOS）：stderr 写 message 与换行后 _exit(status)。可从任意栈状态跳入或调用：先按 16 字节对齐栈。
+export function macAbort(b: Ref<StructuredBuffer>, entry: string, data: string, message: string, status: int): void {
+    asBufferSection(b, 0, 1); label(b, entry);
+    ins2(b, "and", r64(4), imm(-16));
+    ins2(b, "sub", r64(4), imm(32));
+    ins2(b, "mov", r32(1), imm(2));
+    ins2(b, "lea", r64(2), asStructuredMem(2, -1, -1, 0, 0, 1, data));
+    ins2(b, "mov", r32(8), imm(len(message) + 1));
+    ins1(b, "call", asStructuredTarget("__tx_mac_write"));
+    ins2(b, "mov", r32(1), imm(status));
+    ins1(b, "call", asStructuredTarget("__tx_mac__exit"));
+    asBufferSection(b, 1, 1); label(b, data);
+    let i = 0;
+    while (i < len(message)) { asBufferByte(b, byteAt(message, i) catch 0, 1); i = i + 1; }
+    asBufferByte(b, 10, 1);
+    asBufferSection(b, 0, 1);
+}
+
+// 系统调用形的蹦床：实参在 rdi rsi rdx r10 r8 r9，除 rax、rcx、r11 外的寄存器（含 xmm0–15）都保留，结果 −errno。
+function scShim(b: Ref<StructuredBuffer>, name: string, nargs: int, ret: int): void {
+    const entry = "__tx_mac_sc_" + name;
+    label(b, entry);
+    ins1(b, "push", r64(5)); ins2(b, "mov", r64(5), r64(4));
+    ins1(b, "push", r64(7)); ins1(b, "push", r64(6)); ins1(b, "push", r64(2));
+    ins1(b, "push", r64(8)); ins1(b, "push", r64(9)); ins1(b, "push", r64(10));
+    ins2(b, "and", r64(4), imm(-16));
+    ins2(b, "sub", r64(4), imm(256));
+    let k = 0;
+    while (k < 16) { ins2(b, "movupd", stack(16 * k), xmm(k)); k = k + 1; }
+    if (nargs >= 4) { ins2(b, "mov", r64(1), r64(10)); }
+    if (name == "read" || name == "write") { capCount(b, entry); }
+    callImport(b, name);
+    if (ret == RET_I32 || ret == RET_RAW32) { ins2(b, "shl", r64(0), imm(32)); ins2(b, "sar", r64(0), imm(32)); }
+    if (ret == RET_I64 || ret == RET_I32) {
+        ins2(b, "cmp", r64(0), imm(-1));
+        ins1(b, "jne", asStructuredTarget(entry + "_done"));
+        negErrno(b);
+        label(b, entry + "_done");
+    }
+    k = 0;
+    while (k < 16) { ins2(b, "movupd", xmm(k), stack(16 * k)); k = k + 1; }
+    ins2(b, "lea", r64(4), frame(-48));
+    ins1(b, "pop", r64(10)); ins1(b, "pop", r64(9)); ins1(b, "pop", r64(8));
+    ins1(b, "pop", r64(2)); ins1(b, "pop", r64(6)); ins1(b, "pop", r64(7)); ins1(b, "pop", r64(5));
+    ins0(b, "ret");
+}
+
+/// macOS 内核的系统接口例程（代码段）：表里每个函数的蹦床、系统调用形的蹦床、取线程号。
+export function macSysEmit(b: Ref<StructuredBuffer>): void {
+    asBufferSection(b, 0, 1);
+    const items = strSplit(MAC_TABLE, " ");
+    if (b.a64) {
+        for (item in items) { trampolineA64(b, tableName(item), tableArgs(item), tableFixed(item), tableRet(item)); }
+        gettidA64(b);
+        return;
+    }
+    let k = 0;
+    while (k < listLen(items)) {
+        const item = listGet(items, k) catch "";
+        trampoline(b, tableName(item), tableArgs(item), tableRet(item));
+        k = k + 1;
+    }
+    const shims = strSplit(SC_TABLE, " ");
+    k = 0;
+    while (k < listLen(shims)) {
+        const item = listGet(shims, k) catch "";
+        scShim(b, tableName(item), tableArgs(item), tableRet(item));
+        k = k + 1;
+    }
+    // __tx_mac_gettid() → 本线程的系统线程号（pthread_threadid_np(NULL, &id)，64 位、全系统唯一）。
+    label(b, "__tx_mac_gettid");
+    enter(b, 16);
+    ins2(b, "mov", stack(0), imm(0));
+    ins2(b, "xor", r32(7), r32(7));
+    ins2(b, "lea", r64(6), stack(0));
+    callImport(b, "pthread_threadid_np");
+    ins2(b, "mov", r64(0), stack(0));
+    leave(b, 16);
+}

@@ -1,0 +1,351 @@
+// A64 指令编码（macOS 适配 M4 设计 A2，docs/design/v052-macos-m4-arm64-v0.1-20261024.md）。
+// 每种指令形式一个纯函数，返回 32 位编码字；操作数编不出时返回 -1，不悄悄改写（同 Apple 汇编器）。合法化
+// （大常数、大偏移）在上一层用 x16／x17 做。寄存器参数是编码号 0..31：31 在可取栈指针的位置是 sp，在其余
+// 位置是 xzr／wzr，由调用方按指令形式理解（同 A64 编码本身）。sf＝1 为 64 位、0 为 32 位。
+// 校验：tests/a64/encodings.txt（scripts/a64-encodings.py 由 Apple clang 或 zig cc 生成）经 a64_encode_probe 逐条核对。
+
+// 条件码（b.cond、csel 等）。
+export const A64_EQ: int = 0;
+export const A64_NE: int = 1;
+export const A64_HS: int = 2;
+export const A64_LO: int = 3;
+export const A64_MI: int = 4;
+export const A64_PL: int = 5;
+export const A64_VS: int = 6;
+export const A64_VC: int = 7;
+export const A64_HI: int = 8;
+export const A64_LS: int = 9;
+export const A64_GE: int = 10;
+export const A64_LT: int = 11;
+export const A64_GT: int = 12;
+export const A64_LE: int = 13;
+export const A64_AL: int = 14;
+
+/// 条件取反（eq↔ne、hs↔lo…；al 不可取反，得 -1）。
+export function a64InvertCond(cond: int): int {
+    if (cond < 0 || cond > 13) { return -1; }
+    return cond ^ 1;
+}
+
+function isReg(r: int): bool { return r >= 0 && r <= 31; }
+function isBit(v: int): bool { return v == 0 || v == 1; }
+function fits(v: int, lo: int, hi: int): bool { return v >= lo && v <= hi; }
+
+// ---------------------------------------------------------------------------
+// 逻辑立即数（N:immr:imms）。算法同 LLVM AArch64_AM::processLogicalImmediate：先找重复单元的宽度，
+// 再在单元内求循环右移量与连续 1 的个数。全 0、全 1 与不是“循环移位的连续 1”的值编不出。
+// ---------------------------------------------------------------------------
+
+function onesBelow(n: int): int {
+    if (n >= 64) { return -1; }
+    return (1 << n) - 1;
+}
+function ctz64(v: int): int {
+    if (v == 0) { return 64; }
+    let n = 0;
+    while (((v >>> n) & 1) == 0) { n = n + 1; }
+    return n;
+}
+function cto64(v: int): int {
+    let n = 0;
+    while (n < 64 && ((v >>> n) & 1) == 1) { n = n + 1; }
+    return n;
+}
+function clo64(v: int): int {
+    let n = 0;
+    while (n < 64 && ((v >>> (63 - n)) & 1) == 1) { n = n + 1; }
+    return n;
+}
+// 非零且是一段连续的 1（可左移过）。
+function isShiftedMask(v: int): bool {
+    if (v == 0) { return false; }
+    const m = v >>> ctz64(v);
+    const k = cto64(m);
+    return k == 64 || (m >>> k) == 0;
+}
+
+/// 逻辑立即数的 13 位编码 N<<12 | immr<<6 | imms；编不出得 -1。sf＝0 时只看低 32 位且须是 32 位值。
+export function a64BitmaskImm(value: int, sf: int): int {
+    let imm = value;
+    let regSize = 64;
+    if (sf == 0) {
+        regSize = 32;
+        if ((imm >>> 32) != 0) { return -1; }
+        imm = imm | (imm << 32);
+    }
+    if (imm == 0 || imm == -1) { return -1; }
+    let size = 64;
+    let done = false;
+    while (!done && size > 2) {
+        const half = size / 2;
+        const mask = onesBelow(half);
+        if ((imm & mask) != ((imm >>> half) & mask)) { done = true; } else { size = half; }
+    }
+    let mask = -1;
+    if (size < 64) { mask = onesBelow(size); }
+    imm = imm & mask;
+    let rot = 0;
+    let ones = 0;
+    if (isShiftedMask(imm)) {
+        rot = ctz64(imm);
+        ones = cto64(imm >>> rot);
+    } else {
+        imm = imm | ~mask;
+        if (!isShiftedMask(~imm)) { return -1; }
+        const lead = clo64(imm);
+        rot = 64 - lead;
+        ones = lead + cto64(imm) - (64 - size);
+    }
+    const immr = (size - rot) & (size - 1);
+    let nimms = ~(size - 1) << 1;
+    nimms = nimms | (ones - 1);
+    const n = ((nimms >>> 6) & 1) ^ 1;
+    if (regSize == 32 && n == 1) { return -1; }
+    return (n << 12) | (immr << 6) | (nimms & 63);
+}
+
+// ---------------------------------------------------------------------------
+// 数据处理（立即数）
+// ---------------------------------------------------------------------------
+
+/// add／sub（op 0／1）、S＝1 置标志；imm12 0..4095，sh12＝1 左移 12 位。rd 在 S＝0 时 31 为 sp，rn 的 31 恒为 sp。
+export function a64AddSubImm(sf: int, op: int, s: int, rd: int, rn: int, imm12: int, sh12: int): int {
+    if (!isBit(sf) || !isBit(op) || !isBit(s) || !isBit(sh12) || !isReg(rd) || !isReg(rn) || !fits(imm12, 0, 4095)) { return -1; }
+    return (sf << 31) | (op << 30) | (s << 29) | (34 << 23) | (sh12 << 22) | (imm12 << 10) | (rn << 5) | rd;
+}
+
+/// and／orr／eor／ands（opc 0..3）与逻辑立即数；rd 在 opc≠3 时 31 为 sp。
+export function a64LogicalImm(sf: int, opc: int, rd: int, rn: int, value: int): int {
+    if (!isBit(sf) || !fits(opc, 0, 3) || !isReg(rd) || !isReg(rn)) { return -1; }
+    const bm = a64BitmaskImm(value, sf);
+    if (bm < 0) { return -1; }
+    return (sf << 31) | (opc << 29) | (36 << 23) | (bm << 10) | (rn << 5) | rd;
+}
+
+/// movn／movz／movk（opc 0／2／3）；hw 为 16 位片号（32 位时 0..1）。
+export function a64MoveWide(sf: int, opc: int, rd: int, imm16: int, hw: int): int {
+    if (!isBit(sf) || !(opc == 0 || opc == 2 || opc == 3) || !isReg(rd) || !fits(imm16, 0, 65535) || !fits(hw, 0, 1 + sf * 2)) { return -1; }
+    return (sf << 31) | (opc << 29) | (37 << 23) | (hw << 21) | (imm16 << 5) | rd;
+}
+
+/// sbfm／bfm／ubfm（opc 0／1／2），N 与 sf 相同；immr、imms 0..(宽度−1)。lsl／lsr／asr 的立即数形、sxtw 等都是它的别名。
+export function a64Bitfield(sf: int, opc: int, rd: int, rn: int, immr: int, imms: int): int {
+    const top = 31 + sf * 32;
+    if (!isBit(sf) || !fits(opc, 0, 2) || !isReg(rd) || !isReg(rn) || !fits(immr, 0, top) || !fits(imms, 0, top)) { return -1; }
+    return (sf << 31) | (opc << 29) | (38 << 23) | (sf << 22) | (immr << 16) | (imms << 10) | (rn << 5) | rd;
+}
+
+/// adr（page＝0，字节偏移 ±1 MiB）／adrp（page＝1，偏移以 4 KiB 页计，±4 GiB）。
+export function a64Adr(page: int, rd: int, offset: int): int {
+    if (!isBit(page) || !isReg(rd) || !fits(offset, -1048576, 1048575)) { return -1; }
+    const v = offset & 2097151;
+    return (page << 31) | ((v & 3) << 29) | (16 << 24) | ((v >>> 2) << 5) | rd;
+}
+
+// ---------------------------------------------------------------------------
+// 数据处理（寄存器）
+// ---------------------------------------------------------------------------
+
+/// add／sub 移位寄存器形：shift 0 lsl、1 lsr、2 asr；amount 0..(宽度−1)。三个寄存器的 31 都是零寄存器。
+export function a64AddSubShifted(sf: int, op: int, s: int, rd: int, rn: int, rm: int, shift: int, amount: int): int {
+    if (!isBit(sf) || !isBit(op) || !isBit(s) || !isReg(rd) || !isReg(rn) || !isReg(rm) || !fits(shift, 0, 2) || !fits(amount, 0, 31 + sf * 32)) { return -1; }
+    return (sf << 31) | (op << 30) | (s << 29) | (11 << 24) | (shift << 22) | (rm << 16) | (amount << 10) | (rn << 5) | rd;
+}
+
+/// add／sub 扩展寄存器形：option 0..7（uxtb uxth uxtw uxtx sxtb sxth sxtw sxtx），amount 0..4。
+/// rd（S＝0 时）与 rn 的 31 是 sp，rm 的 31 是零寄存器——涉及 sp 的寄存器加减用这一形。
+export function a64AddSubExt(sf: int, op: int, s: int, rd: int, rn: int, rm: int, option: int, amount: int): int {
+    if (!isBit(sf) || !isBit(op) || !isBit(s) || !isReg(rd) || !isReg(rn) || !isReg(rm) || !fits(option, 0, 7) || !fits(amount, 0, 4)) { return -1; }
+    return (sf << 31) | (op << 30) | (s << 29) | (11 << 24) | (1 << 21) | (rm << 16) | (option << 13) | (amount << 10) | (rn << 5) | rd;
+}
+
+/// and／orr／eor／ands（opc 0..3）移位寄存器形；n＝1 取反 rm（bic／orn／eon／bics）；shift 0..3（含 ror）。
+export function a64LogicalShifted(sf: int, opc: int, n: int, rd: int, rn: int, rm: int, shift: int, amount: int): int {
+    if (!isBit(sf) || !fits(opc, 0, 3) || !isBit(n) || !isReg(rd) || !isReg(rn) || !isReg(rm) || !fits(shift, 0, 3) || !fits(amount, 0, 31 + sf * 32)) { return -1; }
+    return (sf << 31) | (opc << 29) | (10 << 24) | (shift << 22) | (n << 21) | (rm << 16) | (amount << 10) | (rn << 5) | rd;
+}
+
+// 两源数据处理的 opcode：udiv 2、sdiv 3、lslv 8、lsrv 9、asrv 10、rorv 11。
+export const A64_UDIV: int = 2;
+export const A64_SDIV: int = 3;
+export const A64_LSLV: int = 8;
+export const A64_LSRV: int = 9;
+export const A64_ASRV: int = 10;
+export const A64_RORV: int = 11;
+
+/// 两源数据处理（除法、按寄存器移位；移位计数按位宽取模）。
+export function a64DataProc2(sf: int, opcode: int, rd: int, rn: int, rm: int): int {
+    const ok = opcode == 2 || opcode == 3 || (opcode >= 8 && opcode <= 11);
+    if (!isBit(sf) || !ok || !isReg(rd) || !isReg(rn) || !isReg(rm)) { return -1; }
+    return (sf << 31) | (214 << 21) | (rm << 16) | (opcode << 10) | (rn << 5) | rd;
+}
+
+/// 三源数据处理：op31 0 madd／msub（o0 0／1）、1 smaddl／smsubl、2 smulh（o0 0、ra 31）、5 umaddl、6 umulh。
+export function a64DataProc3(sf: int, op31: int, o0: int, rd: int, rn: int, rm: int, ra: int): int {
+    if (!isBit(sf) || !isBit(o0) || !isReg(rd) || !isReg(rn) || !isReg(rm) || !isReg(ra)) { return -1; }
+    if (op31 == 0) {
+    } else if ((op31 == 1 || op31 == 5) && sf == 1) {
+    } else if ((op31 == 2 || op31 == 6) && sf == 1 && o0 == 0 && ra == 31) {
+    } else { return -1; }
+    return (sf << 31) | (27 << 24) | (op31 << 21) | (rm << 16) | (o0 << 15) | (ra << 10) | (rn << 5) | rd;
+}
+
+/// csel（op 0、o2 0）、csinc（0、1）、csinv（1、0）、csneg（1、1）。cset rd, c ＝ csinc rd, zr, zr, 取反(c)。
+export function a64CondSelect(sf: int, op: int, o2: int, rd: int, rn: int, rm: int, cond: int): int {
+    if (!isBit(sf) || !isBit(op) || !isBit(o2) || !isReg(rd) || !isReg(rn) || !isReg(rm) || !fits(cond, 0, 15)) { return -1; }
+    return (sf << 31) | (op << 30) | (212 << 21) | (rm << 16) | (cond << 12) | (o2 << 10) | (rn << 5) | rd;
+}
+
+// ---------------------------------------------------------------------------
+// 读写
+// ---------------------------------------------------------------------------
+// size：0 字节、1 半字、2 字、3 双字（浮点 v＝1 时 2 为 s、3 为 d）；opc：0 写、1 读、2 读并符号扩展到 64 位、
+// 3 读并符号扩展到 32 位（2、3 只用于整数 size 0..2；size 2 只有 opc 2，即 ldrsw）。rn 的 31 是 sp，rt 的 31 是零寄存器。
+
+function ldstOk(size: int, v: int, opc: int): bool {
+    if (!fits(size, 0, 3) || !isBit(v) || !fits(opc, 0, 3)) { return false; }
+    if (v == 1) { return size >= 2 && opc <= 1; }
+    if (opc <= 1) { return true; }
+    if (size == 3) { return false; }
+    if (size == 2) { return opc == 2; }
+    return true;
+}
+
+/// 无符号偏移形 [rn, #offset]：offset 为字节数，须是访问宽度的倍数且 < 4096×宽度。
+export function a64LdStUImm(size: int, v: int, opc: int, rt: int, rn: int, offset: int): int {
+    if (!ldstOk(size, v, opc) || !isReg(rt) || !isReg(rn)) { return -1; }
+    const unit = 1 << size;
+    if (offset < 0 || offset % unit != 0 || offset / unit > 4095) { return -1; }
+    return (size << 30) | (7 << 27) | (v << 26) | (1 << 24) | (opc << 22) | ((offset / unit) << 10) | (rn << 5) | rt;
+}
+
+/// 未缩放（ldur／stur，mode 0）、后变址（mode 1，[rn], #imm）、前变址（mode 3，[rn, #imm]!）：imm −256..255。
+export function a64LdStImm9(size: int, v: int, opc: int, rt: int, rn: int, imm9: int, mode: int): int {
+    if (!ldstOk(size, v, opc) || !isReg(rt) || !isReg(rn) || !fits(imm9, -256, 255) || !(mode == 0 || mode == 1 || mode == 3)) { return -1; }
+    // 写回时基址与整数数据寄存器同号（31 一边是 sp、一边是零寄存器，不算）：架构上 CONSTRAINED UNPREDICTABLE，LLVM／Apple 汇编器拒收。
+    if (mode != 0 && v == 0 && rt == rn && rn != 31) { return -1; }
+    return (size << 30) | (7 << 27) | (v << 26) | (opc << 22) | ((imm9 & 511) << 12) | (mode << 10) | (rn << 5) | rt;
+}
+
+/// 寄存器偏移形 [rn, rm, 扩展 #s]：option 2 uxtw、3 lsl（uxtx）、6 sxtw、7 sxtx；scale＝1 时按访问宽度左移。
+export function a64LdStReg(size: int, v: int, opc: int, rt: int, rn: int, rm: int, option: int, scale: int): int {
+    const okOpt = option == 2 || option == 3 || option == 6 || option == 7;
+    if (!ldstOk(size, v, opc) || !isReg(rt) || !isReg(rn) || !isReg(rm) || !okOpt || !isBit(scale)) { return -1; }
+    return (size << 30) | (7 << 27) | (v << 26) | (opc << 22) | (1 << 21) | (rm << 16) | (option << 13) | (scale << 12) | (2 << 10) | (rn << 5) | rt;
+}
+
+/// 成对读写：opc 0 为 32 位（浮点为 s）、2 为 64 位整数、1 为 d（v＝1）；l＝1 读；mode 1 后变址、2 带偏移、3 前变址。
+/// offset 为字节数，须是元素宽度的倍数，换算后在 −64..63。
+export function a64LdStPair(opc: int, v: int, l: int, rt: int, rt2: int, rn: int, offset: int, mode: int): int {
+    if (!isBit(v) || !isBit(l) || !isReg(rt) || !isReg(rt2) || !isReg(rn) || !fits(mode, 1, 3)) { return -1; }
+    let unit = 0;
+    if (v == 0 && opc == 0) { unit = 4; }
+    if (v == 0 && opc == 2) { unit = 8; }
+    if (v == 1 && opc == 0) { unit = 4; }
+    if (v == 1 && opc == 1) { unit = 8; }
+    if (unit == 0 || offset % unit != 0 || !fits(offset / unit, -64, 63)) { return -1; }
+    // 架构上 CONSTRAINED UNPREDICTABLE 的组合（LLVM／Apple 汇编器拒收）：写回时基址与整数数据寄存器同号、ldp 两目标同号。
+    if (mode != 2 && v == 0 && rn != 31 && (rt == rn || rt2 == rn)) { return -1; }
+    if (l == 1 && rt == rt2) { return -1; }
+    return (opc << 30) | (5 << 27) | (v << 26) | (mode << 23) | (l << 22) | (((offset / unit) & 127) << 15) | (rt2 << 10) | (rn << 5) | rt;
+}
+
+// ---------------------------------------------------------------------------
+// 原子（LSE）与获取／释放
+// ---------------------------------------------------------------------------
+
+/// ldaddal（swp＝0）／swpal（swp＝1）：size 2 字、3 双字；先读后改，旧值进 rt。
+export function a64AtomicAl(size: int, swp: int, rs: int, rt: int, rn: int): int {
+    if (!fits(size, 2, 3) || !isBit(swp) || !isReg(rs) || !isReg(rt) || !isReg(rn)) { return -1; }
+    return (size << 30) | (56 << 24) | (1 << 23) | (1 << 22) | (1 << 21) | (rs << 16) | (swp << 15) | (rn << 5) | rt;
+}
+
+/// casal：rs 进为期望值、出为旧值；rt 为新值。
+export function a64Casal(size: int, rs: int, rt: int, rn: int): int {
+    if (!fits(size, 2, 3) || !isReg(rs) || !isReg(rt) || !isReg(rn)) { return -1; }
+    return (size << 30) | (8 << 24) | (1 << 23) | (1 << 22) | (1 << 21) | (rs << 16) | (1 << 15) | (31 << 10) | (rn << 5) | rt;
+}
+
+/// ldar（kind 0）、stlr（kind 1）、ldapr（kind 2）：size 0..3。
+export function a64AcqRel(kind: int, size: int, rt: int, rn: int): int {
+    if (!fits(kind, 0, 2) || !fits(size, 0, 3) || !isReg(rt) || !isReg(rn)) { return -1; }
+    let base = 148896768;
+    if (kind == 1) { base = 144702464; }
+    if (kind == 2) { base = 952090624; }
+    return (size << 30) | base | (rn << 5) | rt;
+}
+
+// ---------------------------------------------------------------------------
+// 跳转与系统
+// ---------------------------------------------------------------------------
+
+/// b（link＝0）／bl（link＝1）：offset 为相对本条指令的字节数，4 的倍数，±128 MiB。
+export function a64Branch(link: int, offset: int): int {
+    if (!isBit(link) || offset % 4 != 0 || !fits(offset, -134217728, 134217724)) { return -1; }
+    return (link << 31) | (5 << 26) | ((offset / 4) & 67108863);
+}
+
+/// b.cond：±1 MiB。
+export function a64BranchCond(cond: int, offset: int): int {
+    if (!fits(cond, 0, 14) || offset % 4 != 0 || !fits(offset, -1048576, 1048572)) { return -1; }
+    return (84 << 24) | (((offset / 4) & 524287) << 5) | cond;
+}
+
+/// cbz（nz＝0）／cbnz（nz＝1）：±1 MiB。
+export function a64CompareBranch(sf: int, nz: int, rt: int, offset: int): int {
+    if (!isBit(sf) || !isBit(nz) || !isReg(rt) || offset % 4 != 0 || !fits(offset, -1048576, 1048572)) { return -1; }
+    return (sf << 31) | (26 << 25) | (nz << 24) | (((offset / 4) & 524287) << 5) | rt;
+}
+
+/// tbz（nz＝0）／tbnz（nz＝1）：测 rt 的第 bit 位（0..63），±32 KiB。
+export function a64TestBranch(nz: int, rt: int, bit: int, offset: int): int {
+    if (!isBit(nz) || !isReg(rt) || !fits(bit, 0, 63) || offset % 4 != 0 || !fits(offset, -32768, 32764)) { return -1; }
+    return ((bit >>> 5) << 31) | (27 << 25) | (nz << 24) | ((bit & 31) << 19) | (((offset / 4) & 16383) << 5) | rt;
+}
+
+/// br（kind 0）、blr（kind 1）、ret（kind 2）。
+export function a64BranchReg(kind: int, rn: int): int {
+    if (!fits(kind, 0, 2) || !isReg(rn)) { return -1; }
+    return 3592355840 | (kind << 21) | (rn << 5);
+}
+
+/// brk #imm16。
+export function a64Brk(imm16: int): int {
+    if (!fits(imm16, 0, 65535)) { return -1; }
+    return 3558866944 | (imm16 << 5);
+}
+export const A64_NOP: int = 3573751839;
+export const A64_DMB_ISH: int = 3573758911;
+
+// ---------------------------------------------------------------------------
+// 浮点（ftype 0 单精度、1 双精度）
+// ---------------------------------------------------------------------------
+
+/// 浮点与通用寄存器之间的搬运与转换：rmode／opcode 见 A64 的 “Conversion between floating-point and integer”：
+/// fmov 通用→浮点（0、7）、浮点→通用（0、6），scvtf（0、2）、ucvtf（0、3），fcvtzs（3、0）、fcvtzu（3、1）。
+export function a64FpInt(sf: int, ftype: int, rmode: int, opcode: int, rd: int, rn: int): int {
+    const fmov = rmode == 0 && (opcode == 6 || opcode == 7);
+    const cvt = (rmode == 0 && (opcode == 2 || opcode == 3)) || (rmode == 3 && (opcode == 0 || opcode == 1));
+    if (!isBit(sf) || !isBit(ftype) || !(fmov || cvt) || !isReg(rd) || !isReg(rn)) { return -1; }
+    if (fmov && sf != ftype) { return -1; }
+    return (sf << 31) | (30 << 24) | (ftype << 22) | (1 << 21) | (rmode << 19) | (opcode << 16) | (rn << 5) | rd;
+}
+
+/// 浮点单源：opcode 0 fmov、1 fabs、2 fneg、3 fsqrt、4 fcvt 到单精度、5 fcvt 到双精度（ftype 为源的类型，且不得与目标相同）。
+export function a64FpUnary(ftype: int, opcode: int, rd: int, rn: int): int {
+    if (!isBit(ftype) || !fits(opcode, 0, 5) || !isReg(rd) || !isReg(rn)) { return -1; }
+    if ((opcode == 4 && ftype == 0) || (opcode == 5 && ftype == 1)) { return -1; }
+    return (30 << 24) | (ftype << 22) | (1 << 21) | (opcode << 15) | (16 << 10) | (rn << 5) | rd;
+}
+
+/// 浮点两源：opcode 0 fmul、1 fdiv、2 fadd、3 fsub。
+export function a64FpBinary(ftype: int, opcode: int, rd: int, rn: int, rm: int): int {
+    if (!isBit(ftype) || !fits(opcode, 0, 3) || !isReg(rd) || !isReg(rn) || !isReg(rm)) { return -1; }
+    return (30 << 24) | (ftype << 22) | (1 << 21) | (rm << 16) | (opcode << 12) | (2 << 10) | (rn << 5) | rd;
+}
+
+/// fcmp rn, rm（zero＝0）或 fcmp rn, #0.0（zero＝1，rm 须为 0）。
+export function a64Fcmp(ftype: int, rn: int, rm: int, zero: int): int {
+    if (!isBit(ftype) || !isReg(rn) || !isReg(rm) || !isBit(zero) || (zero == 1 && rm != 0)) { return -1; }
+    return (30 << 24) | (ftype << 22) | (1 << 21) | (rm << 16) | (8 << 10) | (rn << 5) | (zero << 3);
+}

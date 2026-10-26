@@ -1,0 +1,90 @@
+// x86_64 Linux: reap adopted exits and kill adopted live descendants; procWait owns each managed worker.
+// 作为 subreaper，worker 树里脱离进程组（setsid、双 fork）的后代在父进程退出后过继到这里。只收僵尸时，一个存活的
+// 后台进程就让每次 tools/call 都停在 cleanup_pending；所以不在受管名单里的存活子进程一律 SIGKILL，下一轮再收。
+// 被收割前 PID 不会复用，按 PID 杀是安全的。子进程名单取自 /proc/self/task/*/children（内核缺这个文件时只能等它们自己退出）。
+declare function reapPrctl(option: i32, arg: usize, b: usize, c: usize, d: usize): i32 from syscall 157;
+declare function reapPrctlRead(option: i32, arg: Bytes, b: usize, c: usize, d: usize): i32 from syscall 157;
+declare function reapGetPid(): i32 from syscall 39;
+declare function reapWaitId(kind: i32, id: i32, info: Bytes, options: i32, usage: usize): i32 from syscall 247;
+declare function reapWaitPid(pid: i32, status: Bytes, options: i32, usage: usize): i32 from syscall 61;
+declare function reapSignalAction(signal: i32, action: Bytes, previous: usize, size: usize): i32 from syscall 13;
+declare function reapOpen(dir: i32, path: string, flags: i32, mode: u32): i32 from syscall 257;
+declare function reapRead(fd: i32, buf: Bytes, n: usize): i64 from syscall 0;
+declare function reapClose(fd: i32): i32 from syscall 3;
+declare function reapKill(pid: i32, signal: i32): i32 from syscall 62;
+
+let started: bool = false;
+let problem: string = "";
+function pidAt(info: Bytes): int {
+    let value = 0; let i = 0;
+    while (i < 4) { value = value | ((bytesGet(info, 16 + i) catch 0) << (i * 8)); i = i + 1; }
+    return value;
+}
+export function reaperStart(): bool {
+    started = false; problem = "";
+    // 本进程的子退出由显式wait管理，不能继承SIG_IGN/SA_NOCLDWAIT的自动回收语义。
+    if (reapSignalAction(17, bytesNew(32), 0, 8) != 0) { problem = "sigchld_default_failed"; return false; }
+    if (reapPrctl(36, 1, 0, 0, 0) != 0) { problem = "set_subreaper_failed"; return false; }
+    const value = bytesNew(4);
+    if (reapPrctlRead(37, value, 0, 0, 0) != 0 || (bytesGet(value, 0) catch 0) != 1) { problem = "get_subreaper_failed"; return false; }
+    started = true; return true;
+}
+export function reaperSelfPid(): int { return reapGetPid() as int; }
+// 当前全部子进程（各线程的 children 文件，空格分隔的十进制 PID）。
+function liveChildren(): List<int> {
+    const out: List<int> = listNew();
+    const tasks = listDir("/proc/self/task") catch (e) { return out; };
+    const buf = bytesNew(65536);
+    for (tid in tasks) {
+        const fd = reapOpen(-100, "/proc/self/task/" + tid + "/children", 524288, 0);
+        if (fd < 0) { continue; }
+        let pid = 0;
+        while (true) {
+            const n = reapRead(fd, buf, 65536);
+            if (n <= 0) { break; }
+            let i = 0;
+            while (i < n) {
+                const c = bytesGet(buf, i) catch 32;
+                if (c >= 48 && c <= 57) { pid = pid * 10 + (c - 48); }
+                else { if (pid > 0) { listPush(out, pid); } pid = 0; }
+                i = i + 1;
+            }
+        }
+        if (pid > 0) { listPush(out, pid); }
+        reapClose(fd);
+    }
+    return out;
+}
+// 杀掉不在受管名单里的存活子进程；杀了至少一个时返回 true。
+function killAdopted(owners: List<int>): bool {
+    let killed = false;
+    for (pid in liveChildren()) {
+        let owned = false;
+        for (owner in owners) { if (owner == pid) { owned = true; } }
+        if (!owned && reapKill(pid as i32, 9) == 0) { killed = true; }
+    }
+    return killed;
+}
+export function reaperError(): string { return problem; }
+// true means another sweep is needed, including a live protected child.
+export function reaperSweep(owners: List<int>): bool {
+    problem = "";
+    if (!started) { problem = "subreaper_not_started"; return true; }
+    for (pid in owners) { if (pid <= 0) { return true; } }
+    const info = bytesNew(128); const status = bytesNew(4); let count = 0;
+    while (count < 64) {
+        let i = 0; while (i < 128) { bytesSet(info, i, 0); i = i + 1; }
+        const result = reapWaitId(0, 0, info, 16777221, 0);
+        if (result == -10) { return false; } // ECHILD
+        if (result == -4) { return true; } // EINTR
+        if (result != 0) { problem = "waitid:" + toStr(result as int); return true; }
+        const pid = pidAt(info);
+        if (pid == 0) { killAdopted(owners); return true; }
+        for (owner in owners) { if (owner == pid) { return true; } }
+        const reaped = reapWaitPid(pid as i32, status, 1, 0);
+        if (reaped == -10) { count = count + 1; continue; }
+        if (reaped != pid as i32) { if (reaped != 0 && reaped != -4) { problem = "wait4:" + toStr(reaped as int); } return true; }
+        count = count + 1;
+    }
+    return true;
+}

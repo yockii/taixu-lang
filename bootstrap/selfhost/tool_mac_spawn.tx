@@ -1,0 +1,357 @@
+// procSpawn／procSpawnLimited 的 macOS 部分（macOS 适配 M3 设计 G3、G4，docs/design/v052-macos-m3-toolchain-v0.1-20261024.md）。
+// 两个 Unix 目标共用 tool_spawn.tx 的实参检查、管道、argv 与工作目录副本、回收与 errno 映射；这里只放机制不同的部分：
+// - 子进程环境：本进程当前的环境（进程级环境表经 __tx_rt_env_block 拷出，含 std/os 的 setenv；D3 v0.39），与 Linux 同一语义。
+// - procSpawn：posix_spawn——file actions 把三根管道接到 0／1／2，控制通道 addinherit_np，工作目录 addchdir_np；属性只设
+//   POSIX_SPAWN_CLOEXEC_DEFAULT（未显式接上的描述符一律关闭）。
+// - procSpawnLimited：fork 后子进程只调 libSystem 的系统调用包装（setpgid、setrlimit、dup2、fcntl、chdir、execve、_exit，异步信号
+//   安全），失败的 errno 经 CLOEXEC 管道回传（exec 成功则父进程读到 EOF），同 Go 的 forkExec。macOS 没有 pipe2，建管道与置 CLOEXEC
+//   之间若有别的线程起子进程，描述符会漏进子进程：建管道与起子进程共用内核的 fork 锁（__tx_nrt_fork_lock）。
+// - 内存预算：RLIMIT_AS 在 macOS 上不可用（上位稿 §六②），由全进程一个看守线程每 50 ms 按进程组累加 proc_pid_rusage 的物理足迹，
+//   超过预算即整组 SIGKILL（事后发现、杀掉，峰值可短暂超出）。
+import { StructuredBuffer, asBufferSection, asBufferAlign, asBufferLabel, asBufferZero } from "./assemble";
+import { RtFn, L, I, A, G } from "./rtfn_base";
+import { rtBegin, rtSet, rtOp, rtShift, rtDivMod, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtRet, rtRetVoid, rtLoadAcq, rtStoreRel } from "./rtfn";
+import { REC_COUNT, REC_BYTES, R_STATE, R_PROC, R_DONE, R_JOB, CHANNEL_VAR, REAP_COOKIE_VAR, toolCheck, toolText, xs0, xs1, xs2, xs3, xs4, xs6 } from "./tool_base";
+import { uxSys, uxMac, uxConst } from "./unix_sys";
+
+const MODULE: string = "bootstrap/selfhost/tool_mac_spawn.tx";
+const POSIX_SPAWN_CLOEXEC_DEFAULT: int = 0x4000;
+const RLIMIT_CPU: int = 0;
+const RLIMIT_CORE: int = 4;
+const PROC_PGRP_ONLY: int = 2;
+const RUSAGE_INFO_V0: int = 0;
+const RI_PHYS_FOOTPRINT: int = 72;
+const WATCH_PIDS: int = 1024;
+const WATCH_MS: int = 50;
+
+/// 数据、锁、环境与看守线程（在 tool_spawn 的 Unix 辅助例程之后发射）。
+export function emitMacSpawnSupport(b: Ref<StructuredBuffer>, t: int): void {
+    asBufferSection(b, 3, 1);
+    asBufferAlign(b, 3, 1);
+    asBufferLabel(b, "__tx_tool_watch_flag", 1); asBufferZero(b, 8, 1);
+    // 各表项的内存预算（字节；0 不看守）。只在受限子进程起来后写，表项被重新领取时由 R_JOB 区分。
+    asBufferLabel(b, "__tx_tool_membudget", 1); asBufferZero(b, REC_COUNT * 8, 1);
+    asBufferSection(b, 0, 1);
+    emitEnviron(b);
+    emitWatch(b, t);
+}
+
+/// __tx_tool_devnull() → 以只读、CLOEXEC 打开的 /dev/null（编号 ≥3）；失败 −1。同 Linux 的那份（在 tool_spawn 的环境例程尾部）。
+export function emitMacDevNull(b: Ref<StructuredBuffer>, t: int): void {
+    const nullPath = "/dev/null";
+    const nulPath = toolText(b, nullPath);
+    const f = rtBegin(b, "__tx_tool_devnull", "", "pz fd", 3, MODULE);
+    rtCall2(f, "pz", "__tx_tool_cstr", A(nulPath), I(len(nullPath)));
+    uxSys(f, t, "fd", 2, xs3(L("pz"), I(uxConst(t, "O_CLOEXEC")), I(0)));
+    rtCall1(f, "", "__tx_native_mem_free", L("pz"));
+    rtCall1(f, "fd", "__tx_tool_lift", L("fd"));
+    rtRet(f, L("fd"));
+    toolCheck(f);
+}
+
+// __tx_tool_environ(cr, ew, ctl, bufp, ev) → 子进程的 envp（新分配，调用方释放）；条目指向 ev——调用方经 __tx_rt_env_block
+// 取得的本进程当前环境（含 std/os 的 setenv；D3 v0.39），起完子进程后由调用方释放——不另拷贝。
+// 去掉 TAIXU_DEBUG_CHANNEL=…；ctl 位 2 时在数组尾部的空间里写本次的 TAIXU_DEBUG_CHANNEL=<cr>,<ew> 并追加。
+// ctl 位 4（受限子进程，M3 设计 G9）：去掉 TAIXU_REAP_COOKIE=…，另分配一条 TAIXU_REAP_COOKIE=<旧值>:<新 token> 并追加（没有旧值
+// 时只有 token；token 为 arc4random_buf 的 16 字节写成 32 个小写十六进制数字），*bufp 记下这条的缓冲由调用方释放；否则 *bufp 记 0。
+function emitEnviron(b: Ref<StructuredBuffer>): void {
+    const prefix = toolText(b, CHANNEL_VAR + "=");
+    const cookie = toolText(b, REAP_COOKIE_VAR + "=");
+    const hex = toolText(b, "0123456789abcdef");
+    const pn = len(CHANNEL_VAR) + 1;
+    const cn = len(REAP_COOKIE_VAR) + 1;
+    const f = rtBegin(b, "__tx_tool_environ", "cr ew ctl bufp ev", "cnt i arr k p m c x v d old on cb r0 r1", 3, MODULE);
+    rtSet(f, "cb", I(0)); rtSet(f, "old", I(0));
+    rtSet(f, "cnt", I(0));
+    rtIf(f, L("ev"), "eq", I(0), "counted");
+    rtLabel(f, "count");
+    rtShift(f, "x", L("cnt"), "shl", 3); rtOp(f, "x", L("x"), "add", L("ev")); rtLoad(f, "x", L("x"), 0, 8);
+    rtIf(f, L("x"), "eq", I(0), "counted");
+    rtOp(f, "cnt", L("cnt"), "add", I(1)); rtJump(f, "count");
+    rtLabel(f, "counted");
+    // 指针槽：保留的条目（至多 cnt）＋控制通道＋cookie＋NULL；其后 96 字节放控制通道那一条。
+    rtOp(f, "x", L("cnt"), "add", I(3)); rtShift(f, "x", L("x"), "shl", 3); rtOp(f, "x", L("x"), "add", I(96));
+    rtCall2(f, "arr", "__tx_native_mem_alloc", L("x"), I(8));
+    rtIf(f, L("arr"), "eq", I(0), "oom");
+    rtSet(f, "k", I(0)); rtSet(f, "i", I(0));
+    rtLabel(f, "entry");
+    rtIf(f, L("i"), "ge", L("cnt"), "entries");
+    rtShift(f, "p", L("i"), "shl", 3); rtOp(f, "p", L("p"), "add", L("ev")); rtLoad(f, "p", L("p"), 0, 8);
+    rtOp(f, "i", L("i"), "add", I(1));
+    // 前缀比较：条目短于前缀时在它的 NUL 处就不相等。
+    rtSet(f, "m", I(0));
+    rtLabel(f, "cmp");
+    rtIf(f, L("m"), "ge", I(pn), "entry");
+    rtOp(f, "x", L("p"), "add", L("m")); rtLoad(f, "c", L("x"), 0, 1);
+    rtOp(f, "x", A(prefix), "add", L("m")); rtLoad(f, "x", L("x"), 0, 1);
+    rtIf(f, L("c"), "ne", L("x"), "cookie");
+    rtOp(f, "m", L("m"), "add", I(1)); rtJump(f, "cmp");
+    rtLabel(f, "cookie");
+    rtOp(f, "x", L("ctl"), "and", I(4)); rtIf(f, L("x"), "eq", I(0), "keep");
+    rtSet(f, "m", I(0));
+    rtLabel(f, "ccmp");
+    rtIf(f, L("m"), "ge", I(cn), "cfound");
+    rtOp(f, "x", L("p"), "add", L("m")); rtLoad(f, "c", L("x"), 0, 1);
+    rtOp(f, "x", A(cookie), "add", L("m")); rtLoad(f, "x", L("x"), 0, 1);
+    rtIf(f, L("c"), "ne", L("x"), "keep");
+    rtOp(f, "m", L("m"), "add", I(1)); rtJump(f, "ccmp");
+    rtLabel(f, "cfound");
+    rtOp(f, "old", L("p"), "add", I(cn)); rtJump(f, "entry");
+    rtLabel(f, "keep");
+    rtShift(f, "x", L("k"), "shl", 3); rtOp(f, "x", L("x"), "add", L("arr")); rtStore(f, L("x"), 0, L("p"), 8);
+    rtOp(f, "k", L("k"), "add", I(1)); rtJump(f, "entry");
+    rtLabel(f, "entries");
+    rtOp(f, "x", L("ctl"), "and", I(2)); rtIf(f, L("x"), "eq", I(0), "nochannel");
+    rtOp(f, "v", L("cnt"), "add", I(3)); rtShift(f, "v", L("v"), "shl", 3); rtOp(f, "v", L("v"), "add", L("arr"));
+    rtCall3(f, "", "__tx_tool_copy", L("v"), A(prefix), I(pn));
+    rtOp(f, "d", L("v"), "add", I(pn));
+    rtCall3(f, "d", "__tx_tool_dec", L("d"), L("cr"), I(0));
+    rtStore(f, L("d"), 0, I(44), 1); rtOp(f, "d", L("d"), "add", I(1));
+    rtCall3(f, "d", "__tx_tool_dec", L("d"), L("ew"), I(0));
+    rtStore(f, L("d"), 0, I(0), 1);
+    rtShift(f, "x", L("k"), "shl", 3); rtOp(f, "x", L("x"), "add", L("arr")); rtStore(f, L("x"), 0, L("v"), 8);
+    rtOp(f, "k", L("k"), "add", I(1));
+    rtLabel(f, "nochannel");
+    rtOp(f, "x", L("ctl"), "and", I(4)); rtIf(f, L("x"), "eq", I(0), "terminate");
+    // 旧值的长度；新条目＝前缀＋旧值＋“:”＋32 位十六进制＋NUL。
+    rtSet(f, "on", I(0));
+    rtIf(f, L("old"), "eq", I(0), "sized");
+    rtLabel(f, "olen");
+    rtOp(f, "x", L("old"), "add", L("on")); rtLoad(f, "c", L("x"), 0, 1);
+    rtIf(f, L("c"), "eq", I(0), "sized");
+    rtOp(f, "on", L("on"), "add", I(1)); rtJump(f, "olen");
+    rtLabel(f, "sized");
+    rtOp(f, "x", L("on"), "add", I(cn + 34));
+    rtCall2(f, "cb", "__tx_native_mem_alloc", L("x"), I(1));
+    rtIf(f, L("cb"), "eq", I(0), "oom");
+    rtCall3(f, "", "__tx_tool_copy", L("cb"), A(cookie), I(cn));
+    rtOp(f, "d", L("cb"), "add", I(cn));
+    rtIf(f, L("on"), "eq", I(0), "token");
+    rtCall3(f, "", "__tx_tool_copy", L("d"), L("old"), L("on"));
+    rtOp(f, "d", L("d"), "add", L("on"));
+    rtStore(f, L("d"), 0, I(58), 1); rtOp(f, "d", L("d"), "add", I(1));
+    rtLabel(f, "token");
+    rtSet(f, "r0", I(0)); rtSet(f, "r1", I(0));
+    rtAddrOf(f, "v", "r0");
+    uxMac(f, "", "arc4random_buf", xs2(L("v"), I(16)));
+    rtSet(f, "m", I(0));
+    rtLabel(f, "hexbyte");
+    rtIf(f, L("m"), "ge", I(16), "hexdone");
+    rtOp(f, "x", L("v"), "add", L("m")); rtLoad(f, "c", L("x"), 0, 1);
+    rtShift(f, "x", L("c"), "shr", 4); rtOp(f, "x", L("x"), "add", A(hex)); rtLoad(f, "x", L("x"), 0, 1); rtStore(f, L("d"), 0, L("x"), 1);
+    rtOp(f, "x", L("c"), "and", I(15)); rtOp(f, "x", L("x"), "add", A(hex)); rtLoad(f, "x", L("x"), 0, 1); rtStore(f, L("d"), 1, L("x"), 1);
+    rtOp(f, "d", L("d"), "add", I(2)); rtOp(f, "m", L("m"), "add", I(1)); rtJump(f, "hexbyte");
+    rtLabel(f, "hexdone");
+    rtStore(f, L("d"), 0, I(0), 1);
+    rtShift(f, "x", L("k"), "shl", 3); rtOp(f, "x", L("x"), "add", L("arr")); rtStore(f, L("x"), 0, L("cb"), 8);
+    rtOp(f, "k", L("k"), "add", I(1));
+    rtLabel(f, "terminate");
+    rtShift(f, "x", L("k"), "shl", 3); rtOp(f, "x", L("x"), "add", L("arr")); rtStore(f, L("x"), 0, I(0), 8);
+    rtStore(f, L("bufp"), 0, L("cb"), 8);
+    rtRet(f, L("arr"));
+    rtLabel(f, "oom");
+    rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRet(f, I(0));
+    toolCheck(f);
+}
+
+/// procSpawn 的起进程段（发在 tool_spawn 的 "fork" 标号处）。成功到 "started"；posix_spawn 失败时 cerr 为 errno、到 "mapped"
+/// （不回收：没有子进程）；工作目录打不开时 cerr 为 4096＋errno（错误归到 cwd，同 Linux）；资源失败到 "io"。
+export function macPosixSpawn(f: Ref<RtFn>, t: int): void {
+    // posix_spawn 对 addchdir 与 exec 的失败返回同一种 errno：先开一次工作目录，把这类错误归到 cwd 上。
+    rtIf(f, L("cw"), "eq", I(0), "mspawn");
+    uxSys(f, t, "w", 2, xs3(L("cw"), I(uxConst(t, "O_DIRECTORY") | uxConst(t, "O_CLOEXEC")), I(0)));
+    rtIf(f, L("w"), "ge", I(0), "mcwdok");
+    rtOp(f, "cerr", I(4096), "sub", L("w"));
+    rtJump(f, "mapped");
+    rtLabel(f, "mcwdok");
+    uxSys(f, t, "", 3, xs1(L("w")));
+    rtLabel(f, "mspawn");
+    rtSet(f, "fa", I(0)); rtSet(f, "at", I(0));
+    rtAddrOf(f, "fap", "fa"); rtAddrOf(f, "atp", "at");
+    uxMac(f, "w", "posix_spawn_file_actions_init", xs1(L("fap")));
+    rtIf(f, L("w"), "ne", I(0), "io");
+    uxMac(f, "w", "posix_spawnattr_init", xs1(L("atp")));
+    rtIf(f, L("w"), "ne", I(0), "mnoattr");
+    uxMac(f, "w", "posix_spawnattr_setflags", xs2(L("atp"), I(POSIX_SPAWN_CLOEXEC_DEFAULT)));
+    rtIf(f, L("w"), "ne", I(0), "mfail");
+    uxMac(f, "w", "posix_spawn_file_actions_adddup2", xs3(L("fap"), L("inR"), I(0)));
+    rtIf(f, L("w"), "ne", I(0), "mfail");
+    uxMac(f, "w", "posix_spawn_file_actions_adddup2", xs3(L("fap"), L("outW"), I(1)));
+    rtIf(f, L("w"), "ne", I(0), "mfail");
+    uxMac(f, "w", "posix_spawn_file_actions_adddup2", xs3(L("fap"), L("errW"), I(2)));
+    rtIf(f, L("w"), "ne", I(0), "mfail");
+    // 控制通道两端留在原号，子进程按环境变量里的号使用；addinherit_np 让带 CLOEXEC 的描述符在 CLOEXEC_DEFAULT 下照样继承（实测）。
+    rtIf(f, L("cR"), "eq", I(-1), "mchdir");
+    uxMac(f, "w", "posix_spawn_file_actions_addinherit_np", xs2(L("fap"), L("cR")));
+    rtIf(f, L("w"), "ne", I(0), "mfail");
+    uxMac(f, "w", "posix_spawn_file_actions_addinherit_np", xs2(L("fap"), L("eW")));
+    rtIf(f, L("w"), "ne", I(0), "mfail");
+    rtLabel(f, "mchdir");
+    rtIf(f, L("cw"), "eq", I(0), "mgo");
+    uxMac(f, "w", "posix_spawn_file_actions_addchdir_np", xs2(L("fap"), L("cw")));
+    rtIf(f, L("w"), "ne", I(0), "mfail");
+    rtLabel(f, "mgo");
+    rtSet(f, "pid", I(0));
+    rtAddrOf(f, "x", "pid");
+    uxMac(f, "cerr", "posix_spawn", xs6(L("x"), L("ce"), L("fap"), L("atp"), L("av"), L("env")));
+    uxMac(f, "", "posix_spawnattr_destroy", xs1(L("atp")));
+    uxMac(f, "", "posix_spawn_file_actions_destroy", xs1(L("fap")));
+    rtIf(f, L("cerr"), "ne", I(0), "mapped");
+    rtJump(f, "started");
+    rtLabel(f, "mfail");
+    uxMac(f, "", "posix_spawnattr_destroy", xs1(L("atp")));
+    rtLabel(f, "mnoattr");
+    uxMac(f, "", "posix_spawn_file_actions_destroy", xs1(L("fap")));
+    rtJump(f, "io");
+}
+
+/// procSpawnLimited 的起进程段：fork＋子进程设置（M3 设计 G3、G4）。成功到 "started"（并登记内存预算、启动看守线程）；
+/// 子进程设置或 exec 失败时 cerr 为回传的值（exec 为 errno，chdir 为 4096＋errno，限额为 8192＋errno），到 "reap" 回收后映射；
+/// fork 本身失败到 "io"。
+export function macForkSpawn(f: Ref<RtFn>, t: int): void {
+    rtSet(f, "pr", I(-1)); rtSet(f, "pw", I(-1));
+    rtAddrOf(f, "p", "pr"); rtAddrOf(f, "q", "pw");
+    rtCall2(f, "x", "__tx_tool_pipe", L("p"), L("q"));
+    rtIf(f, L("x"), "ne", I(0), "mpipefail");
+    rtSet(f, "cerr", I(0));
+    rtCall0(f, "", "__tx_nrt_fork_lock");
+    uxMac(f, "pid", "fork", xs0());
+    rtIf(f, L("pid"), "ne", I(0), "mparent");
+    // 子进程：只调系统调用包装、只写局部变量；任何一步失败都把 cerr 写进回传管道后 _exit(127)，绝不 exec。
+    uxSys(f, t, "w", 109, xs2(I(0), I(0)));
+    rtIf(f, L("w"), "lt", I(0), "mbudget");
+    rtAddrOf(f, "lim", "rl0");
+    rtSet(f, "rl0", L("budgetCpu")); rtSet(f, "rl1", L("budgetCpu"));
+    uxMac(f, "w", "setrlimit", xs2(I(RLIMIT_CPU), L("lim")));
+    rtIf(f, L("w"), "lt", I(0), "mbudget");
+    rtSet(f, "rl0", I(0)); rtSet(f, "rl1", I(0));
+    uxMac(f, "w", "setrlimit", xs2(I(RLIMIT_CORE), L("lim")));
+    rtIf(f, L("w"), "lt", I(0), "mbudget");
+    uxSys(f, t, "", 33, xs2(L("inR"), I(0)));
+    uxSys(f, t, "", 33, xs2(L("outW"), I(1)));
+    uxSys(f, t, "", 33, xs2(L("errW"), I(2)));
+    rtIf(f, L("cR"), "eq", I(-1), "mchild_cwd");
+    uxSys(f, t, "", 72, xs3(L("cR"), I(uxConst(t, "F_SETFD")), I(0)));
+    uxSys(f, t, "", 72, xs3(L("eW"), I(uxConst(t, "F_SETFD")), I(0)));
+    rtLabel(f, "mchild_cwd");
+    rtIf(f, L("cw"), "eq", I(0), "mexec");
+    uxSys(f, t, "w", 80, xs1(L("cw")));
+    rtIf(f, L("w"), "ge", I(0), "mexec");
+    rtOp(f, "cerr", I(4096), "sub", L("w"));
+    rtJump(f, "mchildfail");
+    rtLabel(f, "mexec");
+    uxMac(f, "w", "execve", xs3(L("ce"), L("av"), L("env")));
+    rtOp(f, "cerr", I(0), "sub", L("w"));
+    rtJump(f, "mchildfail");
+    rtLabel(f, "mbudget");
+    rtOp(f, "cerr", I(8192), "sub", L("w"));
+    rtLabel(f, "mchildfail");
+    rtAddrOf(f, "x", "cerr");
+    uxSys(f, t, "", 1, xs3(L("pw"), L("x"), I(4)));
+    uxMac(f, "", "_exit", xs1(I(127)));
+    // 父进程：放锁、关回传管道的写端，读到 EOF 即 exec 成功，读到 4 字节即子进程的失败值。
+    rtLabel(f, "mparent");
+    rtCall0(f, "", "__tx_nrt_fork_unlock");
+    uxSys(f, t, "", 3, xs1(L("pw")));
+    rtIf(f, L("pid"), "lt", I(0), "mforkfail");
+    rtAddrOf(f, "x", "cerr");
+    rtSet(f, "got", I(0));
+    rtLabel(f, "mread");
+    rtOp(f, "p", L("x"), "add", L("got"));
+    rtOp(f, "q", I(4), "sub", L("got"));
+    uxSys(f, t, "w", 0, xs3(L("pr"), L("p"), L("q")));
+    rtIf(f, L("w"), "eq", I(-4), "mread");
+    rtIf(f, L("w"), "le", I(0), "mreadend");
+    rtOp(f, "got", L("got"), "add", L("w"));
+    rtIf(f, L("got"), "lt", I(4), "mread");
+    rtLabel(f, "mreadend");
+    uxSys(f, t, "", 3, xs1(L("pr")));
+    rtIf(f, L("got"), "eq", I(4), "reap");
+    rtSet(f, "cerr", I(0));
+    // 登记内存预算并确保看守线程在跑。
+    rtOp(f, "x", L("rec"), "sub", A("__tx_tool_recs"));
+    rtDivMod(f, "x", "", L("x"), I(REC_BYTES));
+    rtShift(f, "x", L("x"), "shl", 3);
+    rtOp(f, "x", L("x"), "add", A("__tx_tool_membudget"));
+    rtStoreRel(f, L("x"), 0, L("budgetMem"));
+    rtCall0(f, "", "__tx_tool_watch_start");
+    rtJump(f, "started");
+    rtLabel(f, "mforkfail");
+    uxSys(f, t, "", 3, xs1(L("pr")));
+    rtJump(f, "io");
+    rtLabel(f, "mpipefail");
+    rtCall1(f, "", "__tx_tool_close", L("pr"));
+    rtCall1(f, "", "__tx_tool_close", L("pw"));
+    rtJump(f, "io");
+}
+
+// __tx_tool_watch_start()：第一次调用时起看守线程（pthread_create 后 detach）；起不来时下次再试。
+// __tx_tool_watch_entry(arg)：线程入口（libSystem 按 C 约定调用，不返回）。每 WATCH_MS 毫秒扫一遍句柄表：受限（R_JOB≠0）、
+// 使用中且主进程未回收的表项，按进程组累加物理足迹，超过预算即 kill(−pgid, SIGKILL)，并把该项预算记为 −1（已因内存结束）。
+// 与回收的竞争：只在 R_DONE 为 0（主进程尚未被 wait4 回收，PID 仍归它）时杀组，同 Linux budgetKill 的 PID 复用防护；
+// 回收方在 wait4 返回与写 R_DONE 之间的窗口里 PID 被别的进程取得并自建同号进程组的可能性，与 Linux 的 nopeek 路径同量级。
+// 入口由 libSystem 直接调用，rbx 不是值槽窗口：本例程及其调用的例程只能用进程级数据（句柄表、预算表），不得访问线程块字段。
+function emitWatch(b: Ref<StructuredBuffer>, t: int): void {
+    let f = rtBegin(b, "__tx_tool_watch_start", "", "r tid tp", 4, MODULE);
+    rtCall3(f, "r", "__tx_tool_cas", A("__tx_tool_watch_flag"), I(0), I(1));
+    rtIf(f, L("r"), "eq", I(0), "done");
+    rtSet(f, "tid", I(0));
+    rtAddrOf(f, "tp", "tid");
+    uxMac(f, "r", "pthread_create", xs4(L("tp"), I(0), A("__tx_tool_watch_entry"), I(0)));
+    rtIf(f, L("r"), "eq", I(0), "started");
+    rtStore(f, A("__tx_tool_watch_flag"), 0, I(0), 8);
+    rtJump(f, "done");
+    rtLabel(f, "started");
+    uxMac(f, "", "pthread_detach", xs1(L("tid")));
+    rtLabel(f, "done");
+    rtRetVoid(f);
+    toolCheck(f);
+
+    let ri = "";
+    let k = 0;
+    while (k < 12) { ri = ri + " ri" + toStr(k); k = k + 1; }
+    f = rtBegin(b, "__tx_tool_watch_entry", "", "pids k rec budget pid n j p sum x rp" + ri, 4, MODULE);
+    rtCall4(f, "pids", "__tx_mac_page_alloc", I(0), I(WATCH_PIDS * 4), I(0), I(0));
+    rtIf(f, L("pids"), "eq", I(0), "quit");
+    rtAddrOf(f, "rp", "ri0");
+    rtLabel(f, "round");
+    rtCall1(f, "", "__tx_tool_sleep", I(WATCH_MS));
+    rtSet(f, "k", I(0));
+    rtLabel(f, "slot");
+    rtIf(f, L("k"), "ge", I(REC_COUNT), "round");
+    rtShift(f, "x", L("k"), "shl", 3); rtOp(f, "x", L("x"), "add", A("__tx_tool_membudget")); rtLoadAcq(f, "budget", L("x"), 0);
+    rtIf(f, L("budget"), "le", I(0), "next");
+    rtOp(f, "rec", L("k"), "imul", I(REC_BYTES)); rtOp(f, "rec", L("rec"), "add", A("__tx_tool_recs"));
+    rtLoadAcq(f, "x", L("rec"), R_STATE); rtIf(f, L("x"), "ne", I(2), "next");
+    rtLoad(f, "x", L("rec"), R_JOB, 8); rtIf(f, L("x"), "eq", I(0), "next");
+    rtLoadAcq(f, "x", L("rec"), R_DONE); rtIf(f, L("x"), "ne", I(0), "next");
+    rtLoad(f, "pid", L("rec"), R_PROC, 8); rtIf(f, L("pid"), "le", I(0), "next");
+    // 组内进程（受限子进程以自己为组长）：proc_listpids 返回写入的字节数。
+    uxMac(f, "n", "proc_listpids", xs4(I(PROC_PGRP_ONLY), L("pid"), L("pids"), I(WATCH_PIDS * 4)));
+    rtIf(f, L("n"), "le", I(0), "next");
+    rtShift(f, "n", L("n"), "shr", 2);
+    rtSet(f, "sum", I(0)); rtSet(f, "j", I(0));
+    rtLabel(f, "member");
+    rtIf(f, L("j"), "ge", L("n"), "summed");
+    rtShift(f, "x", L("j"), "shl", 2); rtOp(f, "x", L("x"), "add", L("pids")); rtLoad(f, "p", L("x"), 0, 4);
+    rtOp(f, "j", L("j"), "add", I(1));
+    rtIf(f, L("p"), "le", I(0), "member");
+    uxMac(f, "x", "proc_pid_rusage", xs3(L("p"), I(RUSAGE_INFO_V0), L("rp")));
+    rtIf(f, L("x"), "ne", I(0), "member");
+    rtLoad(f, "x", L("rp"), RI_PHYS_FOOTPRINT, 8);
+    rtOp(f, "sum", L("sum"), "add", L("x"));
+    rtJump(f, "member");
+    rtLabel(f, "summed");
+    rtIf(f, L("sum"), "le", L("budget"), "next");
+    rtLoadAcq(f, "x", L("rec"), R_DONE); rtIf(f, L("x"), "ne", I(0), "next");
+    rtOp(f, "x", I(0), "sub", L("pid"));
+    uxSys(f, t, "", 62, xs2(L("x"), I(uxConst(t, "SIGKILL"))));
+    rtShift(f, "x", L("k"), "shl", 3); rtOp(f, "x", L("x"), "add", A("__tx_tool_membudget")); rtStoreRel(f, L("x"), 0, I(-1));
+    rtLabel(f, "next");
+    rtOp(f, "k", L("k"), "add", I(1));
+    rtJump(f, "slot");
+    rtLabel(f, "quit");
+    rtRetVoid(f);
+    toolCheck(f);
+}

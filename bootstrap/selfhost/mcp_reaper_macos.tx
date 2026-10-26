@@ -1,0 +1,176 @@
+// x86_64 macOS（M3 设计 G9）：没有子收割者。worker 由 procSpawnLimited 起，环境里带回收 cookie（TAIXU_REAP_COOKIE 的最后一段
+// token），它的后代继承之。清扫时枚举本用户的进程、读各自的启动环境（sysctl KERN_PROCARGS2，同 Jenkins ProcessTree 的 Darwin
+// 实现）：带已知 token、不是受管进程、PPID 链也到不了受管进程的，即已脱离受管进程树的后代（等同 Linux 子收割者收到的过继进程）。
+// 先逐个 SIGSTOP 冻结，反复枚举到不再出现新的（快速连续 fork 的也收得住），再核对启动时刻未变后 SIGKILL，由 launchd 回收。
+// exec 时清空或改掉环境的后代认不出来（策略报告已声明）。全量枚举有代价：受管名单变了或上次扫到过时立即扫，否则至少隔 1 秒。
+import { REAP_COOKIE_VAR } from "./tool_base";
+
+declare function getpid(): i32 from "libSystem";
+declare function getuid(): u32 from "libSystem";
+declare function kill(pid: i32, signal: i32): i32 from "libSystem";
+declare function sigaction(signal: i32, action: Bytes, previous: usize): i32 from "libSystem";
+declare function sysctl(name: Bytes, count: u32, value: Bytes, size: Bytes, replacement: usize, replacementSize: usize): i32 from "libSystem";
+declare function proc_listpids(kind: u32, info: u32, buffer: Bytes, size: i32): i32 from "libSystem";
+declare function proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: Bytes, size: i32): i32 from "libSystem";
+
+const SIGKILL: i32 = 9;
+const SIGSTOP: i32 = 17;
+const SIGCHLD: i32 = 20;
+const PROC_UID_ONLY: u32 = 4;
+const PROC_PIDTBSDINFO: i32 = 3;
+const BSDINFO_BYTES: int = 136;
+const SZOMB: int = 5;
+const ARGS_MAX: int = 1048576;
+const SCAN_INTERVAL_MS: int = 1000;
+const FREEZE_ROUNDS: int = 16;
+
+let started: bool = false;
+let problem: string = "";
+let tokens: List<string> = listNew();
+let tokenPids: List<int> = listNew();
+let lastOwners: string = "";
+let lastScanMs: int = 0;
+let lastFound: bool = false;
+let args: Bytes = bytesNew(0);
+
+function u32at(b: Bytes, at: int): int {
+    let n = 0; let i = 0; while (i < 4) { n = n | ((bytesGet(b, at + i) catch 0) << (i * 8)); i = i + 1; } return n;
+}
+function u64at(b: Bytes, at: int): int { return u32at(b, at) | (u32at(b, at + 4) << 32); }
+function setU32(b: Bytes, at: int, v: int): void {
+    let i = 0; while (i < 4) { bytesSet(b, at + i, (v >> (i * 8)) & 255); i = i + 1; }
+}
+function has(xs: List<int>, x: int): bool { for (v in xs) { if (v == x) { return true; } } return false; }
+function known(token: string): bool { for (t in tokens) { if (t == token) { return true; } } return false; }
+
+// proc_bsdinfo：status@4、ppid@16、启动时刻 tvsec@120／tvusec@128；取不到（已退出、无权限）为 None。
+function info(pid: int): Bytes? {
+    const b = bytesNew(BSDINFO_BYTES);
+    if (proc_pidinfo(pid as i32, PROC_PIDTBSDINFO, 0, b, BSDINFO_BYTES as i32) as int != BSDINFO_BYTES) { return None; }
+    return b;
+}
+function startOf(b: Bytes): int { return u64at(b, 120) * 1000000 + u64at(b, 128); }
+
+// pid 的启动环境里 TAIXU_REAP_COOKIE 的各段（KERN_PROCARGS2：argc、exec 路径与补齐的 NUL、argc 个实参、环境到空串为止）。
+function cookieTokens(pid: int): List<string> {
+    const out: List<string> = listNew();
+    if (bytesLen(args) == 0) { args = bytesNew(ARGS_MAX); }
+    const mib = bytesNew(12); setU32(mib, 0, 1); setU32(mib, 4, 49); setU32(mib, 8, pid);
+    const size = bytesNew(8); setU32(size, 0, ARGS_MAX);
+    if (sysctl(mib, 3, args, size, 0, 0) != 0) { return out; }
+    const n = u64at(size, 0);
+    if (n < 4 || n > ARGS_MAX) { return out; }
+    let argc = u32at(args, 0); let i = 4;
+    while (i < n && (bytesGet(args, i) catch 0) != 0) { i = i + 1; }
+    while (i < n && (bytesGet(args, i) catch 1) == 0) { i = i + 1; }
+    while (argc > 0 && i < n) { while (i < n && (bytesGet(args, i) catch 0) != 0) { i = i + 1; } i = i + 1; argc = argc - 1; }
+    const prefix = bytesFromStr(REAP_COOKIE_VAR + "=");
+    const pn = bytesLen(prefix);
+    while (i < n && (bytesGet(args, i) catch 0) != 0) {
+        const start = i;
+        while (i < n && (bytesGet(args, i) catch 0) != 0) { i = i + 1; }
+        if (i - start > pn && bytesEqual(bytesSlice(args, start, pn), prefix)) {
+            let at = start + pn; let j = at;
+            while (j <= i) {
+                if (j == i || (bytesGet(args, j) catch 58) == 58) {
+                    if (j > at) { listPush(out, bytesToStr(bytesSlice(args, at, j - at)) catch ""); }
+                    at = j + 1;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+function carries(pid: int): bool {
+    for (t in cookieTokens(pid)) { if (known(t)) { return true; } }
+    return false;
+}
+// 沿 PPID 往上是否到得了受管进程；中途取不到信息或到了 launchd（1）即否。
+function underOwner(pid: int, owners: List<int>): bool {
+    let current = pid; let depth = 0;
+    while (depth < 64) {
+        const b = info(current);
+        if (b == None) { return false; }
+        const parent = u32at(b catch bytesNew(0), 16);
+        if (has(owners, parent)) { return true; }
+        if (parent <= 1) { return false; }
+        current = parent; depth = depth + 1;
+    }
+    return false;
+}
+function userPids(): List<int> | Error {
+    let cap = 4096;
+    while (cap <= 1048576) {
+        const b = bytesNew(cap * 4);
+        const got = proc_listpids(PROC_UID_ONLY, getuid(), b, (cap * 4) as i32) as int;
+        if (got < 0) { return err("proc_listpids"); }
+        if (got < cap * 4) {
+            const out: List<int> = listNew(); let i = 0;
+            while (i + 4 <= got) { const pid = u32at(b, i); if (pid > 0) { listPush(out, pid); } i = i + 4; }
+            return out;
+        }
+        cap = cap * 4;
+    }
+    return err("proc_listpids");
+}
+
+export function reaperStart(): bool {
+    started = false; problem = "";
+    // 本进程的子退出由显式 wait 管理，不能继承 SIG_IGN／SA_NOCLDWAIT 的自动回收语义（同 Linux）。
+    if (sigaction(SIGCHLD, bytesNew(16), 0) != 0) { problem = "sigchld_default_failed"; return false; }
+    tokens = listNew(); tokenPids = listNew(); lastOwners = ""; lastScanMs = 0; lastFound = false;
+    started = true; return true;
+}
+export function reaperSelfPid(): int { return getpid() as int; }
+export function reaperError(): string { return problem; }
+// true 表示还需清扫（本轮冻结并杀了脱离者，或取不到受管进程）。
+export function reaperSweep(owners: List<int>): bool {
+    problem = "";
+    if (!started) { problem = "reaper_not_started"; return true; }
+    for (pid in owners) { if (pid <= 0) { return true; } }
+    // 受管进程（worker）的 token 是它的 cookie 的最后一段；读不到时下一轮再读。
+    for (pid in owners) {
+        if (!has(tokenPids, pid)) {
+            const found = cookieTokens(pid);
+            if (listLen(found) > 0) {
+                const token = listGet(found, listLen(found) - 1) catch "";
+                if (len(token) > 0 && !known(token)) { listPush(tokens, token); }
+                listPush(tokenPids, pid);
+            }
+        }
+    }
+    let key = ""; for (pid in owners) { key = key + toStr(pid) + ","; }
+    const now = monoNs() / 1000000;
+    if (!lastFound && key == lastOwners && now - lastScanMs < SCAN_INTERVAL_MS) { return false; }
+    lastOwners = key; lastScanMs = now; lastFound = false;
+    if (listLen(tokens) == 0) { return false; }
+    const me = getpid() as int;
+    const frozen: List<int> = listNew(); const starts: List<int> = listNew();
+    let round = 0;
+    while (round < FREEZE_ROUNDS) {
+        const pids = userPids() catch (e) { problem = "proc_listpids_failed"; return true; };
+        let fresh = 0;
+        for (pid in pids) {
+            if (pid <= 1 || pid == me || has(owners, pid) || has(frozen, pid)) { continue; }
+            const b = info(pid);
+            if (b == None) { continue; }
+            const bi = b catch bytesNew(0);
+            if (u32at(bi, 4) == SZOMB || underOwner(pid, owners) || !carries(pid)) { continue; }
+            if (kill(pid as i32, SIGSTOP) == 0) { listPush(frozen, pid); listPush(starts, startOf(bi)); fresh = fresh + 1; }
+        }
+        if (fresh == 0) { break; }
+        round = round + 1;
+    }
+    let i = 0;
+    while (i < listLen(frozen)) {
+        const pid = listGet(frozen, i) catch 0;
+        const b = info(pid);
+        // 冻结后再核对一次启动时刻：同号已换成别的进程（绕了一整圈 PID）时不杀。
+        if (b != None && startOf(b catch bytesNew(0)) == (listGet(starts, i) catch -1)) { kill(pid as i32, SIGKILL); }
+        i = i + 1;
+    }
+    lastFound = listLen(frozen) > 0;
+    return lastFound;
+}

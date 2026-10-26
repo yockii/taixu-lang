@@ -1,0 +1,293 @@
+// Mach-O MH_OBJECT（x86_64、arm64）目标文件层（docs/design/v052-macho-object-v0.1-20261026.md）：读汇编器映像，不改源字节，
+// 交给 macOS 的系统链接器（ld64）与 C 的目标文件互链。同 emit_elf_object.tx 的四节、符号与修补：
+// - 一个无名 LC_SEGMENT_64：__TEXT,__text、__DATA,__const（只读数据；含绝对地址时 ld64 放进 __DATA_CONST，__TEXT 里不许有
+//   需要加载期修补的指针）、__DATA,__data、__DATA,__bss（零填充）；LC_BUILD_VERSION、LC_SYMTAB、LC_DYSYMTAB。不设
+//   MH_SUBSECTIONS_VIA_SYMBOLS：每节整块是一个原子，链接器不按符号拆分或剥除。
+// - 符号名加前导 _（同 C 编译器：C 里的 __tx_retain 即目标文件里的 ___tx_retain）；本地、外部定义、未定义三段。
+// - 重定位一律 r_extern＝1。x86_64：PC32 在 call／jmp／jcc rel32 上为 BRANCH，其余为 SIGNED（加数相对字段末尾，写在原位，
+//   字段后带立即数的指令由汇编器在加数里扣除）；ABS64 为 UNSIGNED。arm64：CALL26／JUMP26 为 BRANCH26、ADR_PREL_PG_HI21 为
+//   PAGE21、ADD 与各宽度 LDST 的 LO12 为 PAGEOFF12（宽度由链接器按指令解码），非零加数前置 ARM64_RELOC_ADDEND；ABS64 为
+//   UNSIGNED，加数写在原位。同节的本地 PC32（arm64 为 CALL26／JUMP26）同 ELF 层就地定下。
+// - 太虚链接器合成的导入槽（__imp_<名>）与线程局部描述符（__tx_tls_tlv）在目标文件里没有对应物，遇到即拒绝。
+import { asImgA64, asImgText, asImgRdata, asImgData, asImgBssSize, asImgAlignPow, asFailedAs, asSymCountL, asSymNameL, asSymSecL, asSymOffL, asSymNeededL, asFixCountL, asFixSecL, asFixAtL, asFixKindL, asFixSymL, asFixAddendL } from "./assemble";
+
+export struct MachoObjectResult { ok: bool, bytes: Bytes, error: string }
+struct Name { name: string, definition: int, global: bool, required: bool, index: int }
+
+function fail(message: string): Ref<MachoObjectResult> { return new MachoObjectResult { ok: false, bytes: bytesNew(0), error: message }; }
+function word(out: Bytes, value: int, width: int): void {
+    let i = 0;
+    while (i < width) { bytesPush(out, (value >>> (8 * i)) & 255); i = i + 1; }
+}
+function put(out: Bytes, at: int, value: int, width: int): void {
+    let i = 0;
+    while (i < width) { bytesSet(out, at + i, (value >>> (8 * i)) & 255); i = i + 1; }
+}
+function name16(out: Bytes, s: string): void {
+    bytesAppend(out, bytesFromStr(s)); let i = len(s);
+    while (i < 16) { bytesPush(out, 0); i = i + 1; }
+}
+function validName(name: string): bool {
+    if (len(name) == 0) { return false; }
+    let i = 0;
+    while (i < len(name)) { if ((byteAt(name, i) catch 0) == 0) { return false; } i = i + 1; }
+    return true;
+}
+function startsWith(s: string, prefix: string): bool {
+    if (len(s) < len(prefix)) { return false; }
+    let i = 0;
+    while (i < len(prefix)) { if ((byteAt(s, i) catch -1) != (byteAt(prefix, i) catch -2)) { return false; } i = i + 1; }
+    return true;
+}
+function hash(name: string): int {
+    let h = 2166136261; let i = 0;
+    while (i < len(name)) { h = ((h ^ (byteAt(name, i) catch 0)) * 16777619) & 4294967295; i = i + 1; }
+    return h;
+}
+struct Names { heads: List<int>, next: List<int>, rows: List<Ref<Name>> }
+function find(n: Ref<Names>, name: string): int {
+    let i = listGet(n.heads, hash(name) & (listLen(n.heads) - 1)) catch -1;
+    while (i >= 0) {
+        if ((listGet(n.rows, i) catch noName()).name == name) { return i; }
+        i = listGet(n.next, i) catch -1;
+    }
+    return -1;
+}
+function noName(): Ref<Name> { return new Name { name: "", definition: -1, global: false, required: false, index: -1 }; }
+function add(n: Ref<Names>, name: string, definition: int, global: bool): int {
+    const i = listLen(n.rows); const bucket = hash(name) & (listLen(n.heads) - 1);
+    listPush(n.rows, new Name { name: name, definition: definition, global: global, required: global, index: -1 });
+    listPush(n.next, listGet(n.heads, bucket) catch -1); listSet(n.heads, bucket, i);
+    return i;
+}
+// 写出前能就地定下的修补：x86 的同节 PC32，A64 的同节 CALL26／JUMP26（同 ELF 层）。
+function bindsLocally(kind: int, a64: bool): bool {
+    if (a64) { return kind == 2 || kind == 3; }
+    return kind == 0;
+}
+// x86 的 PC32 字段之前是 call／jmp rel32（E8／E9）或 jcc rel32（0F 80..8F）即分支。
+function x86Branch(code: Bytes, at: int): bool {
+    const op = bytesGet(code, at - 1) catch -1;
+    if (op == 232 || op == 233) { return true; }
+    return op >= 128 && op <= 143 && (bytesGet(code, at - 2) catch -1) == 15;
+}
+// 字节序比较（符号表按名字排序用）。
+function strLess(a: string, b: string): bool {
+    let i = 0;
+    while (i < len(a) && i < len(b)) {
+        const x = byteAt(a, i) catch 0; const y = byteAt(b, i) catch 0;
+        if (x != y) { return x < y; }
+        i = i + 1;
+    }
+    return len(a) < len(b);
+}
+// 按名字排序（外部定义与未定义两段，便于工具二分查找；本地段保持次序）。
+function sortByName(xs: List<int>, rows: List<Ref<Name>>): List<int> {
+    let src = xs; const n = listLen(xs); let width = 1;
+    while (width < n) {
+        const dst: List<int> = listNew(); let lo = 0;
+        while (lo < n) {
+            let i = lo; let mid = lo + width; if (mid > n) { mid = n; }
+            let j = mid; let hi = lo + 2 * width; if (hi > n) { hi = n; }
+            while (i < mid || j < hi) {
+                const a = (listGet(rows, listGet(src, i) catch 0) catch noName()).name;
+                const b = (listGet(rows, listGet(src, j) catch 0) catch noName()).name;
+                if (j >= hi || (i < mid && !strLess(b, a))) { listPush(dst, listGet(src, i) catch 0); i = i + 1; }
+                else { listPush(dst, listGet(src, j) catch 0); j = j + 1; }
+            }
+            lo = hi;
+        }
+        src = dst; width = width * 2;
+    }
+    return src;
+}
+function reloc(out: Bytes, at: int, symbol: int, pcrel: int, length: int, typ: int): void {
+    word(out, at, 4); word(out, (symbol & 16777215) | (pcrel << 24) | (length << 25) | (1 << 27) | (typ << 28), 4);
+}
+
+/// 把当前汇编器映像写成 Mach-O 目标文件；exports 为外部定义（太虚名，不含前导 _）。
+export function machoWriteObject(exports: List<string>): Ref<MachoObjectResult> {
+    if (asFailedAs() != 0) { return fail("AssemblerFailed"); }
+    const a64 = asImgA64() == 1;
+    const bodies: List<Bytes> = listNew(); const sizes: List<int> = listNew(); const aligns: List<int> = listNew();
+    let sec = 0;
+    while (sec < 4) {
+        const power = asImgAlignPow(sec);
+        if (power < 0 || power > 15) { return fail("UnsupportedSectionAlignment"); }
+        const bytes = bytesNew(0);
+        if (sec == 0) { bytesAppend(bytes, asImgText()); }
+        if (sec == 1) { bytesAppend(bytes, asImgRdata()); }
+        if (sec == 2) { bytesAppend(bytes, asImgData()); }
+        let size = bytesLen(bytes);
+        if (sec == 3) { size = asImgBssSize(); if (size < 0 || size > 4294967295) { return fail("BadBssSize"); } }
+        listPush(bodies, bytes); listPush(sizes, size); listPush(aligns, power); sec = sec + 1;
+    }
+    const names = new Names { heads: listNew(), next: listNew(), rows: listNew() };
+    let buckets = 4096;
+    while (buckets < asSymCountL() * 2 && buckets < 1048576) { buckets = buckets * 2; }
+    let i = 0; while (i < buckets) { listPush(names.heads, -1); i = i + 1; }
+    i = 0;
+    while (i < asSymCountL()) {
+        if (asSymNeededL(i) == 0) { i = i + 1; continue; }
+        const name = asSymNameL(i); const s = asSymSecL(i); const off = asSymOffL(i);
+        if (!validName(name) || find(names, name) >= 0) { return fail("BadSymbolName"); }
+        if (s < 0 || s > 3 || off < 0 || off > (listGet(sizes, s) catch -1)) { return fail("BadSymbol"); }
+        add(names, name, i, false); i = i + 1;
+    }
+    i = 0;
+    while (i < listLen(exports)) {
+        const name = listGet(exports, i) catch ""; const found = find(names, name);
+        if (found < 0) { return fail("MissingExport:" + name); }
+        const row = listGet(names.rows, found) catch noName();
+        if (row.global) { return fail("DuplicateExport:" + name); }
+        row.global = true; row.required = true; i = i + 1;
+    }
+    i = 0;
+    while (i < asFixCountL()) {
+        const name = asFixSymL(i);
+        if (!validName(name)) { return fail("BadSymbolName"); }
+        if (startsWith(name, "__imp_") || name == "__tx_tls_tlv") { return fail("UnsupportedInObject:" + name); }
+        let found = find(names, name);
+        if (found < 0) { found = add(names, name, -1, true); }
+        const row = listGet(names.rows, found) catch noName();
+        if (!bindsLocally(asFixKindL(i), a64) || row.definition < 0 || row.global || asSymSecL(row.definition) != asFixSecL(i)) { row.required = true; }
+        i = i + 1;
+    }
+    // 符号次序：本地（定义而不导出）、外部定义、未定义。
+    const locals: List<int> = listNew(); let defined: List<int> = listNew(); let undefined: List<int> = listNew();
+    i = 0;
+    while (i < listLen(names.rows)) {
+        const row = listGet(names.rows, i) catch noName();
+        if (row.required) {
+            if (row.definition < 0) { listPush(undefined, i); } else if (row.global) { listPush(defined, i); } else { listPush(locals, i); }
+        }
+        i = i + 1;
+    }
+    defined = sortByName(defined, names.rows); undefined = sortByName(undefined, names.rows);
+    const order: List<int> = listNew();
+    for (k in locals) { listPush(order, k); } for (k in defined) { listPush(order, k); } for (k in undefined) { listPush(order, k); }
+    // 节在对象地址空间里依次排开（按各自对齐），符号值＝节地址＋节内偏移。
+    const addrs: List<int> = listNew(); let addr = 0; sec = 0;
+    while (sec < 4) {
+        const alignment = 1 << (listGet(aligns, sec) catch 0);
+        addr = ((addr + alignment - 1) / alignment) * alignment; listPush(addrs, addr);
+        addr = addr + (listGet(sizes, sec) catch 0); sec = sec + 1;
+    }
+    const strings = bytesNew(0); bytesPush(strings, 32); bytesPush(strings, 0);
+    const table = bytesNew(0); let k = 0;
+    for (index in order) {
+        const row = listGet(names.rows, index) catch noName(); row.index = k;
+        word(table, bytesLen(strings), 4);
+        bytesAppend(strings, bytesFromStr("_" + row.name)); bytesPush(strings, 0);
+        if (row.definition < 0) { word(table, 1, 1); word(table, 0, 1); word(table, 0, 2); word(table, 0, 8); }
+        else {
+            const s = asSymSecL(row.definition); let typ = 14; if (row.global) { typ = 15; }
+            word(table, typ, 1); word(table, s + 1, 1); word(table, 0, 2); word(table, (listGet(addrs, s) catch 0) + asSymOffL(row.definition), 8);
+        }
+        k = k + 1;
+    }
+    while (bytesLen(strings) % 8 != 0) { bytesPush(strings, 0); }
+    // 重定位：按节分开（bss 没有）。
+    const relocs: List<Bytes> = listNew(); sec = 0;
+    while (sec < 3) { listPush(relocs, bytesNew(0)); sec = sec + 1; }
+    i = 0;
+    while (i < asFixCountL()) {
+        const s = asFixSecL(i); const at = asFixAtL(i); const kind = asFixKindL(i); const addend = asFixAddendL(i);
+        if (s < 0 || s > 2) { return fail("BadRelocation"); }
+        const body = listGet(bodies, s) catch bytesNew(0); const rs = listGet(relocs, s) catch bytesNew(0);
+        let width = 4; if (kind == 1) { width = 8; }
+        if (at < 0 || bytesLen(body) < width || at > bytesLen(body) - width) { return fail("BadRelocation"); }
+        const row = listGet(names.rows, find(names, asFixSymL(i))) catch noName();
+        const local = row.definition >= 0 && !row.global && asSymSecL(row.definition) == s;
+        if (a64) {
+            if (kind < 1 || kind > 10 || (kind != 1 && s != 0)) { return fail("BadRelocation"); }
+            if (bindsLocally(kind, true) && local) {
+                const delta = asSymOffL(row.definition) + addend - at;
+                if (delta % 4 != 0 || delta < -134217728 || delta > 134217724) { return fail("RelativeRelocationOutOfRange"); }
+                const insn = (bytesGet(body, at) catch 0) | ((bytesGet(body, at + 1) catch 0) << 8) | ((bytesGet(body, at + 2) catch 0) << 16) | ((bytesGet(body, at + 3) catch 0) << 24);
+                put(body, at, (insn & 4227858432) | ((delta / 4) & 67108863), 4);
+            } else if (kind == 1) {
+                put(body, at, addend, 8); reloc(rs, at, row.index, 0, 3, 0);
+            } else {
+                // BRANCH26 2，PAGE21 3，PAGEOFF12 4；加数经 ARM64_RELOC_ADDEND（10，r_extern 0，r_symbolnum 为 24 位有符号加数）。
+                let typ = 4; if (kind == 2 || kind == 3) { typ = 2; } if (kind == 4) { typ = 3; }
+                let pcrel = 0; if (typ != 4) { pcrel = 1; }
+                if (addend != 0) {
+                    if (addend < -8388608 || addend > 8388607) { return fail("AddendOutOfRange"); }
+                    word(rs, at, 4); word(rs, (addend & 16777215) | (2 << 25) | (10 << 28), 4);
+                }
+                reloc(rs, at, row.index, pcrel, 2, typ);
+            }
+        } else if (kind == 1) {
+            put(body, at, addend, 8); reloc(rs, at, row.index, 0, 3, 0);
+        } else if (kind == 0) {
+            if (local) {
+                // 同 asResolveLocalFixups：字段＝目标＋加数−（字段起点＋4）。
+                const value = asSymOffL(row.definition) + addend - at - 4;
+                if (value < -2147483648 || value > 2147483647) { return fail("RelativeRelocationOutOfRange"); }
+                put(body, at, value, 4);
+            } else {
+                // 原位加数：字段末尾到目标的偏移（ELF 层写 addend − 4、以字段起点为 P，二者相同）。
+                if (addend < -2147483648 || addend > 2147483647) { return fail("RelativeRelocationOutOfRange"); }
+                put(body, at, addend, 4);
+                let typ = 1; if (s == 0 && x86Branch(body, at)) { typ = 2; }
+                reloc(rs, at, row.index, 1, 2, typ);
+            }
+        } else { return fail("BadRelocation"); }
+        i = i + 1;
+    }
+    // 布局：头、load commands、各节内容、重定位、符号表、字符串表。
+    const ncmds = 4; const sizeofcmds = (72 + 80 * 4) + 24 + 24 + 80;
+    let at = 32 + sizeofcmds; const offs: List<int> = listNew(); sec = 0;
+    while (sec < 4) {
+        const alignment = 1 << (listGet(aligns, sec) catch 0);
+        at = ((at + alignment - 1) / alignment) * alignment;
+        if (sec == 3) { listPush(offs, 0); } else { listPush(offs, at); at = at + bytesLen(listGet(bodies, sec) catch bytesNew(0)); }
+        sec = sec + 1;
+    }
+    const dataEnd = at;
+    at = ((at + 7) / 8) * 8; const relOffs: List<int> = listNew(); sec = 0;
+    while (sec < 3) { listPush(relOffs, at); at = at + bytesLen(listGet(relocs, sec) catch bytesNew(0)); sec = sec + 1; }
+    listPush(relOffs, 0);
+    at = ((at + 7) / 8) * 8; const symOff = at; at = at + bytesLen(table); const strOff = at;
+    const out = bytesNew(0);
+    if (a64) { word(out, 0xFEEDFACF, 4); word(out, 0x0100000C, 4); word(out, 0, 4); }
+    else { word(out, 0xFEEDFACF, 4); word(out, 0x01000007, 4); word(out, 3, 4); }
+    word(out, 1, 4); word(out, ncmds, 4); word(out, sizeofcmds, 4); word(out, 0, 4); word(out, 0, 4);
+    const firstOff = listGet(offs, 0) catch 0;
+    word(out, 25, 4); word(out, 72 + 80 * 4, 4); name16(out, "");
+    word(out, 0, 8); word(out, addr, 8); word(out, firstOff, 8); word(out, dataEnd - firstOff, 8);
+    word(out, 7, 4); word(out, 7, 4); word(out, 4, 4); word(out, 0, 4);
+    const sects = ["__text", "__const", "__data", "__bss"]; const segs = ["__TEXT", "__DATA", "__DATA", "__DATA"];
+    const flags = [0x80000400, 0, 0, 1];
+    sec = 0;
+    while (sec < 4) {
+        name16(out, sects[sec]); name16(out, segs[sec]);
+        word(out, listGet(addrs, sec) catch 0, 8); word(out, listGet(sizes, sec) catch 0, 8); word(out, listGet(offs, sec) catch 0, 4);
+        word(out, listGet(aligns, sec) catch 0, 4);
+        const nrel = bytesLen(listGet(relocs, sec) catch bytesNew(0)) / 8;
+        if (nrel == 0) { word(out, 0, 4); } else { word(out, listGet(relOffs, sec) catch 0, 4); }
+        word(out, nrel, 4); word(out, flags[sec], 4); word(out, 0, 4); word(out, 0, 4); word(out, 0, 4);
+        sec = sec + 1;
+    }
+    // LC_BUILD_VERSION：macOS 13.0（同产物），不列工具。
+    word(out, 0x32, 4); word(out, 24, 4); word(out, 1, 4); word(out, 0x0D0000, 4); word(out, 0x0D0000, 4); word(out, 0, 4);
+    word(out, 2, 4); word(out, 24, 4); word(out, symOff, 4); word(out, listLen(order), 4); word(out, strOff, 4); word(out, bytesLen(strings), 4);
+    word(out, 11, 4); word(out, 80, 4);
+    word(out, 0, 4); word(out, listLen(locals), 4); word(out, listLen(locals), 4); word(out, listLen(defined), 4);
+    word(out, listLen(locals) + listLen(defined), 4); word(out, listLen(undefined), 4);
+    i = 0; while (i < 12) { word(out, 0, 4); i = i + 1; }
+    if (bytesLen(out) != 32 + sizeofcmds) { return fail("LoadCommandSize"); }
+    sec = 0;
+    while (sec < 3) {
+        while (bytesLen(out) < (listGet(offs, sec) catch 0)) { bytesPush(out, 0); }
+        bytesAppend(out, listGet(bodies, sec) catch bytesNew(0)); sec = sec + 1;
+    }
+    while (bytesLen(out) % 8 != 0) { bytesPush(out, 0); }
+    for (rs in relocs) { bytesAppend(out, rs); }
+    while (bytesLen(out) < symOff) { bytesPush(out, 0); }
+    bytesAppend(out, table);
+    if (bytesLen(out) != strOff) { return fail("SymbolTableLayout"); }
+    bytesAppend(out, strings);
+    return new MachoObjectResult { ok: true, bytes: out, error: "" };
+}

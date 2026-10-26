@@ -1,0 +1,174 @@
+// std/fs 系统面的 Linux 目标文件（D3 v0.23 按目标选择文件；导出面同 fs_sys.tx）：全部经 from syscall
+// （x86_64 调用号），产物保持静态、不依赖 libc。语义同 Zig 宿主 posix/fsops.zig（stat 跟随符号链接、
+// mkdir 权限 0755、remove 先 unlink 再 rmdir）；文件名按字节取回，非法 UTF-8 替换为 U+FFFD。
+// 含 NUL 的路径按失败处理（不交给系统调用截断）。
+import { u16At, lossyStr, nulFree, bytePrefix } from "./sys_text";
+
+declare function lxOpenat(dir: int, path: string, flags: int, mode: int): int from syscall 257;
+declare function lxClose(fd: int): int from syscall 3;
+declare function lxGetdents64(fd: int, buf: Bytes, n: int): int from syscall 217;
+declare function lxNewfstatat(dir: int, path: string, st: Bytes, flags: int): int from syscall 262;
+declare function lxMkdir(path: string, mode: int): int from syscall 83;
+declare function lxUnlink(path: string): int from syscall 87;
+declare function lxRmdir(path: string): int from syscall 84;
+declare function lxRename(src: string, dst: string): int from syscall 82;
+declare function lxGetcwd(buf: Bytes, n: int): int from syscall 79;
+
+const AT_FDCWD: int = -100;
+// O_RDONLY | O_DIRECTORY | O_CLOEXEC
+const OPEN_DIR: int = 589824;
+// struct stat（x86_64，144 字节）：st_mode 在偏移 24，st_size 在 48。
+const STAT_SIZE: int = 144;
+const S_IFMT: int = 61440;
+const S_IFDIR: int = 16384;
+const ERANGE: int = 34;
+
+function pathOk(path: string): bool {
+    return nulFree(path) && len(path) > 0;
+}
+
+// stat 结果；失败（不存在、无权限、路径不可用）返回空 Bytes。
+function statOf(path: string): Bytes {
+    if (!pathOk(path)) {
+        return bytesNew(0);
+    }
+    const st = bytesNew(STAT_SIZE);
+    if (lxNewfstatat(AT_FDCWD, path, st, 0) != 0) {
+        return bytesNew(0);
+    }
+    return st;
+}
+
+function u32At(b: Bytes, off: int): int {
+    return u16At(b, off) + u16At(b, off + 2) * 65536;
+}
+
+export function sysExists(path: string): bool {
+    return bytesLen(statOf(path)) > 0;
+}
+
+export function sysMkdir(path: string): int {
+    if (!pathOk(path)) {
+        return -1;
+    }
+    if (lxMkdir(path, 493) == 0) {
+        return 0;
+    }
+    return -1;
+}
+
+// 逐级建目录：已存在且是目录视为成功；途经的 `/` 前缀不存在就建。
+export function sysMkdirs(path: string): int {
+    if (sysExists(path)) {
+        if (sysStatIsDir(path) == 1) {
+            return 0;
+        }
+        return -1;
+    }
+    let i: int = 1;
+    while (i < len(path)) {
+        if ((byteAt(path, i) catch 0) == 47) {
+            const pre = bytePrefix(path, i);
+            if (!sysExists(pre) && sysMkdir(pre) != 0) {
+                return -1;
+            }
+        }
+        i = i + 1;
+    }
+    return sysMkdir(path);
+}
+
+export function sysRemove(path: string): int {
+    if (!pathOk(path)) {
+        return -1;
+    }
+    if (lxUnlink(path) == 0) {
+        return 0;
+    }
+    if (lxRmdir(path) == 0) {
+        return 0;
+    }
+    return -1;
+}
+
+export function sysRename(from: string, to: string): int {
+    if (!pathOk(from) || !pathOk(to)) {
+        return -1;
+    }
+    if (lxRename(from, to) == 0) {
+        return 0;
+    }
+    return -1;
+}
+
+export function sysStatSize(path: string): int {
+    const st = statOf(path);
+    if (bytesLen(st) == 0) {
+        return -1;
+    }
+    return u32At(st, 48) + u32At(st, 52) * 4294967296;
+}
+
+export function sysStatIsDir(path: string): int {
+    const st = statOf(path);
+    if (bytesLen(st) == 0) {
+        return -1;
+    }
+    if ((u32At(st, 24) & S_IFMT) == S_IFDIR) {
+        return 1;
+    }
+    return 0;
+}
+
+export function sysCwd(): string {
+    let cap: int = 4096;
+    while (cap <= 1048576) {
+        const buf = bytesNew(cap);
+        const n = lxGetcwd(buf, cap);
+        if (n > 0) {
+            return lossyStr(bytesSlice(buf, 0, n - 1));
+        }
+        if (n != -ERANGE) {
+            return "";
+        }
+        cap = cap * 4;
+    }
+    return "";
+}
+
+// linux_dirent64：d_reclen 在偏移 16（u16），d_name 从 19 起、以 NUL 结尾。
+export function sysListDir(path: string): List<string> | Error {
+    if (!pathOk(path)) {
+        return err("cannot open: " + path);
+    }
+    const fd = lxOpenat(AT_FDCWD, path, OPEN_DIR, 0);
+    if (fd < 0) {
+        return err("cannot open: " + path);
+    }
+    const names: List<string> = listNew();
+    const buf = bytesNew(32768);
+    while (true) {
+        const n = lxGetdents64(fd, buf, 32768);
+        if (n <= 0) {
+            break;
+        }
+        let off: int = 0;
+        while (off < n) {
+            const reclen = u16At(buf, off + 16);
+            let end: int = off + 19;
+            while (end < off + reclen && (bytesGet(buf, end) catch 0) != 0) {
+                end = end + 1;
+            }
+            const name = lossyStr(bytesSlice(buf, off + 19, end - off - 19));
+            if (name != "." && name != "..") {
+                listPush(names, name);
+            }
+            if (reclen <= 0) {
+                break;
+            }
+            off = off + reclen;
+        }
+    }
+    lxClose(fd);
+    return names;
+}

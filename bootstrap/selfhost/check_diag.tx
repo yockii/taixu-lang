@@ -1,0 +1,193 @@
+// check_diag.tx —— LSP 检查的结构化诊断（第 6 轮 6d-1，LSP 与 MCP 实施设计 §三-6）。
+//
+// drvCheck 与 taixu build 出同一批诊断：驱动在写诊断文本的同时记一条结构化记录（码、模块的归一路径、显示名、
+// 行、列、消息、是否随附 explain 提示行），按记录逐条回渲即得同一份文本。本模块放与驱动状态无关的部分：
+// 记录与回渲、解析期协议行与文本诊断的转换、语义诊断的转换（去掉与驱动导入诊断重复的 3008）、embedBytes
+// 的存在与大小检查（只取元数据，不读内容）。
+
+import { SemaView, CgEmbedSite, svModuleDisplay, embedProblem } from "./codegen";
+import { CheckDiag } from "./check_model";
+
+export struct DrvDiag {
+    code: int, // 0＝没有码的驱动消息（msg 即整行）
+    path: string, // 模块的归一路径；没有时为空
+    display: string,
+    line: int,
+    col: int,
+    msg: string,
+    hint: bool, // 回渲时随附 `  └─ 处置详见: taixu explain 码`
+}
+
+export function newDrvDiag(code: int, path: string, display: string, line: int, col: int, msg: string, hint: bool): Ref<DrvDiag> {
+    return new DrvDiag { code: code, path: path, display: display, line: line, col: col, msg: msg, hint: hint };
+}
+
+export function renderDrvDiag(d: Ref<DrvDiag>): string {
+    if (d.code == 0) { return d.msg + "\n"; }
+    let out = d.display + ":" + toStr(d.line) + ":" + toStr(d.col) + ": error " + toStr(d.code) + ": " + d.msg + "\n";
+    if (d.hint) { out = out + "  └─ 处置详见: taixu explain " + toStr(d.code) + "\n"; }
+    return out;
+}
+
+export function renderDrvDiags(ds: List<Ref<DrvDiag>>): string {
+    let out = "";
+    for (d in ds) { out = out + renderDrvDiag(d); }
+    return out;
+}
+
+function cpCount(s: string): int {
+    let n = 0;
+    let i = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) catch 0;
+        if ((c & 192) != 128) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+function cpAt(s: string, i: int): int {
+    return byteAt(strSub(s, i, 1), 0) catch 0;
+}
+
+// 十进制数字串的值；不是纯数字（含空串）返回 -1。
+function decOf(s: string): int {
+    if (len(s) == 0) { return -1; }
+    let v = 0;
+    let i = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) catch 0;
+        if (c < 48 || c > 57) { return -1; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+function spaceFrom(s: string, from: int, n: int): int {
+    let i = from;
+    while (i < n && cpAt(s, i) != 32) { i = i + 1; }
+    return i;
+}
+
+// 解析期协议行 `! 码 行 列 消息`（判形同 driver 的 renderParseDiag；不合形的行记为没有码的消息）。
+export function parseLineDiag(path: string, display: string, ln: string): Ref<DrvDiag> {
+    const n = cpCount(ln);
+    if (n < 2 || cpAt(ln, 0) != 33 || cpAt(ln, 1) != 32) { return newDrvDiag(0, path, display, 0, 0, ln, false); }
+    const a = spaceFrom(ln, 2, n);
+    const b = spaceFrom(ln, a + 1, n);
+    const c = spaceFrom(ln, b + 1, n);
+    if (c >= n) { return newDrvDiag(0, path, display, 0, 0, ln, false); }
+    const codeText = strSub(ln, 2, a - 2);
+    const line = decOf(strSub(ln, a + 1, b - a - 1));
+    const col = decOf(strSub(ln, b + 1, c - b - 1));
+    const code = decOf(codeText);
+    if (code <= 0 || line < 0 || col < 0) {
+        // 行列或码不是数字：build 照原样拼出文本，这里按整行文本记（回渲相同）。
+        const raw = display + ":" + strSub(ln, a + 1, b - a - 1) + ":" + strSub(ln, b + 1, c - b - 1) + ": error " + codeText + ": " + strSub(ln, c + 1, n - c - 1);
+        return newDrvDiag(0, path, display, 0, 0, raw, false);
+    }
+    const hint = cpCount(codeText) == 4 && cpAt(codeText, 0) == 51;
+    return newDrvDiag(code, path, display, line, col, strSub(ln, c + 1, n - c - 1), hint);
+}
+
+// `显示名:行:列: error 码: 消息` 形的文本逐行转记录（按目标选择文件的 3033 等）；`  └─` 行并入上一条的提示。
+export function textDiags(text: string, path: string): List<Ref<DrvDiag>> {
+    const out: List<Ref<DrvDiag>> = listNew();
+    for (ln in strSplit(text, "\n")) {
+        if (len(ln) == 0) { continue; }
+        if (strIndexOf(ln, "  └─") == 0) {
+            if (listLen(out) > 0) {
+                const last = listGet(out, listLen(out) - 1) catch newDrvDiag(0, "", "", 0, 0, "", false);
+                last.hint = true;
+            }
+            continue;
+        }
+        const at = strIndexOf(ln, ": error ");
+        let d = newDrvDiag(0, path, "", 0, 0, ln, false);
+        if (at > 0) {
+            const head = strSub(ln, 0, at);
+            const rest = strSub(ln, at + 8, cpCount(ln) - at - 8);
+            const sep = strIndexOf(rest, ": ");
+            const c2 = lastColon(head);
+            const c1 = lastColon(strSub(head, 0, c2));
+            if (sep > 0 && c1 > 0 && c2 > c1) {
+                const code = decOf(strSub(rest, 0, sep));
+                const line = decOf(strSub(head, c1 + 1, c2 - c1 - 1));
+                const col = decOf(strSub(head, c2 + 1, cpCount(head) - c2 - 1));
+                if (code > 0 && line >= 0 && col >= 0) {
+                    d = newDrvDiag(code, path, strSub(head, 0, c1), line, col, strSub(rest, sep + 2, cpCount(rest) - sep - 2), false);
+                }
+            }
+        }
+        listPush(out, d);
+    }
+    return out;
+}
+
+function lastColon(s: string): int {
+    let at = -1;
+    let i = 0;
+    const n = cpCount(s);
+    while (i < n) {
+        if (cpAt(s, i) == 58) { at = i; }
+        i = i + 1;
+    }
+    return at;
+}
+
+// 语义诊断（SemaView 的诊断行，次序同 diagRenderSv）转记录；模块路径取驱动的模块表（SEIN 模块序）。
+// semamirror 对找不到目标的 import 报的 3008 若与驱动已记的导入诊断同位置（同模块、行、列），去掉。
+export function semaDiags(sv: Ref<SemaView>, modPaths: List<string>, driverDiags: List<Ref<DrvDiag>>): List<Ref<DrvDiag>> {
+    const rows: List<Ref<CheckDiag>> = listNew();
+    let i = 0;
+    while (i < sv.diagCount) {
+        listPush(rows, new CheckDiag { code: listGet(sv.diagCodes, i) catch 0, module: listGet(sv.diagMods, i) catch 0,
+                line: listGet(sv.diagLines, i) catch 0, col: listGet(sv.diagCols, i) catch 0, msg: listGet(sv.diagMsgs, i) catch "" });
+        i = i + 1;
+    }
+    return checkDiags(rows, semaDisplays(sv), modPaths, driverDiags);
+}
+
+function semaDisplays(sv: Ref<SemaView>): List<string> {
+    const out: List<string> = listNew(); let i = 0;
+    while (i < listLen(sv.modules)) { listPush(out, svModuleDisplay(sv, i)); i = i + 1; }
+    return out;
+}
+
+export function checkDiags(rows: List<Ref<CheckDiag>>, displays: List<string>, modPaths: List<string>, driverDiags: List<Ref<DrvDiag>>): List<Ref<DrvDiag>> {
+    const out: List<Ref<DrvDiag>> = listNew();
+    for (r in rows) {
+        const midx = r.module;
+        const path = listGet(modPaths, midx) catch "";
+        if (!(r.code == 3008 && importDiagAt(driverDiags, path, r.line, r.col))) {
+            listPush(out, newDrvDiag(r.code, path, listGet(displays, midx) catch "", r.line, r.col, r.msg, r.code >= 3000 && r.code < 4000));
+        }
+    }
+    return out;
+}
+
+function importDiagAt(ds: List<Ref<DrvDiag>>, path: string, line: int, col: int): bool {
+    for (d in ds) {
+        if ((d.code == 3008 || d.code == 3009) && d.path == path && d.line == line && d.col == col) { return true; }
+    }
+    return false;
+}
+
+// embedBytes 的存在与大小（LSP 与 MCP 实施设计 §三-4、§三-6）：经 codegen 的 embedProblem 只取元数据、不读内容，
+// 与代码生成同一判定、同一文案（3102，不随附 explain 行）。
+export function embedDiags(sites: List<Ref<CgEmbedSite>>, sv: Ref<SemaView>, modPaths: List<string>): List<Ref<DrvDiag>> {
+    return embedDiagsFor(sites, semaDisplays(sv), modPaths);
+}
+
+export function embedDiagsFor(sites: List<Ref<CgEmbedSite>>, displays: List<string>, modPaths: List<string>): List<Ref<DrvDiag>> {
+    const out: List<Ref<DrvDiag>> = listNew();
+    for (s in sites) {
+        const why = embedProblem(s.path, s.lit);
+        if (len(why) > 0) {
+            const mpath = listGet(modPaths, s.module) catch "";
+            listPush(out, newDrvDiag(3102, mpath, listGet(displays, s.module) catch "", s.line, s.col, why, false));
+        }
+    }
+    return out;
+}

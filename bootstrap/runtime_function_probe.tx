@@ -1,0 +1,225 @@
+// Buffered runtime boundaries, independent return paths and object-local facts.
+import { StructuredBuffer, asBufferNew, asBufferNewA64, asBufferSection, asBufferInstruction, asBufferSubmit, asStructuredBegin, asStructuredReg,
+    asBufferFunctionBegin, asBufferBoundaryBegin, asBufferFunctionEnd, asBufferFunctionPrologueEnd, asBufferFunctionEpilogueStart, asBufferFrame,
+    asStructuredMissing, asFailedAs, asLastErrAs, asImgText } from "./selfhost/assemble";
+import { RtOp, I, L } from "./selfhost/rtfn_base";
+import { a64BufferSubmit } from "./selfhost/a64_asm";
+import { rtBegin, rtEnd, rtFailed, rtIf, rtLabel, rtRet, rtSet, rtCallList, rtCallC, rtSyscall, rtTrap } from "./selfhost/rtfn";
+import { NativeFunction, NativeFrameEvent, NativeEpilogue, nativeFunctionCopy, nativeFunctionsSnapshot, nativeFunctionValidate } from "./selfhost/native_function_data";
+import { nativeObjectFunctions } from "./selfhost/native_function_object";
+import { nativeFunctionEncode, nativeFunctionDecode } from "./selfhost/native_function_codec";
+import { coffCaptureAssembler, coffWrite, coffWriteFunctions, coffResultOk, coffResultBytes } from "./selfhost/emit_coff_storage";
+import { elfWriteObject, elfWriteObjectFunctions, elfObjectOk, elfObjectBytes } from "./selfhost/emit_elf_object";
+import { linkMapEnable, linkMapScope, linkMapBegin, linkMapAddSection, linkMapAddPlacement, linkMapDone, linkMapData } from "./selfhost/link_map_data";
+import { linkMapAttachFunctions } from "./selfhost/link_map_functions";
+import { linkMapFinish, linkMapJson } from "./selfhost/link_map";
+import { rawNameOf } from "./selfhost/binary_name";
+import { T_X64_WINDOWS, T_X64_LINUX, T_ARM64_MACOS } from "./selfhost/target";
+
+function changed(data: Bytes, at: int, value: int): Bytes {
+    const copy = bytesSlice(data, 0, bytesLen(data)); bytesSet(copy, at, value); return copy;
+}
+function rejected(data: Bytes, code: Bytes): void {
+    const bad = nativeFunctionDecode(data, code, 0, "x86_64"); assert(!bad.ok && len(bad.error) > 0 && listLen(bad.functions) == 0, "bad metadata accepted");
+}
+function shell(b: Ref<StructuredBuffer>): void {
+    asBufferFunctionBegin(b, "fixture/callback.tx", "fixture_shell", "ffi-callback-shell");
+    asBufferFrame(b, "push-nonvolatile", 3, 8); asBufferFrame(b, "push-nonvolatile", 12, 8);
+    asBufferFrame(b, "allocate-stack", 4, 40); asBufferFunctionPrologueEnd(b);
+    let i = 0;
+    while (i < 2) {
+        asBufferFunctionEpilogueStart(b); asBufferFrame(b, "release-stack", 4, 40);
+        asBufferFrame(b, "pop-nonvolatile", 12, 8); asBufferFrame(b, "pop-nonvolatile", 3, 8);
+        asBufferFrame(b, "return", -1, 8); i = i + 1;
+    }
+    asBufferFunctionEnd(b);
+}
+function callBounds(): void {
+    for (kind in [0, 1, 2, 3, 4, 5]) {
+        for (accepted in [false, true]) {
+            const b = asBufferNew();
+            let reserve = 4; let count = 5;
+            if (kind == 1) { count = 7; if (accepted) { reserve = 7; } }
+            if (kind == 2) { count = 11; if (accepted) { reserve = 11; } else { reserve = 0; } }
+            if (kind == 0 && accepted) { reserve = 5; }
+            if (kind == 3) { count = 7; if (accepted) { count = 6; } reserve = 0; }
+            if (kind >= 4) { count = 4; }
+            const f = rtBegin(b, "call_bounds", "", "fp", reserve, "fixture/runtime.tx");
+            rtSet(f, "fp", I(0));
+            const values: List<Ref<RtOp>> = listNew(); const classes: List<int> = listNew();
+            let i = 0;
+            while (i < count) { listPush(values, I(i)); listPush(classes, 0); i = i + 1; }
+            if (kind == 4 && !accepted) { listPop(classes) catch -1; }
+            if (kind == 5 && !accepted) { listSet(classes, 0, 2); }
+            if (kind == 0) { rtCallList(f, "", "never_executed", values); }
+            else if (kind == 3) { rtSyscall(f, "", 1, values); }
+            else { rtCallC(f, "", "", "fp", values, classes, kind == 2); }
+            rtRet(f, I(0)); rtEnd(f);
+            assert((rtFailed(f) == "") == accepted, "call boundary guard mismatch: " + toStr(kind) + " " + rtFailed(f));
+        }
+    }
+}
+function vectorBounds(): void {
+    for (accepted in [false, true]) {
+        asStructuredBegin(); const b = asBufferNew();
+        let instruction = "addsd"; if (accepted) { instruction = "movupd"; }
+        asBufferInstruction(b, instruction, 2, asStructuredReg(3, 10), asStructuredReg(3, 11), asStructuredMissing(), 1);
+        asBufferSubmit(b); assert((asFailedAs() == 0) == accepted, "unsupported high XMM must reject");
+        if (accepted) {
+            const code = asImgText(); const expected = [102, 69, 15, 16, 211];
+            assert(bytesLen(code) == 5, "MOVUPD register encoding size");
+            let i = 0; while (i < 5) { assert((bytesGet(code, i) catch -1) == expected[i], "MOVUPD REX.R/B encoding"); i = i + 1; }
+        }
+    }
+}
+// A64 frames (M4 design §A5): real rtfn emission replayed by the A64 assembler, then one fault per copy.
+function a64Fault(f: Ref<NativeFunction>, index: int, reg: int, bytes: int, expected: string): void {
+    const copy = nativeFunctionCopy(f);
+    const e = listGet(copy.events, index) catch new NativeFrameEvent { before: -1, after: -1, kind: "", reg: -1, bytes: 0 };
+    if (reg != -2) { e.reg = reg; } if (bytes >= 0) { e.bytes = bytes; }
+    const got = nativeFunctionValidate(copy, "aarch64"); assert(got == expected, "A64 fault " + toStr(index) + ": " + got);
+}
+function a64Frames(x86: Ref<NativeFunction>): void {
+    asStructuredBegin(); const b = asBufferNewA64(); asBufferSection(b, 0, 1);
+    let f = rtBegin(b, "a64_small", "a", "", 0, "fixture/a64.tx");
+    rtIf(f, L("a"), "eq", I(0), "other"); rtRet(f, I(1)); rtLabel(f, "other"); rtRet(f, L("a")); rtEnd(f); assert(rtFailed(f) == "", rtFailed(f));
+    f = rtBegin(b, "a64_large", "a", "", 520, "fixture/a64.tx"); rtRet(f, L("a")); rtEnd(f); assert(rtFailed(f) == "", rtFailed(f));
+    a64BufferSubmit(b); assert(asFailedAs() == 0, asLastErrAs());
+    const image = nativeFunctionsSnapshot(); assert(image.ok && image.isa == "aarch64" && listLen(image.functions) == 2, image.error);
+    const code = bytesSlice(asImgText(), 0, bytesLen(asImgText()));
+    const dummy = new NativeFunction { id: -1, module: "", name: "", linkName: "", origin: "", stackModel: "fixed-call", begin: -1, end: -1, prologueEnd: -1, epilogues: listNew(), events: listNew() };
+    const missingEvent = new NativeFrameEvent { before: -1, after: -1, kind: "", reg: -1, bytes: 0 };
+    const small = listGet(image.functions, 0) catch dummy; const large = listGet(image.functions, 1) catch dummy;
+    const e0 = listGet(small.events, 0) catch missingEvent; const e1 = listGet(small.events, 1) catch missingEvent;
+    assert(listLen(small.epilogues) == 2 && listLen(small.events) == 12 && e0.reg == 30 && e1.reg == 29 && e0.before == e1.before
+        && e0.after == e1.after && e0.after - e0.before == 4, "A64 frame record is one stp with two pushes");
+    let allocations = 0; for (e in large.events) { if (e.kind == "allocate-stack") { allocations = allocations + 1; } }
+    assert(allocations == 2 && nativeFunctionValidate(large, "aarch64") == "", "A64 large frame in two aligned steps");
+    assert(nativeFunctionValidate(small, "x86_64") != "", "A64 registers read as x86-64");
+    // Events: push x30, push x29, set x29, allocate | release, pop x29, pop x30, return (twice).
+    a64Fault(small, 0, 18, -1, "BadFramePush"); a64Fault(small, 1, 30, -1, "BadFramePush");
+    a64Fault(small, 1, -2, 16, "MisalignedFrame"); a64Fault(small, 2, 30, -1, "BadFramePointer");
+    a64Fault(small, 3, -2, 24, "BadFrameAllocation"); a64Fault(small, 4, -2, 32, "BadFrameRelease");
+    a64Fault(small, 5, -2, 16, "BadFramePop"); a64Fault(small, 7, -2, 8, "BadFrameReturn");
+    const swapped = nativeFunctionCopy(small);
+    const s0 = listGet(swapped.events, 0) catch missingEvent; const s1 = listGet(swapped.events, 1) catch missingEvent; s0.reg = 29; s1.reg = 30;
+    assert(nativeFunctionValidate(swapped, "aarch64") == "BadFramePointer", "frame pointer without a frame record");
+    // Same-range events exist only on A64: an x86 instruction never carries two.
+    const doubled = nativeFunctionCopy(x86); const first = listGet(doubled.events, 0) catch missingEvent;
+    const events: List<Ref<NativeFrameEvent>> = listNew();
+    listPush(events, first); listPush(events, new NativeFrameEvent { before: first.before, after: first.after, kind: first.kind, reg: 13, bytes: 8 });
+    let k = 1; while (k < listLen(doubled.events)) { listPush(events, listGet(doubled.events, k) catch missingEvent); k = k + 1; }
+    doubled.events = events; assert(nativeFunctionValidate(doubled, "x86_64") == "BadFrameEventRange", "x86 same-range events accepted");
+    // The object directory is read by the object's machine; registers never cross ISAs.
+    const blob = nativeFunctionEncode(image, code, 1);
+    assert(nativeFunctionDecode(blob, code, 1, "aarch64").ok && !nativeFunctionDecode(blob, code, 1, "x86_64").ok, "A64 directory ISA");
+    const exports: List<string> = listNew(); listPush(exports, "a64_small"); listPush(exports, "a64_large");
+    const elf = elfWriteObjectFunctions(exports, image); assert(elfObjectOk(elf) == 1, "A64 object writing failed");
+    const own = nativeObjectFunctions(elfObjectBytes(elf), T_ARM64_MACOS);
+    assert(own.present && own.image.ok && own.image.isa == "aarch64" && listLen(own.image.functions) == 2, own.image.error);
+    assert(!nativeObjectFunctions(elfObjectBytes(elf), T_X64_LINUX).image.ok, "A64 object read as x86-64");
+    for (target in ["x86_64-linux", "aarch64-macos"]) {
+        linkMapBegin(target); linkMapAddSection(0, rawNameOf("text"), 4294967296, 0, bytesLen(code), bytesLen(code));
+        linkMapAddPlacement(0, own.inputSection, 0, 4294967296, bytesLen(code)); linkMapDone();
+        let expected = ""; if (target == "x86_64-linux") { expected = "FunctionIsaMismatch:aarch64"; }
+        assert(linkMapAttachFunctions(own.image, 0, own.inputSection) == expected && linkMapData().ok == (expected == ""), "map ISA check " + target);
+    }
+}
+export function main(args: []string): int {
+    if (len(args) != 1) { return 64; }
+    linkMapEnable(true); linkMapScope("functions"); asStructuredBegin();
+    const b = asBufferNew(); asBufferSection(b, 0, 1);
+    let f = rtBegin(b, "fixture_branch", "a", "", 0, "fixture/runtime.tx");
+    rtIf(f, L("a"), "eq", I(0), "other"); rtRet(f, I(11));
+    rtLabel(f, "other"); rtRet(f, I(22));
+    // Unreachable ordinary bytes after the second return are still in this function.
+    rtSet(f, "a", I(99)); rtEnd(f); assert(rtFailed(f) == "", rtFailed(f));
+    asBufferInstruction(b, "mov", 2, asStructuredReg(0, 0), asStructuredReg(0, 0), asStructuredMissing(), 1);
+    f = rtBegin(b, "fixture_zero_return", "", "", 0, "fixture/runtime.tx");
+    rtTrap(f); rtEnd(f); assert(rtFailed(f) == "", rtFailed(f));
+    shell(b);
+    let boundaryId = 0;
+    for (model in ["process-entry", "thread-entry", "stack-transition", "stack-disposal"]) {
+        asBufferBoundaryBegin(b, "fixture/boundary.tx", "fixture_boundary_" + toStr(boundaryId), model);
+        // An actual ret does not make a special boundary an ordinary call frame.
+        let instruction = "ud2"; if (model == "thread-entry") { instruction = "ret"; }
+        asBufferInstruction(b, instruction, 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1);
+        asBufferFunctionEnd(b); boundaryId = boundaryId + 1;
+    }
+    asBufferSubmit(b); assert(asFailedAs() == 0, asLastErrAs());
+    const image = nativeFunctionsSnapshot(); assert(image.ok && listLen(image.functions) == 7, image.error);
+    const code = bytesSlice(asImgText(), 0, bytesLen(asImgText()));
+    const exports: List<string> = listNew(); listPush(exports, "fixture_branch"); listPush(exports, "fixture_zero_return");
+    const co = coffCaptureAssembler(); const coff = coffWriteFunctions(co, exports, image); const elf = elfWriteObjectFunctions(exports, image);
+    assert(coffResultOk(coff) == 1 && elfObjectOk(elf) == 1, "object writing failed");
+    const cf = nativeObjectFunctions(coffResultBytes(coff), T_X64_WINDOWS); const ef = nativeObjectFunctions(elfObjectBytes(elf), T_X64_LINUX);
+    assert(cf.present && cf.image.ok && ef.present && ef.image.ok, cf.image.error + ef.image.error);
+    assert(cf.inputSection == 0 && ef.inputSection == 1 && listLen(cf.image.functions) == 7 && listLen(ef.image.functions) == 7, "object identity");
+    const plainCo = coffWrite(co, exports); const plainElf = elfWriteObject(exports);
+    assert(!nativeObjectFunctions(coffResultBytes(plainCo), T_X64_WINDOWS).present && !nativeObjectFunctions(elfObjectBytes(plainElf), T_X64_LINUX).present, "invented absent metadata");
+    const blob = nativeFunctionEncode(image, code, 0);
+    rejected(changed(blob, 4, 1), code); rejected(changed(blob, 8, 1), code); rejected(changed(blob, 12, 0), code);
+    rejected(changed(blob, 4, 2), code);
+    rejected(changed(blob, 20, 0), code); rejected(changed(blob, 84, 255), code);
+    rejected(changed(blob, 88, 255), code); rejected(changed(blob, 92, 255), code);
+    let i = 0;
+    for (cut in [0, 1, 7, 19, 83, 87, 100, bytesLen(blob) - 1]) { rejected(bytesSlice(blob, 0, cut), code); i = i + 1; }
+    const trailing = bytesSlice(blob, 0, bytesLen(blob)); bytesPush(trailing, 0); rejected(trailing, code);
+    const wrongCode = changed(code, 0, (bytesGet(code, 0) catch 0) ^ 1); rejected(blob, wrongCode);
+    const dummy = new NativeFunction { id: -1, module: "", name: "", linkName: "", origin: "", stackModel: "fixed-call", begin: -1, end: -1, prologueEnd: -1, epilogues: listNew(), events: listNew() };
+    const boundary = listGet(cf.image.functions, 3) catch dummy;
+    assert(boundary.stackModel == "process-entry" && nativeFunctionValidate(boundary, "x86_64") == "", "boundary round trip");
+    const wrongModel = nativeFunctionCopy(boundary); wrongModel.stackModel = "future";
+    assert(nativeFunctionValidate(wrongModel, "x86_64") == "UnknownStackModel", "unknown model accepted");
+    const wrongOrigin = nativeFunctionCopy(boundary); wrongOrigin.origin = "runtime-rtfn";
+    assert(nativeFunctionValidate(wrongOrigin, "x86_64") == "BadBoundaryFrame", "boundary origin accepted");
+    const falsePrologue = nativeFunctionCopy(boundary); falsePrologue.prologueEnd = boundary.begin + 1;
+    assert(nativeFunctionValidate(falsePrologue, "x86_64") == "BadBoundaryFrame", "boundary prologue invented");
+    const falseEvent = nativeFunctionCopy(boundary);
+    listPush(falseEvent.events, new NativeFrameEvent { before: boundary.begin, after: boundary.end, kind: "return", reg: -1, bytes: 8 });
+    assert(nativeFunctionValidate(falseEvent, "x86_64") == "BadBoundaryFrame", "boundary event invented");
+    const falseEpilogue = nativeFunctionCopy(boundary);
+    listPush(falseEpilogue.epilogues, new NativeEpilogue { begin: boundary.begin, end: boundary.end });
+    assert(nativeFunctionValidate(falseEpilogue, "x86_64") == "BadBoundaryFrame" && nativeFunctionValidate(boundary, "x86_64") == "", "boundary copy shared or invented epilogue");
+    const originalShell = listGet(cf.image.functions, 2) catch dummy;
+    assert(originalShell.origin == "ffi-callback-shell" && listLen(originalShell.epilogues) == 2, "saved frame round trip");
+    const missingEvent = new NativeFrameEvent { before: -1, after: -1, kind: "", reg: -1, bytes: 0 };
+    for (index in [0, 1, 4, 8]) {
+        const badShell = nativeFunctionCopy(originalShell);
+        const event = listGet(badShell.events, index) catch missingEvent;
+        event.reg = 5;
+        assert(nativeFunctionValidate(badShell, "x86_64") != "", "wrong restore register accepted");
+    }
+    const badSize = nativeFunctionCopy(originalShell);
+    const sizeEvent = listGet(badSize.events, 0) catch missingEvent; sizeEvent.bytes = 16;
+    assert(nativeFunctionValidate(badSize, "x86_64") != "", "wrong push size accepted");
+    const duplicateSave = nativeFunctionCopy(originalShell);
+    const duplicateEvent = listGet(duplicateSave.events, 1) catch missingEvent; duplicateEvent.reg = 3;
+    assert(nativeFunctionValidate(duplicateSave, "x86_64") != "", "duplicate save accepted");
+    assert(nativeFunctionValidate(originalShell, "x86_64") == "", "frame copy shared events");
+    const first = listGet(image.functions, 0) catch dummy;
+    const ep = listGet(first.epilogues, 1) catch new NativeEpilogue { begin: -1, end: -1 };
+    assert(listLen(first.epilogues) == 2 && first.end > ep.end, "multi-return end inferred"); ep.begin = ep.begin + 1;
+    assert(nativeFunctionValidate(first, "x86_64") != "", "invalid independent epilogue accepted");
+    const copy = listGet(cf.image.functions, 0) catch dummy;
+    assert(nativeFunctionValidate(copy, "x86_64") == "" && listLen(copy.epilogues) == 2, "object snapshot shared source");
+    asStructuredBegin();
+    assert(nativeFunctionValidate(copy, "x86_64") == "", "assembler reset mutated object snapshot");
+    const missing = asBufferNew();
+    f = rtBegin(missing, "unfinished", "", "", 0, "fixture/runtime.tx"); asBufferSubmit(missing);
+    assert(!nativeFunctionsSnapshot().ok, "missing end accepted");
+    rtEnd(f); rtEnd(f); assert(len(rtFailed(f)) > 0, "duplicate end accepted");
+    const after = asBufferNew(); f = rtBegin(after, "closed", "a", "", 0, "fixture/runtime.tx"); rtEnd(f); rtRet(f, I(0));
+    assert(len(rtFailed(f)) > 0, "emission after end accepted");
+    callBounds(); vectorBounds(); a64Frames(originalShell);
+    linkMapBegin("fixture"); linkMapAddSection(0, rawNameOf("text"), 5242880, 512, bytesLen(code), bytesLen(code));
+    linkMapAddPlacement(3, 0, 0, 5242880, bytesLen(code)); linkMapDone();
+    assert(linkMapAttachFunctions(cf.image, 3, 0) == "", "attach object snapshot");
+    const file = bytesNew(512); bytesAppend(file, code);
+    writeFileBytes(args[0] + "/fixture.obj", coffResultBytes(coff)) catch (e) { eprint(e.message); return 1; };
+    writeFileBytes(args[0] + "/fixture.o", elfObjectBytes(elf)) catch (e) { eprint(e.message); return 1; };
+    writeFileBytes(args[0] + "/plain.obj", coffResultBytes(plainCo)) catch (e) { eprint(e.message); return 1; };
+    writeFileBytes(args[0] + "/plain.o", elfObjectBytes(plainElf)) catch (e) { eprint(e.message); return 1; };
+    writeFileBytes(args[0] + "/fixture.bin", file) catch (e) { eprint(e.message); return 1; };
+    print(linkMapJson(linkMapFinish(file))); return 0;
+}

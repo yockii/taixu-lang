@@ -1,0 +1,509 @@
+// A64 反汇编（macOS 适配 M4 设计 A2、A11，docs/design/v052-macos-m4-arm64-v0.1-20261024.md）：一个 32 位指令字译成一行文本。
+// - 子集与 a64_encode.tx 相同（另认它导出的 nop、dmb ish 两个常量）。文本与 tests/a64/encodings.txt 的汇编列逐字相同：只用基本
+//   助记符（不用 mov、cmp、lsl 等别名）；逻辑立即数、movz 等的 imm16 与 brk 写十六进制，其余立即数写十进制；跳转目标写相对
+//   本条指令的字节偏移（b #8），adrp 写页偏移乘 4096 后的字节数。
+// - 严格：先按固定位认出形式、取出字段，再交给 a64_encode 里同一个编码函数重编，须与原字逐位相同才出文本——编码函数拒绝的
+//   字段组合（含写回基址与数据寄存器同号、ldp 两目标同号这类 CONSTRAINED UNPREDICTABLE）、逻辑立即数的非规范写法、保留位
+//   不为零的字都过不去。认不出的字一律得 .inst 0x%08x，不猜。
+// - 核对：bootstrap/a64_disasm_probe.tx 拿编码表正例逐条比对（scripts/test-a64-encodings.py 跑）。
+import { a64AddSubImm, a64LogicalImm, a64MoveWide, a64Bitfield, a64Adr, a64AddSubShifted, a64AddSubExt, a64LogicalShifted, a64DataProc2, a64DataProc3, a64CondSelect } from "./a64_encode";
+import { a64LdStUImm, a64LdStImm9, a64LdStReg, a64LdStPair, a64AtomicAl, a64Casal, a64AcqRel, a64Branch, a64BranchCond, a64CompareBranch, a64TestBranch, a64BranchReg, a64Brk } from "./a64_encode";
+import { a64FpInt, a64FpUnary, a64FpBinary, a64Fcmp, A64_NOP, A64_DMB_ISH } from "./a64_encode";
+
+const COND: List<string> = strSplit("eq ne hs lo mi pl vs vc hi ls ge lt gt le al nv", " ");
+const EXT: List<string> = strSplit("uxtb uxth uxtw uxtx sxtb sxth sxtw sxtx", " ");
+const SHIFT: List<string> = strSplit("lsl lsr asr ror", " ");
+const LOGIC: List<string> = strSplit("and orr eor ands bic orn eon bics", " ");
+const MOVE: List<string> = strSplit("movn - movz movk", " ");
+const BFM: List<string> = strSplit("sbfm bfm ubfm", " ");
+const DP2: List<string> = strSplit("- - udiv sdiv - - - - lslv lsrv asrv rorv", " ");
+const CSEL: List<string> = strSplit("csel csinc csinv csneg", " ");
+const ACQ: List<string> = strSplit("ldar stlr ldapr", " ");
+const BR: List<string> = strSplit("br blr ret", " ");
+const FP1: List<string> = strSplit("fmov fabs fneg fsqrt", " ");
+const FP2: List<string> = strSplit("fmul fdiv fadd fsub", " ");
+const HEX: string = "0123456789abcdef";
+
+function pick(xs: List<string>, k: int): string { return listGet(xs, k) catch "?"; }
+function sel(c: bool, a: string, b: string): string {
+    if (c) { return a; }
+    return b;
+}
+function one(c: bool): int {
+    if (c) { return 1; }
+    return 0;
+}
+// 第 lo 位起的 n 位（无符号）；sext 把低 n 位当有符号数。
+function bits(w: int, lo: int, n: int): int { return (w >>> lo) & ((1 << n) - 1); }
+function sext(v: int, n: int): int { return (v << (64 - n)) >> (64 - n); }
+
+// 无符号十六进制（小写）；不足 width 位时左补 0。
+function hex(v: int, width: int): string {
+    let s = "";
+    let x = v;
+    while (x != 0 || len(s) < width) {
+        s = strSub(HEX, x & 15, 1) + s;
+        x = x >>> 4;
+    }
+    return s;
+}
+
+// 寄存器名（同编码表的 r／wsp／fr）：r 的 31 是零寄存器；rsp 的 31 是 sp（32 位形写 wsp）；base 是读写的基址（恒 64 位，31 为 sp）。
+function r(n: int, sf: int): string {
+    if (sf == 1) {
+        if (n == 31) { return "xzr"; }
+        return "x" + toStr(n);
+    }
+    if (n == 31) { return "wzr"; }
+    return "w" + toStr(n);
+}
+function rsp(n: int, sf: int): string {
+    if (n != 31) { return r(n, sf); }
+    return sel(sf == 1, "sp", "wsp");
+}
+function base(n: int): string { return rsp(n, 1); }
+function fr(n: int, ftype: int): string { return sel(ftype == 1, "d", "s") + toStr(n); }
+
+// ---------------------------------------------------------------------------
+// 数据处理（立即数）
+// ---------------------------------------------------------------------------
+
+function addSubName(op: int, s: int): string { return sel(op == 1, "sub", "add") + sel(s == 1, "s", ""); }
+
+function addSubImm(w: int): string {
+    const sf = bits(w, 31, 1);
+    const op = bits(w, 30, 1);
+    const s = bits(w, 29, 1);
+    const sh = bits(w, 22, 1);
+    const imm12 = bits(w, 10, 12);
+    const rn = bits(w, 5, 5);
+    const rd = bits(w, 0, 5);
+    if (a64AddSubImm(sf, op, s, rd, rn, imm12, sh) != w) { return ""; }
+    const d = sel(s == 1, r(rd, sf), rsp(rd, sf));
+    return addSubName(op, s) + " " + d + ", " + rsp(rn, sf) + ", #" + toStr(imm12) + sel(sh == 1, ", lsl #12", "");
+}
+
+// 逻辑立即数 N:immr:imms 还原成值（A64 的 DecodeBitMasks）；保留编码得 0（0 本身编不出，不与真值相混）。
+// 只做还原，规范与否交给重编：immr 高出元素宽度的位、32 位形的 N＝1 都在重编时对不上。
+function bitmaskValue(sf: int, n: int, immr: int, imms: int): int {
+    const combo = (n << 6) | (~imms & 63);
+    if (combo < 2) { return 0; }
+    let lg = 6;
+    while (((combo >>> lg) & 1) == 0) { lg = lg - 1; }
+    const esize = 1 << lg;
+    const width = 32 + sf * 32;
+    if (esize > width) { return 0; }
+    const levels = esize - 1;
+    const ones = (imms & levels) + 1;
+    if (ones == esize) { return 0; }
+    const rot = immr & levels;
+    let elem = -1 >>> (64 - ones);
+    if (rot > 0) {
+        elem = (elem >>> rot) | (elem << (esize - rot));
+        if (esize < 64) { elem = elem & ((1 << esize) - 1); }
+    }
+    let v = elem;
+    let k = esize;
+    while (k < width) {
+        v = v | (v << k);
+        k = k * 2;
+    }
+    return v;
+}
+
+function logicalImm(w: int): string {
+    const sf = bits(w, 31, 1);
+    const opc = bits(w, 29, 2);
+    const value = bitmaskValue(sf, bits(w, 22, 1), bits(w, 16, 6), bits(w, 10, 6));
+    const rn = bits(w, 5, 5);
+    const rd = bits(w, 0, 5);
+    if (value == 0 || a64LogicalImm(sf, opc, rd, rn, value) != w) { return ""; }
+    const d = sel(opc == 3, r(rd, sf), rsp(rd, sf));
+    return pick(LOGIC, opc) + " " + d + ", " + r(rn, sf) + ", #0x" + hex(value, 1);
+}
+
+function moveWide(w: int): string {
+    const sf = bits(w, 31, 1);
+    const opc = bits(w, 29, 2);
+    const hw = bits(w, 21, 2);
+    const imm16 = bits(w, 5, 16);
+    const rd = bits(w, 0, 5);
+    if (a64MoveWide(sf, opc, rd, imm16, hw) != w) { return ""; }
+    return pick(MOVE, opc) + " " + r(rd, sf) + ", #0x" + hex(imm16, 1) + ", lsl #" + toStr(hw * 16);
+}
+
+function bitfield(w: int): string {
+    const sf = bits(w, 31, 1);
+    const opc = bits(w, 29, 2);
+    const immr = bits(w, 16, 6);
+    const imms = bits(w, 10, 6);
+    const rn = bits(w, 5, 5);
+    const rd = bits(w, 0, 5);
+    if (a64Bitfield(sf, opc, rd, rn, immr, imms) != w) { return ""; }
+    return pick(BFM, opc) + " " + r(rd, sf) + ", " + r(rn, sf) + ", #" + toStr(immr) + ", #" + toStr(imms);
+}
+
+function adr(w: int): string {
+    const page = bits(w, 31, 1);
+    const offset = sext((bits(w, 5, 19) << 2) | bits(w, 29, 2), 21);
+    const rd = bits(w, 0, 5);
+    if (a64Adr(page, rd, offset) != w) { return ""; }
+    if (page == 1) { return "adrp " + r(rd, 1) + ", #" + toStr(offset * 4096); }
+    return "adr " + r(rd, 1) + ", #" + toStr(offset);
+}
+
+// ---------------------------------------------------------------------------
+// 数据处理（寄存器）
+// ---------------------------------------------------------------------------
+
+function addSubShifted(w: int): string {
+    const sf = bits(w, 31, 1);
+    const op = bits(w, 30, 1);
+    const s = bits(w, 29, 1);
+    const shift = bits(w, 22, 2);
+    const rm = bits(w, 16, 5);
+    const amount = bits(w, 10, 6);
+    const rn = bits(w, 5, 5);
+    const rd = bits(w, 0, 5);
+    if (a64AddSubShifted(sf, op, s, rd, rn, rm, shift, amount) != w) { return ""; }
+    return addSubName(op, s) + " " + r(rd, sf) + ", " + r(rn, sf) + ", " + r(rm, sf) + ", " + pick(SHIFT, shift) + " #" + toStr(amount);
+}
+
+function addSubExt(w: int): string {
+    const sf = bits(w, 31, 1);
+    const op = bits(w, 30, 1);
+    const s = bits(w, 29, 1);
+    const rm = bits(w, 16, 5);
+    const option = bits(w, 13, 3);
+    const amount = bits(w, 10, 3);
+    const rn = bits(w, 5, 5);
+    const rd = bits(w, 0, 5);
+    if (a64AddSubExt(sf, op, s, rd, rn, rm, option, amount) != w) { return ""; }
+    const d = sel(s == 1, r(rd, sf), rsp(rd, sf));
+    // 只有 64 位形的 uxtx／sxtx 取 x 寄存器作 rm。
+    const msf = one(sf == 1 && (option == 3 || option == 7));
+    return addSubName(op, s) + " " + d + ", " + rsp(rn, sf) + ", " + r(rm, msf) + ", " + pick(EXT, option) + " #" + toStr(amount);
+}
+
+function logicalShifted(w: int): string {
+    const sf = bits(w, 31, 1);
+    const opc = bits(w, 29, 2);
+    const shift = bits(w, 22, 2);
+    const n = bits(w, 21, 1);
+    const rm = bits(w, 16, 5);
+    const amount = bits(w, 10, 6);
+    const rn = bits(w, 5, 5);
+    const rd = bits(w, 0, 5);
+    if (a64LogicalShifted(sf, opc, n, rd, rn, rm, shift, amount) != w) { return ""; }
+    return pick(LOGIC, n * 4 + opc) + " " + r(rd, sf) + ", " + r(rn, sf) + ", " + r(rm, sf) + ", " + pick(SHIFT, shift) + " #" + toStr(amount);
+}
+
+function dataProc2(w: int): string {
+    const sf = bits(w, 31, 1);
+    const rm = bits(w, 16, 5);
+    const opcode = bits(w, 10, 6);
+    const rn = bits(w, 5, 5);
+    const rd = bits(w, 0, 5);
+    if (a64DataProc2(sf, opcode, rd, rn, rm) != w) { return ""; }
+    return pick(DP2, opcode) + " " + r(rd, sf) + ", " + r(rn, sf) + ", " + r(rm, sf);
+}
+
+function dataProc3(w: int): string {
+    const sf = bits(w, 31, 1);
+    const op31 = bits(w, 21, 3);
+    const rm = bits(w, 16, 5);
+    const o0 = bits(w, 15, 1);
+    const ra = bits(w, 10, 5);
+    const rn = bits(w, 5, 5);
+    const rd = bits(w, 0, 5);
+    if (a64DataProc3(sf, op31, o0, rd, rn, rm, ra) != w) { return ""; }
+    if (op31 == 0) { return sel(o0 == 1, "msub", "madd") + " " + r(rd, sf) + ", " + r(rn, sf) + ", " + r(rm, sf) + ", " + r(ra, sf); }
+    if (op31 == 1 || op31 == 5) {
+        // 长乘加：目标与累加数是 x，两个乘数是 w。
+        const m = sel(op31 == 5, "u", "s") + sel(o0 == 1, "msubl", "maddl");
+        return m + " " + r(rd, 1) + ", " + r(rn, 0) + ", " + r(rm, 0) + ", " + r(ra, 1);
+    }
+    return sel(op31 == 6, "umulh", "smulh") + " " + r(rd, 1) + ", " + r(rn, 1) + ", " + r(rm, 1);
+}
+
+function condSelect(w: int): string {
+    const sf = bits(w, 31, 1);
+    const op = bits(w, 30, 1);
+    const rm = bits(w, 16, 5);
+    const cond = bits(w, 12, 4);
+    const o2 = bits(w, 10, 1);
+    const rn = bits(w, 5, 5);
+    const rd = bits(w, 0, 5);
+    if (a64CondSelect(sf, op, o2, rd, rn, rm, cond) != w) { return ""; }
+    return pick(CSEL, op * 2 + o2) + " " + r(rd, sf) + ", " + r(rn, sf) + ", " + r(rm, sf) + ", " + pick(COND, cond);
+}
+
+// ---------------------------------------------------------------------------
+// 读写
+// ---------------------------------------------------------------------------
+
+// 助记符与数据寄存器名（同编码表 ldst_name）：浮点读写是 str／ldr 加 s／d；整数按宽度加 b／h，符号扩展读是 ldrsb／ldrsh／ldrsw。
+function ldstName(size: int, v: int, opc: int): string {
+    if (v == 0 && opc >= 2) { return "ldrs" + strSub("bhw", size, 1); }
+    const m = sel(opc == 1, "ldr", "str");
+    if (v == 0 && size == 0) { return m + "b"; }
+    if (v == 0 && size == 1) { return m + "h"; }
+    return m;
+}
+function ldstRt(size: int, v: int, opc: int, rt: int): string {
+    if (v == 1) { return fr(rt, one(size == 3)); }
+    if (opc <= 1) { return r(rt, one(size == 3)); }
+    return r(rt, one(opc == 2));
+}
+
+function ldstUImm(w: int): string {
+    const size = bits(w, 30, 2);
+    const v = bits(w, 26, 1);
+    const opc = bits(w, 22, 2);
+    const offset = bits(w, 10, 12) << size;
+    const rn = bits(w, 5, 5);
+    const rt = bits(w, 0, 5);
+    if (a64LdStUImm(size, v, opc, rt, rn, offset) != w) { return ""; }
+    return ldstName(size, v, opc) + " " + ldstRt(size, v, opc, rt) + ", [" + base(rn) + ", #" + toStr(offset) + "]";
+}
+
+function ldstImm9(w: int): string {
+    const size = bits(w, 30, 2);
+    const v = bits(w, 26, 1);
+    const opc = bits(w, 22, 2);
+    const imm9 = sext(bits(w, 12, 9), 9);
+    const mode = bits(w, 10, 2);
+    const rn = bits(w, 5, 5);
+    const rt = bits(w, 0, 5);
+    if (a64LdStImm9(size, v, opc, rt, rn, imm9, mode) != w) { return ""; }
+    const m = ldstName(size, v, opc);
+    const head = " " + ldstRt(size, v, opc, rt) + ", [" + base(rn);
+    const imm = "#" + toStr(imm9);
+    // 未缩放形在助记符第三个字母处插 u：str→stur、ldrsb→ldursb。
+    if (mode == 0) { return strSub(m, 0, 2) + "u" + strSub(m, 2, len(m) - 2) + head + ", " + imm + "]"; }
+    if (mode == 1) { return m + head + "], " + imm; }
+    return m + head + ", " + imm + "]!";
+}
+
+function ldstReg(w: int): string {
+    const size = bits(w, 30, 2);
+    const v = bits(w, 26, 1);
+    const opc = bits(w, 22, 2);
+    const rm = bits(w, 16, 5);
+    const option = bits(w, 13, 3);
+    const scale = bits(w, 12, 1);
+    const rn = bits(w, 5, 5);
+    const rt = bits(w, 0, 5);
+    if (a64LdStReg(size, v, opc, rt, rn, rm, option, scale) != w) { return ""; }
+    // 不缩放时 lsl 不写、扩展名照写；缩放时写移位量（字节访问写 #0 表示 S＝1）。
+    let tail = "";
+    if (scale == 1) { tail = ", " + sel(option == 3, "lsl", pick(EXT, option)) + " #" + toStr(size); }
+    else if (option != 3) { tail = ", " + pick(EXT, option); }
+    const idx = r(rm, one(option == 3 || option == 7));
+    return ldstName(size, v, opc) + " " + ldstRt(size, v, opc, rt) + ", [" + base(rn) + ", " + idx + tail + "]";
+}
+
+function ldstPair(w: int): string {
+    const opc = bits(w, 30, 2);
+    const v = bits(w, 26, 1);
+    const mode = bits(w, 23, 2);
+    const l = bits(w, 22, 1);
+    const imm7 = sext(bits(w, 15, 7), 7);
+    const rt2 = bits(w, 10, 5);
+    const rn = bits(w, 5, 5);
+    const rt = bits(w, 0, 5);
+    // 元素宽度：x 与 d 为 8，w 与 s 为 4；别的 opc／v 组合（ldpsw、q 寄存器）由重编拒绝。
+    let unit = 4;
+    if (opc == 2 || (v == 1 && opc == 1)) { unit = 8; }
+    const offset = imm7 * unit;
+    if (a64LdStPair(opc, v, l, rt, rt2, rn, offset, mode) != w) { return ""; }
+    let a = r(rt, one(opc == 2));
+    let b = r(rt2, one(opc == 2));
+    if (v == 1) {
+        a = fr(rt, opc);
+        b = fr(rt2, opc);
+    }
+    const head = sel(l == 1, "ldp", "stp") + " " + a + ", " + b + ", [" + base(rn);
+    const imm = "#" + toStr(offset);
+    if (mode == 1) { return head + "], " + imm; }
+    if (mode == 2) { return head + ", " + imm + "]"; }
+    return head + ", " + imm + "]!";
+}
+
+// ---------------------------------------------------------------------------
+// 原子（LSE）与获取／释放
+// ---------------------------------------------------------------------------
+
+function atomicAl(w: int): string {
+    const size = bits(w, 30, 2);
+    const rs = bits(w, 16, 5);
+    const swp = bits(w, 15, 1);
+    const rn = bits(w, 5, 5);
+    const rt = bits(w, 0, 5);
+    if (a64AtomicAl(size, swp, rs, rt, rn) != w) { return ""; }
+    return sel(swp == 1, "swpal", "ldaddal") + " " + r(rs, size - 2) + ", " + r(rt, size - 2) + ", [" + base(rn) + "]";
+}
+
+function casal(w: int): string {
+    const size = bits(w, 30, 2);
+    const rs = bits(w, 16, 5);
+    const rn = bits(w, 5, 5);
+    const rt = bits(w, 0, 5);
+    if (a64Casal(size, rs, rt, rn) != w) { return ""; }
+    return "casal " + r(rs, size - 2) + ", " + r(rt, size - 2) + ", [" + base(rn) + "]";
+}
+
+function acqRel(w: int, kind: int): string {
+    const size = bits(w, 30, 2);
+    const rn = bits(w, 5, 5);
+    const rt = bits(w, 0, 5);
+    if (a64AcqRel(kind, size, rt, rn) != w) { return ""; }
+    const m = pick(ACQ, kind) + sel(size == 0, "b", sel(size == 1, "h", ""));
+    return m + " " + r(rt, one(size == 3)) + ", [" + base(rn) + "]";
+}
+
+// ---------------------------------------------------------------------------
+// 跳转与系统（偏移相对本条指令，单位字节）
+// ---------------------------------------------------------------------------
+
+function branch(w: int): string {
+    const link = bits(w, 31, 1);
+    const offset = sext(bits(w, 0, 26), 26) * 4;
+    if (a64Branch(link, offset) != w) { return ""; }
+    return sel(link == 1, "bl", "b") + " #" + toStr(offset);
+}
+
+function branchCond(w: int): string {
+    const cond = bits(w, 0, 4);
+    const offset = sext(bits(w, 5, 19), 19) * 4;
+    if (a64BranchCond(cond, offset) != w) { return ""; }
+    return "b." + pick(COND, cond) + " #" + toStr(offset);
+}
+
+function compareBranch(w: int): string {
+    const sf = bits(w, 31, 1);
+    const nz = bits(w, 24, 1);
+    const offset = sext(bits(w, 5, 19), 19) * 4;
+    const rt = bits(w, 0, 5);
+    if (a64CompareBranch(sf, nz, rt, offset) != w) { return ""; }
+    return sel(nz == 1, "cbnz", "cbz") + " " + r(rt, sf) + ", #" + toStr(offset);
+}
+
+function testBranch(w: int): string {
+    const bit = (bits(w, 31, 1) << 5) | bits(w, 19, 5);
+    const nz = bits(w, 24, 1);
+    const offset = sext(bits(w, 5, 14), 14) * 4;
+    const rt = bits(w, 0, 5);
+    if (a64TestBranch(nz, rt, bit, offset) != w) { return ""; }
+    return sel(nz == 1, "tbnz", "tbz") + " " + r(rt, one(bit >= 32)) + ", #" + toStr(bit) + ", #" + toStr(offset);
+}
+
+function branchReg(w: int): string {
+    const kind = bits(w, 21, 2);
+    const rn = bits(w, 5, 5);
+    if (a64BranchReg(kind, rn) != w) { return ""; }
+    return pick(BR, kind) + " " + r(rn, 1);
+}
+
+function brk(w: int): string {
+    const imm16 = bits(w, 5, 16);
+    if (a64Brk(imm16) != w) { return ""; }
+    return "brk #0x" + hex(imm16, 1);
+}
+
+// ---------------------------------------------------------------------------
+// 浮点（ftype 0 单精度、1 双精度）
+// ---------------------------------------------------------------------------
+
+function fpInt(w: int): string {
+    const sf = bits(w, 31, 1);
+    const ftype = bits(w, 22, 1);
+    const rmode = bits(w, 19, 2);
+    const opcode = bits(w, 16, 3);
+    const rn = bits(w, 5, 5);
+    const rd = bits(w, 0, 5);
+    if (a64FpInt(sf, ftype, rmode, opcode, rd, rn) != w) { return ""; }
+    if (rmode == 0 && opcode == 6) { return "fmov " + r(rd, sf) + ", " + fr(rn, ftype); }
+    if (rmode == 0 && opcode == 7) { return "fmov " + fr(rd, ftype) + ", " + r(rn, sf); }
+    if (rmode == 0) { return sel(opcode == 3, "ucvtf", "scvtf") + " " + fr(rd, ftype) + ", " + r(rn, sf); }
+    return sel(opcode == 1, "fcvtzu", "fcvtzs") + " " + r(rd, sf) + ", " + fr(rn, ftype);
+}
+
+function fpUnary(w: int): string {
+    const ftype = bits(w, 22, 1);
+    const opcode = bits(w, 15, 6);
+    const rn = bits(w, 5, 5);
+    const rd = bits(w, 0, 5);
+    if (a64FpUnary(ftype, opcode, rd, rn) != w) { return ""; }
+    // fcvt：opcode 4 到单精度、5 到双精度，ftype 是源的类型。
+    if (opcode == 4 || opcode == 5) { return "fcvt " + fr(rd, opcode - 4) + ", " + fr(rn, ftype); }
+    return pick(FP1, opcode) + " " + fr(rd, ftype) + ", " + fr(rn, ftype);
+}
+
+function fpBinary(w: int): string {
+    const ftype = bits(w, 22, 1);
+    const rm = bits(w, 16, 5);
+    const opcode = bits(w, 12, 4);
+    const rn = bits(w, 5, 5);
+    const rd = bits(w, 0, 5);
+    if (a64FpBinary(ftype, opcode, rd, rn, rm) != w) { return ""; }
+    return pick(FP2, opcode) + " " + fr(rd, ftype) + ", " + fr(rn, ftype) + ", " + fr(rm, ftype);
+}
+
+function fcmp(w: int): string {
+    const ftype = bits(w, 22, 1);
+    const rm = bits(w, 16, 5);
+    const rn = bits(w, 5, 5);
+    const zero = bits(w, 3, 1);
+    if (a64Fcmp(ftype, rn, rm, zero) != w) { return ""; }
+    if (zero == 1) { return "fcmp " + fr(rn, ftype) + ", #0.0"; }
+    return "fcmp " + fr(rn, ftype) + ", " + fr(rm, ftype);
+}
+
+// ---------------------------------------------------------------------------
+// 分派：各形式的固定位（掩码＋值）两两不相交，次序无关；认出形式后仍要过重编。
+// ---------------------------------------------------------------------------
+
+function decode(w: int): string {
+    if (w == A64_NOP) { return "nop"; }
+    if (w == A64_DMB_ISH) { return "dmb ish"; }
+    if ((w & 0x1F000000) == 0x10000000) { return adr(w); }
+    if ((w & 0x1F800000) == 0x11000000) { return addSubImm(w); }
+    if ((w & 0x1F800000) == 0x12000000) { return logicalImm(w); }
+    if ((w & 0x1F800000) == 0x12800000) { return moveWide(w); }
+    if ((w & 0x1F800000) == 0x13000000) { return bitfield(w); }
+    if ((w & 0x1F200000) == 0x0B000000) { return addSubShifted(w); }
+    if ((w & 0x1FE00000) == 0x0B200000) { return addSubExt(w); }
+    if ((w & 0x1F000000) == 0x0A000000) { return logicalShifted(w); }
+    if ((w & 0x7FE00000) == 0x1AC00000) { return dataProc2(w); }
+    if ((w & 0x7F000000) == 0x1B000000) { return dataProc3(w); }
+    if ((w & 0x3FE00800) == 0x1A800000) { return condSelect(w); }
+    if ((w & 0x3B000000) == 0x39000000) { return ldstUImm(w); }
+    if ((w & 0x3B200000) == 0x38000000) { return ldstImm9(w); }
+    if ((w & 0x3B200C00) == 0x38200800) { return ldstReg(w); }
+    if ((w & 0x3A000000) == 0x28000000) { return ldstPair(w); }
+    if ((w & 0x3FE07C00) == 0x38E00000) { return atomicAl(w); }
+    if ((w & 0x3FE0FC00) == 0x08E0FC00) { return casal(w); }
+    if ((w & 0x3FFFFC00) == 0x08DFFC00) { return acqRel(w, 0); }
+    if ((w & 0x3FFFFC00) == 0x089FFC00) { return acqRel(w, 1); }
+    if ((w & 0x3FFFFC00) == 0x38BFC000) { return acqRel(w, 2); }
+    if ((w & 0x7C000000) == 0x14000000) { return branch(w); }
+    if ((w & 0xFF000010) == 0x54000000) { return branchCond(w); }
+    if ((w & 0x7E000000) == 0x34000000) { return compareBranch(w); }
+    if ((w & 0x7E000000) == 0x36000000) { return testBranch(w); }
+    if ((w & 0xFF9FFC1F) == 0xD61F0000) { return branchReg(w); }
+    if ((w & 0xFFE0001F) == 0xD4200000) { return brk(w); }
+    if ((w & 0x7FA0FC00) == 0x1E200000) { return fpInt(w); }
+    if ((w & 0xFFA07C00) == 0x1E204000) { return fpUnary(w); }
+    if ((w & 0xFFA00C00) == 0x1E200800) { return fpBinary(w); }
+    if ((w & 0xFFA0FC17) == 0x1E202000) { return fcmp(w); }
+    return "";
+}
+
+/// 反汇编一个指令字（只看低 32 位）：子集内得一行汇编文本，否则得 .inst 0x%08x。
+export function a64Disasm(word: int): string {
+    const w = word & 0xFFFFFFFF;
+    const t = decode(w);
+    if (len(t) > 0) { return t; }
+    return ".inst 0x" + hex(w, 8);
+}

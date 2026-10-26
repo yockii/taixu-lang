@@ -1,0 +1,518 @@
+// NRT Bytes builtins (D3 v0.18; docs/design/v052-bytes-embed-stage0-v0.1-20261013.md §三).
+// O4 第二步 2c2 起，Bytes（值标签 17）与紧凑 List<u8>（标签 15）是同一种对象形态：kind 10、payload kind 7、
+// form 3、elem 4（u8），ptr@32 len@40 cap@48；cap 按字节计且 ≥ len，cap≠0 当且仅当 ptr 是本对象独占的块
+// （释放走列表的 list_destroy：cap≠0 才 free）。空的 Bytes 不持有块（ptr 为哨兵 1 或 0，cap 0）。经
+// bytesAsList/listAsBytes 两侧可交替修改，len 可能变小（listPop 等）。字符串仍是字符串形态（kind 1、pk 0）。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, L, I, A } from "./rtfn_base";
+import { rtBegin, rtSet, rtOp, rtShift, rtLoad, rtStore, rtLabel, rtJump, rtIf, rtIf32, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtCall5, rtRet, rtRetVoid, rtF32BitsToF64, rtF64ToF32Bits } from "./rtfn";
+import { ARITY, check, text, memcpyName, trapText, trapAt, arity, argTag, strSpan, nrtTarget, frozenGuard, pinGuard } from "./nrt_base";
+import { tSysV } from "./target";
+import { leakStamp } from "./nrt_leak";
+
+export const NRT_BYTES_EXPORTS: string = "__tx_bi_bytes_new __tx_bi_bytes_len __tx_bi_bytes_get __tx_bi_bytes_set __tx_bi_bytes_push __tx_bi_bytes_append __tx_bi_bytes_slice __tx_bi_bytes_equal __tx_bi_bytes_from_str __tx_bi_bytes_to_str __tx_bi_read_file_bytes __tx_bi_bytes_as_list __tx_bi_list_as_bytes __tx_bi_bytes_copy __tx_bi_bytes_fill __tx_bi_bytes_get_num __tx_bi_bytes_set_num";
+
+const TAG_BYTES: int = 17;
+
+function memsetName(): string { if (tSysV(nrtTarget())) { return "__tx_linux_memset"; } return "memset"; }
+function memmoveName(): string { if (tSysV(nrtTarget())) { return "__tx_linux_memmove"; } return "memmove"; }
+
+// Object address of the Bytes value in slot `slot` into `o`.
+function bytesObj(f: Ref<RtFn>, slot: string, o: string): void {
+    rtLoad(f, o, L(slot), 8, 4);
+    rtCall1(f, o, "__tx_native_object_address_v1", L(o));
+}
+
+export function emitNrtBytes(b: Ref<StructuredBuffer>): void {
+    // Object flags: 16 frozen, 32 shared-block payload borrow, 64 transient FFI pin. 借用期内任何改变长度的操作
+    // 由各内建在入口按调用处报 4024（D3 v0.34 §6.8-16）；这里是迁移数据区之前的兜底，不看容量。冻结与借用共享块
+    // 载荷的对象同样由各内建在入口报 4022；这里一并兜底（借用载荷审计，设计 v052-borrowed-payload-audit）：借用的
+    // Bytes 与 List 容量等于长度、看似自有缓冲，漏了入口检查的调用方会把指向共享块的数据区当自有块重新分配。
+    const guard = rtBegin(b, "__tx_nrt_buffer_pin_check", "o", "flags", 5, "bootstrap/selfhost/nrt_bytes.tx");
+    rtLoad(guard, "flags", L("o"), 0, 4); rtOp(guard, "flags", L("flags"), "and", I(112));
+    rtIf(guard, L("flags"), "eq", I(0), "ok");
+    rtIf(guard, L("flags"), "lt", I(64), "frozen");
+    const message = "FFI 借用期间不能改变 Bytes 的长度（含 List<u8> 别名）";
+    const label = text(b, message);
+    // No source call site is passed to this shared backing helper; report unknown rather than inventing fn 0.
+    rtCall5(guard, "", "__tx_trap", I(-1), I(0), I(4024), A(label), I(len(message)));
+    rtLabel(guard, "frozen");
+    const fmessage = "冻结或借用共享块载荷的对象不能改变长度（frozen_write）";
+    const flabel = text(b, fmessage);
+    rtCall5(guard, "", "__tx_trap", I(-1), I(0), I(4022), A(flabel), I(len(fmessage)));
+    rtLabel(guard, "ok"); rtRetVoid(guard); check(guard);
+    emitBytesBasic(b);
+    emitBytesGrow(b);
+    emitBytesConvert(b);
+    emitBytesBulk(b);
+}
+
+function emitBytesBasic(b: Ref<StructuredBuffer>): void {
+    // bytesNew(n): n zero bytes; n < 0 traps.
+    let f = rtBegin(b, "__tx_bi_bytes_new", "win fn pc a nargs", "s t n q", 5, "bootstrap/selfhost/nrt_bytes.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", 1, "type");
+    rtLoad(f, "n", L("s"), 8, 8);
+    rtIf(f, L("n"), "lt", I(0), "neg");
+    rtSet(f, "q", I(0));
+    rtIf(f, L("n"), "eq", I(0), "make");
+    rtCall2(f, "q", "__tx_native_mem_alloc", L("n"), I(1));
+    rtIf(f, L("q"), "eq", I(0), "oom");
+    rtCall3(f, "", memsetName(), L("q"), I(0), L("n"));
+    rtLabel(f, "make");
+    rtCall2(f, "q", "__tx_nrt_u8_take", L("q"), L("n"));
+    leakStamp(f, "q", "stamped");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_BYTES), L("q"));
+    rtRetVoid(f);
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "bytesNew 的长度不是 int");
+    trapAt(b, f, "neg", 4002, "bytesNew 长度为负");
+    rtRetVoid(f); check(f);
+
+    // bytesLen(b): int.
+    f = rtBegin(b, "__tx_bi_bytes_len", "win fn pc a nargs", "s t o n", 5, "bootstrap/selfhost/nrt_bytes.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", TAG_BYTES, "type");
+    bytesObj(f, "s", "o"); rtLoad(f, "n", L("o"), 40, 8);
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(1), L("n"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "bytesLen 的实参不是 Bytes");
+    rtRetVoid(f); check(f);
+
+    // bytesGet(b, i): int? — out of range → None (same as listGet).
+    f = rtBegin(b, "__tx_bi_bytes_get", "win fn pc a nargs", "s t x i o n p v", 5, "bootstrap/selfhost/nrt_bytes.tx");
+    arity(b, f, 2);
+    argTag(f, 0, "s", "t", TAG_BYTES, "type");
+    argTag(f, 1, "x", "t", 1, "itype");
+    rtLoad(f, "i", L("x"), 8, 8);
+    bytesObj(f, "s", "o"); rtLoad(f, "n", L("o"), 40, 8);
+    rtIf(f, L("i"), "lt", I(0), "none"); rtIf(f, L("i"), "ge", L("n"), "none");
+    rtLoad(f, "p", L("o"), 32, 8); rtOp(f, "p", L("p"), "add", L("i")); rtLoad(f, "v", L("p"), 0, 1);
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(1), L("v"));
+    rtRetVoid(f);
+    rtLabel(f, "none"); rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(4), I(0)); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "bytesGet 第一实参不是 Bytes");
+    trapAt(b, f, "itype", 4010, "bytesGet 索引不是 int");
+    rtRetVoid(f); check(f);
+
+    // bytesSet(b, i, v): out of range or v outside 0..255 traps; the result slot is untouched.
+    f = rtBegin(b, "__tx_bi_bytes_set", "win fn pc a nargs", "s t x i y v o n p", 5, "bootstrap/selfhost/nrt_bytes.tx");
+    arity(b, f, 3);
+    argTag(f, 0, "s", "t", TAG_BYTES, "type");
+    frozenGuard(f, "s", "t", "frozen");
+    argTag(f, 1, "x", "t", 1, "itype");
+    argTag(f, 2, "y", "t", 1, "vtype");
+    rtLoad(f, "i", L("x"), 8, 8); rtLoad(f, "v", L("y"), 8, 8);
+    bytesObj(f, "s", "o"); rtLoad(f, "n", L("o"), 40, 8);
+    rtIf(f, L("i"), "lt", I(0), "oob"); rtIf(f, L("i"), "ge", L("n"), "oob");
+    rtIf(f, L("v"), "lt", I(0), "range"); rtIf(f, L("v"), "gt", I(255), "range");
+    rtLoad(f, "p", L("o"), 32, 8); rtOp(f, "p", L("p"), "add", L("i")); rtStore(f, L("p"), 0, L("v"), 1);
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "bytesSet 第一实参不是 Bytes");
+    trapAt(b, f, "itype", 4010, "bytesSet 索引不是 int");
+    trapAt(b, f, "vtype", 4010, "bytesSet 字节值不是 int");
+    trapAt(b, f, "oob", 4002, "bytesSet 索引越界");
+    trapAt(b, f, "range", 4002, "bytesSet 字节值须为 0..255");
+    rtRetVoid(f); rtLabel(f, "frozen"); trapText(b, f, 4022, "bytesSet 写入了冻结的 Bytes（来自 Shared，深度不可变）");
+    rtRetVoid(f); check(f);
+
+    // bytesEqual(x, y): same length and same bytes.
+    f = rtBegin(b, "__tx_bi_bytes_equal", "win fn pc a nargs", "s t r xo yo n m p q i u v", 5, "bootstrap/selfhost/nrt_bytes.tx");
+    arity(b, f, 2);
+    argTag(f, 0, "s", "t", TAG_BYTES, "type");
+    argTag(f, 1, "r", "t", TAG_BYTES, "type");
+    bytesObj(f, "s", "xo"); bytesObj(f, "r", "yo");
+    rtLoad(f, "n", L("xo"), 40, 8); rtLoad(f, "m", L("yo"), 40, 8);
+    rtIf(f, L("n"), "ne", L("m"), "no");
+    rtLoad(f, "p", L("xo"), 32, 8); rtLoad(f, "q", L("yo"), 32, 8);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "loop");
+    rtIf(f, L("i"), "ge", L("n"), "yes");
+    rtLoad(f, "u", L("p"), 0, 1); rtLoad(f, "v", L("q"), 0, 1);
+    rtIf(f, L("u"), "ne", L("v"), "no");
+    rtOp(f, "p", L("p"), "add", I(1)); rtOp(f, "q", L("q"), "add", I(1)); rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "loop");
+    rtLabel(f, "yes"); rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(3), I(1)); rtRetVoid(f);
+    rtLabel(f, "no"); rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(3), I(0)); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "bytesEqual 的实参不是 Bytes");
+    rtRetVoid(f); check(f);
+}
+
+function emitBytesGrow(b: Ref<StructuredBuffer>): void {
+    // __tx_nrt_u8_reserve(o, need)：列表形态的 Bytes 容量 ≥ need（need > len）。倍增、至少 16；cap≠0 时 realloc
+    // 保留前 len 字节，否则新分配（不持有块的对象 len 为 0；为稳妥仍拷贝 len 字节、不释放原指针）。
+    let g = rtBegin(b, "__tx_nrt_u8_reserve", "o need", "n c p q", 4, "bootstrap/selfhost/nrt_bytes.tx");
+    rtLoad(g, "n", L("o"), 40, 8); rtLoad(g, "c", L("o"), 48, 8);
+    rtIf(g, L("need"), "le", L("c"), "done");
+    rtCall1(g, "", "__tx_nrt_buffer_pin_check", L("o"));
+    rtLoad(g, "p", L("o"), 32, 8);
+    rtIf(g, L("c"), "ne", I(0), "grow");
+    rtSet(g, "c", L("need"));
+    rtIf(g, L("c"), "ge", I(16), "fresh");
+    rtSet(g, "c", I(16));
+    rtLabel(g, "fresh");
+    rtCall2(g, "q", "__tx_native_mem_alloc", L("c"), I(1));
+    rtIf(g, L("q"), "eq", I(0), "oom");
+    rtIf(g, L("n"), "eq", I(0), "got");
+    rtCall3(g, "", memcpyName(), L("q"), L("p"), L("n"));
+    rtJump(g, "got");
+    rtLabel(g, "grow");
+    rtOp(g, "c", L("c"), "add", L("c"));
+    rtIf(g, L("c"), "ge", I(16), "big");
+    rtSet(g, "c", I(16));
+    rtLabel(g, "big");
+    rtIf(g, L("c"), "ge", L("need"), "sized");
+    rtSet(g, "c", L("need"));
+    rtLabel(g, "sized");
+    rtCall4(g, "q", "__tx_native_mem_realloc", L("p"), L("n"), L("c"), I(1));
+    rtIf(g, L("q"), "eq", I(0), "oom");
+    rtLabel(g, "got");
+    rtStore(g, L("o"), 32, L("q"), 8); rtStore(g, L("o"), 48, L("c"), 8);
+    rtLabel(g, "done"); rtRetVoid(g);
+    rtLabel(g, "oom"); rtCall0(g, "", "__tx_native_object_oom_v1"); rtRetVoid(g); check(g);
+
+    // __tx_nrt_bytes_reserve(o, need): capacity ≥ need (need > len). Doubles,
+    // minimum 16; the sentinel buffer of an empty Bytes is never reallocated.
+    let f = rtBegin(b, "__tx_nrt_bytes_reserve", "o need", "n c p q", 4, "bootstrap/selfhost/nrt_bytes.tx");
+    rtLoad(f, "n", L("o"), 40, 8); rtLoad(f, "c", L("o"), 48, 8);
+    rtIf(f, L("c"), "ne", I(0), "have");
+    rtSet(f, "c", L("n"));
+    rtLabel(f, "have");
+    rtIf(f, L("need"), "le", L("c"), "done");
+    rtCall1(f, "", "__tx_nrt_buffer_pin_check", L("o"));
+    rtOp(f, "c", L("c"), "add", L("c"));
+    rtIf(f, L("c"), "ge", I(16), "big");
+    rtSet(f, "c", I(16));
+    rtLabel(f, "big");
+    rtIf(f, L("c"), "ge", L("need"), "sized");
+    rtSet(f, "c", L("need"));
+    rtLabel(f, "sized");
+    rtLoad(f, "p", L("o"), 32, 8);
+    rtIf(f, L("n"), "ne", I(0), "grow");
+    rtCall2(f, "q", "__tx_native_mem_alloc", L("c"), I(1));
+    rtJump(f, "got");
+    rtLabel(f, "grow");
+    rtCall4(f, "q", "__tx_native_mem_realloc", L("p"), L("n"), L("c"), I(1));
+    rtLabel(f, "got");
+    rtIf(f, L("q"), "eq", I(0), "oom");
+    rtStore(f, L("o"), 32, L("q"), 8); rtStore(f, L("o"), 48, L("c"), 8);
+    rtLabel(f, "done"); rtRetVoid(f);
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRetVoid(f); check(f);
+
+    // bytesPush(b, v): append one byte; v outside 0..255 traps.
+    f = rtBegin(b, "__tx_bi_bytes_push", "win fn pc a nargs", "s t y v o n p", 5, "bootstrap/selfhost/nrt_bytes.tx");
+    arity(b, f, 2);
+    argTag(f, 0, "s", "t", TAG_BYTES, "type");
+    frozenGuard(f, "s", "t", "frozen");
+    argTag(f, 1, "y", "t", 1, "vtype");
+    rtLoad(f, "v", L("y"), 8, 8);
+    rtIf(f, L("v"), "lt", I(0), "range"); rtIf(f, L("v"), "gt", I(255), "range");
+    bytesObj(f, "s", "o"); pinGuard(f, "o", "t", "pinned"); rtLoad(f, "n", L("o"), 40, 8);
+    rtOp(f, "p", L("n"), "add", I(1));
+    rtCall2(f, "", "__tx_nrt_u8_reserve", L("o"), L("p"));
+    rtLoad(f, "p", L("o"), 32, 8); rtOp(f, "p", L("p"), "add", L("n")); rtStore(f, L("p"), 0, L("v"), 1);
+    rtOp(f, "n", L("n"), "add", I(1)); rtStore(f, L("o"), 40, L("n"), 8);
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "bytesPush 第一实参不是 Bytes");
+    trapAt(b, f, "vtype", 4010, "bytesPush 字节值不是 int");
+    trapAt(b, f, "range", 4002, "bytesPush 字节值须为 0..255");
+    trapAt(b, f, "pinned", 4024, "bytesPush 改变了外部调用借用中的 Bytes 的长度");
+    rtRetVoid(f); rtLabel(f, "frozen"); trapText(b, f, 4022, "bytesPush 写入了冻结的 Bytes（来自 Shared，深度不可变）");
+    rtRetVoid(f); check(f);
+
+    // bytesAppend(dst, src): src may be dst; its span is re-read after growth.
+    f = rtBegin(b, "__tx_bi_bytes_append", "win fn pc a nargs", "s t r o so n m p q", 5, "bootstrap/selfhost/nrt_bytes.tx");
+    arity(b, f, 2);
+    argTag(f, 0, "s", "t", TAG_BYTES, "type");
+    frozenGuard(f, "s", "t", "frozen");
+    argTag(f, 1, "r", "t", TAG_BYTES, "type");
+    bytesObj(f, "s", "o"); bytesObj(f, "r", "so");
+    rtLoad(f, "n", L("o"), 40, 8); rtLoad(f, "m", L("so"), 40, 8);
+    rtIf(f, L("m"), "eq", I(0), "done");
+    pinGuard(f, "o", "t", "pinned");
+    rtOp(f, "p", L("n"), "add", L("m"));
+    rtCall2(f, "", "__tx_nrt_u8_reserve", L("o"), L("p"));
+    rtLoad(f, "p", L("o"), 32, 8); rtOp(f, "p", L("p"), "add", L("n"));
+    rtLoad(f, "q", L("so"), 32, 8);
+    rtCall3(f, "", memcpyName(), L("p"), L("q"), L("m"));
+    rtOp(f, "n", L("n"), "add", L("m")); rtStore(f, L("o"), 40, L("n"), 8);
+    rtLabel(f, "done"); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "bytesAppend 的实参不是 Bytes");
+    trapAt(b, f, "pinned", 4024, "bytesAppend 改变了外部调用借用中的 Bytes 的长度");
+    rtRetVoid(f); rtLabel(f, "frozen"); trapText(b, f, 4022, "bytesAppend 写入了冻结的 Bytes（来自 Shared，深度不可变）");
+    rtRetVoid(f); check(f);
+}
+
+function emitBytesConvert(b: Ref<StructuredBuffer>): void {
+    // bytesSlice(b, from, count): a copy; from/count outside the bytes trap.
+    let f = rtBegin(b, "__tx_bi_bytes_slice", "win fn pc a nargs", "s t x y i c o n p q", 5, "bootstrap/selfhost/nrt_bytes.tx");
+    arity(b, f, 3);
+    argTag(f, 0, "s", "t", TAG_BYTES, "type");
+    argTag(f, 1, "x", "t", 1, "itype");
+    argTag(f, 2, "y", "t", 1, "itype");
+    rtLoad(f, "i", L("x"), 8, 8); rtLoad(f, "c", L("y"), 8, 8);
+    bytesObj(f, "s", "o"); rtLoad(f, "n", L("o"), 40, 8);
+    rtIf(f, L("i"), "lt", I(0), "oob"); rtIf(f, L("c"), "lt", I(0), "oob");
+    rtIf(f, L("i"), "gt", L("n"), "oob");
+    rtOp(f, "q", L("n"), "sub", L("i")); rtIf(f, L("c"), "gt", L("q"), "oob");
+    rtLoad(f, "p", L("o"), 32, 8); rtOp(f, "p", L("p"), "add", L("i"));
+    rtCall2(f, "q", "__tx_nrt_u8_copy", L("p"), L("c"));
+    leakStamp(f, "q", "stamped");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_BYTES), L("q"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "bytesSlice 第一实参不是 Bytes");
+    trapAt(b, f, "itype", 4010, "bytesSlice 的起始与计数须为 int");
+    trapAt(b, f, "oob", 4002, "bytesSlice 越界");
+    rtRetVoid(f); check(f);
+
+    // bytesFromStr(s): a copy of the string's UTF-8 bytes.
+    f = rtBegin(b, "__tx_bi_bytes_from_str", "win fn pc a nargs", "s t p n q", 5, "bootstrap/selfhost/nrt_bytes.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", 6, "type");
+    strSpan(f, "s", "p", "n");
+    rtCall2(f, "q", "__tx_nrt_u8_copy", L("p"), L("n"));
+    leakStamp(f, "q", "stamped");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_BYTES), L("q"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "bytesFromStr 的实参不是 string");
+    rtRetVoid(f); check(f);
+
+    // bytesToStr(b): string | Error — strict UTF-8 (no overlongs, surrogates or > U+10FFFF).
+    const bad = "bytesToStr: 不是合法的 UTF-8";
+    const badLabel = text(b, bad);
+    f = rtBegin(b, "__tx_bi_bytes_to_str", "win fn pc a nargs", "s t o p n e c d k lo hi q", 5, "bootstrap/selfhost/nrt_bytes.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", TAG_BYTES, "type");
+    bytesObj(f, "s", "o"); rtLoad(f, "p", L("o"), 32, 8); rtLoad(f, "n", L("o"), 40, 8);
+    rtOp(f, "e", L("p"), "add", L("n"));
+    rtLabel(f, "lead");
+    rtIf(f, L("p"), "uge", L("e"), "valid");
+    rtLoad(f, "c", L("p"), 0, 1); rtOp(f, "p", L("p"), "add", I(1));
+    rtIf(f, L("c"), "lt", I(128), "lead");
+    rtSet(f, "lo", I(128)); rtSet(f, "hi", I(191));
+    rtIf(f, L("c"), "lt", I(194), "invalid");
+    rtSet(f, "k", I(1)); rtIf(f, L("c"), "le", I(223), "first");
+    rtSet(f, "k", I(2));
+    rtIf(f, L("c"), "ne", I(224), "e1"); rtSet(f, "lo", I(160)); rtJump(f, "first");
+    rtLabel(f, "e1"); rtIf(f, L("c"), "ne", I(237), "e2"); rtSet(f, "hi", I(159)); rtJump(f, "first");
+    rtLabel(f, "e2"); rtIf(f, L("c"), "le", I(239), "first");
+    rtSet(f, "k", I(3)); rtIf(f, L("c"), "gt", I(244), "invalid");
+    rtIf(f, L("c"), "ne", I(240), "f4"); rtSet(f, "lo", I(144)); rtJump(f, "first");
+    rtLabel(f, "f4"); rtIf(f, L("c"), "ne", I(244), "first"); rtSet(f, "hi", I(143));
+    rtLabel(f, "first");
+    // First continuation byte uses [lo, hi]; the rest use [128, 191].
+    rtIf(f, L("p"), "uge", L("e"), "invalid");
+    rtLoad(f, "d", L("p"), 0, 1); rtOp(f, "p", L("p"), "add", I(1));
+    rtIf(f, L("d"), "lt", L("lo"), "invalid"); rtIf(f, L("d"), "gt", L("hi"), "invalid");
+    rtOp(f, "k", L("k"), "sub", I(1));
+    rtLabel(f, "cont");
+    rtIf(f, L("k"), "eq", I(0), "lead");
+    rtIf(f, L("p"), "uge", L("e"), "invalid");
+    rtLoad(f, "d", L("p"), 0, 1); rtOp(f, "p", L("p"), "add", I(1));
+    rtIf(f, L("d"), "lt", I(128), "invalid"); rtIf(f, L("d"), "gt", I(191), "invalid");
+    rtOp(f, "k", L("k"), "sub", I(1)); rtJump(f, "cont");
+    rtLabel(f, "valid");
+    bytesObj(f, "s", "o"); rtLoad(f, "p", L("o"), 32, 8);
+    rtCall3(f, "q", "__tx_nrt_str_copy", L("p"), L("n"), I(1));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(6), L("q"));
+    rtRetVoid(f);
+    rtLabel(f, "invalid");
+    rtCall3(f, "q", "__tx_nrt_str_copy", A(badLabel), I(len(bad)), I(2));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(5), L("q"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "bytesToStr 的实参不是 Bytes");
+    rtRetVoid(f); check(f);
+
+    // readFileBytes(path): readFile's file read; the content buffer moves from the string into a Bytes object
+    // (O4 step 2c2: the string gives up its buffer — len 0, sentinel ptr — and is released by the slot write).
+    f = rtBegin(b, "__tx_bi_read_file_bytes", "win fn pc a nargs", "p t o q n", 5, "bootstrap/selfhost/nrt_bytes.tx");
+    rtCall5(f, "", "__tx_bi_read_file", L("win"), L("fn"), L("pc"), L("a"), L("nargs"));
+    rtOp(f, "p", L("a"), "and", I(4294967295)); rtShift(f, "p", L("p"), "shl", 4); rtOp(f, "p", L("p"), "add", L("win"));
+    rtLoad(f, "t", L("p"), 0, 1);
+    rtIf(f, L("t"), "ne", I(6), "done");
+    rtLoad(f, "o", L("p"), 8, 4); rtCall1(f, "o", "__tx_native_object_address_v1", L("o"));
+    rtLoad(f, "q", L("o"), 32, 8); rtLoad(f, "n", L("o"), 40, 8);
+    rtStore(f, L("o"), 32, I(1), 8); rtStore(f, L("o"), 40, I(0), 8);
+    rtCall2(f, "q", "__tx_nrt_u8_take", L("q"), L("n"));
+    leakStamp(f, "q", "stamped");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_BYTES), L("q"));
+    rtLabel(f, "done"); rtRetVoid(f); check(f);
+
+    // bytesAsList(b): List<u8>——同一个对象（计数加一），只换值标签（O4 第二步 2c2，设计 §五-4、§七-1）。
+    f = rtBegin(b, "__tx_bi_bytes_as_list", "win fn pc a nargs", "s t x", 5, "bootstrap/selfhost/nrt_bytes.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", TAG_BYTES, "type");
+    rtLoad(f, "x", L("s"), 8, 4);
+    rtCall4(f, "", "__tx_nrt_set_retain", L("win"), L("a"), I(15), L("x"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "bytesAsList 的实参不是 Bytes");
+    rtRetVoid(f); check(f);
+
+    // listAsBytes(l): Bytes——须为紧凑的 List<u8>（form 3、elem 4；静态类型 List<u8> 的列表总是），同一个对象。
+    f = rtBegin(b, "__tx_bi_list_as_bytes", "win fn pc a nargs", "s t x o k", 5, "bootstrap/selfhost/nrt_bytes.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", 15, "type");
+    rtLoad(f, "x", L("s"), 8, 4);
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("x"));
+    rtLoad(f, "k", L("o"), 16, 4); rtIf(f, L("k"), "ne", I(7), "shape");
+    rtLoad(f, "k", L("o"), 28, 4); rtIf(f, L("k"), "ne", I(3), "shape");
+    rtLoad(f, "k", L("o"), 24, 4); rtIf(f, L("k"), "ne", I(4), "shape");
+    rtCall4(f, "", "__tx_nrt_set_retain", L("win"), L("a"), I(TAG_BYTES), L("x"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "listAsBytes 的实参不是 List");
+    trapAt(b, f, "shape", 4010, "listAsBytes 的实参不是紧凑的 List<u8>");
+    rtRetVoid(f); check(f);
+}
+
+// D3 v0.37 批量操作（LANG-32，docs/design/v052-bytes-bulk-v0.1-20261024.md）。定宽读写的种类码由代码生成作末个实参传入：
+// 低 4 位宽度（1、2、4、8），16 有符号，32 浮点（宽 4 为 f32、宽 8 为 float），64 大端。
+function emitBytesBulk(b: Ref<StructuredBuffer>): void {
+    // bytesCopy(dst, at, src, from, count)：memmove 语义（同一对象、区间重叠均可）；下标或个数为负、区间越界 trap 4002。
+    let f = rtBegin(b, "__tx_bi_bytes_copy", "win fn pc a nargs", "s t x i y j n o so p q", 5, "bootstrap/selfhost/nrt_bytes.tx");
+    arity(b, f, 5);
+    argTag(f, 0, "s", "t", TAG_BYTES, "type");
+    frozenGuard(f, "s", "t", "frozen");
+    argTag(f, 1, "x", "t", 1, "itype"); rtLoad(f, "i", L("x"), 8, 8);
+    argTag(f, 2, "y", "t", TAG_BYTES, "type");
+    argTag(f, 3, "x", "t", 1, "itype"); rtLoad(f, "j", L("x"), 8, 8);
+    argTag(f, 4, "x", "t", 1, "itype"); rtLoad(f, "n", L("x"), 8, 8);
+    rtIf(f, L("i"), "lt", I(0), "oob"); rtIf(f, L("j"), "lt", I(0), "oob"); rtIf(f, L("n"), "lt", I(0), "oob");
+    bytesObj(f, "s", "o"); bytesObj(f, "y", "so");
+    rtLoad(f, "p", L("o"), 40, 8); rtOp(f, "p", L("p"), "sub", L("n")); rtIf(f, L("i"), "gt", L("p"), "oob");
+    rtLoad(f, "q", L("so"), 40, 8); rtOp(f, "q", L("q"), "sub", L("n")); rtIf(f, L("j"), "gt", L("q"), "oob");
+    rtIf(f, L("n"), "eq", I(0), "done");
+    rtLoad(f, "p", L("o"), 32, 8); rtOp(f, "p", L("p"), "add", L("i"));
+    rtLoad(f, "q", L("so"), 32, 8); rtOp(f, "q", L("q"), "add", L("j"));
+    rtCall3(f, "", memmoveName(), L("p"), L("q"), L("n"));
+    rtLabel(f, "done"); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "bytesCopy 的 dst、src 须为 Bytes");
+    trapAt(b, f, "itype", 4010, "bytesCopy 的位置与个数须为 int");
+    trapAt(b, f, "oob", 4002, "bytesCopy 区间越界（位置或个数为负，或超出长度）");
+    rtRetVoid(f); rtLabel(f, "frozen"); trapText(b, f, 4022, "bytesCopy 写入了冻结的 Bytes（来自 Shared，深度不可变）");
+    rtRetVoid(f); check(f);
+
+    // bytesFill(b, at, count, value)：越界或值不在 0..255 trap 4002。
+    f = rtBegin(b, "__tx_bi_bytes_fill", "win fn pc a nargs", "s t x i n v o p", 5, "bootstrap/selfhost/nrt_bytes.tx");
+    arity(b, f, 4);
+    argTag(f, 0, "s", "t", TAG_BYTES, "type");
+    frozenGuard(f, "s", "t", "frozen");
+    argTag(f, 1, "x", "t", 1, "itype"); rtLoad(f, "i", L("x"), 8, 8);
+    argTag(f, 2, "x", "t", 1, "itype"); rtLoad(f, "n", L("x"), 8, 8);
+    argTag(f, 3, "x", "t", 1, "itype"); rtLoad(f, "v", L("x"), 8, 8);
+    rtIf(f, L("i"), "lt", I(0), "oob"); rtIf(f, L("n"), "lt", I(0), "oob");
+    rtIf(f, L("v"), "lt", I(0), "range"); rtIf(f, L("v"), "gt", I(255), "range");
+    bytesObj(f, "s", "o");
+    rtLoad(f, "p", L("o"), 40, 8); rtOp(f, "p", L("p"), "sub", L("n")); rtIf(f, L("i"), "gt", L("p"), "oob");
+    rtIf(f, L("n"), "eq", I(0), "done");
+    rtLoad(f, "p", L("o"), 32, 8); rtOp(f, "p", L("p"), "add", L("i"));
+    rtCall3(f, "", memsetName(), L("p"), L("v"), L("n"));
+    rtLabel(f, "done"); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "bytesFill 第一实参不是 Bytes");
+    trapAt(b, f, "itype", 4010, "bytesFill 的位置、个数与值须为 int");
+    trapAt(b, f, "oob", 4002, "bytesFill 区间越界（位置或个数为负，或超出长度）");
+    trapAt(b, f, "range", 4002, "bytesFill 字节值须为 0..255");
+    rtRetVoid(f); rtLabel(f, "frozen"); trapText(b, f, 4022, "bytesFill 写入了冻结的 Bytes（来自 Shared，深度不可变）");
+    rtRetVoid(f); check(f);
+
+    // bytesGetLE／bytesGetBE<T>(b, at)：越界得 None（同 bytesGet）；整数按种类扩展，浮点给双精度位型。
+    f = rtBegin(b, "__tx_bi_bytes_get_num", "win fn pc a nargs", "s t x i k w e o n p q d m v c", 5, "bootstrap/selfhost/nrt_bytes.tx");
+    arity(b, f, 3);
+    argTag(f, 0, "s", "t", TAG_BYTES, "type");
+    argTag(f, 1, "x", "t", 1, "itype"); rtLoad(f, "i", L("x"), 8, 8);
+    argTag(f, 2, "x", "t", 1, "kind"); rtLoad(f, "k", L("x"), 8, 8);
+    numWidth(f, "kind");
+    rtIf(f, L("i"), "lt", I(0), "none");
+    bytesObj(f, "s", "o"); rtLoad(f, "n", L("o"), 40, 8);
+    rtOp(f, "n", L("n"), "sub", L("w")); rtIf(f, L("i"), "gt", L("n"), "none");
+    rtLoad(f, "p", L("o"), 32, 8); rtOp(f, "p", L("p"), "add", L("i"));
+    // 小端从最高地址往回、大端从最低地址往前，逐字节左移拼入。
+    rtOp(f, "e", L("k"), "and", I(64));
+    rtIf(f, L("e"), "ne", I(0), "be");
+    rtOp(f, "q", L("p"), "add", L("w")); rtOp(f, "q", L("q"), "sub", I(1)); rtSet(f, "d", I(-1)); rtJump(f, "load");
+    rtLabel(f, "be"); rtSet(f, "q", L("p")); rtSet(f, "d", I(1));
+    rtLabel(f, "load"); rtSet(f, "v", I(0)); rtSet(f, "m", L("w"));
+    rtLabel(f, "byte");
+    rtShift(f, "v", L("v"), "shl", 8); rtLoad(f, "c", L("q"), 0, 1); rtOp(f, "v", L("v"), "or", L("c"));
+    rtOp(f, "q", L("q"), "add", L("d")); rtOp(f, "m", L("m"), "sub", I(1)); rtIf(f, L("m"), "ne", I(0), "byte");
+    rtOp(f, "e", L("k"), "and", I(32));
+    rtIf(f, L("e"), "ne", I(0), "flt");
+    rtOp(f, "e", L("k"), "and", I(16));
+    rtIf(f, L("e"), "eq", I(0), "int");
+    rtIf(f, L("w"), "eq", I(1), "s1"); rtIf(f, L("w"), "eq", I(2), "s2"); rtIf(f, L("w"), "eq", I(4), "s4"); rtJump(f, "int");
+    rtLabel(f, "s1"); rtShift(f, "v", L("v"), "shl", 56); rtShift(f, "v", L("v"), "sar", 56); rtJump(f, "int");
+    rtLabel(f, "s2"); rtShift(f, "v", L("v"), "shl", 48); rtShift(f, "v", L("v"), "sar", 48); rtJump(f, "int");
+    rtLabel(f, "s4"); rtShift(f, "v", L("v"), "shl", 32); rtShift(f, "v", L("v"), "sar", 32);
+    rtLabel(f, "int"); rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(1), L("v")); rtRetVoid(f);
+    rtLabel(f, "flt"); rtIf(f, L("w"), "ne", I(4), "f64"); rtF32BitsToF64(f, "v", L("v"));
+    rtLabel(f, "f64"); rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(2), L("v")); rtRetVoid(f);
+    rtLabel(f, "none"); rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(4), I(0)); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "bytesGetLE／bytesGetBE 第一实参不是 Bytes");
+    trapAt(b, f, "itype", 4010, "bytesGetLE／bytesGetBE 的位置不是 int");
+    trapAt(b, f, "kind", 4010, "bytesGetLE／bytesGetBE 的种类码无效（编译器缺陷）");
+    rtRetVoid(f); check(f);
+
+    // bytesSetLE／bytesSetBE<T>(b, at, v)：越界 trap 4002，冻结 trap 4022；值已按 T 检查过，只取低位。
+    f = rtBegin(b, "__tx_bi_bytes_set_num", "win fn pc a nargs", "s t x y i k w e o n p q d m v", 5, "bootstrap/selfhost/nrt_bytes.tx");
+    arity(b, f, 4);
+    argTag(f, 0, "s", "t", TAG_BYTES, "type");
+    frozenGuard(f, "s", "t", "frozen");
+    argTag(f, 1, "x", "t", 1, "itype"); rtLoad(f, "i", L("x"), 8, 8);
+    argTag(f, 3, "x", "t", 1, "kind"); rtLoad(f, "k", L("x"), 8, 8);
+    numWidth(f, "kind");
+    // 值的标签须与种类相符：浮点种类要 float（2），整数种类要 int（1）。
+    argTag(f, 2, "y", "t", -1, "");
+    rtOp(f, "e", L("k"), "and", I(32));
+    rtIf(f, L("e"), "ne", I(0), "vf");
+    rtIf(f, L("t"), "ne", I(1), "vtype"); rtJump(f, "vok");
+    rtLabel(f, "vf"); rtIf(f, L("t"), "ne", I(2), "vtype");
+    rtLabel(f, "vok"); rtLoad(f, "v", L("y"), 8, 8);
+    rtIf(f, L("i"), "lt", I(0), "oob");
+    bytesObj(f, "s", "o"); rtLoad(f, "n", L("o"), 40, 8);
+    rtOp(f, "n", L("n"), "sub", L("w")); rtIf(f, L("i"), "gt", L("n"), "oob");
+    rtIf(f, L("e"), "eq", I(0), "bits"); rtIf(f, L("w"), "ne", I(4), "bits"); rtF64ToF32Bits(f, "v", L("v"));
+    rtLabel(f, "bits");
+    rtLoad(f, "p", L("o"), 32, 8); rtOp(f, "p", L("p"), "add", L("i"));
+    // 小端从最低地址往前、大端从最高地址往回，逐字节写低 8 位后右移。
+    rtOp(f, "e", L("k"), "and", I(64));
+    rtIf(f, L("e"), "ne", I(0), "be");
+    rtSet(f, "q", L("p")); rtSet(f, "d", I(1)); rtJump(f, "store");
+    rtLabel(f, "be"); rtOp(f, "q", L("p"), "add", L("w")); rtOp(f, "q", L("q"), "sub", I(1)); rtSet(f, "d", I(-1));
+    rtLabel(f, "store"); rtSet(f, "m", L("w"));
+    rtLabel(f, "byte");
+    rtStore(f, L("q"), 0, L("v"), 1); rtShift(f, "v", L("v"), "shr", 8);
+    rtOp(f, "q", L("q"), "add", L("d")); rtOp(f, "m", L("m"), "sub", I(1)); rtIf(f, L("m"), "ne", I(0), "byte");
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "bytesSetLE／bytesSetBE 第一实参不是 Bytes");
+    trapAt(b, f, "itype", 4010, "bytesSetLE／bytesSetBE 的位置不是 int");
+    trapAt(b, f, "vtype", 4010, "bytesSetLE／bytesSetBE 的值与类型实参不符");
+    trapAt(b, f, "kind", 4010, "bytesSetLE／bytesSetBE 的种类码无效（编译器缺陷）");
+    rtLabel(f, "oob"); rtOp(f, "e", L("k"), "and", I(64)); rtIf(f, L("e"), "ne", I(0), "oobbe");
+    trapText(b, f, 4002, "bytesSetLE 位置越界（为负或超出长度）"); rtRetVoid(f);
+    trapAt(b, f, "oobbe", 4002, "bytesSetBE 位置越界（为负或超出长度）");
+    rtRetVoid(f); rtLabel(f, "frozen"); trapText(b, f, 4022, "bytesSetLE／bytesSetBE 写入了冻结的 Bytes（来自 Shared，深度不可变）");
+    rtRetVoid(f); check(f);
+}
+
+// 种类码 k 的低 4 位取宽度到 w；不是 1、2、4、8 即转 bad。
+function numWidth(f: Ref<RtFn>, bad: string): void {
+    rtOp(f, "w", L("k"), "and", I(15));
+    rtIf(f, L("w"), "eq", I(1), "wok"); rtIf(f, L("w"), "eq", I(2), "wok"); rtIf(f, L("w"), "eq", I(4), "wok"); rtIf(f, L("w"), "eq", I(8), "wok");
+    rtJump(f, bad);
+    rtLabel(f, "wok");
+}

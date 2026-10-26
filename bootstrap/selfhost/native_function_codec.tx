@@ -1,0 +1,85 @@
+// txfn/3: bounded object-local function, frame and boundary facts. Offsets are u64 LE;
+// only nonnegative i64 values are accepted by the current native image model.
+// Register numbers follow the object's machine (x86-64 or aarch64 GPRs); readers reject unknown event kinds.
+import { NativeFunctionImage, NativeFunction, NativeFrameEvent, NativeEpilogue, nativeFunctionValidate } from "./native_function_data";
+import { sha256Hex } from "./sha256";
+
+struct Reader { data: Bytes, at: int, error: string }
+function put(out: Bytes, value: int, width: int): void {
+    let i = 0; while (i < width) { bytesPush(out, (value >>> (8 * i)) & 255); i = i + 1; }
+}
+function text(out: Bytes, value: string): void { put(out, len(value), 4); bytesAppend(out, bytesFromStr(value)); }
+function kindId(kind: string): int {
+    if (kind == "allocate-stack") { return 1; } if (kind == "release-stack") { return 2; } if (kind == "return") { return 3; } if (kind == "push-nonvolatile") { return 4; } if (kind == "pop-nonvolatile") { return 5; } if (kind == "set-frame-pointer") { return 6; } return 0;
+}
+function kindName(id: int): string {
+    if (id == 1) { return "allocate-stack"; } if (id == 2) { return "release-stack"; } if (id == 3) { return "return"; } if (id == 4) { return "push-nonvolatile"; } if (id == 5) { return "pop-nonvolatile"; } if (id == 6) { return "set-frame-pointer"; } return "";
+}
+export function nativeFunctionEncode(image: Ref<NativeFunctionImage>, code: Bytes, section: int): Bytes {
+    assert(image.ok && section >= 0, "invalid function image for object");
+    const out = bytesFromStr("TXFN"); put(out, 3, 4); put(out, section, 4); put(out, bytesLen(code), 8);
+    bytesAppend(out, bytesFromStr(sha256Hex(code))); put(out, listLen(image.functions), 4);
+    let id = 0; let end = 0;
+    for (f in image.functions) {
+        assert(nativeFunctionValidate(f, image.isa) == "" && f.origin != "tx-generated" && f.id == id && f.begin >= end && f.end <= bytesLen(code) && f.linkName == f.name, "invalid object function");
+        text(out, f.module); text(out, f.name); text(out, f.origin); text(out, f.stackModel);
+        put(out, f.begin, 8); put(out, f.end, 8); put(out, f.prologueEnd, 8); put(out, listLen(f.epilogues), 4);
+        for (ep in f.epilogues) { put(out, ep.begin, 8); put(out, ep.end, 8); }
+        put(out, listLen(f.events), 4);
+        for (e in f.events) {
+            const kind = kindId(e.kind); assert(kind > 0 && e.reg >= -1 && e.reg <= 31, "unsupported object frame event");
+            put(out, e.before, 8); put(out, e.after, 8); put(out, kind, 1); put(out, e.reg + 1, 1); put(out, e.bytes, 8);
+        }
+        id = id + 1; end = f.end;
+    }
+    return out;
+}
+function fail(r: Ref<Reader>, message: string): void { if (len(r.error) == 0) { r.error = message; } }
+function take(r: Ref<Reader>, size: int): Bytes {
+    if (len(r.error) > 0) { return bytesNew(0); }
+    if (size < 0 || size > bytesLen(r.data) - r.at) { fail(r, "TruncatedFunctionMetadata"); return bytesNew(0); }
+    const out = bytesSlice(r.data, r.at, size); r.at = r.at + size; return out;
+}
+function read(r: Ref<Reader>, width: int): int {
+    const bytes = take(r, width); let value = 0; let i = 0;
+    while (i < bytesLen(bytes)) { value = value | ((bytesGet(bytes, i) catch 0) << (8 * i)); i = i + 1; }
+    if (value < 0) { fail(r, "FunctionMetadataIntegerOverflow"); } return value;
+}
+function string(r: Ref<Reader>): string {
+    const size = read(r, 4); const value = bytesToStr(take(r, size)) catch (e) { fail(r, "InvalidFunctionMetadataUtf8"); return ""; };
+    return value;
+}
+function count(r: Ref<Reader>, minimum: int): int {
+    const n = read(r, 4);
+    if (n > (bytesLen(r.data) - r.at) / minimum) { fail(r, "InvalidFunctionMetadataCount"); return 0; } return n;
+}
+export function nativeFunctionDecode(blob: Bytes, code: Bytes, section: int, isa: string): Ref<NativeFunctionImage> {
+    const out = new NativeFunctionImage { ok: false, error: "", isa: isa, functions: listNew() };
+    const r = new Reader { data: blob, at: 0, error: "" };
+    if (!bytesEqual(take(r, 4), bytesFromStr("TXFN")) || read(r, 4) != 3) { out.error = "UnknownFunctionMetadataVersion"; return out; }
+    const declaredSection = read(r, 4); const size = read(r, 8); const digest = take(r, 64);
+    if (len(r.error) > 0 || declaredSection != section || size != bytesLen(code) || !bytesEqual(digest, bytesFromStr(sha256Hex(code)))) { out.error = "FunctionMetadataTextMismatch"; return out; }
+    const n = count(r, 48); let id = 0; let previousEnd = 0;
+    const functions: List<Ref<NativeFunction>> = listNew();
+    while (id < n && len(r.error) == 0) {
+        const module = string(r); const name = string(r); const origin = string(r); const model = string(r);
+        const begin = read(r, 8); const end = read(r, 8); const prologueEnd = read(r, 8);
+        const f = new NativeFunction { id: id, module: module, name: name, linkName: name, origin: origin, stackModel: model,
+            begin: begin, end: end, prologueEnd: prologueEnd, epilogues: listNew(), events: listNew() };
+        const ne = count(r, 16); let e = 0;
+        while (e < ne && len(r.error) == 0) {
+            const a = read(r, 8); const b = read(r, 8); listPush(f.epilogues, new NativeEpilogue { begin: a, end: b }); e = e + 1;
+        }
+        const nf = count(r, 26); e = 0;
+        while (e < nf && len(r.error) == 0) {
+            const a = read(r, 8); const b = read(r, 8); const kind = kindName(read(r, 1)); const reg = read(r, 1) - 1; const bytes = read(r, 8);
+            listPush(f.events, new NativeFrameEvent { before: a, after: b, kind: kind, reg: reg, bytes: bytes }); e = e + 1;
+        }
+        const problem = nativeFunctionValidate(f, isa);
+        if (len(problem) > 0 || f.origin == "tx-generated" || f.begin < previousEnd || f.end > bytesLen(code)) { fail(r, "InvalidObjectFunction:" + problem); }
+        listPush(functions, f); previousEnd = f.end; id = id + 1;
+    }
+    if (len(r.error) == 0 && r.at != bytesLen(blob)) { fail(r, "TrailingFunctionMetadata"); }
+    if (len(r.error) > 0) { out.error = r.error; return out; }
+    out.functions = functions; out.ok = true; return out;
+}

@@ -1,0 +1,431 @@
+// 测试专用页堆（安全审查攻关第 2 项，docs/design/v052-heap-check-v0.1-20261024.md）：内核生成器 --generic=heapcheck 时代替分配器的
+// 三个例程（导出名与私有约定同 kernel_alloc_generic.tx），产物经 --link-object 链接；编译器内嵌的标准内核不含它。
+// 每块单独映射“数据页 + 1 页”，末页不可访问（Windows 只保留不提交，Unix 经 mprotect）；用户区贴着保护页、按 16 对齐，之前 32 字节块头
+// {魔数@0, 尺寸@8, 基址@16, 数据页长@24}，块头之前与块尾空隙填哨兵 0xA5。进程级账本（线性探测散列表，项 {指针@0, 状态@8, 基址@16,
+// 尺寸@24}，删除后移补位；映射长由尺寸推出）；释放时查不到为非法释放、不是活块为重复释放，块头四项与账本不符或哨兵被改为越界写，
+// 都经 __tx_trap 报 4012（消息以 heapcheck: 开头）。释放的块整段改为不可访问、入先进先出的隔离环（不复用地址），环满才把最早的块
+// 归还系统。账本与隔离环由一把锁保护（原子交换，拿不到时让出处理器）；映射、解除提交与归还都在锁外做，锁里只有表操作。不访问线程块。
+import { StructuredBuffer, asBufferLabel, asBufferZero } from "./assemble";
+import { RtFn, RtOp, L, I, A, G } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtSetGlobal, rtOp, rtShift, rtLoad, rtStore, rtLabel, rtJump, rtIf, rtCall1, rtCall2, rtCall3, rtCall4, rtCall5, rtRet, rtRetVoid, rtAtomicXchg, rtRdataBytes } from "./rtfn";
+import { tKernel32, tMacos, tSysV } from "./target";
+import { uxSys, uxMapFlags } from "./unix_sys";
+
+const MODULE: string = "bootstrap/selfhost/kernel_alloc_check.tx";
+// 块头魔数（“HEAPCKTX”的小端字节）与 8 字节哨兵字（0xA5 × 8）。
+const MAGIC: int = 6364794925862700360;
+const CANARY_WORD: int = -6510615555426900571;
+const SLOTS: int = 1048576;
+const ENTRY: int = 32;
+const FULL: int = 786432;
+const RING: int = 65536;
+// 尺寸上限（测试用）：超过即得 0，同取页失败。
+const NEED_MAX: int = 1099511627776;
+const MEM_COMMIT: int = 4096;
+const MEM_RESERVE: int = 8192;
+const MEM_DECOMMIT: int = 16384;
+const MEM_RELEASE: int = 32768;
+const PAGE_NOACCESS: int = 1;
+const PAGE_RW: int = 4;
+
+/// 页长：macOS 按 16 KiB（arm64 的页；x86_64 上同样可用），其余 4 KiB。
+function pageOf(t: int): int {
+    if (tMacos(t)) { return 16384; }
+    return 4096;
+}
+
+function memsetName(t: int): string {
+    if (tSysV(t)) { return "__tx_linux_memset"; }
+    return "memset";
+}
+
+function memcpyName(t: int): string {
+    if (tSysV(t)) { return "__tx_linux_memcpy"; }
+    return "memcpy";
+}
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+function ops3(a: Ref<RtOp>, b: Ref<RtOp>, c: Ref<RtOp>): List<Ref<RtOp>> {
+    const xs: List<Ref<RtOp>> = listNew();
+    listPush(xs, a);
+    listPush(xs, b);
+    listPush(xs, c);
+    return xs;
+}
+
+/// 进程级状态，放进内核唯一的 .bss 块：锁字、账本表与隔离环的地址、环头、环内块数、账本已用项数。
+export function allocCheckBss(b: Ref<StructuredBuffer>): void {
+    for (n in strSplit("__tx_hc_lock __tx_hc_table __tx_hc_ring __tx_hc_head __tx_hc_count __tx_hc_used", " ")) {
+        asBufferLabel(b, n, 1);
+        asBufferZero(b, 8, 1);
+    }
+}
+
+// 取锁、放锁（原子交换，全屏障）；拿不到时让出处理器（同 nrt_rt.tx 的 __tx_rt_lock），不空转——持锁者可能正被换下。
+function lock(f: Ref<RtFn>, t: int, tag: string): void {
+    rtLabel(f, tag);
+    rtAtomicXchg(f, "lk", A("__tx_hc_lock"), 0, I(1));
+    rtIf(f, L("lk"), "eq", I(0), tag + "_got");
+    if (tKernel32(t)) {
+        rtCall1(f, "", "Sleep", I(0));
+    } else {
+        const none: List<Ref<RtOp>> = listNew();
+        uxSys(f, t, "", 24, none);
+    }
+    rtJump(f, tag);
+    rtLabel(f, tag + "_got");
+}
+
+function unlock(f: Ref<RtFn>): void { rtAtomicXchg(f, "lk", A("__tx_hc_lock"), 0, I(0)); }
+
+// 报告并结束：先放锁（__tx_trap 输出诊断时可能再分配），再报 4012。
+function report(b: Ref<StructuredBuffer>, f: Ref<RtFn>, label: string, message: string): void {
+    const data = "__tx_hc_text_" + label;
+    rtRdataBytes(b, data, message);
+    rtLabel(f, label);
+    unlock(f);
+    rtCall5(f, "", "__tx_trap", I(-1), I(0), I(4012), A(data), I(len(message)));
+    rtRetVoid(f);
+}
+
+// 映射 n 字节可读写的页（失败转 fail）；Unix 经 mmap，Windows 经 VirtualAlloc。
+function rawMap(f: Ref<RtFn>, t: int, dst: string, n: Ref<RtOp>, fail: string): void {
+    if (tKernel32(t)) {
+        rtCall4(f, dst, "VirtualAlloc", I(0), n, I(MEM_COMMIT + MEM_RESERVE), I(PAGE_RW));
+        rtIf(f, L(dst), "eq", I(0), fail);
+        return;
+    }
+    const xs: List<Ref<RtOp>> = listNew();
+    listPush(xs, I(0));
+    listPush(xs, n);
+    listPush(xs, I(3));
+    listPush(xs, I(uxMapFlags(t, 34)));
+    listPush(xs, I(-1));
+    listPush(xs, I(0));
+    uxSys(f, t, dst, 9, xs);
+    rtIf(f, L(dst), "lt", I(1), fail);
+}
+
+// 归还整段映射（base, maplen）。
+function release(f: Ref<RtFn>, t: int, base: string, maplen: string): void {
+    if (tKernel32(t)) {
+        rtCall3(f, "", "VirtualFree", L(base), I(0), I(MEM_RELEASE));
+        return;
+    }
+    const xs: List<Ref<RtOp>> = listNew();
+    listPush(xs, L(base));
+    listPush(xs, L(maplen));
+    uxSys(f, t, "", 11, xs);
+}
+
+// 由尺寸推出布局：r16 = 用户区（≥1 字节、按 16 取整），total = 数据页长（r16 + 32 字节块头，按页取整）。size 须 ≤ NEED_MAX。
+function layout(f: Ref<RtFn>, page: int, size: string, r16: string, total: string, tag: string): void {
+    rtSet(f, r16, L(size));
+    rtIf(f, L(r16), "ugt", I(0), tag);
+    rtSet(f, r16, I(1));
+    rtLabel(f, tag);
+    rtOp(f, r16, L(r16), "add", I(15));
+    rtOp(f, r16, L(r16), "and", I(-16));
+    rtOp(f, total, L(r16), "add", I(32 + page - 1));
+    rtOp(f, total, L(total), "and", I(0 - page));
+}
+
+// dst = 键 p 的起始槽地址：(((p >> 12) ^ (p >> 22)) & (SLOTS − 1)) × ENTRY + 表基址。用局部 x。
+function home(f: Ref<RtFn>, dst: string, p: string): void {
+    rtShift(f, dst, L(p), "shr", 12);
+    rtShift(f, "x", L(p), "shr", 22);
+    rtOp(f, dst, L(dst), "xor", L("x"));
+    rtOp(f, dst, L(dst), "and", I(SLOTS - 1));
+    rtShift(f, dst, L(dst), "shl", 5);
+    rtOp(f, dst, L(dst), "add", G("__tx_hc_table"));
+}
+
+// s 前进到下一槽，表尾回绕；tag 为本处唯一的标签。用局部 x。
+function nextSlot(f: Ref<RtFn>, s: string, tag: string): void {
+    rtOp(f, s, L(s), "add", I(ENTRY));
+    rtOp(f, "x", G("__tx_hc_table"), "add", I(SLOTS * ENTRY));
+    rtIf(f, L(s), "ult", L("x"), tag);
+    rtSet(f, s, G("__tx_hc_table"));
+    rtLabel(f, tag);
+}
+
+// __tx_hc_find(p) → 槽地址，或 0（无表或无此键）。调用方持锁。
+function findFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_hc_find", "p", "s k n x", 0, MODULE);
+    rtSet(f, "s", G("__tx_hc_table"));
+    rtIf(f, L("s"), "eq", I(0), "none");
+    home(f, "s", "p");
+    rtSet(f, "n", I(0));
+    rtLabel(f, "probe");
+    rtLoad(f, "k", L("s"), 0, 8);
+    rtIf(f, L("k"), "eq", I(0), "none");
+    rtIf(f, L("k"), "eq", L("p"), "hit");
+    nextSlot(f, "s", "wrap");
+    rtOp(f, "n", L("n"), "add", I(1));
+    rtIf(f, L("n"), "ult", I(SLOTS), "probe");
+    rtLabel(f, "none");
+    rtRet(f, I(0));
+    rtLabel(f, "hit");
+    rtRet(f, L("s"));
+    done(f, failures);
+}
+
+// __tx_hc_insert(p, base, size) → 1，或 0（建表失败或账本已满）。键 p 须不在表里（新映射的地址）。调用方持锁。
+function insertFn(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    const f = rtBegin(b, "__tx_hc_insert", "p base size", "s k n x", 6, MODULE);
+    rtSet(f, "s", G("__tx_hc_table"));
+    rtIf(f, L("s"), "ne", I(0), "have");
+    rawMap(f, t, "s", I(SLOTS * ENTRY), "fail");
+    rtSetGlobal(f, "__tx_hc_table", L("s"));
+    rawMap(f, t, "s", I(RING * 8), "fail");
+    rtSetGlobal(f, "__tx_hc_ring", L("s"));
+    rtLabel(f, "have");
+    rtSet(f, "n", G("__tx_hc_used"));
+    rtIf(f, L("n"), "ge", I(FULL), "fail");
+    home(f, "s", "p");
+    rtLabel(f, "probe");
+    rtLoad(f, "k", L("s"), 0, 8);
+    rtIf(f, L("k"), "eq", I(0), "put");
+    nextSlot(f, "s", "wrap");
+    rtJump(f, "probe");
+    rtLabel(f, "put");
+    rtStore(f, L("s"), 0, L("p"), 8);
+    rtStore(f, L("s"), 8, I(1), 8);
+    rtStore(f, L("s"), 16, L("base"), 8);
+    rtStore(f, L("s"), 24, L("size"), 8);
+    rtOp(f, "n", L("n"), "add", I(1));
+    rtSetGlobal(f, "__tx_hc_used", L("n"));
+    rtRet(f, I(1));
+    rtLabel(f, "fail");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// __tx_hc_delete(s)：删去槽 s，其后同一探测串里的项按需前移补位（线性探测的后移删除，不留墓碑）。调用方持锁。
+function deleteFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_hc_delete", "s", "i j k h x n", 0, MODULE);
+    rtSet(f, "i", L("s"));
+    rtSet(f, "j", L("s"));
+    rtLabel(f, "scan");
+    nextSlot(f, "j", "wrap");
+    rtLoad(f, "k", L("j"), 0, 8);
+    rtIf(f, L("k"), "eq", I(0), "clear");
+    home(f, "h", "k");
+    // 起始槽 h 落在循环区间 (i, j] 内则 j 的项留在原处；否则前移到 i。
+    rtIf(f, L("i"), "ugt", L("j"), "wrapped");
+    rtIf(f, L("h"), "ule", L("i"), "move");
+    rtIf(f, L("h"), "ugt", L("j"), "move");
+    rtJump(f, "scan");
+    rtLabel(f, "wrapped");
+    rtIf(f, L("h"), "ugt", L("i"), "scan");
+    rtIf(f, L("h"), "ule", L("j"), "scan");
+    rtLabel(f, "move");
+    rtLoad(f, "x", L("j"), 0, 8);
+    rtStore(f, L("i"), 0, L("x"), 8);
+    rtLoad(f, "x", L("j"), 8, 8);
+    rtStore(f, L("i"), 8, L("x"), 8);
+    rtLoad(f, "x", L("j"), 16, 8);
+    rtStore(f, L("i"), 16, L("x"), 8);
+    rtLoad(f, "x", L("j"), 24, 8);
+    rtStore(f, L("i"), 24, L("x"), 8);
+    rtSet(f, "i", L("j"));
+    rtJump(f, "scan");
+    rtLabel(f, "clear");
+    rtStore(f, L("i"), 0, I(0), 8);
+    rtStore(f, L("i"), 8, I(0), 8);
+    rtStore(f, L("i"), 16, I(0), 8);
+    rtStore(f, L("i"), 24, I(0), 8);
+    rtSet(f, "n", G("__tx_hc_used"));
+    rtOp(f, "n", L("n"), "sub", I(1));
+    rtSetGlobal(f, "__tx_hc_used", L("n"));
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+// __tx_native_mem_alloc(size, align) → 指针，或 0（size 为负、align 不是 1..16 的 2 的幂、超过测试上限、取页失败）。
+function allocFn(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    const page = pageOf(t);
+    const f = rtBegin(b, "__tx_native_mem_alloc", "size align", "r16 total maplen base p n x y ok lk", 6, MODULE);
+    rtIf(f, L("size"), "lt", I(0), "null");
+    rtIf(f, L("align"), "eq", I(0), "null");
+    rtIf(f, L("align"), "ugt", I(16), "null");
+    rtOp(f, "x", L("align"), "sub", I(1));
+    rtOp(f, "x", L("x"), "and", L("align"));
+    rtIf(f, L("x"), "ne", I(0), "null");
+    rtIf(f, L("size"), "gt", I(NEED_MAX), "null");
+    layout(f, page, "size", "r16", "total", "need1");
+    rtOp(f, "maplen", L("total"), "add", I(page));
+    if (tKernel32(t)) {
+        // 只保留整段，再提交数据页；末页保留不提交即保护页。
+        rtCall4(f, "base", "VirtualAlloc", I(0), L("maplen"), I(MEM_RESERVE), I(PAGE_NOACCESS));
+        rtIf(f, L("base"), "eq", I(0), "null");
+        rtCall4(f, "x", "VirtualAlloc", L("base"), L("total"), I(MEM_COMMIT), I(PAGE_RW));
+        rtIf(f, L("x"), "ne", I(0), "mapped");
+        rtCall3(f, "", "VirtualFree", L("base"), I(0), I(MEM_RELEASE));
+        rtJump(f, "null");
+    } else {
+        rawMap(f, t, "base", L("maplen"), "null");
+        rtOp(f, "x", L("base"), "add", L("total"));
+        uxSys(f, t, "", 10, ops3(L("x"), I(page), I(0)));
+    }
+    rtLabel(f, "mapped");
+    rtOp(f, "p", L("base"), "add", L("total"));
+    rtOp(f, "p", L("p"), "sub", L("r16"));
+    rtOp(f, "n", L("p"), "sub", L("base"));
+    rtOp(f, "n", L("n"), "sub", I(32));
+    rtIf(f, L("n"), "eq", I(0), "left");
+    rtCall3(f, "", memsetName(t), L("base"), I(165), L("n"));
+    rtLabel(f, "left");
+    rtStore(f, L("p"), -32, I(MAGIC), 8);
+    rtStore(f, L("p"), -24, L("size"), 8);
+    rtStore(f, L("p"), -16, L("base"), 8);
+    rtStore(f, L("p"), -8, L("total"), 8);
+    rtOp(f, "n", L("r16"), "sub", L("size"));
+    rtIf(f, L("n"), "eq", I(0), "right");
+    rtOp(f, "x", L("p"), "add", L("size"));
+    rtCall3(f, "", memsetName(t), L("x"), I(165), L("n"));
+    rtLabel(f, "right");
+    lock(f, t, "lock");
+    rtCall3(f, "ok", "__tx_hc_insert", L("p"), L("base"), L("size"));
+    rtIf(f, L("ok"), "eq", I(0), "full");
+    unlock(f);
+    rtRet(f, L("p"));
+    rtLabel(f, "null");
+    rtRet(f, I(0));
+    report(b, f, "full", "heapcheck: 账本已满（活块与隔离块超过上限）");
+    done(f, failures);
+}
+
+// __tx_native_mem_free(ptr)：空指针什么也不做；核对账本、块头与哨兵后整段改为不可访问、入隔离环。账本状态 1 活、3 释放中
+// （已核对、正在解除提交，此时的再次释放同样报重复释放）、2 已隔离；两段持锁之间别的线程的后移删除可能挪动槽位，第二段重查。
+function freeFn(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    const page = pageOf(t);
+    const f = rtBegin(b, "__tx_native_mem_free", "ptr", "s st base sz r16 total c e w cw x y lk q h n", 5, MODULE);
+    rtIf(f, L("ptr"), "eq", I(0), "out");
+    lock(f, t, "lock");
+    rtCall1(f, "s", "__tx_hc_find", L("ptr"));
+    rtIf(f, L("s"), "eq", I(0), "invalid");
+    rtLoad(f, "st", L("s"), 8, 8);
+    rtIf(f, L("st"), "ne", I(1), "double");
+    rtLoad(f, "base", L("s"), 16, 8);
+    rtLoad(f, "sz", L("s"), 24, 8);
+    layout(f, page, "sz", "r16", "total", "need1");
+    // 块头四项都与账本核对（尺寸被改会让块尾哨兵的核对区间偏移）。
+    rtLoad(f, "x", L("ptr"), -32, 8);
+    rtSet(f, "y", I(MAGIC));
+    rtIf(f, L("x"), "ne", L("y"), "header");
+    rtLoad(f, "x", L("ptr"), -24, 8);
+    rtIf(f, L("x"), "ne", L("sz"), "header");
+    rtLoad(f, "x", L("ptr"), -16, 8);
+    rtIf(f, L("x"), "ne", L("base"), "header");
+    rtLoad(f, "x", L("ptr"), -8, 8);
+    rtIf(f, L("x"), "ne", L("total"), "header");
+    // 块头之前的哨兵（长度是 16 的倍数，按 8 字节核对）。
+    rtSet(f, "cw", I(CANARY_WORD));
+    rtSet(f, "c", L("base"));
+    rtOp(f, "e", L("ptr"), "sub", I(32));
+    rtLabel(f, "leftw");
+    rtIf(f, L("c"), "ugt", L("e"), "header");
+    rtIf(f, L("c"), "eq", L("e"), "leftok");
+    rtLoad(f, "w", L("c"), 0, 8);
+    rtIf(f, L("w"), "ne", L("cw"), "canary");
+    rtOp(f, "c", L("c"), "add", I(8));
+    rtJump(f, "leftw");
+    rtLabel(f, "leftok");
+    // 块尾空隙的哨兵（逐字节）。
+    rtOp(f, "c", L("ptr"), "add", L("sz"));
+    rtOp(f, "e", L("base"), "add", L("total"));
+    rtLabel(f, "rightb");
+    rtIf(f, L("c"), "eq", L("e"), "rightok");
+    rtLoad(f, "w", L("c"), 0, 1);
+    rtIf(f, L("w"), "ne", I(165), "canary");
+    rtOp(f, "c", L("c"), "add", I(1));
+    rtJump(f, "rightb");
+    rtLabel(f, "rightok");
+    rtStore(f, L("s"), 8, I(3), 8);
+    unlock(f);
+    // 整段数据页改为不可访问：Windows 解除提交（保留地址），Unix mprotect(PROT_NONE)。
+    if (tKernel32(t)) {
+        rtCall3(f, "", "VirtualFree", L("base"), L("total"), I(MEM_DECOMMIT));
+    } else {
+        uxSys(f, t, "", 10, ops3(L("base"), L("total"), I(0)));
+    }
+    lock(f, t, "lock2");
+    rtCall1(f, "s", "__tx_hc_find", L("ptr"));
+    rtStore(f, L("s"), 8, I(2), 8);
+    // 隔离环满则先逐出最早的块（删去账本项；映射在放锁后归还，c 为 0 表示没有）。
+    rtSet(f, "c", I(0));
+    rtSet(f, "n", G("__tx_hc_count"));
+    rtIf(f, L("n"), "ult", I(RING), "push");
+    rtSet(f, "h", G("__tx_hc_head"));
+    rtShift(f, "x", L("h"), "shl", 3);
+    rtOp(f, "x", L("x"), "add", G("__tx_hc_ring"));
+    rtLoad(f, "q", L("x"), 0, 8);
+    rtOp(f, "h", L("h"), "add", I(1));
+    rtOp(f, "h", L("h"), "and", I(RING - 1));
+    rtSetGlobal(f, "__tx_hc_head", L("h"));
+    rtOp(f, "n", L("n"), "sub", I(1));
+    rtSetGlobal(f, "__tx_hc_count", L("n"));
+    rtCall1(f, "x", "__tx_hc_find", L("q"));
+    rtIf(f, L("x"), "eq", I(0), "push");
+    rtLoad(f, "c", L("x"), 16, 8);
+    rtLoad(f, "sz", L("x"), 24, 8);
+    layout(f, page, "sz", "r16", "e", "need2");
+    rtOp(f, "e", L("e"), "add", I(page));
+    rtCall1(f, "", "__tx_hc_delete", L("x"));
+    rtLabel(f, "push");
+    rtSet(f, "h", G("__tx_hc_head"));
+    rtSet(f, "n", G("__tx_hc_count"));
+    rtOp(f, "x", L("h"), "add", L("n"));
+    rtOp(f, "x", L("x"), "and", I(RING - 1));
+    rtShift(f, "x", L("x"), "shl", 3);
+    rtOp(f, "x", L("x"), "add", G("__tx_hc_ring"));
+    rtStore(f, L("x"), 0, L("ptr"), 8);
+    rtOp(f, "n", L("n"), "add", I(1));
+    rtSetGlobal(f, "__tx_hc_count", L("n"));
+    unlock(f);
+    rtIf(f, L("c"), "eq", I(0), "out");
+    release(f, t, "c", "e");
+    rtLabel(f, "out");
+    rtRetVoid(f);
+    report(b, f, "invalid", "heapcheck: 释放了不是分配器给出的指针");
+    report(b, f, "double", "heapcheck: 重复释放");
+    report(b, f, "header", "heapcheck: 块头被改写（向前越界写）");
+    report(b, f, "canary", "heapcheck: 块外的字节被改写（越界写）");
+    done(f, failures);
+}
+
+// __tx_native_mem_realloc(ptr, old, new, align)：同 kernel_alloc_generic.tx——新分配、拷 min(old, new)、释放旧块，旧地址随之失效。
+function reallocFn(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    const f = rtBegin(b, "__tx_native_mem_realloc", "ptr old size align", "q n", 3, MODULE);
+    rtIf(f, L("size"), "eq", I(0), "null");
+    rtCall2(f, "q", "__tx_native_mem_alloc", L("size"), L("align"));
+    rtIf(f, L("q"), "eq", I(0), "null");
+    rtIf(f, L("ptr"), "eq", I(0), "copied");
+    rtIf(f, L("old"), "eq", I(0), "copied");
+    rtSet(f, "n", L("old"));
+    rtIf(f, L("n"), "ule", L("size"), "copy");
+    rtSet(f, "n", L("size"));
+    rtLabel(f, "copy");
+    rtCall3(f, "", memcpyName(t), L("q"), L("ptr"), L("n"));
+    rtLabel(f, "copied");
+    rtCall1(f, "", "__tx_native_mem_free", L("ptr"));
+    rtRet(f, L("q"));
+    rtLabel(f, "null");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+/// 发出页堆的全部例程；rtfn 的失败记进 failures。进程级状态另由 allocCheckBss 放进 .bss。
+export function allocCheckEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    findFn(b, failures);
+    insertFn(b, failures, t);
+    deleteFn(b, failures);
+    allocFn(b, failures, t);
+    freeFn(b, failures, t);
+    reallocFn(b, failures, t);
+}

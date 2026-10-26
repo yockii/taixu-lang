@@ -1,0 +1,741 @@
+// dbg_view.tx —— 调试会话里值的读取与渲染（第 6 轮 6c-4b、6c-4c；调试实施设计 §四-4“值的渲染规格”、§五；
+// VM 调试协议参考 §五）。
+// 经 READ 读产物内存：值槽 16 字节（标签@0、载荷@8，堆值的载荷为 u32 对象号）；对象 72 字节（object_abi.tx）。
+// 槽状态在线程块的 [TB+16]：RC 表@0（每对象 u32）、next 表@8（存活的项为 0xFFFFFFFE）、高水位@16、容量@24、
+// 对象表@48。三张表随扩容移动：每次停下重读位置，表内容按块缓存到下次停下。
+// 名字取 ProgramContext 的类型表与声明名；定宽整数与 f32 运行期与 int/float 共用标签，按变量表与 decl 字段的
+// SEB1 类型（DbgInfo）渲染。渲染只读不写，转换一律取不会 trap 的写法。
+import { ProgramContext } from "./program_context";
+import { DbgProc, wireRead, wireU64, wireText } from "./dbg_wire";
+import { dbgStr } from "./dbg_out";
+import { TB_SLOTS } from "./thread_block_abi";
+import { OBJECT_BYTES, OBJECT_OFF_TYPE, OBJECT_OFF_PAYLOAD, OBJECT_OFF_META, OBJECT_OFF_AUX, OBJECT_OFF_PTR, OBJECT_OFF_LEN, OBJECT_OFF_RESULT } from "./object_abi";
+import { LIST_FORM_COMPACT } from "./list_compact";
+
+const BRIEF_BYTES: int = 16;
+const TEXT_BYTES: int = 64;
+const WIDTH: int = 32;
+const DEPTH: int = 8;
+const LIVE: int = 4294967294;
+const LOW32: int = 4294967295;
+// 缓存块：每块 256 项。
+const CHUNK: int = 256;
+// truncated 的位：1 深度、2 宽度、4 串。
+const TR_DEPTH: int = 1;
+const TR_WIDTH: int = 2;
+const TR_STR: int = 4;
+// f32 的最大有限值。
+const F32_MAX: float = 340282346638528859811704183484516925440.0;
+
+// 一个值槽（已读出的 16 字节）。
+export struct DbgSlot {
+    tag: int,
+    pay: int,
+}
+
+export struct DbgView {
+    ctx: Ref<ProgramContext>,
+    p: Ref<DbgProc>,
+    // 线程块（HELLO 的主线程块）与槽状态的各表（每次停下后重读）。
+    tb: int,
+    rc: int,
+    next: int,
+    hwm: int,
+    cap: int,
+    objs: int,
+    // 函数名（闭包名已由会话改写成绝对路径的形式）。
+    fnNames: List<string>,
+    // 表内容的块缓存：键＝表号×2^40＋块号。
+    cKeys: List<int>,
+    cData: List<Bytes>,
+}
+
+export function viewNew(ctx: Ref<ProgramContext>, p: Ref<DbgProc>, tb: int, fnNames: List<string>): Ref<DbgView> {
+    return new DbgView { ctx: ctx, p: p, tb: tb, rc: 0, next: 0, hwm: 0, cap: 0, objs: 0, fnNames: fnNames, cKeys: listNew(), cData: listNew() };
+}
+
+// 停下后重读槽状态，清空缓存。
+export function viewRefresh(v: Ref<DbgView>): void {
+    v.cKeys = listNew();
+    v.cData = listNew();
+    v.rc = 0;
+    v.next = 0;
+    v.hwm = 0;
+    v.cap = 0;
+    v.objs = 0;
+    const st = wireU64(wireRead(v.p, v.tb + TB_SLOTS, 8), 0);
+    if (st == 0) { return; }
+    const hdr = wireRead(v.p, st, 56);
+    if (bytesLen(hdr) < 56) { return; }
+    v.rc = wireU64(hdr, 0);
+    v.next = wireU64(hdr, 8);
+    v.hwm = wireU64(hdr, 16);
+    v.cap = wireU64(hdr, 24);
+    v.objs = wireU64(hdr, 48);
+}
+
+function u32At(b: Bytes, at: int): int {
+    return (bytesGet(b, at) catch 0) | ((bytesGet(b, at + 1) catch 0) << 8) | ((bytesGet(b, at + 2) catch 0) << 16) | ((bytesGet(b, at + 3) catch 0) << 24);
+}
+
+// 表 table（0 RC、1 next、2 对象）第 idx 项所在的块；块按容量截短，读不到时为空。
+function chunkOf(v: Ref<DbgView>, table: int, idx: int): Bytes {
+    const c = idx / CHUNK;
+    const key = table * 1099511627776 + c;
+    let k = 0;
+    while (k < listLen(v.cKeys)) {
+        if ((listGet(v.cKeys, k) catch -1) == key) { return listGet(v.cData, k) catch bytesNew(0); }
+        k = k + 1;
+    }
+    let base = v.rc;
+    let elem = 4;
+    if (table == 1) { base = v.next; }
+    if (table == 2) {
+        base = v.objs;
+        elem = OBJECT_BYTES;
+    }
+    let n = CHUNK;
+    if (c * CHUNK + n > v.cap) { n = v.cap - c * CHUNK; }
+    let data = bytesNew(0);
+    if (base != 0 && n > 0) { data = wireRead(v.p, base + c * CHUNK * elem, n * elem); }
+    listPush(v.cKeys, key);
+    listPush(v.cData, data);
+    return data;
+}
+
+function tableU32(v: Ref<DbgView>, table: int, idx: int): int {
+    const b = chunkOf(v, table, idx);
+    const at = (idx % CHUNK) * 4;
+    if (at + 4 > bytesLen(b)) { return -1; }
+    return u32At(b, at);
+}
+
+// 对象号是否指向存活对象（下标小于高水位、next 表为存活标记）。
+function isLive(v: Ref<DbgView>, idx: int): bool {
+    const i = idx & LOW32;
+    if (i >= v.hwm) { return false; }
+    return tableU32(v, 1, i) == LIVE;
+}
+
+function objHeader(v: Ref<DbgView>, idx: int): Bytes {
+    const i = idx & LOW32;
+    const b = chunkOf(v, 2, i);
+    const at = (i % CHUNK) * OBJECT_BYTES;
+    if (at + OBJECT_BYTES > bytesLen(b)) { return bytesNew(0); }
+    return bytesSlice(b, at, OBJECT_BYTES);
+}
+
+// 引用计数（永生对象为 4294967295，同 VM）；读不到为 −1。
+export function viewRc(v: Ref<DbgView>, idx: int): int {
+    const r = tableU32(v, 0, idx & LOW32);
+    if (r < 0) { return -1; }
+    if (r >= 2147483648) { return 4294967295; }
+    return r;
+}
+
+export function viewTagName(tag: int): string {
+    if (tag == 1) { return "int"; }
+    if (tag == 2) { return "float"; }
+    if (tag == 3) { return "bool"; }
+    if (tag == 4 || tag == 0) { return "none"; }
+    if (tag == 5) { return "err"; }
+    if (tag == 6) { return "string"; }
+    if (tag == 7) { return "struct"; }
+    if (tag == 8) { return "enum"; }
+    if (tag == 9) { return "ref"; }
+    if (tag == 10) { return "array"; }
+    if (tag == 11) { return "slice"; }
+    if (tag == 12) { return "fn"; }
+    if (tag == 14) { return "weak"; }
+    if (tag == 15) { return "list"; }
+    if (tag == 16) { return "future"; }
+    if (tag == 17) { return "bytes"; }
+    if (tag == 18) { return "gen"; }
+    if (tag == 19) { return "thread"; }
+    if (tag == 20) { return "shared"; }
+    if (tag == 21) { return "atomic"; }
+    return "unknown";
+}
+
+function isHeap(tag: int): bool {
+    return tag >= 5 && tag != 12 && tag <= 21 && tag != 13;
+}
+
+// 窗口 win 起 n 个值槽。
+export function viewSlots(v: Ref<DbgView>, win: int, n: int): List<Ref<DbgSlot>> {
+    const out: List<Ref<DbgSlot>> = listNew();
+    if (n <= 0) { return out; }
+    const raw = wireRead(v.p, win, 16 * n);
+    let k = 0;
+    while (k < n) {
+        if (16 * k + 16 <= bytesLen(raw)) {
+            listPush(out, new DbgSlot { tag: (bytesGet(raw, 16 * k) catch 0), pay: wireU64(raw, 16 * k + 8) });
+        } else {
+            listPush(out, new DbgSlot { tag: -1, pay: 0 });
+        }
+        k = k + 1;
+    }
+    return out;
+}
+
+// —— 静态类型（SEB1 池号；−1 为未知）——
+
+function tyKind(v: Ref<DbgView>, ty: int): int {
+    if (ty < 0) { return -1; }
+    return listGet(v.ctx.dbg.tysK, ty) catch -1;
+}
+
+function tyA(v: Ref<DbgView>, ty: int): int {
+    if (ty < 0) { return -1; }
+    return listGet(v.ctx.dbg.tysA, ty) catch -1;
+}
+
+// 去掉可选、失败联合与 Ref 的外层。
+function tyInner(v: Ref<DbgView>, ty: int): int {
+    let t = ty;
+    let guard = 0;
+    while (guard < 16) {
+        const k = tyKind(v, t);
+        if (k != 6 && k != 7 && k != 8) { return t; }
+        t = tyA(v, t);
+        guard = guard + 1;
+    }
+    return t;
+}
+
+// 列表、数组、切片、Shared 的元素（内层）类型。
+function tyElem(v: Ref<DbgView>, ty: int): int {
+    const t = tyInner(v, ty);
+    const k = tyKind(v, t);
+    if (k == 10 || k == 11 || k == 12 || k == 24) { return tyA(v, t); }
+    return -1;
+}
+
+// 定宽种类码（1 i8 … 9 usize、10 f32）；不是定宽数值为 0。
+function fwCode(v: Ref<DbgView>, ty: int): int {
+    const t = tyInner(v, ty);
+    const k = tyKind(v, t);
+    if (k != 0 && k != 1) { return 0; }
+    const b = listGet(v.ctx.dbg.tysB, t) catch 0;
+    if (b >= 1 && b <= 10) { return b; }
+    return 0;
+}
+
+function fwName(c: int): string {
+    if (c == 1) { return "i8"; }
+    if (c == 2) { return "i16"; }
+    if (c == 3) { return "i32"; }
+    if (c == 4) { return "u8"; }
+    if (c == 5) { return "u16"; }
+    if (c == 6) { return "u32"; }
+    if (c == 7) { return "u64"; }
+    if (c == 8) { return "isize"; }
+    if (c == 9) { return "usize"; }
+    if (c == 10) { return "f32"; }
+    return "";
+}
+
+// u64 位型的无符号十进制：x = 2h + b，x / 10 = h / 5，余数 (h % 5)×2 + b（全程不越出 int）。
+function u64Text(x: int): string {
+    if (x >= 0) { return toStr(x); }
+    const h = (x >> 1) & 9223372036854775807;
+    const q = h / 5;
+    const r = (h % 5) * 2 + (x & 1);
+    return toStr(q) + toStr(r);
+}
+
+// f32 值（以 float 位型存放）：非有限或超出 f32 范围时按 float 写（`as f32` 在有限溢出时会 trap）。
+function f32Text(bits: int): string {
+    const x = floatFromBits(bits);
+    if (x != x || x > F32_MAX || x < -F32_MAX) { return toStr(x); }
+    return toStr(x as f32);
+}
+
+// 单精度位型 → 双精度位型（紧凑 List<f32> 的元素）。
+function f32BitsToF64(b: int): int {
+    const sign = (b >> 31) & 1;
+    const e = (b >> 23) & 255;
+    const m = b & 8388607;
+    if (e == 0) {
+        if (m == 0) { return sign << 63; }
+        // 次正规数：m × 2^-149，精确。
+        let x = (m as float) * floatFromBits(874 << 52);
+        if (sign == 1) { x = -x; }
+        return floatToBits(x);
+    }
+    if (e == 255) { return (sign << 63) | (2047 << 52) | (m << 29); }
+    return (sign << 63) | ((e - 127 + 1023) << 52) | (m << 29);
+}
+
+// 整数或浮点槽按定宽种类写出的 (tag, 文本)。
+function numTag(t: int, c: int): string {
+    if (t == 1 && c >= 1 && c <= 9) { return fwName(c); }
+    if (t == 2 && c == 10) { return "f32"; }
+    return viewTagName(t);
+}
+
+function numText(t: int, pay: int, c: int): string {
+    if (t == 1) {
+        if (c == 7 || c == 9) { return u64Text(pay); }
+        return toStr(pay);
+    }
+    if (c == 10) { return f32Text(pay); }
+    return toStr(floatFromBits(pay));
+}
+
+// —— 名字 ——
+
+// 对象类型号对应的 decl（结构或枚举）；没有为 −1。
+function declOf(v: Ref<DbgView>, ty: int): int {
+    const k = listGet(v.ctx.cgTysK, ty) catch 0;
+    if (k == 12 || k == 13) { return listGet(v.ctx.cgTysA, ty) catch -1; }
+    return -1;
+}
+
+function strAt(v: Ref<DbgView>, si: int): string {
+    if (si < 0) { return ""; }
+    return listGet(v.ctx.cgStrings, si) catch "";
+}
+
+function declName(v: Ref<DbgView>, d: int): string {
+    if (d < 0) { return ""; }
+    return strAt(v, listGet(v.ctx.declNameIdx, d) catch -1);
+}
+
+// 静态类型 ty 指向的结构或枚举的 decl；不是或未登记为 −1。
+function declOfTy(v: Ref<DbgView>, ty: int): int {
+    const t = tyInner(v, ty);
+    const k = tyKind(v, t);
+    if (k == 13) { return listGet(v.ctx.dbg.sebStructs, tyA(v, t)) catch -1; }
+    if (k == 14 || k == 19) { return listGet(v.ctx.dbg.sebEnums, tyA(v, t)) catch -1; }
+    return -1;
+}
+
+// 对象的 decl：先看对象头的类型号；没有 TXC 类型指向的 decl（类型号为 0）时用 hint（富错误里的枚举号），再按
+// 静态类型找回。
+function objDecl(v: Ref<DbgView>, hdr: Bytes, ty: int, hint: int): int {
+    const d = declOf(v, u32At(hdr, OBJECT_OFF_TYPE));
+    if (d >= 0) { return d; }
+    if (hint >= 0) { return hint; }
+    return declOfTy(v, ty);
+}
+
+function fnName(v: Ref<DbgView>, fi: int): string {
+    if (fi < 0 || fi >= listLen(v.fnNames)) { return "?"; }
+    return listGet(v.fnNames, fi) catch "?";
+}
+
+// —— 串与错误 ——
+
+// 串或错误消息所在的对象号（富错误的消息在载荷第一个值槽里）；取不到为 −1。
+function textObj(v: Ref<DbgView>, tag: int, idx: int): int {
+    if (!isLive(v, idx)) { return -1; }
+    const hdr = objHeader(v, idx);
+    if (bytesLen(hdr) < OBJECT_BYTES) { return -1; }
+    if (tag == 5 && u32At(hdr, OBJECT_OFF_PAYLOAD) != 0) {
+        const s0 = wireRead(v.p, wireU64(hdr, OBJECT_OFF_PTR), 16);
+        if (bytesLen(s0) < 16) { return -1; }
+        const m = wireU64(s0, 8);
+        if (!isLive(v, m)) { return -1; }
+        return m;
+    }
+    return idx & LOW32;
+}
+
+// 对象 o 的文本：至多 limit 字节，在字符边界截断（调试实施设计 §五）。
+function textOf(v: Ref<DbgView>, o: int, limit: int): string {
+    if (o < 0) { return "?"; }
+    const hdr = objHeader(v, o);
+    if (bytesLen(hdr) < OBJECT_BYTES) { return "?"; }
+    const ptr = wireU64(hdr, OBJECT_OFF_PTR);
+    const n = wireU64(hdr, OBJECT_OFF_LEN);
+    let take = n;
+    if (take > limit) { take = limit; }
+    if (take <= 0) { return ""; }
+    const raw = wireRead(v.p, ptr, take + 3);
+    // 不切在字符中间：截断处若是续字节（10xxxxxx）就往前退到字符开头。
+    let cut = take;
+    if (cut < n) {
+        while (cut > 0 && ((bytesGet(raw, cut) catch 0) & 192) == 128) { cut = cut - 1; }
+    }
+    if (cut > bytesLen(raw)) { cut = bytesLen(raw); }
+    return wireText(bytesSlice(raw, 0, cut));
+}
+
+function textLen(v: Ref<DbgView>, o: int): int {
+    if (o < 0) { return 0; }
+    return wireU64(objHeader(v, o), OBJECT_OFF_LEN);
+}
+
+// —— brief ——
+
+// frames 里槽的 tag（定宽整数与 f32 按静态类型）。
+export function viewSlotTag(v: Ref<DbgView>, s: Ref<DbgSlot>, ty: int): string {
+    if (s.tag == 1 || s.tag == 2) { return numTag(s.tag, fwCode(v, ty)); }
+    return viewTagName(s.tag);
+}
+
+function genState(st: int): string {
+    if (st == 0) { return "new"; }
+    if (st == 1) { return "suspended"; }
+    if (st == 2) { return "running"; }
+    if (st == 3) { return "done"; }
+    return "?";
+}
+
+function threadState(v: Ref<DbgView>, hdr: Bytes): string {
+    const rec = wireRead(v.p, wireU64(hdr, OBJECT_OFF_PTR) + 16, 8);
+    if (bytesLen(rec) < 8) { return "?"; }
+    const st = wireU64(rec, 0);
+    if (st == 0) { return "running"; }
+    if (st == 1) { return "done"; }
+    if (st == 2) { return "failed"; }
+    return "?";
+}
+
+function atomicText(v: Ref<DbgView>, hdr: Bytes): string {
+    const cell = wireRead(v.p, wireU64(hdr, OBJECT_OFF_PTR), 8);
+    if (bytesLen(cell) < 8) { return "?"; }
+    return toStr(wireU64(cell, 0));
+}
+
+function weakText(v: Ref<DbgView>, hdr: Bytes): string {
+    const target = u32At(hdr, OBJECT_OFF_META);
+    if (u32At(hdr, OBJECT_OFF_AUX) != 0 || !isLive(v, target)) { return "dead"; }
+    return "#" + toStr(target);
+}
+
+function futureText(hdr: Bytes): string {
+    // Future（nrt_async.tx）：属主任务 u32@24、状态 u32@28（0 未决 1 完成 2 取消）。
+    const st = u32At(hdr, OBJECT_OFF_AUX);
+    let state = "pending";
+    if (st == 1) { state = "done"; }
+    if (st == 2) { state = "cancelled"; }
+    return state + " task#" + toStr(u32At(hdr, OBJECT_OFF_META));
+}
+
+// frames 里槽的 brief（VM 调试协议参考 §五 的表；原生特有的种类见调试实施设计 §四-4）。
+export function viewBrief(v: Ref<DbgView>, s: Ref<DbgSlot>, ty: int): string {
+    const t = s.tag;
+    if (t == 1 || t == 2) { return numText(t, s.pay, fwCode(v, ty)); }
+    if (t == 3) {
+        if (s.pay != 0) { return "true"; }
+        return "false";
+    }
+    if (t == 4 || t == 0) { return "none"; }
+    if (t == 12) { return fnName(v, s.pay & LOW32); }
+    if (!isHeap(t)) { return "?"; }
+    const idx = s.pay & LOW32;
+    if (!isLive(v, idx)) { return "#" + toStr(idx) + " freed"; }
+    if (t == 5 || t == 6) { return textOf(v, textObj(v, t, idx), BRIEF_BYTES); }
+    const hdr = objHeader(v, idx);
+    if (bytesLen(hdr) < OBJECT_BYTES) { return "?"; }
+    if (t == 7 || t == 8 || t == 9) {
+        let name = declName(v, objDecl(v, hdr, ty, -1));
+        if (len(name) == 0) { name = viewTagName(t); }
+        return "#" + toStr(idx) + " " + name;
+    }
+    if (t == 10) { return "[len " + toStr(u32At(hdr, OBJECT_OFF_META)) + "]"; }
+    if (t == 11) { return "slice len " + toStr(u32At(hdr, OBJECT_OFF_AUX)); }
+    if (t == 15) { return "list len " + toStr(wireU64(hdr, OBJECT_OFF_LEN)); }
+    if (t == 17) { return "bytes len " + toStr(wireU64(hdr, OBJECT_OFF_LEN)); }
+    if (t == 14) { return weakText(v, hdr); }
+    if (t == 16) { return futureText(hdr); }
+    if (t == 18) { return genState(u32At(hdr, OBJECT_OFF_META)) + " " + fnName(v, u32At(hdr, OBJECT_OFF_AUX)); }
+    if (t == 19) { return threadState(v, hdr); }
+    if (t == 21) { return atomicText(v, hdr); }
+    return "#" + toStr(idx) + " " + viewTagName(t);
+}
+
+// 槽的 rc：存活的堆值为数字，其余 null。
+export function viewRcText(v: Ref<DbgView>, s: Ref<DbgSlot>): string {
+    if (!isHeap(s.tag) || !isLive(v, s.pay)) { return "null"; }
+    const r = viewRc(v, s.pay);
+    if (r < 0) { return "null"; }
+    return toStr(r);
+}
+
+// —— inspect ——
+
+// 节点的头部（tag、type、text、rc、truncated 位）；children 另由 viewKids 给出。
+export struct DbgHead {
+    tag: string,
+    ty: string,
+    text: string,
+    rc: string,
+    tr: int,
+}
+
+// 一个子节点：名字（数组与列表元素为空）、值槽、静态类型；fw 为紧凑列表元素的定宽种类（其余为 0）；hint 为
+// 对象头给不出 decl 时用的 decl（富错误的载荷，其余为 −1）。
+export struct DbgKid {
+    name: string,
+    slot: Ref<DbgSlot>,
+    ty: int,
+    fw: int,
+    hint: int,
+}
+
+// 一个节点：键序同 VM（tag、name、type、text、rc、truncated、children）；name、type、rc 为空串时省略。
+function mk(tag: string, name: string, ty: string, text: string, rc: string, tr: int, kids: string): string {
+    let out = "{\"tag\":" + dbgStr(tag);
+    if (len(name) > 0) { out = out + ",\"name\":" + dbgStr(name); }
+    if (len(ty) > 0) { out = out + ",\"type\":" + dbgStr(ty); }
+    out = out + ",\"text\":" + dbgStr(text);
+    if (len(rc) > 0) { out = out + ",\"rc\":" + rc; }
+    if (tr != 0) {
+        out = out + ",\"truncated\":{\"depth\":" + flag(tr, TR_DEPTH) + ",\"width\":" + flag(tr, TR_WIDTH) + ",\"str\":" + flag(tr, TR_STR) + "}";
+    }
+    return out + ",\"children\":[" + kids + "]}";
+}
+
+function flag(tr: int, bit: int): string {
+    if ((tr & bit) != 0) { return "true"; }
+    return "false";
+}
+
+function comma(kids: string, node: string): string {
+    if (len(kids) == 0) { return node; }
+    return kids + "," + node;
+}
+
+function head(tag: string, ty: string, text: string, rc: string, tr: int): Ref<DbgHead> {
+    return new DbgHead { tag: tag, ty: ty, text: text, rc: rc, tr: tr };
+}
+
+function emptyInts(): List<int> { return listNew(); }
+
+function widthFlag(n: int): int {
+    if (n > WIDTH) { return TR_WIDTH; }
+    return 0;
+}
+
+function codeOf(v: Ref<DbgView>, ty: int, fw: int): int {
+    if (fw > 0) { return fw; }
+    return fwCode(v, ty);
+}
+
+// 枚举值的变体名（取不到写 variant N）。
+function variantName(v: Ref<DbgView>, d: int, vi: int): string {
+    const vnames = listGet(v.ctx.declVariantNames, d) catch emptyInts();
+    const name = strAt(v, listGet(vnames, vi) catch -1);
+    if (len(name) == 0) { return "variant " + toStr(vi); }
+    return name;
+}
+
+// 节点的头部（调试实施设计 §四-4 的渲染规格）。
+export function viewHead(v: Ref<DbgView>, s: Ref<DbgSlot>, ty: int, fw: int, hint: int): Ref<DbgHead> {
+    const t = s.tag;
+    if (t == 1 || t == 2) {
+        const c = codeOf(v, ty, fw);
+        return head(numTag(t, c), "", numText(t, s.pay, c), "", 0);
+    }
+    if (!isHeap(t)) { return head(viewTagName(t), "", viewBrief(v, s, ty), "", 0); }
+    const idx = s.pay & LOW32;
+    if (!isLive(v, idx)) { return head(viewTagName(t), "", "freed", "", 0); }
+    const rc = viewRcText(v, s);
+    if (t == 5 || t == 6) {
+        const o = textObj(v, t, idx);
+        let tr = 0;
+        if (textLen(v, o) > TEXT_BYTES) { tr = TR_STR; }
+        const text = textOf(v, o, TEXT_BYTES);
+        if (t == 6) { return head("string", "", text, rc, tr); }
+        const eh = objHeader(v, idx);
+        if (u32At(eh, OBJECT_OFF_PAYLOAD) == 0) { return head("err", "", text, rc, tr); }
+        // 富错误：0 消息、1 种类名、2 类型号、3 变体载荷、4 原因（nrt_errors.tx）。
+        const kind = listGet(viewSlots(v, wireU64(eh, OBJECT_OFF_PTR) + 16, 1), 0) catch new DbgSlot { tag: 0, pay: 0 };
+        let kname = "";
+        if (kind.tag == 6) { kname = textOf(v, textObj(v, 6, kind.pay), TEXT_BYTES); }
+        return head("err", kname, text, rc, tr);
+    }
+    const hdr = objHeader(v, idx);
+    if (bytesLen(hdr) < OBJECT_BYTES) { return head(viewTagName(t), "", "?", rc, 0); }
+    const pk = u32At(hdr, OBJECT_OFF_PAYLOAD);
+    if ((t == 7 || t == 9) && pk == 1) {
+        const n = wireU64(hdr, OBJECT_OFF_LEN);
+        return head(viewTagName(t), declName(v, objDecl(v, hdr, ty, hint)), toStr(n) + " 字段", rc, widthFlag(n));
+    }
+    if (t == 8 || (t == 9 && pk == 2)) {
+        const d = objDecl(v, hdr, ty, hint);
+        return head("enum", declName(v, d), variantName(v, d, u32At(hdr, OBJECT_OFF_META)), rc, widthFlag(wireU64(hdr, OBJECT_OFF_LEN)));
+    }
+    if (t == 7 || t == 8 || t == 9) { return head(viewTagName(t), declName(v, objDecl(v, hdr, ty, hint)), "?", rc, 0); }
+    if (t == 10) {
+        const n = u32At(hdr, OBJECT_OFF_META);
+        return head("array", "", "len=" + toStr(n), rc, widthFlag(n));
+    }
+    if (t == 11) {
+        const n = u32At(hdr, OBJECT_OFF_AUX);
+        return head("slice", "", "len=" + toStr(n), rc, widthFlag(n));
+    }
+    if (t == 15 || t == 17) {
+        const n = wireU64(hdr, OBJECT_OFF_LEN);
+        return head(viewTagName(t), "", "len=" + toStr(n), rc, widthFlag(n));
+    }
+    if (t == 20) { return head("shared", "", "shared", rc, 0); }
+    return head(viewTagName(t), "", viewBrief(v, s, ty), rc, 0);
+}
+
+function kid(out: List<Ref<DbgKid>>, name: string, slot: Ref<DbgSlot>, ty: int, fw: int, hint: int): void {
+    listPush(out, new DbgKid { name: name, slot: slot, ty: ty, fw: fw, hint: hint });
+}
+
+// 节点的直接子节点（至多 32 个；调试实施设计 §四-4）：结构类与枚举的字段带名字，数组、切片、列表与 Bytes 的
+// 元素不带名字，富错误为载荷与原因，Shared 为本线程已物化的内层值。
+export function viewKids(v: Ref<DbgView>, s: Ref<DbgSlot>, ty: int, hint: int): List<Ref<DbgKid>> {
+    const out: List<Ref<DbgKid>> = listNew();
+    const t = s.tag;
+    if (!isHeap(t) || t == 6 || !isLive(v, s.pay)) { return out; }
+    const hdr = objHeader(v, s.pay & LOW32);
+    if (bytesLen(hdr) < OBJECT_BYTES) { return out; }
+    const pk = u32At(hdr, OBJECT_OFF_PAYLOAD);
+    if (t == 5) {
+        if (pk == 0) { return out; }
+        const slots = viewSlots(v, wireU64(hdr, OBJECT_OFF_PTR), 5);
+        const pool = listGet(slots, 2) catch new DbgSlot { tag: 0, pay: 0 };
+        const payload = listGet(slots, 3) catch new DbgSlot { tag: 0, pay: 0 };
+        let pd = -1;
+        if (pool.tag == 1) { pd = listGet(v.ctx.dbg.sebEnums, pool.pay) catch -1; }
+        if (payload.tag != 0 && payload.tag != 4) { kid(out, "payload", payload, -1, 0, pd); }
+        const cause = listGet(slots, 4) catch new DbgSlot { tag: 0, pay: 0 };
+        if (cause.tag != 0 && cause.tag != 4) { kid(out, "cause", cause, -1, 0, -1); }
+        return out;
+    }
+    if ((t == 7 || t == 9) && pk == 1) {
+        const d = objDecl(v, hdr, ty, hint);
+        const names = listGet(v.ctx.declFieldNames, d) catch emptyInts();
+        const sebs = listGet(v.ctx.dbg.declFSeb, d) catch emptyInts();
+        const slots = viewSlots(v, wireU64(hdr, OBJECT_OFF_PTR), capped(wireU64(hdr, OBJECT_OFF_LEN)));
+        let i = 0;
+        while (i < listLen(slots)) {
+            kid(out, strAt(v, listGet(names, i) catch -1), listGet(slots, i) catch new DbgSlot { tag: 0, pay: 0 }, listGet(sebs, i) catch -1, 0, -1);
+            i = i + 1;
+        }
+        return out;
+    }
+    if (t == 8 || (t == 9 && pk == 2)) {
+        const d = objDecl(v, hdr, ty, hint);
+        const vi = u32At(hdr, OBJECT_OFF_META);
+        // 本变体的字段在 decl 的摊平表里的起点。
+        const counts = listGet(v.ctx.dbg.declVCnt, d) catch emptyInts();
+        let off = 0;
+        let j = 0;
+        while (j < vi && j < listLen(counts)) {
+            off = off + (listGet(counts, j) catch 0);
+            j = j + 1;
+        }
+        const fnames = listGet(v.ctx.declVarFNames, d) catch emptyInts();
+        const sebs = listGet(v.ctx.dbg.declVSeb, d) catch emptyInts();
+        const slots = viewSlots(v, wireU64(hdr, OBJECT_OFF_PTR), capped(wireU64(hdr, OBJECT_OFF_LEN)));
+        let i = 0;
+        while (i < listLen(slots)) {
+            kid(out, strAt(v, listGet(fnames, off + i) catch -1), listGet(slots, i) catch new DbgSlot { tag: 0, pay: 0 }, listGet(sebs, off + i) catch -1, 0, -1);
+            i = i + 1;
+        }
+        return out;
+    }
+    if (t == 10) {
+        seqKids(v, out, wireU64(hdr, OBJECT_OFF_PTR), capped(u32At(hdr, OBJECT_OFF_META)), tyElem(v, ty));
+        return out;
+    }
+    if (t == 11) {
+        // 切片总是底层数组的前 len 个元素。
+        const arr = u32At(hdr, OBJECT_OFF_META);
+        if (!isLive(v, arr)) { return out; }
+        const ah = objHeader(v, arr);
+        let shown = u32At(ah, OBJECT_OFF_META);
+        const n = u32At(hdr, OBJECT_OFF_AUX);
+        if (shown > n) { shown = n; }
+        seqKids(v, out, wireU64(ah, OBJECT_OFF_PTR), capped(shown), tyElem(v, ty));
+        return out;
+    }
+    if (t == 15 || t == 17) {
+        listKids(v, out, hdr, tyElem(v, ty));
+        return out;
+    }
+    if (t == 20) {
+        const rt = bytesGet(hdr, OBJECT_OFF_RESULT) catch 0;
+        if (rt != 0 && rt != 4) { kid(out, "value", new DbgSlot { tag: rt, pay: wireU64(hdr, OBJECT_OFF_RESULT + 8) }, tyElem(v, ty), 0, -1); }
+    }
+    return out;
+}
+
+function capped(n: int): int {
+    if (n > WIDTH) { return WIDTH; }
+    if (n < 0) { return 0; }
+    return n;
+}
+
+function seqKids(v: Ref<DbgView>, out: List<Ref<DbgKid>>, ptr: int, n: int, ety: int): void {
+    if (ptr == 0 || n <= 0) { return; }
+    const slots = viewSlots(v, ptr, n);
+    let i = 0;
+    while (i < listLen(slots)) {
+        kid(out, "", listGet(slots, i) catch new DbgSlot { tag: 0, pay: 0 }, ety, 0, -1);
+        i = i + 1;
+    }
+}
+
+// 列表（通用、原值、紧凑三种形态）与 Bytes（紧凑 u8）的元素。
+function listKids(v: Ref<DbgView>, out: List<Ref<DbgKid>>, hdr: Bytes, ety: int): void {
+    const elem = u32At(hdr, OBJECT_OFF_META);
+    const form = u32At(hdr, OBJECT_OFF_AUX);
+    const ptr = wireU64(hdr, OBJECT_OFF_PTR);
+    const shown = capped(wireU64(hdr, OBJECT_OFF_LEN));
+    if (form == LIST_FORM_COMPACT) {
+        let w = 4;
+        if (elem == 1 || elem == 4) { w = 1; }
+        if (elem == 2 || elem == 5) { w = 2; }
+        const raw = wireRead(v.p, ptr, shown * w);
+        let i = 0;
+        while (i < shown && (i + 1) * w <= bytesLen(raw)) {
+            let x = 0;
+            let k = w - 1;
+            while (k >= 0) {
+                x = (x << 8) | (bytesGet(raw, i * w + k) catch 0);
+                k = k - 1;
+            }
+            // 有符号种类按宽度符号扩展。
+            if (elem == 1 && x >= 128) { x = x - 256; }
+            if (elem == 2 && x >= 32768) { x = x - 65536; }
+            if (elem == 3 && x >= 2147483648) { x = x - 4294967296; }
+            if (elem == 10) {
+                kid(out, "", new DbgSlot { tag: 2, pay: f32BitsToF64(x) }, -1, 10, -1);
+            } else {
+                kid(out, "", new DbgSlot { tag: 1, pay: x }, -1, elem, -1);
+            }
+            i = i + 1;
+        }
+        return;
+    }
+    if (form == 2) {
+        // 原值形态：8 字节元素，元素种类即标签（1 int、2 float、3 bool）。
+        const words = wireRead(v.p, ptr, shown * 8);
+        let ri = 0;
+        while (ri < shown && (ri + 1) * 8 <= bytesLen(words)) {
+            kid(out, "", new DbgSlot { tag: elem, pay: wireU64(words, ri * 8) }, ety, 0, -1);
+            ri = ri + 1;
+        }
+        return;
+    }
+    seqKids(v, out, ptr, shown, ety);
+}
+
+// inspect 的根（静态类型 ty 取自变量表，未知为 −1）：整棵树，深 8、宽 32。
+export function viewInspect(v: Ref<DbgView>, s: Ref<DbgSlot>, ty: int): string {
+    return node(v, s, ty, 0, -1, 0, "");
+}
+
+function node(v: Ref<DbgView>, s: Ref<DbgSlot>, ty: int, fw: int, hint: int, depth: int, name: string): string {
+    if (depth > DEPTH) { return mk(viewTagName(s.tag), name, "", "…", "", TR_DEPTH, ""); }
+    const h = viewHead(v, s, ty, fw, hint);
+    let kids = "";
+    const ks = viewKids(v, s, ty, hint);
+    let i = 0;
+    while (i < listLen(ks)) {
+        const k = listGet(ks, i) catch new DbgKid { name: "", slot: s, ty: -1, fw: 0, hint: -1 };
+        kids = comma(kids, node(v, k.slot, k.ty, k.fw, k.hint, depth + 1, k.name));
+        i = i + 1;
+    }
+    return mk(h.tag, name, h.ty, h.text, h.rc, h.tr, kids);
+}

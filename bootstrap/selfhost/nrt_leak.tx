@@ -1,0 +1,405 @@
+// 退出时泄漏检查（TOOL-84 第一步，docs/design/v052-leak-check-v0.1-20261017.md）。
+// 构建带 --leak-check 时镜像版本字的高 32 位位 0 置位，内核启动时读进进程级的 __tx_leak_on。开启时：
+// - __tx_site_of（nrt.tx 的叶子例程，关闭时直接得 0）转到 __tx_leak_site_of，分配点记为（函数, pc）的行表项
+//   相对镜像基址的位置：（行表项地址 − 镜像基址）/ 8，非零；
+// - 主线程正常退出、子线程结束时先放开根（入口窗口的结果槽、本线程各模块状态的字段），再扫描本线程的对象表：
+//   仍存活且非永生的对象即泄漏（成环，或运行期少放了计数），按（种类, 分配点）汇总后一次写到 stderr；
+//   任一线程发现泄漏，进程退出码为 23（__tx_entry_finish 覆盖程序本来的退出码）。
+// trap 与致命退出不经过这里（进程中途终止，不检查）。
+import { StructuredBuffer, asBufferLabel, asBufferZero, asBufferSection, asBufferAlign, asBufferAddress, asBufferQuad } from "./assemble";
+import { RtFn, L, I, A, G, GAcq } from "./rtfn_base";
+import { rtBegin, rtSet, rtOp, rtShift, rtDivMod, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtRet, rtRetVoid } from "./rtfn";
+import { check, text } from "./nrt_base";
+import { TB_OS_TID } from "./thread_block_abi";
+
+// 与 ./nrt 的镜像常量一致（nrt 引用本模块，不能反向 import）。
+const IMG_NFUNCS: int = 16;
+const IMG_NMODULES: int = 24;
+const IMG_FUNCS: int = 48;
+const IMG_MODULES: int = 56;
+const IMG_STRINGS: int = 64;
+const FN_STRIDE: int = 64;
+// 槽表：next[idx] 的存活标记、rc 的永生值。
+const LIVE: int = 4294967294;
+const IMMORTAL: int = 4294967295;
+const BUF: int = 8192;
+const MAX_GROUPS: int = 20;
+const PREVIEW: int = 40;
+export const LEAK_EXIT: int = 23;
+// 对象种类 0..15 的名字（kind 1 str 起，与 object_record 的编号一致；Bytes 与 List<u8> 同形态，记为 List）。
+const KIND_NAMES: string = "? string Error struct enum Ref array slice closure Weak List Future Generator Thread Shared Atomic";
+
+/// 进程级 .bss：开关与“已发现泄漏”标志。
+export function nrtLeakBss(b: Ref<StructuredBuffer>): void {
+    asBufferLabel(b, "__tx_leak_on", 1); asBufferZero(b, 8, 1);
+    asBufferLabel(b, "__tx_leak_found", 1); asBufferZero(b, 8, 1);
+}
+
+/// 内建在新建对象（局部 idx）后登记分配点；函数须以局部 fn/pc 持有调用位置。关闭时只多一次标志判断。
+export function leakStamp(f: Ref<RtFn>, idx: string, label: string): void {
+    rtIf(f, G("__tx_leak_on"), "eq", I(0), label);
+    rtCall3(f, "", "__tx_leak_stamp", L(idx), L("fn"), L("pc"));
+    rtLabel(f, label);
+}
+
+export function emitNrtLeak(b: Ref<StructuredBuffer>): void {
+    emitLeakSites(b);
+    emitLeakText(b);
+    emitLeakPreview(b);
+    emitLeakScan(b);
+    emitLeakExits(b);
+}
+
+function emitLeakSites(b: Ref<StructuredBuffer>): void {
+    // __tx_leak_site_of(fn, pc) → 分配点（0＝位置未知）。只读镜像，不碰线程块。
+    let f = rtBegin(b, "__tx_leak_site_of", "fn pc", "img x e", 0, "bootstrap/selfhost/nrt_leak.tx");
+    rtSet(f, "img", A("__tx_nrt_image"));
+    rtOp(f, "fn", L("fn"), "and", I(4294967295)); rtOp(f, "pc", L("pc"), "and", I(4294967295));
+    rtLoad(f, "x", L("img"), IMG_NFUNCS, 8);
+    rtIf(f, L("fn"), "uge", L("x"), "none");
+    rtLoad(f, "e", L("img"), IMG_FUNCS, 8); rtOp(f, "x", L("fn"), "imul", I(FN_STRIDE)); rtOp(f, "e", L("e"), "add", L("x"));
+    rtLoad(f, "x", L("e"), 24, 8);
+    rtIf(f, L("pc"), "uge", L("x"), "none");
+    rtLoad(f, "e", L("e"), 32, 8);
+    rtShift(f, "x", L("pc"), "shl", 3); rtOp(f, "e", L("e"), "add", L("x"));
+    rtOp(f, "e", L("e"), "sub", L("img")); rtShift(f, "e", L("e"), "shr", 3);
+    rtRet(f, L("e"));
+    rtLabel(f, "none"); rtRet(f, I(0)); check(f);
+
+    // __tx_leak_stamp(idx, fn, pc)：把分配点写进对象记录的 site（u32@8）。
+    f = rtBegin(b, "__tx_leak_stamp", "idx fn pc", "s o", 2, "bootstrap/selfhost/nrt_leak.tx");
+    rtCall2(f, "s", "__tx_leak_site_of", L("fn"), L("pc"));
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("idx"));
+    rtStore(f, L("o"), 8, L("s"), 4);
+    rtRetVoid(f); check(f);
+}
+
+function emitLeakText(b: Ref<StructuredBuffer>): void {
+    const names = strSplit(KIND_NAMES, " ");
+    const labels: List<string> = listNew();
+    let k = 0;
+    while (k < listLen(names)) { listPush(labels, text(b, listGet(names, k) catch "")); k = k + 1; }
+    asBufferSection(b, 1, 1);
+    asBufferAlign(b, 3, 1);
+    asBufferLabel(b, "__tx_leak_kind_names", 1);
+    k = 0;
+    while (k < listLen(names)) { asBufferAddress(b, listGet(labels, k) catch "", 1); asBufferQuad(b, len(listGet(names, k) catch ""), 1); k = k + 1; }
+    asBufferSection(b, 0, 1);
+
+    // __tx_leak_put(buf, pos, ptr, n) → 新 pos（报告缓冲 BUF 字节，留 8 字节余量）。
+    let f = rtBegin(b, "__tx_leak_put", "buf pos ptr n", "i c d", 0, "bootstrap/selfhost/nrt_leak.tx");
+    rtSet(f, "i", I(0));
+    rtLabel(f, "loop");
+    rtIf(f, L("i"), "ge", L("n"), "done");
+    rtIf(f, L("pos"), "ge", I(BUF - 8), "done");
+    rtOp(f, "c", L("ptr"), "add", L("i")); rtLoad(f, "c", L("c"), 0, 1);
+    rtOp(f, "d", L("buf"), "add", L("pos")); rtStore(f, L("d"), 0, L("c"), 1);
+    rtOp(f, "i", L("i"), "add", I(1)); rtOp(f, "pos", L("pos"), "add", I(1));
+    rtJump(f, "loop");
+    rtLabel(f, "done"); rtRet(f, L("pos")); check(f);
+
+    // __tx_leak_dec(buf, pos, v) → 新 pos（v ≥ 0 的十进制）。
+    f = rtBegin(b, "__tx_leak_dec", "buf pos v", "t0 t1 t2 p n q r", 4, "bootstrap/selfhost/nrt_leak.tx");
+    rtAddrOf(f, "p", "t0");
+    rtSet(f, "n", I(24));
+    rtIf(f, L("v"), "ne", I(0), "digit");
+    rtSet(f, "n", I(23)); rtStore(f, L("p"), 23, I(48), 1);
+    rtJump(f, "emit");
+    rtLabel(f, "digit");
+    rtIf(f, L("v"), "eq", I(0), "emit");
+    rtDivMod(f, "q", "r", L("v"), I(10));
+    rtSet(f, "v", L("q"));
+    rtOp(f, "n", L("n"), "sub", I(1));
+    rtOp(f, "r", L("r"), "add", I(48)); rtOp(f, "q", L("p"), "add", L("n")); rtStore(f, L("q"), 0, L("r"), 1);
+    rtJump(f, "digit");
+    rtLabel(f, "emit");
+    rtOp(f, "q", L("p"), "add", L("n")); rtSet(f, "r", I(24)); rtOp(f, "r", L("r"), "sub", L("n"));
+    rtCall4(f, "pos", "__tx_leak_put", L("buf"), L("pos"), L("q"), L("r"));
+    rtRet(f, L("pos")); check(f);
+
+    // __tx_leak_where(buf, pos, site) → 新 pos：`模块:行:列`，找不到所属函数时写“位置未登记”。
+    const unknown = "位置未登记";
+    const unknownL = text(b, unknown);
+    const colon = text(b, ":");
+    f = rtBegin(b, "__tx_leak_where", "buf pos site", "img a n i e lp x y", 4, "bootstrap/selfhost/nrt_leak.tx");
+    rtIf(f, L("site"), "eq", I(0), "unknown");
+    rtSet(f, "img", A("__tx_nrt_image"));
+    rtShift(f, "a", L("site"), "shl", 3); rtOp(f, "a", L("a"), "add", L("img"));
+    rtLoad(f, "n", L("img"), IMG_NFUNCS, 8);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "find");
+    rtIf(f, L("i"), "uge", L("n"), "unknown");
+    rtLoad(f, "e", L("img"), IMG_FUNCS, 8); rtOp(f, "x", L("i"), "imul", I(FN_STRIDE)); rtOp(f, "e", L("e"), "add", L("x"));
+    rtLoad(f, "lp", L("e"), 32, 8);
+    rtIf(f, L("lp"), "eq", I(0), "next");
+    rtIf(f, L("a"), "ult", L("lp"), "next");
+    rtLoad(f, "x", L("e"), 24, 8); rtShift(f, "x", L("x"), "shl", 3); rtOp(f, "x", L("x"), "add", L("lp"));
+    rtIf(f, L("a"), "uge", L("x"), "next");
+    // 模块路径：modules[mod].path（字符串号）→ strings[号] = {len, ptr}。
+    rtLoad(f, "x", L("e"), 8, 8);
+    rtLoad(f, "y", L("img"), IMG_NMODULES, 8);
+    rtIf(f, L("x"), "uge", L("y"), "unknown");
+    rtLoad(f, "y", L("img"), IMG_MODULES, 8); rtShift(f, "x", L("x"), "shl", 5); rtOp(f, "x", L("x"), "add", L("y"));
+    rtLoad(f, "x", L("x"), 24, 8);
+    rtLoad(f, "y", L("img"), IMG_STRINGS, 8); rtShift(f, "x", L("x"), "shl", 4); rtOp(f, "x", L("x"), "add", L("y"));
+    rtLoad(f, "y", L("x"), 8, 8); rtLoad(f, "x", L("x"), 0, 8);
+    rtCall4(f, "pos", "__tx_leak_put", L("buf"), L("pos"), L("y"), L("x"));
+    rtCall4(f, "pos", "__tx_leak_put", L("buf"), L("pos"), A(colon), I(1));
+    rtLoad(f, "x", L("a"), 0, 4);
+    rtCall3(f, "pos", "__tx_leak_dec", L("buf"), L("pos"), L("x"));
+    rtCall4(f, "pos", "__tx_leak_put", L("buf"), L("pos"), A(colon), I(1));
+    rtLoad(f, "x", L("a"), 4, 4);
+    rtCall3(f, "pos", "__tx_leak_dec", L("buf"), L("pos"), L("x"));
+    rtRet(f, L("pos"));
+    rtLabel(f, "next");
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "find");
+    rtLabel(f, "unknown");
+    rtCall4(f, "pos", "__tx_leak_put", L("buf"), L("pos"), A(unknownL), I(len(unknown)));
+    rtRet(f, L("pos")); check(f);
+}
+
+/// __tx_leak_preview(buf, pos, idx) → 新 pos：字符串对象的内容预览 `，例 "…"`——至多 PREVIEW 字节、在 UTF-8
+/// 字符边界截断，控制字符写成 `?`（报告一行一组）。
+function emitLeakPreview(b: Ref<StructuredBuffer>): void {
+    const head = "，例 \"";
+    const lHead = text(b, head);
+    const lTail = text(b, "\"");
+    const lMore = text(b, "…\"");
+    const f = rtBegin(b, "__tx_leak_preview", "buf pos idx", "o p n i c d cut", 4, "bootstrap/selfhost/nrt_leak.tx");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("idx"));
+    rtLoad(f, "p", L("o"), 32, 8); rtLoad(f, "n", L("o"), 40, 8);
+    rtSet(f, "cut", I(0));
+    rtIf(f, L("n"), "ule", I(PREVIEW), "whole");
+    rtSet(f, "cut", I(1)); rtSet(f, "n", I(PREVIEW));
+    rtLabel(f, "back");
+    rtIf(f, L("n"), "eq", I(0), "whole");
+    rtOp(f, "c", L("p"), "add", L("n")); rtLoad(f, "c", L("c"), 0, 1);
+    rtOp(f, "c", L("c"), "and", I(192));
+    rtIf(f, L("c"), "ne", I(128), "whole");
+    rtOp(f, "n", L("n"), "sub", I(1)); rtJump(f, "back");
+    rtLabel(f, "whole");
+    rtCall4(f, "pos", "__tx_leak_put", L("buf"), L("pos"), A(lHead), I(len(head)));
+    rtSet(f, "i", I(0));
+    rtLabel(f, "copy");
+    rtIf(f, L("i"), "uge", L("n"), "copied");
+    rtIf(f, L("pos"), "ge", I(BUF - 16), "copied");
+    rtOp(f, "c", L("p"), "add", L("i")); rtLoad(f, "c", L("c"), 0, 1);
+    rtIf(f, L("c"), "uge", I(32), "plain");
+    rtSet(f, "c", I(63));
+    rtLabel(f, "plain");
+    rtOp(f, "d", L("buf"), "add", L("pos")); rtStore(f, L("d"), 0, L("c"), 1);
+    rtOp(f, "pos", L("pos"), "add", I(1)); rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "copy");
+    rtLabel(f, "copied");
+    rtIf(f, L("cut"), "ne", I(0), "more");
+    rtCall4(f, "pos", "__tx_leak_put", L("buf"), L("pos"), A(lTail), I(1));
+    rtRet(f, L("pos"));
+    rtLabel(f, "more");
+    rtCall4(f, "pos", "__tx_leak_put", L("buf"), L("pos"), A(lMore), I(len("…\"")));
+    rtRet(f, L("pos")); check(f);
+}
+
+/// 存活且非永生的槽：idx 在局部 i；不是则跳 skip。用局部 x。
+function liveOrSkip(f: Ref<RtFn>, skip: string): void {
+    rtShift(f, "x", L("i"), "shl", 2); rtOp(f, "x", L("x"), "add", L("nxp")); rtLoad(f, "x", L("x"), 0, 4);
+    rtIf(f, L("x"), "ne", I(LIVE), skip);
+    rtShift(f, "x", L("i"), "shl", 2); rtOp(f, "x", L("x"), "add", L("rcp")); rtLoad(f, "x", L("x"), 0, 4);
+    rtIf(f, L("x"), "eq", I(0), skip);
+    rtIf(f, L("x"), "eq", I(IMMORTAL), skip);
+}
+
+function emitLeakScan(b: Ref<StructuredBuffer>): void {
+    // __tx_leak_roots()：放开本线程各模块状态（永生）的字段——模块级变量是退出时唯一还持有对象的根。
+    let f = rtBegin(b, "__tx_leak_roots", "", "img n i mods o p k nf v", 1, "bootstrap/selfhost/nrt_leak.tx");
+    rtSet(f, "img", A("__tx_nrt_image"));
+    rtLoad(f, "n", L("img"), IMG_NMODULES, 8);
+    rtSet(f, "mods", G("__tx_nrt_module_states"));
+    rtSet(f, "i", I(0));
+    rtLabel(f, "mod");
+    rtIf(f, L("i"), "uge", L("n"), "done");
+    rtShift(f, "o", L("i"), "shl", 2); rtOp(f, "o", L("o"), "add", L("mods")); rtLoad(f, "o", L("o"), 0, 4);
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("o"));
+    rtLoad(f, "p", L("o"), 32, 8); rtLoad(f, "nf", L("o"), 40, 8);
+    rtSet(f, "k", I(0));
+    rtLabel(f, "field");
+    rtIf(f, L("k"), "uge", L("nf"), "fdone");
+    rtShift(f, "v", L("k"), "shl", 4); rtOp(f, "v", L("v"), "add", L("p"));
+    rtCall1(f, "", "__tx_release", L("v"));
+    rtStore(f, L("v"), 0, I(4), 8); rtStore(f, L("v"), 8, I(0), 8);
+    rtOp(f, "k", L("k"), "add", I(1)); rtJump(f, "field");
+    rtLabel(f, "fdone");
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "mod");
+    rtLabel(f, "done"); rtRetVoid(f); check(f);
+
+    // __tx_leak_scan(tid) → 泄漏对象数：扫描本线程的对象表，有泄漏时汇总写 stderr、置 __tx_leak_found。
+    // tid 0＝主线程，否则为子线程的系统线程号（写进报告首行）。
+    // 汇总表开放寻址，每项 16 字节 {键+1, 个数 u32, 首次出现的槽号 u32}，键＝site × 16 + 种类。
+    const headA = "taixu: [runtime:leak] 退出时仍有 ";
+    const headT = "taixu: [runtime:leak] 线程（系统线程号 ";
+    const headT2 = "）结束时仍有 ";
+    const headB = " 个对象存活（引用计数成环，或运行期少放了计数）：\n";
+    const rowA = "  ";
+    const rowB = " 个 ";
+    const rowC = "，分配于 ";
+    const restA = "  其余 ";
+    const restB = " 组共 ";
+    const restC = " 个对象\n";
+    const lHeadA = text(b, headA); const lHeadT = text(b, headT); const lHeadT2 = text(b, headT2); const lHeadB = text(b, headB);
+    const lRowA = text(b, rowA); const lRowB = text(b, rowB); const lRowC = text(b, rowC); const lNl = text(b, "\n");
+    const lRestA = text(b, restA); const lRestB = text(b, restB); const lRestC = text(b, restC);
+    f = rtBegin(b, "__tx_leak_scan", "tid", "st rcp nxp n i x cnt cap tab groups o k s key h e buf pos printed pobj j best bc bf c", 4, "bootstrap/selfhost/nrt_leak.tx");
+    rtSet(f, "st", G("__tx_nrt_slots"));
+    rtLoad(f, "rcp", L("st"), 0, 8); rtLoad(f, "nxp", L("st"), 8, 8); rtLoad(f, "n", L("st"), 16, 8);
+    rtSet(f, "cnt", I(0)); rtSet(f, "i", I(0));
+    rtLabel(f, "count");
+    rtIf(f, L("i"), "uge", L("n"), "counted");
+    liveOrSkip(f, "cnext");
+    rtOp(f, "cnt", L("cnt"), "add", I(1));
+    rtLabel(f, "cnext");
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "count");
+    rtLabel(f, "counted");
+    rtIf(f, L("cnt"), "ne", I(0), "found");
+    rtRet(f, I(0));
+    rtLabel(f, "found");
+    rtCall2(f, "", "__tx_atomic_add", A("__tx_leak_found"), I(1));
+    // 汇总表：容量取 ≥ 2 × 泄漏数的 2 的幂（至少 16），清零。
+    rtSet(f, "cap", I(16));
+    rtShift(f, "x", L("cnt"), "shl", 1);
+    rtLabel(f, "grow");
+    rtIf(f, L("cap"), "ge", L("x"), "sized");
+    rtShift(f, "cap", L("cap"), "shl", 1); rtJump(f, "grow");
+    rtLabel(f, "sized");
+    rtShift(f, "x", L("cap"), "shl", 4);
+    rtCall2(f, "tab", "__tx_native_mem_alloc", L("x"), I(8));
+    rtIf(f, L("tab"), "eq", I(0), "oom");
+    rtSet(f, "j", I(0));
+    rtLabel(f, "clear");
+    rtIf(f, L("j"), "uge", L("x"), "cleared");
+    rtOp(f, "e", L("tab"), "add", L("j")); rtStore(f, L("e"), 0, I(0), 8);
+    rtOp(f, "j", L("j"), "add", I(8)); rtJump(f, "clear");
+    rtLabel(f, "cleared");
+    rtSet(f, "groups", I(0)); rtSet(f, "i", I(0));
+    rtLabel(f, "agg");
+    rtIf(f, L("i"), "uge", L("n"), "aggdone");
+    liveOrSkip(f, "anext");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("i"));
+    rtLoad(f, "k", L("o"), 12, 4); rtLoad(f, "s", L("o"), 8, 4);
+    rtIf(f, L("k"), "ule", I(15), "kindok");
+    rtSet(f, "k", I(0));
+    rtLabel(f, "kindok");
+    rtShift(f, "key", L("s"), "shl", 4); rtOp(f, "key", L("key"), "or", L("k")); rtOp(f, "key", L("key"), "add", I(1));
+    rtShift(f, "h", L("key"), "shr", 7); rtOp(f, "h", L("h"), "xor", L("key"));
+    rtOp(f, "x", L("cap"), "sub", I(1));
+    rtLabel(f, "probe");
+    rtOp(f, "h", L("h"), "and", L("x"));
+    rtShift(f, "e", L("h"), "shl", 4); rtOp(f, "e", L("e"), "add", L("tab"));
+    rtLoad(f, "c", L("e"), 0, 8);
+    rtIf(f, L("c"), "eq", I(0), "fresh");
+    rtIf(f, L("c"), "eq", L("key"), "hit");
+    rtOp(f, "h", L("h"), "add", I(1)); rtJump(f, "probe");
+    rtLabel(f, "fresh");
+    rtStore(f, L("e"), 0, L("key"), 8); rtStore(f, L("e"), 8, I(1), 4); rtStore(f, L("e"), 12, L("i"), 4);
+    rtOp(f, "groups", L("groups"), "add", I(1));
+    rtJump(f, "anext");
+    rtLabel(f, "hit");
+    rtLoad(f, "c", L("e"), 8, 4); rtOp(f, "c", L("c"), "add", I(1)); rtStore(f, L("e"), 8, L("c"), 4);
+    rtLabel(f, "anext");
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "agg");
+    rtLabel(f, "aggdone");
+    // 报告：首行，然后按个数降序（相同按首次出现）列至多 MAX_GROUPS 组，其余合计一行；一次写出。
+    rtCall2(f, "buf", "__tx_native_mem_alloc", I(BUF), I(1));
+    rtIf(f, L("buf"), "eq", I(0), "oom");
+    rtSet(f, "pos", I(0));
+    rtIf(f, L("tid"), "ne", I(0), "thead");
+    rtCall4(f, "pos", "__tx_leak_put", L("buf"), L("pos"), A(lHeadA), I(len(headA)));
+    rtJump(f, "hcount");
+    rtLabel(f, "thead");
+    rtCall4(f, "pos", "__tx_leak_put", L("buf"), L("pos"), A(lHeadT), I(len(headT)));
+    rtCall3(f, "pos", "__tx_leak_dec", L("buf"), L("pos"), L("tid"));
+    rtCall4(f, "pos", "__tx_leak_put", L("buf"), L("pos"), A(lHeadT2), I(len(headT2)));
+    rtLabel(f, "hcount");
+    rtCall3(f, "pos", "__tx_leak_dec", L("buf"), L("pos"), L("cnt"));
+    rtCall4(f, "pos", "__tx_leak_put", L("buf"), L("pos"), A(lHeadB), I(len(headB)));
+    rtSet(f, "printed", I(0)); rtSet(f, "pobj", I(0));
+    rtLabel(f, "group");
+    rtIf(f, L("printed"), "ge", I(MAX_GROUPS), "rest");
+    rtIf(f, L("pos"), "ge", I(BUF - 1024), "rest");
+    rtSet(f, "bc", I(0)); rtSet(f, "bf", I(0)); rtSet(f, "best", I(0)); rtSet(f, "j", I(0));
+    rtLabel(f, "pick");
+    rtIf(f, L("j"), "uge", L("cap"), "picked");
+    rtShift(f, "e", L("j"), "shl", 4); rtOp(f, "e", L("e"), "add", L("tab"));
+    rtLoad(f, "c", L("e"), 0, 8); rtIf(f, L("c"), "eq", I(0), "pnext");
+    rtLoad(f, "c", L("e"), 8, 4); rtIf(f, L("c"), "eq", I(0), "pnext");
+    rtIf(f, L("c"), "ugt", L("bc"), "take");
+    rtIf(f, L("c"), "ne", L("bc"), "pnext");
+    rtLoad(f, "x", L("e"), 12, 4); rtIf(f, L("x"), "uge", L("bf"), "pnext");
+    rtLabel(f, "take");
+    rtSet(f, "best", L("j")); rtSet(f, "bc", L("c")); rtLoad(f, "bf", L("e"), 12, 4);
+    rtLabel(f, "pnext");
+    rtOp(f, "j", L("j"), "add", I(1)); rtJump(f, "pick");
+    rtLabel(f, "picked");
+    rtIf(f, L("bc"), "eq", I(0), "rest");
+    rtShift(f, "e", L("best"), "shl", 4); rtOp(f, "e", L("e"), "add", L("tab"));
+    rtLoad(f, "key", L("e"), 0, 8); rtOp(f, "key", L("key"), "sub", I(1));
+    rtStore(f, L("e"), 8, I(0), 4);
+    rtCall4(f, "pos", "__tx_leak_put", L("buf"), L("pos"), A(lRowA), I(len(rowA)));
+    rtCall3(f, "pos", "__tx_leak_dec", L("buf"), L("pos"), L("bc"));
+    rtCall4(f, "pos", "__tx_leak_put", L("buf"), L("pos"), A(lRowB), I(len(rowB)));
+    rtOp(f, "k", L("key"), "and", I(15)); rtShift(f, "k", L("k"), "shl", 4); rtOp(f, "k", L("k"), "add", A("__tx_leak_kind_names"));
+    rtLoad(f, "x", L("k"), 8, 8); rtLoad(f, "k", L("k"), 0, 8);
+    rtCall4(f, "pos", "__tx_leak_put", L("buf"), L("pos"), L("k"), L("x"));
+    rtCall4(f, "pos", "__tx_leak_put", L("buf"), L("pos"), A(lRowC), I(len(rowC)));
+    rtShift(f, "s", L("key"), "shr", 4);
+    rtCall3(f, "pos", "__tx_leak_where", L("buf"), L("pos"), L("s"));
+    rtOp(f, "k", L("key"), "and", I(15));
+    rtIf(f, L("k"), "ne", I(1), "noprev");
+    rtCall3(f, "pos", "__tx_leak_preview", L("buf"), L("pos"), L("bf"));
+    rtLabel(f, "noprev");
+    rtCall4(f, "pos", "__tx_leak_put", L("buf"), L("pos"), A(lNl), I(1));
+    rtOp(f, "printed", L("printed"), "add", I(1)); rtOp(f, "pobj", L("pobj"), "add", L("bc"));
+    rtJump(f, "group");
+    rtLabel(f, "rest");
+    rtIf(f, L("pobj"), "ge", L("cnt"), "flush");
+    rtCall4(f, "pos", "__tx_leak_put", L("buf"), L("pos"), A(lRestA), I(len(restA)));
+    rtOp(f, "x", L("groups"), "sub", L("printed"));
+    rtCall3(f, "pos", "__tx_leak_dec", L("buf"), L("pos"), L("x"));
+    rtCall4(f, "pos", "__tx_leak_put", L("buf"), L("pos"), A(lRestB), I(len(restB)));
+    rtOp(f, "x", L("cnt"), "sub", L("pobj"));
+    rtCall3(f, "pos", "__tx_leak_dec", L("buf"), L("pos"), L("x"));
+    rtCall4(f, "pos", "__tx_leak_put", L("buf"), L("pos"), A(lRestC), I(len(restC)));
+    rtLabel(f, "flush");
+    rtCall3(f, "", "__tx_nrt_write", I(2), L("buf"), L("pos"));
+    rtCall1(f, "", "__tx_native_mem_free", L("buf"));
+    rtCall1(f, "", "__tx_native_mem_free", L("tab"));
+    rtRet(f, L("cnt"));
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRet(f, I(0)); check(f);
+}
+
+function emitLeakExits(b: Ref<StructuredBuffer>): void {
+    // __tx_entry_finish → 进程退出码：__tx_entry_result（nrt.tx：任务泵、等线程、main 的结果）之后，开启时放开根并
+    // 扫描主线程；本线程或任一子线程发现过泄漏则退出码为 23。
+    let f = rtBegin(b, "__tx_entry_finish", "", "code n", 1, "bootstrap/selfhost/nrt_leak.tx");
+    rtCall0(f, "code", "__tx_entry_result");
+    rtIf(f, G("__tx_leak_on"), "eq", I(0), "done");
+    rtCall0(f, "", "__tx_leak_roots");
+    rtCall1(f, "n", "__tx_leak_scan", I(0));
+    rtIf(f, GAcq("__tx_leak_found"), "eq", I(0), "done");
+    rtSet(f, "code", I(LEAK_EXIT));
+    rtLabel(f, "done");
+    rtRet(f, L("code")); check(f);
+
+    // __tx_leak_thread()：子线程结果已发送之后、整堆归还之前——放开入口窗口的结果槽与模块级变量，再扫描。
+    f = rtBegin(b, "__tx_leak_thread", "", "win t", 1, "bootstrap/selfhost/nrt_leak.tx");
+    rtIf(f, G("__tx_leak_on"), "eq", I(0), "done");
+    rtSet(f, "win", G("__tx_nrt_entry_win"));
+    rtCall1(f, "", "__tx_release", L("win"));
+    rtStore(f, L("win"), 0, I(4), 8); rtStore(f, L("win"), 8, I(0), 8);
+    rtCall0(f, "", "__tx_leak_roots");
+    rtSet(f, "t", A("__tx_nrt_tb")); rtLoad(f, "t", L("t"), TB_OS_TID, 4);
+    rtIf(f, L("t"), "ne", I(0), "named");
+    rtSet(f, "t", I(1));
+    rtLabel(f, "named");
+    rtCall1(f, "", "__tx_leak_scan", L("t"));
+    rtLabel(f, "done");
+    rtRetVoid(f); check(f);
+}

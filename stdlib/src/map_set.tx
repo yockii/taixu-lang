@@ -1,0 +1,409 @@
+// ============================================================================
+// std/map_set —— Map／Set（V0.7-S3，D20 §四-1；STD-02）。
+//
+// **迭代序＝插入序（确定性优先红线，禁哈希序）**：条目按插入序存放于平行
+// List（mapKeys/setToList 即插入序）；开放寻址桶表（线性探测）只服务键定位。
+// V0.39-G0：哈希改位混合（FNV-1a 64 变体＋multiply-xor-shift，见 hashStr
+// 头注）——迭代序红线不受影响（结构保证）。
+//
+// 类型面（S1 具体化注记）：S1 无用户泛型且 List 元素冻结面不含 enum 值，
+// 值取 `Ref<Json>` 装箱（json.tx 的"数据边界"先例）；键面冻结 string/int
+// 双族（mapGet 族＝string 键，mapGetInt 族＝int 键，两类键互不相等）。
+// 对象形态互转：objToMap／mapToObj（Json.Obj ↔ Map，键序保持）。
+// ============================================================================
+
+import { Json, KV } from "./json";
+
+// Map 值结构（Ref 句柄语义：mapNew 产生 Ref<Map>，赋值/传参共享）。
+// slots：桶槽 → 条目下标（-1 空）；条目平行表 keys/ikeys/isInt/vals 依插入序。
+export struct Map {
+    slots: List<int>,
+    keys: List<string>,
+    ikeys: List<int>,
+    isInt: List<bool>,
+    vals: List<Ref<Json>>,
+}
+
+const map_init_cap: int = 8;
+
+export function mapNew(): Ref<Map> {
+    const m: Ref<Map> = new Map {
+        slots: listNew(),
+        keys: listNew(),
+        ikeys: listNew(),
+        isInt: listNew(),
+        vals: listNew(),
+    };
+    let i: int = 0;
+    while (i < map_init_cap) {
+        listPush(m.slots, -1);
+        i = i + 1;
+    }
+    return m;
+}
+
+// —— 哈希（V0.39-G0 位混合重写；弧 G1-c 清单）——
+// FNV-1a 64 位变体＋multiply-xor-shift 终混（除法消除——31-多项式每字符
+// 一次除法的分布与性能债清偿；位混合质量升）。**迭代序红线不受影响**：
+// 迭代序＝插入序是平行表的结构性保证（条目存放序与哈希值无关——头注红
+// 线条），哈希只影响桶定位/探测长度。冲突分布变化如实登记：桶足迹与旧
+// 31-多项式完全不同（map-set.tx 用例集全绿为回归锚）。常量为 64 位二补
+// 码有符号十进制（位型＝0xCBF29CE484222325 / 0x100000001B3 /
+// 0xFF51AFD7ED558CCD / 0xC4CEB9FE1A85EC53）。
+const H_BASIS: int = -3750763034362895579;
+const H_PRIME: int = 1099511628211;
+const H_MIX1: int = -49064778989728563;
+const H_MIX2: int = -4265267296055464877;
+
+function hashStr(s: string): int {
+    let h: int = H_BASIS;
+    let i: int = 0;
+    while (i < len(s)) {
+        h = imul(h ^ (byteAt(s, i) catch 0), H_PRIME);
+        i = i + 1;
+    }
+    h = imul(h ^ (h >>> 31), H_MIX1);
+    return (h ^ (h >>> 29)) & 9223372036854775807; // 63 位非负（% cap 桶序契约）
+}
+
+function hashInt(n: int): int {
+    let h: int = imul(n ^ (n >>> 33), H_MIX1);
+    h = imul(h ^ (h >>> 29), H_MIX2);
+    return (h ^ (h >>> 32)) & 9223372036854775807; // 63 位非负
+}
+
+function entryHash(m: Ref<Map>, idx: int): int {
+    if (listGet(m.isInt, idx) catch false) {
+        return hashInt(listGet(m.ikeys, idx) catch 0);
+    }
+    return hashStr(listGet(m.keys, idx) catch "");
+}
+
+// 键相等：同类同值（string/int 两类键互不相等，对齐类型相异语义）。
+function entryKeyEq(m: Ref<Map>, idx: int, k: string, ik: int, isInt: bool): bool {
+    const entryIsInt = listGet(m.isInt, idx) catch false;
+    if (entryIsInt != isInt) {
+        return false;
+    }
+    if (isInt) {
+        return (listGet(m.ikeys, idx) catch 0) == ik;
+    }
+    return (listGet(m.keys, idx) catch "") == k;
+}
+
+// 查找条目下标；不存在返回 -1。
+function findEntry(m: Ref<Map>, k: string, ik: int, isInt: bool): int {
+    const cap = listLen(m.slots);
+    if (cap == 0) {
+        return -1;
+    }
+    let h: int = 0;
+    if (isInt) {
+        h = hashInt(ik);
+    } else {
+        h = hashStr(k);
+    }
+    let slot = h % cap;
+    if (slot < 0) {
+        slot = slot + cap;
+    }
+    let probe: int = 0;
+    while (probe < cap) {
+        const idx = listGet(m.slots, slot) catch -1;
+        if (idx == -1) {
+            return -1; // 开放寻址：空槽即终止（无删除，无墓碑）
+        }
+        if (entryKeyEq(m, idx, k, ik, isInt)) {
+            return idx;
+        }
+        slot = (slot + 1) % cap;
+        probe = probe + 1;
+    }
+    return -1;
+}
+
+// 载荷 ≥ 3/4 容量即扩容：桶表原地翻倍（条目序不动——迭代序红线不受影响）。
+// List 是句柄：不能换对象，只能原地改写/追加槽位。
+function maybeGrow(m: Ref<Map>): void {
+    const size = listLen(m.keys);
+    const cap = listLen(m.slots);
+    if (size * 4 <= cap * 3) {
+        return;
+    }
+    let i: int = 0;
+    while (i < cap) {
+        listSet(m.slots, i, -1);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < cap) {
+        listPush(m.slots, -1);
+        i = i + 1;
+    }
+    let e: int = 0;
+    while (e < size) {
+        let slot = entryHash(m, e) % (cap * 2);
+        if (slot < 0) {
+            slot = slot + cap * 2;
+        }
+        while ((listGet(m.slots, slot) catch -1) != -1) {
+            slot = (slot + 1) % (cap * 2);
+        }
+        listSet(m.slots, slot, e);
+        e = e + 1;
+    }
+}
+
+// mapSet（string 键）：已存在则覆写值（保持原插入位），否则尾追加。
+export function mapSet(m: Ref<Map>, k: string, v: Ref<Json>): void {
+    const found = findEntry(m, k, 0, false);
+    if (found >= 0) {
+        listSet(m.vals, found, v);
+        return;
+    }
+    maybeGrow(m);
+    listPush(m.keys, k);
+    listPush(m.ikeys, 0);
+    listPush(m.isInt, false);
+    listPush(m.vals, v);
+    placeLast(m);
+}
+
+// mapSetInt（int 键族）。
+export function mapSetInt(m: Ref<Map>, k: int, v: Ref<Json>): void {
+    const found = findEntry(m, "", k, true);
+    if (found >= 0) {
+        listSet(m.vals, found, v);
+        return;
+    }
+    maybeGrow(m);
+    listPush(m.keys, "");
+    listPush(m.ikeys, k);
+    listPush(m.isInt, true);
+    listPush(m.vals, v);
+    placeLast(m);
+}
+
+// 尾条目入桶（findEmptySlot 前置：调用方已保证有富余槽）。
+function placeLast(m: Ref<Map>): void {
+    const idx = listLen(m.keys) - 1;
+    const h = entryHash(m, idx);
+    let slot = h % listLen(m.slots);
+    if (slot < 0) {
+        slot = slot + listLen(m.slots);
+    }
+    while ((listGet(m.slots, slot) catch -1) != -1) {
+        slot = (slot + 1) % listLen(m.slots);
+    }
+    listSet(m.slots, slot, idx);
+}
+
+// mapGet（string 键）：缺失返回 None。
+export function mapGet(m: Ref<Map>, k: string): Ref<Json>? {
+    const idx = findEntry(m, k, 0, false);
+    if (idx < 0) {
+        return None;
+    }
+    return listGet(m.vals, idx);
+}
+
+// mapGetInt（int 键族）。
+export function mapGetInt(m: Ref<Map>, k: int): Ref<Json>? {
+    const idx = findEntry(m, "", k, true);
+    if (idx < 0) {
+        return None;
+    }
+    return listGet(m.vals, idx);
+}
+
+export function mapHas(m: Ref<Map>, k: string): bool {
+    return findEntry(m, k, 0, false) >= 0;
+}
+
+export function mapHasInt(m: Ref<Map>, k: int): bool {
+    return findEntry(m, "", k, true) >= 0;
+}
+
+export function mapLen(m: Ref<Map>): int {
+    return listLen(m.keys);
+}
+
+// 键列表（**插入序**——确定性红线）；int 键族见 mapIntKeys。
+export function mapKeys(m: Ref<Map>): List<string> {
+    const out: List<string> = listNew();
+    let i: int = 0;
+    while (i < listLen(m.keys)) {
+        const isInt = listGet(m.isInt, i) catch false;
+        if (!isInt) {
+            listPush(out, listGet(m.keys, i) catch "");
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+export function mapIntKeys(m: Ref<Map>): List<int> {
+    const out: List<int> = listNew();
+    let i: int = 0;
+    while (i < listLen(m.keys)) {
+        const isInt = listGet(m.isInt, i) catch false;
+        if (isInt) {
+            listPush(out, listGet(m.ikeys, i) catch 0);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ============================================================================
+// Set（string 元素；同一桶表机制，无值列）
+// ============================================================================
+
+export struct Set {
+    slots: List<int>,
+    keys: List<string>,
+}
+
+export function setNew(): Ref<Set> {
+    const s: Ref<Set> = new Set {
+        slots: listNew(),
+        keys: listNew(),
+    };
+    let i: int = 0;
+    while (i < map_init_cap) {
+        listPush(s.slots, -1);
+        i = i + 1;
+    }
+    return s;
+}
+
+function setFind(s: Ref<Set>, k: string): int {
+    const cap = listLen(s.slots);
+    if (cap == 0) {
+        return -1;
+    }
+    let slot = hashStr(k) % cap;
+    if (slot < 0) {
+        slot = slot + cap;
+    }
+    let probe: int = 0;
+    while (probe < cap) {
+        const idx = listGet(s.slots, slot) catch -1;
+        if (idx == -1) {
+            return -1;
+        }
+        if ((listGet(s.keys, idx) catch "") == k) {
+            return idx;
+        }
+        slot = (slot + 1) % cap;
+        probe = probe + 1;
+    }
+    return -1;
+}
+
+// setAdd：已存在不动作（集合语义）；返回是否新增。
+export function setAdd(s: Ref<Set>, k: string): bool {
+    if (setFind(s, k) >= 0) {
+        return false;
+    }
+    setGrow(s);
+    listPush(s.keys, k);
+    const idx = listLen(s.keys) - 1;
+    let slot = hashStr(k) % listLen(s.slots);
+    if (slot < 0) {
+        slot = slot + listLen(s.slots);
+    }
+    while ((listGet(s.slots, slot) catch -1) != -1) {
+        slot = (slot + 1) % listLen(s.slots);
+    }
+    listSet(s.slots, slot, idx);
+    return true;
+}
+
+// 桶表原地翻倍＋按插入序重排（同 Map.maybeGrow）。
+function setGrow(s: Ref<Set>): void {
+    const size = listLen(s.keys);
+    const cap = listLen(s.slots);
+    if ((size + 1) * 4 <= cap * 3) {
+        return;
+    }
+    let i: int = 0;
+    while (i < cap) {
+        listSet(s.slots, i, -1);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < cap) {
+        listPush(s.slots, -1);
+        i = i + 1;
+    }
+    let e: int = 0;
+    while (e < size) {
+        let slot = hashStr(listGet(s.keys, e) catch "") % (cap * 2);
+        if (slot < 0) {
+            slot = slot + cap * 2;
+        }
+        while ((listGet(s.slots, slot) catch -1) != -1) {
+            slot = (slot + 1) % (cap * 2);
+        }
+        listSet(s.slots, slot, e);
+        e = e + 1;
+    }
+}
+
+export function setHas(s: Ref<Set>, k: string): bool {
+    return setFind(s, k) >= 0;
+}
+
+export function setLen(s: Ref<Set>): int {
+    return listLen(s.keys);
+}
+
+// 元素列表（**插入序**——确定性红线）。
+export function setToList(s: Ref<Set>): List<string> {
+    const out: List<string> = listNew();
+    let i: int = 0;
+    while (i < listLen(s.keys)) {
+        listPush(out, listGet(s.keys, i) catch "");
+        i = i + 1;
+    }
+    return out;
+}
+
+// ============================================================================
+// Json.Obj ↔ Map 互转（键序保持插入序；值以 Ref<Json> 直通）
+// ============================================================================
+
+// Json.Obj → Map（键序保持插入序；非 Obj 得 None——S1 switch 臂类型严格
+// 并轨，失败信号走可选通道而非 Error）。
+export function objToMap(o: Ref<Json>): Ref<Map>? {
+    return switch (o) {
+        case Obj(entries) => objFromEntries(entries),
+        else => None,
+    };
+}
+
+function objFromEntries(entries: List<Ref<KV>>): Ref<Map>? {
+    const m = mapNew();
+    let i: int = 0;
+    while (i < listLen(entries)) {
+        const kv = listGet(entries, i) catch new KV { k: "", v: new Json.Null() };
+        mapSet(m, kv.k, kv.v);
+        i = i + 1;
+    }
+    return m;
+}
+
+export function mapToObj(m: Ref<Map>): Ref<Json> {
+    const entries: List<Ref<KV>> = listNew();
+    let i: int = 0;
+    while (i < listLen(m.keys)) {
+        if (!(listGet(m.isInt, i) catch false)) {
+            const k = listGet(m.keys, i) catch "";
+            const v = listGet(m.vals, i) catch new Json.Null();
+            listPush(entries, new KV { k: k, v: v });
+        }
+        i = i + 1;
+    }
+    return new Json.Obj(entries);
+}

@@ -1,0 +1,701 @@
+// ============================================================================
+// std/json —— JSON 值模型＋解析／序列化（V0.7-S4，D20 §四-3；STD-02）。
+//
+// 值模型（S1 具体化；D20 原文 `Arr(List)`/`Obj(Map)` 为承载形态伪码——List 元素
+// 冻结面不含 enum/struct 值，故嵌套 Json 经 Ref 装箱）：
+//   - 标量直接承载；数组 `Arr(List< Ref<Json>>)`；对象 `Obj(List< Ref<KV>>)`
+//     ——KV 依插入序存放（**确定性优先红线：对象键序＝插入序**，禁哈希序）；
+//   - 与 Map 的互转见 map_set.tx（objToMap/mapToObj）。
+//
+// jsonParse：递归下降（byteAt 逐字节）；深度上限 64、输入上限 1 MiB（SRS §10）；
+// 整数 i64 面越界、指数面越界、非有限结果、孤立代理项均结构化报 Error。
+// jsonStringify：控制字符转义全集；float 整值补 `.0` 保 float 通道（往返恒等）。
+// ============================================================================
+
+// 对象成员（键值对；依插入序）。
+export struct KV {
+    k: string,
+    v: Ref<Json>,
+}
+
+// JSON 值（enum 装箱先例，AGENTS V0.7 执行包"数据边界"）。
+export enum Json {
+    Null,
+    Bool(b: bool),
+    Int(n: int),
+    Float(x: float),
+    Str(s: string),
+    Arr(items: List<Ref<Json>>),
+    Obj(entries: List<Ref<KV>>),
+}
+
+// —— 上下限（SRS §10）——
+const max_depth: int = 64;
+const max_input: int = 1048576; // 1 MiB
+// 指数面守卫：|exp| ≤ 400 时 10^up 不上溢 f64（其余报错/下溢为零）。
+const max_exp: int = 400;
+
+// ============================================================================
+// UTF-8 码点读取（S1 无位运算：掩码以 % 算术承载；输入恒为良构 UTF-8）
+// ============================================================================
+
+// 位置 i 处的序列长度（1–4）；续字节缺失/非法返回 0。
+function seqLenAt(s: string, i: int): int {
+    const bopt = byteAt(s, i);
+    if (bopt == None) {
+        return 0;
+    }
+    const b = bopt catch 0;
+    if (b < 128) {
+        return 1;
+    }
+    if (b >= 194 && b <= 223) {
+        return 2;
+    }
+    if (b >= 224 && b <= 239) {
+        return 3;
+    }
+    if (b >= 240 && b <= 244) {
+        return 4;
+    }
+    return 0;
+}
+
+// 位置 i 处的码点（-1 = 非良构序列）。
+function decodeAt(s: string, i: int): int {
+    const n = seqLenAt(s, i);
+    if (n == 0) {
+        return -1;
+    }
+    const bopt = byteAt(s, i);
+    if (bopt == None) {
+        return -1;
+    }
+    const b = bopt catch -1;
+    if (n == 1) {
+        return b;
+    }
+    const b2opt = byteAt(s, i + 1);
+    if (b2opt == None) {
+        return -1;
+    }
+    const b2 = b2opt catch -1;
+    if (b2 < 128 || b2 >= 192) {
+        return -1;
+    }
+    if (n == 2) {
+        return (b % 32) * 64 + (b2 % 64);
+    }
+    const b3opt = byteAt(s, i + 2);
+    if (b3opt == None) {
+        return -1;
+    }
+    const b3 = b3opt catch -1;
+    if (b3 < 128 || b3 >= 192) {
+        return -1;
+    }
+    if (n == 3) {
+        return (b % 16) * 4096 + (b2 % 64) * 64 + (b3 % 64);
+    }
+    const b4opt = byteAt(s, i + 3);
+    if (b4opt == None) {
+        return -1;
+    }
+    const b4 = b4opt catch -1;
+    if (b4 < 128 || b4 >= 192) {
+        return -1;
+    }
+    return (b % 8) * 262144 + (b2 % 64) * 4096 + (b3 % 64) * 64 + (b4 % 64);
+}
+
+// ============================================================================
+// 解析器状态与游标
+// ============================================================================
+
+struct Parser {
+    src: string,
+    pos: int,
+    depth: int,
+}
+
+function peek(p: Ref<Parser>): int {
+    return byteAt(p.src, p.pos) catch -1;
+}
+
+function bump(p: Ref<Parser>): void {
+    p.pos = p.pos + 1;
+}
+
+function skipWs(p: Ref<Parser>): void {
+    while (true) {
+        const c = peek(p);
+        if (c == 32 || c == 9 || c == 10 || c == 13) {
+            bump(p);
+        } else {
+            return;
+        }
+    }
+}
+
+function startsWith(p: Ref<Parser>, lit: string): bool {
+    let i: int = 0;
+    while (i < len(lit)) {
+        if ((byteAt(p.src, p.pos + i) catch -1) != (byteAt(lit, i) catch -2)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ============================================================================
+// jsonParse
+// ============================================================================
+
+export function jsonParse(src: string): Ref<Json> | Error {
+    if (len(src) > max_input) {
+        return err("json: 输入超过 1 MiB 上限");
+    }
+    const p: Ref<Parser> = new Parser { src: src, pos: 0, depth: 0 };
+    skipWs(p);
+    const v = parseValue(p)?;
+    skipWs(p);
+    if (p.pos != len(p.src)) {
+        return err("json: 值之后存在多余字符");
+    }
+    return v;
+}
+
+function parseValue(p: Ref<Parser>): Ref<Json> | Error {
+    const c = peek(p);
+    if (c == -1) {
+        return err("json: 意外提前结束");
+    }
+    if (c == 110) {
+        // 'n' → null
+        if (startsWith(p, "null")) {
+            p.pos = p.pos + 4;
+            return new Json.Null();
+        }
+        return err("json: 非法字面量");
+    }
+    if (c == 116) {
+        // 't' → true
+        if (startsWith(p, "true")) {
+            p.pos = p.pos + 4;
+            return new Json.Bool(true);
+        }
+        return err("json: 非法字面量");
+    }
+    if (c == 102) {
+        // 'f' → false
+        if (startsWith(p, "false")) {
+            p.pos = p.pos + 5;
+            return new Json.Bool(false);
+        }
+        return err("json: 非法字面量");
+    }
+    if (c == 34) {
+        // '"' → 字符串
+        const s = parseString(p)?;
+        return new Json.Str(s);
+    }
+    if (c == 91) {
+        // '[' → 数组
+        return parseArray(p);
+    }
+    if (c == 123) {
+        // '{' → 对象
+        return parseObject(p);
+    }
+    if (c == 45 || (c >= 48 && c <= 57)) {
+        // '-' 或数字
+        return parseNumber(p);
+    }
+    return err("json: 非法值起始字符");
+}
+
+function parseArray(p: Ref<Parser>): Ref<Json> | Error {
+    p.depth = p.depth + 1;
+    if (p.depth > max_depth) {
+        return err("json: 嵌套深度超过 64");
+    }
+    bump(p); // '['
+    const items: List<Ref<Json>> = listNew();
+    skipWs(p);
+    if (peek(p) == 93) {
+        // ']'
+        bump(p);
+        p.depth = p.depth - 1;
+        return new Json.Arr(items);
+    }
+    while (true) {
+        skipWs(p);
+        const v = parseValue(p)?;
+        listPush(items, v);
+        skipWs(p);
+        const c = peek(p);
+        if (c == 44) {
+            // ','
+            bump(p);
+            continue;
+        }
+        if (c == 93) {
+            bump(p);
+            p.depth = p.depth - 1;
+            return new Json.Arr(items);
+        }
+        return err("json: 数组缺少 ',' 或 ']'");
+    }
+    // 不可达（循环内全路径 return）；while 不参与发散分析，此行守卫返回路径检查。
+    return err("json: 数组缺少 ',' 或 ']'");
+}
+
+function parseObject(p: Ref<Parser>): Ref<Json> | Error {
+    p.depth = p.depth + 1;
+    if (p.depth > max_depth) {
+        return err("json: 嵌套深度超过 64");
+    }
+    bump(p); // '{'
+    const entries: List<Ref<KV>> = listNew();
+    skipWs(p);
+    if (peek(p) == 125) {
+        // '}'
+        bump(p);
+        p.depth = p.depth - 1;
+        return new Json.Obj(entries);
+    }
+    while (true) {
+        skipWs(p);
+        if (peek(p) != 34) {
+            return err("json: 对象键必须是字符串");
+        }
+        const k = parseString(p)?;
+        skipWs(p);
+        if (peek(p) != 58) {
+            // ':'
+            return err("json: 对象缺少 ':'");
+        }
+        bump(p);
+        skipWs(p);
+        const v = parseValue(p)?;
+        listPush(entries, new KV { k: k, v: v });
+        skipWs(p);
+        const c = peek(p);
+        if (c == 44) {
+            bump(p);
+            continue;
+        }
+        if (c == 125) {
+            bump(p);
+            p.depth = p.depth - 1;
+            return new Json.Obj(entries);
+        }
+        return err("json: 对象缺少 ',' 或 '}'");
+    }
+    // 不可达（循环内全路径 return）；while 不参与发散分析，此行守卫返回路径检查。
+    return err("json: 对象缺少 ',' 或 '}'");
+}
+
+// 十六进制 4 位 → 0..65535；非十六进制返回 -1。
+function hex4(p: Ref<Parser>): int {
+    let v: int = 0;
+    let i: int = 0;
+    while (i < 4) {
+        const c = peek(p);
+        let d: int = 0;
+        if (c >= 48 && c <= 57) {
+            d = c - 48;
+        } else if (c >= 97 && c <= 102) {
+            d = c - 97 + 10;
+        } else if (c >= 65 && c <= 70) {
+            d = c - 65 + 10;
+        } else {
+            return -1;
+        }
+        v = v * 16 + d;
+        bump(p);
+        i = i + 1;
+    }
+    return v;
+}
+
+// 解析字符串字面量（游标位于起始 '"'）；转义全集＋\\u 代理对（残缺即 Error）。
+function parseString(p: Ref<Parser>): string | Error {
+    bump(p); // 开引号
+    let out: string = "";
+    while (true) {
+        const c = peek(p);
+        if (c == -1) {
+            return err("json: 字符串未闭合");
+        }
+        if (c == 34) {
+            bump(p);
+            return out;
+        }
+        if (c == 92) {
+            // '\\'
+            bump(p);
+            const e = peek(p);
+            if (e == 34) {
+                out = out + "\"";
+                bump(p);
+            } else if (e == 92) {
+                out = out + "\\";
+                bump(p);
+            } else if (e == 47) {
+                // '/'
+                out = out + "/";
+                bump(p);
+            } else if (e == 98) {
+                // 'b'
+                out = out + "\u{8}";
+                bump(p);
+            } else if (e == 102) {
+                // 'f'
+                out = out + "\u{c}";
+                bump(p);
+            } else if (e == 110) {
+                // 'n'
+                out = out + "\n";
+                bump(p);
+            } else if (e == 114) {
+                // 'r'
+                out = out + "\r";
+                bump(p);
+            } else if (e == 116) {
+                // 't'
+                out = out + "\t";
+                bump(p);
+            } else if (e == 117) {
+                // 'u'
+                bump(p);
+                const hi = hex4(p);
+                if (hi < 0) {
+                    return err("json: 非法 \\u 转义");
+                }
+                let cp: int = 0;
+                if (hi >= 55296 && hi <= 56319) {
+                    // 高代理 D800–DBFF：必须紧跟 \\uDC00–\\uDFFF 低代理
+                    if (peek(p) != 92) {
+                        return err("json: 高代理缺少低代理配对");
+                    }
+                    bump(p);
+                    if (peek(p) != 117) {
+                        return err("json: 高代理缺少低代理配对");
+                    }
+                    bump(p);
+                    const lo = hex4(p);
+                    if (lo < 56320 || lo > 57343) {
+                        return err("json: 高代理缺少低代理配对");
+                    }
+                    cp = 65536 + (hi - 55296) * 1024 + (lo - 56320);
+                } else if (hi >= 56320 && hi <= 57343) {
+                    // 孤立低代理 DC00–DFFF
+                    return err("json: 孤立低代理");
+                } else {
+                    cp = hi;
+                }
+                // cp 已过代理区校验（0–0xD7FF / 0xE000–0x10FFFF），utf8Encode 必成。
+                out = out + (utf8Encode(cp) catch "");
+            } else {
+                return err("json: 非法转义字符");
+            }
+            continue;
+        }
+        if (c < 32) {
+            return err("json: 字符串含未转义控制字符");
+        }
+        // 非 ASCII：按 UTF-8 序列整段解码再编码（保持原文；S1 无子串切片）。
+        const n = seqLenAt(p.src, p.pos);
+        if (n == 0) {
+            return err("json: 非法 UTF-8 序列");
+        }
+        const cp = decodeAt(p.src, p.pos);
+        if (cp < 0) {
+            return err("json: 非法 UTF-8 序列");
+        }
+        p.pos = p.pos + n;
+        out = out + (utf8Encode(cp) catch "json: 非法码点");
+        continue;
+    }
+    // 不可达；while 不参与发散分析，此行守卫返回路径检查。
+    return err("json: 字符串未闭合");
+}
+
+// ============================================================================
+// 数字（两遍：先扫形态与终点，再按 Int/Float 分别累积）
+// ============================================================================
+
+function digitAt(s: string, i: int): int {
+    const c = byteAt(s, i) catch -1;
+    if (c >= 48 && c <= 57) {
+        return c - 48;
+    }
+    return -1;
+}
+
+function parseNumber(p: Ref<Parser>): Ref<Json> | Error {
+    const start = p.pos;
+    let neg = false;
+    if (peek(p) == 45) {
+        neg = true;
+        bump(p);
+    }
+    if (digitAt(p.src, p.pos) < 0) {
+        return err("json: 数字缺少整数部分");
+    }
+    // —— 第一遍：扫描（int/float 判定 + 终点）——
+    let isFloat = false;
+    let j = p.pos;
+    while (digitAt(p.src, j) >= 0) {
+        j = j + 1;
+    }
+    if ((byteAt(p.src, j) catch -1) == 46) {
+        // '.'
+        isFloat = true;
+        j = j + 1;
+        if (digitAt(p.src, j) < 0) {
+            return err("json: 小数点后缺少数字");
+        }
+        while (digitAt(p.src, j) >= 0) {
+            j = j + 1;
+        }
+    }
+    const ec = byteAt(p.src, j) catch -1;
+    if (ec == 101 || ec == 69) {
+        // 'e' / 'E'
+        isFloat = true;
+        j = j + 1;
+        const sc = byteAt(p.src, j) catch -1;
+        if (sc == 43 || sc == 45) {
+            j = j + 1;
+        }
+        if (digitAt(p.src, j) < 0) {
+            return err("json: 指数缺少数字");
+        }
+        while (digitAt(p.src, j) >= 0) {
+            j = j + 1;
+        }
+    }
+    const end = j;
+    // —— 第二遍：累积 ——
+    if (!isFloat) {
+        let v: int = 0;
+        if (neg) {
+            let k = start + 1;
+            while (k < end) {
+                const d = digitAt(p.src, k);
+                // i64 下界缝：仅 -9223372036854775808 精确可达，d=9 即越界。
+                if (v < -922337203685477580 || (v == -922337203685477580 && d > 8)) {
+                    return err("json: 整数越界（i64）");
+                }
+                v = v * 10 - d;
+                k = k + 1;
+            }
+        } else {
+            let k = start;
+            while (k < end) {
+                const d = digitAt(p.src, k);
+                // i64 上界缝：v=…580 且 d>7 时 v*10+d 越界。
+                if (v > 922337203685477580 || (v == 922337203685477580 && d > 7)) {
+                    return err("json: 整数越界（i64）");
+                }
+                v = v * 10 + d;
+                k = k + 1;
+            }
+        }
+        p.pos = end;
+        return new Json.Int(v);
+    }
+    // Float 形：先定位指数起点，尾数只在 [start, ke) 逐位累积（含小数位计数），
+    // 再以 10^up 幂乘/幂除；指数面守卫 |exp| ≤ 400：上溢报 Error、深下溢归零
+    //（确定性）。
+    let ke = start;
+    while (ke < end && (byteAt(p.src, ke) catch 0) != 101 && (byteAt(p.src, ke) catch 0) != 69) {
+        ke = ke + 1;
+    }
+    let mant: float = 0.0;
+    let frac: int = 0;
+    let k2 = start;
+    if (neg) {
+        k2 = k2 + 1;
+    }
+    let seenDot = false;
+    while (k2 < ke) {
+        const c = byteAt(p.src, k2) catch 48;
+        if (c == 46) {
+            seenDot = true;
+        } else {
+            mant = mant * 10.0 + (digitAt(p.src, k2) as float);
+            if (seenDot) {
+                frac = frac + 1;
+            }
+        }
+        k2 = k2 + 1;
+    }
+    let expv: int = 0;
+    let expNeg = false;
+    if (ke < end) {
+        let ki = ke + 1;
+        if ((byteAt(p.src, ki) catch 0) == 43) {
+            ki = ki + 1;
+        } else if ((byteAt(p.src, ki) catch 0) == 45) {
+            expNeg = true;
+            ki = ki + 1;
+        }
+        while (ki < end) {
+            if (expv > 99999999) {
+                return err("json: 指数越界");
+            }
+            expv = expv * 10 + digitAt(p.src, ki);
+            ki = ki + 1;
+        }
+        if (expNeg) {
+            expv = -expv;
+        }
+    }
+    let x: float = mant;
+    const up: int = expv - frac;
+    if (up > max_exp) {
+        return err("json: 数值越界（非有限）");
+    }
+    if (up < -max_exp) {
+        x = 0.0; // 深下溢：确定性归零
+    } else if (up >= 0) {
+        let t: int = 0;
+        while (t < up) {
+            x = x * 10.0;
+            t = t + 1;
+        }
+    } else {
+        let t: int = 0;
+        while (t < -up) {
+            x = x / 10.0;
+            t = t + 1;
+        }
+    }
+    if (neg) {
+        x = -x;
+    }
+    if (x > 1.7976931348623157e308 || x < -1.7976931348623157e308) {
+        return err("json: 数值越界（非有限）");
+    }
+    p.pos = end;
+    return new Json.Float(x);
+}
+
+// ============================================================================
+// jsonStringify（规范形：对象键序＝插入序；控制字符转义；float 整值补 .0）
+// ============================================================================
+
+export function jsonStringify(j: Ref<Json>): string {
+    return switch (j) {
+        case Null => "null",
+        case Bool(b) => boolStr(b),
+        case Int(n) => toStr(n),
+        case Float(x) => stringifyFloat(x),
+        case Str(s) => stringifyString(s),
+        case Arr(items) => stringifyArr(items),
+        case Obj(entries) => stringifyObj(entries),
+    };
+}
+
+function boolStr(b: bool): string {
+    if (b) {
+        return "true";
+    }
+    return "false";
+}
+
+function stringifyArr(items: List<Ref<Json>>): string {
+    let out: string = "[";
+    let i: int = 0;
+    while (i < listLen(items)) {
+        if (i > 0) {
+            out = out + ",";
+        }
+        out = out + jsonStringify(listGet(items, i) catch new Json.Null());
+        i = i + 1;
+    }
+    return out + "]";
+}
+
+function stringifyObj(entries: List<Ref<KV>>): string {
+    let out: string = "{";
+    let i: int = 0;
+    while (i < listLen(entries)) {
+        if (i > 0) {
+            out = out + ",";
+        }
+        const kv = listGet(entries, i) catch new KV { k: "", v: new Json.Null() };
+        out = out + stringifyString(kv.k) + ":" + jsonStringify(kv.v);
+        i = i + 1;
+    }
+    return out + "}";
+}
+
+// float 规范形：toStr 最短形；整值无 '.'/'e' 时补 ".0"（float 通道往返恒等）。
+function stringifyFloat(x: float): string {
+    const s = toStr(x);
+    let i: int = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) catch 0;
+        if (c == 46 || c == 101 || c == 69) {
+            // '.' 'e' 'E'
+            return s;
+        }
+        i = i + 1;
+    }
+    return s + ".0";
+}
+
+function stringifyString(s: string): string {
+    let out: string = "\"";
+    let i: int = 0;
+    while (i < len(s)) {
+        const n = seqLenAt(s, i);
+        if (n == 0) {
+            i = i + 1;
+            continue; // 非良构字节跳过（解析产物不出现；防御面）
+        }
+        const cp = decodeAt(s, i);
+        if (cp < 32) {
+            out = out + escapeControl(cp);
+        } else if (cp == 34) {
+            out = out + "\\\""; // JSON 转义：引号 → 反斜杠＋引号
+        } else if (cp == 92) {
+            out = out + "\\\\"; // JSON 转义：单反斜杠 → 双反斜杠
+        } else {
+            out = out + (utf8Encode(cp) catch "");
+        }
+        i = i + n;
+    }
+    return out + "\"";
+}
+
+function escapeControl(cp: int): string {
+    if (cp == 8) {
+        return "\\b";
+    }
+    if (cp == 9) {
+        return "\\t";
+    }
+    if (cp == 10) {
+        return "\\n";
+    }
+    if (cp == 12) {
+        return "\\f";
+    }
+    if (cp == 13) {
+        return "\\r";
+    }
+    return "\\u00" + hexDigit(cp / 16) + hexDigit(cp % 16);
+}
+
+function hexDigit(v: int): string {
+    if (v < 10) {
+        return utf8Encode(48 + v) catch "0";
+    }
+    return utf8Encode(87 + v) catch "0"; // 'a' + v - 10
+}

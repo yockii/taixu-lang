@@ -1,0 +1,188 @@
+// 可移植渲染器的公共部分（macOS 适配 M4 设计 A9 修订，docs/design/v052-macos-m4-arm64-v0.1-20261024.md）：上下文、值槽读写、
+// 引用计数、trap 与内建调用。只经 gen_ops 的指令宏出指令；语义照 emitmirror 的原生形态逐条对照，标号与之同名
+// （.L<函数>_<pc><后缀>），帧内偏移沿用记录给出的 x86 rsp 相对值（escape 缓冲、字符串构建状态、[SP+32..55] 的出参区）。
+// 首版不做 run 内寄存器分配：每个定义直接写回值槽。跨调用要留的值放 K0／K1，调用后 T0–T3 失效。
+import { Gen, G_W, G_K0, G_K1, G_T0, G_T1, G_T2, G_T3, G_SP, genLabel, genJmp, genMov, genMovI, genLd, genSt, genStI, genLdX, genLea, genLeaSym, genOpI, genBrI, genCall, genRes, gaI, gaR, gaLea, gaSym, GArg } from "./gen_ops";
+import { VALUE_BYTES, VALUE_PAYLOAD_OFFSET } from "./value_abi";
+import { TB_MASK } from "./thread_block_abi";
+import { emCallbiTargetFor, emRecordInt } from "../emitmirror";
+
+// run 里的一条值形操作（记录 op 及其载荷）。
+export struct POp {
+    pc: int, kind: string, u0: int, t0: int, u1: int, t1: int, def: int, ot: int, nt: int, bx: int,
+    val: int, fval: string, msgI: int, msgL: int, msg2I: int, msg2L: int, msgN: int,
+}
+
+export struct PCtx {
+    g: Ref<Gen>,
+    a64: bool,
+    fnIdx: int,
+    regCount: int,
+    framePad: int,
+    frameTotal: int,
+    hasFn: bool,
+    sawFn: bool,
+    escBuf: List<int>,
+    escUnits: List<int>,
+    escScalar: List<int>,
+    escNTags: List<int>,
+    escTagFirst: List<int>,
+    escTagFlat: List<int>,
+    sblIdx: List<int>,
+    sblCond: List<int>,
+    sblExit: List<int>,
+    sblAdd: List<int>,
+    sblRoot: List<int>,
+    sblBSlot: List<int>,
+    sblPrepend: List<int>,
+    sblBase: List<int>,
+    resumePcs: List<int>,
+    resumeLand: List<int>,
+    pendLbls: List<int>,
+    runLen: int,
+    runFused: int,
+    run: List<Ref<POp>>,
+    runLbls: List<int>,
+    pendingPayload: string,
+    pendingLiveN: int,
+    rejFn: List<int>,
+    rejPc: List<int>,
+    rejCode: List<string>,
+    rejDetail: List<string>,
+}
+
+export function pAt(xs: List<int>, i: int): int { return listGet(xs, i) catch 0; }
+export function pField(rec: List<string>, i: int, dflt: int): int { return emRecordInt(listGet(rec, i) catch toStr(dflt)); }
+export function pRej(c: Ref<PCtx>, pc: int, code: string, detail: string): void {
+    listPush(c.rejFn, c.fnIdx); listPush(c.rejPc, pc); listPush(c.rejCode, code); listPush(c.rejDetail, detail);
+}
+export function tagOff(slot: int): int { return slot * VALUE_BYTES; }
+export function payOff(slot: int): int { return slot * VALUE_BYTES + VALUE_PAYLOAD_OFFSET; }
+export function pcLbl(c: Ref<PCtx>, pc: int): string { return ".L" + toStr(c.fnIdx) + "_" + toStr(pc); }
+export function epiLbl(c: Ref<PCtx>): string { return ".L" + toStr(c.fnIdx) + "_epi"; }
+
+// —— 值槽读写（标签按 emitmirror 的宽度：比较读 1 字节，写入多为 4 字节，整槽搬运 8 字节）——
+export function ldPay(c: Ref<PCtx>, r: int, slot: int): void { genLd(c.g, 8, r, G_W, payOff(slot)); }
+export function ldPay32(c: Ref<PCtx>, r: int, slot: int): void { genLd(c.g, 4, r, G_W, payOff(slot)); }
+export function ldTag(c: Ref<PCtx>, r: int, slot: int): void { genLd(c.g, 1, r, G_W, tagOff(slot)); }
+export function ldTagQ(c: Ref<PCtx>, r: int, slot: int): void { genLd(c.g, 8, r, G_W, tagOff(slot)); }
+export function stPay(c: Ref<PCtx>, slot: int, r: int): void { genSt(c.g, 8, G_W, payOff(slot), r); }
+export function stPayI(c: Ref<PCtx>, slot: int, v: int): void { genStI(c.g, 8, G_W, payOff(slot), v); }
+export function stTag(c: Ref<PCtx>, slot: int, v: int): void { genStI(c.g, 4, G_W, tagOff(slot), v); }
+export function stTagQ(c: Ref<PCtx>, slot: int, r: int): void { genSt(c.g, 8, G_W, tagOff(slot), r); }
+export function stTagQI(c: Ref<PCtx>, slot: int, v: int): void { genStI(c.g, 8, G_W, tagOff(slot), v); }
+/// 槽 = None（标签 4 写 4 字节、载荷 0）。
+export function stNone(c: Ref<PCtx>, slot: int): void { stTag(c, slot, 4); stPayI(c, slot, 0); }
+/// 槽 = None（标签整 8 字节写 4）：bclear、retx 等与 emitmirror 的 qword 写同宽。
+export function stNoneQ(c: Ref<PCtx>, slot: int): void { stTagQI(c, slot, 4); stPayI(c, slot, 0); }
+
+/// 标签不是 tag 时转到 label（known 为记录给出的已知标签，相同则不查）。
+export function guardTag(c: Ref<PCtx>, slot: int, tag: int, known: int, label: string): void {
+    if (known == tag) { return; }
+    ldTag(c, G_T0, slot);
+    genBrI(c.g, "ne", G_T0, tag, label);
+}
+/// tagReg 里的标签不是堆引用时转到 label（查 __tx_is_heapref 表；用 T3）。
+export function notHeapBr(c: Ref<PCtx>, tagReg: int, label: string): void {
+    genLeaSym(c.g, G_T3, "__tx_is_heapref");
+    genLdX(c.g, 1, G_T3, G_T3, tagReg, false);
+    genBrI(c.g, "eq", G_T3, 0, label);
+}
+/// 覆写前释放槽里的旧值（堆引用才调 __tx_release）。之后 T 寄存器失效。
+export function releaseOld(c: Ref<PCtx>, slot: int, suffix: string): void {
+    ldTag(c, G_T0, slot);
+    notHeapBr(c, G_T0, suffix);
+    genCall(c.g, "__tx_release", argsOf1(gaLea(G_W, tagOff(slot))));
+    genLabel(c.g, suffix);
+}
+/// 同 releaseOld，标签 0..4（未初始化、int、float、bool、None）先放过。
+export function releaseOldQuick(c: Ref<PCtx>, slot: int, suffix: string): void {
+    ldTag(c, G_T0, slot);
+    genBrI(c.g, "ule", G_T0, 4, suffix);
+    releaseOld(c, slot, suffix + "q");
+    genLabel(c.g, suffix);
+}
+/// [addr] 处的值是堆引用则 retain（addr 须是 K 寄存器或 W，调用后仍要用）。
+export function retainAt(c: Ref<PCtx>, addr: int, suffix: string): void {
+    genLd(c.g, 1, G_T0, addr, 0);
+    notHeapBr(c, G_T0, suffix);
+    genCall(c.g, "__tx_retain", argsOf1(gaR(addr)));
+    genLabel(c.g, suffix);
+}
+export function releaseAt(c: Ref<PCtx>, addr: int, suffix: string): void {
+    genLd(c.g, 1, G_T0, addr, 0);
+    notHeapBr(c, G_T0, suffix);
+    genCall(c.g, "__tx_release", argsOf1(gaR(addr)));
+    genLabel(c.g, suffix);
+}
+/// [W + off] 处的值是堆引用则 retain。
+export function retainSlotOff(c: Ref<PCtx>, off: int, suffix: string): void {
+    genLd(c.g, 1, G_T0, G_W, off);
+    notHeapBr(c, G_T0, suffix);
+    genCall(c.g, "__tx_retain", argsOf1(gaLea(G_W, off)));
+    genLabel(c.g, suffix);
+}
+
+export function argsOf1(a: Ref<GArg>): List<Ref<GArg>> { const xs: List<Ref<GArg>> = listNew(); listPush(xs, a); return xs; }
+export function argsOf2(a: Ref<GArg>, b: Ref<GArg>): List<Ref<GArg>> { const xs = argsOf1(a); listPush(xs, b); return xs; }
+export function argsOf3(a: Ref<GArg>, b: Ref<GArg>, d: Ref<GArg>): List<Ref<GArg>> { const xs = argsOf2(a, b); listPush(xs, d); return xs; }
+/// 内核的“窗口、函数号、pc、整数…”形调用。
+export function kcall(c: Ref<PCtx>, sym: string, pc: int, xs: List<int>): void {
+    const args: List<Ref<GArg>> = listNew();
+    listPush(args, gaR(G_W)); listPush(args, gaI(c.fnIdx)); listPush(args, gaI(pc));
+    let i = 0;
+    while (i < listLen(xs)) { listPush(args, gaI(pAt(xs, i))); i = i + 1; }
+    genCall(c.g, sym, args);
+}
+export function ints1(a: int): List<int> { const xs: List<int> = listNew(); listPush(xs, a); return xs; }
+export function ints2(a: int, b: int): List<int> { const xs = ints1(a); listPush(xs, b); return xs; }
+export function ints3(a: int, b: int, d: int): List<int> { const xs = ints2(a, b); listPush(xs, d); return xs; }
+export function ints4(a: int, b: int, d: int, e: int): List<int> { const xs = ints3(a, b, d); listPush(xs, e); return xs; }
+
+/// __tx_trap(函数号, pc, 码, 消息, 消息长)：不返回。
+export function trap(c: Ref<PCtx>, pc: int, code: int, msgIdx: int, msgLen: int): void {
+    const args: List<Ref<GArg>> = listNew();
+    listPush(args, gaI(c.fnIdx)); listPush(args, gaI(pc)); listPush(args, gaI(code));
+    listPush(args, gaSym(".Lmsg" + toStr(msgIdx))); listPush(args, gaI(msgLen));
+    genCall(c.g, "__tx_trap", args);
+}
+/// callbi 通用路：__tx_callbi（或调试、工具链、外部函数桩）(窗口, 函数号, pc, a, 内建号, 实参数)。
+export function callbiGeneric(c: Ref<PCtx>, pc: int, a: int, biId: int, nargs: int): void {
+    kcall(c, emCallbiTargetFor(biId, 4096), pc, ints3(a, biId, nargs));
+}
+/// r = 当前线程块（W & TB_MASK）。
+export function tbInto(c: Ref<PCtx>, r: int): void { genOpI(c.g, "and", r, G_W, TB_MASK); }
+
+// —— 字符串构建环（记录 sbl）：状态在帧上 [SP + base + sbi*48 …]，+24 为已开始标志、+32 暂存 ——
+export function sblRedirect(c: Ref<PCtx>, pc: int, target: int): string {
+    let si = 0;
+    while (si < listLen(c.sblIdx)) {
+        if (pAt(c.sblCond, si) == pc && pAt(c.sblExit, si) == target && pAt(c.sblIdx, si) == si) {
+            return ".Lstrb" + toStr(c.fnIdx) + "_" + toStr(si);
+        }
+        si = si + 1;
+    }
+    return "";
+}
+/// 出口 pc 的标号前：构建过的环把结果物化回根槽（标签 6）。
+export function sblMat(c: Ref<PCtx>, pc: int): void {
+    let si = 0;
+    while (si < listLen(c.sblIdx)) {
+        if (pAt(c.sblExit, si) == pc && pAt(c.sblIdx, si) == si) {
+            const base = pAt(c.sblBase, si) + si * 48;
+            const root = pAt(c.sblRoot, si);
+            genLabel(c.g, ".Lstrb" + toStr(c.fnIdx) + "_" + toStr(si));
+            genLd(c.g, 4, G_T0, G_SP, base + 24);
+            genBrI(c.g, "eq", G_T0, 0, pcLbl(c, pc));
+            let fin = "__tx_strb_finish";
+            if (pAt(c.sblPrepend, si) == 1) { fin = "__tx_strb_finish_pre"; }
+            genCall(c.g, fin, argsOf3(gaLea(G_SP, base), gaI(c.fnIdx), gaI(pAt(c.sblAdd, si))));
+            genRes(c.g, G_K1);
+            genCall(c.g, "__tx_release", argsOf1(gaLea(G_W, tagOff(root))));
+            stPay(c, root, G_K1);
+            stTag(c, root, 6);
+            return;
+        }
+        si = si + 1;
+    }
+}

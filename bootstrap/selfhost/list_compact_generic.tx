@@ -1,0 +1,376 @@
+// 紧凑列表的可移植版（rtfn 写，macOS 适配 M4 设计 A8）：语义与导出名同 list_compact.tx 的 listCompactEmit 与 listCompactLeafEmit。
+// form 3，元素按 1/2/4 字节存放，elem 存定宽种类码（1 i8、2 i16、3 i32、4 u8、5 u16、6 u32、10 f32）。描述符同 List ABI v1：
+// ptr@0 len@8 cap@16 form u32@24 elem u32@28，cap 按元素个数计。读出按种类符号扩展或零扩展成 int 载荷（f32 扩成 f64 位），写入只核对
+// 标签（整数 1、f32 2）后截取低位。手写版按自定寄存器内联的 kindWidth／loadRaw／storeRaw／toValue／fromValue 在这里是向当前函数
+// 发语句的生成助手，约定用固定名字的局部（kind w addr raw tag pay），每个函数里各用一次（标号不加编号）。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, L, I, G } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtShift, rtLoad, rtStore, rtLabel, rtJump, rtIf, rtCall2, rtCall3, rtCall1, rtRet, rtRet2, rtF32BitsToF64, rtF64ToF32Bits } from "./rtfn";
+import { OBJ_FLAG_FROZEN } from "./store_abi";
+import { LIST_FORM_COMPACT } from "./list_compact";
+import { tSysV } from "./target";
+
+const MODULE: string = "bootstrap/selfhost/list_compact_generic.tx";
+const MASK32: int = 4294967295;
+// 列表对象的类型标签（对象头 u32@16）；对象记录 72 字节，槽表的对象数组在 +48。
+const OBJ_KIND_LIST: int = 7;
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// w ← 种类 kind 的元素宽度；种类非法跳 bad。
+function kindWidth(f: Ref<RtFn>, bad: string): void {
+    rtSet(f, "w", I(1));
+    rtIf(f, L("kind"), "eq", I(1), "wok");
+    rtIf(f, L("kind"), "eq", I(4), "wok");
+    rtSet(f, "w", I(2));
+    rtIf(f, L("kind"), "eq", I(2), "wok");
+    rtIf(f, L("kind"), "eq", I(5), "wok");
+    rtSet(f, "w", I(4));
+    rtIf(f, L("kind"), "eq", I(3), "wok");
+    rtIf(f, L("kind"), "eq", I(6), "wok");
+    rtIf(f, L("kind"), "eq", I(10), "wok");
+    rtJump(f, bad);
+    rtLabel(f, "wok");
+}
+
+// raw ← addr 处 w 字节（零扩展的原始位）。
+function loadRaw(f: Ref<RtFn>): void {
+    rtIf(f, L("w"), "ne", I(1), "l2");
+    rtLoad(f, "raw", L("addr"), 0, 1);
+    rtJump(f, "ld");
+    rtLabel(f, "l2");
+    rtIf(f, L("w"), "ne", I(2), "l4");
+    rtLoad(f, "raw", L("addr"), 0, 2);
+    rtJump(f, "ld");
+    rtLabel(f, "l4");
+    rtLoad(f, "raw", L("addr"), 0, 4);
+    rtLabel(f, "ld");
+}
+
+// addr 处 w 字节 ← raw 的低位。
+function storeRaw(f: Ref<RtFn>): void {
+    rtIf(f, L("w"), "ne", I(1), "s2");
+    rtStore(f, L("addr"), 0, L("raw"), 1);
+    rtJump(f, "sd");
+    rtLabel(f, "s2");
+    rtIf(f, L("w"), "ne", I(2), "s4");
+    rtStore(f, L("addr"), 0, L("raw"), 2);
+    rtJump(f, "sd");
+    rtLabel(f, "s4");
+    rtStore(f, L("addr"), 0, L("raw"), 4);
+    rtLabel(f, "sd");
+}
+
+// 原始位 raw → 值：tag（整数 1、f32 2），pay（按种类符号扩展；f32 扩成 f64 位；无符号种类即原始位）。
+function toValue(f: Ref<RtFn>): void {
+    rtSet(f, "tag", I(1));
+    rtSet(f, "pay", L("raw"));
+    rtIf(f, L("kind"), "ne", I(1), "v2");
+    rtShift(f, "pay", L("raw"), "shl", 56);
+    rtShift(f, "pay", L("pay"), "sar", 56);
+    rtJump(f, "vd");
+    rtLabel(f, "v2");
+    rtIf(f, L("kind"), "ne", I(2), "v3");
+    rtShift(f, "pay", L("raw"), "shl", 48);
+    rtShift(f, "pay", L("pay"), "sar", 48);
+    rtJump(f, "vd");
+    rtLabel(f, "v3");
+    rtIf(f, L("kind"), "ne", I(3), "vf");
+    rtShift(f, "pay", L("raw"), "shl", 32);
+    rtShift(f, "pay", L("pay"), "sar", 32);
+    rtJump(f, "vd");
+    rtLabel(f, "vf");
+    rtIf(f, L("kind"), "ne", I(10), "vd");
+    rtF32BitsToF64(f, "pay", L("raw"));
+    rtSet(f, "tag", I(2));
+    rtLabel(f, "vd");
+}
+
+// 值（局部 val 指向 {标签@0, 载荷@8}）→ 原始位 raw：标签取低 8 位，须为整数（f32 须为 2），不符跳 bad；f32 舍入为单精度位
+// （值本就可精确表示）。
+function fromValue(f: Ref<RtFn>, bad: string): void {
+    rtLoad(f, "tag", L("val"), 0, 8);
+    rtOp(f, "tag", L("tag"), "and", I(255));
+    rtLoad(f, "raw", L("val"), 8, 8);
+    rtIf(f, L("kind"), "eq", I(10), "ff");
+    rtIf(f, L("tag"), "ne", I(1), bad);
+    rtJump(f, "fd");
+    rtLabel(f, "ff");
+    rtIf(f, L("tag"), "ne", I(2), bad);
+    rtF64ToF32Bits(f, "raw", L("raw"));
+    rtLabel(f, "fd");
+}
+
+// 描述符 desc 核对（非空、form 3、len ≤ cap、idx < len、ptr 非空、种类合法）后按下标定址：addr = ptr + idx × w。
+function element(f: Ref<RtFn>, bad: string): void {
+    rtIf(f, L("desc"), "eq", I(0), bad);
+    rtLoad(f, "x", L("desc"), 24, 4);
+    rtIf(f, L("x"), "ne", I(LIST_FORM_COMPACT), bad);
+    rtLoad(f, "n", L("desc"), 8, 8);
+    rtLoad(f, "x", L("desc"), 16, 8);
+    rtIf(f, L("n"), "ugt", L("x"), bad);
+    rtIf(f, L("idx"), "uge", L("n"), bad);
+    rtLoad(f, "x", L("desc"), 0, 8);
+    rtIf(f, L("x"), "eq", I(0), bad);
+    rtLoad(f, "kind", L("desc"), 28, 4);
+    kindWidth(f, bad);
+    rtOp(f, "addr", L("idx"), "imul", L("w"));
+    rtLoad(f, "x", L("desc"), 0, 8);
+    rtOp(f, "addr", L("addr"), "add", L("x"));
+}
+
+// cget(desc, idx, out) → 3，out 得 {标签, 载荷}；失败 0。
+function getFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_list_cget_v1", "desc idx out", "x n kind w addr raw tag pay", 0, MODULE);
+    rtIf(f, L("out"), "eq", I(0), "bad");
+    element(f, "bad");
+    loadRaw(f);
+    toValue(f);
+    rtStore(f, L("out"), 0, L("tag"), 8);
+    rtStore(f, L("out"), 8, L("pay"), 8);
+    rtRet(f, I(LIST_FORM_COMPACT));
+    rtLabel(f, "bad");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// cremove(desc, idx, out) → 3：取出元素写入 out，其后的字节逐字节前移一个元素宽度，len 减一；失败 0。
+function removeFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_list_cremove_v1", "desc idx out", "x n kind w addr raw tag pay end src c", 0, MODULE);
+    rtIf(f, L("out"), "eq", I(0), "bad");
+    element(f, "bad");
+    loadRaw(f);
+    toValue(f);
+    rtStore(f, L("out"), 0, L("tag"), 8);
+    rtStore(f, L("out"), 8, L("pay"), 8);
+    // 末端在写出之后从描述符重读（同手写版）。
+    rtLoad(f, "end", L("desc"), 8, 8);
+    rtOp(f, "end", L("end"), "imul", L("w"));
+    rtLoad(f, "x", L("desc"), 0, 8);
+    rtOp(f, "end", L("end"), "add", L("x"));
+    rtOp(f, "src", L("addr"), "add", L("w"));
+    rtLabel(f, "loop");
+    rtIf(f, L("src"), "uge", L("end"), "done");
+    rtLoad(f, "c", L("src"), 0, 1);
+    rtStore(f, L("addr"), 0, L("c"), 1);
+    rtOp(f, "addr", L("addr"), "add", I(1));
+    rtOp(f, "src", L("src"), "add", I(1));
+    rtJump(f, "loop");
+    rtLabel(f, "done");
+    rtLoad(f, "n", L("desc"), 8, 8);
+    rtOp(f, "n", L("n"), "sub", I(1));
+    rtStore(f, L("desc"), 8, L("n"), 8);
+    rtRet(f, I(LIST_FORM_COMPACT));
+    rtLabel(f, "bad");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// cset(desc, idx, val) → 2（同原始形态“已原位写入”，调用方不走通用槽）；失败 0。
+function setFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_list_cset_v1", "desc idx val", "x n kind w addr raw tag", 0, MODULE);
+    rtIf(f, L("val"), "eq", I(0), "bad");
+    element(f, "bad");
+    fromValue(f, "bad");
+    storeRaw(f);
+    rtRet(f, I(2));
+    rtLabel(f, "bad");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// cappend(desc, val) → 1：容量不足时按倍增（至少 8 个元素）另分配、拷贝、释放旧块（旧容量为 0 时不释放）；失败 0。
+function appendFn(b: Ref<StructuredBuffer>, failures: List<string>, copy: string): void {
+    const f = rtBegin(b, "__tx_native_list_cappend_v1", "desc val", "x n cap ncap fresh old kind w addr raw tag", 3, MODULE);
+    rtIf(f, L("desc"), "eq", I(0), "fail");
+    rtIf(f, L("val"), "eq", I(0), "fail");
+    rtLoad(f, "x", L("desc"), 24, 4);
+    rtIf(f, L("x"), "ne", I(LIST_FORM_COMPACT), "fail");
+    rtLoad(f, "kind", L("desc"), 28, 4);
+    kindWidth(f, "fail");
+    fromValue(f, "fail");
+    rtLoad(f, "n", L("desc"), 8, 8);
+    rtLoad(f, "cap", L("desc"), 16, 8);
+    rtIf(f, L("n"), "ugt", L("cap"), "fail");
+    rtIf(f, L("n"), "ult", L("cap"), "store");
+    rtIf(f, L("cap"), "uge", I(288230376151711744), "fail");
+    rtShift(f, "ncap", L("cap"), "shl", 1);
+    rtIf(f, L("ncap"), "uge", I(8), "grow");
+    rtSet(f, "ncap", I(8));
+    rtLabel(f, "grow");
+    rtOp(f, "x", L("ncap"), "imul", L("w"));
+    rtCall2(f, "fresh", "__tx_native_mem_alloc", L("x"), I(8));
+    rtIf(f, L("fresh"), "eq", I(0), "fail");
+    rtLoad(f, "x", L("desc"), 8, 8);
+    rtOp(f, "x", L("x"), "imul", L("w"));
+    rtIf(f, L("x"), "eq", I(0), "nocopy");
+    rtLoad(f, "old", L("desc"), 0, 8);
+    rtCall3(f, "", copy, L("fresh"), L("old"), L("x"));
+    rtLabel(f, "nocopy");
+    rtLoad(f, "x", L("desc"), 16, 8);
+    rtIf(f, L("x"), "eq", I(0), "nofree");
+    rtLoad(f, "old", L("desc"), 0, 8);
+    rtCall1(f, "", "__tx_native_mem_free", L("old"));
+    rtLabel(f, "nofree");
+    rtStore(f, L("desc"), 0, L("fresh"), 8);
+    rtStore(f, L("desc"), 16, L("ncap"), 8);
+    rtLabel(f, "store");
+    rtLoad(f, "n", L("desc"), 8, 8);
+    rtOp(f, "addr", L("n"), "imul", L("w"));
+    rtLoad(f, "x", L("desc"), 0, 8);
+    rtOp(f, "addr", L("addr"), "add", L("x"));
+    storeRaw(f);
+    rtLoad(f, "n", L("desc"), 8, 8);
+    rtOp(f, "n", L("n"), "add", I(1));
+    rtStore(f, L("desc"), 8, L("n"), 8);
+    rtRet(f, I(1));
+    rtLabel(f, "fail");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// cinsert(desc, idx, val) → 1（idx ≤ len）：先追加到末尾，再把 [idx, 末尾) 的字节自后向前后移一个元素宽度，新元素写到 idx 处；
+// 失败 0（追加失败时返回追加的结果）。
+function insertFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_list_cinsert_v1", "desc idx val", "x n ok kind w addr raw dst at c", 2, MODULE);
+    rtIf(f, L("desc"), "eq", I(0), "bad");
+    rtLoad(f, "n", L("desc"), 8, 8);
+    rtIf(f, L("idx"), "ugt", L("n"), "bad");
+    rtCall2(f, "ok", "__tx_native_list_cappend_v1", L("desc"), L("val"));
+    rtIf(f, L("ok"), "eq", I(0), "appendfail");
+    rtLoad(f, "kind", L("desc"), 28, 4);
+    kindWidth(f, "bad");
+    // addr ＝ 刚追加的末元素；raw ＝ 它的原始位。
+    rtLoad(f, "n", L("desc"), 8, 8);
+    rtOp(f, "addr", L("n"), "sub", I(1));
+    rtOp(f, "addr", L("addr"), "imul", L("w"));
+    rtLoad(f, "x", L("desc"), 0, 8);
+    rtOp(f, "addr", L("addr"), "add", L("x"));
+    loadRaw(f);
+    rtOp(f, "dst", L("idx"), "imul", L("w"));
+    rtOp(f, "dst", L("dst"), "add", L("x"));
+    rtOp(f, "at", L("addr"), "sub", I(1));
+    rtLabel(f, "loop");
+    rtIf(f, L("at"), "ult", L("dst"), "place");
+    rtLoad(f, "c", L("at"), 0, 1);
+    rtOp(f, "x", L("at"), "add", L("w"));
+    rtStore(f, L("x"), 0, L("c"), 1);
+    rtOp(f, "at", L("at"), "sub", I(1));
+    rtJump(f, "loop");
+    rtLabel(f, "place");
+    rtSet(f, "addr", L("dst"));
+    storeRaw(f);
+    rtRet(f, I(1));
+    rtLabel(f, "appendfail");
+    rtRet(f, L("ok"));
+    rtLabel(f, "bad");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// __tx_lc_bytes(kind, n) → n × 宽度（发送与接收用）；种类非法或 n ≥ 2^61（运行时加固 H2：宽度 ≤ 4，乘积不溢出）得 −1。
+// 种类取低 32 位（同手写版的 ecx）。
+function bytesFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_lc_bytes", "kind n", "w w2", 0, MODULE);
+    rtOp(f, "kind", L("kind"), "and", I(MASK32));
+    kindWidth(f, "bad");
+    rtShift(f, "w2", L("n"), "shr", 61);
+    rtIf(f, L("w2"), "ne", I(0), "bad");
+    rtOp(f, "n", L("n"), "imul", L("w"));
+    rtRet(f, L("n"));
+    rtLabel(f, "bad");
+    rtRet(f, I(-1));
+    done(f, failures);
+}
+
+// 列表对象下标 obj（取低 32 位）→ 对象地址 o ＝ 本线程槽表的对象数组 + obj × 72。
+function objAddr(f: Ref<RtFn>): void {
+    rtOp(f, "o", L("obj"), "and", I(MASK32));
+    rtOp(f, "o", L("o"), "imul", I(72));
+    rtSet(f, "x", G("__tx_nrt_slots"));
+    rtLoad(f, "x", L("x"), 48, 8);
+    rtOp(f, "o", L("o"), "add", L("x"));
+}
+
+// 紧凑列表的内联叶子例程（NRT；O4 第二步 2c1b）：生成代码对 callbi 71/72/73 直调（emitmirror 的 emitCompactListInline）。
+// 非紧凑、越界、冻结、标签不符一律返回“走通用路”，由内建给出同一结果或同一 trap。生成代码按手写版的约定调用：ecx＝对象下标、
+// rdx＝元素下标、r8＝值指针；cget1 的结果是两个值（载荷、标签），经 rtRet2 返回（x86 rax、r8，A64 x0、x1）；三者只用 rtfn 的易失临时寄存器与 xmm0，不改 rbx。
+function leafGetFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_list_cget1", "obj idx", "o x kind w addr raw tag pay", 0, MODULE);
+    objAddr(f);
+    rtLoad(f, "x", L("o"), 16, 4);
+    rtIf(f, L("x"), "ne", I(OBJ_KIND_LIST), "slow");
+    rtLoad(f, "x", L("o"), 28, 4);
+    rtIf(f, L("x"), "ne", I(LIST_FORM_COMPACT), "slow");
+    rtLoad(f, "x", L("o"), 40, 8);
+    rtIf(f, L("idx"), "uge", L("x"), "slow");
+    rtLoad(f, "kind", L("o"), 24, 4);
+    kindWidth(f, "slow");
+    rtOp(f, "addr", L("idx"), "imul", L("w"));
+    rtLoad(f, "x", L("o"), 32, 8);
+    rtOp(f, "addr", L("addr"), "add", L("x"));
+    loadRaw(f);
+    toValue(f);
+    rtRet2(f, L("pay"), L("tag"));
+    rtLabel(f, "slow");
+    rtRet2(f, I(0), I(0));
+    done(f, failures);
+}
+
+// cset1(obj, idx, val) → 1 已写，0 走通用路（冻结、非紧凑、越界、标签不符）。
+function leafSetFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_list_cset1", "obj idx val", "o x kind w addr raw tag", 0, MODULE);
+    objAddr(f);
+    rtLoad(f, "x", L("o"), 0, 4);
+    rtOp(f, "x", L("x"), "and", I(OBJ_FLAG_FROZEN));
+    rtIf(f, L("x"), "ne", I(0), "slow");
+    rtLoad(f, "x", L("o"), 16, 4);
+    rtIf(f, L("x"), "ne", I(OBJ_KIND_LIST), "slow");
+    rtLoad(f, "x", L("o"), 28, 4);
+    rtIf(f, L("x"), "ne", I(LIST_FORM_COMPACT), "slow");
+    rtLoad(f, "x", L("o"), 40, 8);
+    rtIf(f, L("idx"), "uge", L("x"), "slow");
+    rtLoad(f, "kind", L("o"), 24, 4);
+    kindWidth(f, "slow");
+    fromValue(f, "slow");
+    rtOp(f, "addr", L("idx"), "imul", L("w"));
+    rtLoad(f, "x", L("o"), 32, 8);
+    rtOp(f, "addr", L("addr"), "add", L("x"));
+    storeRaw(f);
+    rtRet(f, I(1));
+    rtLabel(f, "slow");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// clen1(obj) → 长度；不是列表得 −1。
+function leafLenFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_list_clen1", "obj", "o x", 0, MODULE);
+    objAddr(f);
+    rtLoad(f, "x", L("o"), 16, 4);
+    rtIf(f, L("x"), "ne", I(OBJ_KIND_LIST), "slow");
+    rtLoad(f, "x", L("o"), 40, 8);
+    rtRet(f, L("x"));
+    rtLabel(f, "slow");
+    rtRet(f, I(-1));
+    done(f, failures);
+}
+
+/// 发出紧凑列表的函数（含 NRT 的三个叶子例程）；rtfn 的失败记进 failures。t 为目标编号：SysV 目标的私有约定 memcpy 是
+/// __tx_linux_memcpy（导出的 memcpy 是 SysV 约定的），其余目标用 memcpy（同手写版）。
+export function listCompactGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    let copy = "memcpy";
+    if (tSysV(t)) { copy = "__tx_linux_memcpy"; }
+    getFn(b, failures);
+    removeFn(b, failures);
+    setFn(b, failures);
+    appendFn(b, failures, copy);
+    insertFn(b, failures);
+    bytesFn(b, failures);
+    leafGetFn(b, failures);
+    leafSetFn(b, failures);
+    leafLenFn(b, failures);
+}

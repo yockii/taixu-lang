@@ -1,0 +1,206 @@
+// lsp_complete.tx —— 原生 LSP 的 completion（第 6 轮 6d-3b2，LSP 与 MCP 实施设计 §四-5）。
+//
+// 光标在注释、串、字符字面量、模板串的字面部分里，或紧跟 `.` 之后（成员补全记在 TOOL-92）→ 空表。否则全量交给客户端
+// 过滤（回裸数组即 isIncomplete: false，同 Zig 版的形）：该处可见的局部、本模块顶层声明与导入名（lsp_scope）、prelude
+// 的导出、内建（仅 --toolchain 的只在 LSP 带 --toolchain 时给；被用户声明遮蔽的不给）、预声明类型名、关键字与 None。
+// 同名取先出现的（局部、模块、prelude 与内建、关键字的次序）。sortText 按这四组分组后接名字。
+import { Root, diagRoots, setOverlay } from "./lsp_diag";
+import { AnaDetail, anaDetailOf, anaDetails } from "./ana_index";
+import { LspDoc, docKey, posToOffset, joinComma } from "./lsp_docs";
+import { builtins } from "./lsp_builtins";
+import { DocToks, docToks, tokKind, tokStart, tokEnd, tokBefore, visibleAt } from "./lsp_scope";
+import { drvCheck, drvSetOverlay, drvAnaDetInts, drvAnaDetStrs, drvModulePathList, drvToolchainOn } from "./driver";
+import { sliceText, K_IDENT, K_DOT, K_COMMENT, K_STR, K_CHAR, K_TEMPLATE } from "../lexer";
+import { dbgStr } from "./dbg_out";
+import { pathIsSep } from "./path_sep";
+
+const KEYWORDS: string = "export function struct enum let const if else while for break continue return switch case test import true false new catch as defer interface async await declare yield";
+const TYPES: string = "int float bool string void Error Ref Weak List Future Bytes Gen Thread Shared Atomic i8 i16 i32 i64 u8 u16 u32 u64 isize usize f32 f64";
+
+const KIND_FUNCTION: int = 3;
+const KIND_VARIABLE: int = 6;
+const KIND_CLASS: int = 7;
+const KIND_ENUM: int = 13;
+const KIND_KEYWORD: int = 14;
+const KIND_CONSTANT: int = 21;
+const KIND_STRUCT: int = 22;
+
+struct Item {
+    label: string,
+    kind: int,
+    detail: string,
+    group: string,
+}
+
+// prelude 的导出（服务进程内首次需要时做一次探测检查，之后缓存；prelude 内嵌于编译器、不变）。
+let preludeDone: bool = false;
+let preludeItems: List<Ref<Item>> = listNew();
+
+// 按字节比较前缀（strSub 按码点计，不能拿字节长度去截）。
+function startsWith(s: string, p: string): bool {
+    if (len(s) < len(p)) { return false; }
+    let i = 0;
+    while (i < len(p)) {
+        if ((byteAt(s, i) catch -1) != (byteAt(p, i) catch -2)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 声明的种类：函数 3、struct 22、enum 13、const 绑定 21，其余（let、形参、catch 与模式绑定）6。
+function kindOf(tt: int, text: string): int {
+    if (tt == 0) { return KIND_FUNCTION; }
+    if (tt == 1) { return KIND_STRUCT; }
+    if (tt == 2) { return KIND_ENUM; }
+    if (tt == 4 && startsWith(text, "const ")) { return KIND_CONSTANT; }
+    return KIND_VARIABLE;
+}
+
+function kindOfText(text: string): int {
+    if (startsWith(text, "function ") || startsWith(text, "async function ") || startsWith(text, "function* ")) { return KIND_FUNCTION; }
+    if (startsWith(text, "struct ") || startsWith(text, "declare struct ")) { return KIND_STRUCT; }
+    if (startsWith(text, "enum ")) { return KIND_ENUM; }
+    if (startsWith(text, "const ")) { return KIND_CONSTANT; }
+    return KIND_VARIABLE;
+}
+
+// 探测检查：覆盖层里一个只引用 prelude 标志名的内存文件（放在 dir 下，不落盘），取 prelude 模块里带导出位的
+// 声明。之后恢复覆盖层为打开的文档。
+function loadPrelude(docs: List<Ref<LspDoc>>, dir: string, targetId: int): void {
+    preludeDone = true;
+    const probe = dir + "__taixu_lsp_prelude_probe__.tx";
+    const ps: List<string> = listNew();
+    const ts: List<string> = listNew();
+    listPush(ps, probe);
+    // 标志名分段拼出（同驱动的 PRELUDE_ANCHORS）：编译器自身源码里不出现完整标志名。
+    listPush(ts, "// map" + "New\n");
+    drvSetOverlay(ps, ts);
+    drvCheck(probe, targetId, true);
+    let pm = -1;
+    let i = 0;
+    for (p in drvModulePathList()) {
+        if (p == "<prelude>") { pm = i; }
+        i = i + 1;
+    }
+    if (pm >= 0) {
+        for (det in anaDetails(drvAnaDetInts(), drvAnaDetStrs())) {
+            if (det.mod == pm && det.exported) {
+                listPush(preludeItems, new Item { label: det.name, kind: kindOfText(det.text), detail: det.text, group: "2" });
+            }
+        }
+    }
+    setOverlay(docs);
+}
+
+// 路径的目录部分，含末尾的分隔符（沿用文档路径原有的分隔符）。
+function dirOf(path: string): string {
+    let i = len(path) - 1;
+    while (i >= 0) {
+        const b = byteAt(path, i) catch 0;
+        if (pathIsSep(b)) { return sliceText(path, 0, i + 1); }
+        i = i - 1;
+    }
+    return "";
+}
+
+// 模板串 tpl 的第 rel 个字节是否在 `${…}` 插值段里。
+function inInterp(tpl: string, rel: int): bool {
+    let inside = false;
+    let depth = 0;
+    let i = 1;
+    while (i < rel && i < len(tpl)) {
+        const b = byteAt(tpl, i) catch 0;
+        if (!inside) {
+            if (b == 92) {
+                i = i + 1;
+            } else if (b == 36 && (byteAt(tpl, i + 1) catch 0) == 123) {
+                inside = true;
+                depth = 0;
+                i = i + 1;
+            }
+        } else if (b == 123) {
+            depth = depth + 1;
+        } else if (b == 125) {
+            if (depth == 0) { inside = false; } else { depth = depth - 1; }
+        }
+        i = i + 1;
+    }
+    return inside;
+}
+
+// 光标处不补全：注释、串、字符字面量、模板串的字面部分里，或紧跟 `.` 之后。
+function quiet(t: Ref<DocToks>, off: int): bool {
+    const i = tokBefore(t, off);
+    if (i < 0) { return false; }
+    const k = tokKind(t, i);
+    const end = tokEnd(t, i);
+    if (k == K_COMMENT) {
+        const text = listGet(t.texts, i) catch "";
+        // 行注释到行尾为止，光标在行尾也算在注释里。
+        if (startsWith(text, "//")) { return off <= end; }
+        return off < end;
+    }
+    if ((k == K_STR || k == K_CHAR) && off < end) { return true; }
+    if (k == K_TEMPLATE && off < end) { return !inInterp(listGet(t.texts, i) catch "", off - tokStart(t, i)); }
+    if (k == K_DOT && off >= end) { return true; }
+    if (k == K_IDENT && off <= end) {
+        let j = i - 1;
+        while (j >= 0 && tokKind(t, j) == K_COMMENT) { j = j - 1; }
+        return j >= 0 && tokKind(t, j) == K_DOT && tokEnd(t, j) == tokStart(t, i);
+    }
+    return false;
+}
+
+function has(items: List<Ref<Item>>, label: string): bool {
+    for (x in items) {
+        if (x.label == label) { return true; }
+    }
+    return false;
+}
+
+function add(items: List<Ref<Item>>, it: Ref<Item>): void {
+    if (!has(items, it.label)) { listPush(items, it); }
+}
+
+// textDocument/completion 的结果（JSON 文本）。调用前该文档的入口已同步分析。
+export function completeAt(docs: List<Ref<LspDoc>>, d: Ref<LspDoc>, line: int, ch: int, enc: int, targetId: int): string {
+    const t = docToks(d.text);
+    const off = posToOffset(d, line, ch, enc);
+    if (quiet(t, off)) { return "[]"; }
+    const items: List<Ref<Item>> = listNew();
+    for (r in diagRoots()) {
+        let m = -1;
+        let i = 0;
+        while (i < listLen(r.paths) && m < 0) {
+            const p = listGet(r.paths, i) catch "<prelude>";
+            if (p != "<prelude>" && docKey(p) == d.key) { m = i; }
+            i = i + 1;
+        }
+        if (m >= 0 && listLen(items) == 0) {
+            for (v in visibleAt(r, m, d.text, t, off)) {
+                let text = "";
+                const dv = anaDetailOf(r.dets, v.key);
+                if (dv != None) { text = (dv catch new AnaDetail { key: "", mod: -1, how: 0, name: "", text: "", exported: false, varies: false }).text; }
+                let group = "1";
+                if (v.local) { group = "0"; }
+                add(items, new Item { label: v.name, kind: kindOf(v.tt, text), detail: text, group: group });
+            }
+        }
+    }
+    if (!preludeDone) { loadPrelude(docs, dirOf(d.path), targetId); }
+    for (x in preludeItems) { add(items, x); }
+    const tool = drvToolchainOn();
+    for (b in builtins()) {
+        if (tool || !b.toolchain) { add(items, new Item { label: b.name, kind: KIND_FUNCTION, detail: b.sig, group: "2" }); }
+    }
+    for (n in strSplit(TYPES, " ")) { add(items, new Item { label: n, kind: KIND_CLASS, detail: "", group: "2" }); }
+    add(items, new Item { label: "None", kind: KIND_CONSTANT, detail: "", group: "2" });
+    for (n in strSplit(KEYWORDS, " ")) { add(items, new Item { label: n, kind: KIND_KEYWORD, detail: "", group: "3" }); }
+    const parts: List<string> = listNew();
+    for (x in items) {
+        let detail = "";
+        if (len(x.detail) > 0) { detail = ",\"detail\":" + dbgStr(x.detail); }
+        listPush(parts, "{\"label\":" + dbgStr(x.label) + ",\"kind\":" + toStr(x.kind) + detail + ",\"sortText\":" + dbgStr(x.group + x.label) + "}");
+    }
+    return "[" + joinComma(parts) + "]";
+}

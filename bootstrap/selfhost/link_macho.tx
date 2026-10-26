@@ -1,0 +1,467 @@
+// Mach-O x86_64 可执行文件写出（macOS 适配 M1，docs/design/v052-macos-m1-macho-v0.1-20261024.md E3–E5）。
+// 输入同 ELF：我们自己的 ELF64 可重定位目标文件（程序＋内核），读入、放置、符号解析、拷节与重定位由 link_objects.tx 完成；
+// 本文件只管 Mach-O 的布局与写出：
+// - 段：__PAGEZERO（4 GiB）、__TEXT（头、load commands、__text；r-x）、__DATA_CONST（__const＝rodata、__got 导入槽；
+//   dyld 修补后只读）、__DATA（__data、__thread_vars、零填充的 __thread_bss 与 __bss）、__LINKEDIT；全部按 16 KiB 对齐，
+//   __TEXT／__DATA_CONST／__DATA 的虚拟地址＝BASE＋文件偏移（核心按此拷节与重定位）。
+// - 修补：LC_DYLD_INFO_ONLY 的 rebase（64 位绝对地址，只许落在 __DATA_CONST／__DATA）与非惰性 bind（导入槽、TLV 描述符）。
+// - 导入：目标文件里引用而未定义的 `__imp_<名>` 即导入，槽在 __got，绑定 `_<名>`（两级命名空间）：经 machoImportFrom 登记了库的
+//   按该库的序号，其余归 libSystem（序号 1）；libSystem 以外的库按登记的首次出现顺序各一条 LC_LOAD_DYLIB（M2 设计 F2）。
+// - TLS：合成一个 TLV 描述符 `__tx_tls_tlv`（首字绑定 `__tlv_bootstrap`，模板为 8 字节零填充），内核的 __tx_tls_tb_get/set 经它访问。
+// - UUID 取映像（UUID 置零、签名之前）的 SHA-256 前 16 字节，同样的输入在任何宿主上得同样的产物。
+// - 签名：ad-hoc、linker-signed（CodeDirectory 0x20400，flags 0x20002，SHA-256，4 KiB 页，带 execSeg）。
+// - 函数符号（v052-image-symbols）：本地符号含全部函数（程序函数用可读名 <模块>.<函数>，内核内部例程取函数目录），
+//   function starts 覆盖全部函数；--strip 只去本地符号。
+import { rawNameOf } from "./binary_name";
+import { ImageSymbol, linkSymbolsCollect, linkSymbolsStripped } from "./link_symbols";
+import { linkMapSymbolsEnabled, linkMapEnabled, linkMapDone, linkMapSynthetic } from "./link_map_data";
+import { LKO_IMAGE_LIMIT, lkoObjectMachine, lkoReject, lkoFailure, lkoAlignUp, lkoLookup, lkoAddress, lkoAddGlobal, lkoGlobalCount, lkoGlobalName, lkoGlobalKind, lkoUndefinedWithPrefix, lkoBegin, lkoPlace, lkoGroupSize, lkoGroupAlign, lkoSetGroupBase, lkoDefineGlobals, lkoCacheSymbols, lkoCopySections, lkoRelocate, lkoCollectMap } from "./link_objects";
+import { sha256Range } from "./sha256";
+import { pathSeps } from "./path_sep";
+
+const BASE: int = 4294967296;
+const SEG: int = 16384;
+const CS_PAGE: int = 4096;
+const DYLD: string = "/usr/lib/dyld";
+const LIBSYSTEM: string = "/usr/lib/libSystem.B.dylib";
+// macOS 13.0（上位稿 D7）；sdk 字段同写 13.0（实测 13.0 与 26.0 都被接受）。
+const MIN_OS: int = 0x0D0000;
+const TLV_SLOT: string = "__tx_tls_tlv";
+const IMPORT_PREFIX: string = "__imp_";
+
+let out: Bytes = bytesNew(0);
+let identifier: string = "a.out";
+const importSyms: List<string> = listNew();
+const importLibs: List<string> = listNew();
+
+/// 外部函数的导入：符号（不含前导下划线）来自安装名为 dylib 的库。每次链接前先 machoImportReset。
+export function machoImportReset(): void {
+    while (listLen(importSyms) > 0) { listRemoveAt(importSyms, listLen(importSyms) - 1); listRemoveAt(importLibs, listLen(importLibs) - 1); }
+}
+export function machoImportFrom(symbol: string, dylib: string): void { listPush(importSyms, symbol); listPush(importLibs, dylib); }
+
+function indexOf(xs: List<string>, s: string): int {
+    let i = 0;
+    while (i < listLen(xs)) { if ((listGet(xs, i) catch "") == s) { return i; } i = i + 1; }
+    return -1;
+}
+
+/// 代码签名的 identifier：入口文件的主名（最后一个 / 或 \ 之后、第一个 . 之前），即产物的文件名（taixu.tx 的 stemCli 同规则）。
+/// 由驱动按入口设置，构建与编译画像（profile）因此得到同一产物。
+export function machoIdentifierFor(entryPath: string): void {
+    let stem = entryPath;
+    for (sep in pathSeps()) {
+        const parts = strSplit(stem, sep);
+        stem = listGet(parts, listLen(parts) - 1) catch stem;
+    }
+    const dot = strIndexOf(stem, ".");
+    if (dot > 0) { stem = strSub(stem, 0, dot); }
+    identifier = stem;
+}
+
+function reject(message: string): int {
+    lkoReject(message);
+    out = bytesNew(0);
+    return 1;
+}
+function failed(): int {
+    out = bytesNew(0);
+    return 1;
+}
+
+function le(b: Bytes, value: int, width: int): void {
+    let i = 0;
+    while (i < width) { bytesPush(b, (value >>> (i * 8)) & 255); i = i + 1; }
+}
+function be(b: Bytes, value: int, width: int): void {
+    let i = width - 1;
+    while (i >= 0) { bytesPush(b, (value >>> (i * 8)) & 255); i = i - 1; }
+}
+function put(at: int, value: int, width: int): void {
+    let i = 0;
+    while (i < width) { bytesSet(out, at + i, (value >>> (i * 8)) & 255); i = i + 1; }
+}
+function text(b: Bytes, s: string): void {
+    let i = 0;
+    while (i < len(s)) { bytesPush(b, byteAt(s, i) catch 0); i = i + 1; }
+}
+// 定长名字字段（段名、节名 16 字节，NUL 填充）。
+function name16(b: Bytes, s: string): void {
+    text(b, s);
+    let i = len(s);
+    while (i < 16) { bytesPush(b, 0); i = i + 1; }
+}
+function uleb(b: Bytes, value: int): void {
+    let v = value;
+    while (true) {
+        const byte = v & 127;
+        v = v >>> 7;
+        if (v == 0) { bytesPush(b, byte); return; }
+        bytesPush(b, byte | 128);
+    }
+}
+function padTo(b: Bytes, alignment: int): void {
+    while (bytesLen(b) % alignment != 0) { bytesPush(b, 0); }
+}
+
+function segment(b: Bytes, name: string, va: int, vmSize: int, fileOff: int, fileSize: int, maxProt: int, initProt: int, nsects: int, flags: int): void {
+    le(b, 25, 4); le(b, 72 + 80 * nsects, 4); name16(b, name);
+    le(b, va, 8); le(b, vmSize, 8); le(b, fileOff, 8); le(b, fileSize, 8);
+    le(b, maxProt, 4); le(b, initProt, 4); le(b, nsects, 4); le(b, flags, 4);
+}
+function section(b: Bytes, sect: string, seg: string, va: int, size: int, fileOff: int, alignPow: int, flags: int, reserved1: int): void {
+    name16(b, sect); name16(b, seg);
+    le(b, va, 8); le(b, size, 8); le(b, fileOff, 4); le(b, alignPow, 4);
+    le(b, 0, 4); le(b, 0, 4); le(b, flags, 4); le(b, reserved1, 4); le(b, 0, 4); le(b, 0, 4);
+}
+// 路径类 load command（LC_LOAD_DYLINKER、LC_LOAD_DYLIB）：头长 head，路径以 NUL 结尾，整条补齐到 8 的倍数。
+function pathCommandSize(head: int, path: string): int { return lkoAlignUp(head + len(path) + 1, 8); }
+
+function minInt(a: int, b: int): int { if (a < b) { return a; } return b; }
+function maxInt(a: int, b: int): int { if (a > b) { return a; } return b; }
+
+function log2(value: int): int {
+    let p = 0;
+    while ((1 << p) < value) { p = p + 1; }
+    return p;
+}
+
+// 文件偏移 at 所在的节（1 起；七个节按 load command 的次序）；inclusive 为真时节末端也算。没有为 0。
+function sectionOf(starts: List<int>, ends: List<int>, at: int, inclusive: bool): int {
+    let k = 0;
+    while (k < listLen(starts)) {
+        const lo = listGet(starts, k) catch 0; const hi = listGet(ends, k) catch 0;
+        if (at >= lo && (at < hi || (inclusive && at == hi))) { return k + 1; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// 自底向上归并排序（function starts 的地址）。
+function sortInts(xs: List<int>): List<int> {
+    let src: List<int> = listNew();
+    for (x in xs) { listPush(src, x); }
+    const n = listLen(src);
+    let width = 1;
+    while (width < n) {
+        const dst: List<int> = listNew();
+        let lo = 0;
+        while (lo < n) {
+            let i = lo; const mid = minInt(lo + width, n); let j = mid; const hi = minInt(lo + 2 * width, n);
+            while (i < mid || j < hi) {
+                if (j >= hi || (i < mid && (listGet(src, i) catch 0) <= (listGet(src, j) catch 0))) { listPush(dst, listGet(src, i) catch 0); i = i + 1; }
+                else { listPush(dst, listGet(src, j) catch 0); j = j + 1; }
+            }
+            lo = hi;
+        }
+        src = dst;
+        width = width * 2;
+    }
+    return src;
+}
+
+// 绑定流的库序号：与当前不同时才设（≤15 用 SET_DYLIB_ORDINAL_IMM，否则 SET_DYLIB_ORDINAL_ULEB）。
+function bindOrdinal(link: Bytes, current: int, wanted: int): void {
+    if (wanted == current) { return; }
+    if (wanted <= 15) { bytesPush(link, 16 | wanted); return; }
+    bytesPush(link, 32); uleb(link, wanted);
+}
+
+/// 链接成 Mach-O 可执行文件；entry 为 LC_MAIN 指向的符号（内核的 main，C 约定 main(argc, argv, envp, apple)）。
+export function linkMachO(objects: List<Bytes>, entry: string): int {
+    out = bytesNew(0);
+    // 架构随目标文件（macOS 适配 M4 设计 A3）：aarch64 对象写 ARM64 的 cputype，其余同 x86_64。
+    let arm64 = false;
+    if (listLen(objects) > 0 && lkoObjectMachine(listGet(objects, 0) catch bytesNew(0)) == 183) { arm64 = true; }
+    let mapTarget = "x86_64-macos";
+    if (arm64) { mapTarget = "aarch64-macos"; }
+    if (lkoBegin(objects, mapTarget) != 0) { return failed(); }
+    if (lkoPlace() != 0) { return failed(); }
+    const slots = lkoUndefinedWithPrefix(IMPORT_PREFIX);
+    const imports: List<string> = listNew();
+    for (s in slots) {
+        const name = strSub(s, len(IMPORT_PREFIX), len(s) - len(IMPORT_PREFIX));
+        if (len(name) == 0) { return reject("BadImportName:" + s); }
+        listPush(imports, name);
+    }
+    const nimp = listLen(imports);
+    // 库与各导入的库序号：libSystem 恒为 1，其余按登记的首次出现顺序。
+    const dylibs: List<string> = listNew();
+    listPush(dylibs, LIBSYSTEM);
+    for (lib in importLibs) { if (indexOf(dylibs, lib) < 0) { listPush(dylibs, lib); } }
+    const ordinals: List<int> = listNew();
+    for (name in imports) {
+        const at = indexOf(importSyms, name);
+        if (at < 0) { listPush(ordinals, 1); } else { listPush(ordinals, indexOf(dylibs, listGet(importLibs, at) catch LIBSYSTEM) + 1); }
+    }
+    let extraCmds = 0;
+    let d = 1;
+    while (d < listLen(dylibs)) { extraCmds = extraCmds + pathCommandSize(24, listGet(dylibs, d) catch ""); d = d + 1; }
+    // load commands 的总长（各条定长或只依赖路径），先算出才能定 __text 的位置。
+    const nsects = 1 + 2 + 4;
+    const sizeofcmds = 72 + (72 + 80) + (72 + 160) + (72 + 320) + 72 + 48 + 24 + 80 + pathCommandSize(12, DYLD) + 24 + 24 + 16 + 24 + pathCommandSize(24, LIBSYSTEM) + extraCmds + 16 + 16;
+    const ncmds = 16 + listLen(dylibs) - 1;
+    const textOff = lkoAlignUp(32 + sizeofcmds, lkoGroupAlign(0));
+    const textEnd = textOff + lkoGroupSize(0);
+    const dcOff = lkoAlignUp(textEnd, SEG);
+    const constOff = dcOff;
+    const constEnd = constOff + lkoGroupSize(1);
+    const gotOff = lkoAlignUp(constEnd, 8);
+    const gotEnd = gotOff + 8 * nimp;
+    const dcSize = lkoAlignUp(maxInt(gotEnd - dcOff, 1), SEG);
+    const dataOff = dcOff + dcSize;
+    const dataEnd = dataOff + lkoGroupSize(2);
+    const tvOff = lkoAlignUp(dataEnd, 8);
+    const tvEnd = tvOff + 24;
+    const dataFileSize = lkoAlignUp(tvEnd - dataOff, SEG);
+    // 零填充：TLV 模板（8 字节）与 bss 在文件内容之后，只占虚拟地址。
+    const tbssOff = lkoAlignUp(tvEnd, 8);
+    const bssOff = lkoAlignUp(tbssOff + 8, lkoGroupAlign(3));
+    const bssEnd = bssOff + lkoGroupSize(3);
+    if (bssEnd > LKO_IMAGE_LIMIT) { return reject("ImageTooLarge"); }
+    const dataVmSize = lkoAlignUp(bssEnd - dataOff, SEG);
+    const leOff = dataOff + dataFileSize;
+    const leVa = BASE + dataOff + dataVmSize;
+    lkoSetGroupBase(0, BASE + textOff); lkoSetGroupBase(1, BASE + constOff);
+    lkoSetGroupBase(2, BASE + dataOff); lkoSetGroupBase(3, BASE + bssOff);
+    if (lkoDefineGlobals() != 0) { return failed(); }
+    let q = 0;
+    while (q < nimp) {
+        const slot = IMPORT_PREFIX + (listGet(imports, q) catch "");
+        if (lkoLookup(slot) >= 0) { return reject("DuplicateSymbol:" + slot); }
+        lkoAddGlobal(slot, BASE + gotOff + 8 * q);
+        if (linkMapSymbolsEnabled()) { linkMapSynthetic(rawNameOf(slot), "got-slot", 1, BASE + gotOff + 8 * q); }
+        q = q + 1;
+    }
+    if (lkoLookup(TLV_SLOT) >= 0) { return reject("DuplicateSymbol:" + TLV_SLOT); }
+    lkoAddGlobal(TLV_SLOT, BASE + tvOff);
+    lkoCacheSymbols();
+    const entryIndex = lkoLookup(entry);
+    if (entryIndex < 0) { return reject("MissingEntry:" + entry); }
+    const entryAddress = lkoAddress(entryIndex);
+    if (lkoGlobalKind(entryIndex) != 0 || entryAddress < BASE + textOff || entryAddress >= BASE + textEnd) { return reject("EntryNotInText:" + entry); }
+    const symbols = linkSymbolsCollect();
+    if (!symbols.ok) { return reject(symbols.error); }
+    bytesAppend(out, bytesNew(leOff));
+    lkoCopySections(out, BASE);
+    const absSites: List<int> = listNew();
+    if (lkoRelocate(out, BASE, absSites) != 0) { return failed(); }
+
+    // __LINKEDIT：rebase、bind、function starts、符号表、间接符号表、字符串表，最后是签名。
+    const link = bytesNew(0);
+    const rebaseAt = 0;
+    bytesPush(link, 17); // REBASE_OPCODE_SET_TYPE_IMM | POINTER
+    for (site in absSites) {
+        const fileAt = site - BASE;
+        let seg = 0;
+        let segStart = 0;
+        if (fileAt >= dcOff && fileAt + 8 <= dcOff + dcSize) { seg = 2; segStart = dcOff; }
+        else if (fileAt >= dataOff && fileAt + 8 <= dataOff + dataFileSize) { seg = 3; segStart = dataOff; }
+        else { return reject("AbsoluteRelocationOutsideData"); }
+        bytesPush(link, 32 | seg); uleb(link, fileAt - segStart); // SET_SEGMENT_AND_OFFSET_ULEB
+        bytesPush(link, 81); // DO_REBASE_IMM_TIMES 1
+    }
+    bytesPush(link, 0);
+    padTo(link, 8);
+    const rebaseSize = bytesLen(link) - rebaseAt;
+    const bindAt = bytesLen(link);
+    bytesPush(link, 17); // BIND_OPCODE_SET_DYLIB_ORDINAL_IMM 1（libSystem）
+    bytesPush(link, 81); // BIND_OPCODE_SET_TYPE_IMM | POINTER
+    let ordinal = 1;
+    q = 0;
+    while (q < nimp) {
+        bindOrdinal(link, ordinal, listGet(ordinals, q) catch 1);
+        ordinal = listGet(ordinals, q) catch 1;
+        bytesPush(link, 64); text(link, "_" + (listGet(imports, q) catch "")); bytesPush(link, 0);
+        bytesPush(link, 112 | 2); uleb(link, gotOff + 8 * q - dcOff);
+        bytesPush(link, 144); // DO_BIND
+        q = q + 1;
+    }
+    bindOrdinal(link, ordinal, 1);
+    bytesPush(link, 64); text(link, "__tlv_bootstrap"); bytesPush(link, 0);
+    bytesPush(link, 112 | 3); uleb(link, tvOff - dataOff);
+    bytesPush(link, 144);
+    bytesPush(link, 0);
+    padTo(link, 8);
+    const bindSize = bytesLen(link) - bindAt;
+    // function starts：__text 里各全局符号与各函数的位置（相对 __TEXT 起点，ULEB 增量，0 结尾）。
+    const starts: List<int> = listNew();
+    let k = 0;
+    while (k < lkoGlobalCount()) {
+        const a = lkoAddress(k);
+        if (lkoGlobalKind(k) == 0 && a >= BASE + textOff && a < BASE + textEnd) { listPush(starts, a - BASE); }
+        k = k + 1;
+    }
+    for (f in symbols.list) { if (f.va >= BASE + textOff && f.va < BASE + textEnd) { listPush(starts, f.va - BASE); } }
+    const sorted = sortInts(starts);
+    const startsAt = bytesLen(link);
+    let prev = 0;
+    for (x in sorted) { if (x != prev) { uleb(link, x - prev); prev = x; } }
+    bytesPush(link, 0);
+    padTo(link, 8);
+    const startsSize = bytesLen(link) - startsAt;
+    // 符号表：本地（全部函数，再是函数以外的链接全局符号，按地址所在的节；绝对值记 N_ABS；--strip 时没有）、一个外部定义
+    // （__mh_execute_header）、未定义（导入与 __tlv_bootstrap）。
+    const starts7: List<int> = listNew(); const ends7: List<int> = listNew();
+    listPush(starts7, textOff); listPush(ends7, textEnd);
+    listPush(starts7, constOff); listPush(ends7, constEnd);
+    listPush(starts7, gotOff); listPush(ends7, gotEnd);
+    listPush(starts7, dataOff); listPush(ends7, dataEnd);
+    listPush(starts7, tvOff); listPush(ends7, tvEnd);
+    listPush(starts7, tbssOff); listPush(ends7, tbssOff + 8);
+    listPush(starts7, bssOff); listPush(ends7, bssEnd);
+    const strtab = bytesNew(0);
+    bytesPush(strtab, 32); bytesPush(strtab, 0);
+    const nlist = bytesNew(0);
+    let nlocal = 0;
+    // 函数表已列出的全局符号（同名同址）不再重复；程序函数的 f_N 因此只以可读名出现。
+    const covered: List<int> = listNew();
+    k = 0;
+    while (k < lkoGlobalCount()) { listPush(covered, 0); k = k + 1; }
+    let named: List<Ref<ImageSymbol>> = listNew();
+    if (!linkSymbolsStripped()) { named = symbols.list; }
+    for (f in named) {
+        le(nlist, bytesLen(strtab), 4); le(nlist, 14, 1); le(nlist, sectionOf(starts7, ends7, f.va - BASE, false), 1); le(nlist, 0, 2); le(nlist, f.va, 8);
+        text(strtab, f.name); bytesPush(strtab, 0);
+        nlocal = nlocal + 1;
+        const g = lkoLookup(f.link);
+        if (g >= 0 && lkoGlobalKind(g) == 0 && lkoAddress(g) == f.va) { listSet(covered, g, 1); }
+    }
+    k = 0;
+    while (k < lkoGlobalCount() && !linkSymbolsStripped()) {
+        const nm = lkoGlobalName(k);
+        const a = lkoAddress(k);
+        if (len(nm) > 0 && (listGet(covered, k) catch 0) == 0) {
+            let typ = 14; let value = a;
+            // 节号（1 起）：先按半开区间归属；正好落在某节末端的标号（如模板尾）再按闭区间归到那一节。
+            let sect = 0;
+            if (lkoGlobalKind(k) == 1) { typ = 2; }
+            else {
+                sect = sectionOf(starts7, ends7, a - BASE, false);
+                if (sect == 0) { sect = sectionOf(starts7, ends7, a - BASE, true); }
+                if (sect == 0) { typ = 2; }
+            }
+            le(nlist, bytesLen(strtab), 4); le(nlist, typ, 1); le(nlist, sect, 1); le(nlist, 0, 2); le(nlist, value, 8);
+            text(strtab, nm); bytesPush(strtab, 0);
+            nlocal = nlocal + 1;
+        }
+        k = k + 1;
+    }
+    le(nlist, bytesLen(strtab), 4); le(nlist, 15, 1); le(nlist, 1, 1); le(nlist, 16, 2); le(nlist, BASE, 8);
+    text(strtab, "__mh_execute_header"); bytesPush(strtab, 0);
+    q = 0;
+    while (q < nimp) {
+        // n_desc 的高字节为库序号（SET_LIBRARY_ORDINAL）。
+        le(nlist, bytesLen(strtab), 4); le(nlist, 1, 1); le(nlist, 0, 1); le(nlist, (listGet(ordinals, q) catch 1) * 256, 2); le(nlist, 0, 8);
+        text(strtab, "_" + (listGet(imports, q) catch "")); bytesPush(strtab, 0);
+        q = q + 1;
+    }
+    le(nlist, bytesLen(strtab), 4); le(nlist, 1, 1); le(nlist, 0, 1); le(nlist, 256, 2); le(nlist, 0, 8);
+    text(strtab, "__tlv_bootstrap"); bytesPush(strtab, 0);
+    padTo(strtab, 8);
+    const nsyms = nlocal + 1 + nimp + 1;
+    const symAt = bytesLen(link);
+    bytesAppend(link, nlist);
+    const indirectAt = bytesLen(link);
+    q = 0;
+    while (q < nimp) { le(link, nlocal + 1 + q, 4); q = q + 1; }
+    padTo(link, 8);
+    const strAt = bytesLen(link);
+    bytesAppend(link, strtab);
+    padTo(link, 16);
+    const sigAt = leOff + bytesLen(link);
+    const pages = (sigAt + CS_PAGE - 1) / CS_PAGE;
+    const ident = bytesNew(0); text(ident, identifier); bytesPush(ident, 0);
+    const cdSize = 88 + bytesLen(ident) + 32 * pages;
+    const sigSize = 20 + cdSize;
+    const sigPadded = lkoAlignUp(sigSize, 16);
+    const leFileSize = bytesLen(link) + sigPadded;
+    const textSegSize = dcOff;
+
+    // 头与 load commands。
+    const h = bytesNew(0);
+    if (arm64) { le(h, 0xFEEDFACF, 4); le(h, 0x0100000C, 4); le(h, 0, 4); le(h, 2, 4); }
+    else { le(h, 0xFEEDFACF, 4); le(h, 0x01000007, 4); le(h, 3, 4); le(h, 2, 4); }
+    le(h, ncmds, 4); le(h, sizeofcmds, 4); le(h, 0x1 | 0x4 | 0x80 | 0x200000 | 0x800000, 4); le(h, 0, 4);
+    segment(h, "__PAGEZERO", 0, BASE, 0, 0, 0, 0, 0, 0);
+    segment(h, "__TEXT", BASE, textSegSize, 0, textSegSize, 5, 5, 1, 0);
+    section(h, "__text", "__TEXT", BASE + textOff, lkoGroupSize(0), textOff, log2(lkoGroupAlign(0)), 0x80000400, 0);
+    segment(h, "__DATA_CONST", BASE + dcOff, dcSize, dcOff, dcSize, 3, 3, 2, 16);
+    section(h, "__const", "__DATA_CONST", BASE + constOff, lkoGroupSize(1), constOff, log2(lkoGroupAlign(1)), 0, 0);
+    section(h, "__got", "__DATA_CONST", BASE + gotOff, 8 * nimp, gotOff, 3, 6, 0);
+    segment(h, "__DATA", BASE + dataOff, dataVmSize, dataOff, dataFileSize, 3, 3, 4, 0);
+    section(h, "__data", "__DATA", BASE + dataOff, lkoGroupSize(2), dataOff, log2(lkoGroupAlign(2)), 0, 0);
+    section(h, "__thread_vars", "__DATA", BASE + tvOff, 24, tvOff, 3, 19, 0);
+    section(h, "__thread_bss", "__DATA", BASE + tbssOff, 8, 0, 3, 18, 0);
+    section(h, "__bss", "__DATA", BASE + bssOff, lkoGroupSize(3), 0, log2(lkoGroupAlign(3)), 1, 0);
+    segment(h, "__LINKEDIT", leVa, lkoAlignUp(leFileSize, SEG), leOff, leFileSize, 1, 1, 0, 0);
+    le(h, 0x80000022, 4); le(h, 48, 4);
+    le(h, leOff + rebaseAt, 4); le(h, rebaseSize, 4); le(h, leOff + bindAt, 4); le(h, bindSize, 4);
+    le(h, 0, 4); le(h, 0, 4); le(h, 0, 4); le(h, 0, 4); le(h, 0, 4); le(h, 0, 4);
+    le(h, 2, 4); le(h, 24, 4); le(h, leOff + symAt, 4); le(h, nsyms, 4); le(h, leOff + strAt, 4); le(h, bytesLen(strtab), 4);
+    le(h, 11, 4); le(h, 80, 4);
+    le(h, 0, 4); le(h, nlocal, 4); le(h, nlocal, 4); le(h, 1, 4); le(h, nlocal + 1, 4); le(h, nimp + 1, 4);
+    le(h, 0, 4); le(h, 0, 4); le(h, 0, 4); le(h, 0, 4); le(h, 0, 4); le(h, 0, 4);
+    le(h, leOff + indirectAt, 4); le(h, nimp, 4); le(h, 0, 4); le(h, 0, 4); le(h, 0, 4); le(h, 0, 4);
+    const dyldStart = bytesLen(h);
+    le(h, 14, 4); le(h, pathCommandSize(12, DYLD), 4); le(h, 12, 4); text(h, DYLD); bytesPush(h, 0); padTo(h, 8);
+    if (bytesLen(h) - dyldStart != pathCommandSize(12, DYLD)) { return reject("LoadCommandSize"); }
+    const uuidAt = bytesLen(h) + 8;
+    le(h, 27, 4); le(h, 24, 4); le(h, 0, 8); le(h, 0, 8);
+    le(h, 50, 4); le(h, 24, 4); le(h, 1, 4); le(h, MIN_OS, 4); le(h, MIN_OS, 4); le(h, 0, 4);
+    le(h, 42, 4); le(h, 16, 4); le(h, 0, 8);
+    le(h, 0x80000028, 4); le(h, 24, 4); le(h, entryAddress - BASE, 8); le(h, 0, 8);
+    const libStart = bytesLen(h);
+    le(h, 12, 4); le(h, pathCommandSize(24, LIBSYSTEM), 4); le(h, 24, 4); le(h, 2, 4); le(h, 0x05276403, 4); le(h, 0x10000, 4);
+    text(h, LIBSYSTEM); bytesPush(h, 0); padTo(h, 8);
+    if (bytesLen(h) - libStart != pathCommandSize(24, LIBSYSTEM)) { return reject("LoadCommandSize"); }
+    // 其余库：时间戳 2，current／compatibility 版本写 0（不要求最低兼容版本；我们不读库文件，无从得知其版本，同 Go 的链接器）。
+    d = 1;
+    while (d < listLen(dylibs)) {
+        const lib = listGet(dylibs, d) catch "";
+        const at = bytesLen(h);
+        le(h, 12, 4); le(h, pathCommandSize(24, lib), 4); le(h, 24, 4); le(h, 2, 4); le(h, 0, 4); le(h, 0, 4);
+        text(h, lib); bytesPush(h, 0); padTo(h, 8);
+        if (bytesLen(h) - at != pathCommandSize(24, lib)) { return reject("LoadCommandSize"); }
+        d = d + 1;
+    }
+    le(h, 38, 4); le(h, 16, 4); le(h, leOff + startsAt, 4); le(h, startsSize, 4);
+    le(h, 29, 4); le(h, 16, 4); le(h, sigAt, 4); le(h, sigPadded, 4);
+    if (bytesLen(h) != 32 + sizeofcmds || bytesLen(h) > textOff) { return reject("LoadCommandSize"); }
+    let i = 0;
+    while (i < bytesLen(h)) { bytesSet(out, i, bytesGet(h, i) catch 0); i = i + 1; }
+    // TLV 描述符：thunk（bind 填入）、key 0、模板内偏移 0。
+    put(tvOff, 0, 8); put(tvOff + 8, 0, 8); put(tvOff + 16, 0, 8);
+    bytesAppend(out, link);
+    if (bytesLen(out) != sigAt) { return reject("LinkeditLayout"); }
+    // UUID：其余字节都定了（UUID 仍为零）之后取摘要；按 RFC 4122 标出版本 3 与变体。
+    const digest = sha256Range(out, 0, sigAt);
+    i = 0;
+    while (i < 16) { bytesSet(out, uuidAt + i, bytesGet(digest, i) catch 0); i = i + 1; }
+    bytesSet(out, uuidAt + 6, ((bytesGet(digest, 6) catch 0) & 15) | 48);
+    bytesSet(out, uuidAt + 8, ((bytesGet(digest, 8) catch 0) & 63) | 128);
+    // 签名（大端）：SuperBlob{magic, length, count} + BlobIndex{CodeDirectory, 20} + CodeDirectory。
+    const sig = bytesNew(0);
+    be(sig, 0xFADE0CC0, 4); be(sig, sigSize, 4); be(sig, 1, 4); be(sig, 0, 4); be(sig, 20, 4);
+    be(sig, 0xFADE0C02, 4); be(sig, cdSize, 4); be(sig, 0x20400, 4); be(sig, 0x20002, 4);
+    be(sig, 88 + bytesLen(ident), 4); be(sig, 88, 4); be(sig, 0, 4); be(sig, pages, 4); be(sig, sigAt, 4);
+    bytesPush(sig, 32); bytesPush(sig, 2); bytesPush(sig, 0); bytesPush(sig, 12);
+    be(sig, 0, 4); be(sig, 0, 4); be(sig, 0, 4); be(sig, 0, 4);
+    be(sig, 0, 8); be(sig, 0, 8); be(sig, textSegSize, 8); be(sig, 1, 8);
+    bytesAppend(sig, ident);
+    let p = 0;
+    while (p < pages) {
+        const from = p * CS_PAGE;
+        bytesAppend(sig, sha256Range(out, from, minInt(CS_PAGE, sigAt - from)));
+        p = p + 1;
+    }
+    if (bytesLen(sig) != sigSize) { return reject("SignatureLayout"); }
+    bytesAppend(out, sig);
+    padTo(out, 16);
+    if (bytesLen(out) != sigAt + sigPadded) { return reject("SignatureLayout"); }
+    if (linkMapEnabled()) { lkoCollectMap(BASE, entryAddress); linkMapDone(); }
+    return 0;
+}
+
+export function machoBytes(): Bytes { return out; }
+export function machoError(): string { return lkoFailure(); }

@@ -1,0 +1,106 @@
+// 致命错误出口的可移植版（rtfn 写，macOS 适配 M4 设计 A8）：语义与导出名同 runtime_memory_gen.tx 的 panicBody、movePanic。
+// 三个入口 __tx_native_memory_span_panic（拷贝跨度不符）、__tx_native_move_overflow、__tx_native_move_null（memmove 的地址
+// 溢出／为零）由拷贝例程调用或跳入（入口时栈与一次调用相同：rsp ≡ 8 mod 16），都不返回；进入时先过进程级致命锁
+// __tx_nrt_die_enter（运行时加固 H3，同手写版；可移植版只用于 NRT 内核）。
+// - Windows：经 __tx_native_memory_panic_write 向标准错误写诊断（控制台用 WriteConsoleW 写 UTF-16，否则 WriteFile 写字节），
+//   再写一个换行，然后 rtTrap（x86 为 ud2：未处理的非法指令异常，退出码 0xC000001D）。
+// - Linux：一次 write(2, 诊断＋换行) 后 exit_group(134)；macOS：__tx_mac_write(2, 诊断＋换行) 后 __tx_mac__exit(134)。
+import { StructuredBuffer, asBufferSection, asBufferLabel, asBufferByte } from "./assemble";
+import { RtFn, RtOp, L, I, A } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtLabel, rtJump, rtIf, rtIf32, rtAddrOf, rtCall0, rtCall1, rtCall2, rtCall3, rtCall5, rtSyscall, rtTrap, rtRetVoid } from "./rtfn";
+import { tRawSyscall, tMacos } from "./target";
+
+const MODULE: string = "bootstrap/selfhost/kernel_panic_generic.tx";
+// 同 runtime_memory_gen.tx 的 MEMORY_ASSERTION_MESSAGE（旧执行宿主 ShimPanic 的文字）。
+const ASSERTION: string = "reached unreachable code";
+const OVERFLOW: string = "integer overflow";
+const NULL_CAST: string = "cast causes pointer to be null";
+const PANIC_STATUS: int = 134;
+const NEWLINE: string = "__tx_native_memory_newline";
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// .rdata 里的字节串：text 的每个字节，wide 时每个字节后跟一个 0（ASCII 的 UTF-16LE），nl 时末尾加换行。
+function rdata(b: Ref<StructuredBuffer>, label: string, text: string, wide: bool, nl: bool): void {
+    asBufferSection(b, 1, 1);
+    asBufferLabel(b, label, 1);
+    let k = 0;
+    while (k < len(text)) {
+        asBufferByte(b, byteAt(text, k) catch 0, 1);
+        if (wide) { asBufferByte(b, 0, 1); }
+        k = k + 1;
+    }
+    if (nl) { asBufferByte(b, 10, 1); }
+    asBufferSection(b, 0, 1);
+}
+
+// __tx_native_memory_panic_write(narrow, wide, n)：标准错误为空句柄时什么也不写；控制台写 wide 的 n 个 UTF-16 单元，否则写 narrow 的 n 字节。
+function panicWriteFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_memory_panic_write", "narrow wide n", "h mode c written wp", 5, MODULE);
+    rtCall1(f, "h", "GetStdHandle", I(-12));
+    rtIf(f, L("h"), "eq", I(0), "done");
+    rtSet(f, "mode", I(0));
+    rtSet(f, "written", I(0));
+    rtAddrOf(f, "wp", "mode");
+    rtCall2(f, "c", "GetConsoleMode", L("h"), L("wp"));
+    rtAddrOf(f, "wp", "written");
+    rtIf32(f, L("c"), "eq", I(0), "bytes");
+    rtCall5(f, "", "WriteConsoleW", L("h"), L("wide"), L("n"), L("wp"), I(0));
+    rtJump(f, "done");
+    rtLabel(f, "bytes");
+    rtCall5(f, "", "WriteFile", L("h"), L("narrow"), L("n"), L("wp"), I(0));
+    rtLabel(f, "done");
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+// Windows 的出口：诊断、换行，然后 ud2。
+function windowsExit(b: Ref<StructuredBuffer>, failures: List<string>, entry: string, data: string, message: string): void {
+    rdata(b, data, message, false, false);
+    rdata(b, data + "_wide", message, true, false);
+    const f = rtBegin(b, entry, "", "", 3, MODULE);
+    rtCall0(f, "", "__tx_nrt_die_enter");
+    rtCall3(f, "", "__tx_native_memory_panic_write", A(data), A(data + "_wide"), I(len(message)));
+    rtCall3(f, "", "__tx_native_memory_panic_write", A(NEWLINE), A(NEWLINE + "_wide"), I(1));
+    if (b.a64) { listPush(failures, entry + ": WindowsPanicOnA64"); }
+    rtTrap(f);
+    done(f, failures);
+}
+
+// Linux／macOS 的出口：诊断与换行一次写出，然后以 134 退出（不返回；末尾的返回不可达）。
+function unixExit(b: Ref<StructuredBuffer>, failures: List<string>, t: int, entry: string, data: string, message: string): void {
+    rdata(b, data, message, false, true);
+    const f = rtBegin(b, entry, "", "", 3, MODULE);
+    rtCall0(f, "", "__tx_nrt_die_enter");
+    if (tRawSyscall(t)) {
+        const w: List<Ref<RtOp>> = listNew(); listPush(w, I(2)); listPush(w, A(data)); listPush(w, I(len(message) + 1));
+        rtSyscall(f, "", 1, w);
+        const x: List<Ref<RtOp>> = listNew(); listPush(x, I(PANIC_STATUS));
+        rtSyscall(f, "", 231, x);
+    } else {
+        rtCall3(f, "", "__tx_mac_write", I(2), A(data), I(len(message) + 1));
+        rtCall1(f, "", "__tx_mac__exit", I(PANIC_STATUS));
+    }
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+/// 发出致命错误出口的三个入口（NRT 内核恒带 memmove 的两个）；rtfn 的失败记进 failures。t 为目标编号（决定输出与退出方式）。
+export function panicGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    asBufferSection(b, 0, 1);
+    if (tRawSyscall(t) || tMacos(t)) {
+        unixExit(b, failures, t, "__tx_native_memory_span_panic", "__tx_native_memory_assertion", ASSERTION);
+        unixExit(b, failures, t, "__tx_native_move_overflow", "__tx_native_move_overflow_message", OVERFLOW);
+        unixExit(b, failures, t, "__tx_native_move_null", "__tx_native_move_null_message", NULL_CAST);
+        return;
+    }
+    rdata(b, NEWLINE, "\n", false, false);
+    rdata(b, NEWLINE + "_wide", "\n", true, false);
+    panicWriteFn(b, failures);
+    windowsExit(b, failures, "__tx_native_memory_span_panic", "__tx_native_memory_assertion", ASSERTION);
+    windowsExit(b, failures, "__tx_native_move_overflow", "__tx_native_move_overflow_message", OVERFLOW);
+    windowsExit(b, failures, "__tx_native_move_null", "__tx_native_move_null_message", NULL_CAST);
+}

@@ -1,0 +1,199 @@
+// std/net TCP 系统面的 macOS 目标文件（D3 v0.35 按目标选择文件；导出面同 net_sys_linux.tx）：经 libSystem（D3 §6.8-7），
+// 语义同 Linux 版。句柄表与地址规则见 net_impl.tx。与 Linux 的差别：
+// - sockaddr_in 开头是 sin_len（16）与 1 字节的 sin_family，net_impl 按 Linux／Windows 布局（2 字节 family）建的地址在这里改写；
+// - 没有 SOCK_CLOEXEC 与 accept4：建好套接字后立即经 fcntl 设 FD_CLOEXEC（Rust 标准库在 Apple 上同此法；在这两步之间别的
+//   线程起的子进程可能继承它，窗口与 Rust 相同）；
+// - 没有 MSG_NOSIGPIPE：每个套接字（含 accept 得到的）设 SO_NOSIGPIPE，对端已关闭时 send 返回失败而不是 SIGPIPE 杀掉进程；
+// - MSG_WAITALL 的值不同。被信号打断（EINTR，经 ffiLastError 读）的 accept/send/recv 自动重试。recv 的 UTF-8 规则同 Linux。
+import { slotAlloc, slotPeek, slotTake, sockaddrOf, sockaddrAny } from "./net_impl";
+import { lossyStr, utf8Complete, seqLen } from "./sys_text";
+
+declare function socket(domain: i32, kind: i32, proto: i32): i32 from "libSystem";
+declare function fcntl(fd: i32, cmd: i32, ...arg: i32): i32 from "libSystem";
+declare function setsockopt(fd: i32, level: i32, name: i32, val: Bytes, vlen: u32): i32 from "libSystem";
+declare function connect(fd: i32, addr: Bytes, alen: u32): i32 from "libSystem";
+declare function bind(fd: i32, addr: Bytes, alen: u32): i32 from "libSystem";
+declare function listen(fd: i32, backlog: i32): i32 from "libSystem";
+declare function accept(fd: i32, addr: Bytes, alen: Bytes): i32 from "libSystem";
+declare function send(fd: i32, buf: Bytes, n: usize, flags: i32): isize from "libSystem";
+declare function recv(fd: i32, buf: Bytes, n: usize, flags: i32): isize from "libSystem";
+declare function close(fd: i32): i32 from "libSystem";
+
+const AF_INET: int = 2;
+const SOCK_STREAM: int = 1;
+const F_SETFD: int = 2;
+const FD_CLOEXEC: int = 1;
+const SOL_SOCKET: int = 65535;
+const SO_NOSIGPIPE: int = 4130;
+const MSG_PEEK: int = 2;
+const MSG_WAITALL: int = 64;
+const EINTR: int = 4;
+
+// macOS 的 sockaddr_in：sin_len、sin_family 各 1 字节，其后同 Linux。
+function darwinAddr(sa: Bytes): Bytes {
+    if (bytesLen(sa) == 16) {
+        bytesSet(sa, 0, 16);
+        bytesSet(sa, 1, AF_INET);
+    }
+    return sa;
+}
+
+// 新描述符设 FD_CLOEXEC 与 SO_NOSIGPIPE，再登记进句柄表；任一步失败或表满时关闭它并报失败。
+function adopt(fd: int): int {
+    const one = bytesNew(4);
+    bytesSetLE<i32>(one, 0, 1);
+    if (fcntl(wrapTo<i32>(fd), wrapTo<i32>(F_SETFD), wrapTo<i32>(FD_CLOEXEC)) != 0
+        || setsockopt(wrapTo<i32>(fd), wrapTo<i32>(SOL_SOCKET), wrapTo<i32>(SO_NOSIGPIPE), one, 4) != 0) {
+        close(wrapTo<i32>(fd));
+        return -1;
+    }
+    const slot = slotAlloc(fd);
+    if (slot < 0) {
+        close(wrapTo<i32>(fd));
+    }
+    return slot;
+}
+
+function newSocket(): int {
+    return socket(wrapTo<i32>(AF_INET), wrapTo<i32>(SOCK_STREAM), 0);
+}
+
+export function sysTcpConnect(host: string, port: int): int {
+    if (port <= 0 || port > 65535) {
+        return -1;
+    }
+    const sa = darwinAddr(sockaddrOf(host, port));
+    if (bytesLen(sa) == 0) {
+        return -1;
+    }
+    const fd = newSocket();
+    if (fd < 0) {
+        return -1;
+    }
+    const slot = adopt(fd);
+    if (slot < 0) {
+        return -1;
+    }
+    if (connect(wrapTo<i32>(fd), sa, 16) != 0) {
+        sysTcpClose(slot);
+        return -1;
+    }
+    return slot;
+}
+
+export function sysTcpListen(port: int): int {
+    if (port < 0 || port > 65535) {
+        return -1;
+    }
+    const fd = newSocket();
+    if (fd < 0) {
+        return -1;
+    }
+    const slot = adopt(fd);
+    if (slot < 0) {
+        return -1;
+    }
+    if (bind(wrapTo<i32>(fd), darwinAddr(sockaddrAny(port)), 16) != 0 || listen(wrapTo<i32>(fd), 8) != 0) {
+        sysTcpClose(slot);
+        return -1;
+    }
+    return slot;
+}
+
+export function sysTcpAccept(l: int): int {
+    const ls = slotPeek(l);
+    if (ls < 0) {
+        return -1;
+    }
+    while (true) {
+        const alen = bytesNew(4);
+        bytesSet(alen, 0, 16);
+        const fd: int = accept(wrapTo<i32>(ls), bytesNew(16), alen);
+        if (fd < 0 && ffiLastError() == EINTR) {
+            continue;
+        }
+        if (fd < 0) {
+            return -1;
+        }
+        return adopt(fd);
+    }
+    return -1;
+}
+
+export function sysTcpSend(fd: int, data: string): int {
+    const s = slotPeek(fd);
+    if (s < 0) {
+        return -1;
+    }
+    const n = len(data);
+    if (n == 0) {
+        return 0;
+    }
+    if (n > 2147483647) {
+        return -1;
+    }
+    const buf = bytesFromStr(data);
+    while (true) {
+        const r: int = send(wrapTo<i32>(s), buf, wrapTo<usize>(n), 0);
+        if (r >= 0) {
+            return r;
+        }
+        if (ffiLastError() != EINTR) {
+            return -1;
+        }
+    }
+    return -1;
+}
+
+function recvRetry(s: int, buf: Bytes, n: int, flags: int): int {
+    while (true) {
+        const r: int = recv(wrapTo<i32>(s), buf, wrapTo<usize>(n), wrapTo<i32>(flags));
+        if (r >= 0 || ffiLastError() != EINTR) {
+            return r;
+        }
+    }
+    return -1;
+}
+
+export function sysTcpRecv(fd: int, max: int): string | Error {
+    const s = slotPeek(fd);
+    if (s < 0) {
+        return err("net: bad socket");
+    }
+    if (max <= 0) {
+        return err("net: recv max must be positive");
+    }
+    let n: int = max;
+    if (n > 1048576) {
+        n = 1048576;
+    }
+    const buf = bytesNew(n + 4);
+    const got = recvRetry(s, buf, n, MSG_PEEK);
+    if (got == 0) {
+        return "";
+    }
+    if (got < 0) {
+        return err("net: recv failed");
+    }
+    let keep: int = utf8Complete(buf, got);
+    let flags: int = 0;
+    if (keep == 0) {
+        keep = seqLen(bytesGet(buf, 0) catch 0);
+        flags = MSG_WAITALL;
+    }
+    const r = recvRetry(s, buf, keep, flags);
+    if (r == 0) {
+        return "";
+    }
+    if (r < 0) {
+        return err("net: recv failed");
+    }
+    return lossyStr(bytesSlice(buf, 0, r));
+}
+
+export function sysTcpClose(fd: int): void {
+    const s = slotTake(fd);
+    if (s >= 0) {
+        close(wrapTo<i32>(s));
+    }
+}

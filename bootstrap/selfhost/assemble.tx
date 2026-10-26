@@ -1,0 +1,2603 @@
+// assemble.tx —— .s 直发汇编器的 .tx 承接（V0.50-S5-① 批 D；BOOT-47；D102 §一
+// ——src/tools/aot/direct_emit.zig Assembler 的同构移植）。
+//
+// 职责：.s 文本（emitmirror 产物）→ AsmImage（text/rdata 两节字节＋符号表＋
+// 修补点）。词表外结构化拒绝（UnsupportedDirective/BadInstruction/BadOperand
+// ——lastLine/lastErrText 诊断面随行）。
+//
+// 锚（批 D）：同一 .s 输入下 text/rdata 节字节＋修补点与 zig Assembler 逐字节
+// 恒等；端到端锚＝链接后 PE 行为恒等（link_pe.tx 批 D 后半）。
+//
+// x86-64 编码面＝direct_emit 词表全量（mov/movabs/movzx/
+// lea/cmp/test/alu 族/移位族/GrpFF·F7/setcc/jcc/call/ret/push/pop/SSE 标量·
+// packed/VEX.256 AVX2 选入面）。
+
+import { compileProfileActive, compileProfileInstruction } from "./compile_profile_data";
+import { nativeFunctionsActive, nativeFunctionsReset, nativeFunctionBegin, nativeFunctionOwnedBegin, nativeFunctionBoundaryBegin, nativeFunctionEvent, nativeFunctionPrologueEnd, nativeFunctionEpilogueStart, nativeFunctionEnd } from "./native_function_data";
+
+// ============================================================================
+// §0 常量与结构
+// ============================================================================
+
+// 节 id：0=text 1=rdata（.data 由 blob 侧承担——生成面零 .data）。
+const SEC_TEXT: int = 0;
+const SEC_RDATA: int = 1;
+const SEC_DATA: int = 2;
+const SEC_BSS: int = 3;
+
+// 修补 kind：0=rel32 1=addr64。
+const FIX_REL32: int = 0;
+const FIX_ADDR64: int = 0 + 1;
+// A64 映像（macOS 适配 M4 设计 A3）的修补 kind，只经 asA64Word 登记；addr64 在 A64 映像里同样用 1。
+export const FIX_A64_CALL26: int = 2;
+export const FIX_A64_JUMP26: int = 3;
+export const FIX_A64_PAGE21: int = 4;
+export const FIX_A64_ADD_LO12: int = 5;
+// LDST8..LDST128 依次为 6..10（访问宽度 2^0..2^4 字节）。
+export const FIX_A64_LDST8: int = 6;
+
+// 寄存器类别：0=r64 1=r32 2=r8 3=xmm 4=ymm。
+const CLS_R64: int = 0;
+const CLS_R32: int = 1;
+const CLS_R8: int = 2;
+const CLS_XMM: int = 3;
+const CLS_YMM: int = 4;
+
+// Operand kind：0=reg 1=imm 2=mem 3=label。
+const OPD_REG: int = 0;
+const OPD_IMM: int = 1;
+const OPD_MEM: int = 2;
+const OPD_LABEL: int = 3;
+
+// MemSize：0=b 1=d 2=q 3=w（缺省 q；w 只用于 movzx 读与 mov 写，O4 第二步紧凑列表）。
+const MSZ_B: int = 0;
+const MSZ_D: int = 1;
+const MSZ_Q: int = 2;
+const MSZ_W: int = 3;
+
+// 解析器独占构造和填写；编码阶段只读借用引用，避免逐次深拷贝十二字段。
+export struct Operand {
+    kind: int,
+    cls: int, // reg 类别（kind=0）
+    num: int, // reg 编码号（0..15；xmm 词表 0..15（高号仅用于已支持 REX 的指令）；ymm 0..15）
+    imm: int,
+    memSize: int,
+    memBase: int, // -1＝无
+    memIndex: int, // -1＝无
+    scale: int, // SIB scale 位 0..3
+    disp: int,
+    hasRip: int,
+    ripSym: string,
+    label: string,
+}
+
+// 以下哨兵只读；内存寻址仍逐次独占构造，编码器不得修改操作数。
+const missingOperand: Ref<Operand> = new Operand { kind: -1, cls: 0, num: 0, imm: 0, memSize: MSZ_Q, memBase: -1, memIndex: -1, scale: 0, disp: 0, hasRip: 0, ripSym: "", label: "" };
+const badMemoryOperand: Ref<Operand> = new Operand { kind: OPD_MEM, cls: -1, num: -1, imm: 0, memSize: MSZ_Q, memBase: -1, memIndex: -1, scale: 0, disp: 0, hasRip: 0, ripSym: "", label: "" };
+const badRegisterOperand: Ref<Operand> = new Operand { kind: OPD_REG, cls: -1, num: -1, imm: 0, memSize: MSZ_Q, memBase: -1, memIndex: -1, scale: 0, disp: 0, hasRip: 0, ripSym: "", label: "" };
+const registerOperands: List<Ref<Operand>> = listNew();
+
+function opdReg(cls: int, num: int): Ref<Operand> {
+    if (cls < 0 || num < 0) { return badRegisterOperand; }
+    // ISA寄存器描述只读且与映像无关，按类别/编码号共享；解析仍校验名称。
+    if (cls < 5 && num < 16) {
+        while (listLen(registerOperands) < 80) { listPush(registerOperands, missingOperand); }
+        const idx = cls * 16 + num;
+        const cached = listGet(registerOperands, idx) catch missingOperand;
+        if (cached.kind == OPD_REG) { return cached; }
+        const value = new Operand { kind: OPD_REG, cls: cls, num: num, imm: 0, memSize: MSZ_Q, memBase: -1, memIndex: -1, scale: 0, disp: 0, hasRip: 0, ripSym: "", label: "" };
+        listSet(registerOperands, idx, value);
+        return value;
+    }
+    return new Operand { kind: OPD_REG, cls: cls, num: num, imm: 0, memSize: MSZ_Q, memBase: -1, memIndex: -1, scale: 0, disp: 0, hasRip: 0, ripSym: "", label: "" };
+}
+
+function opdImm(v: int): Ref<Operand> {
+    return new Operand { kind: OPD_IMM, cls: 0, num: 0, imm: v, memSize: MSZ_Q, memBase: -1, memIndex: -1, scale: 0, disp: 0, hasRip: 0, ripSym: "", label: "" };
+}
+
+function opdLabel(l: string): Ref<Operand> {
+    return new Operand { kind: OPD_LABEL, cls: 0, num: 0, imm: 0, memSize: MSZ_Q, memBase: -1, memIndex: -1, scale: 0, disp: 0, hasRip: 0, ripSym: "", label: l };
+}
+
+function opdMem(m: Ref<Operand>): Ref<Operand> {
+    return m;
+}
+
+function emptyOperand(): Ref<Operand> {
+    return missingOperand;
+}
+
+// AsmImage：三个紧凑字节节＋BSS 大小；符号／修补索引保持完整 int。
+// 节经 Bytes 交接，链接器回填使用独立副本，不修改本图。
+struct AsmImage {
+    text: Bytes,
+    rdata: Bytes,
+    data: Bytes, bssSize: int, storageUsed: int,
+    textAlignPow: int, rdataAlignPow: int, dataAlignPow: int, bssAlignPow: int,
+    symNames: List<string>,
+    symSec: List<int>,
+    symOff: List<int>,
+    fixSec: List<int>,
+    fixAt: List<int>,
+    fixKind: List<int>,
+    fixSym: List<string>,
+    fixAddend: List<int>,
+    // 1 = symbol must reach the linker (global name, or still referenced by a
+    // fixup after asResolveLocalFixups); empty until that pass runs.
+    symNeeded: List<int>,
+    // 1 = A64 映像（asSetA64）：代码节只经 asA64Word 写入，ELF 写出按 aarch64。
+    a64: int,
+}
+
+function newAsmImage(): Ref<AsmImage> {
+    return new AsmImage {
+        text: bytesNew(0), rdata: bytesNew(0), data: bytesNew(0), bssSize: 0, storageUsed: 0, textAlignPow: 4, rdataAlignPow: 4, dataAlignPow: 4, bssAlignPow: 4,
+        symNames: listNew(), symSec: listNew(), symOff: listNew(),
+        fixSec: listNew(), fixAt: listNew(), fixKind: listNew(), fixSym: listNew(), fixAddend: listNew(),
+        symNeeded: listNew(), a64: 0,
+    };
+}
+
+// ============================================================================
+// §1 汇编器状态与基础发射
+// ============================================================================
+
+let as_last_line: int = 0;
+// 仅对当前原始行实际验证过的ASCII及其派生子串启用直接截取。
+let as_line_ascii: int = 0;
+let as_last_err: string = "";
+let as_cur: int = SEC_TEXT;
+let as_img: Ref<AsmImage> = newAsmImage();
+// 当前节的字节列表；只在新映像或切换节时更新，免逐字节读映像字段。
+let as_bytes: Bytes = as_img.text;
+// 本条指令登记的 rip 相对修正下标（-1＝无；见 asRipSettle）。
+let asRipPending: int = -1;
+
+function asReset(): void {
+    nativeFunctionsReset();
+    asRipPending = -1;
+    as_line_ascii = 0;
+    as_failed = 0;
+    as_last_line = 0;
+    as_last_err = "";
+    as_cur = SEC_TEXT;
+    as_img = newAsmImage();
+    as_bytes = as_img.text;
+    operandCacheReset();
+    instructionCacheReset();
+    // 符号索引属于本次装配，重复调用不得命中前一映像的标签。
+    while (listLen(siHead) > 0) { listRemoveAt(siHead, listLen(siHead) - 1); }
+    while (listLen(siKeys) > 0) { listRemoveAt(siKeys, listLen(siKeys) - 1); }
+    while (listLen(siVals) > 0) { listRemoveAt(siVals, listLen(siVals) - 1); }
+    while (listLen(siNext) > 0) { listRemoveAt(siNext, listLen(siNext) - 1); }
+}
+
+function asOut(): Bytes {
+    return as_bytes;
+}
+
+function asHere(): int {
+    if (as_cur == SEC_BSS) { return as_img.bssSize; }
+    return bytesLen(asOut());
+}
+
+function asEmitByte(b: int): void {
+    if (as_cur == SEC_BSS) { asFail("UnsupportedDirective"); return; }
+    bytesPush(asOut(), b & 0xFF);
+}
+
+function asAddFixAt(kind: int, sym: string, addend: int): void {
+    listPush(as_img.fixSec, as_cur);
+    listPush(as_img.fixAt, asHere());
+    listPush(as_img.fixKind, kind);
+    listPush(as_img.fixSym, sym);
+    listPush(as_img.fixAddend, addend);
+}
+
+function asEmitRel32Fix(sym: string, addend: int): void {
+    asAddFixAt(FIX_REL32, sym, addend);
+    asEmitByte(0);
+    asEmitByte(0);
+    asEmitByte(0);
+    asEmitByte(0);
+}
+
+// —— StrIdx 扁平哈希索引（P8 首案；FNV-1a 32 位＋64K 桶头＋链表扁平平行
+// 表——asDefLabel O(n²) 线性查重清偿；S1 嵌套 List 字面量类型面禁用故扁平）——
+const SI_BUCKETS: int = 65536;
+const siHead: List<int> = listNew();
+const siKeys: List<string> = listNew();
+const siVals: List<int> = listNew();
+const siNext: List<int> = listNew();
+
+function siInit(): void {
+    while (listLen(siHead) < SI_BUCKETS) { listPush(siHead, -1); }
+}
+
+function siHash(name: string): int {
+    let h: int = 2166136261;
+    let i = 0;
+    while (i < len(name)) {
+        h = imul(h, 16777619) ^ (byteAt(name, i) catch 0);
+        i = i + 1;
+    }
+    return (h >>> 0) & (SI_BUCKETS - 1);
+}
+
+function siGet(name: string): int {
+    siInit();
+    let i = listGet(siHead, siHash(name)) catch -1;
+    while (i >= 0) {
+        if ((listGet(siKeys, i) catch "") == name) { return listGet(siVals, i) catch -1; }
+        i = listGet(siNext, i) catch -1;
+    }
+    return -1;
+}
+
+function siPut(name: string, val: int): void {
+    siInit();
+    const h = siHash(name);
+    let i = listGet(siHead, h) catch -1;
+    while (i >= 0) {
+        if ((listGet(siKeys, i) catch "") == name) { return; }
+        i = listGet(siNext, i) catch -1;
+    }
+    listPush(siKeys, name);
+    listPush(siVals, val);
+    listPush(siNext, listGet(siHead, h) catch -1);
+    listSet(siHead, h, listLen(siKeys) - 1);
+}
+
+// —— 扁平索引终结 ——
+function asDefLabel(name: string): int {
+    // 0＝成功；-1＝重复符号（查重经扁平哈希索引——P8 首案）。
+    if (siGet(name) >= 0) { return -1; }
+    siPut(name, listLen(as_img.symNames));
+    listPush(as_img.symNames, name);
+    listPush(as_img.symSec, as_cur);
+    listPush(as_img.symOff, asHere());
+    return 0;
+}
+
+function if1int(b: bool): int {
+    if (b) { return 1; }
+    return 0;
+}
+
+function modrm(mod: int, reg: int, rm: int): int {
+    return ((mod & 3) << 6) | ((reg & 7) << 3) | (rm & 7);
+}
+
+function rexByte(w: int, r: int, x: int, b: int): int {
+    return 0x40 | (w << 3) | (r << 2) | (x << 1) | b;
+}
+
+function asRex(w: int, r: int, x: int, b: int): void {
+    // 条件发射（0x40 冗余前缀省略——GAS 同款）。
+    if (w != 0 || r != 0 || x != 0 || b != 0) {
+        asEmitByte(rexByte(w, r, x, b));
+    }
+}
+
+function asEmitImm32(v: int): void {
+    asEmitByte(v & 0xFF);
+    asEmitByte((v >>> 8) & 0xFF);
+    asEmitByte((v >>> 16) & 0xFF);
+    asEmitByte((v >>> 24) & 0xFF);
+}
+
+function asEmitImm64(v: int): void {
+    let k = 0;
+    while (k < 8) {
+        asEmitByte((v >>> (k * 8)) & 0xFF);
+        k = k + 1;
+    }
+}
+
+// ============================================================================
+// §2 词法（寄存器表/整数解析/操作数解析）
+// ============================================================================
+
+// 固定 ISA 名称语法直接判别：保留原36个精确名称，不分配切片或查表结果盒。
+function regLegacyNum(name: string, lead: int): int {
+    if (len(name) != 3 || (byteAt(name, 0) catch 0) != lead) { return -1; }
+    const a = byteAt(name, 1) catch 0;
+    const b = byteAt(name, 2) catch 0;
+    if (b == 120) {
+        if (a == 97) { return 0; }
+        if (a == 99) { return 1; }
+        if (a == 100) { return 2; }
+        if (a == 98) { return 3; }
+    }
+    if (a == 115 && b == 112) { return 4; }
+    if (a == 98 && b == 112) { return 5; }
+    if (a == 115 && b == 105) { return 6; }
+    if (a == 100 && b == 105) { return 7; }
+    return -1;
+}
+
+function regExtendedNum(name: string, size: int): int {
+    if ((size != 2 && size != 3) || (byteAt(name, 0) catch 0) != 114) { return -1; }
+    const a = byteAt(name, 1) catch 0;
+    if (size == 2) {
+        if (a == 56) { return 8; }
+        if (a == 57) { return 9; }
+        return -1;
+    }
+    const b = byteAt(name, 2) catch 0;
+    if (a == 49 && b >= 48 && b <= 53) { return 10 + b - 48; }
+    return -1;
+}
+
+function reg64Num(name: string): int {
+    const legacy = regLegacyNum(name, 114);
+    if (legacy >= 0) { return legacy; }
+    return regExtendedNum(name, len(name));
+}
+
+function byteRex(r: int, x: int, b: int, force: bool): void {
+    if (force && r == 0 && x == 0 && b == 0) { asEmitByte(0x40); }
+    else { asRex(0, r, x, b); }
+}
+
+function regByName(name: string): Ref<Operand> {
+    const r64 = reg64Num(name);
+    if (r64 >= 0) { return opdReg(CLS_R64, r64); }
+    const r32 = regLegacyNum(name, 101);
+    if (r32 >= 0) { return opdReg(CLS_R32, r32); }
+    const n = len(name);
+    if ((n == 3 || n == 4) && (byteAt(name, n - 1) catch 0) == 100) {
+        const extended = regExtendedNum(name, n - 1);
+        if (extended >= 0) { return opdReg(CLS_R32, extended); }
+    }
+    if (n == 2 && (byteAt(name, 1) catch 0) == 108) {
+        const lead = byteAt(name, 0) catch 0;
+        if (lead == 97) { return opdReg(CLS_R8, 0); }
+        if (lead == 99) { return opdReg(CLS_R8, 1); }
+        if (lead == 100) { return opdReg(CLS_R8, 2); }
+        if (lead == 98) { return opdReg(CLS_R8, 3); }
+    }
+    if (name == "spl") { return opdReg(CLS_R8, 4); }
+    if (name == "bpl") { return opdReg(CLS_R8, 5); }
+    if (name == "sil") { return opdReg(CLS_R8, 6); }
+    if (name == "dil") { return opdReg(CLS_R8, 7); }
+    if ((n == 3 || n == 4) && (byteAt(name, n - 1) catch 0) == 98) {
+        const extended = regExtendedNum(name, n - 1);
+        if (extended >= 0) { return opdReg(CLS_R8, extended); }
+    }
+    return opdReg(-1, -1);
+}
+
+const DEC_BAD2: int = -9223372036854775807 - 1;
+// 解析成功旗标（哨兵与合法值相撞消解——"-9223372036854775808" 合法结果
+// 恰等于 DEC_BAD2；调用面改问旗标不问值）。
+let parseIntAutoOk: int = 0;
+
+function parseIntAuto(s: string): int {
+    // 0x/0X 前缀十六进制，其余十进制（base 0 禁——前导零八进制静默错值面）。
+    if (len(s) > 2 && (byteAt(s, 0) catch 0) == 48) {
+        const c = byteAt(s, 1) catch 0;
+        if (c == 120 || c == 88) {
+            let v: int = 0;
+            let i = 2;
+            while (i < len(s)) {
+                const hv = hexValAs(byteAt(s, i) catch 0);
+                if (hv < 0) { parseIntAutoOk = 0; return DEC_BAD2; }
+                v = v * 16 + hv;
+                i = i + 1;
+            }
+            parseIntAutoOk = 1;
+            return v;
+        }
+    }
+    let neg = false;
+    let i = 0;
+    if ((byteAt(s, 0) catch 0) == 45) {
+        neg = true;
+        i = 1;
+        if (len(s) == 1) { parseIntAutoOk = 0; return DEC_BAD2; }
+    }
+    // 负域累加（INT64_MIN 可表示——.s 中 movabs rdx, -9223372036854775808
+    // 立即数活捉：正域累加在末位即溢出 trap，assemble:317 int_overflow）。
+    let v: int = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) catch 48;
+        if (c < 48 || c > 57) { parseIntAutoOk = 0; return DEC_BAD2; }
+        v = v * 10 - (c - 48);
+        i = i + 1;
+    }
+    if (neg) { parseIntAutoOk = 1; return v; }
+    if (v == -9223372036854775807 - 1) { parseIntAutoOk = 0; return DEC_BAD2; } // 正域越界
+    parseIntAutoOk = 1;
+    return -v;
+}
+
+function hexValAs(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return -1;
+}
+
+function parseMemTx(tokFull: string): Ref<Operand> {
+    const bad = badMemoryOperand;
+    let m = new Operand { kind: OPD_MEM, cls: 0, num: 0, imm: 0, memSize: MSZ_Q, memBase: -1, memIndex: -1, scale: 0, disp: 0, hasRip: 0, ripSym: "", label: "" };
+    let body = tokFull;
+    if (strStartsWithAs(body, "byte ptr ")) {
+        m.memSize = MSZ_B;
+        body = asByteSub(body, 9, len(body) - 9);
+    } else if (strStartsWithAs(body, "dword ptr ")) {
+        m.memSize = MSZ_D;
+        body = asByteSub(body, 10, len(body) - 10);
+    } else if (strStartsWithAs(body, "qword ptr ")) {
+        m.memSize = MSZ_Q;
+        body = asByteSub(body, 10, len(body) - 10);
+    } else if (strStartsWithAs(body, "word ptr ")) {
+        m.memSize = MSZ_W;
+        body = asByteSub(body, 9, len(body) - 9);
+    }
+    if (len(body) > 0 && (byteAt(body, 0) catch 0) == 91) { body = asByteSub(body, 1, len(body) - 1); }
+    if (len(body) > 0 && (byteAt(body, len(body) - 1) catch 0) == 93) { body = asByteSub(body, 0, len(body) - 1); }
+    if (strStartsWithAs(body, "rip")) {
+        const rest = trimSp(body, 3);
+        if (len(rest) < 2 || (byteAt(rest, 0) catch 0) != 43) { return bad; }
+        m.hasRip = 1;
+        m.ripSym = trimSp(rest, 1);
+        return m;
+    }
+    // token 流：base/index/index*N/disp（'+' 分隔符——tokenize 空格后逐 token 剥尾 +）。
+    const toks = strSplit(body, " ");
+    let first = 1;
+    let ti = 0;
+    let seenAny = 0;
+    while (ti < listLen(toks)) {
+        let tok = listGet(toks, ti) catch "";
+        if (tok == "+") { ti = ti + 1; continue; }
+        if (len(tok) > 0 && (byteAt(tok, len(tok) - 1) catch 0) == 43) { tok = asByteSub(tok, 0, len(tok) - 1); }
+        if (len(tok) == 0) { ti = ti + 1; continue; }
+        // 比例变址 reg*N（N∈{2,4,8}）。
+        let star = -1;
+        let ci = 0;
+        while (ci < len(tok)) {
+            if ((byteAt(tok, ci) catch 0) == 42) { star = ci; break; }
+            ci = ci + 1;
+        }
+        if (star >= 0) {
+            const rname = trimSp(asByteSub(tok, 0, star), 0);
+            const sname = trimSp(asByteSub(tok, star + 1, len(tok) - star - 1), 0);
+            const rn = reg64Num(rname);
+            if (rn < 0) { return bad; }
+            if (!(sname == "2" || sname == "4" || sname == "8")) { return bad; }
+            m.memIndex = rn;
+            const sn = parseIntAuto(sname);
+            if (sn == DEC_BAD2) { return bad; }
+            m.scale = ilog2Tx(sn);
+            first = 0;
+            seenAny = 1;
+            ti = ti + 1;
+            continue;
+        }
+        const rn = reg64Num(tok);
+        if (rn >= 0) {
+            if (first == 1) { m.memBase = rn; } else { m.memIndex = rn; }
+            first = 0;
+            seenAny = 1;
+            ti = ti + 1;
+            continue;
+        }
+        const dv = parseIntAuto(tok);
+        if (dv == DEC_BAD2) { return bad; }
+        m.disp = dv;
+        first = 0;
+        seenAny = 1;
+        ti = ti + 1;
+    }
+    if (m.memBase < 0 && m.memIndex < 0) { return bad; }
+    return m;
+}
+
+// 解析游标按UTF-8字节计数；strSub的索引和长度则按码点计数。
+// 调用者只在ASCII分隔符处截取，因此lo/hi始终位于码点边界。
+// 完整字段直接返回原串，长.byte成功路径无需额外扫描或复制。
+function asByteSub(s: string, lo: int, count: int): string {
+    if (lo == 0 && count == len(s)) { return s; }
+    if (count == 0) { return ""; }
+    if (as_line_ascii == 1) { return strSub(s, lo, count); }
+    const hi = lo + count;
+    let i = 0;
+    let begin = 0;
+    let end = 0;
+    while (i < hi) {
+        const c = byteAt(s, i) catch 0;
+        if (c < 128 || c >= 192) {
+            end = end + 1;
+            if (i < lo) { begin = begin + 1; }
+        }
+        i = i + 1;
+    }
+    return strSub(s, begin, end - begin);
+}
+
+function strStartsWithAs(s: string, p: string): bool {
+    if (len(s) < len(p)) { return false; }
+    let i = 0;
+    while (i < len(p)) {
+        if ((byteAt(s, i) catch 0) != (byteAt(p, i) catch 0)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+function trimSp(s: string, from: int): string {
+    // 从 from 起剥首尾空格。
+    let lo = from;
+    let hi = len(s);
+    while (lo < hi && (byteAt(s, lo) catch 32) == 32) { lo = lo + 1; }
+    while (hi > lo && (byteAt(s, hi - 1) catch 32) == 32) { hi = hi - 1; }
+    if (hi <= lo) { return ""; }
+    return asByteSub(s, lo, hi - lo);
+}
+
+function ilog2Tx(v: int): int {
+    let n = 0;
+    let x = v;
+    while (x > 1) {
+        x = x / 2;
+        n = n + 1;
+    }
+    return n;
+}
+
+// 本次装配内部的有界只读解析结果表；完整字符串核对，碰撞只造成重解析。
+// 不缓存产物或诊断，重入释放所有已占槽的字符串/对象。
+const OC_BUCKETS: int = 4096;
+const operandKeys: List<string> = listNew();
+const operandValues: List<Ref<Operand>> = listNew();
+const operandUsed: List<int> = listNew();
+
+function operandCacheReset(): void {
+    while (listLen(operandUsed) > 0) {
+        const i = listGet(operandUsed, listLen(operandUsed) - 1) catch 0;
+        listSet(operandKeys, i, "");
+        listSet(operandValues, i, missingOperand);
+        listRemoveAt(operandUsed, listLen(operandUsed) - 1);
+    }
+}
+
+function parseOperandTx(tokIn: string): Ref<Operand> {
+    // 短寄存器名直接走ISA判别，免去字符串哈希。
+    if (len(tokIn) < 5) { return parseOperandSlow(tokIn); }
+    while (listLen(operandKeys) < OC_BUCKETS) {
+        listPush(operandKeys, "");
+        listPush(operandValues, missingOperand);
+    }
+    const i = siHash(tokIn) & (OC_BUCKETS - 1);
+    const key = listGet(operandKeys, i) catch "";
+    if (key == tokIn) { return listGet(operandValues, i) catch missingOperand; }
+    const value = parseOperandSlow(tokIn);
+    if (value.cls < 0) { return value; }
+    if (len(key) == 0) { listPush(operandUsed, i); }
+    listSet(operandKeys, i, tokIn);
+    listSet(operandValues, i, value);
+    return value;
+}
+
+function parseOperandSlow(tokIn: string): Ref<Operand> {
+    const bad = badMemoryOperand;
+    const tok = trimSpAll(tokIn);
+    if (len(tok) == 0) { return bad; }
+    const r = regByName(tok);
+    if (r.num >= 0) { return r; }
+    if (strStartsWithAs(tok, "xmm")) {
+        const n = parseIntTx2(asByteSub(tok, 3, len(tok) - 3));
+        if (n < 0 || n > 15) { return bad; }
+        return opdReg(CLS_XMM, n);
+    }
+    if (strStartsWithAs(tok, "ymm")) {
+        const n = parseIntTx2(asByteSub(tok, 3, len(tok) - 3));
+        if (n < 0 || n > 15) { return bad; }
+        return opdReg(CLS_YMM, n);
+    }
+    let hasBracket = 0;
+    let ci = 0;
+    while (ci < len(tok)) {
+        if ((byteAt(tok, ci) catch 0) == 91) { hasBracket = 1; }
+        ci = ci + 1;
+    }
+    if (hasBracket == 1) {
+        if ((byteAt(tok, len(tok) - 1) catch 0) != 93) { return bad; }
+        return parseMemTx(tok);
+    }
+    const c0 = byteAt(tok, 0) catch 0;
+    if ((c0 >= 48 && c0 <= 57) || (c0 == 45 && len(tok) > 1)) {
+        const v = parseIntAuto(tok);
+        if (parseIntAutoOk == 0) { return bad; }
+        return opdImm(v);
+    }
+    return opdLabel(tok);
+}
+
+function trimSpAll(s: string): string {
+    return trimSp(s, 0);
+}
+
+function parseIntTx2(s: string): int {
+    // 无符号十进制短解析（xmm/ymm 编号；负/非法＝-1）。
+    if (len(s) == 0) { return -1; }
+    let v: int = 0;
+    let i = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) catch 48;
+        if (c < 48 || c > 57) { return -1; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+// —— AsmImage 跨模块访问器；调用者只能读，需回填时另行复制 ——
+export function asImgText(): Bytes {
+    return as_img.text;
+}
+
+export function asImgAlignPow(sec: int): int {
+    if (sec == SEC_TEXT) { return as_img.textAlignPow; }
+    if (sec == SEC_RDATA) { return as_img.rdataAlignPow; }
+    if (sec == SEC_DATA) { return as_img.dataAlignPow; }
+    return as_img.bssAlignPow;
+}
+export function asImgData(): Bytes { return as_img.data; }
+export function asImgBssSize(): int { return as_img.bssSize; }
+export function asStorageUsed(): int { return as_img.storageUsed; }
+
+export function asImgRdata(): Bytes {
+    return as_img.rdata;
+}
+
+// 复用装配期符号索引，链接查询不再重复扫描全部标签。
+export function asSymIndexL(name: string): int {
+    return siGet(name);
+}
+
+export function asSymCountL(): int {
+    return listLen(as_img.symNames);
+}
+
+export function asSymNameL(i: int): string {
+    return listGet(as_img.symNames, i) catch "";
+}
+
+export function asSymSecL(i: int): int {
+    return listGet(as_img.symSec, i) catch 0;
+}
+
+export function asSymOffL(i: int): int {
+    return listGet(as_img.symOff, i) catch 0;
+}
+
+// rel32 fixups whose label is defined in the site's own section are position
+// independent (disp = label + addend - (at + 4), exactly what a linker computes
+// for one contiguous section): patch them now and drop them. Then mark which
+// symbols still reach the linker; ".L" labels no remaining fixup names do not.
+export function asResolveLocalFixups(): void {
+    const img = as_img;
+    const n = listLen(img.fixSec);
+    const fixSec: List<int> = listNew(); const fixAt: List<int> = listNew(); const fixKind: List<int> = listNew();
+    const fixSym: List<string> = listNew(); const fixAddend: List<int> = listNew();
+    const needed: List<int> = listNew();
+    let i = 0;
+    while (i < listLen(img.symNames)) {
+        const name = listGet(img.symNames, i) catch "";
+        if (len(name) >= 2 && (byteAt(name, 0) catch 0) == 46 && (byteAt(name, 1) catch 0) == 76) { listPush(needed, 0); } else { listPush(needed, 1); }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n) {
+        const sec = listGet(img.fixSec, i) catch -1;
+        const at = listGet(img.fixAt, i) catch 0;
+        const kind = listGet(img.fixKind, i) catch -1;
+        const sym = listGet(img.fixSym, i) catch "";
+        const addend = listGet(img.fixAddend, i) catch 0;
+        const si = siGet(sym);
+        let bytes: Bytes = img.text;
+        if (sec == SEC_RDATA) { bytes = img.rdata; }
+        if (sec == SEC_DATA) { bytes = img.data; }
+        const disp = (listGet(img.symOff, si) catch 0) + addend - at - 4;
+        if (kind == FIX_REL32 && si >= 0 && sec >= SEC_TEXT && sec <= SEC_DATA && (listGet(img.symSec, si) catch -1) == sec
+            && at >= 0 && at + 4 <= bytesLen(bytes) && disp >= -2147483648 && disp <= 2147483647) {
+            let k = 0;
+            while (k < 4) { bytesSet(bytes, at + k, (disp >>> (k * 8)) & 255); k = k + 1; }
+        } else {
+            listPush(fixSec, sec); listPush(fixAt, at); listPush(fixKind, kind); listPush(fixSym, sym); listPush(fixAddend, addend);
+            if (si >= 0) { listSet(needed, si, 1); }
+        }
+        i = i + 1;
+    }
+    img.fixSec = fixSec; img.fixAt = fixAt; img.fixKind = fixKind; img.fixSym = fixSym; img.fixAddend = fixAddend;
+    img.symNeeded = needed;
+}
+
+export function asSymNeededL(i: int): int {
+    if (listLen(as_img.symNeeded) == 0) { return 1; }
+    return listGet(as_img.symNeeded, i) catch 1;
+}
+
+export function asFixCountL(): int {
+    return listLen(as_img.fixSec);
+}
+
+export function asFixSecL(i: int): int {
+    return listGet(as_img.fixSec, i) catch 0;
+}
+
+export function asFixAtL(i: int): int {
+    return listGet(as_img.fixAt, i) catch 0;
+}
+
+export function asFixKindL(i: int): int {
+    return listGet(as_img.fixKind, i) catch 0;
+}
+
+export function asFixSymL(i: int): string {
+    return listGet(as_img.fixSym, i) catch "";
+}
+
+export function asFixAddendL(i: int): int {
+    return listGet(as_img.fixAddend, i) catch 0;
+}
+
+// ============================================================================
+// §3 主循环（direct_emit run :311-370 同构——词表外结构化拒绝）
+// ============================================================================
+
+// 十进制.byte字段直接扫描，免分词/子串/逐字段trim与emit函数调用。
+// 其他格式及越界仍走原解析器；空字段保留原来的零值语义。
+function emitByteDecimals(line: string, out: Bytes): int {
+    let i = 5;
+    let value: int = 0;
+    let digits: int = 0;
+    let trailing: int = 0;
+    while (i < len(line)) {
+        const c = byteAt(line, i) catch 0;
+        if (c >= 48 && c <= 57) {
+            if (trailing == 1) { return 0; }
+            value = value * 10 + c - 48;
+            if (value > 255) { return 0; }
+            digits = 1;
+        } else if (c == 32) {
+            if (digits == 1) { trailing = 1; }
+        } else if (c == 44) {
+            bytesPush(out, value);
+            value = 0; digits = 0; trailing = 0;
+        } else { return 0; }
+        i = i + 1;
+    }
+    bytesPush(out, value);
+    parseIntAutoOk = 1;
+    return 1;
+}
+
+// run：逐行汇编（失败＝lastErr 非空＋返回空 image）。
+export function assembleText(src: string): Ref<AsmImage> {
+    asReset();
+    const lines = strSplit(src, "\n");
+    let li = 0;
+    while (li < listLen(lines)) {
+        as_last_line = as_last_line + 1;
+        const rawLine = listGet(lines, li) catch "";
+        const line = trimCrlfSp(rawLine);
+        as_last_err = line;
+        if (len(line) == 0) { li = li + 1; continue; }
+        // 普通指令跳过七种点号指令前缀检查；局部标签仍在下方统一处理。
+        if ((byteAt(line, 0) catch 0) == 46) {
+            if (strStartsWithAs(line, ".intel_syntax") || strStartsWithAs(line, ".globl")) { li = li + 1; continue; }
+            if (strStartsWithAs(line, ".p2align")) {
+                const arg = trimSp(line, 8);
+                const n = storageParseInt(arg);
+                if (storageNumberOk == 0) { asFail("BadOperand"); return as_img; }
+                asStructuredAlign(n);
+                if (as_failed == 1) { return as_img; }
+                li = li + 1;
+                continue;
+            }
+            if (line == ".data" || line == ".bss") {
+                let sec = SEC_DATA; if (line == ".bss") { sec = SEC_BSS; }
+                asStructuredSection(sec); li = li + 1; continue;
+            }
+            if (strStartsWithAs(line, ".zero")) {
+                const n = storageParseInt(trimSp(line, 5));
+                if (storageNumberOk == 0) { asFail("BadBssSize"); return as_img; }
+                asStructuredZero(n); if (as_failed == 1) { return as_img; }
+                li = li + 1; continue;
+            }
+            if (strStartsWithAs(line, ".text")) { as_cur = SEC_TEXT; as_bytes = as_img.text; li = li + 1; continue; }
+            if (strStartsWithAs(line, ".section")) {
+                const sectionName = trimSp(line, 8);
+                if (sectionName == ".data" || sectionName == ".bss") {
+                    let sec = SEC_DATA; if (sectionName == ".bss") { sec = SEC_BSS; }
+                    asStructuredSection(sec);
+                } else if (strIndexOf(line, ".rdata") >= 0 || strIndexOf(line, ".rodata") >= 0) {
+                    as_cur = SEC_RDATA;
+                    as_bytes = as_img.rdata;
+                } else {
+                    asFail("UnsupportedDirective");
+                    return as_img;
+                }
+                li = li + 1;
+                continue;
+            }
+            if (strStartsWithAs(line, ".byte")) {
+                if (as_cur != SEC_RDATA && as_cur != SEC_DATA) { asFail("UnsupportedDirective"); return as_img; }
+                const byteOut = asOut();
+                const byteStart = bytesLen(byteOut);
+                if (emitByteDecimals(line, byteOut) == 1) { li = li + 1; continue; }
+                // 未支持的形式交回原解析器；先撤回本行暂写，保留原错误及部分输出。
+                while (bytesLen(byteOut) > byteStart) { listRemoveAt(bytesAsList(byteOut), bytesLen(byteOut) - 1); }
+                const toks = strSplit(asByteSub(line, 5, len(line) - 5), ",");
+                let ti = 0;
+                while (ti < listLen(toks)) {
+                    const field = trimSpAll(listGet(toks, ti) catch "");
+                    const v = storageParseInt(field);
+                    // Legacy empty byte fields are zero, matching the fast scanner.
+                    if ((storageNumberOk == 0 && len(field) > 0) || v < 0 || v > 255) { asFail("BadOperand"); return as_img; }
+                    asEmitByte(v);
+                    ti = ti + 1;
+                }
+                li = li + 1;
+                continue;
+            }
+            if (strStartsWithAs(line, ".quad")) {
+                if (as_cur != SEC_RDATA && as_cur != SEC_DATA) { asFail("UnsupportedDirective"); return as_img; }
+                const toks = strSplit(asByteSub(line, 5, len(line) - 5), ",");
+                let ti = 0;
+                while (ti < listLen(toks)) {
+                    asStorageQuadText(trimSpAll(listGet(toks, ti) catch ""));
+                    if (as_failed == 1) { return as_img; }
+                    ti = ti + 1;
+                }
+                li = li + 1;
+                continue;
+            }
+        }
+        if ((byteAt(line, len(line) - 1) catch 0) == 58) { // ':'
+            const name = trimSp(asByteSub(line, 0, len(line) - 1), 0);
+            if (len(name) == 0) { asFail("BadOperand"); return as_img; }
+            if (asDefLabel(name) < 0) { asFail("DuplicateSymbol"); return as_img; }
+            li = li + 1;
+            continue;
+        }
+        if (as_cur != SEC_TEXT) { asFail("InstructionOutsideText"); return as_img; }
+        asmInstrTx(line);
+        if (len(as_last_err) > 0 && as_failed == 1) { return as_img; }
+        li = li + 1;
+    }
+    return as_img;
+}
+
+let as_failed: int = 0;
+
+export function asLastErrAs(): string {
+    return as_last_err;
+}
+
+export function asFailedAs(): int {
+    return as_failed;
+}
+
+export function asLastLineAs(): int {
+    return as_last_line;
+}
+
+function asFail(name: string): void {
+    as_failed = 1;
+    as_last_err = name;
+}
+
+function trimCrlfSp(s: string): string {
+    // assembleText先按LF分行，s内没有LF；尾加LF的首次码点位置
+    // 就是整行码点数。仅码点数等于字节数时，整行及子串确认为ASCII。
+    as_line_ascii = 0;
+    if (strIndexOf(s + "\n", "\n") == len(s)) { as_line_ascii = 1; }
+    // 剥首尾空格/制表/CR。
+    let lo = 0;
+    let hi = len(s);
+    while (lo < hi) {
+        const c = byteAt(s, lo) catch 32;
+        if (c == 32 || c == 9 || c == 13) { lo = lo + 1; } else { break; }
+    }
+    while (hi > lo) {
+        const c = byteAt(s, hi - 1) catch 32;
+        if (c == 32 || c == 9 || c == 13) { hi = hi - 1; } else { break; }
+    }
+    if (hi <= lo) { return ""; }
+    return asByteSub(s, lo, hi - lo);
+}
+
+// 字段位置为UTF-8字节边界；ASCII前缀可直接使用码点截取。
+function splitTokPiece(body: string, lo: int, hi: int, ascii: int): string {
+    if (ascii == 1) { return strSub(body, lo, hi - lo); }
+    return asByteSub(body, lo, hi - lo);
+}
+
+function splitTok(line: string, from: int): List<string> {
+    // 空格＋逗号分隔；空字段仍跳过，制表符仍属于字段内容。
+    const out: List<string> = listNew();
+    const body = asByteSub(line, from, len(line) - from);
+    let lo = -1;
+    let ascii = 1;
+    let i = 0;
+    while (i < len(body)) {
+        const c = byteAt(body, i) catch 32;
+        if (c == 32 || c == 44) {
+            if (lo >= 0) { listPush(out, splitTokPiece(body, lo, i, ascii)); lo = -1; }
+        } else {
+            if (lo < 0) { lo = i; }
+            if (c >= 128) { ascii = 0; }
+        }
+        i = i + 1;
+    }
+    if (lo >= 0) { listPush(out, splitTokPiece(body, lo, i, ascii)); }
+    return out;
+}
+
+function shl1n(n: int): int {
+    let v = 1;
+    let i = 0;
+    while (i < n) {
+        v = imul(v, 2);
+        i = i + 1;
+    }
+    return v;
+}
+
+// ============================================================================
+// §4 指令编码（direct_emit asmInstr＋编码器族同构）
+// ============================================================================
+
+let op0: Ref<Operand> = emptyOperand();
+let op1: Ref<Operand> = emptyOperand();
+let op2: Ref<Operand> = emptyOperand();
+
+// 编码不依赖地址且没有修补点的指令可按完整文本复用；标签、指令伪码和
+// 有重定位的编码不进入缓存。固定槽数，冲突替换，装配边界释放全部驻留内容。
+const IC_BUCKETS: int = 4096;
+const instructionKeys: List<string> = listNew();
+const instructionLow: List<int> = listNew();
+const instructionHigh: List<int> = listNew();
+const instructionSizes: List<int> = listNew();
+const instructionUsed: List<int> = listNew();
+
+function instructionCacheReset(): void {
+    let i = 0;
+    while (i < listLen(instructionUsed)) {
+        const h = listGet(instructionUsed, i) catch 0;
+        listSet(instructionKeys, h, "");
+        listSet(instructionLow, h, 0);
+        listSet(instructionHigh, h, 0);
+        listSet(instructionSizes, h, 0);
+        i = i + 1;
+    }
+    while (listLen(instructionUsed) > 0) { listRemoveAt(instructionUsed, listLen(instructionUsed) - 1); }
+}
+
+function asmInstrTx(line: string): void {
+    while (listLen(instructionKeys) < IC_BUCKETS) {
+        listPush(instructionKeys, "");
+        listPush(instructionLow, 0);
+        listPush(instructionHigh, 0);
+        listPush(instructionSizes, 0);
+    }
+    const h = siHash(line) & (IC_BUCKETS - 1);
+    const out = asOut();
+    if ((listGet(instructionKeys, h) catch "") == line) {
+        let word = listGet(instructionLow, h) catch 0;
+        const high = listGet(instructionHigh, h) catch 0;
+        const size = listGet(instructionSizes, h) catch 0;
+        let i = 0;
+        while (i < size) {
+            if (i == 8) { word = high; }
+            bytesPush(out, word & 255);
+            word = word >>> 8;
+            i = i + 1;
+        }
+        return;
+    }
+    const start = bytesLen(out);
+    const fixes = listLen(as_img.fixAt);
+    asmInstrSlow(line);
+    if (as_failed != 0 || fixes != listLen(as_img.fixAt)) { return; }
+    // x86指令最多15字节；两个完整64位字容纳编码，不为每个缓存项建列表。
+    // 超过容量仅放弃缓存，保留原编码结果，不截断或拒绝输入。
+    const size = bytesLen(out) - start;
+    if (size > 16) { return; }
+    let low: int = 0;
+    let high: int = 0;
+    let i = 0;
+    while (i < size) {
+        const byte = bytesGet(out, start + i) catch 0;
+        if (i < 8) { low = low | (byte << (i * 8)); }
+        else { high = high | (byte << ((i - 8) * 8)); }
+        i = i + 1;
+    }
+    if ((listGet(instructionKeys, h) catch "") == "") { listPush(instructionUsed, h); }
+    listSet(instructionKeys, h, line);
+    listSet(instructionLow, h, low);
+    listSet(instructionHigh, h, high);
+    listSet(instructionSizes, h, size);
+}
+
+function asmInstrSlow(line: string): void {
+    // 原生分隔扫描避免逐字节运行时调用。先按空格确定助记符；
+    // 无逗号的单操作数字段直接解析，多操作数只保留一个原生拆分列表。
+    // strIndexOf返回码点位置，mn字节长度再交给asByteSub转换操作数。
+    let sp = strIndexOf(line, " ");
+    let mn = line;
+    if (sp < 0) { sp = len(line); }
+    else { mn = strSub(line, 0, sp); sp = len(mn); }
+    op0 = emptyOperand();
+    op1 = emptyOperand();
+    op2 = emptyOperand();
+    let nops = 0;
+    if (sp + 1 < len(line)) {
+        const rest = asByteSub(line, sp + 1, len(line) - sp - 1);
+        if (strIndexOf(rest, ",") < 0) {
+            op0 = parseOperandTx(rest);
+            if (op0.cls == -1 && op0.kind == OPD_MEM) { asFail("BadOperand"); return; }
+            nops = 1;
+        } else {
+            const toks = strSplit(rest, ",");
+            let ti = 0;
+            while (ti < listLen(toks)) {
+                if (nops >= 3) { asFail("BadOperand"); return; }
+                const o = parseOperandTx(listGet(toks, ti) catch "");
+                if (o.cls == -1 && o.kind == OPD_MEM) { asFail("BadOperand"); return; }
+                if (nops == 0) { op0 = o; } else if (nops == 1) { op1 = o; } else { op2 = o; }
+                nops = nops + 1;
+                ti = ti + 1;
+            }
+        }
+    }
+    asmEncodeOperands(mn, nops);
+    if (asRipPending >= 0) { asRipSettle(); }
+}
+
+// Shared ISA dispatch; caller supplies the already parsed, read-only operands.
+function asmEncodeOperands(mn: string, nops: int): void {
+    // High XMM operands are admitted only by encoders with verified REX handling.
+    if (((op0.cls == CLS_XMM && op0.num > 7) || (op1.cls == CLS_XMM && op1.num > 7) || (op2.cls == CLS_XMM && op2.num > 7))
+        && mn != "movupd" && mn != "movq" && mn != "vbroadcastsd") { asFail("BadOperand"); return; }
+    // Hot mnemonics first, keyed by the first byte; anything else falls through
+    // to the full table below (same encoders, same rejections).
+    const c0 = byteAt(mn, 0) catch 0;
+    if (c0 == 109) { // 'm'
+        if (mn == "mov") { encMov(op0, op1); return; }
+        if (mn == "movzx") { encMovzx(op0, op1); return; }
+        if (mn == "movabs") { encMovabs(op0, op1); return; }
+    } else if (c0 == 106) { // 'j'
+        if (nops == 1) { encJmp(mn, op0); return; }
+    } else if (c0 == 108) { // 'l'
+        if (mn == "lea") { encLea(op0, op1); return; }
+        if (mn == "lockxadd") { encLockXadd(op0, op1); return; }
+        if (mn == "lockcmpxchg") { encMemRmw(op0, op1, 1, 0xB1); return; }
+    } else if (c0 == 99) { // 'c'
+        if (mn == "call") { encCall(op0); return; }
+        if (mn == "cmp") { encCmp(op0, op1); return; }
+    } else if (c0 == 97) { // 'a'
+        if (mn == "add" || mn == "and") { encAlu(mn, op0, op1); return; }
+    } else if (c0 == 115) { // 's'
+        if (mn == "sub") { encAlu(mn, op0, op1); return; }
+        if (mn == "shl" || mn == "shr" || mn == "sar") { encShift(mn, op0, op1); return; }
+    } else if (c0 == 116) { // 't'
+        if (mn == "test") { encTest(op0, op1); return; }
+    } else if (c0 == 112) { // 'p'
+        if (mn == "push") { encPushPop(op0, 1); return; }
+        if (mn == "pop") { encPushPop(op0, 0); return; }
+    } else if (c0 == 114) { // 'r'
+        if (mn == "ret") { asEmitByte(0xC3); return; }
+    }
+    if (mn == "cld" || mn == "ud2" || mn == "syscall") {
+        if (nops != 0) { asFail("BadOperand"); return; }
+        if (mn == "cld") { asEmitByte(0xFC); }
+        else if (mn == "syscall") { asEmitByte(0x0F); asEmitByte(0x05); }
+        else { asEmitByte(0x0F); asEmitByte(0x0B); }
+        return;
+    }
+    if (mn == "rep") {
+        if (nops != 1 || op0.kind != OPD_LABEL) { asFail("BadOperand"); return; }
+        if (op0.label == "movsb") { asEmitByte(0xF3); asEmitByte(0xA4); return; }
+        if (op0.label == "stosb") { asEmitByte(0xF3); asEmitByte(0xAA); return; }
+        asFail("BadInstruction"); return;
+    }
+    if (mn == "mov") { encMov(op0, op1); return; }
+    if (mn == "movabs") { encMovabs(op0, op1); return; }
+    if (mn == "movzx") { encMovzx(op0, op1); return; }
+    if (mn == "lea") { encLea(op0, op1); return; }
+    if (mn == "cmp") { encCmp(op0, op1); return; }
+    if (mn == "test") { encTest(op0, op1); return; }
+    if (mn == "lockxadd") { encLockXadd(op0, op1); return; }
+    if (mn == "lockcmpxchg") { encMemRmw(op0, op1, 1, 0xB1); return; }
+    if (mn == "xchg") { encMemRmw(op0, op1, 0, 0x87); return; }
+    if (mn == "add" || mn == "sub" || mn == "imul" || mn == "and" || mn == "xor" || mn == "or") { encAlu(mn, op0, op1); return; }
+    if (mn == "shl" || mn == "shr" || mn == "sar") { encShift(mn, op0, op1); return; }
+    if (mn == "inc") { encGrpFF(op0, 0); return; }
+    if (mn == "dec") { encGrpFF(op0, 1); return; }
+    if (mn == "neg") { encGrpF7(op0, 3); return; }
+    if (mn == "not") { encGrpF7(op0, 2); return; }
+    if (mn == "idiv") { encGrpF7(op0, 7); return; }
+    // 定宽数值（O4 第二步）：u64/usize 的乘法看高半、除法与取余用无符号除法（只用于 NRT 运行期例程）。
+    if (mn == "mul") { encGrpF7(op0, 4); return; }
+    if (mn == "div") { encGrpF7(op0, 6); return; }
+    if (mn == "cqo") { asEmitByte(0x48); asEmitByte(0x99); return; }
+    if (mn == "setl" || mn == "setle" || mn == "sete" || mn == "setb" || mn == "setbe" || mn == "setnp") { encSetcc(mn, op0); return; }
+    if (len(mn) > 0 && (byteAt(mn, 0) catch 0) == 106 && nops == 1) { encJmp(mn, op0); return; } // 'j'
+    if (mn == "call") { encCall(op0); return; }
+    if (mn == "ret") { asEmitByte(0xC3); return; }
+    if (mn == "push") { encPushPop(op0, 1); return; }
+    if (mn == "pop") { encPushPop(op0, 0); return; }
+    if (mn == "movsd") {
+        if (op0.kind == OPD_MEM && op1.kind == OPD_REG && op1.cls == CLS_XMM) {
+            const e = memEncTx(op0);
+            if (e.bad == 1) { asFail("BadOperand"); return; }
+            asEmitByte(0xF2);
+            asRex(0, 0, e.rexX, e.rexB);
+            asEmitByte(0x0F);
+            asEmitByte(0x11);
+            emitModRmMemTx(e, op1.num & 7);
+            return;
+        }
+        encSse(op0, op1, 0x10);
+        return;
+    }
+    if (mn == "addsd") { encSse(op0, op1, 0x58); return; }
+    if (mn == "subsd") { encSse(op0, op1, 0x5C); return; }
+    if (mn == "mulsd") { encSse(op0, op1, 0x59); return; }
+    if (mn == "divsd") { encSse(op0, op1, 0x5E); return; }
+    if (mn == "ucomisd") { encSse(op0, op1, 0x2E); return; }
+    if (mn == "movq") { encMovq(op0, op1); return; }
+    if (mn == "cvtsi2sd") { encCvtsi2sd(op0, op1); return; }
+    // 定宽数值（O4 第一步）：f32 舍入与无符号 64 位转浮点所需的单精度指令，只用于 NRT 转换例程。
+    if (mn == "cvtsi2ss") { encCvtsi2ss(op0, op1); return; }
+    if (mn == "cvtsd2ss") { encSse(op0, op1, 0x5A); return; }
+    if (mn == "cvtss2sd") { encSseF3(op0, op1, 0x5A); return; }
+    if (mn == "addss") { encSseF3(op0, op1, 0x58); return; }
+    if (mn == "movupd") { encPackedMov(op0, op1); return; }
+    if (mn == "addpd") { encPacked(op0, op1, 0x58); return; }
+    if (mn == "mulpd") { encPacked(op0, op1, 0x59); return; }
+    if (mn == "unpcklpd") { encPackedRR(op0, op1, 0x14); return; }
+    if (mn == "cpuid") { asEmitByte(0x0F); asEmitByte(0xA2); return; }
+    if (mn == "xgetbv") { asEmitByte(0x0F); asEmitByte(0x01); asEmitByte(0xD0); return; }
+    if (mn == "vbroadcastsd") { encVbroadcastsd(op0, op1); return; }
+    if (mn == "vmovupd") { encVmovupd(op0, op1); return; }
+    if (mn == "vaddpd") { encVexPd(op0, op1, op2, 0x58); return; }
+    if (mn == "vmulpd") { encVexPd(op0, op1, op2, 0x59); return; }
+    asFail("BadInstruction");
+}
+
+// —— MemEnc（direct_emit memEnc :642-658 同构）——
+struct MemEncTx {
+    bad: int,
+    hasRip: int,
+    ripSym: string,
+    rexX: int,
+    rexB: int,
+    sib: int, // -1＝无
+    rm: int,
+    disp: int,
+}
+
+function memEncTx(m: Ref<Operand>): Ref<MemEncTx> {
+    if (m.hasRip == 1) {
+        return new MemEncTx { bad: 0, hasRip: 1, ripSym: m.ripSym, rexX: 0, rexB: 0, sib: -1, rm: 0, disp: 0 };
+    }
+    if (m.memBase < 0) { return new MemEncTx { bad: 1, hasRip: 0, ripSym: "", rexX: 0, rexB: 0, sib: -1, rm: 0, disp: 0 }; }
+    const base = m.memBase;
+    const e = new MemEncTx { bad: 0, hasRip: 0, ripSym: "", rexX: 0, rexB: extBit(base), sib: -1, rm: base & 7, disp: m.disp };
+    if (m.memIndex >= 0) {
+        e.rexX = extBit(m.memIndex);
+        e.rm = 4;
+        e.sib = ((m.scale & 3) << 6) | ((m.memIndex & 7) << 3) | (base & 7);
+    } else if ((base & 7) == 4) { // rsp
+        e.rm = 4;
+        e.sib = (4 << 3) | 4;
+    }
+    return e;
+}
+
+function extBit(num: int): int {
+    if (num >= 8) { return 1; }
+    return 0;
+}
+
+// x86-64 的 rip 相对位移以下一条指令的地址为基准；REL32 修正按“位移字段之后
+// 即指令末尾”计算，所以位移字段后面还有立即数（cmp/mov [rip+x], imm）时，指令
+// 编完后由 asRipSettle 把多出的字节数从 addend 中扣除（此前这种形式会静默定址
+// 到错误地址；现有代码不用它，产物不变）。只登记 rip 操作数，其余指令零开销。
+
+function asRipSettle(): void {
+    const tail = asHere() - (listGet(as_img.fixAt, asRipPending) catch 0) - 4;
+    if (tail > 0) { listSet(as_img.fixAddend, asRipPending, (listGet(as_img.fixAddend, asRipPending) catch 0) - tail); }
+    asRipPending = -1;
+}
+
+function emitModRmMemTx(e: Ref<MemEncTx>, regfield: int): void {
+    if (e.hasRip == 1) {
+        asEmitByte(modrm(0, regfield, 5));
+        asRipPending = listLen(as_img.fixSec);
+        asEmitRel32Fix(e.ripSym, 0);
+        return;
+    }
+    const baseNeedsDisp = e.rm == 5 || (e.sib >= 0 && (e.sib & 7) == 5);
+    if (e.disp == 0 && !baseNeedsDisp) {
+        asEmitByte(modrm(0, regfield, e.rm));
+        if (e.sib >= 0) { asEmitByte(e.sib); }
+        return;
+    }
+    const disp8Fits = e.disp >= -128 && e.disp <= 127;
+    if (disp8Fits) {
+        asEmitByte(modrm(1, regfield, e.rm));
+        if (e.sib >= 0) { asEmitByte(e.sib); }
+        asEmitByte(e.disp & 0xFF);
+        return;
+    }
+    asEmitByte(modrm(2, regfield, e.rm));
+    if (e.sib >= 0) { asEmitByte(e.sib); }
+    asEmitImm32(e.disp);
+}
+
+// 段前缀绝对寻址 fs:[disp32]／gs:[disp32]（线程第 1 步的平台 TLS：Linux fs:[-8]、Windows gs:[0x58]）。
+// 只有 64 位 mov 的读写接受它（encMov）；其余指令经 memEncTx 一律拒绝（无基址、非 rip）。
+export function asStructuredSegMem(seg: string, disp: int): Ref<Operand> {
+    if ((seg != "fs" && seg != "gs") || disp < -2147483648 || disp > 2147483647) { asFail("BadOperand"); return emptyOperand(); }
+    return new Operand { kind: OPD_MEM, cls: 0, num: 0, imm: 0, memSize: MSZ_Q, memBase: -1, memIndex: -1, scale: 0, disp: disp, hasRip: 0, ripSym: "", label: seg };
+}
+
+function isSegMem(m: Ref<Operand>): bool {
+    return m.kind == OPD_MEM && m.memBase < 0 && m.memIndex < 0 && m.hasRip == 0 && (m.label == "fs" || m.label == "gs");
+}
+
+// 段前缀、REX.W、操作码、ModRM（mod=00 rm=100）、SIB（无基址无变址 0x25）、disp32。
+function encSegMov(m: Ref<Operand>, reg: int, opcode: int): void {
+    if (m.label == "fs") { asEmitByte(0x64); } else { asEmitByte(0x65); }
+    asRex(1, extBit(reg), 0, 0);
+    asEmitByte(opcode);
+    asEmitByte(modrm(0, reg & 7, 4));
+    asEmitByte(0x25);
+    asEmitImm32(m.disp);
+}
+
+// —— mov（direct_emit encMov :702-814 同构）——
+function encMov(dst: Ref<Operand>, src: Ref<Operand>): void {
+    if (dst.kind == OPD_REG && dst.cls == CLS_R64 && isSegMem(src)) { encSegMov(src, dst.num, 0x8B); return; }
+    if (src.kind == OPD_REG && src.cls == CLS_R64 && isSegMem(dst)) { encSegMov(dst, src.num, 0x89); return; }
+    if (dst.kind == OPD_REG) {
+        if (dst.cls == CLS_R64) {
+            const dr = dst.num;
+            if (src.kind == OPD_REG && src.cls == CLS_R64) {
+                asRex(1, extBit(src.num), 0, extBit(dr));
+                asEmitByte(0x89);
+                asEmitByte(modrm(3, src.num & 7, dr & 7));
+                return;
+            }
+            if (src.kind == OPD_IMM) {
+                if (src.imm < -2147483648 - 1 + 1 - 1) {
+                    // imm 域 [−2^31, 2^32)
+                }
+                if (src.imm < -2147483648 || src.imm > 4294967295) { asFail("BadOperand"); return; }
+                asRex(1, 0, 0, extBit(dr));
+                asEmitByte(0xC7);
+                asEmitByte(modrm(3, 0, dr & 7));
+                asEmitImm32(src.imm);
+                return;
+            }
+            if (src.kind == OPD_MEM) {
+                const e = memEncTx(src);
+                if (e.bad == 1) { asFail("BadOperand"); return; }
+                asRex(1, extBit(dr), e.rexX, e.rexB);
+                asEmitByte(0x8B);
+                emitModRmMemTx(e, dr & 7);
+                return;
+            }
+            asFail("BadOperand");
+            return;
+        }
+        if (dst.cls == CLS_R32) {
+            if (src.kind == OPD_REG && src.cls == CLS_R32) {
+                asRex(0, extBit(src.num), 0, extBit(dst.num));
+                asEmitByte(0x89);
+                asEmitByte(modrm(3, src.num & 7, dst.num & 7));
+                return;
+            }
+            if (src.kind == OPD_MEM) {
+                if (src.memSize != MSZ_D) { asFail("BadOperand"); return; }
+                const e = memEncTx(src);
+                if (e.bad == 1) { asFail("BadOperand"); return; }
+                asRex(0, extBit(dst.num), e.rexX, e.rexB);
+                asEmitByte(0x8B);
+                emitModRmMemTx(e, dst.num & 7);
+                return;
+            }
+            if (src.kind == OPD_IMM) {
+                if (dst.num >= 8) { asRex(0, 0, 0, 1); }
+                asEmitByte(0xB8 + (dst.num & 7));
+                asEmitImm32(src.imm);
+                return;
+            }
+            asFail("BadOperand");
+            return;
+        }
+        if (dst.cls == CLS_R8) {
+            if (src.kind == OPD_MEM) {
+                if (src.memSize != MSZ_B) { asFail("BadOperand"); return; }
+                const e = memEncTx(src);
+                if (e.bad == 1) { asFail("BadOperand"); return; }
+                byteRex(extBit(dst.num), e.rexX, e.rexB, dst.num >= 4);
+                asEmitByte(0x8A);
+                emitModRmMemTx(e, dst.num & 7);
+                return;
+            }
+            asFail("BadOperand");
+            return;
+        }
+        asFail("BadOperand");
+        return;
+    }
+    if (dst.kind == OPD_MEM) {
+        if (src.kind == OPD_REG) {
+            if (src.cls == CLS_R64) {
+                const e = memEncTx(dst);
+                if (e.bad == 1) { asFail("BadOperand"); return; }
+                asRex(1, extBit(src.num), e.rexX, e.rexB);
+                asEmitByte(0x89);
+                emitModRmMemTx(e, src.num & 7);
+                return;
+            }
+            if (src.cls == CLS_R32) {
+                // word：写 32 位寄存器的低 16 位（操作数宽度前缀 66 在 REX 之前）。
+                if (dst.memSize != MSZ_D && dst.memSize != MSZ_W) { asFail("BadOperand"); return; }
+                const e = memEncTx(dst);
+                if (e.bad == 1) { asFail("BadOperand"); return; }
+                if (dst.memSize == MSZ_W) { asEmitByte(0x66); }
+                asRex(0, extBit(src.num), e.rexX, e.rexB);
+                asEmitByte(0x89);
+                emitModRmMemTx(e, src.num & 7);
+                return;
+            }
+            if (src.cls == CLS_R8) {
+                if (dst.memSize != MSZ_B) { asFail("BadOperand"); return; }
+                const e = memEncTx(dst);
+                if (e.bad == 1) { asFail("BadOperand"); return; }
+                byteRex(extBit(src.num), e.rexX, e.rexB, src.num >= 4);
+                asEmitByte(0x88);
+                emitModRmMemTx(e, src.num & 7);
+                return;
+            }
+            asFail("BadOperand");
+            return;
+        }
+        if (src.kind == OPD_IMM) {
+            if (dst.memSize == MSZ_D) {
+                const e = memEncTx(dst);
+                if (e.bad == 1) { asFail("BadOperand"); return; }
+                asRex(0, 0, e.rexX, e.rexB);
+                asEmitByte(0xC7);
+                emitModRmMemTx(e, 0);
+                asEmitImm32(src.imm);
+                return;
+            }
+            if (dst.memSize == MSZ_Q) {
+                const e = memEncTx(dst);
+                if (e.bad == 1) { asFail("BadOperand"); return; }
+                asRex(1, 0, e.rexX, e.rexB);
+                asEmitByte(0xC7);
+                emitModRmMemTx(e, 0);
+                asEmitImm32(src.imm);
+                return;
+            }
+            asFail("BadOperand");
+            return;
+        }
+        asFail("BadOperand");
+        return;
+    }
+    asFail("BadOperand");
+}
+
+function encMovabs(dst: Ref<Operand>, src: Ref<Operand>): void {
+    if (dst.kind != OPD_REG || dst.cls != CLS_R64 || src.kind != OPD_IMM) { asFail("BadOperand"); return; }
+    asRex(1, 0, 0, extBit(dst.num));
+    asEmitByte(0xB8 + (dst.num & 7));
+    asEmitImm64(src.imm);
+}
+
+function encMovzx(dst: Ref<Operand>, src: Ref<Operand>): void {
+    if (dst.kind != OPD_REG || dst.cls != CLS_R32) { asFail("BadOperand"); return; }
+    if (src.kind == OPD_MEM) {
+        if (src.memSize != MSZ_B && src.memSize != MSZ_W) { asFail("BadOperand"); return; }
+        const e = memEncTx(src);
+        if (e.bad == 1) { asFail("BadOperand"); return; }
+        asRex(0, extBit(dst.num), e.rexX, e.rexB);
+        asEmitByte(0x0F);
+        if (src.memSize == MSZ_W) { asEmitByte(0xB7); } else { asEmitByte(0xB6); }
+        emitModRmMemTx(e, dst.num & 7);
+        return;
+    }
+    if (src.kind == OPD_REG && src.cls == CLS_R8) {
+        byteRex(extBit(dst.num), 0, extBit(src.num), src.num >= 4);
+        asEmitByte(0x0F);
+        asEmitByte(0xB6);
+        asEmitByte(modrm(3, dst.num & 7, src.num & 7));
+        return;
+    }
+    asFail("BadOperand");
+}
+
+function encLockXadd(dst: Ref<Operand>, src: Ref<Operand>): void {
+    // LOCK XADD（F0 0F C1 /r；v052-runtime-rc-weak-generation D3 原子臂）：
+    // r/m32,r32 与 r/m64,r64（mem/reg 四形态）；r8/混合宽度/立即数拒绝。
+    // 前缀序 F0 先于 REX（GNU 规范序）；reg,reg 目的落 RM 域（modrm(3,src,dst)）。
+    if (src.kind != OPD_REG) { asFail("BadOperand"); return; }
+    if (src.cls == CLS_R32) {
+        if (dst.kind == OPD_MEM) {
+            const e = memEncTx(dst);
+            if (e.bad == 1) { asFail("BadOperand"); return; }
+            asEmitByte(0xF0);
+            asRex(0, extBit(src.num), e.rexX, e.rexB);
+            asEmitByte(0x0F); asEmitByte(0xC1);
+            emitModRmMemTx(e, src.num & 7);
+            return;
+        }
+        if (dst.kind == OPD_REG && dst.cls == CLS_R32) {
+            asEmitByte(0xF0);
+            asRex(0, extBit(src.num), 0, extBit(dst.num));
+            asEmitByte(0x0F); asEmitByte(0xC1);
+            asEmitByte(modrm(3, src.num & 7, dst.num & 7));
+            return;
+        }
+        asFail("BadOperand"); return;
+    }
+    if (src.cls == CLS_R64) {
+        if (dst.kind == OPD_MEM) {
+            const e = memEncTx(dst);
+            if (e.bad == 1) { asFail("BadOperand"); return; }
+            asEmitByte(0xF0);
+            asRex(1, extBit(src.num), e.rexX, e.rexB);
+            asEmitByte(0x0F); asEmitByte(0xC1);
+            emitModRmMemTx(e, src.num & 7);
+            return;
+        }
+        if (dst.kind == OPD_REG && dst.cls == CLS_R64) {
+            asEmitByte(0xF0);
+            asRex(1, extBit(src.num), 0, extBit(dst.num));
+            asEmitByte(0x0F); asEmitByte(0xC1);
+            asEmitByte(modrm(3, src.num & 7, dst.num & 7));
+            return;
+        }
+    }
+    asFail("BadOperand");
+}
+
+function encMemRmw(dst: Ref<Operand>, src: Ref<Operand>, locked: int, opc: int): void {
+    // 线程第 4c 步的原子读改写（Atomic<int> 的 store/cas）：只收 mem,r32 与 mem,r64。
+    // XCHG（87 /r，带内存操作数时处理器自动加锁，不另发 F0）；LOCK CMPXCHG（F0 0F B1 /r，比较值在 eax/rax）。
+    // 前缀序同 encLockXadd：F0 先于 REX。
+    if (dst.kind != OPD_MEM || src.kind != OPD_REG || (src.cls != CLS_R32 && src.cls != CLS_R64)) { asFail("BadOperand"); return; }
+    const e = memEncTx(dst);
+    if (e.bad == 1) { asFail("BadOperand"); return; }
+    if (locked == 1) { asEmitByte(0xF0); }
+    let w: int = 0;
+    if (src.cls == CLS_R64) { w = 1; }
+    asRex(w, extBit(src.num), e.rexX, e.rexB);
+    if (opc == 0xB1) { asEmitByte(0x0F); }
+    asEmitByte(opc);
+    emitModRmMemTx(e, src.num & 7);
+}
+
+function encLea(dst: Ref<Operand>, src: Ref<Operand>): void {
+    if (dst.kind != OPD_REG || dst.cls != CLS_R64 || src.kind != OPD_MEM) { asFail("BadOperand"); return; }
+    const e = memEncTx(src);
+    if (e.bad == 1) { asFail("BadOperand"); return; }
+    asRex(1, extBit(dst.num), e.rexX, e.rexB);
+    asEmitByte(0x8D);
+    emitModRmMemTx(e, dst.num & 7);
+}
+
+function emitImmAlu(ext: int, v: int, rm: int): void {
+    if (v >= -128 && v <= 127) {
+        asEmitByte(0x83);
+        asEmitByte(modrm(3, ext, rm));
+        asEmitByte(v & 0xFF);
+    } else {
+        asEmitByte(0x81);
+        asEmitByte(modrm(3, ext, rm));
+        asEmitImm32(v);
+    }
+}
+
+function encCmp(dst: Ref<Operand>, src: Ref<Operand>): void {
+    if (dst.kind == OPD_REG) {
+        if (dst.cls == CLS_R64) {
+            const dr = dst.num;
+            if (src.kind == OPD_MEM) {
+                const e = memEncTx(src);
+                if (e.bad == 1) { asFail("BadOperand"); return; }
+                asRex(1, extBit(dr), e.rexX, e.rexB);
+                asEmitByte(0x3B);
+                emitModRmMemTx(e, dr & 7);
+                return;
+            }
+            if (src.kind == OPD_REG && src.cls == CLS_R64) {
+                asRex(1, extBit(src.num), 0, extBit(dr));
+                asEmitByte(0x39);
+                asEmitByte(modrm(3, src.num & 7, dr & 7));
+                return;
+            }
+            if (src.kind == OPD_IMM) {
+                asRex(1, 0, 0, extBit(dr));
+                emitImmAlu(7, src.imm, dr & 7);
+                return;
+            }
+            asFail("BadOperand");
+            return;
+        }
+        if (dst.cls == CLS_R32) {
+            if (src.kind == OPD_MEM) {
+                const e = memEncTx(src);
+                if (e.bad == 1) { asFail("BadOperand"); return; }
+                asRex(0, extBit(dst.num), e.rexX, e.rexB);
+                asEmitByte(0x3B);
+                emitModRmMemTx(e, dst.num & 7);
+                return;
+            }
+            if (src.kind == OPD_REG && src.cls == CLS_R32) {
+                asRex(0, extBit(src.num), 0, extBit(dst.num));
+                asEmitByte(0x39);
+                asEmitByte(modrm(3, src.num & 7, dst.num & 7));
+                return;
+            }
+            if (src.kind == OPD_IMM) {
+                if (dst.num >= 8) { asRex(0, 0, 0, 1); }
+                emitImmAlu(7, src.imm, dst.num & 7);
+                return;
+            }
+            asFail("BadOperand");
+            return;
+        }
+        asFail("BadOperand");
+        return;
+    }
+    if (dst.kind == OPD_MEM && src.kind == OPD_IMM) {
+        const e = memEncTx(dst);
+        if (e.bad == 1) { asFail("BadOperand"); return; }
+        if (dst.memSize == MSZ_B) {
+            asRex(0, 0, e.rexX, e.rexB);
+            asEmitByte(0x80);
+            emitModRmMemTx(e, 7);
+            asEmitByte(src.imm & 0xFF);
+            return;
+        }
+        if (dst.memSize == MSZ_Q) {
+            asRex(1, 0, e.rexX, e.rexB);
+            if (src.imm >= -128 && src.imm <= 127) {
+                asEmitByte(0x83);
+                emitModRmMemTx(e, 7);
+                asEmitByte(src.imm & 0xFF);
+            } else {
+                asEmitByte(0x81);
+                emitModRmMemTx(e, 7);
+                asEmitImm32(src.imm);
+            }
+            return;
+        }
+        if (dst.memSize == MSZ_D) {
+            asRex(0, 0, e.rexX, e.rexB);
+            if (src.imm >= -128 && src.imm <= 127) {
+                asEmitByte(0x83);
+                emitModRmMemTx(e, 7);
+                asEmitByte(src.imm & 0xFF);
+            } else {
+                asEmitByte(0x81);
+                emitModRmMemTx(e, 7);
+                asEmitImm32(src.imm);
+            }
+            return;
+        }
+        asFail("BadOperand");
+        return;
+    }
+    asFail("BadOperand");
+}
+
+function encTest(a: Ref<Operand>, b: Ref<Operand>): void {
+    if (a.kind != OPD_REG || b.kind != OPD_REG || a.cls != b.cls) { asFail("BadOperand"); return; }
+    if (a.cls != CLS_R64 && a.cls != CLS_R32 && a.cls != CLS_R8) { asFail("BadOperand"); return; }
+    if (a.cls == CLS_R8) {
+        byteRex(extBit(b.num), 0, extBit(a.num), a.num >= 4 || b.num >= 4);
+        asEmitByte(0x84);
+    } else {
+        asRex(if1int(a.cls == CLS_R64), extBit(b.num), 0, extBit(a.num));
+        asEmitByte(0x85);
+    }
+    asEmitByte(modrm(3, b.num & 7, a.num & 7));
+}
+
+function encAlu(mn: string, dst: Ref<Operand>, src: Ref<Operand>): void {
+    let dstIsR8 = 0;
+    if (dst.kind == OPD_REG && dst.cls == CLS_R8) { dstIsR8 = 1; }
+    if (dstIsR8 == 0 && (mn == "add" || mn == "sub" || mn == "and" || mn == "or" || mn == "xor")) {
+        let ext = 6;
+        let opRm = 0x33;
+        let opMr = 0x31;
+        if (mn == "add") { ext = 0; opRm = 0x03; opMr = 0x01; }
+        else if (mn == "or") { ext = 1; opRm = 0x0B; opMr = 0x09; }
+        else if (mn == "and") { ext = 4; opRm = 0x23; opMr = 0x21; }
+        else if (mn == "sub") { ext = 5; opRm = 0x2B; opMr = 0x29; }
+        if (dst.kind == OPD_REG && (dst.cls == CLS_R64 || dst.cls == CLS_R32)) {
+            const w = dst.cls == CLS_R64;
+            const dr = dst.num;
+            if (src.kind == OPD_MEM) {
+                const e = memEncTx(src);
+                if (e.bad == 1) { asFail("BadOperand"); return; }
+                asRex(if1int(w), extBit(dr), e.rexX, e.rexB);
+                asEmitByte(opRm);
+                emitModRmMemTx(e, dr & 7);
+                return;
+            }
+            if (src.kind == OPD_IMM) {
+                asRex(if1int(w), 0, 0, extBit(dr));
+                emitImmAlu(ext, src.imm, dr & 7);
+                return;
+            }
+            if (src.kind == OPD_REG && src.cls == dst.cls) {
+                asRex(if1int(w), extBit(src.num), 0, extBit(dr));
+                asEmitByte(opMr);
+                asEmitByte(modrm(3, src.num & 7, dr & 7));
+                return;
+            }
+            asFail("BadOperand");
+            return;
+        }
+        asFail("BadOperand");
+        return;
+    }
+    if (mn == "imul") {
+        if (dst.kind != OPD_REG || dst.cls != CLS_R64) { asFail("BadOperand"); return; }
+        if (src.kind == OPD_MEM) {
+            const e = memEncTx(src);
+            if (e.bad == 1) { asFail("BadOperand"); return; }
+            asRex(1, extBit(dst.num), e.rexX, e.rexB);
+            asEmitByte(0x0F);
+            asEmitByte(0xAF);
+            emitModRmMemTx(e, dst.num & 7);
+            return;
+        }
+        if (src.kind == OPD_REG && src.cls == CLS_R64) {
+            asRex(1, extBit(dst.num), 0, extBit(src.num));
+            asEmitByte(0x0F);
+            asEmitByte(0xAF);
+            asEmitByte(modrm(3, dst.num & 7, src.num & 7));
+            return;
+        }
+        asFail("BadOperand");
+        return;
+    }
+    if (mn == "and") {
+        if (dst.kind == OPD_REG && dst.cls == CLS_R8 && src.kind == OPD_REG && src.cls == CLS_R8) {
+            byteRex(extBit(src.num), 0, extBit(dst.num), dst.num >= 4 || src.num >= 4);
+            asEmitByte(0x20);
+            asEmitByte(modrm(3, src.num & 7, dst.num & 7));
+            return;
+        }
+        if (dst.kind == OPD_REG && dst.cls == CLS_R64 && src.kind == OPD_IMM) {
+            asRex(1, 0, 0, extBit(dst.num));
+            emitImmAlu(4, src.imm, dst.num & 7);
+            return;
+        }
+        asFail("BadOperand");
+        return;
+    }
+    if (mn == "xor") {
+        if (dst.kind == OPD_REG && dst.cls == CLS_R8 && src.kind == OPD_IMM) {
+            if (dst.num != 0) { asFail("BadOperand"); return; }
+            asEmitByte(0x34);
+            asEmitByte(src.imm & 0xFF);
+            return;
+        }
+        if (dst.kind == OPD_REG && dst.cls == CLS_R64 && src.kind == OPD_IMM) {
+            asRex(1, 0, 0, extBit(dst.num));
+            emitImmAlu(6, src.imm, dst.num & 7);
+            return;
+        }
+        if (dst.kind == OPD_REG && dst.cls == CLS_R64 && src.kind == OPD_REG && src.cls == CLS_R64) {
+            asRex(1, extBit(src.num), 0, extBit(dst.num));
+            asEmitByte(0x31);
+            asEmitByte(modrm(3, src.num & 7, dst.num & 7));
+            return;
+        }
+        if (dst.kind == OPD_REG && dst.cls == CLS_R32 && src.kind == OPD_REG && src.cls == CLS_R32) {
+            asRex(0, extBit(src.num), 0, extBit(dst.num));
+            asEmitByte(0x31);
+            asEmitByte(modrm(3, src.num & 7, dst.num & 7));
+            return;
+        }
+        asFail("BadOperand");
+        return;
+    }
+    asFail("BadInstruction");
+}
+
+function encShift(mn: string, dst: Ref<Operand>, cnt: Ref<Operand>): void {
+    let ext = 7;
+    if (mn == "shl") { ext = 4; } else if (mn == "shr") { ext = 5; }
+    if (dst.kind != OPD_REG) { asFail("BadOperand"); return; }
+    if (dst.cls != CLS_R64 && dst.cls != CLS_R32) { asFail("BadOperand"); return; }
+    let w = 0;
+    if (dst.cls == CLS_R64) { w = 1; }
+    const r = dst.num;
+    if (cnt.kind == OPD_IMM) {
+        asRex(w, 0, 0, extBit(r));
+        if (cnt.imm == 1) {
+            asEmitByte(0xD1);
+            asEmitByte(modrm(3, ext, r & 7));
+            return;
+        }
+        asEmitByte(0xC1);
+        asEmitByte(modrm(3, ext, r & 7));
+        asEmitByte(cnt.imm & 0xFF);
+        return;
+    }
+    if (cnt.kind == OPD_REG && cnt.cls == CLS_R8 && cnt.num == 1) {
+        asRex(w, 0, 0, extBit(r));
+        asEmitByte(0xD3);
+        asEmitByte(modrm(3, ext, r & 7));
+        return;
+    }
+    asFail("BadOperand");
+}
+
+function encGrpFF(dst: Ref<Operand>, ext: int): void {
+    if (dst.kind != OPD_REG || dst.cls != CLS_R64) { asFail("BadOperand"); return; }
+    asRex(1, 0, 0, extBit(dst.num));
+    asEmitByte(0xFF);
+    asEmitByte(modrm(3, ext, dst.num & 7));
+}
+
+function encGrpF7(dst: Ref<Operand>, ext: int): void {
+    if (dst.kind != OPD_REG || dst.cls != CLS_R64) { asFail("BadOperand"); return; }
+    asRex(1, 0, 0, extBit(dst.num));
+    asEmitByte(0xF7);
+    asEmitByte(modrm(3, ext, dst.num & 7));
+}
+
+function encSetcc(mn: string, dst: Ref<Operand>): void {
+    if (dst.kind != OPD_REG || dst.cls != CLS_R8) { asFail("BadOperand"); return; }
+    let cc = -1;
+    if (mn == "setl") { cc = 0x9C; }
+    else if (mn == "setle") { cc = 0x9E; }
+    else if (mn == "sete") { cc = 0x94; }
+    else if (mn == "setb") { cc = 0x92; }
+    else if (mn == "setbe") { cc = 0x96; }
+    else if (mn == "setnp") { cc = 0x9B; }
+    if (cc < 0) { asFail("BadInstruction"); return; }
+    byteRex(0, 0, extBit(dst.num), dst.num >= 4);
+    asEmitByte(0x0F);
+    asEmitByte(cc);
+    asEmitByte(modrm(3, 0, dst.num & 7));
+}
+
+function encJmp(mn: string, target: Ref<Operand>): void {
+    if (target.kind != OPD_LABEL) { asFail("BadOperand"); return; }
+    if (mn == "jmp") {
+        asEmitByte(0xE9);
+        asEmitRel32Fix(target.label, 0);
+        return;
+    }
+    let cc = -1;
+    if (mn == "jo") { cc = 0x80; }
+    else if (mn == "jno") { cc = 0x81; }
+    else if (mn == "jne") { cc = 0x85; }
+    else if (mn == "je" || mn == "jz") { cc = 0x84; }
+    else if (mn == "ja") { cc = 0x87; }
+    else if (mn == "jae") { cc = 0x83; }
+    else if (mn == "jbe") { cc = 0x86; }
+    else if (mn == "jb") { cc = 0x82; }
+    else if (mn == "js") { cc = 0x88; }
+    else if (mn == "jns") { cc = 0x89; }
+    else if (mn == "jl") { cc = 0x8C; }
+    else if (mn == "jge") { cc = 0x8D; }
+    else if (mn == "jle") { cc = 0x8E; }
+    else if (mn == "jg") { cc = 0x8F; }
+    else if (mn == "jp") { cc = 0x8A; }
+    else if (mn == "jnp") { cc = 0x8B; }
+    if (cc < 0) { asFail("BadInstruction"); return; }
+    asEmitByte(0x0F);
+    asEmitByte(cc);
+    asEmitRel32Fix(target.label, 0);
+}
+
+function encCall(target: Ref<Operand>): void {
+    if (target.kind == OPD_LABEL) {
+        asEmitByte(0xE8);
+        asEmitRel32Fix(target.label, 0);
+        return;
+    }
+    if (target.kind == OPD_REG && target.cls == CLS_R64) {
+        asRex(1, 0, 0, extBit(target.num));
+        asEmitByte(0xFF);
+        asEmitByte(modrm(3, 2, target.num & 7));
+        return;
+    }
+    asFail("BadOperand");
+}
+
+function encPushPop(dst: Ref<Operand>, push: int): void {
+    if (dst.kind != OPD_REG || dst.cls != CLS_R64) { asFail("BadOperand"); return; }
+    if (extBit(dst.num) == 1) { asEmitByte(0x41); }
+    let base = 0x58;
+    if (push == 1) { base = 0x50; }
+    asEmitByte(base + (dst.num & 7));
+}
+
+function encSse(dst: Ref<Operand>, src: Ref<Operand>, opc: int): void {
+    if (dst.kind != OPD_REG || dst.cls != CLS_XMM) { asFail("BadOperand"); return; }
+    let prefix = 0xF2;
+    if (opc == 0x2E) { prefix = 0x66; }
+    if (src.kind == OPD_MEM) {
+        const e = memEncTx(src);
+        if (e.bad == 1) { asFail("BadOperand"); return; }
+        asEmitByte(prefix);
+        asRex(0, 0, e.rexX, e.rexB);
+        asEmitByte(0x0F);
+        asEmitByte(opc);
+        emitModRmMemTx(e, dst.num & 7);
+        return;
+    }
+    if (src.kind == OPD_REG && src.cls == CLS_XMM) {
+        asEmitByte(prefix);
+        asEmitByte(0x0F);
+        asEmitByte(opc);
+        asEmitByte(modrm(3, dst.num & 7, src.num & 7));
+        return;
+    }
+    asFail("BadOperand");
+}
+
+function encMovq(dst: Ref<Operand>, src: Ref<Operand>): void {
+    // xmm 在 ModRM.reg、通用寄存器在 ModRM.rm：REX.R 取 xmm 的扩展位，REX.B 取通用寄存器的扩展位
+    //（原形两向都只设 REX.B 且 xmm←r64 取错了操作数——r8..r15、xmm8..15 会编成别的寄存器；
+    // 只用低号寄存器的既有调用字节不变。O4 第一步 f32 转换首次触发）。
+    if (dst.kind == OPD_REG && dst.cls == CLS_R64 && src.kind == OPD_REG && src.cls == CLS_XMM) {
+        asEmitByte(0x66);
+        asEmitByte(rexByte(1, extBit(src.num), 0, extBit(dst.num)));
+        asEmitByte(0x0F);
+        asEmitByte(0x7E);
+        asEmitByte(modrm(3, src.num & 7, dst.num & 7));
+        return;
+    }
+    if (dst.kind == OPD_REG && dst.cls == CLS_XMM && src.kind == OPD_REG && src.cls == CLS_R64) {
+        asEmitByte(0x66);
+        asEmitByte(rexByte(1, extBit(dst.num), 0, extBit(src.num)));
+        asEmitByte(0x0F);
+        asEmitByte(0x6E);
+        asEmitByte(modrm(3, dst.num & 7, src.num & 7));
+        return;
+    }
+    asFail("BadOperand");
+}
+
+function encCvtsi2sd(dst: Ref<Operand>, src: Ref<Operand>): void {
+    if (dst.kind != OPD_REG || dst.cls != CLS_XMM) { asFail("BadOperand"); return; }
+    const regBits = dst.num & 7;
+    if (src.kind == OPD_REG) {
+        if (src.cls != CLS_R64) { asFail("BadOperand"); return; }
+        asEmitByte(0xF2);
+        asEmitByte(rexByte(1, 0, 0, extBit(src.num)));
+        asEmitByte(0x0F);
+        asEmitByte(0x2A);
+        asEmitByte(modrm(3, regBits, src.num & 7));
+        return;
+    }
+    if (src.kind == OPD_MEM) {
+        const e = memEncTx(src);
+        if (e.bad == 1) { asFail("BadOperand"); return; }
+        asEmitByte(0xF2);
+        asEmitByte(0x48);
+        asEmitByte(0x0F);
+        asEmitByte(0x2A);
+        emitModRmMemTx(e, regBits);
+        return;
+    }
+    asFail("BadOperand");
+}
+
+// F3 0F 2A /r（REX.W）：cvtsi2ss xmm, r64——只收 xmm0..7 与 64 位寄存器源。
+function encCvtsi2ss(dst: Ref<Operand>, src: Ref<Operand>): void {
+    if (dst.kind != OPD_REG || dst.cls != CLS_XMM || src.kind != OPD_REG || src.cls != CLS_R64) { asFail("BadOperand"); return; }
+    asEmitByte(0xF3);
+    asEmitByte(rexByte(1, 0, 0, extBit(src.num)));
+    asEmitByte(0x0F);
+    asEmitByte(0x2A);
+    asEmitByte(modrm(3, dst.num & 7, src.num & 7));
+}
+
+// F3 0F op /r 的寄存器—寄存器形（cvtss2sd 0x5A、addss 0x58）；只收 xmm0..7。
+function encSseF3(dst: Ref<Operand>, src: Ref<Operand>, opc: int): void {
+    if (dst.kind != OPD_REG || dst.cls != CLS_XMM || src.kind != OPD_REG || src.cls != CLS_XMM) { asFail("BadOperand"); return; }
+    asEmitByte(0xF3);
+    asEmitByte(0x0F);
+    asEmitByte(opc);
+    asEmitByte(modrm(3, dst.num & 7, src.num & 7));
+}
+
+// —— packed/VEX 族（movupd/addpd/mulpd/unpcklpd/vbroadcastsd/vmovupd/vaddpd/vmulpd）——
+function encPackedMov(dst: Ref<Operand>, src: Ref<Operand>): void {
+    if (dst.kind == OPD_REG && dst.cls == CLS_XMM) {
+        if (src.kind == OPD_MEM) {
+            const e = memEncTx(src);
+            if (e.bad == 1) { asFail("BadOperand"); return; }
+            asEmitByte(0x66);
+            asRex(0, extBit(dst.num), e.rexX, e.rexB);
+            asEmitByte(0x0F);
+            asEmitByte(0x10);
+            emitModRmMemTx(e, dst.num & 7);
+            return;
+        }
+        if (src.kind == OPD_REG && src.cls == CLS_XMM) {
+            asEmitByte(0x66);
+            asRex(0, extBit(dst.num), 0, extBit(src.num));
+            asEmitByte(0x0F);
+            asEmitByte(0x10);
+            asEmitByte(modrm(3, dst.num & 7, src.num & 7));
+            return;
+        }
+        asFail("BadOperand");
+        return;
+    }
+    if (dst.kind == OPD_MEM) {
+        if (src.kind != OPD_REG || src.cls != CLS_XMM) { asFail("BadOperand"); return; }
+        const e = memEncTx(dst);
+        if (e.bad == 1) { asFail("BadOperand"); return; }
+        asEmitByte(0x66);
+        asRex(0, extBit(src.num), e.rexX, e.rexB);
+        asEmitByte(0x0F);
+        asEmitByte(0x11);
+        emitModRmMemTx(e, src.num & 7);
+        return;
+    }
+    asFail("BadOperand");
+}
+
+function encPacked(dst: Ref<Operand>, src: Ref<Operand>, opc: int): void {
+    if (dst.kind != OPD_REG || dst.cls != CLS_XMM) { asFail("BadOperand"); return; }
+    if (src.kind == OPD_MEM) {
+        const e = memEncTx(src);
+        if (e.bad == 1) { asFail("BadOperand"); return; }
+        asEmitByte(0x66);
+        asRex(0, 0, e.rexX, e.rexB);
+        asEmitByte(0x0F);
+        asEmitByte(opc);
+        emitModRmMemTx(e, dst.num & 7);
+        return;
+    }
+    if (src.kind == OPD_REG && src.cls == CLS_XMM) {
+        asEmitByte(0x66);
+        asEmitByte(0x0F);
+        asEmitByte(opc);
+        asEmitByte(modrm(3, dst.num & 7, src.num & 7));
+        return;
+    }
+    asFail("BadOperand");
+}
+
+function encPackedRR(dst: Ref<Operand>, src: Ref<Operand>, opc: int): void {
+    if (dst.kind != OPD_REG || dst.cls != CLS_XMM) { asFail("BadOperand"); return; }
+    if (src.kind != OPD_REG || src.cls != CLS_XMM) { asFail("BadOperand"); return; }
+    asEmitByte(0x66);
+    asEmitByte(0x0F);
+    asEmitByte(opc);
+    asEmitByte(modrm(3, dst.num & 7, src.num & 7));
+}
+
+function emitVex(map: int, vvvv: int, r: int, x: int, b: int): void {
+    const vv = ((~vvvv) & 0xF) << 3;
+    if (map == 1 && x == 0 && b == 0) {
+        asEmitByte(0xC5);
+        let b2 = vv | 0x04 | 0x01;
+        if (r == 0) { b2 = b2 | 0x80; }
+        asEmitByte(b2);
+        return;
+    }
+    asEmitByte(0xC4);
+    let b2 = map | 0x20;
+    if (r == 0) { b2 = b2 | 0x80; }
+    if (x == 0) { b2 = b2 | 0x40; }
+    if (b == 0) { b2 = b2 | 0x20; }
+    asEmitByte(b2);
+    asEmitByte(vv | 0x04 | 0x01);
+}
+
+function encVbroadcastsd(dst: Ref<Operand>, src: Ref<Operand>): void {
+    if (dst.kind != OPD_REG || dst.cls != CLS_YMM) { asFail("BadOperand"); return; }
+    if (src.kind != OPD_REG || src.cls != CLS_XMM) { asFail("BadOperand"); return; }
+    emitVex(2, 0, extBit(dst.num), 0, extBit(src.num));
+    asEmitByte(0x19);
+    asEmitByte(modrm(3, dst.num & 7, src.num & 7));
+}
+
+function encVmovupd(dst: Ref<Operand>, src: Ref<Operand>): void {
+    if (dst.kind == OPD_REG && dst.cls == CLS_YMM) {
+        if (src.kind != OPD_MEM) { asFail("BadOperand"); return; }
+        const e = memEncTx(src);
+        if (e.bad == 1) { asFail("BadOperand"); return; }
+        emitVex(1, 0, extBit(dst.num), e.rexX, e.rexB);
+        asEmitByte(0x10);
+        emitModRmMemTx(e, dst.num & 7);
+        return;
+    }
+    if (dst.kind == OPD_MEM) {
+        if (src.kind != OPD_REG || src.cls != CLS_YMM) { asFail("BadOperand"); return; }
+        const e = memEncTx(dst);
+        if (e.bad == 1) { asFail("BadOperand"); return; }
+        emitVex(1, 0, extBit(src.num), e.rexX, e.rexB);
+        asEmitByte(0x11);
+        emitModRmMemTx(e, src.num & 7);
+        return;
+    }
+    asFail("BadOperand");
+}
+
+function encVexPd(dst: Ref<Operand>, src1: Ref<Operand>, src2: Ref<Operand>, opc: int): void {
+    if (dst.kind != OPD_REG || dst.cls != CLS_YMM) { asFail("BadOperand"); return; }
+    if (src1.kind != OPD_REG || src1.cls != CLS_YMM) { asFail("BadOperand"); return; }
+    const r = extBit(dst.num);
+    if (src2.kind == OPD_REG && src2.cls == CLS_YMM) {
+        emitVex(1, src1.num, r, 0, extBit(src2.num));
+        asEmitByte(opc);
+        asEmitByte(modrm(3, dst.num & 7, src2.num & 7));
+        return;
+    }
+    if (src2.kind == OPD_MEM) {
+        const e = memEncTx(src2);
+        if (e.bad == 1) { asFail("BadOperand"); return; }
+        emitVex(1, src1.num, r, e.rexX, e.rexB);
+        asEmitByte(opc);
+        emitModRmMemTx(e, dst.num & 7);
+        return;
+    }
+    asFail("BadOperand");
+}
+// Prototype native emission protocol; all ISA encoding remains in assemble.tx.
+export function asStructuredBegin(): Ref<AsmImage> { asReset(); return as_img; }
+export function asStructuredSection(sec: int): void {
+    if (as_failed == 1) { return; }
+    if (sec == 0) { as_cur = SEC_TEXT; as_bytes = as_img.text; return; }
+    if (sec == 1) { as_cur = SEC_RDATA; as_bytes = as_img.rdata; return; }
+    if (sec == 2) { as_cur = SEC_DATA; as_bytes = as_img.data; as_img.storageUsed = 1; return; }
+    if (sec == 3) { as_cur = SEC_BSS; as_bytes = bytesNew(0); as_img.storageUsed = 1; return; }
+    asFail("UnsupportedDirective");
+}
+export function asStructuredLabel(name: string): void {
+    if (as_failed == 1) { return; }
+    if (len(name) == 0) { asFail("BadOperand"); return; }
+    if (asDefLabel(name) < 0) { asFail("DuplicateSymbol"); }
+}
+export function asStructuredAlign(n: int): void {
+    if (as_failed == 1) { return; }
+    if (n < 0 || n > 63) { asFail("UnsupportedDirective"); return; }
+    if (as_cur == SEC_TEXT && n > as_img.textAlignPow) { as_img.textAlignPow = n; }
+    if (as_cur == SEC_RDATA && n > as_img.rdataAlignPow) { as_img.rdataAlignPow = n; }
+    if (as_cur == SEC_DATA && n > as_img.dataAlignPow) { as_img.dataAlignPow = n; }
+    if (as_cur == SEC_BSS && n > as_img.bssAlignPow) { as_img.bssAlignPow = n; }
+    if (as_cur != SEC_BSS && n >= 32) {
+        if (asHere() != 0) { asFail("BadSectionAlignment"); } return;
+    }
+    if (as_cur == SEC_BSS) {
+        if (n >= 32) { if (as_img.bssSize != 0) { asFail("BadBssSize"); } return; }
+        const al = shl1n(n);
+        const padding = (al - as_img.bssSize % al) % al;
+        asStructuredZero(padding); return;
+    }
+    const al = shl1n(n);
+    while (bytesLen(asOut()) % al != 0) { asEmitByte(0); }
+}
+export function asStructuredByte(v: int): void {
+    if (as_failed == 1) { return; }
+    if (as_cur != SEC_RDATA && as_cur != SEC_DATA) { asFail("UnsupportedDirective"); return; }
+    if (v < 0 || v > 255) { asFail("BadOperand"); return; }
+    asEmitByte(v);
+}
+export function asStructuredQuad(v: int): void {
+    if (as_failed == 1) { return; }
+    if (as_cur != SEC_RDATA && as_cur != SEC_DATA) { asFail("UnsupportedDirective"); return; }
+    asEmitImm64(v);
+}
+export function asStructuredAddress(name: string): void { asStructuredAddressAddend(name, 0); }
+export function asStructuredAddressAddend(name: string, addend: int): void {
+    if (as_failed == 1) { return; }
+    if (as_cur != SEC_RDATA && as_cur != SEC_DATA) { asFail("UnsupportedDirective"); return; }
+    if (len(name) == 0) { asFail("BadOperand"); return; }
+    if (!storageLabelValid(name)) { asFail("BadOperand"); return; }
+    asAddFixAt(FIX_ADDR64, name, addend);
+    asEmitImm64(0);
+}
+// A64 入口（a64_asm.tx 用）：asStructuredBegin 之后调 asSetA64 标记映像；指令字由 a64_encode 编好，修补 kind 见 FIX_A64_*。
+// x86 的指令入口在 A64 映像里拒绝，反之亦然。
+export function asSetA64(): void { as_img.a64 = 1; }
+export function asImgA64(): int { return as_img.a64; }
+export function asA64Here(): int { return asHere(); }
+/// 在代码节当前位置写一条指令字；kind ≥ 0 时先在同一位置登记修补（符号 sym、加数 addend）。
+export function asA64Word(word: int, kind: int, sym: string, addend: int): void {
+    if (as_failed == 1) { return; }
+    if (as_img.a64 != 1 || as_cur != SEC_TEXT) { asFail("InstructionOutsideText"); return; }
+    if (word < 0 || word > 4294967295 || kind > FIX_A64_LDST8 + 4) { asFail("BadOperand"); return; }
+    if (kind >= 0) {
+        if (kind < FIX_A64_CALL26 || len(sym) == 0) { asFail("BadOperand"); return; }
+        asAddFixAt(kind, sym, addend);
+    }
+    let k = 0;
+    while (k < 4) { asEmitByte((word >>> (k * 8)) & 255); k = k + 1; }
+}
+/// 在当前节当前位置定义标号；0 成功，-1 重名。
+export function asA64Label(name: string): int {
+    if (as_failed == 1) { return -1; }
+    if (len(name) == 0) { asFail("BadOperand"); return -1; }
+    return asDefLabel(name);
+}
+export function asStructuredMissing(): Ref<Operand> { return emptyOperand(); }
+export function asStructuredReg(cls: int, num: int): Ref<Operand> {
+    if (cls < 0 || cls > 4 || num < 0 || num > 15) {
+        asFail("BadOperand"); return emptyOperand();
+    }
+    return opdReg(cls, num);
+}
+export function asStructuredImm(v: int): Ref<Operand> { return opdImm(v); }
+export function asStructuredTarget(name: string): Ref<Operand> {
+    if (len(name) == 0) { asFail("BadOperand"); return emptyOperand(); }
+    return opdLabel(name);
+}
+export function asStructuredMem(size: int, base: int, index: int, scale: int, disp: int, rip: int, symbol: string): Ref<Operand> {
+    if (size < 0 || size > 3 || base < -1 || base > 15 || index < -1 || index > 15 || scale < 0 || scale > 3 || rip < 0 || rip > 1) {
+        asFail("BadOperand"); return emptyOperand();
+    }
+    if ((rip == 1 && (len(symbol) == 0 || base != -1 || index != -1)) || (rip == 0 && base < 0)) {
+        asFail("BadOperand"); return emptyOperand();
+    }
+    return new Operand { kind: OPD_MEM, cls: 0, num: 0, imm: 0, memSize: size,
+        memBase: base, memIndex: index, scale: scale, disp: disp, hasRip: rip, ripSym: symbol, label: "" };
+}
+export function asStructuredInstruction(mn: string, nops: int, a: Ref<Operand>, b: Ref<Operand>, c: Ref<Operand>, line: int): void {
+    if (as_failed == 1) { return; }
+    as_last_line = line;
+    as_last_err = "";
+    if (as_cur != SEC_TEXT || as_img.a64 == 1) { asFail("InstructionOutsideText"); return; }
+    if (nops < 0 || nops > 3 || line < 1) { asFail("BadOperand"); return; }
+    if ((nops > 0 && a.kind < 0) || (nops > 1 && b.kind < 0) || (nops > 2 && c.kind < 0)) {
+        asFail("BadOperand"); return;
+    }
+    op0 = a; op1 = b; op2 = c;
+    asmEncodeOperands(mn, nops);
+    if (asRipPending >= 0) { asRipSettle(); }
+}
+// C prototype buffered emission. No instruction text is constructed or parsed.
+// A64 缓冲（asBufferNewA64）另有条目 kind 20..26，由 a64_asm.tx 写入并经 a64BufferSubmit 提交（macOS 适配 M4 设计 A2、A3）。
+export struct StructuredEntry {
+    kind: int, mnemonic: string, nops: int,
+    a: Ref<Operand>, b: Ref<Operand>, c: Ref<Operand>,
+    value: int, name: string, line: int,
+}
+// line：A64 条目记下的行号（pc＋2，同 asProducer*；可移植渲染器逐操作设定）；listFn：清单开启时本缓冲所属的函数号（-1 不记）。
+// id 区分缓冲（按缓冲记状态的构造器用，如 rtfn 的记录）。
+export struct StructuredBuffer {
+    entries: List<Ref<StructuredEntry>>, missing: Ref<Operand>, invalid: Ref<StructuredEntry>, a64: bool, line: int, listFn: int, id: int,
+}
+let asBufferCount: int = 0;
+export function asBufferNew(): Ref<StructuredBuffer> {
+    const missing = emptyOperand();
+    const invalid = new StructuredEntry { kind: -1, mnemonic: "", nops: 0,
+        a: missing, b: missing, c: missing, value: 0, name: "", line: 0 };
+    asBufferCount = asBufferCount + 1;
+    return new StructuredBuffer { entries: listNew(), missing: missing, invalid: invalid, a64: false, line: 1, listFn: -1, id: asBufferCount };
+}
+/// A64 代码的缓冲：数据与标号条目同 asBufferNew，指令只能经 a64_asm.tx 写入。
+export function asBufferNewA64(): Ref<StructuredBuffer> {
+    const b = asBufferNew();
+    b.a64 = true;
+    return b;
+}
+/// 让映像失败（A64 提交用；原因与当前行同 asStructured*）。
+export function asFailWith(name: string, line: int): void {
+    as_last_line = line;
+    if (as_failed == 0) { asFail(name); }
+}
+export function asBufferClear(buf: Ref<StructuredBuffer>): void { buf.entries = listNew(); }
+function asBufferEntry(buf: Ref<StructuredBuffer>, kind: int, value: int, name: string, line: int): void {
+    const missing = buf.missing;
+    listPush(buf.entries, new StructuredEntry { kind: kind, mnemonic: "", nops: 0,
+            a: missing, b: missing, c: missing, value: value, name: name, line: line });
+}
+export function asBufferInstruction(buf: Ref<StructuredBuffer>, mnemonic: string, nops: int, a: Ref<Operand>, b: Ref<Operand>, c: Ref<Operand>, line: int): void {
+    listPush(buf.entries, new StructuredEntry { kind: 0, mnemonic: mnemonic, nops: nops,
+            a: a, b: b, c: c, value: 0, name: "", line: line });
+}
+export function asBufferSection(buf: Ref<StructuredBuffer>, sec: int, line: int): void { asBufferEntry(buf, 1, sec, "", line); }
+export function asBufferLabel(buf: Ref<StructuredBuffer>, name: string, line: int): void { asBufferEntry(buf, 2, 0, name, line); }
+export function asBufferAlign(buf: Ref<StructuredBuffer>, power: int, line: int): void { asBufferEntry(buf, 3, power, "", line); }
+export function asBufferByte(buf: Ref<StructuredBuffer>, value: int, line: int): void { asBufferEntry(buf, 4, value, "", line); }
+export function asBufferQuad(buf: Ref<StructuredBuffer>, value: int, line: int): void { asBufferEntry(buf, 5, value, "", line); }
+export function asBufferAddress(buf: Ref<StructuredBuffer>, name: string, line: int): void { asBufferEntry(buf, 6, 0, name, line); }
+export function asBufferZero(buf: Ref<StructuredBuffer>, value: int, line: int): void { asBufferEntry(buf, 7, value, "", line); }
+export function asBufferAddressAddend(buf: Ref<StructuredBuffer>, name: string, addend: int, line: int): void { asBufferEntry(buf, 8, addend, name, line); }
+// Metadata travels with buffered producer actions, never as machine bytes. 函数的起止每次都记（产物函数符号用，
+// v052-image-symbols）；序言、尾声与帧事件只在收集函数帧（--map）时记。
+export function asBufferFunctionBegin(buf: Ref<StructuredBuffer>, module: string, name: string, origin: string): void {
+    listPush(buf.entries, new StructuredEntry { kind: 9, mnemonic: module, name: name, value: 0, nops: 0,
+            a: buf.missing, b: buf.missing, c: buf.missing, line: 1 });
+    const entry = listGet(buf.entries, listLen(buf.entries) - 1) catch buf.invalid;
+    // The otherwise unused operand label owns the declared producer origin.
+    entry.a = asStructuredTarget(origin);
+}
+export function asBufferBoundaryBegin(buf: Ref<StructuredBuffer>, module: string, name: string, model: string): void {
+    asBufferFunctionBegin(buf, module, name, "process-thread-entry");
+    const entry = listGet(buf.entries, listLen(buf.entries) - 1) catch buf.invalid;
+    entry.kind = 14; entry.b = asStructuredTarget(model);
+}
+/// 生成函数 f_<id> 的开头（可移植渲染器用；与 emitmirror 的 asProducerFunctionBegin 记同一条函数信息）。
+export function asBufferGeneratedBegin(buf: Ref<StructuredBuffer>, id: int): void {
+    asBufferEntry(buf, 15, id, "f_" + toStr(id), 1);
+}
+export function asBufferFunctionEnd(buf: Ref<StructuredBuffer>): void { asBufferEntry(buf, 10, 0, "", 1); }
+export function asBufferFunctionPrologueEnd(buf: Ref<StructuredBuffer>): void { if (nativeFunctionsActive()) { asBufferEntry(buf, 11, 0, "", 1); } }
+export function asBufferFunctionEpilogueStart(buf: Ref<StructuredBuffer>): void { if (nativeFunctionsActive()) { asBufferEntry(buf, 12, 0, "", 1); } }
+export function asBufferFrame(buf: Ref<StructuredBuffer>, kind: string, reg: int, size: int): void {
+    const missing = buf.missing; let mn = ""; let n = 0; let a = missing; let b = missing;
+    if (kind == "allocate-stack" || kind == "release-stack") {
+        if (reg != 4 || size < 0 || size % 8 != 0) { asFail("BadBufferedFrameOperand"); return; }
+        mn = "sub"; if (kind == "release-stack") { mn = "add"; } n = 2; a = asStructuredReg(0, 4); b = asStructuredImm(size);
+    } else if (kind == "push-nonvolatile" || kind == "pop-nonvolatile") {
+        if (size != 8 || (reg != 3 && reg != 5 && reg != 6 && reg != 7 && (reg < 12 || reg > 15))) { asFail("BadBufferedFrameOperand"); return; }
+        mn = "push"; if (kind == "pop-nonvolatile") { mn = "pop"; } n = 1; a = asStructuredReg(0, reg);
+    } else if (kind == "return") {
+        if (reg != -1 || size != 8) { asFail("BadBufferedFrameOperand"); return; } mn = "ret";
+    } else if (kind == "set-frame-pointer") {
+        if (reg != 5 || size != 0) { asFail("BadBufferedFrameOperand"); return; }
+        mn = "mov"; n = 2; a = asStructuredReg(0, 5); b = asStructuredReg(0, 4);
+    }
+    else { asFail("BadBufferedFrameKind"); return; }
+    asBufferInstruction(buf, mn, n, a, b, missing, 1);
+    if (nativeFunctionsActive()) {
+        const entry = listGet(buf.entries, listLen(buf.entries) - 1) catch buf.invalid;
+        entry.kind = 13; entry.name = kind; entry.value = size;
+    }
+}
+// Append exactly the original source length: self-append is finite, no iteration truncation.
+function asBufferGet(buf: Ref<StructuredBuffer>, index: int): Ref<StructuredEntry> {
+    const entry = listGet(buf.entries, index) catch buf.invalid;
+    assert(entry.kind >= 0, "structured buffer index invariant");
+    return entry;
+}
+export function asBufferAppend(dst: Ref<StructuredBuffer>, src: Ref<StructuredBuffer>): void {
+    const n = listLen(src.entries);
+    let i = 0;
+    while (i < n) { listPush(dst.entries, asBufferGet(src, i)); i = i + 1; }
+}
+export function asBufferSubmit(buf: Ref<StructuredBuffer>): void {
+    if (buf.a64) { asFail("A64BufferNeedsA64Submit"); return; }
+    let i = 0;
+    while (i < listLen(buf.entries)) {
+        if (as_failed == 1) { return; }
+        const entry = asBufferGet(buf, i);
+        as_last_line = entry.line;
+        if (entry.line < 1) { asFail("BadOperand"); return; }
+        if (entry.kind == 0) { asStructuredInstruction(entry.mnemonic, entry.nops, entry.a, entry.b, entry.c, entry.line); }
+        else if (entry.kind == 1) { asStructuredSection(entry.value); }
+        else if (entry.kind == 2) { asStructuredLabel(entry.name); }
+        else if (entry.kind == 3) { asStructuredAlign(entry.value); }
+        else if (entry.kind == 4) { asStructuredByte(entry.value); }
+        else if (entry.kind == 5) { asStructuredQuad(entry.value); }
+        else if (entry.kind == 6) { asStructuredAddress(entry.name); }
+        else if (entry.kind == 7) { asStructuredZero(entry.value); }
+        else if (entry.kind == 8) { asStructuredAddressAddend(entry.name, entry.value); }
+        else if (entry.kind == 9 || entry.kind == 14) {
+            if (as_cur != SEC_TEXT) { asFail("FunctionOutsideText"); return; }
+            if (entry.kind == 14) { nativeFunctionBoundaryBegin(entry.mnemonic, entry.name, entry.b.label, asHere()); }
+            else { nativeFunctionOwnedBegin(entry.mnemonic, entry.name, entry.a.label, asHere()); }
+        }
+        else if (entry.kind == 10) { if (as_cur != SEC_TEXT) { asFail("FunctionEndOutsideText"); return; } nativeFunctionEnd(asHere()); }
+        else if (entry.kind == 11) { nativeFunctionPrologueEnd(asHere()); }
+        else if (entry.kind == 12) { nativeFunctionEpilogueStart(asHere()); }
+        else if (entry.kind == 13) {
+            const before = asHere(); asStructuredInstruction(entry.mnemonic, entry.nops, entry.a, entry.b, entry.c, entry.line);
+            let reg = entry.a.num; if (entry.name == "return") { reg = -1; }
+            if (as_failed == 0) { nativeFunctionEvent(before, asHere(), entry.name, reg, entry.value); }
+        }
+        else if (entry.kind == 15) {
+            if (as_cur != SEC_TEXT) { asFail("FunctionOutsideText"); return; }
+            nativeFunctionBegin(entry.value, entry.name, asHere());
+        }
+        else { asFail("BadInstruction"); return; }
+        i = i + 1;
+    }
+}
+
+let asProducerMeta: List<int> = listNew();
+let asProducerNames: List<string> = listNew();
+let asProducerOperands: List<Ref<Operand>> = listNew();
+// Explicit producer actions: record instruction boundaries only after ISA encoding.
+export function asProducerFunctionBegin(id: int, line: int): void {
+    const name = "f_" + toStr(id); asProducerLabel(0, name, line);
+    if (as_failed == 0) { nativeFunctionBegin(id, name, asHere()); }
+}
+export function asProducerFunctionPrologueEnd(): void { if (as_failed == 0) { nativeFunctionPrologueEnd(asHere()); } }
+export function asProducerFunctionEpilogueStart(): void { if (as_failed == 0) { nativeFunctionEpilogueStart(asHere()); } }
+export function asProducerFunctionEnd(): void { if (as_failed == 0) { nativeFunctionEnd(asHere()); } }
+export function asProducerFrame(kind: string, reg: int, size: int, line: int): void {
+    const before = asHere(); const missing = asStructuredMissing();
+    if (kind == "push-nonvolatile" || kind == "pop-nonvolatile") {
+        let mn = "push"; if (kind == "pop-nonvolatile") { mn = "pop"; }
+        asProducerInstruction(0, mn, 1, asStructuredReg(0, reg), missing, missing, line);
+    } else if (kind == "allocate-stack" || kind == "release-stack") {
+        let mn = "sub"; if (kind == "release-stack") { mn = "add"; }
+        asProducerInstruction(0, mn, 2, asStructuredReg(0, 4), asStructuredImm(size), missing, line);
+    } else if (kind == "set-frame-pointer") {
+        asProducerInstruction(0, "mov", 2, asStructuredReg(0, 5), asStructuredReg(0, 4), missing, line);
+    } else if (kind == "return") { asProducerInstruction(0, "ret", 0, missing, missing, missing, line); }
+    else { asFail("BadFrameInstruction"); return; }
+    if (as_failed == 0) { nativeFunctionEvent(before, asHere(), kind, reg, size); }
+}
+export function asProducerBeginFunction(): void {
+    asProducerMeta = listNew(); asProducerNames = listNew(); asProducerOperands = listNew();
+}
+export function asProducerSubmitBody(): void {
+    // Shape is checked once here: every instruction pushed four meta words and
+    // three operands, so the per-entry reads below stay in range.
+    const count = listLen(asProducerNames);
+    const meta = asProducerMeta;
+    const operands = asProducerOperands;
+    assert(listLen(meta) == count * 4, "producer record shape invariant");
+    let i = 0;
+    while (i < count) {
+        if (as_failed == 1) { break; }
+        const pos = i * 4;
+        const kind = listGet(meta, pos) catch -1;
+        const nops = listGet(meta, pos + 1) catch -1;
+        const line = listGet(meta, pos + 2) catch -1;
+        const operandBase = listGet(meta, pos + 3) catch -1;
+        const name = listGet(asProducerNames, i) catch "";
+        as_last_line = line;
+        if (line < 1) { asFail("BadOperand"); break; }
+        if (kind == 0) {
+            asStructuredInstruction(name, nops, listGet(operands, operandBase) catch missingOperand, listGet(operands, operandBase + 1) catch missingOperand, listGet(operands, operandBase + 2) catch missingOperand, line);
+        } else if (kind == 2) { asStructuredLabel(name); }
+        else { asFail("BadInstruction"); break; }
+        i = i + 1;
+    }
+    if (asListingOn) { asListingBody(); }
+    asProducerBeginFunction();
+}
+export function asProducerLabel(body: int, name: string, line: int): void {
+    if (body == 1) {
+        listPush(asProducerMeta, 2); listPush(asProducerMeta, 0);
+        listPush(asProducerMeta, line); listPush(asProducerMeta, -1);
+        listPush(asProducerNames, name);
+    } else {
+        as_last_line = line; asStructuredLabel(name);
+        if (asListingOn) { asListingAdd(2, name, 0, missingOperand, missingOperand, missingOperand, line); }
+    }
+}
+export function asProducerInstruction(body: int, mn: string, nops: int, a: Ref<Operand>, b: Ref<Operand>, c: Ref<Operand>, line: int): void {
+    if (body == 1) {
+        const operandBase = listLen(asProducerOperands);
+        listPush(asProducerOperands, a); listPush(asProducerOperands, b); listPush(asProducerOperands, c);
+        listPush(asProducerMeta, 0); listPush(asProducerMeta, nops);
+        listPush(asProducerMeta, line); listPush(asProducerMeta, operandBase);
+        listPush(asProducerNames, mn);
+    } else {
+        asStructuredInstruction(mn, nops, a, b, c, line);
+        if (asListingOn) { asListingAdd(0, mn, nops, a, b, c, line); }
+    }
+}
+export function asProducerInteger(text: string): int {
+    const value = parseIntAuto(text);
+    if (parseIntAutoOk == 0) { asFail("BadOperand"); }
+    return value;
+}
+export function asProducerRegister(name: string): Ref<Operand> {
+    if (name == "rax") { return asStructuredReg(0, 0); }
+    if (name == "rcx") { return asStructuredReg(0, 1); }
+    if (name == "rdx") { return asStructuredReg(0, 2); }
+    if (name == "rbx") { return asStructuredReg(0, 3); }
+    if (name == "rsp") { return asStructuredReg(0, 4); }
+    if (name == "rbp") { return asStructuredReg(0, 5); }
+    if (name == "rsi") { return asStructuredReg(0, 6); }
+    if (name == "rdi") { return asStructuredReg(0, 7); }
+    if (name == "r8") { return asStructuredReg(0, 8); }
+    if (name == "r9") { return asStructuredReg(0, 9); }
+    if (name == "r10") { return asStructuredReg(0, 10); }
+    if (name == "r11") { return asStructuredReg(0, 11); }
+    if (name == "r12") { return asStructuredReg(0, 12); }
+    if (name == "r13") { return asStructuredReg(0, 13); }
+    if (name == "r14") { return asStructuredReg(0, 14); }
+    if (name == "r15") { return asStructuredReg(0, 15); }
+    if (name == "eax") { return asStructuredReg(1, 0); }
+    if (name == "ecx") { return asStructuredReg(1, 1); }
+    if (name == "edx") { return asStructuredReg(1, 2); }
+    if (name == "ebx") { return asStructuredReg(1, 3); }
+    if (name == "esp") { return asStructuredReg(1, 4); }
+    if (name == "ebp") { return asStructuredReg(1, 5); }
+    if (name == "esi") { return asStructuredReg(1, 6); }
+    if (name == "edi") { return asStructuredReg(1, 7); }
+    if (name == "r8d") { return asStructuredReg(1, 8); }
+    if (name == "r9d") { return asStructuredReg(1, 9); }
+    if (name == "r10d") { return asStructuredReg(1, 10); }
+    if (name == "r11d") { return asStructuredReg(1, 11); }
+    if (name == "r12d") { return asStructuredReg(1, 12); }
+    if (name == "r13d") { return asStructuredReg(1, 13); }
+    if (name == "r14d") { return asStructuredReg(1, 14); }
+    if (name == "r15d") { return asStructuredReg(1, 15); }
+    if (name == "al") { return asStructuredReg(2, 0); }
+    if (name == "cl") { return asStructuredReg(2, 1); }
+    if (name == "dl") { return asStructuredReg(2, 2); }
+    if (name == "bl") { return asStructuredReg(2, 3); }
+    if (name == "xmm0") { return asStructuredReg(3, 0); }
+    if (name == "xmm1") { return asStructuredReg(3, 1); }
+    if (name == "xmm2") { return asStructuredReg(3, 2); }
+    if (name == "xmm3") { return asStructuredReg(3, 3); }
+    if (name == "xmm4") { return asStructuredReg(3, 4); }
+    if (name == "xmm5") { return asStructuredReg(3, 5); }
+    if (name == "xmm6") { return asStructuredReg(3, 6); }
+    if (name == "xmm7") { return asStructuredReg(3, 7); }
+    if (name == "xmm8") { return asStructuredReg(3, 8); }
+    if (name == "xmm9") { return asStructuredReg(3, 9); }
+    if (name == "xmm10") { return asStructuredReg(3, 10); }
+    if (name == "xmm11") { return asStructuredReg(3, 11); }
+    if (name == "xmm12") { return asStructuredReg(3, 12); }
+    if (name == "xmm13") { return asStructuredReg(3, 13); }
+    if (name == "xmm14") { return asStructuredReg(3, 14); }
+    if (name == "xmm15") { return asStructuredReg(3, 15); }
+    if (name == "ymm0") { return asStructuredReg(4, 0); }
+    if (name == "ymm1") { return asStructuredReg(4, 1); }
+    if (name == "ymm2") { return asStructuredReg(4, 2); }
+    if (name == "ymm3") { return asStructuredReg(4, 3); }
+    if (name == "ymm4") { return asStructuredReg(4, 4); }
+    if (name == "ymm5") { return asStructuredReg(4, 5); }
+    if (name == "ymm6") { return asStructuredReg(4, 6); }
+    if (name == "ymm7") { return asStructuredReg(4, 7); }
+    if (name == "ymm8") { return asStructuredReg(4, 8); }
+    if (name == "ymm9") { return asStructuredReg(4, 9); }
+    if (name == "ymm10") { return asStructuredReg(4, 10); }
+    if (name == "ymm11") { return asStructuredReg(4, 11); }
+    if (name == "ymm12") { return asStructuredReg(4, 12); }
+    if (name == "ymm13") { return asStructuredReg(4, 13); }
+    if (name == "ymm14") { return asStructuredReg(4, 14); }
+    if (name == "ymm15") { return asStructuredReg(4, 15); }
+    asFail("BadOperand"); return emptyOperand();
+}
+
+// Logical zero storage never constructs an initialized byte list.
+export function asStructuredZero(n: int): void {
+    if (as_failed == 1) { return; }
+    if (as_cur != SEC_BSS) { asFail("UnsupportedDirective"); return; }
+    if (n < 0 || n > 4294967295 || as_img.bssSize > 4294967295 - n) { asFail("BadBssSize"); return; }
+    as_img.bssSize = as_img.bssSize + n;
+}
+let storageNumberOk: int = 0;
+function storageParseInt(text: string): int {
+    storageNumberOk = 0;
+    if (len(text) == 0) { return 0; }
+    let at = 0; let negative = 0;
+    if ((byteAt(text, at) catch 0) == 45) { negative = 1; at = at + 1; }
+    else if ((byteAt(text, at) catch 0) == 43) { at = at + 1; }
+    let base = 10;
+    if (at + 2 < len(text) && (byteAt(text, at) catch 0) == 48 && ((byteAt(text, at + 1) catch 0) == 120 || (byteAt(text, at + 1) catch 0) == 88)) { base = 16; at = at + 2; }
+    if (at >= len(text)) { return 0; }
+    let limit = -9223372036854775807; if (negative == 1) { limit = limit - 1; }
+    let value = 0;
+    while (at < len(text)) {
+        const digit = hexValAs(byteAt(text, at) catch 0);
+        if (digit < 0 || digit >= base) { return 0; }
+        if (value < limit / base || (value == limit / base && digit > -(limit % base))) { return 0; }
+        value = value * base - digit; at = at + 1;
+    }
+    storageNumberOk = 1;
+    if (negative == 1) { return value; } return -value;
+}
+function storageLabelValid(name: string): bool {
+    if (len(name) == 0) { return false; }
+    let i = 0;
+    while (i < len(name)) {
+        const b = byteAt(name, i) catch 0;
+        if (!((b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 || b == 46 || b == 36 || b >= 128 || (i > 0 && b >= 48 && b <= 57))) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+function asStorageQuadText(text: string): void {
+    const value = storageParseInt(text);
+    if (storageNumberOk == 1) { asStructuredQuad(value); return; }
+    let split = -1; let i = 1;
+    while (i < len(text)) {
+        const c = byteAt(text, i) catch 0;
+        if (c == 43 || c == 45) { split = i; break; } i = i + 1;
+    }
+    if (split < 0) { asStructuredAddressAddend(text, 0); return; }
+    const name = trimSpAll(asByteSub(text, 0, split));
+    const magnitude = storageParseInt(trimSpAll(asByteSub(text, split + 1, len(text) - split - 1)));
+    if (storageNumberOk == 0 || magnitude < 0) { asFail("BadOperand"); return; }
+    let addend = magnitude; if ((byteAt(text, split) catch 0) == 45) { addend = -magnitude; }
+    asStructuredAddressAddend(name, addend);
+}
+
+// 原生函数清单（6d-5）：关闭时只在函数提交与序言/尾声处判断；体内编码热循环不变。
+// A64 的行（asListingA64）不带结构化操作数，操作数按反汇编文本放在 ops；x86 的行 ops 为空。
+export struct AsListingRow {
+    fnIdx: int, pc: int, kind: int, name: string, nops: int,
+    a: Ref<Operand>, b: Ref<Operand>, c: Ref<Operand>, ops: List<string>,
+}
+const asListingNoOps: List<string> = listNew();
+let asListingOn: bool = false;
+let asListingFn: int = -1;
+let asListingLimit: int = 0;
+let asListingCut: bool = false;
+let asListingRows: List<Ref<AsListingRow>> = listNew();
+export function asListingClear(): void {
+    asListingOn = false; asListingFn = -1; asListingCut = false; asListingRows = listNew();
+}
+export function asListingStart(limit: int): void {
+    asListingClear(); asListingLimit = limit; asListingOn = true;
+}
+export function asListingSelect(fnIdx: int): void { asListingFn = fnIdx; }
+export function asListingStop(): void { asListingOn = false; }
+export function asListingGet(): List<Ref<AsListingRow>> { return asListingRows; }
+export function asListingTruncated(): bool { return asListingCut; }
+function asListingAdd(kind: int, name: string, nops: int, a: Ref<Operand>, b: Ref<Operand>, c: Ref<Operand>, line: int): void {
+    if (asListingFn < 0 || asListingCut) { return; }
+    if (compileProfileActive()) {
+        if (kind == 0) {
+            let imm = 0; let zeros = 0; let mem = 0;
+            if (nops > 0) { if (a.kind == 1) { imm = imm + 1; if (a.imm == 0) { zeros = zeros + 1; } } if (a.kind == 2) { mem = mem + 1; } }
+            if (nops > 1) { if (b.kind == 1) { imm = imm + 1; if (b.imm == 0) { zeros = zeros + 1; } } if (b.kind == 2) { mem = mem + 1; } }
+            if (nops > 2) { if (c.kind == 1) { imm = imm + 1; if (c.imm == 0) { zeros = zeros + 1; } } if (c.kind == 2) { mem = mem + 1; } }
+            compileProfileInstruction(asListingFn, nops, imm, zeros, mem);
+        }
+        return;
+    }
+    if (asListingLimit > 0 && listLen(asListingRows) >= asListingLimit) { asListingCut = true; return; }
+    listPush(asListingRows, new AsListingRow { fnIdx: asListingFn, pc: line - 2, kind: kind,
+            name: name, nops: nops, a: a, b: b, c: c, ops: asListingNoOps });
+}
+export function asListingActive(): bool { return asListingOn; }
+/// A64 清单行（a64BufferSubmit 用）：kind 0 指令（name 助记符、ops 操作数文本）、2 标号；line 同 asProducer*。
+/// 编译画像按操作数文本计数：# 开头为立即数（#0、#0x0 为零），[ 开头为内存。
+export function asListingA64(fnIdx: int, kind: int, name: string, ops: List<string>, line: int): void {
+    if (!asListingOn || asListingCut || fnIdx < 0) { return; }
+    if (compileProfileActive()) {
+        if (kind == 0) {
+            let imm = 0; let zeros = 0; let mem = 0;
+            for (o in ops) {
+                const head = byteAt(o, 0) catch 0;
+                if (head == 35) { imm = imm + 1; if (o == "#0" || o == "#0x0") { zeros = zeros + 1; } }
+                if (head == 91) { mem = mem + 1; }
+            }
+            compileProfileInstruction(fnIdx, listLen(ops), imm, zeros, mem);
+        }
+        return;
+    }
+    if (asListingLimit > 0 && listLen(asListingRows) >= asListingLimit) { asListingCut = true; return; }
+    listPush(asListingRows, new AsListingRow { fnIdx: fnIdx, pc: line - 2, kind: kind, name: name, nops: 0,
+            a: missingOperand, b: missingOperand, c: missingOperand, ops: ops });
+}
+function asListingBody(): void {
+    let i = 0;
+    while (i < listLen(asProducerNames) && !asListingCut) {
+        const p = i * 4;
+        const k = listGet(asProducerMeta, p) catch -1;
+        const n = listGet(asProducerMeta, p + 1) catch 0;
+        const line = listGet(asProducerMeta, p + 2) catch 1;
+        const base = listGet(asProducerMeta, p + 3) catch -1;
+        asListingAdd(k, listGet(asProducerNames, i) catch "", n,
+            listGet(asProducerOperands, base) catch missingOperand,
+            listGet(asProducerOperands, base + 1) catch missingOperand,
+            listGet(asProducerOperands, base + 2) catch missingOperand, line);
+        i = i + 1;
+    }
+}

@@ -1,0 +1,1698 @@
+// link_pe.tx —— Windows PE 直发链接器的 .tx 承接（V0.50-S5-① 批 D 后半；BOOT-47；
+// D102 §一——src/tools/aot/direct_link.zig buildExeAssembled/emitPe 的同构移植）。
+//
+// 职责：AsmImage（经 assemble.tx 导出访问器）＋shim blob COFF（readFile 字节）
+// → gc-sections 裁剪 → 宿主三节布局 → 导入面（IBN/ILT/IAT/DLL 名/描述符）→
+// 重定位回填 → PE32+ 直写。
+//
+// 差异登记（selfhost-delimitation §五 R-c）：validateRoutedTable 的
+// LoadLibraryA/GetProcAddress 实测校验无 .tx FFI——砍为静态归类（dllOf 表驱动
+// 不变；导入表正确性由产物行为验证覆盖）。
+//
+// AsmImage 经 assemble.tx 标量访问器跨模块；可附加冻结宿主静态 COFF 对象。
+
+import { asImgText, asImgRdata, asImgData, asImgBssSize, asImgAlignPow, asFailedAs, asSymCountL, asSymIndexL, asSymNameL, asSymSecL, asSymOffL, asSymNeededL, asFixCountL, asFixSecL, asFixAtL, asFixKindL, asFixSymL, asFixAddendL } from "./assemble";
+
+import { BinaryName, rawName, rawNameOf, rawNameEmpty, rawNameNone, rawNameSize, rawNameByte, rawNamePrefix, rawNameEqual, rawNameLess, rawNameText, rawNameTextHash, rawNameEqualText } from "./binary_name";
+import { linkMapSymbolsEnabled, linkMapAddPlacement, linkMapEnabled, linkMapBegin, linkMapFail, linkMapDone, linkMapLayout, linkMapAddSection, linkMapRow, linkMapInput, linkMapAdd, linkMapSynthetic } from "./link_map_data";
+
+function dec(v: int): string {
+    return toStr(v);
+}
+
+// ============================================================================
+// §0 常量（direct_link §2 同构）
+// ============================================================================
+
+const IMAGE_BASE: int = 0x400000;
+const SEC_ALIGN: int = 0x1000;
+const FILE_ALIGN: int = 0x200;
+const STACK_RESERVE: int = 0x800000;
+const HEADERS_OFF: int = 0x400;
+// 映像（含虚拟尾部）上限：代码一律用 32 位相对重定位（small code model），超过 2 GiB 即够不着。
+const IMAGE_LIMIT: int = 2147483648;
+const TEXT_RVA: int = 0x1000;
+const OWNED_RUNTIME_SYMBOLS = "memcpy memmove memset memcmp memchr malloc calloc realloc free strlen strcmp strncmp strcpy strncpy strcat strchr strrchr strstr exit __stack_chk_guard __stack_chk_fail ___chkstk_ms __divti3 __udivti3 wcslen mbstowcs strtol strtoul qsort fopen fclose fread fseek ftell feof ferror getenv snprintf __cxa_begin_catch _Unwind_Resume _ZSt9terminatev __intrinsic_setjmpex longjmp _errno __mingw_fprintf __mingw_snprintf __mingw_vfprintf __mingw_vsnprintf __acrt_iob_func __tx_native_mem_alloc __tx_native_mem_free __tx_native_mem_realloc __tx_store_str_ptr __tx_store_str_len __tx_store_str_set_span __tx_store_new_str_take __tx_store_str_reuse_ok __tx_site_of __tx_str_concat_host __tx_host_entry_setup __tx_entry_stage __tx_entry_win_ptr __tx_host_argv_fail";
+
+const DEF_BOTTOM2: int = -2;
+const DEF_TOP2: int = -1;
+
+let lk_failed: int = 0;
+let lk_missing: string = "";
+
+function lkFail(missing: string): void {
+    lk_failed = 1;
+    lk_missing = missing;
+    linkMapFail(missing);
+}
+
+// ============================================================================
+// §1 COFF 解析（CoffObj.parse :49-148 同构；字节源＝string）
+// ============================================================================
+
+struct CoffReloc {
+    va: int,
+    sym: int,
+    typ: int,
+}
+
+struct CoffSection {
+    originObject: int, originIndex: int,
+    nameSpan: Ref<BinaryName>,
+    rawSource: Bytes, // 所属对象的字节；持有整个对象，不借用临时裸切片。
+    rawAt: int,
+    byteCount: int,
+    zeroFill: int, // .bss 零填充；其他节保持原始对象字节。
+    vsize: int,
+    relocs: List<Ref<CoffReloc>>,
+    alignBytes: int,
+}
+
+struct CoffSymbol {
+    nameSpan: Ref<BinaryName>,
+    value: int,
+    secno: int, // 1 基；0＝外部未定义
+    storageClass: int,
+    originObject: int, originIndex: int, originSection: int, symbolType: int,
+}
+
+struct CoffObj {
+    sections: List<Ref<CoffSection>>,
+    symbols: List<Ref<CoffSymbol>>,
+}
+
+function dummyCoffSection(): Ref<CoffSection> {
+    return new CoffSection { originObject: -1, originIndex: -1, nameSpan: rawNameEmpty(), rawSource: bytesNew(0), rawAt: 0, byteCount: 0, zeroFill: 0, vsize: 0, relocs: listNew(), alignBytes: 16 };
+}
+
+// 解析时仅登记字节范围；边界/重定位仍全量校验，可达性决定后才复制。
+function appendCoffBytes(dst: Bytes, sec: Ref<CoffSection>): void {
+    const n = sec.byteCount;
+    if (sec.zeroFill == 1) {
+        bytesAppend(dst, bytesNew(n));
+    } else {
+        // parseCoff checked rawAt + byteCount against the object size.
+        bytesAppend(dst, bytesSlice(sec.rawSource, sec.rawAt, n));
+    }
+}
+
+function dummyCoffSymbol(): Ref<CoffSymbol> {
+    return new CoffSymbol { nameSpan: rawNameEmpty(), value: 0, secno: 0, storageClass: 0,
+        originObject: -1, originIndex: -1, originSection: 0, symbolType: 0 };
+}
+
+function rdU16(data: Bytes, off: int): int {
+    const b0 = bytesGet(data, off) catch 0;
+    const b1 = bytesGet(data, off + 1) catch 0;
+    return b0 | (b1 << 8);
+}
+
+function rdU32(data: Bytes, off: int): int {
+    let v = 0;
+    let k = 0;
+    while (k < 4) {
+        v = v | ((bytesGet(data, off + k) catch 0) << (k * 8));
+        k = k + 1;
+    }
+    return v;
+}
+
+function rdI32(data: Bytes, off: int): int {
+    return rdU32(data, off);
+}
+
+function rdU64(data: Bytes, off: int): int {
+    let v = 0;
+    let k = 0;
+    while (k < 8) {
+        v = v | ((bytesGet(data, off + k) catch 0) << (k * 8));
+        k = k + 1;
+    }
+    return v;
+}
+
+function trimNul(b: string): string {
+    let hi = len(b);
+    while (hi > 0 && (byteAt(b, hi - 1) catch 0) == 0) { hi = hi - 1; }
+    if (hi == 0) { return ""; }
+    return strSub(b, 0, hi);
+}
+
+function cstrAt(data: string, off: int): string {
+    let end = off;
+    while (end < len(data)) {
+        if ((byteAt(data, end) catch 0) == 0) { break; }
+        end = end + 1;
+    }
+    if (end <= off) { return ""; }
+    return strSub(data, off, end - off);
+}
+
+function coffName(data: Bytes, off: int, maximum: int): Ref<BinaryName> {
+    if (off < 0 || maximum < 0 || off > bytesLen(data) || maximum > bytesLen(data) - off) { return rawName(data, -1, 0); }
+    let count = 0;
+    while (count < maximum && (bytesGet(data, off + count) catch 0) != 0) { count = count + 1; }
+    return rawName(data, off, count);
+}
+
+// COFF fixed fields follow the oracle's trim-at-both-ends rule. Internal
+// bytes, including NUL, retain their identity; only long names use C strings.
+function coffShortName(data: Bytes, off: int): Ref<BinaryName> {
+    if (off < 0 || off > bytesLen(data) || 8 > bytesLen(data) - off) { return rawName(data, -1, 0); }
+    let lo = 0; let hi = 8;
+    while (lo < hi && (bytesGet(data, off + lo) catch -1) == 0) { lo = lo + 1; }
+    while (hi > lo && (bytesGet(data, off + hi - 1) catch -1) == 0) { hi = hi - 1; }
+    return rawName(data, off + lo, hi - lo);
+}
+
+function nameStarts(name: Ref<BinaryName>, prefix: string): int {
+    if (!name.ok || rawNameSize(name) < len(prefix)) { return 0; }
+    const head = name.prefix; const source = name.source; const at = name.at;
+    const hl = len(head); let i = 0;
+    while (i < len(prefix)) {
+        let b = -1;
+        if (i < hl) { b = byteAt(head, i) catch -1; } else { b = bytesGet(source, at + i - hl) catch -1; }
+        if (b != (byteAt(prefix, i) catch -1)) { return 0; } i = i + 1;
+    }
+    return 1;
+}
+
+// Parsed COFF names have no synthesized prefix; slicing retains their owner.
+function coffNameSlice(name: Ref<BinaryName>, off: int, count: int): Ref<BinaryName> {
+    if (!name.ok || len(name.prefix) != 0 || off < 0 || count < 0 || off > name.byteCount || count > name.byteCount - off) { return rawNameNone(); }
+    return rawName(name.source, name.at + off, count);
+}
+
+function nameInList(names: List<Ref<BinaryName>>, name: Ref<BinaryName>): int {
+    let i = 0;
+    while (i < listLen(names)) { if (rawNameEqual(listGet(names, i) catch rawNameNone(), name)) { return 1; } i = i + 1; }
+    return 0;
+}
+
+function sortNames(names: List<Ref<BinaryName>>): void {
+    let i = 0;
+    while (i < listLen(names)) {
+        let mi = i; let j = i + 1;
+        while (j < listLen(names)) { if (rawNameLess(listGet(names, j) catch rawNameNone(), listGet(names, mi) catch rawNameNone())) { mi = j; } j = j + 1; }
+        if (mi != i) { const value = listGet(names, i) catch rawNameNone(); listSet(names, i, listGet(names, mi) catch rawNameNone()); listSet(names, mi, value); }
+        i = i + 1;
+    }
+}
+
+function parseCoff(data: Bytes, originObject: int): Ref<CoffObj> {
+    const obj = new CoffObj { sections: listNew(), symbols: listNew() };
+    if (bytesLen(data) < 20) { lkFail("BadImage"); return obj; }
+    if (rdU16(data, 0) != 0x8664) { lkFail("BadImage"); return obj; }
+    const nsec = rdU16(data, 2);
+    const symptr = rdU32(data, 8);
+    const nsyms = rdU32(data, 12);
+    const strtabPtr = symptr + nsyms * 18;
+    if (strtabPtr + 4 > bytesLen(data)) { lkFail("BadImage"); return obj; }
+    const strtabSize = rdU32(data, strtabPtr);
+    if (strtabSize < 4 || strtabSize > bytesLen(data) - strtabPtr) { lkFail("BadStringTable"); return obj; }
+
+    let off = 20;
+    let si = 0;
+    while (si < nsec) {
+        if (off + 40 > bytesLen(data)) { lkFail("BadImage"); return obj; }
+        const rawname = coffShortName(data, off);
+        const vsize = rdU32(data, off + 8);
+        const rawsize = rdU32(data, off + 16);
+        const rawptr = rdU32(data, off + 20);
+        const relptr = rdU32(data, off + 24);
+        const nrel = rdU16(data, off + 32);
+        let nameSpan = rawNameEmpty();
+        if (rawNameByte(rawname, 0) == 47) { // '/'
+            const n = rawNameText(rawname);
+            const stroff = parseIntAutoL(n, 1);
+            if (stroff < 4 || stroff >= strtabSize) { lkFail("BadImage"); return obj; }
+            nameSpan = coffName(data, strtabPtr + stroff, strtabSize - stroff);
+        } else {
+            nameSpan = rawname;
+        }
+        if (!nameSpan.ok) { lkFail("BadImage"); return obj; }
+        const isBss = nameStarts(nameSpan, ".bss");
+        if (isBss == 0 && rawptr + rawsize > bytesLen(data)) { lkFail("BadImage"); return obj; }
+        // .bss 没有原始字节，也就没有可重定位的位置；它在映像里只占虚拟空间（见数据段布局），不写进文件。
+        if (isBss == 1 && nrel > 0) { lkFail("BadImage"); return obj; }
+        let byteCount = rawsize;
+        if (isBss == 1) {
+            if (vsize > byteCount) { byteCount = vsize; }
+        }
+        const sec = new CoffSection { originObject: originObject, originIndex: si, nameSpan: nameSpan, rawSource: data, rawAt: rawptr, byteCount: byteCount, zeroFill: isBss, vsize: vsize, relocs: listNew(), alignBytes: 16 };
+        let ri = 0;
+        while (ri < nrel) {
+            const ro = relptr + ri * 10;
+            if (ro + 10 > bytesLen(data)) { lkFail("BadImage"); return obj; }
+            listPush(sec.relocs, new CoffReloc { va: rdU32(data, ro), sym: rdU32(data, ro + 4), typ: rdU16(data, ro + 8) });
+            ri = ri + 1;
+        }
+        const chars = rdU32(data, off + 36);
+        // IMAGE_SCN_ALIGN_*（PE/COFF 规范）：n 为 1..14 时对齐 2^(n−1) 字节，0 为缺省 16，15 保留。节在映像里按 SEC_ALIGN
+        // 起始，更大的要求放不到，同 ELF 一侧报 UnsupportedSectionAlignment（此前按 2^n 解，每个输入节都多对齐一倍）。
+        const a = (chars >>> 20) & 0xF;
+        if (a == 0) {
+            sec.alignBytes = 16;
+        } else {
+            sec.alignBytes = shl1n2(a - 1);
+        }
+        if (a == 15 || sec.alignBytes > SEC_ALIGN) { lkFail("UnsupportedSectionAlignment"); return obj; }
+        listPush(obj.sections, sec);
+        off = off + 40;
+        si = si + 1;
+    }
+
+    // aux 预扫。
+    const isAux: List<int> = listNew();
+    let i = 0;
+    while (i < nsyms) { listPush(isAux, 0); i = i + 1; }
+    i = 0;
+    while (i < nsyms) {
+        const e2 = symptr + i * 18;
+        const numaux = bytesGet(data, e2 + 17) catch 0;
+        if (numaux >= nsyms - i) { lkFail("BadSymbolAux"); return obj; }
+        let k = 1;
+        while (k < 1 + numaux && i + k < nsyms) {
+            listSet(isAux, i + k, 1);
+            k = k + 1;
+        }
+        i = i + 1 + numaux; // zig `: (i += 1)` 基线步进＋numaux——漏 1 即死循环
+    }
+    i = 0;
+    while (i < nsyms) {
+        if ((listGet(isAux, i) catch 0) == 1) {
+            listPush(obj.symbols, dummyCoffSymbol());
+            i = i + 1;
+            continue;
+        }
+        const e = symptr + i * 18;
+        let allZero = 1;
+        let k = 0;
+        while (k < 4) {
+            if ((bytesGet(data, e + k) catch 0) != 0) { allZero = 0; }
+            k = k + 1;
+        }
+        let nameSpan = rawNameEmpty();
+        if (allZero == 1) {
+            const stroff = rdU32(data, e + 4);
+            if (stroff < 4 || stroff >= strtabSize) { lkFail("BadSymbolName"); return obj; }
+            nameSpan = coffName(data, strtabPtr + stroff, strtabSize - stroff);
+        } else {
+            nameSpan = coffShortName(data, e);
+        }
+        if (!nameSpan.ok) { lkFail("BadImage"); return obj; }
+        // secno＝i16 两字节（zig readInt(i16)）——4 字节误读把 storage_class/
+        // numaux 拼进高位，secno 全错（gc/宇宙注册双失败）。
+        let secno = rdU16(data, e + 12);
+        if (secno >= 32768) { secno = secno - 65536; }
+        if (secno > listLen(obj.sections)) { lkFail("BadSymbolSection"); return obj; }
+        if (secno > 0) {
+            const sec = listGet(obj.sections, secno - 1) catch dummyCoffSection(); let extent = sec.byteCount;
+            if (sec.vsize > extent) { extent = sec.vsize; }
+            if (rdU32(data, e + 8) > extent) { lkFail("BadSymbolValue"); return obj; }
+        }
+        listPush(obj.symbols, new CoffSymbol { nameSpan: nameSpan, value: rdU32(data, e + 8), secno: secno, storageClass: bytesGet(data, e + 16) catch 0,
+                originObject: originObject, originIndex: i, originSection: secno, symbolType: rdU16(data, e + 14) });
+        i = i + 1;
+    }
+    for (section in obj.sections) {
+        for (reloc in section.relocs) {
+            if (reloc.sym >= nsyms || (listGet(isAux, reloc.sym) catch 1) == 1) { lkFail("BadRelocationSymbol"); return obj; }
+            let width = 4; if (reloc.typ == 1) { width = 8; }
+            if (reloc.va > section.byteCount || width > section.byteCount - reloc.va) { lkFail("BadRelocationSite"); return obj; }
+        }
+    }
+    return obj;
+}
+
+function parseIntAutoL(s: string, from: int): int {
+    let v: int = 0;
+    let i = from;
+    if (len(s) <= from) { return -1; }
+    while (i < len(s)) {
+        const c = byteAt(s, i) catch 48;
+        if (c < 48 || c > 57) { return -1; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+function strStartsWithL(s: string, p: string): int {
+    if (len(s) < len(p)) { return 0; }
+    if (strSub(s, 0, len(p)) == p) { return 1; }
+    return 0;
+}
+
+function shl1n2(n: int): int {
+    let v = 1;
+    let i = 0;
+    while (i < n) {
+        v = imul(v, 2);
+        i = i + 1;
+    }
+    return v;
+}
+
+function alignUpL(v: int, a: int): int {
+    return (v + a - 1) / a * a;
+}
+
+// ============================================================================
+// §2 节名归类＋DLL 归类（secKindOf/dllOf 同构）
+// ============================================================================
+
+// kind：0=text 1=rdata 2=data -1=不载入
+function secKindOfL(name: Ref<BinaryName>): int {
+    if (nameStarts(name, ".text") == 1) { return 0; }
+    if (nameStarts(name, ".bss") == 1) { return 2; }
+    if (nameStarts(name, ".data") == 1) { return 2; }
+    if (nameStarts(name, ".rdata") == 1 || nameStarts(name, ".refptr") == 1) { return 1; }
+    if (nameStarts(name, ".tls") == 1) { return 2; }
+    return -1;
+}
+
+function isTlsNameL(name: Ref<BinaryName>): int {
+    return nameStarts(name, ".tls");
+}
+
+function isSplitDataPartL(name: Ref<BinaryName>): int {
+    let dollar = -1; let dot = -1; let i = 0;
+    while (i < rawNameSize(name)) { const c = rawNameByte(name, i); if (c == 36) { dollar = i; } if (c == 46) { dot = i; } i = i + 1; }
+    if (dollar < 0 || dot <= dollar || dot + 1 >= rawNameSize(name)) { return 0; }
+    i = dot + 1;
+    while (i < rawNameSize(name)) { const c = rawNameByte(name, i); if (c < 48 || c > 57) { return 0; } i = i + 1; }
+    return 1;
+}
+
+function splitPartDigitsL(name: Ref<BinaryName>): Ref<BinaryName> {
+    let dot = 0; let i = 0;
+    while (i < rawNameSize(name)) { if ((rawNameByte(name, i)) == 46) { dot = i; } i = i + 1; }
+    let start = dot + 1;
+    while (start + 1 < rawNameSize(name) && (rawNameByte(name, start)) == 48) { start = start + 1; }
+    return coffNameSlice(name, start, rawNameSize(name) - start);
+}
+
+function sortSplitDataPartsL(parts: List<Ref<BlobSec>>, co: Ref<CoffObj>): void {
+    let i = 0;
+    while (i < listLen(parts)) {
+        const left = listGet(parts, i) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
+        let nameLeft = (listGet(co.sections, left.coffIdx) catch dummyCoffSection()).nameSpan;
+        if (isSplitDataPartL(nameLeft) == 0) { i = i + 1; continue; }
+        let j = i + 1;
+        while (j < listLen(parts)) {
+            const right = listGet(parts, j) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
+            const nameRight = (listGet(co.sections, right.coffIdx) catch dummyCoffSection()).nameSpan;
+            if (isSplitDataPartL(nameRight) == 1) {
+                const a = splitPartDigitsL(nameLeft); const b = splitPartDigitsL(nameRight);
+                if (rawNameSize(b) < rawNameSize(a) || (rawNameSize(b) == rawNameSize(a) && rawNameLess(b, a))) {
+                    const keep = listGet(parts, i) catch left; listSet(parts, i, right); listSet(parts, j, keep); nameLeft = nameRight;
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+function dataGroupKeyL(name: Ref<BinaryName>): Ref<BinaryName> {
+    let dollar = -1;
+    let i = 0;
+    while (i < rawNameSize(name)) {
+        if ((rawNameByte(name, i)) == 36) { dollar = i; break; } // '$'
+        i = i + 1;
+    }
+    if (dollar < 0) { return name; }
+    let after = coffNameSlice(name, dollar + 1, rawNameSize(name) - dollar - 1);
+    let dot = -1;
+    let j = rawNameSize(after) - 1;
+    while (j >= 0) {
+        if ((rawNameByte(after, j)) == 46) { dot = j; break; } // '.'
+        j = j - 1;
+    }
+    if (dot >= 0) {
+        const tail = coffNameSlice(after, dot + 1, rawNameSize(after) - dot - 1);
+        let isNum = 0;
+        if (rawNameSize(tail) > 0) {
+            isNum = 1;
+            let k = 0;
+            while (k < rawNameSize(tail)) {
+                const c = rawNameByte(tail, k);
+                if (c < 48 || c > 57) { isNum = 0; break; }
+                k = k + 1;
+            }
+        }
+        if (isNum == 1) { after = coffNameSlice(after, 0, dot); }
+    }
+    return after;
+}
+
+function strStartsWithP(name: string, p: string): int {
+    return strStartsWithL(name, p);
+}
+
+// D3 v0.23 FFI：带 from "库" 的外部函数按声明的库名导入，优先于下面按名字归类的表；
+// driver 在每次链接前设置（不用 FFI 的程序为空表，导入面不变）。
+const dllOverNames: List<string> = listNew();
+const dllOverDlls: List<string> = listNew();
+export function lkSetImportDll(name: string, dll: string): void {
+    listPush(dllOverNames, name);
+    listPush(dllOverDlls, dll);
+}
+export function lkClearImportDlls(): void {
+    while (listLen(dllOverNames) > 0) { listRemoveAt(dllOverNames, listLen(dllOverNames) - 1); }
+    while (listLen(dllOverDlls) > 0) { listRemoveAt(dllOverDlls, listLen(dllOverDlls) - 1); }
+}
+
+function dllOfL(name: Ref<BinaryName>): string {
+    let ov = 0;
+    while (ov < listLen(dllOverNames)) {
+        const on = listGet(dllOverNames, ov) catch "";
+        if (rawNameEqualText(name, on, rawNameTextHash(on))) { return listGet(dllOverDlls, ov) catch "kernel32.dll"; }
+        ov = ov + 1;
+    }
+    if (rawNameEqualText(name, "CommandLineToArgvW", rawNameTextHash("CommandLineToArgvW"))) { return "shell32.dll"; }
+    if (nameStarts(name, "Nt") == 1 || nameStarts(name, "Rtl") == 1 || nameStarts(name, "Ldr") == 1) { return "ntdll.dll"; }
+    if (nameStarts(name, "Dwm") == 1) { return "dwmapi.dll"; }
+    if (nameStarts(name, "GetOpenFileName") == 1 || nameStarts(name, "GetSaveFileName") == 1 || nameStarts(name, "CommDlgExtendedError") == 1) { return "comdlg32.dll"; }
+    // user32 前缀族（direct_link dllOf user 表全量转录）。
+    const user = "RegisterClass CreateWindowEx DefWindowProc GetMessage PeekMessage PostMessage SendMessage TranslateMessage DispatchMessage ShowWindow UpdateWindow DestroyWindow SetWindowPos GetWindowRect AdjustWindowRect MoveWindow InvalidateRect GetClientRect GetDC ReleaseDC PostQuitMessage LoadCursor SetCursor GetKeyState SetTimer KillTimer MessageBox GetDpiForWindow SetProcessDpiAwarenessContext SetProcessDPIAware GetSystemMetrics GetMonitorInfo MonitorFromWindow GetWindowLong SetWindowLong ClientToScreen ScreenToClient SetWindowText IsWindowVisible LoadIcon GetForegroundWindow SetForegroundWindow SetLayeredWindowAttributes CreateMenu DestroyMenu DeleteMenu DrawMenuBar GetMenu SetMenu TrackPopupMenu InsertMenuItem SetMenuItemInfo GetMenuItemInfo GetSubMenu EnableMenuItem CheckMenuItem MsgWaitForMultipleObjects AppendMenu InsertMenu ModifyMenu RemoveMenu GetMenuState IsZoomed IsIconic OpenClipboard CloseClipboard EmptyClipboard SetClipboardData GetClipboardData IsClipboardFormatAvailable";
+    if (prefixInList(name, user) == 1) { return "user32.dll"; }
+    const gdi = "SetDIBitsToDevice StretchDIBits CreateDC DeleteDC DeleteObject CreateCompatibleDC CreateDIBSection SelectObject BitBlt PatBlt CreateSolidBrush SetTextColor SetBkColor Polygon Rectangle MoveToEx LineTo PolylineTo ExtCreatePen CreatePen";
+    if (prefixInList(name, gdi) == 1) { return "gdi32.dll"; }
+    const ws2 = "WSAStartup WSAGetLastError WSACleanup socket connect bind listen accept closesocket send recv htons htonl ntohs ntohl inet_addr inet_ntoa";
+    if (exactInList(name, ws2) == 1) { return "ws2_32.dll"; }
+    const crt = "fma fmaf fmod fmodf sqrt sqrtf pow powf sin sinf cos cosf tan tanf asin acos atan atanf atan2 atan2f exp expf exp2 log logf log2 log10 sinh cosh tanh hypot hypotf cbrt floor floorf ceil ceilf round roundf trunc truncf fmin fmax fminf fmaxf ldexp frexp modf";
+    if (exactInList(name, crt) == 1) { return "ucrtbase.dll"; }
+    return "kernel32.dll";
+}
+
+function prefixInList(name: Ref<BinaryName>, list: string): int {
+    let pos = 0;
+    const n = len(list);
+    while (pos <= n) {
+        let end = pos;
+        while (end < n && (byteAt(list, end) catch 32) != 32) { end = end + 1; }
+        if (end > pos) {
+            const p = strSub(list, pos, end - pos);
+            if (nameStarts(name, p) == 1) { return 1; }
+        }
+        pos = end + 1;
+    }
+    return 0;
+}
+
+function exactInList(name: Ref<BinaryName>, list: string): int {
+    let pos = 0;
+    const n = len(list);
+    while (pos <= n) {
+        let end = pos;
+        while (end < n && (byteAt(list, end) catch 32) != 32) { end = end + 1; }
+        if (end > pos) {
+            const p = strSub(list, pos, end - pos);
+            if (rawNameEqualText(name, p, rawNameTextHash(p))) { return 1; }
+        }
+        pos = end + 1;
+    }
+    return 0;
+}
+
+// ============================================================================
+// §3 链接主体（buildExeAssembled :370-991 同构；validateRoutedTable 砍除＝
+// R-c 差异登记——导入面正确性由产物行为验证覆盖）
+// ============================================================================
+
+// BlobSec 视图。
+struct BlobSec {
+    obj: int,
+    coffIdx: int,
+    kind: int,
+    off: int,
+}
+
+function findBlobSec(secs: List<Ref<BlobSec>>, obj: int, ci: int): int {
+    let i = 0;
+    while (i < listLen(secs)) {
+        const bs = listGet(secs, i) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
+        if (bs.obj == obj && bs.coffIdx == ci) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 符号宇宙（名字→VA）：平行表＋线性查（规模＝blob 符号数百级）。
+const uniNames: List<string> = listNew();
+const uniVa: List<int> = listNew();
+
+// COFF 外部定义名（EXTERNAL/2）→首次定义的符号下标；先到先得。STATIC(3)
+// 局部定义不登记——跨对象查名只认外部定义（作用域修复见
+// docs/design/v052-coff-symbol-scope-20261009.md）。
+const SI_BUCKETS: int = 65536;
+const siHead: List<int> = listNew();
+const siKeys: List<Ref<BinaryName>> = listNew();
+const siVals: List<int> = listNew();
+const siNext: List<int> = listNew();
+
+function siInit(): void {
+    while (listLen(siHead) < SI_BUCKETS) { listPush(siHead, -1); }
+}
+
+function siHash(name: Ref<BinaryName>): int { return (name.hash >>> 0) & (SI_BUCKETS - 1); }
+
+function siGet(name: Ref<BinaryName>): int {
+    siInit();
+    let i = listGet(siHead, siHash(name)) catch -1;
+    while (i >= 0) {
+        if (rawNameEqual(listGet(siKeys, i) catch rawNameNone(), name)) { return listGet(siVals, i) catch -1; }
+        i = listGet(siNext, i) catch -1;
+    }
+    return -1;
+}
+
+function siGetText(name: string): int {
+    siInit(); const hash = rawNameTextHash(name);
+    let i = listGet(siHead, (hash >>> 0) & (SI_BUCKETS - 1)) catch -1;
+    while (i >= 0) {
+        if (rawNameEqualText(listGet(siKeys, i) catch rawNameNone(), name, hash)) { return listGet(siVals, i) catch -1; }
+        i = listGet(siNext, i) catch -1;
+    }
+    return -1;
+}
+
+function siPut(name: Ref<BinaryName>, val: int): void {
+    siInit();
+    const h = siHash(name);
+    let i = listGet(siHead, h) catch -1;
+    while (i >= 0) {
+        if (rawNameEqual(listGet(siKeys, i) catch rawNameNone(), name)) { return; }
+        i = listGet(siNext, i) catch -1;
+    }
+    listPush(siKeys, name);
+    listPush(siVals, val);
+    listPush(siNext, listGet(siHead, h) catch -1);
+    listSet(siHead, h, listLen(siKeys) - 1);
+}
+
+// —— 扁平索引终结 ——
+function uniPutSpan(name: Ref<BinaryName>, va: int): void {
+    // 先到先得（getOrPut not found 语义——直写链接侧哈希；lpBuild 懒构建
+    // 在 uniGet 前，故 uniPut 登记项不受重建覆盖）。
+    if (uniGetSpan(name) >= 0) { return; }
+    while (listLen(lpHead) < 65536) { listPush(lpHead, -1); } // 桶头懒扩（P8）
+    listPush(lpKeys, name);
+    listPush(lpVals, va);
+    const h = lpHash(name);
+    listPush(lpNext, listGet(lpHead, h) catch -1);
+    listSet(lpHead, h, listLen(lpKeys) - 1);
+}
+
+// —— 链接侧哈希索引（本模块态——over asSymNameL/blob/imp 名；懒构建）——
+const lpHead: List<int> = listNew();
+const lpKeys: List<Ref<BinaryName>> = listNew();
+const lpVals: List<int> = listNew();
+const lpNext: List<int> = listNew();
+
+function lpHash(name: Ref<BinaryName>): int { return (name.hash >>> 0) & 65535; }
+
+function uniGetSpan(name: Ref<BinaryName>): int {
+    // P8 首案：线性扫描→扁平哈希索引（注册全在 linkExe 宇宙节——VA 已定）。
+    let i = listGet(lpHead, lpHash(name)) catch -1;
+    while (i >= 0) {
+        if (rawNameEqual(listGet(lpKeys, i) catch rawNameNone(), name)) { return listGet(lpVals, i) catch -1; }
+        i = listGet(lpNext, i) catch -1;
+    }
+    return -1;
+}
+
+function uniPut(name: string, va: int): void {
+    if (uniGet(name) >= 0) { return; }
+    uniPutSpan(rawNameOf(name), va);
+}
+function uniGet(name: string): int {
+    const hash = rawNameTextHash(name); let i = listGet(lpHead, (hash >>> 0) & 65535) catch -1;
+    while (i >= 0) {
+        if (rawNameEqualText(listGet(lpKeys, i) catch rawNameNone(), name, hash)) { return listGet(lpVals, i) catch -1; }
+        i = listGet(lpNext, i) catch -1;
+    }
+    return -1;
+}
+
+// exe 输出字节面。
+let exeBytes: Bytes = bytesNew(0);
+
+// linkExe：装配态（assembleText 已跑）＋shim blob 字节 → PE 字节写入 exeBytes。
+// 返回 0 成功；非 0＝结构化失败（lkMissing 携带）。
+export function linkExe(shimObj: Bytes, guiSubsystem: int): int {
+    return linkExeObjects(shimObj, guiSubsystem, listNew());
+}
+
+// 外部静态对象是冻结执行宿主的字节输入，不参与编译算法代算。
+// 将各对象的节/符号索引重基后交给同一可达性和重定位管线。
+export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: List<Bytes>): int {
+    linkMapBegin("x86_64-windows");
+    lk_failed = 0;
+    lk_missing = "";
+    // 每次链接独立建表；不能让上一映像的名字或 VA 污染下一映像。
+    while (listLen(siHead) > 0) { listRemoveAt(siHead, listLen(siHead) - 1); }
+    while (listLen(siKeys) > 0) { listRemoveAt(siKeys, listLen(siKeys) - 1); }
+    while (listLen(siVals) > 0) { listRemoveAt(siVals, listLen(siVals) - 1); }
+    while (listLen(siNext) > 0) { listRemoveAt(siNext, listLen(siNext) - 1); }
+    while (listLen(lpHead) > 0) { listRemoveAt(lpHead, listLen(lpHead) - 1); }
+    while (listLen(lpKeys) > 0) { listRemoveAt(lpKeys, listLen(lpKeys) - 1); }
+    while (listLen(lpVals) > 0) { listRemoveAt(lpVals, listLen(lpVals) - 1); }
+    while (listLen(lpNext) > 0) { listRemoveAt(lpNext, listLen(lpNext) - 1); }
+    exeBytes = bytesNew(0);
+    // —— COFF 解析（shim 首位；附加对象索引重基，不把其全部导出设为根）——
+    const coffs: List<Ref<CoffObj>> = listNew();
+    const co = parseCoff(shimObj, 0);
+    if (lk_failed == 1) { return 1; }
+    if (asFailedAs() != 0) { lkFail("AssemblerFailed"); return 1; }
+    const shimSymbols = listLen(co.symbols);
+    let oi = 0;
+    while (oi < listLen(objectBytes)) {
+        const extra = parseCoff(listGet(objectBytes, oi) catch bytesNew(0), oi + 1);
+        if (lk_failed == 1) { return 1; }
+        const sectionBase = listLen(co.sections);
+        const symbolBase = listLen(co.symbols);
+        let es = 0;
+        while (es < listLen(extra.sections)) {
+            const section = listGet(extra.sections, es) catch dummyCoffSection();
+            let er = 0;
+            while (er < listLen(section.relocs)) {
+                const reloc = listGet(section.relocs, er) catch new CoffReloc { va: 0, sym: 0, typ: 0 };
+                reloc.sym = reloc.sym + symbolBase;
+                er = er + 1;
+            }
+            listPush(co.sections, section);
+            es = es + 1;
+        }
+        es = 0;
+        while (es < listLen(extra.symbols)) {
+            const symbol = listGet(extra.symbols, es) catch dummyCoffSymbol();
+            if (symbol.secno > 0) { symbol.secno = symbol.secno + sectionBase; }
+            listPush(co.symbols, symbol);
+            es = es + 1;
+        }
+        oi = oi + 1;
+    }
+    listPush(coffs, co);
+
+    // 只登记正节号 EXTERNAL(2) 定义：COFF STATIC(3) 局部符号仅由所在对象的
+    // 重定位符号索引/节号解析，不进跨对象查名（作用域修复
+    // docs/design/v052-coff-symbol-scope-20261009.md）；辅助项/未定义同名项
+    // 不得遮蔽后面的定义。
+    const runtimeProviders: List<Ref<BinaryName>> = listNew();
+    let symbolIndex = 0;
+    while (symbolIndex < listLen(co.symbols)) {
+        const symbol = listGet(co.symbols, symbolIndex) catch dummyCoffSymbol();
+        if (symbol.secno > 0 && symbol.storageClass == 2 && exactInList(symbol.nameSpan, OWNED_RUNTIME_SYMBOLS) == 1) {
+            if (nameInList(runtimeProviders, symbol.nameSpan) == 1) {
+                lkFail("DuplicateRuntimeSymbol: " + rawNameText(symbol.nameSpan)); return 1;
+            }
+            listPush(runtimeProviders, symbol.nameSpan);
+        }
+        if (symbol.secno > 0 && symbol.storageClass == 2) { siPut(symbol.nameSpan, symbolIndex); }
+        symbolIndex = symbolIndex + 1;
+    }
+    const allByCoff: List<int> = listNew();
+    const reachByCoff: List<int> = listNew();
+    let sectionIndex = 0;
+    while (sectionIndex < listLen(co.sections)) {
+        listPush(allByCoff, -1);
+        listPush(reachByCoff, -1);
+        sectionIndex = sectionIndex + 1;
+    }
+
+    // 入口桩存在性（assemble 符号面——单次线性扫，非热点面）。
+    let hasEntry = 0;
+    let hi2 = 0;
+    const hn2 = asSymCountL();
+    while (hi2 < hn2) {
+        if (asSymNameL(hi2) == "__tx_entry") { hasEntry = 1; break; }
+        hi2 = hi2 + 1;
+    }
+    if (hasEntry == 0) { lkFail("__tx_entry (MissingEntryStub)"); return 1; }
+
+    // —— blob 载荷节收集 ——
+    const allSecs: List<Ref<BlobSec>> = listNew();
+    let ci = 0;
+    while (ci < listLen(co.sections)) {
+        const cs = listGet(co.sections, ci) catch dummyCoffSection();
+        const kind = secKindOfL(cs.nameSpan);
+        if (kind < 0) { ci = ci + 1; continue; }
+        if (cs.byteCount == 0 && kind != 2) { ci = ci + 1; continue; }
+        listSet(allByCoff, ci, listLen(allSecs));
+        listPush(allSecs, new BlobSec { obj: 0, coffIdx: ci, kind: kind, off: 0 });
+        ci = ci + 1;
+    }
+
+    // —— gc-sections BFS（根 1＝prog fixup 目标；根 2＝shim 导出 scl2）——
+    const reach: List<int> = listNew(); // allSecs 序的可达位
+    let z = 0;
+    while (z < listLen(allSecs)) { listPush(reach, 0); z = z + 1; }
+    const queue: List<int> = listNew();
+
+    // markByName：定义名索引＋COFF 节下标直查（单 obj 扁平化）。
+    // 返回 allSecs 序（-1＝未载入/未定义）。
+    let fi = 0;
+    while (fi < asFixCountL()) {
+        const m = markByText(co, allByCoff, asFixSymL(fi));
+        if (m >= 0 && (listGet(reach, m) catch 0) == 0) {
+            listSet(reach, m, 1);
+            listPush(queue, m);
+        }
+        fi = fi + 1;
+    }
+    let si2 = 0;
+    while (si2 < shimSymbols) {
+        const sym = listGet(co.symbols, si2) catch dummyCoffSymbol();
+        if (sym.secno <= 0 || sym.storageClass != 2) { si2 = si2 + 1; continue; }
+        const m = markByName(co, allByCoff, sym.nameSpan);
+        if (m >= 0 && (listGet(reach, m) catch 0) == 0) {
+            listSet(reach, m, 1);
+            listPush(queue, m);
+        }
+        si2 = si2 + 1;
+    }
+    const reachSecs: List<Ref<BlobSec>> = listNew(); // BFS 弹出序＝zig reach_secs（节合并序的决定面——COFF 序过滤会整体错位 rel32）
+    while (listLen(queue) > 0) {
+        const cur = listGet(queue, listLen(queue) - 1) catch 0;
+        listRemoveAt(queue, listLen(queue) - 1);
+        const bs = listGet(allSecs, cur) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
+        listSet(reachByCoff, bs.coffIdx, listLen(reachSecs));
+        listPush(reachSecs, bs);
+        const cs = listGet(co.sections, bs.coffIdx) catch dummyCoffSection();
+        let ri = 0;
+        while (ri < listLen(cs.relocs)) {
+            const r = listGet(cs.relocs, ri) catch new CoffReloc { va: 0, sym: 0, typ: 0 };
+            const sym = listGet(co.symbols, r.sym) catch dummyCoffSymbol();
+            if (sym.secno > 0) {
+                const m = (listGet(allByCoff, sym.secno - 1) catch -1);
+                if (m >= 0 && (listGet(reach, m) catch 0) == 0) {
+                    listSet(reach, m, 1);
+                    listPush(queue, m);
+                }
+            } else if (rawNameSize(sym.nameSpan) > 0) {
+                let nm = sym.nameSpan;
+                if (nameStarts(nm, "__imp_") == 1) { nm = coffNameSlice(nm, 6, rawNameSize(nm) - 6); }
+                const m = markByName(co, allByCoff, nm);
+                if (m >= 0 && (listGet(reach, m) catch 0) == 0) {
+                    listSet(reach, m, 1);
+                    listPush(queue, m);
+                }
+            }
+            ri = ri + 1;
+        }
+    }
+    // —— 宿主 text 节 ——
+    const text: Bytes = bytesNew(0);
+    const rdata: Bytes = bytesNew(0);
+    const data: Bytes = bytesNew(0);
+    const imageAlignments: List<int> = listNew();
+    let alignmentSection = 0;
+    while (alignmentSection < 4) {
+        const power = asImgAlignPow(alignmentSection);
+        if (power < 0 || power > 31) { lkFail("ProgramSectionAlignmentOverflow"); return 1; }
+        let alignment = 1; let bit = 0;
+        while (bit < power) { alignment = alignment * 2; bit = bit + 1; }
+        listPush(imageAlignments, alignment); alignmentSection = alignmentSection + 1;
+    }
+    let textAlignment = listGet(imageAlignments, 0) catch 16;
+    let rdataAlignment = listGet(imageAlignments, 1) catch 16;
+    let dataAlignment = listGet(imageAlignments, 2) catch 16;
+    const bssAlignment = listGet(imageAlignments, 3) catch 16;
+    if (bssAlignment > dataAlignment) { dataAlignment = bssAlignment; }
+    let alignmentIndex = 0;
+    while (alignmentIndex < listLen(reachSecs)) {
+        const blob = listGet(reachSecs, alignmentIndex) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
+        const section = listGet(co.sections, blob.coffIdx) catch dummyCoffSection();
+        if (blob.kind == 0 && section.alignBytes > textAlignment) { textAlignment = section.alignBytes; }
+        if (blob.kind == 1 && section.alignBytes > rdataAlignment) { rdataAlignment = section.alignBytes; }
+        if (blob.kind == 2 && section.alignBytes > dataAlignment) { dataAlignment = section.alignBytes; }
+        alignmentIndex = alignmentIndex + 1;
+    }
+    bytesAppend(text, asImgText());
+    let bi = 0;
+    while (bytesLen(text) % 16 != 0) { bytesPush(text, 0x90); }
+    bi = 0;
+    while (bi < listLen(reachSecs)) {
+        const bs = listGet(reachSecs, bi) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
+        const cs = listGet(co.sections, bs.coffIdx) catch dummyCoffSection();
+        if (bs.kind != 0) { bi = bi + 1; continue; }
+        let al = cs.alignBytes;
+        if (al < 16) { al = 16; }
+        while (bytesLen(text) % al != 0) { bytesPush(text, 0x90); }
+        bs.off = bytesLen(text);
+        appendCoffBytes(text, cs);
+        bi = bi + 1;
+    }
+    while (bytesLen(text) % 16 != 0) { bytesPush(text, 0x90); }
+
+    // —— extern 收集（已载节 relocs 实引用）——
+    const impNames: List<Ref<BinaryName>> = listNew();
+    const externs: List<Ref<BinaryName>> = listNew();
+    bi = 0;
+    while (bi < listLen(reachSecs)) {
+        const bs = listGet(reachSecs, bi) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
+        const cs = listGet(co.sections, bs.coffIdx) catch dummyCoffSection();
+        let ri = 0;
+        while (ri < listLen(cs.relocs)) {
+            const r = listGet(cs.relocs, ri) catch new CoffReloc { va: 0, sym: 0, typ: 0 };
+            const sym = listGet(co.symbols, r.sym) catch dummyCoffSymbol();
+            if (sym.secno != 0 || sym.storageClass != 2) { ri = ri + 1; continue; }
+            let nm = sym.nameSpan;
+            let isImp = 0;
+            if (nameStarts(nm, "__imp_") == 1) {
+                nm = coffNameSlice(nm, 6, rawNameSize(nm) - 6);
+                isImp = 1;
+            }
+            if (isImp == 1 && nameInList(impNames, nm) == 0) { listPush(impNames, nm); }
+            if (asHasSymTx(nm) == 1) { ri = ri + 1; continue; }
+            if (siGet(nm) >= 0) { ri = ri + 1; continue; }
+            if (rawNameEqualText(nm, "_tls_index", rawNameTextHash("_tls_index"))) { ri = ri + 1; continue; }
+            if (nameInList(externs, nm) == 0) { listPush(externs, nm); }
+            if (isImp == 1 && nameInList(impNames, nm) == 0) { listPush(impNames, nm); }
+            ri = ri + 1;
+        }
+        bi = bi + 1;
+    }
+    // D3 v0.23 FFI：程序镜像里外部函数调用桩对 __imp_<名> 的引用同样登记为导入
+    // （排在内核导入之后；不用 FFI 的程序没有这种引用，导入面不变）。这些是程序按
+    // from "库" 明确声明的导入，不受下面"运行时算法须自带"的检查；同名若已有本地定义，
+    // 桩会悄悄调到本地实现，故直接拒绝链接。
+    const ffiImports: List<Ref<BinaryName>> = listNew();
+    fi = 0;
+    while (fi < asFixCountL()) {
+        const fixName = asFixSymL(fi);
+        if (strStartsWithL(fixName, "__imp_") == 1 && len(fixName) > 6) {
+            const nm = rawNameOf(strSub(fixName, 6, len(fixName) - 6));
+            if (asHasSymTx(nm) == 1 || siGet(nm) >= 0) { lkFail("FfiImportShadowed: " + rawNameText(nm)); return 1; }
+            if (nameInList(impNames, nm) == 0) { listPush(impNames, nm); }
+            if (nameInList(externs, nm) == 0) { listPush(externs, nm); listPush(ffiImports, nm); }
+        }
+        fi = fi + 1;
+    }
+    sortNames(externs);
+    // These are Taixu-owned runtime algorithms, not kernel32 imports. A
+    // missing provider must fail while linking, rather than emit an image
+    // that will fail during loading. Defined program/COFF names were already
+    // removed from externs by the common symbol resolution above.
+    let unresolvedRuntimeIndex = 0;
+    while (unresolvedRuntimeIndex < listLen(externs)) {
+        const unresolvedRuntime = listGet(externs, unresolvedRuntimeIndex) catch rawNameNone();
+        if (exactInList(unresolvedRuntime, OWNED_RUNTIME_SYMBOLS) == 1 && nameInList(ffiImports, unresolvedRuntime) == 0) {
+            lkFail("UnresolvedRuntimeSymbol: " + rawNameText(unresolvedRuntime)); return 1;
+        }
+        unresolvedRuntimeIndex = unresolvedRuntimeIndex + 1;
+    }
+    const nfn = listLen(externs);
+
+    // thunk 区预留（每 extern 6B）＋尾对齐。
+    const thunkOff = bytesLen(text);
+    z = 0;
+    while (z < nfn * 6) { bytesPush(text, 0); z = z + 1; }
+    while (bytesLen(text) % 16 != 0) { bytesPush(text, 0x90); }
+
+    // —— rdata ——
+    bytesAppend(rdata, asImgRdata());
+    while (bytesLen(rdata) % 16 != 0) { bytesPush(rdata, 0); }
+    bi = 0;
+    while (bi < listLen(reachSecs)) {
+        const bs = listGet(reachSecs, bi) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
+        const cs = listGet(co.sections, bs.coffIdx) catch dummyCoffSection();
+        if (bs.kind != 1) { bi = bi + 1; continue; }
+        let al = cs.alignBytes;
+        if (al < 16) { al = 16; }
+        while (bytesLen(rdata) % al != 0) { bytesPush(rdata, 0); }
+        bs.off = bytesLen(rdata);
+        appendCoffBytes(rdata, cs);
+        bi = bi + 1;
+    }
+
+    // —— data（$ 分组连续合并）＋TLS 区间＋_tls_index＋__imp 槽 ——
+    bytesAppend(data, asImgData());
+    let tlsMin = -1;
+    let tlsMax = 0;
+    const parts: List<List<int>> = listNew(); // 暂存每 part 的 [secIdx]（单元素组键序）
+    const groupKeys: List<Ref<BinaryName>> = listNew();
+    const bssParts: List<Ref<BlobSec>> = listNew();
+    bi = 0;
+    while (bi < listLen(reachSecs)) {
+        const bs = listGet(reachSecs, bi) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
+        const cs = listGet(co.sections, bs.coffIdx) catch dummyCoffSection();
+        if (bs.kind != 2) { bi = bi + 1; continue; }
+        const g = dataGroupKeyL(cs.nameSpan);
+        if (nameInList(groupKeys, g) == 0) { listPush(groupKeys, g); }
+        bi = bi + 1;
+    }
+    let gk = 0;
+    while (gk < listLen(groupKeys)) {
+        const g = listGet(groupKeys, gk) catch rawNameNone();
+        const groupParts: List<Ref<BlobSec>> = listNew();
+        bi = 0;
+        while (bi < listLen(reachSecs)) {
+            const candidate = listGet(reachSecs, bi) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
+            const section = listGet(co.sections, candidate.coffIdx) catch dummyCoffSection();
+            if (candidate.kind == 2 && rawNameEqual(dataGroupKeyL(section.nameSpan), g)) { listPush(groupParts, candidate); }
+            bi = bi + 1;
+        }
+        sortSplitDataPartsL(groupParts, co);
+        let first = 1;
+        bi = 0;
+        while (bi < listLen(groupParts)) {
+            const bs = listGet(groupParts, bi) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
+            const cs = listGet(co.sections, bs.coffIdx) catch dummyCoffSection();
+            // 对象的 .bss 不写零字节：留到全部有内容的数据之后，在虚拟尾部定位（同程序自己的 BSS）。写成文件字节时
+            // 链接时间与产物大小都随对象文件里一个尺寸字段增长（结构化变异：16 MiB 即 14 秒），对象可借此拖垮工具链。
+            if (cs.zeroFill == 1) { listPush(bssParts, bs); bi = bi + 1; continue; }
+            let al = cs.alignBytes;
+            if (al < 16) { al = 16; }
+            if (first != 1) { al = cs.alignBytes; }
+            if (first == 1 || isSplitDataPartL(cs.nameSpan) == 0) {
+                while (bytesLen(data) % al != 0) { bytesPush(data, 0); }
+            }
+            first = 0;
+            bs.off = bytesLen(data);
+            appendCoffBytes(data, cs);
+            if (isTlsNameL(cs.nameSpan) == 1) {
+                if (tlsMin < 0 || bs.off < tlsMin) { tlsMin = bs.off; }
+                const endo = bs.off + cs.byteCount;
+                if (endo > tlsMax) { tlsMax = endo; }
+            }
+            bi = bi + 1;
+        }
+        gk = gk + 1;
+    }
+    let tlsIndexOff = 0;
+    if (tlsMin >= 0) {
+        while (bytesLen(data) % 4 != 0) { bytesPush(data, 0); }
+        tlsIndexOff = bytesLen(data);
+        z = 0;
+        while (z < 4) { bytesPush(data, 0); z = z + 1; }
+    }
+    const impOffs: List<int> = listNew();
+    z = 0;
+    while (z < listLen(impNames)) {
+        while (bytesLen(data) % 8 != 0) { bytesPush(data, 0); }
+        listPush(impOffs, bytesLen(data));
+        z = z + 1;
+        z = z - 1;
+        bytesPush(data, 0); bytesPush(data, 0); bytesPush(data, 0); bytesPush(data, 0);
+        bytesPush(data, 0); bytesPush(data, 0); bytesPush(data, 0); bytesPush(data, 0);
+        z = z + 1;
+    }
+
+    // —— DLL 分组（名序稳定）——
+    const dllNames: List<string> = listNew();
+    z = 0;
+    while (z < listLen(externs)) {
+        const dll = dllOfL(listGet(externs, z) catch rawNameNone());
+        if (strInList(dllNames, dll) == 0) { listPush(dllNames, dll); }
+        z = z + 1;
+    }
+    sortStrings(dllNames);
+    const ndll = listLen(dllNames);
+    const extDll: List<int> = listNew();
+    const extIdxInDll: List<int> = listNew();
+    const counts: List<int> = listNew(); // 每 DLL 独立计数（zig counts 数组同构——
+    // 预填进 extIdxInDll 会把下标整体错位 ndll）
+    z = 0;
+    while (z < ndll) { listPush(counts, 0); z = z + 1; }
+    z = 0;
+    while (z < listLen(externs)) {
+        const dll = dllOfL(listGet(externs, z) catch rawNameNone());
+        let di = 0;
+        let k = 0;
+        while (k < ndll) {
+            if ((listGet(dllNames, k) catch "") == dll) { di = k; break; }
+            k = k + 1;
+        }
+        listPush(extDll, di);
+        listPush(extIdxInDll, listGet(counts, di) catch 0);
+        listSet(counts, di, (listGet(counts, di) catch 0) + 1);
+        z = z + 1;
+    }
+
+    // —— 导入面布局（.rdata 尾；全序 IBN→ILT→IAT→DLL 名→描述符→TLS）——
+    const ibnRva: List<int> = listNew();
+    const ibnOff: List<int> = listNew();
+    let o = bytesLen(rdata);
+    z = 0;
+    while (z < nfn) {
+        const name = listGet(externs, z) catch rawNameNone();
+        if (o % 2 != 0) { bytesPush(rdata, 0); o = o + 1; }
+        listPush(ibnOff, o);
+        bytesPush(rdata, 0); bytesPush(rdata, 0);
+        let k = 0;
+        while (k < rawNameSize(name)) { bytesPush(rdata, rawNameByte(name, k)); k = k + 1; }
+        bytesPush(rdata, 0);
+        o = o + 2 + rawNameSize(name) + 1;
+        z = z + 1;
+    }
+    z = 0;
+    while (z < nfn) { listPush(ibnRva, 0); z = z + 1; }
+    const iltOff: List<int> = listNew();
+    const iatOff: List<int> = listNew();
+    o = bytesLen(rdata);
+    let di = 0;
+    while (di < ndll) {
+        listPush(iltOff, o);
+        o = o + (dllCountOf(externs, dllNames, di) + 1) * 8;
+        di = di + 1;
+    }
+    di = 0;
+    while (di < ndll) {
+        listPush(iatOff, o);
+        o = o + (dllCountOf(externs, dllNames, di) + 1) * 8;
+        di = di + 1;
+    }
+    while (bytesLen(rdata) < o) { bytesPush(rdata, 0); }
+    const dllnameOff: List<int> = listNew();
+    o = bytesLen(rdata);
+    di = 0;
+    while (di < ndll) {
+        const dn = listGet(dllNames, di) catch "";
+        listPush(dllnameOff, o);
+        o = o + len(dn) + 1;
+        di = di + 1;
+    }
+    while (bytesLen(rdata) < o) { bytesPush(rdata, 0); }
+    const descOff = bytesLen(rdata);
+    z = 0;
+    while (z < (ndll + 1) * 20) { bytesPush(rdata, 0); z = z + 1; }
+    let tlsCbOff = 0;
+    let tlsDirOff = 0;
+    if (tlsMin >= 0) {
+        tlsCbOff = bytesLen(rdata);
+        z = 0;
+        while (z < 8) { bytesPush(rdata, 0); z = z + 1; }
+        tlsDirOff = bytesLen(rdata);
+        z = 0;
+        while (z < 40) { bytesPush(rdata, 0); z = z + 1; }
+    }
+
+    // 虚拟尾部：先是对象的 .bss（按组内顺序与各自对齐），再是程序自己的 BSS。映像总长以 2 GiB 为界——代码一律用
+    // 32 位相对重定位（small code model），超出即够不着；尺寸字段都是 32 位，累加不会溢出。
+    let virtualEnd = bytesLen(data);
+    bi = 0;
+    while (bi < listLen(bssParts)) {
+        const bs = listGet(bssParts, bi) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
+        const cs = listGet(co.sections, bs.coffIdx) catch dummyCoffSection();
+        virtualEnd = alignUpL(virtualEnd, cs.alignBytes);
+        bs.off = virtualEnd;
+        virtualEnd = virtualEnd + cs.byteCount;
+        if (virtualEnd > IMAGE_LIMIT) { lkFail("ImageTooLarge"); return 1; }
+        bi = bi + 1;
+    }
+    const programBssSize = asImgBssSize();
+    let programBssOff = virtualEnd;
+    let dataVirtualSize = virtualEnd;
+    if (programBssSize > 0) { programBssOff = alignUpL(virtualEnd, bssAlignment); dataVirtualSize = programBssOff + programBssSize; }
+    // —— RVA 赋值 ——
+    let sectionAlignment = SEC_ALIGN;
+    if (textAlignment > sectionAlignment) { sectionAlignment = textAlignment; }
+    if (rdataAlignment > sectionAlignment) { sectionAlignment = rdataAlignment; }
+    if (dataAlignment > sectionAlignment) { sectionAlignment = dataAlignment; }
+    const imageBase = alignUpL(IMAGE_BASE, sectionAlignment);
+    const textRva = sectionAlignment;
+    const rdataRva = textRva + alignUpL(bytesLen(text), sectionAlignment);
+    const dataRva = rdataRva + alignUpL(bytesLen(rdata), sectionAlignment);
+    const textVa = imageBase + textRva;
+    const rdataVa = imageBase + rdataRva;
+    const dataVa = imageBase + dataRva;
+    z = 0;
+    while (z < nfn) {
+        listSet(ibnRva, z, rdataRva + (listGet(ibnOff, z) catch 0));
+        z = z + 1;
+    }
+
+    // —— 符号宇宙（prog→blob→合成→tls→imp）——
+    let ai = 0;
+    while (ai < asSymCountL()) {
+        // Labels whose every reference the assembler already patched need no VA.
+        if (asSymNeededL(ai) == 0) { ai = ai + 1; continue; }
+        const sec = asSymSecL(ai);
+        const off2 = asSymOffL(ai);
+        let va = 0;
+        if (sec == 0) { va = textVa + off2; }
+        else if (sec == 1) { va = rdataVa + off2; }
+        else if (sec == 2) { va = dataVa + off2; }
+        else if (sec == 3) { va = dataVa + programBssOff + off2; }
+        else { lkFail("BadProgramSection"); return 1; }
+        uniPut(asSymNameL(ai), va);
+        ai = ai + 1;
+    }
+    si2 = 0;
+    while (si2 < listLen(co.symbols)) {
+        const sym = listGet(co.symbols, si2) catch dummyCoffSymbol();
+        if (sym.secno <= 0 || sym.storageClass != 2) { si2 = si2 + 1; continue; }
+        const m = (listGet(reachByCoff, sym.secno - 1) catch -1);
+        if (m < 0) { si2 = si2 + 1; continue; }
+        const bs = listGet(reachSecs, m) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
+        let baseVa = textVa;
+        if (bs.kind == 1) { baseVa = rdataVa; }
+        if (bs.kind == 2) { baseVa = dataVa; }
+        uniPutSpan(sym.nameSpan, baseVa + bs.off + sym.value);
+        si2 = si2 + 1;
+    }
+    z = 0;
+    while (z < nfn) {
+        const name = listGet(externs, z) catch rawNameNone();
+        uniPutSpan(rawNamePrefix(name, "__thunk_"), textVa + thunkOff + z * 6);
+        if (linkMapSymbolsEnabled()) { linkMapSynthetic(rawNamePrefix(name, "__thunk_"), "import-thunk", 0, textVa + thunkOff + z * 6); }
+        const di = listGet(extDll, z) catch 0;
+        uniPutSpan(rawNamePrefix(name, "__iat_"), rdataVa + (listGet(iatOff, di) catch 0) + (listGet(extIdxInDll, z) catch 0) * 8);
+        if (linkMapSymbolsEnabled()) { linkMapSynthetic(rawNamePrefix(name, "__iat_"), "iat-slot", 1, rdataVa + (listGet(iatOff, di) catch 0) + (listGet(extIdxInDll, z) catch 0) * 8); }
+        z = z + 1;
+    }
+    if (tlsMin >= 0) { uniPut("_tls_index", dataVa + tlsIndexOff); if (linkMapSymbolsEnabled()) { linkMapSynthetic(rawNameOf("_tls_index"), "tls-index", 2, dataVa + tlsIndexOff); } }
+    z = 0;
+    while (z < listLen(impNames)) {
+        uniPutSpan(rawNamePrefix(listGet(impNames, z) catch rawNameNone(), "__imp_"), dataVa + (listGet(impOffs, z) catch 0));
+        if (linkMapSymbolsEnabled()) { linkMapSynthetic(rawNamePrefix(listGet(impNames, z) catch rawNameNone(), "__imp_"), "import-slot", 2, dataVa + (listGet(impOffs, z) catch 0)); }
+        z = z + 1;
+    }
+
+    // —— prog fixups 回填 ——
+    fi = 0;
+    while (fi < asFixCountL()) {
+        const symName = asFixSymL(fi);
+        const target = uniGet(symName);
+        if (target < 0) { lkFail(symName); return 1; }
+        const fxSec = asFixSecL(fi);
+        const fxAt = asFixAtL(fi);
+        const fxKind = asFixKindL(fi);
+        const fxAddend = asFixAddendL(fi);
+        let buf = text;
+        if (fxSec == 1) { buf = rdata; }
+        if (fxSec == 2) { buf = data; }
+        if (fxSec < 0 || fxSec > 2) { lkFail("BadProgramFixupSection"); return 1; }
+        let baseVa = textVa;
+        if (fxSec == 1) { baseVa = rdataVa; }
+        if (fxSec == 2) { baseVa = dataVa; }
+        const siteVa = baseVa + fxAt;
+        if (fxAt + 8 > bytesLen(buf)) {
+            lkFail("fixup-OOB sec=" + dec(fxSec) + " at=" + dec(fxAt) + " sym=" + symName + " buflen=" + dec(bytesLen(buf)));
+            return 1;
+        }
+        if (fxKind == 0) { // rel32
+            const v = target + fxAddend - siteVa - 4;
+            writeI32At(buf, fxAt, v);
+        } else { // addr64
+            writeI64At(buf, fxAt, target + fxAddend);
+        }
+        fi = fi + 1;
+    }
+
+    // —— blob relocs 回填 ——
+    bi = 0;
+    while (bi < listLen(reachSecs)) {
+        const bs = listGet(reachSecs, bi) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
+        const cs = listGet(co.sections, bs.coffIdx) catch dummyCoffSection();
+        let buf = text;
+        if (bs.kind == 1) { buf = rdata; }
+        if (bs.kind == 2) { buf = data; }
+        let baseVa = textVa;
+        if (bs.kind == 1) { baseVa = rdataVa; }
+        if (bs.kind == 2) { baseVa = dataVa; }
+        let ri = 0;
+        while (ri < listLen(cs.relocs)) {
+            const r = listGet(cs.relocs, ri) catch new CoffReloc { va: 0, sym: 0, typ: 0 };
+            const sym = listGet(co.symbols, r.sym) catch dummyCoffSymbol();
+            let tva = 0;
+            let symSecrelOff = -1;
+            if (sym.secno == 0) {
+                const uv = uniGetSpan(sym.nameSpan);
+                if (uv >= 0) {
+                    tva = uv;
+                } else if (rawNameEqualText(sym.nameSpan, "_tls_index", rawNameTextHash("_tls_index"))) {
+                    const tv = uniGet("_tls_index");
+                    if (tv < 0) { lkFail(rawNameText(sym.nameSpan)); return 1; }
+                    tva = tv;
+                } else {
+                    const tv = uniGetSpan(rawNamePrefix(sym.nameSpan, "__thunk_"));
+                    if (tv < 0) { lkFail(rawNameText(sym.nameSpan)); return 1; }
+                    tva = tv;
+                }
+            } else {
+                const m = (listGet(reachByCoff, sym.secno - 1) catch -1);
+                if (m < 0) { lkFail(rawNameText(sym.nameSpan)); return 1; }
+                const tbs = listGet(reachSecs, m) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
+                let tBaseVa = textVa;
+                if (tbs.kind == 1) { tBaseVa = rdataVa; }
+                if (tbs.kind == 2) { tBaseVa = dataVa; }
+                tva = tBaseVa + tbs.off + sym.value;
+                if (tbs.kind == 2) { symSecrelOff = tbs.off + sym.value; }
+            }
+            const siteVa = baseVa + bs.off + r.va;
+            if (bs.off + r.va + 8 > bytesLen(buf)) {
+                lkFail("reloc-OOB sec=" + rawNameText(cs.nameSpan) + " va=" + dec(r.va) + " off=" + dec(bs.off) + " buflen=" + dec(bytesLen(buf)) + " sym=" + rawNameText(sym.nameSpan));
+                return 1;
+            }
+            // 隐式加数来自对象字节，结果须核范围（同 ELF 一侧）：此前 REL32、SECREL32 截断写回，越界即成错误产物；
+            // ADDR64 用普通加法，加数近 2^63 时整数溢出 trap。64 位绝对按模 2^64（同 link.exe 与 ELF 侧）。
+            if (r.typ == 4) { // REL32
+                const init = readI32At(buf, bs.off + r.va);
+                const v = init + tva - siteVa - 4;
+                if (v < -2147483648 || v > 2147483647) { lkFail("RelativeRelocationOutOfRange"); return 1; }
+                writeI32At(buf, bs.off + r.va, v);
+            } else if (r.typ == 1) { // ADDR64
+                const init = readI64At(buf, bs.off + r.va);
+                writeI64At(buf, bs.off + r.va, wrapAdd(init, tva));
+            } else if (r.typ == 11) { // SECREL32
+                if (symSecrelOff < 0 || tlsMin < 0) { lkFail("UnsupportedReloc"); return 1; }
+                const v = symSecrelOff - tlsMin;
+                if (v < 0 || v > 4294967295) { lkFail("AbsoluteRelocationOutOfRange"); return 1; }
+                writeU32At(buf, bs.off + r.va, v);
+            } else {
+                lkFail("UnsupportedRelocation:" + dec(r.typ));
+                return 1;
+            }
+            ri = ri + 1;
+        }
+        bi = bi + 1;
+    }
+
+    // —— thunk disp32 回填＋FF 25 操作码 ——
+    z = 0;
+    while (z < nfn) {
+        const name = listGet(externs, z) catch rawNameNone();
+        const iatVa = uniGetSpan(rawNamePrefix(name, "__iat_"));
+        const siteVa = textVa + thunkOff + z * 6 + 2;
+        const disp = iatVa - siteVa - 4;
+        writeI32At(text, thunkOff + z * 6 + 2, disp);
+        bytesSet(text, thunkOff + z * 6, 0xFF);
+        bytesSet(text, thunkOff + z * 6 + 1, 0x25);
+        z = z + 1;
+    }
+    // —— __imp 槽内容回填（真定义优先，缺省 thunk）——
+    z = 0;
+    while (z < listLen(impNames)) {
+        const nm = listGet(impNames, z) catch rawNameNone();
+        let tva = uniGetSpan(nm);
+        if (tva < 0) { tva = uniGetSpan(rawNamePrefix(nm, "__thunk_")); }
+        if (tva < 0) { lkFail(rawNameText(nm)); return 1; }
+        writeI64At(data, listGet(impOffs, z) catch 0, tva);
+        z = z + 1;
+    }
+
+    // —— 导入结构回填 ——
+    z = 0;
+    while (z < nfn) {
+        const di = listGet(extDll, z) catch 0;
+        const k = listGet(extIdxInDll, z) catch 0;
+        const ib = listGet(ibnRva, z) catch 0;
+        const iltA = (listGet(iltOff, di) catch 0) + k * 8;
+        const iatA = (listGet(iatOff, di) catch 0) + k * 8;
+        if (iltA + 8 > bytesLen(rdata) || iatA + 8 > bytesLen(rdata)) {
+            lkFail("ILT-OOB z=" + dec(z) + " di=" + dec(di) + " k=" + dec(k) + " iltA=" + dec(iltA) + " iatA=" + dec(iatA) + " rdata=" + dec(bytesLen(rdata)) + " ndll=" + dec(ndll) + " nfn=" + dec(nfn));
+            return 1;
+        }
+        writeI64At(rdata, iltA, ib);
+        writeI64At(rdata, iatA, ib);
+        z = z + 1;
+    }
+    di = 0;
+    while (di < ndll) {
+        const n = dllCountOf(externs, dllNames, di);
+        writeI64At(rdata, (listGet(iltOff, di) catch 0) + n * 8, 0);
+        writeI64At(rdata, (listGet(iatOff, di) catch 0) + n * 8, 0);
+        di = di + 1;
+    }
+    di = 0;
+    while (di < ndll) {
+        const dn = listGet(dllNames, di) catch "";
+        const doo = listGet(dllnameOff, di) catch 0;
+        let k = 0;
+        while (k < len(dn)) { bytesSet(rdata, doo + k, byteAt(dn, k) catch 0); k = k + 1; }
+        bytesSet(rdata, doo + len(dn), 0);
+        di = di + 1;
+    }
+    di = 0;
+    while (di < ndll) {
+        const o = descOff + di * 20;
+        writeU32At(rdata, o, rdataRva + (listGet(iltOff, di) catch 0));
+        writeU32At(rdata, o + 4, 0);
+        writeU32At(rdata, o + 8, 0);
+        writeU32At(rdata, o + 12, rdataRva + (listGet(dllnameOff, di) catch 0));
+        writeU32At(rdata, o + 16, rdataRva + (listGet(iatOff, di) catch 0));
+        di = di + 1;
+    }
+    let tlsRva = 0;
+    if (tlsMin >= 0) {
+        const o = tlsDirOff;
+        writeI64At(rdata, o, dataVa + tlsMin);
+        writeI64At(rdata, o + 8, dataVa + tlsMax);
+        writeI64At(rdata, o + 16, dataVa + tlsIndexOff);
+        writeI64At(rdata, o + 24, rdataVa + tlsCbOff);
+        writeU32At(rdata, o + 32, 0);
+        writeU32At(rdata, o + 36, 0);
+        tlsRva = rdataRva + tlsDirOff;
+    }
+    // NRT 内核自带 IMAGE_TLS_DIRECTORY64（符号 __tx_tls_directory；模板、索引槽与回调表都在内核里，
+    // 线程设计 §十二）：只把数据目录 9 指向它。
+    if (tlsRva == 0) {
+        const tlsDirVa = uniGet("__tx_tls_directory");
+        if (tlsDirVa >= 0) { tlsRva = tlsDirVa - imageBase; }
+    }
+
+    // —— PE 序列化（emitPe :1030-1142 同构）——
+    const entryVa = uniGet("__tx_entry");
+    if (entryVa < 0) { lkFail("__tx_entry"); return 1; }
+    const entryRva = entryVa - imageBase;
+    const imageSize = dataRva + alignUpL(dataVirtualSize, sectionAlignment);
+    if (dataVirtualSize > 4294967295 || imageSize > 4294967295) { lkFail("ProgramStorageImageOverflow"); return 1; }
+    if (imageSize > IMAGE_LIMIT) { lkFail("ImageTooLarge"); return 1; }
+
+    // DOS 头＋PE32+ 头（逐字段同构）。
+    const hdr: Bytes = bytesNew(0);
+    bytesPush(hdr, 77); bytesPush(hdr, 90); // MZ
+    z = 0;
+    while (z < 58) { bytesPush(hdr, 0); z = z + 1; }
+    w32L(hdr, 0x78);
+    const dosStub = "This program cannot be run in DOS mode.$";
+    const stubBytes: Bytes = bytesNew(0);
+    bytesPush(stubBytes, 0x0E); bytesPush(stubBytes, 0x1F); bytesPush(stubBytes, 0xBA);
+    bytesPush(stubBytes, 0x0E); bytesPush(stubBytes, 0x00); bytesPush(stubBytes, 0xB4);
+    bytesPush(stubBytes, 0x09); bytesPush(stubBytes, 0xCD); bytesPush(stubBytes, 0x21);
+    bytesPush(stubBytes, 0xB8); bytesPush(stubBytes, 0x01); bytesPush(stubBytes, 0x4C);
+    bytesPush(stubBytes, 0xCD); bytesPush(stubBytes, 0x21);
+    let si3 = 0;
+    while (si3 < len(dosStub)) { bytesPush(stubBytes, byteAt(dosStub, si3) catch 0); si3 = si3 + 1; }
+    bytesPush(stubBytes, 0);
+    si3 = 0;
+    while (si3 < bytesLen(stubBytes)) { bytesPush(hdr, bytesGet(stubBytes, si3) catch 0); si3 = si3 + 1; }
+    while (bytesLen(hdr) < 0x78) { bytesPush(hdr, 0); }
+    bytesPush(hdr, 80); bytesPush(hdr, 69); bytesPush(hdr, 0); bytesPush(hdr, 0); // PE\0\0
+    w16L(hdr, 0x8664);
+    let sectionCount = 2;
+    if (dataVirtualSize > 0) { sectionCount = 3; }
+    w16L(hdr, sectionCount);
+    w32L(hdr, 0);
+    w32L(hdr, 0);
+    w32L(hdr, 0);
+    w16L(hdr, 240);
+    w16L(hdr, 0x0022);
+    w16L(hdr, 0x20B);
+    bytesPush(hdr, 0);
+    bytesPush(hdr, 0);
+    w32L(hdr, bytesLen(text) + bytesLen(rdata) + bytesLen(data));
+    w32L(hdr, 0);
+    w32L(hdr, dataVirtualSize - bytesLen(data));
+    w32L(hdr, entryRva);
+    w32L(hdr, textRva);
+    w64L(hdr, imageBase);
+    w32L(hdr, sectionAlignment);
+    w32L(hdr, FILE_ALIGN);
+    w16L(hdr, 6);
+    w16L(hdr, 0);
+    w16L(hdr, 6);
+    w16L(hdr, 0);
+    w32L(hdr, 6); // Win32VersionValue＝6（硬发现③）
+    bytesPush(hdr, 0); bytesPush(hdr, 0); bytesPush(hdr, 0); bytesPush(hdr, 0);
+    w32L(hdr, imageSize); // SizeOfImage@56（硬发现②）
+    w32L(hdr, HEADERS_OFF);
+    w32L(hdr, 0);
+    let subsystem = 3;
+    if (guiSubsystem == 1) { subsystem = 2; }
+    w16L(hdr, subsystem);
+    w16L(hdr, 0);
+    w64L(hdr, STACK_RESERVE);
+    w64L(hdr, 0x10000);
+    w64L(hdr, 0x100000);
+    w64L(hdr, 0);
+    w32L(hdr, 0);
+    w32L(hdr, 16);
+    let d2 = 0;
+    while (d2 < 16) {
+        if (d2 == 1) {
+            w32L(hdr, rdataRva + descOff);
+            w32L(hdr, (ndll + 1) * 20);
+        } else if (d2 == 9 && tlsRva != 0) {
+            w32L(hdr, tlsRva);
+            w32L(hdr, 40);
+        } else {
+            w32L(hdr, 0);
+            w32L(hdr, 0);
+        }
+        d2 = d2 + 1;
+    }
+    // 节表。
+    secHdr(hdr, ".text\0\0\0", bytesLen(text), textRva, alignUpL(bytesLen(text), FILE_ALIGN), HEADERS_OFF, 0x60000020);
+    secHdr(hdr, ".rdata\0\0", bytesLen(rdata), rdataRva, alignUpL(bytesLen(rdata), FILE_ALIGN), HEADERS_OFF + alignUpL(bytesLen(text), FILE_ALIGN), 0x40000040);
+    if (dataVirtualSize > 0) {
+        let dataRawAt = 0;
+        if (bytesLen(data) > 0) { dataRawAt = HEADERS_OFF + alignUpL(bytesLen(text), FILE_ALIGN) + alignUpL(bytesLen(rdata), FILE_ALIGN); }
+        secHdr(hdr, ".data\0\0\0", dataVirtualSize, dataRva, alignUpL(bytesLen(data), FILE_ALIGN), dataRawAt, 0xC0000040);
+    }
+
+    // 落位。
+    bytesAppend(exeBytes, hdr);
+    padTo(exeBytes, HEADERS_OFF);
+    bytesAppend(exeBytes, text);
+    padTo(exeBytes, HEADERS_OFF + alignUpL(bytesLen(text), FILE_ALIGN));
+    bytesAppend(exeBytes, rdata);
+    padTo(exeBytes, HEADERS_OFF + alignUpL(bytesLen(text), FILE_ALIGN) + alignUpL(bytesLen(rdata), FILE_ALIGN));
+    bytesAppend(exeBytes, data);
+    padTo(exeBytes, HEADERS_OFF + alignUpL(bytesLen(text), FILE_ALIGN) + alignUpL(bytesLen(rdata), FILE_ALIGN) + alignUpL(bytesLen(data), FILE_ALIGN));
+    if (linkMapEnabled()) { collectPeMap(co, reachByCoff, reachSecs, textVa, rdataVa, dataVa, programBssOff); linkMapDone(); }
+    return 0;
+}
+
+// Zero-pad b to n bytes (no-op when already that long).
+function padTo(b: Bytes, n: int): void {
+    if (bytesLen(b) < n) { bytesAppend(b, bytesNew(n - bytesLen(b))); }
+}
+
+// —— 辅助（查名/写域/节表）——
+function markByName(co: Ref<CoffObj>, allByCoff: List<int>, nm: Ref<BinaryName>): int {
+    const i = siGet(nm);
+    if (i < 0) { return -1; }
+    const sym = listGet(co.symbols, i) catch dummyCoffSymbol();
+    return listGet(allByCoff, sym.secno - 1) catch -1;
+}
+
+function markByText(co: Ref<CoffObj>, allByCoff: List<int>, name: string): int {
+    const i = siGetText(name);
+    if (i < 0) { return -1; }
+    const symbol = listGet(co.symbols, i) catch dummyCoffSymbol();
+    return listGet(allByCoff, symbol.secno - 1) catch -1;
+}
+
+function strInList(list: List<string>, s: string): int {
+    let i = 0;
+    while (i < listLen(list)) {
+        if ((listGet(list, i) catch "") == s) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+function dllCountOf(externs: List<Ref<BinaryName>>, dllNames: List<string>, di: int): int {
+    const dll = listGet(dllNames, di) catch "";
+    let n = 0;
+    let i = 0;
+    while (i < listLen(externs)) {
+        if (dllOfL(listGet(externs, i) catch rawNameNone()) == dll) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+function strLessTx(a: string, b: string): int {
+    // 字节序字典序（std.mem.order .lt 同构）。
+    let i = 0;
+    while (i < len(a) && i < len(b)) {
+        const ca = byteAt(a, i) catch 0;
+        const cb = byteAt(b, i) catch 0;
+        if (ca != cb) {
+            if (ca < cb) { return 1; }
+            return 0;
+        }
+        i = i + 1;
+    }
+    if (len(a) < len(b)) { return 1; }
+    return 0;
+}
+
+function sortStrings(list: List<string>): void {
+    let i = 0;
+    while (i < listLen(list)) {
+        let mi = i;
+        let j = i + 1;
+        while (j < listLen(list)) {
+            if (strLessTx(listGet(list, j) catch "", listGet(list, mi) catch "") == 1) { mi = j; }
+            j = j + 1;
+        }
+        if (mi != i) {
+            const t = listGet(list, i) catch "";
+            listSet(list, i, listGet(list, mi) catch "");
+            listSet(list, mi, t);
+        }
+        i = i + 1;
+    }
+}
+
+function asHasSymTx(name: Ref<BinaryName>): int {
+    const text = rawNameText(name);
+    if (rawNameEqualText(name, text, rawNameTextHash(text)) && asSymIndexL(text) >= 0) { return 1; }
+    return 0;
+}
+
+/// 有符号 32 位（REL32 的隐式加数）：按符号扩展。
+function readI32At(buf: Bytes, off: int): int {
+    const v = rdI32From(buf, off);
+    if (v >= 2147483648) { return v - 4294967296; }
+    return v;
+}
+
+function readI64At(buf: Bytes, off: int): int {
+    return rdU64From(buf, off);
+}
+
+function rdI32From(buf: Bytes, off: int): int {
+    let v = 0;
+    let k = 0;
+    while (k < 4) {
+        v = v | ((bytesGet(buf, off + k) catch 0) << (k * 8));
+        k = k + 1;
+    }
+    return v;
+}
+
+function rdU64From(buf: Bytes, off: int): int {
+    let v = 0;
+    let k = 0;
+    while (k < 8) {
+        v = v | ((bytesGet(buf, off + k) catch 0) << (k * 8));
+        k = k + 1;
+    }
+    return v;
+}
+
+function writeI32At(buf: Bytes, off: int, v: int): void {
+    bytesSet(buf, off, v & 0xFF);
+    bytesSet(buf, off + 1, (v >>> 8) & 0xFF);
+    bytesSet(buf, off + 2, (v >>> 16) & 0xFF);
+    bytesSet(buf, off + 3, (v >>> 24) & 0xFF);
+}
+
+function writeU32At(buf: Bytes, off: int, v: int): void {
+    writeI32At(buf, off, v);
+}
+
+function writeI64At(buf: Bytes, off: int, v: int): void {
+    let k = 0;
+    while (k < 8) {
+        bytesSet(buf, off + k, (v >>> (k * 8)) & 0xFF);
+        k = k + 1;
+    }
+}
+
+function w16L(list: Bytes, v: int): void {
+    bytesPush(list, v & 0xFF);
+    bytesPush(list, (v >>> 8) & 0xFF);
+}
+
+function w32L(list: Bytes, v: int): void {
+    bytesPush(list, v & 0xFF);
+    bytesPush(list, (v >>> 8) & 0xFF);
+    bytesPush(list, (v >>> 16) & 0xFF);
+    bytesPush(list, (v >>> 24) & 0xFF);
+}
+
+function w64L(list: Bytes, v: int): void {
+    let k = 0;
+    while (k < 8) {
+        bytesPush(list, (v >>> (k * 8)) & 0xFF);
+        k = k + 1;
+    }
+}
+
+function secHdr(hdr: Bytes, name: string, vsize: int, rva: int, rawsize: int, rawptr: int, chars: int): void {
+    let i = 0;
+    while (i < 8) {
+        bytesPush(hdr, byteAt(name, i) catch 0);
+        i = i + 1;
+    }
+    w32L(hdr, vsize);
+    w32L(hdr, rva);
+    w32L(hdr, rawsize);
+    w32L(hdr, rawptr);
+    w32L(hdr, 0);
+    w32L(hdr, 0);
+    w16L(hdr, 0);
+    w16L(hdr, 0);
+    w32L(hdr, chars);
+}
+
+// —— 输出访问器 ——
+export function exeBytesList(): Bytes {
+    return exeBytes;
+}
+
+export function lkIsFailed(): int {
+    return lk_failed;
+}
+
+export function lkGetMissing(): string {
+    return lk_missing;
+}
+
+// Collect from actual placements; never infer function ranges from labels.
+function collectPeMap(co: Ref<CoffObj>, reachByCoff: List<int>, reached: List<Ref<BlobSec>>,
+    textVa: int, rdataVa: int, dataVa: int, programBssOff: int): void {
+    const pe = rdU32(exeBytes, 60); const opt = pe + 24; const base = rdU64(exeBytes, opt + 24);
+    linkMapLayout(base, base + rdU32(exeBytes, opt + 16));
+    const count = rdU16(exeBytes, pe + 6); const headers = opt + rdU16(exeBytes, pe + 20);
+    let i = 0;
+    while (i < count) {
+        const at = headers + i * 40;
+        linkMapAddSection(i, coffShortName(exeBytes, at), base + rdU32(exeBytes, at + 12), rdU32(exeBytes, at + 20), rdU32(exeBytes, at + 16), rdU32(exeBytes, at + 8)); i = i + 1;
+    }
+    linkMapAddPlacement(-1, 0, 0, textVa, bytesLen(asImgText()));
+    for (bs in reached) {
+        const cs = listGet(co.sections, bs.coffIdx) catch dummyCoffSection();
+        let va = textVa; if (bs.kind == 1) { va = rdataVa; } if (bs.kind == 2) { va = dataVa; }
+        linkMapAddPlacement(cs.originObject, cs.originIndex, bs.kind, va + bs.off, cs.byteCount);
+    }
+    if (!linkMapSymbolsEnabled()) { return; }
+    const names = [".text", ".rdata", ".data", ".bss"];
+    i = 0;
+    while (i < asSymCountL()) {
+        const sec = asSymSecL(i); const off = asSymOffL(i);
+        const row = linkMapRow(rawNameOf(asSymNameL(i)), "program", -1, i);
+        linkMapInput(row, sec, rawNameOf(names[sec]), off);
+        row.binding = "label"; row.symbolType = "label"; row.valueKind = "link-va"; row.state = "defined";
+        row.outputSection = sec; row.value = textVa + off;
+        if (sec == 1) { row.value = rdataVa + off; }
+        if (sec == 2) { row.value = dataVa + off; }
+        if (sec == 3) { row.value = dataVa + programBssOff + off; row.outputSection = 2; }
+        if (row.outputSection >= count) { row.outputSection = -1; row.state = "defined-empty-section"; }
+        linkMapAdd(row); i = i + 1;
+    }
+    for (s in co.symbols) {
+        if (rawNameSize(s.nameSpan) == 0) { continue; }
+        const row = linkMapRow(s.nameSpan, "input", s.originObject, s.originIndex);
+        row.symbolType = "coff:" + toStr(s.symbolType); row.binding = "coff:" + toStr(s.storageClass);
+        if (s.storageClass == 2) { row.binding = "global"; } else if (s.storageClass == 3) { row.binding = "local"; }
+        if (s.secno > 0) {
+            const section = listGet(co.sections, s.secno - 1) catch dummyCoffSection();
+            linkMapInput(row, s.originSection, section.nameSpan, s.value);
+            row.valueKind = "section-relative"; row.value = s.value; row.state = "discarded";
+            const m = listGet(reachByCoff, s.secno - 1) catch -1;
+            if (m >= 0) {
+                const bs = listGet(reached, m) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
+                let va = textVa; if (bs.kind == 1) { va = rdataVa; } if (bs.kind == 2) { va = dataVa; }
+                row.valueKind = "link-va"; row.value = va + bs.off + s.value; row.outputSection = bs.kind; row.state = "defined";
+                if (row.outputSection >= count) { row.outputSection = -1; row.state = "defined-empty-section"; }
+            }
+        } else if (s.secno == -1) { row.valueKind = "absolute"; row.value = s.value; row.state = "absolute"; }
+        else if (s.secno == -2) { row.valueKind = "metadata"; row.value = s.value; row.state = "metadata"; }
+        else {
+            const va = uniGetSpan(s.nameSpan);
+            if (va >= 0) { row.valueKind = "link-va"; row.value = va; row.state = "resolved-reference"; }
+        }
+        linkMapAdd(row);
+    }
+}

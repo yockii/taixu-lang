@@ -1,0 +1,352 @@
+// ============================================================================
+// std/image —— PNG 解码（V0.40-S1；STD-12；D88"仅 BMP"之墙）。纯 .tx，
+// 零宿主 extern；IDAT 解压经 std/compress inflate（确定性红线——向量锚
+// tests/image-fx.tx，fixture 由 tests/vectors/gen_vectors.py 冻结生成）。
+//
+// 支持面：bit depth 8 × color type 0/2/3/4/6（灰度/RGB/调色板/灰α/RGBA）；
+// filter 0–4 全还原（None/Sub/Up/Average/Paeth）；PLTE/tRNS；多 IDAT 拼接；
+// CRC32 逐块校验（std/compress crc32——坏块结构化拒绝）。
+// **登记不实施**（README 如实注记）：bit depth 16、行间 Adam7 interlace、
+// 附加块（gAMA/iCCP 等一律安全跳过——PNG 规范 ancillary 语义）。
+// 输出＝RGBA8 像素面（宽×高×4 的 List<int>，行主序）＋宽高。
+// ============================================================================
+
+// IDAT 为 zlib 包装流（RFC 1950）——经 std/compress zlibDecompress
+// 解压（头校验＋adler32 尾随校验）；块 CRC 面用 crc32。
+import { zlibDecompress, crc32 } from "std/compress";
+
+const MAX_PIXELS: int = 16777216; // 4096×4096 上限（解压炸弹同款守卫）
+
+export struct PngImage {
+    width: int,
+    height: int,
+    pixels: List<int>, // RGBA8 行主序，len = w*h*4，元素 0..255
+}
+
+export function decodePngHex(hex: string): PngImage | Error {
+    return decodePng(hexBytes(hex));
+}
+
+export function decodePng(data: List<int>): PngImage | Error {
+    const n: int = listLen(data);
+    if (n < 57) {
+        return err("png: 流过短（签名＋最小 IHDR/IDAT/IEND）");
+    }
+    // 签名：89 50 4E 47 0D 0A 1A 0A。
+    if ((listGet(data, 0) catch 0) != 0x89 || (listGet(data, 1) catch 0) != 0x50
+        || (listGet(data, 2) catch 0) != 0x4E || (listGet(data, 3) catch 0) != 0x47
+        || (listGet(data, 4) catch 0) != 0x0D || (listGet(data, 5) catch 0) != 0x0A
+        || (listGet(data, 6) catch 0) != 0x1A || (listGet(data, 7) catch 0) != 0x0A) {
+        return err("png: magic 不符");
+    }
+    let width: int = 0;
+    let height: int = 0;
+    let colorType: int = -1;
+    let interlace: int = -1;
+    const palette: List<int> = listNew();
+    let palCount: int = 0;
+    const trns: List<int> = listNew();
+    let trnsGray: int = -1;
+    let trnsR: int = -1;
+    let trnsG: int = -1;
+    let trnsB: int = -1;
+    const idat: List<int> = listNew();
+    let sawIEND: bool = false;
+    let p: int = 8;
+    while (p < n && !sawIEND) {
+        if (p + 8 > n) {
+            return err("png: 块头截断");
+        }
+        const clen: int = u32be(data, p);
+        let ctype: string = "";
+        ctype = typeStr(data, p + 4);
+        if (p + 12 + clen > n) {
+            return err("png: 块数据截断");
+        }
+        const dstart: int = p + 8;
+        // CRC32（type＋data 逐块校验）。
+        const crced: List<int> = listNew();
+        let ci: int = 0;
+        while (ci < 4 + clen) {
+            listPush(crced, listGet(data, p + 4 + ci) catch 0);
+            ci = ci + 1;
+        }
+        if (crc32(crced) != u32be(data, dstart + clen)) {
+            return err("png: CRC32 校验失败");
+        }
+        if (ctype == "IHDR") {
+            if (clen != 13) {
+                return err("png: IHDR 长度非法");
+            }
+            width = u32be(data, dstart);
+            height = u32be(data, dstart + 4);
+            const depth: int = listGet(data, dstart + 8) catch 0;
+            colorType = listGet(data, dstart + 9) catch 0;
+            const compression: int = listGet(data, dstart + 10) catch 0;
+            const filterMethod: int = listGet(data, dstart + 11) catch 0;
+            interlace = listGet(data, dstart + 12) catch 0;
+            if (depth != 8) {
+                return err("png: bit depth 8 限定（16 登记不实施）");
+            }
+            if (colorType != 0 && colorType != 2 && colorType != 3 && colorType != 4 && colorType != 6) {
+                return err("png: color type 非法");
+            }
+            if (compression != 0 || filterMethod != 0) {
+                return err("png: 压缩/滤波方法非法");
+            }
+            if (interlace != 0) {
+                return err("png: Adam7 interlace 登记不实施");
+            }
+            if (width <= 0 || height <= 0 || width * height > MAX_PIXELS) {
+                return err("png: 尺寸越界");
+            }
+        } else if (ctype == "PLTE") {
+            if (clen % 3 != 0 || clen > 768) {
+                return err("png: PLTE 长度非法");
+            }
+            palCount = clen / 3;
+            let i: int = 0;
+            while (i < clen) {
+                listPush(palette, listGet(data, dstart + i) catch 0);
+                i = i + 1;
+            }
+        } else if (ctype == "tRNS") {
+            if (colorType == 0) {
+                if (clen != 2) {
+                    return err("png: tRNS 长度非法");
+                }
+                trnsGray = ((listGet(data, dstart) catch 0) << 8 | (listGet(data, dstart + 1) catch 0)) & 0xFF;
+            } else if (colorType == 2) {
+                if (clen != 6) {
+                    return err("png: tRNS 长度非法");
+                }
+                trnsR = ((listGet(data, dstart) catch 0) << 8 | (listGet(data, dstart + 1) catch 0)) & 0xFF;
+                trnsG = ((listGet(data, dstart + 2) catch 0) << 8 | (listGet(data, dstart + 3) catch 0)) & 0xFF;
+                trnsB = ((listGet(data, dstart + 4) catch 0) << 8 | (listGet(data, dstart + 5) catch 0)) & 0xFF;
+            } else if (colorType == 3) {
+                if (clen > palCount) {
+                    return err("png: tRNS 超调色板");
+                }
+                let i: int = 0;
+                while (i < clen) {
+                    listPush(trns, listGet(data, dstart + i) catch 0);
+                    i = i + 1;
+                }
+            } else {
+                return err("png: tRNS 不适用该 color type");
+            }
+        } else if (ctype == "IDAT") {
+            let i: int = 0;
+            while (i < clen) {
+                listPush(idat, listGet(data, dstart + i) catch 0);
+                i = i + 1;
+            }
+        } else if (ctype == "IEND") {
+            sawIEND = true;
+        }
+        // 其余块（ancillary/私用）安全跳过。
+        p = dstart + clen + 4;
+    }
+    if (!sawIEND) {
+        return err("png: 缺 IEND");
+    }
+    if (width <= 0 || height <= 0) {
+        return err("png: 缺 IHDR");
+    }
+    if (colorType == 3 && palCount == 0) {
+        return err("png: 调色板类型缺 PLTE");
+    }
+    if (listLen(idat) == 0) {
+        return err("png: 缺 IDAT");
+    }
+    const raw: List<int> = zlibDecompress(idat)?;
+    const px: List<int> = unfilterToRgba(raw, width, height, colorType,
+        palette, palCount, trns, trnsGray, trnsR, trnsG, trnsB)?;
+    const img: PngImage = { width: width, height: height, pixels: px };
+    return img;
+}
+
+// —— filter 0–4 全还原 → RGBA8 展开 ——
+
+function unfilterToRgba(raw: List<int>, w: int, h: int, colorType: int,
+    palette: List<int>, palCount: int, trns: List<int>, trnsGray: int,
+    trnsR: int, trnsG: int, trnsB: int): List<int> | Error {
+    let channels: int = 4;
+    if (colorType == 0 || colorType == 3) {
+        channels = 1;
+    } else if (colorType == 4) {
+        channels = 2;
+    } else if (colorType == 2) {
+        channels = 3;
+    }
+    const stride: int = w * channels;
+    const need: int = h * (stride + 1);
+    if (listLen(raw) != need) {
+        return err("png: 解压后行长不符");
+    }
+    const out: List<int> = listNew();
+    let prev: List<int> = listNew();
+    let y: int = 0;
+    while (y < h) {
+        const ft: int = listGet(raw, y * (stride + 1)) catch 0;
+        if (ft < 0 || ft > 4) {
+            return err("png: 非法 filter 类型");
+        }
+        const cur: List<int> = listNew();
+        let x: int = 0;
+        while (x < stride) {
+            const base: int = y * (stride + 1) + 1;
+            const filt: int = listGet(raw, base + x) catch 0;
+            let lv: int = 0;
+            if (x >= channels) {
+                lv = listGet(cur, x - channels) catch 0;
+            }
+            const uv: int = listGet(prev, x) catch 0;
+            let ul: int = 0;
+            if (x >= channels) {
+                ul = listGet(prev, x - channels) catch 0;
+            }
+            let v: int = filt;
+            if (ft == 1) {
+                v = filt + lv;
+            } else if (ft == 2) {
+                v = filt + uv;
+            } else if (ft == 3) {
+                v = filt + ((lv + uv) >>> 1);
+            } else if (ft == 4) {
+                v = filt + paeth(lv, uv, ul);
+            }
+            listPush(cur, v & 0xFF);
+            x = x + 1;
+        }
+        if (expandRow(cur, w, colorType, palette, palCount, trns, trnsGray,
+                trnsR, trnsG, trnsB, out) != 0) {
+            return err("png: 调色板索引越界");
+        }
+        prev = cur;
+        y = y + 1;
+    }
+    return out;
+}
+
+// Paeth 预测器（PNG 规范 §6）。
+function paeth(a: int, b: int, c: int): int {
+    const pp: int = a + b - c;
+    const pa: int = absOf(pp - a);
+    const pb: int = absOf(pp - b);
+    const pc: int = absOf(pp - c);
+    if (pa <= pb && pa <= pc) {
+        return a;
+    }
+    if (pb <= pc) {
+        return b;
+    }
+    return c;
+}
+
+function absOf(v: int): int {
+    if (v < 0) {
+        return -v;
+    }
+    return v;
+}
+
+// 单行展开为 RGBA8（tRNS 透明键/调色板 alpha 在此收口）；0＝ok，-1＝索引越界。
+function expandRow(cur: List<int>, w: int, colorType: int, palette: List<int>,
+    palCount: int, trns: List<int>, trnsGray: int, trnsR: int, trnsG: int,
+    trnsB: int, out: List<int>): int {
+    let x: int = 0;
+    while (x < w) {
+        if (colorType == 0) {
+            const g: int = listGet(cur, x) catch 0;
+            let alpha: int = 255;
+            if (trnsGray == g) {
+                alpha = 0;
+            }
+            pushRgba(out, g, g, g, alpha);
+        } else if (colorType == 2) {
+            const r: int = listGet(cur, x * 3) catch 0;
+            const g: int = listGet(cur, x * 3 + 1) catch 0;
+            const b: int = listGet(cur, x * 3 + 2) catch 0;
+            let alpha: int = 255;
+            if (trnsR == r && trnsG == g && trnsB == b) {
+                alpha = 0;
+            }
+            pushRgba(out, r, g, b, alpha);
+        } else if (colorType == 3) {
+            const idx: int = listGet(cur, x) catch 0;
+            if (idx >= palCount) {
+                return -1; // 规范：越界索引按错误处理。
+            }
+            const r: int = listGet(palette, idx * 3) catch 0;
+            const g: int = listGet(palette, idx * 3 + 1) catch 0;
+            const b: int = listGet(palette, idx * 3 + 2) catch 0;
+            const alpha: int = listGet(trns, idx) catch 255;
+            pushRgba(out, r, g, b, alpha);
+        } else if (colorType == 4) {
+            const g: int = listGet(cur, x * 2) catch 0;
+            const a: int = listGet(cur, x * 2 + 1) catch 0;
+            pushRgba(out, g, g, g, a);
+        } else {
+            const r: int = listGet(cur, x * 4) catch 0;
+            const g: int = listGet(cur, x * 4 + 1) catch 0;
+            const b: int = listGet(cur, x * 4 + 2) catch 0;
+            const a: int = listGet(cur, x * 4 + 3) catch 0;
+            pushRgba(out, r, g, b, a);
+        }
+        x = x + 1;
+    }
+    return 0;
+}
+
+function pushRgba(out: List<int>, r: int, g: int, b: int, a: int): void {
+    listPush(out, r & 0xFF);
+    listPush(out, g & 0xFF);
+    listPush(out, b & 0xFF);
+    listPush(out, a & 0xFF);
+}
+
+// —— 字节取数助手 ——
+
+function u32be(data: List<int>, at: int): int {
+    return ((listGet(data, at) catch 0) << 24) | ((listGet(data, at + 1) catch 0) << 16)
+    | ((listGet(data, at + 2) catch 0) << 8) | (listGet(data, at + 3) catch 0);
+}
+
+function typeStr(data: List<int>, at: int): string {
+    let s: string = "";
+    let i: int = 0;
+    while (i < 4) {
+        s = s + (utf8Encode(listGet(data, at + i) catch 0) catch "");
+        i = i + 1;
+    }
+    return s;
+}
+
+function hexBytes(hex: string): List<int> {
+    const t: List<int> = listNew();
+    const n: int = len(hex);
+    let i: int = 0;
+    while (i + 1 < n) {
+        const hi: int = hexVal(byteAt(hex, i) catch -1);
+        const lo: int = hexVal(byteAt(hex, i + 1) catch -1);
+        if (hi >= 0 && lo >= 0) {
+            listPush(t, hi * 16 + lo);
+        }
+        i = i + 2;
+    }
+    return t;
+}
+
+function hexVal(b: int): int {
+    if (b >= 48 && b <= 57) {
+        return b - 48;
+    }
+    if (b >= 97 && b <= 102) {
+        return b - 87;
+    }
+    if (b >= 65 && b <= 70) {
+        return b - 55;
+    }
+    return -1;
+}

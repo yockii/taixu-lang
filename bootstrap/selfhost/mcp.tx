@@ -1,0 +1,271 @@
+// mcp.tx —— 原生 `taixu mcp`（第 6 轮 6d-4a，LSP 与 MCP 实施设计 §四-6；对照 Zig 版 src/tools/mcp.zig 与 D10）。
+//
+// stdin/stdout 上的 JSON-RPC 2.0，一行一条消息。八个 debug_* 工具与 compile、run、test、disasm。
+// 一次处理一条请求；等客户端输入时最多等到最早的会话到期时刻，到点清扫。
+import { JsonValue, jsonNew, jsonParse, jsonGet, JSON_INT, JSON_NUM, JSON_STR, JSON_OBJ } from "./json_parse";
+import { dbgStr, dbgQueueCapped } from "./dbg_out";
+import { McpOut, mcpDebugTool, mcpSweep, mcpWaitMs, mcpCloseAll, mcpSessionGeneration } from "./mcp_debug";
+import { mcpCoreTool } from "./mcp_core";
+
+import { ServiceOptions, serviceOptionsNew } from "./service_options";
+import { workerLimitsValid } from "./mcp_worker_limits";
+import { mcpRequestBudget } from "./mcp_request_budget";
+import { mcpPathPolicy, mcpToolError, mcpSecurityJson } from "./mcp_policy";
+import { proxyConfigure, proxyCall, proxyClose, proxySweep, proxyNeedsSweep, proxyReason, proxyStderr, proxyExitCode, proxyGeneration, proxyReaped, proxyTerminationRequested, proxyExitKnown, proxyStderrTruncated, proxyStderrTextBytes, proxyArtifactsCleaned, proxyCleanupPathsJson, proxyProcessCleanupPending, proxyProcessCleanupError } from "./mcp_proxy";
+import { reaperSelfPid } from "./mcp_reaper";
+import { jsonEnvelopeWithin } from "./json_envelope";
+import { scratchUse } from "./mcp_scratch";
+
+const LINE_MAX: int = 16777216;
+const EVENTS_MAX: int = 4096;
+const SCHEMA: string = "\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\"";
+const P_SESSION: string = "\"session\":{\"type\":\"string\"}";
+const P_TIMEOUT: string = "\"timeout_s\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1800}";
+const P_BREAK: string = "\"module\":{\"type\":\"string\"},\"line\":{\"type\":\"integer\",\"minimum\":0},\"fn\":{\"type\":\"string\"}";
+
+let inBuf: Bytes = bytesNew(65536);
+let inPend: Bytes = bytesNew(0);
+let inScan: int = 0;
+let inEof: bool = false;
+let lineErr: string = "";
+let curLine: Bytes = bytesNew(0);
+let serverVersion: string = "";
+let serverConfig: Ref<ServiceOptions> = serviceOptionsNew();
+let workerShutdown: bool = false;
+
+// 服务器主循环；返回进程退出码（EOF 为 0，超长行与输出断开为 3）。
+export function mcpServe(version: string, c: Ref<ServiceOptions>): int {
+    serverVersion = version; serverConfig = c;
+    if (c.worker) {
+        if (!workerLimitsValid(c.memoryMiB * 1048576, c.cpuSeconds)) { eprint("taixu mcp: WorkerLimitsNotVerified"); return 64; }
+        if (!scratchUse(c.scratch)) { eprint("taixu mcp: WorkerScratchNotVerified"); return 64; }
+        mcpSessionGeneration(toStr(c.generation));
+        const pid = reaperSelfPid();
+        if (pid <= 0) { eprint("taixu mcp: WorkerPidNotVerified"); return 64; }
+        if (stdoutWrite(bytesFromStr("READY " + toStr(c.generation) + " " + toStr(pid) + "\n")) < 0) { return 3; }
+    } else { if (!proxyConfigure(c)) { eprint("taixu mcp: WorkerReaperNotVerified " + proxyProcessCleanupError()); return 64; } }
+    dbgQueueCapped(EVENTS_MAX);
+    while (true) {
+        if (takeLine()) {
+            const reply = handleLine(curLine);
+            if (workerShutdown) { closeService(); return 0; }
+            if (len(reply) > LINE_MAX + 65536) { eprint("taixu mcp: ResponseTooLong"); closeService(); return 3; }
+            if (len(reply) > 0 && stdoutWrite(bytesFromStr(reply + "\n")) < 0) {
+                eprint("taixu mcp: BrokenPipe");
+                closeService();
+                return 3;
+            }
+        } else if (len(lineErr) > 0) {
+            eprint("taixu mcp: " + lineErr);
+            closeService();
+            return 3;
+        } else if (inEof) {
+            closeService();
+            return 0;
+        } else {
+            let wait = mcpWaitMs();
+            if (!serverConfig.worker && proxyNeedsSweep() && (wait < 0 || wait > 50)) { wait = 50; }
+            readIn(wait);
+            if (serverConfig.worker) { mcpSweep(); } else { proxySweep(); }
+        }
+    }
+    return 0;
+}
+
+function closeService(): void { mcpCloseAll(); if (!serverConfig.worker) { proxyClose(); } }
+function lineLimit(): int { if (serverConfig.worker) { return LINE_MAX + 1024; } return LINE_MAX; }
+
+// —— 传输 ——
+
+function readIn(ms: int): void {
+    const got = stdinRead(inBuf, ms);
+    if (got < 0) { inEof = true; } else if (got > 0) {
+        if (got > lineLimit() + 65536 - bytesLen(inPend)) { lineErr = "MessageTooLong"; return; }
+        bytesAppend(inPend, bytesSlice(inBuf, 0, got));
+    }
+}
+
+// 下一行（不含 LF）放进 curLine；还没有完整的行时得 false（超过 16 MiB 记在 lineErr）。流尾时没有 LF 的残行丢弃
+// （同 Zig 版与 MCP 官方 SDK 的 stdio 传输）。
+function takeLine(): bool {
+    const n = bytesLen(inPend);
+    let i = inScan;
+    let lf = -1;
+    while (i < n && lf < 0) {
+        if ((bytesGet(inPend, i) catch 0) == 10) { lf = i; }
+        i = i + 1;
+    }
+    if (lf < 0) {
+        inScan = n;
+        if (n > lineLimit()) { lineErr = "MessageTooLong"; }
+        return false;
+    }
+    if (lf > lineLimit()) {
+        lineErr = "MessageTooLong";
+        return false;
+    }
+    curLine = bytesSlice(inPend, 0, lf);
+    inPend = bytesSlice(inPend, lf + 1, n - lf - 1);
+    inScan = 0;
+    return true;
+}
+
+function hasPrefix(s: string, p: string): bool {
+    if (len(s) < len(p)) { return false; }
+    let k = 0;
+    while (k < len(p)) {
+        if ((byteAt(s, k) catch 0) != (byteAt(p, k) catch 1)) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+// —— JSON-RPC ——
+
+function okResp(id: string, result: string): string {
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":" + result + "}";
+}
+
+function errResp(id: string, code: int, message: string): string {
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":{\"code\":" + toStr(code) + ",\"message\":" + dbgStr(message) + "}}";
+}
+
+// 回显的 id：串重新转义，数原样，其余为 null。
+function idText(v: Ref<JsonValue>): string {
+    if (v.kind == JSON_STR) { return dbgStr(v.s); }
+    if (v.kind == JSON_INT) { return toStr(v.i); }
+    if (v.kind == JSON_NUM) { return v.s; }
+    return "null";
+}
+
+// 一行请求的回复；不回复时为空串。只去掉 CRLF 的末尾 CR；字符串内原始 CR 交给 JSON 严格校验。只有空格与 Tab 的行不回复。
+function handleLine(raw: Bytes): string {
+    let size = bytesLen(raw);
+    if (size > 0 && (bytesGet(raw, size - 1) catch 0) == 13) { size = size - 1; }
+    const line = bytesSlice(raw, 0, size);
+    let blank = true; let k = 0;
+    while (k < size) { const c = bytesGet(line, k) catch 0; if (c != 32 && c != 9) { blank = false; } k = k + 1; }
+    if (blank) { return ""; }
+    let maximum = 32768; if (serverConfig.worker) { maximum = maximum + 16; }
+    if (!jsonEnvelopeWithin(line, maximum)) { return errResp("null", -32600, "RequestTooComplex"); }
+    const doc = jsonParse(line) catch (e) { return errResp("null", -32700, "Parse error"); };
+    if (doc.kind != JSON_OBJ) { return errResp("null", -32600, "Invalid Request"); }
+    if (serverConfig.worker) {
+        const shutdown = jsonGet(doc, "shutdown_worker") catch None;
+        if (shutdown != None) { workerShutdown = true; return ""; }
+        const rv = jsonGet(doc, "request") catch None; const bv = jsonGet(doc, "budget_ms") catch None;
+        if (rv == None || bv == None) { return errResp("null", -32600, "Invalid worker envelope"); }
+        const request = rv catch doc; const budget = bv catch doc;
+        if (request.kind != JSON_OBJ || budget.kind != JSON_INT || budget.i < 1 || budget.i > serverConfig.requestMs) { return errResp("null", -32600, "Invalid worker envelope"); }
+        let inner = budget.i - 200; if (inner < 1) { inner = 1; } mcpRequestBudget(inner);
+        return handleDoc(request, bytesNew(0));
+    }
+    return handleDoc(doc, line);
+}
+function handleDoc(doc: Ref<JsonValue>, raw: Bytes): string {
+    const mv = jsonGet(doc, "method") catch None;
+    if (mv == None) { return ""; }
+    let method = "";
+    const m = mv catch doc;
+    if (m.kind == JSON_STR) { method = m.s; }
+    // 只有缺 id 键的才是通知；通知一律不回复（带 id 的 notifications/* 也不回）。
+    const iv = jsonGet(doc, "id") catch None;
+    if (iv == None) { return ""; }
+    const id = idText(iv catch doc);
+    if (method == "initialize") { return okResp(id, "{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"taixu\",\"title\":\"太虚工具链\",\"version\":" + dbgStr(serverVersion) + "}}"); }
+    if (hasPrefix(method, "notifications/")) { return ""; }
+    if (method == "tools/list") { return okResp(id, toolsList()); }
+    if (method == "server/discover") { return okResp(id, "{\"identity\":{\"name\":\"taixu\",\"title\":\"太虚工具链 MCP\"},\"tools\":[" + toolNames() + "],\"security\":" + mcpSecurityJson(serverConfig) + "}"); }
+    if (method == "tools/call") { return toolsCall(id, doc, raw); }
+    if (method == "ping") { return okResp(id, "{}"); }
+    return errResp(id, -32601, "Method not found");
+}
+
+// —— 工具 ——
+
+function tool(name: string, desc: string, props: string, required: string): string {
+    const budget = "\"timeout_ms\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":" + toStr(serverConfig.requestMs) + "}";
+    return "{\"name\":" + dbgStr(name) + ",\"description\":" + dbgStr(desc) + ",\"inputSchema\":{" + SCHEMA + ",\"properties\":{" + props + "," + budget + "},\"required\":[" + required + "]}}";
+}
+function toolsList(): string {
+    const path = "\"path\":{\"type\":\"string\"}";
+    let s = "{\"tools\":[";
+    s = s + tool("compile", "编译并返回诊断与内部编码摘要；受启动预算限制", path, "\"path\"");
+    s = s + "," + tool("run", "编译并运行；仅明确受信本地工作区，预算包含编译", path + ",\"args\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}", "\"path\"");
+    s = s + "," + tool("test", "逐个运行测试并返回结构化结果；仅明确受信本地工作区", path, "\"path\"");
+    s = s + "," + tool("disasm", "按函数和源码行显示原生汇编；不运行程序，受启动预算限制", path + ",\"format\":{\"type\":\"string\",\"enum\":[\"text\",\"json\"]}", "\"path\"");
+    s = s + "," + tool("debug_start", "启动调试会话；仅明确受信本地工作区，编译受请求预算限制", path + ",\"breakpoints\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{" + P_BREAK + "}}},\"idle_timeout_s\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1800}", "\"path\"");
+    s = s + "," + tool("debug_breakpoint", "会话内设置断点", P_SESSION + "," + P_BREAK, "\"session\"");
+    s = s + "," + tool("debug_step", "单步执行；timeout_s 为程序运行时限（到点结束程序）；请求时限先到时暂停程序并以 reason pause 返回，会话保留", P_SESSION + ",\"mode\":{\"type\":\"string\",\"enum\":[\"into\",\"over\",\"out\"]}," + P_TIMEOUT, "\"session\"");
+    s = s + "," + tool("debug_continue", "继续至停止点或退出；timeout_s 为程序运行时限（到点结束程序）；请求时限先到时暂停程序并以 reason pause 返回，会话保留", P_SESSION + "," + P_TIMEOUT, "\"session\"");
+    s = s + "," + tool("debug_frames", "帧与槽列表", P_SESSION, "\"session\"");
+    s = s + "," + tool("debug_inspect", "结构化查看变量（有深度、宽度和文本上限）", P_SESSION + ",\"frame\":{\"type\":\"integer\",\"minimum\":0},\"slot\":{\"type\":\"integer\",\"minimum\":0}", "\"session\",\"frame\",\"slot\"");
+    s = s + "," + tool("debug_stops", "停止点历史（环形256条）", P_SESSION, "\"session\"");
+    s = s + "," + tool("debug_kill", "终止调试子进程并关闭会话", P_SESSION, "\"session\"");
+    return s + "]}";
+}
+
+function toolNames(): string {
+    return "\"compile\",\"run\",\"test\",\"disasm\",\"debug_start\",\"debug_breakpoint\",\"debug_step\",\"debug_continue\",\"debug_frames\",\"debug_inspect\",\"debug_stops\",\"debug_kill\"";
+}
+
+function dispatchTool(name: string, args: Ref<JsonValue>): Ref<McpOut> {
+    if (hasPrefix(name, "debug_")) { return mcpDebugTool(name, args); }
+    return mcpCoreTool(name, args);
+}
+
+// 请求结构与未知工具是协议错误；工具参数校验失败是 isError 结果，不带 structuredContent（MCP 2025-11-25）。
+function toolsCall(id: string, doc: Ref<JsonValue>, raw: Bytes): string {
+    const pv = jsonGet(doc, "params") catch None;
+    if (pv == None) { return errResp(id, -32602, "Invalid params: params 须为对象"); }
+    const p = pv catch doc;
+    if (p.kind != JSON_OBJ) { return errResp(id, -32602, "Invalid params: params 须为对象"); }
+    const nv = jsonGet(p, "name") catch None;
+    if (nv == None) { return errResp(id, -32602, "Invalid params: name 须为字符串"); }
+    const n = nv catch p;
+    if (n.kind != JSON_STR) { return errResp(id, -32602, "Invalid params: name 须为字符串"); }
+    const name = n.s;
+    let args = jsonNew(JSON_OBJ);
+    const av = jsonGet(p, "arguments") catch None;
+    if (av != None) {
+        const a = av catch p;
+        if (a.kind != JSON_OBJ) { return errResp(id, -32602, "Invalid params: arguments 须为对象"); }
+        args = a;
+    }
+    if (len(name) > 64) { return errResp(id, -32602, "Unknown tool: name too long"); }
+    // toolNames 仅含固定 JSON 字符串，用带引号的完整名字匹配，不能把前缀或未知 debug_* 当成已有工具。
+    if (strIndexOf(toolNames(), dbgStr(name)) < 0) { return errResp(id, -32602, "Unknown tool: " + name); }
+    let budget = serverConfig.requestMs;
+    const tv = jsonGet(args, "timeout_ms") catch None;
+    if (tv != None) {
+        const t = tv catch args;
+        if (t.kind != JSON_INT || t.i < 1 || t.i > serverConfig.requestMs) {
+            return toolReply(id, new McpOut { code: -32602, text: "timeout_ms 需要 1.." + toStr(serverConfig.requestMs) + " 的整数（启动配置上限）", isErr: false });
+        }
+        budget = t.i;
+    }
+    const policy = mcpPathPolicy(name, args, serverConfig);
+    if (policy != None) { return toolReply(id, policy catch new McpOut { code: -32602, text: "Invalid params", isErr: true }); }
+    if (!serverConfig.worker) {
+        const reply = proxyCall(raw, budget);
+        if (len(reply) > 0) { return reply; }
+        const reason = proxyReason();
+        let message = "受限工作进程中止；可重试的请求将使用新的工作进程";
+        if (reason == "cleanup_pending") { message = "先前的 worker、后代或产物尚未完成回收，暂停创建新 worker；请检查进程与路径清理状态"; }
+        if (reason == "request_timeout") { message = "请求超过墙钟预算，已请求终止编译与运行"; }
+        let code = "null"; if (proxyExitKnown()) { code = toStr(proxyExitCode()); }
+        const retryable = reason != "generation_exhausted" && reason != "worker_start_failed" && reason != "worker_verification_failed" && reason != "worker_scratch_failed" && reason != "worker_reaping_failed";
+        return toolReply(id, mcpToolError(name, reason, message, retryable, ",\"worker_generation\":" + toStr(proxyGeneration())
+                + ",\"termination_requested\":" + toStr(proxyTerminationRequested()) + ",\"reaped\":" + toStr(proxyReaped()) + ",\"artifacts_cleaned\":" + toStr(proxyArtifactsCleaned()) + ",\"cleanup_pending_paths\":" + proxyCleanupPathsJson() + ",\"process_cleanup_pending\":" + toStr(proxyProcessCleanupPending()) + ",\"process_cleanup_error\":" + dbgStr(proxyProcessCleanupError()) + ",\"worker_exit_code\":" + code + ",\"stderr_truncated\":" + toStr(proxyStderrTruncated()) + ",\"stderr_text_bytes\":" + toStr(proxyStderrTextBytes()) + ",\"stderr\":" + dbgStr(proxyStderr())));
+    }
+    return toolReply(id, dispatchTool(name, args));
+}
+function toolReply(id: string, r: Ref<McpOut>): string {
+    if (r.code == -32602) {
+        return okResp(id, "{\"content\":[{\"type\":\"text\",\"text\":" + dbgStr(r.text) + "}],\"isError\":true}");
+    }
+    if (r.code != 0) { return errResp(id, r.code, r.text); }
+    let res = "{\"content\":[{\"type\":\"text\",\"text\":" + dbgStr(r.text) + "}],\"structuredContent\":" + r.text;
+    if (r.isErr) { res = res + ",\"isError\":true"; }
+    return okResp(id, res + "}");
+}

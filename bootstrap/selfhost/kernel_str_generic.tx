@@ -1,0 +1,273 @@
+// 字符串与构建器的可移植版（rtfn 写，macOS 适配 M4 设计 A8）：语义与导出名同 runtime_memory_gen.tx 的 strConcat、strOom、strbEmit（NRT 形）。
+// - __tx_str_concat(win, fn, pc, dst, b, c)：值槽 16 字节 {tag@0, idx@8}；b、c 的 tag 低字节都为 6（str）才走原生路径，否则交
+//   __tx_str_concat_host（陷阱 4010）。独占复用（dst==b、两串不同、左串非空、__tx_store_str_reuse_ok）时原地追加：
+//   __tx_nrt_bytes_reserve 按容量几何增长后把右串拷到 ptr+len1，写长度、清 ASCII 缓存位（flags 位 3）；否则精确尺寸新串：
+//   分配、两段拷贝、__tx_site_of、__tx_store_new_str_take 接管，释放 dst 槽旧值后写回 {6, idx}。实参只取低 32 位（栈上的 b、c
+//   由生成代码按 32 位写入，高半不定）。
+// - __tx_str_oom：内存不足终局——过进程级致命锁后向标准错误写“taixu: 内存不足\n”（Windows 经 WriteFile 写原始 UTF-8），以 3 退出。
+//   x86 上手写例程（payload_clone.tx、写字节文件内建等）在自己的帧里跳入（Windows 入口 rsp ≡ 0 mod 16），rtfn 例程则调用它
+//  （rsp ≡ 8）：x86 上 __tx_str_oom 是一段把栈对齐到 16 再调用 __tx_str_oom_body 的入口（同手写 macOS 版先 and rsp, −16），
+//   两种进入方式都使系统接口的调用点对齐。栈指针的调整 rtfn 没有，这两条只在 x86 直接发出；A64 只有 rtfn 的调用者，没有这段入口。
+// - 构建器状态（生成代码帧里）{ptr@0, len@8, cap@16, inited u32@24}：alloc 精确分配；copy 即 memcpy；append／prepend 在容量
+//   不足时取 max(2·cap, len+need) 重新分配（prepend 的内容贴缓冲末端）；finish／finish_pre 精确尺寸复制后接管为新串、
+//   归还缓冲、状态清零。统计经 __tx_strb_stat（allocs 2、appends 1、finishes 4；NRT 里为空操作，照手写版调用）。
+import { StructuredBuffer, asBufferLabel, asBufferInstruction, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget } from "./assemble";
+import { RtFn, RtOp, L, I, A } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtShift, rtLoad, rtStore, rtLabel, rtJump, rtIf, rtIf32, rtAddrOf, rtCall0, rtCall1, rtCall2, rtCall3, rtCall5, rtCallList, rtSyscall, rtRet, rtRetVoid, rtRdataBytes } from "./rtfn";
+import { tSysV, tRawSyscall, tMacos } from "./target";
+
+const MODULE: string = "bootstrap/selfhost/kernel_str_generic.tx";
+const U32: int = 4294967295;
+const TAG_STR: int = 6;
+const OOM_TEXT: string = "taixu: 内存不足\n";
+const OOM_BYTES: int = 20;
+const OOM_STATUS: int = 3;
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// 内核内部的 memcpy：SysV 目标上为 __tx_linux_memcpy（同 runtime_memory_gen.tx 的 nativeName）。
+function memcpyName(t: int): string {
+    if (tSysV(t)) { return "__tx_linux_memcpy"; }
+    return "memcpy";
+}
+
+// __tx_str_oom（x86 上另有对齐入口，见文件头）：致命锁、诊断、退出码 3，不返回。
+function oomFn(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    if (len(OOM_TEXT) != OOM_BYTES) { listPush(failures, "__tx_str_oom: BadOomText"); return; }
+    rtRdataBytes(b, "__tx_str_oom_message", OOM_TEXT);
+    let name = "__tx_str_oom";
+    if (!b.a64) {
+        name = "__tx_str_oom_body";
+        const none = asStructuredMissing();
+        asBufferLabel(b, "__tx_str_oom", 1);
+        asBufferInstruction(b, "and", 2, asStructuredReg(0, 4), asStructuredImm(-16), none, 1);
+        asBufferInstruction(b, "call", 1, asStructuredTarget(name), none, none, 1);
+    }
+    const f = rtBegin(b, name, "", "h written wp", 5, MODULE);
+    rtCall0(f, "", "__tx_nrt_die_enter");
+    if (tRawSyscall(t)) {
+        const w: List<Ref<RtOp>> = listNew(); listPush(w, I(2)); listPush(w, A("__tx_str_oom_message")); listPush(w, I(OOM_BYTES));
+        rtSyscall(f, "", 1, w);
+        const x: List<Ref<RtOp>> = listNew(); listPush(x, I(OOM_STATUS));
+        rtSyscall(f, "", 231, x);
+    } else if (tMacos(t)) {
+        rtCall3(f, "", "__tx_mac_write", I(2), A("__tx_str_oom_message"), I(OOM_BYTES));
+        rtCall1(f, "", "__tx_mac__exit", I(OOM_STATUS));
+    } else {
+        rtCall1(f, "h", "GetStdHandle", I(-12));
+        rtIf(f, L("h"), "eq", I(0), "exit");
+        rtSet(f, "written", I(0));
+        rtAddrOf(f, "wp", "written");
+        rtCall5(f, "", "WriteFile", L("h"), A("__tx_str_oom_message"), I(OOM_BYTES), L("wp"), I(0));
+        rtLabel(f, "exit");
+        rtCall1(f, "", "ExitProcess", I(OOM_STATUS));
+    }
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+// x = win + 16·slot（slot 已是 32 位）。
+function slotAddr(f: Ref<RtFn>, dst: string, slot: string): void {
+    rtShift(f, dst, L(slot), "shl", 4);
+    rtOp(f, dst, L("win"), "add", L(dst));
+}
+
+// __tx_str_concat(win, fn, pc, dst, b, c)：win[dst] = win[b] + win[c]。
+function concatFn(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    const f = rtBegin(b, "__tx_str_concat", "win fn pc dst bs cs", "sa sc x ia ib p1 n1 p2 n2 tot o q site idx", 6, MODULE);
+    rtOp(f, "fn", L("fn"), "and", I(U32));
+    rtOp(f, "pc", L("pc"), "and", I(U32));
+    rtOp(f, "dst", L("dst"), "and", I(U32));
+    rtOp(f, "bs", L("bs"), "and", I(U32));
+    rtOp(f, "cs", L("cs"), "and", I(U32));
+    slotAddr(f, "sa", "bs");
+    rtLoad(f, "x", L("sa"), 0, 1);
+    rtIf(f, L("x"), "ne", I(TAG_STR), "fallback");
+    slotAddr(f, "sc", "cs");
+    rtLoad(f, "x", L("sc"), 0, 1);
+    rtIf(f, L("x"), "ne", I(TAG_STR), "fallback");
+    rtLoad(f, "ia", L("sa"), 8, 4);
+    rtLoad(f, "ib", L("sc"), 8, 4);
+    rtCall1(f, "p1", "__tx_store_str_ptr", L("ia"));
+    rtCall1(f, "n1", "__tx_store_str_len", L("ia"));
+    rtCall1(f, "p2", "__tx_store_str_ptr", L("ib"));
+    rtCall1(f, "n2", "__tx_store_str_len", L("ib"));
+    rtOp(f, "tot", L("n1"), "add", L("n2"));
+    // 独占复用判据（顺序同手写版）。
+    rtIf(f, L("dst"), "ne", L("bs"), "new");
+    rtIf(f, L("ia"), "eq", L("ib"), "new");
+    rtIf(f, L("n1"), "eq", I(0), "new");
+    rtCall1(f, "x", "__tx_store_str_reuse_ok", L("ia"));
+    rtIf32(f, L("x"), "eq", I(0), "new");
+    // 原地追加（字符串原地追加设计 §四-A）：reserve 之后重读缓冲指针。
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("ia"));
+    rtCall2(f, "", "__tx_nrt_bytes_reserve", L("o"), L("tot"));
+    rtLoad(f, "q", L("o"), 32, 8);
+    rtOp(f, "q", L("q"), "add", L("n1"));
+    rtCall3(f, "", memcpyName(t), L("q"), L("p2"), L("n2"));
+    rtStore(f, L("o"), 40, L("tot"), 8);
+    rtLoad(f, "x", L("o"), 0, 4);
+    rtOp(f, "x", L("x"), "and", I(-9));
+    rtStore(f, L("o"), 0, L("x"), 4);
+    rtRetVoid(f);
+    // 新串：精确尺寸分配、两段拷贝、分配点、接管、释放旧槽值、槽写回。
+    rtLabel(f, "new");
+    rtCall2(f, "q", "__tx_native_mem_alloc", L("tot"), I(1));
+    rtIf(f, L("q"), "eq", I(0), "oom");
+    rtCall3(f, "", memcpyName(t), L("q"), L("p1"), L("n1"));
+    rtOp(f, "x", L("q"), "add", L("n1"));
+    rtCall3(f, "", memcpyName(t), L("x"), L("p2"), L("n2"));
+    rtCall2(f, "site", "__tx_site_of", L("fn"), L("pc"));
+    rtOp(f, "site", L("site"), "and", I(U32));
+    rtCall3(f, "idx", "__tx_store_new_str_take", L("q"), L("tot"), L("site"));
+    rtOp(f, "idx", L("idx"), "and", I(U32));
+    slotAddr(f, "x", "dst");
+    rtCall1(f, "", "__tx_release", L("x"));
+    slotAddr(f, "x", "dst");
+    rtStore(f, L("x"), 0, I(TAG_STR), 8);
+    rtStore(f, L("x"), 8, L("idx"), 8);
+    rtRetVoid(f);
+    // tag 不是 str：交宿主路径（报类型不匹配，不返回）。
+    rtLabel(f, "fallback");
+    const xs: List<Ref<RtOp>> = listNew();
+    listPush(xs, L("win")); listPush(xs, L("fn")); listPush(xs, L("pc")); listPush(xs, L("dst")); listPush(xs, L("bs")); listPush(xs, L("cs"));
+    rtCallList(f, "", "__tx_str_concat_host", xs);
+    rtRetVoid(f);
+    rtLabel(f, "oom");
+    rtCall0(f, "", "__tx_str_oom");
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+// __tx_strb_alloc(n) → 精确 n 字节的缓冲。
+function strbAllocFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_strb_alloc", "n", "p", 2, MODULE);
+    rtCall2(f, "p", "__tx_native_mem_alloc", L("n"), I(1));
+    rtIf(f, L("p"), "eq", I(0), "oom");
+    rtCall1(f, "", "__tx_strb_stat", I(2));
+    rtRet(f, L("p"));
+    rtLabel(f, "oom");
+    rtCall0(f, "", "__tx_str_oom");
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+// __tx_strb_copy(dst, src, n) → dst：即内核的 memcpy（手写版是尾跳）。
+function strbCopyFn(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    const f = rtBegin(b, "__tx_strb_copy", "dst src n", "r", 3, MODULE);
+    rtCall3(f, "r", memcpyName(t), L("dst"), L("src"), L("n"));
+    rtRet(f, L("r"));
+    done(f, failures);
+}
+
+// __tx_strb_append(st, s)／__tx_strb_prepend(st, s)：把串 s 的字节接到构建器尾部（prepend 接到内容之前，内容贴缓冲末端）。
+function strbAddFn(b: Ref<StructuredBuffer>, failures: List<string>, t: int, prepend: bool): void {
+    let name = "__tx_strb_append";
+    if (prepend) { name = "__tx_strb_prepend"; }
+    const f = rtBegin(b, name, "st s", "need bytes want cap nc nb p x n", 3, MODULE);
+    rtOp(f, "s", L("s"), "and", I(U32));
+    rtCall1(f, "need", "__tx_store_str_len", L("s"));
+    rtCall1(f, "bytes", "__tx_store_str_ptr", L("s"));
+    rtLoad(f, "want", L("st"), 8, 8);
+    rtOp(f, "want", L("want"), "add", L("need"));
+    rtLoad(f, "cap", L("st"), 16, 8);
+    rtIf(f, L("cap"), "uge", L("want"), "copy");
+    // 新容量 max(2·cap, len+need)（2·cap 按 64 位环绕，同手写版）。
+    rtOp(f, "nc", L("cap"), "add", L("cap"));
+    rtIf(f, L("nc"), "uge", L("want"), "sized");
+    rtSet(f, "nc", L("want"));
+    rtLabel(f, "sized");
+    rtCall2(f, "nb", "__tx_native_mem_alloc", L("nc"), I(1));
+    rtIf(f, L("nb"), "eq", I(0), "oom");
+    rtLoad(f, "n", L("st"), 8, 8);
+    rtSet(f, "p", L("nb"));
+    if (prepend) {
+        rtOp(f, "x", L("nc"), "sub", L("n"));
+        rtOp(f, "p", L("p"), "add", L("x"));
+    }
+    rtLoad(f, "x", L("st"), 0, 8);
+    rtCall3(f, "", memcpyName(t), L("p"), L("x"), L("n"));
+    rtLoad(f, "x", L("st"), 16, 8);
+    rtIf(f, L("x"), "eq", I(0), "nofree");
+    rtLoad(f, "x", L("st"), 0, 8);
+    rtCall1(f, "", "__tx_native_mem_free", L("x"));
+    rtLabel(f, "nofree");
+    rtStore(f, L("st"), 0, L("nb"), 8);
+    rtStore(f, L("st"), 16, L("nc"), 8);
+    rtCall1(f, "", "__tx_strb_stat", I(2));
+    rtLabel(f, "copy");
+    rtLoad(f, "p", L("st"), 0, 8);
+    rtLoad(f, "n", L("st"), 8, 8);
+    if (prepend) {
+        // 写在 cap−len−need 处。
+        rtLoad(f, "x", L("st"), 16, 8);
+        rtOp(f, "x", L("x"), "sub", L("n"));
+        rtOp(f, "x", L("x"), "sub", L("need"));
+    } else {
+        rtSet(f, "x", L("n"));
+    }
+    rtOp(f, "p", L("p"), "add", L("x"));
+    rtCall3(f, "", memcpyName(t), L("p"), L("bytes"), L("need"));
+    rtLoad(f, "n", L("st"), 8, 8);
+    rtOp(f, "n", L("n"), "add", L("need"));
+    rtStore(f, L("st"), 8, L("n"), 8);
+    rtCall1(f, "", "__tx_strb_stat", I(1));
+    rtRetVoid(f);
+    rtLabel(f, "oom");
+    rtCall0(f, "", "__tx_str_oom");
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+// __tx_strb_finish(st, fn, pc)／__tx_strb_finish_pre → 新串号：精确尺寸复制（len 为 0 也分配，同 Zig 的 dupe("")）后接管，
+// 归还缓冲，状态清零。finish_pre 的内容从 ptr+(cap−len) 起。
+function strbFinishFn(b: Ref<StructuredBuffer>, failures: List<string>, t: int, name: string, endBiased: bool): void {
+    const f = rtBegin(b, name, "st fn pc", "site p src x n idx", 3, MODULE);
+    rtOp(f, "fn", L("fn"), "and", I(U32));
+    rtOp(f, "pc", L("pc"), "and", I(U32));
+    rtCall2(f, "site", "__tx_site_of", L("fn"), L("pc"));
+    rtLoad(f, "n", L("st"), 8, 8);
+    rtCall2(f, "p", "__tx_native_mem_alloc", L("n"), I(1));
+    rtIf(f, L("p"), "eq", I(0), "oom");
+    rtLoad(f, "src", L("st"), 0, 8);
+    if (endBiased) {
+        rtLoad(f, "x", L("st"), 16, 8);
+        rtLoad(f, "n", L("st"), 8, 8);
+        rtOp(f, "x", L("x"), "sub", L("n"));
+        rtOp(f, "src", L("src"), "add", L("x"));
+    }
+    rtLoad(f, "n", L("st"), 8, 8);
+    rtCall3(f, "", memcpyName(t), L("p"), L("src"), L("n"));
+    rtLoad(f, "n", L("st"), 8, 8);
+    rtCall3(f, "idx", "__tx_store_new_str_take", L("p"), L("n"), L("site"));
+    rtLoad(f, "x", L("st"), 16, 8);
+    rtIf(f, L("x"), "eq", I(0), "nofree");
+    rtLoad(f, "x", L("st"), 0, 8);
+    rtCall1(f, "", "__tx_native_mem_free", L("x"));
+    rtLabel(f, "nofree");
+    rtStore(f, L("st"), 0, I(0), 8);
+    rtStore(f, L("st"), 8, I(0), 8);
+    rtStore(f, L("st"), 16, I(0), 8);
+    rtStore(f, L("st"), 24, I(0), 4);
+    rtCall1(f, "", "__tx_strb_stat", I(4));
+    rtRet(f, L("idx"));
+    rtLabel(f, "oom");
+    rtCall0(f, "", "__tx_str_oom");
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+/// 发出字符串拼接、内存不足终局与构建器的函数；rtfn 的失败记进 failures。t 为目标编号（决定终局的输出与退出方式、内部 memcpy 名）。
+export function strGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    oomFn(b, failures, t);
+    concatFn(b, failures, t);
+    strbAllocFn(b, failures);
+    strbCopyFn(b, failures, t);
+    strbAddFn(b, failures, t, false);
+    strbAddFn(b, failures, t, true);
+    strbFinishFn(b, failures, t, "__tx_strb_finish", false);
+    strbFinishFn(b, failures, t, "__tx_strb_finish_pre", true);
+}

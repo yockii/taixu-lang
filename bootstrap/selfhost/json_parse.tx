@@ -1,0 +1,470 @@
+// json_parse.tx —— 严格 JSON 解析（第 6 轮 6c-4a；调试会话、DAP 与 MCP 读客户端命令用，调试实施设计 §四-5，
+// VM 调试协议参考 §三）。规则同 Zig std.json 的缺省（VM 的调试协议即以它解析）：
+// - RFC 8259 文法，顶层可以是任何值；值的前后只许空白（空格、\t、\n、\r），其后还有内容即错；
+// - 串：未转义的控制字符（小于 0x20）、不合法的 UTF-8（过长编码、代理区、大于 U+10FFFF、残缺的序列）、不认识的
+//   转义、孤立的 \u 代理都算错；\u 代理对合成一个字符；
+// - 对象里的重复键（按解码后的串比较）算错；
+// - 数：不含 . e E、不是 -0、能放进 i64 的是整数（JSON_INT），其余保留原文（JSON_NUM）；
+// - 嵌套深度不设上限：用显式栈，不递归。
+// 失败得 Error "JSON 第 {字节偏移} 字节：{原因}"。scripts/test-native-json.py 拿它与 Python json（补上以上规则）差分。
+
+export const JSON_NULL: int = 0;
+export const JSON_BOOL: int = 1;
+export const JSON_INT: int = 2;
+export const JSON_NUM: int = 3;
+export const JSON_STR: int = 4;
+export const JSON_ARR: int = 5;
+export const JSON_OBJ: int = 6;
+
+// 一个值：kind 为上面的种类；布尔（0/1）与整数在 i，数的原文与串在 s；数组的元素与对象的值在 items，
+// 对象的键在 keys（与 items 平行，保持出现的顺序）。
+export struct JsonValue {
+    kind: int,
+    i: int,
+    s: string,
+    items: List<Ref<JsonValue>>,
+    keys: List<string>,
+}
+
+struct JsonRd {
+    src: Bytes,
+    n: int,
+    pos: int,
+    err: string,
+}
+
+const JSON_I64_MIN: int = -9223372036854775807 - 1;
+// 对象的键超过这么多个起用散列表查重，之前逐个比较。
+const JSON_DUP_LINEAR: int = 8;
+
+export function jsonNew(kind: int): Ref<JsonValue> {
+    return new JsonValue { kind: kind, i: 0, s: "", items: listNew(), keys: listNew() };
+}
+
+function jsInts(): List<int> { return listNew(); }
+
+function jsFail(r: Ref<JsonRd>, why: string): void {
+    if (len(r.err) == 0) { r.err = "JSON 第 " + toStr(r.pos) + " 字节：" + why; }
+}
+
+function jsAt(r: Ref<JsonRd>, at: int): int {
+    if (at >= r.n) { return -1; }
+    return bytesGet(r.src, at) catch -1;
+}
+
+function jsWs(r: Ref<JsonRd>): void {
+    while (r.pos < r.n) {
+        const c = bytesGet(r.src, r.pos) catch 0;
+        if (c != 32 && c != 9 && c != 10 && c != 13) { return; }
+        r.pos = r.pos + 1;
+    }
+}
+
+// 解析 src 的全部字节为一个 JSON 值。
+export function jsonParse(src: Bytes): Ref<JsonValue> | Error {
+    const r = new JsonRd { src: src, n: bytesLen(src), pos: 0, err: "" };
+    // 打开着的数组与对象（最内层在末尾），以及每个对象查重用的散列表（数组为空表）。
+    const stack: List<Ref<JsonValue>> = listNew();
+    const tables: List<List<int>> = listNew();
+    let result = jsonNew(JSON_NULL);
+    let done = false;
+    jsWs(r);
+    while (len(r.err) == 0 && !done) {
+        // 读一个值的开头：空的数组与对象就地读完，否则入栈去读第一个元素（对象先读键）。
+        let v = jsonNew(JSON_NULL);
+        const c = jsAt(r, r.pos);
+        if (c == 123 || c == 91) {
+            r.pos = r.pos + 1;
+            if (c == 123) { v = jsonNew(JSON_OBJ); } else { v = jsonNew(JSON_ARR); }
+            jsWs(r);
+            const close = jsAt(r, r.pos);
+            if ((c == 123 && close == 125) || (c == 91 && close == 93)) {
+                r.pos = r.pos + 1;
+            } else {
+                listPush(stack, v);
+                listPush(tables, jsInts());
+                if (c == 123) { jsKey(r, stack, tables); }
+                continue;
+            }
+        } else {
+            v = jsScalar(r);
+        }
+        // 值读完：挂到外层容器上，再看逗号或闭括号；闭合的容器本身又是一个读完的值。
+        while (len(r.err) == 0) {
+            const depth = listLen(stack);
+            if (depth == 0) {
+                result = v;
+                done = true;
+                break;
+            }
+            const top = listGet(stack, depth - 1) catch v;
+            listPush(top.items, v);
+            jsWs(r);
+            const d = jsAt(r, r.pos);
+            if (d == 44) {
+                r.pos = r.pos + 1;
+                jsWs(r);
+                if (top.kind == JSON_OBJ) { jsKey(r, stack, tables); }
+                break;
+            }
+            if ((top.kind == JSON_ARR && d == 93) || (top.kind == JSON_OBJ && d == 125)) {
+                r.pos = r.pos + 1;
+                listRemoveAt(stack, depth - 1);
+                listRemoveAt(tables, depth - 1);
+                v = top;
+                continue;
+            }
+            if (top.kind == JSON_ARR) { jsFail(r, "数组元素后须是 , 或 ]"); } else { jsFail(r, "对象的值后须是 , 或 }"); }
+        }
+    }
+    if (len(r.err) == 0) {
+        jsWs(r);
+        if (r.pos < r.n) { jsFail(r, "值后面还有内容"); }
+    }
+    if (len(r.err) > 0) { return err(r.err); }
+    return result;
+}
+
+export function jsonParseStr(s: string): Ref<JsonValue> | Error {
+    return jsonParse(bytesFromStr(s));
+}
+
+// 对象里的一个键及其后的冒号（最内层对象在栈顶）；重复的键算错。
+function jsKey(r: Ref<JsonRd>, stack: List<Ref<JsonValue>>, tables: List<List<int>>): void {
+    if (jsAt(r, r.pos) != 34) {
+        jsFail(r, "对象的键须是串");
+        return;
+    }
+    const key = jsString(r);
+    if (len(r.err) > 0) { return; }
+    const depth = listLen(stack);
+    const obj = listGet(stack, depth - 1) catch jsonNew(JSON_OBJ);
+    if (jsDup(obj, tables, depth - 1, key)) {
+        jsFail(r, "对象里的键重复：" + key);
+        return;
+    }
+    listPush(obj.keys, key);
+    jsWs(r);
+    if (jsAt(r, r.pos) != 58) {
+        jsFail(r, "对象的键后须是 :");
+        return;
+    }
+    r.pos = r.pos + 1;
+    jsWs(r);
+}
+
+// key 是否已在 obj 的键里。键少时逐个比；多了用开放寻址的散列表（槽里放键序＋1），装填过四分之一就翻倍重建。
+// 不重复时把 key 登记进表（键本身由调用方追加）。
+function jsDup(obj: Ref<JsonValue>, tables: List<List<int>>, ti: int, key: string): bool {
+    const n = listLen(obj.keys);
+    if (n < JSON_DUP_LINEAR) {
+        let k = 0;
+        while (k < n) {
+            if ((listGet(obj.keys, k) catch "") == key) { return true; }
+            k = k + 1;
+        }
+        return false;
+    }
+    let table = listGet(tables, ti) catch jsInts();
+    if (listLen(table) < 4 * (n + 1)) {
+        let size = 16;
+        while (size < 8 * (n + 1)) { size = size * 2; }
+        table = jsInts();
+        let z = 0;
+        while (z < size) { listPush(table, 0); z = z + 1; }
+        let k = 0;
+        while (k < n) {
+            jsSlot(table, listGet(obj.keys, k) catch "", obj.keys, k + 1);
+            k = k + 1;
+        }
+        listSet(tables, ti, table);
+    }
+    return jsSlot(table, key, obj.keys, n + 1);
+}
+
+// 在表里找 key：找到返回 true；找不到就把 mark 放进第一个空槽，返回 false。
+function jsSlot(table: List<int>, key: string, keys: List<string>, mark: int): bool {
+    const mask = listLen(table) - 1;
+    let h = jsHash(key) & mask;
+    while (true) {
+        const m = listGet(table, h) catch 0;
+        if (m == 0) {
+            listSet(table, h, mark);
+            return false;
+        }
+        if ((listGet(keys, m - 1) catch "") == key) { return true; }
+        h = (h + 1) & mask;
+    }
+    return false;
+}
+
+// FNV-1a（64 位，环绕乘）。
+function jsHash(s: string): int {
+    let h = -3750763034362895579;
+    let i = 0;
+    const n = len(s);
+    while (i < n) {
+        h = imul(h ^ (byteAt(s, i) catch 0), 1099511628211);
+        i = i + 1;
+    }
+    return h;
+}
+
+// 标量：串、数、true、false、null。
+function jsScalar(r: Ref<JsonRd>): Ref<JsonValue> {
+    const c = jsAt(r, r.pos);
+    if (c == 34) {
+        const v = jsonNew(JSON_STR);
+        v.s = jsString(r);
+        return v;
+    }
+    if (c == 45 || (c >= 48 && c <= 57)) { return jsNumber(r); }
+    if (c == 116 && jsWord(r, "true")) {
+        const v = jsonNew(JSON_BOOL);
+        v.i = 1;
+        return v;
+    }
+    if (c == 102 && jsWord(r, "false")) { return jsonNew(JSON_BOOL); }
+    if (c == 110 && jsWord(r, "null")) { return jsonNew(JSON_NULL); }
+    if (c < 0) { jsFail(r, "缺少值"); } else { jsFail(r, "不是值的开头"); }
+    return jsonNew(JSON_NULL);
+}
+
+function jsWord(r: Ref<JsonRd>, w: string): bool {
+    let i = 0;
+    while (i < len(w)) {
+        if (jsAt(r, r.pos + i) != (byteAt(w, i) catch 0)) { return false; }
+        i = i + 1;
+    }
+    r.pos = r.pos + len(w);
+    return true;
+}
+
+function jsDigit(c: int): bool { return c >= 48 && c <= 57; }
+
+// 数：-?(0|[1-9][0-9]*)(.[0-9]+)?([eE][+-]?[0-9]+)?
+function jsNumber(r: Ref<JsonRd>): Ref<JsonValue> {
+    const start = r.pos;
+    if (jsAt(r, r.pos) == 45) { r.pos = r.pos + 1; }
+    const c = jsAt(r, r.pos);
+    if (c == 48) {
+        r.pos = r.pos + 1;
+    } else if (c >= 49 && c <= 57) {
+        while (jsDigit(jsAt(r, r.pos))) { r.pos = r.pos + 1; }
+    } else {
+        jsFail(r, "数的写法不对");
+        return jsonNew(JSON_NULL);
+    }
+    let integral = true;
+    if (jsAt(r, r.pos) == 46) {
+        integral = false;
+        r.pos = r.pos + 1;
+        if (!jsDigit(jsAt(r, r.pos))) {
+            jsFail(r, "小数点后须有数字");
+            return jsonNew(JSON_NULL);
+        }
+        while (jsDigit(jsAt(r, r.pos))) { r.pos = r.pos + 1; }
+    }
+    const e = jsAt(r, r.pos);
+    if (e == 101 || e == 69) {
+        integral = false;
+        r.pos = r.pos + 1;
+        const sign = jsAt(r, r.pos);
+        if (sign == 43 || sign == 45) { r.pos = r.pos + 1; }
+        if (!jsDigit(jsAt(r, r.pos))) {
+            jsFail(r, "指数须有数字");
+            return jsonNew(JSON_NULL);
+        }
+        while (jsDigit(jsAt(r, r.pos))) { r.pos = r.pos + 1; }
+    }
+    const text = bytesToStr(bytesSlice(r.src, start, r.pos - start)) catch "";
+    if (integral && text != "-0") {
+        // 按负数累加，i64 的最小值也放得下。
+        let neg = false;
+        let i = 0;
+        if ((byteAt(text, 0) catch 0) == 45) {
+            neg = true;
+            i = 1;
+        }
+        let v = 0;
+        let fits = true;
+        while (i < len(text) && fits) {
+            const d = (byteAt(text, i) catch 48) - 48;
+            if (v < -922337203685477580 || (v == -922337203685477580 && d > 8)) {
+                fits = false;
+            } else {
+                v = v * 10 - d;
+            }
+            i = i + 1;
+        }
+        if (fits && !neg && v == JSON_I64_MIN) { fits = false; }
+        if (fits) {
+            const iv = jsonNew(JSON_INT);
+            if (neg) { iv.i = v; } else { iv.i = -v; }
+            return iv;
+        }
+    }
+    const nv = jsonNew(JSON_NUM);
+    nv.s = text;
+    return nv;
+}
+
+// 串（r.pos 在开头的引号上）：返回解码后的内容，r.pos 停在结尾引号之后。
+function jsString(r: Ref<JsonRd>): string {
+    r.pos = r.pos + 1;
+    const out = bytesNew(0);
+    let run = r.pos;
+    while (true) {
+        const c = jsAt(r, r.pos);
+        if (c < 0) {
+            jsFail(r, "串没有结束");
+            return "";
+        }
+        if (c == 34) {
+            if (r.pos > run) { bytesAppend(out, bytesSlice(r.src, run, r.pos - run)); }
+            r.pos = r.pos + 1;
+            break;
+        }
+        if (c == 92) {
+            if (r.pos > run) { bytesAppend(out, bytesSlice(r.src, run, r.pos - run)); }
+            r.pos = r.pos + 1;
+            if (!jsEscape(r, out)) { return ""; }
+            run = r.pos;
+        } else if (c < 32) {
+            jsFail(r, "串里有未转义的控制字符");
+            return "";
+        } else if (c < 128) {
+            r.pos = r.pos + 1;
+        } else {
+            const k = jsUtf8(r, c);
+            if (k == 0) {
+                jsFail(r, "串里有不合法的 UTF-8");
+                return "";
+            }
+            r.pos = r.pos + k;
+        }
+    }
+    return bytesToStr(out) catch "";
+}
+
+// 反斜杠之后的转义（r.pos 在转义字母上），解码的字节追加到 out。
+function jsEscape(r: Ref<JsonRd>, out: Bytes): bool {
+    const e = jsAt(r, r.pos);
+    r.pos = r.pos + 1;
+    if (e == 34 || e == 92 || e == 47) {
+        bytesPush(out, e);
+        return true;
+    }
+    if (e == 98) { bytesPush(out, 8); return true; }
+    if (e == 102) { bytesPush(out, 12); return true; }
+    if (e == 110) { bytesPush(out, 10); return true; }
+    if (e == 114) { bytesPush(out, 13); return true; }
+    if (e == 116) { bytesPush(out, 9); return true; }
+    if (e != 117) {
+        r.pos = r.pos - 1;
+        jsFail(r, "不认识的转义");
+        return false;
+    }
+    let cp = jsHex4(r);
+    if (cp < 0) { return false; }
+    if (cp >= 56320 && cp <= 57343) {
+        jsFail(r, "孤立的 \\u 低代理");
+        return false;
+    }
+    if (cp >= 55296 && cp <= 56319) {
+        if (jsAt(r, r.pos) != 92 || jsAt(r, r.pos + 1) != 117) {
+            jsFail(r, "\\u 高代理后须是低代理");
+            return false;
+        }
+        r.pos = r.pos + 2;
+        const lo = jsHex4(r);
+        if (lo < 0) { return false; }
+        if (lo < 56320 || lo > 57343) {
+            jsFail(r, "\\u 高代理后须是低代理");
+            return false;
+        }
+        cp = 65536 + ((cp - 55296) << 10) + (lo - 56320);
+    }
+    jsPutUtf8(out, cp);
+    return true;
+}
+
+function jsHex4(r: Ref<JsonRd>): int {
+    let v = 0;
+    let k = 0;
+    while (k < 4) {
+        const c = jsAt(r, r.pos);
+        let d = -1;
+        if (c >= 48 && c <= 57) { d = c - 48; }
+        else if (c >= 97 && c <= 102) { d = c - 87; }
+        else if (c >= 65 && c <= 70) { d = c - 55; }
+        if (d < 0) {
+            jsFail(r, "\\u 后须是四位十六进制");
+            return -1;
+        }
+        v = v * 16 + d;
+        r.pos = r.pos + 1;
+        k = k + 1;
+    }
+    return v;
+}
+
+function jsPutUtf8(out: Bytes, cp: int): void {
+    if (cp < 128) {
+        bytesPush(out, cp);
+    } else if (cp < 2048) {
+        bytesPush(out, 192 | (cp >> 6));
+        bytesPush(out, 128 | (cp & 63));
+    } else if (cp < 65536) {
+        bytesPush(out, 224 | (cp >> 12));
+        bytesPush(out, 128 | ((cp >> 6) & 63));
+        bytesPush(out, 128 | (cp & 63));
+    } else {
+        bytesPush(out, 240 | (cp >> 18));
+        bytesPush(out, 128 | ((cp >> 12) & 63));
+        bytesPush(out, 128 | ((cp >> 6) & 63));
+        bytesPush(out, 128 | (cp & 63));
+    }
+}
+
+function jsIn(r: Ref<JsonRd>, at: int, lo: int, hi: int): bool {
+    const d = jsAt(r, at);
+    return d >= lo && d <= hi;
+}
+
+// 首字节 c（≥ 0x80）起的 UTF-8 序列长度，不合法为 0（RFC 3629：拒绝过长编码、代理区与大于 U+10FFFF）。
+function jsUtf8(r: Ref<JsonRd>, c: int): int {
+    const p = r.pos;
+    if (c >= 194 && c <= 223) {
+        if (jsIn(r, p + 1, 128, 191)) { return 2; }
+        return 0;
+    }
+    if (c >= 224 && c <= 239) {
+        let lo = 128;
+        let hi = 191;
+        if (c == 224) { lo = 160; }
+        if (c == 237) { hi = 159; }
+        if (jsIn(r, p + 1, lo, hi) && jsIn(r, p + 2, 128, 191)) { return 3; }
+        return 0;
+    }
+    if (c >= 240 && c <= 244) {
+        let lo = 128;
+        let hi = 191;
+        if (c == 240) { lo = 144; }
+        if (c == 244) { hi = 143; }
+        if (jsIn(r, p + 1, lo, hi) && jsIn(r, p + 2, 128, 191) && jsIn(r, p + 3, 128, 191)) { return 4; }
+        return 0;
+    }
+    return 0;
+}
+
+// 对象里键为 key 的值（没有为 None）。
+export function jsonGet(obj: Ref<JsonValue>, key: string): Ref<JsonValue>? {
+    if (obj.kind != JSON_OBJ) { return None; }
+    let k = 0;
+    while (k < listLen(obj.keys)) {
+        if ((listGet(obj.keys, k) catch "") == key) { return listGet(obj.items, k) catch None; }
+        k = k + 1;
+    }
+    return None;
+}

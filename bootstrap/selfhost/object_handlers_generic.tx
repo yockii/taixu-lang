@@ -1,0 +1,278 @@
+// 对象字段与下标处理的可移植版（rtfn 写，macOS 适配 M4 设计 A8）：语义与导出名同 object_handlers.tx 的 NRT 形。
+// 值 16 字节 {标签字@0（低字节为标签）, 载荷@8}，窗口槽 k 在 win + k×16。对象 72 字节，在线程块槽状态的对象数组
+// （[TB.__tx_nrt_slots + 48]）的第 idx 项：{flags u32@0, 种类 pk u32@16, meta u32@24, aux u32@28, 跨度指针@32, 长度@40}。
+// 字段选择子（NRT 内核配原生链 TXC v6）：第 15 位为自动解引用标志，低 15 位为字段号。
+// 处理函数的四个实参与两个栈实参都按 u32 读（调用方以 32 位写入，栈上的高 32 位不定）。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, L, I, G } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtShift, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtCall1, rtCall2, rtCall4, rtRet } from "./rtfn";
+import { OBJ_FLAG_FROZEN } from "./store_abi";
+
+const MODULE: string = "bootstrap/selfhost/object_handlers_generic.tx";
+const MASK32: int = 4294967295;
+const FIELD_AUTODEREF: int = 32768;
+const FIELD_MASK: int = 32767;
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// dst = win + (slot 局部) × 16：窗口槽的地址。
+function slotAddr(f: Ref<RtFn>, dst: string, slot: string): void {
+    rtShift(f, dst, L(slot), "shl", 4);
+    rtOp(f, dst, L("win"), "add", L(dst));
+}
+
+// 写操作先查冻结（线程第 4b 步）：对象 o 的 flags 有冻结位即跳 target。
+function frozenJump(f: Ref<RtFn>, o: string, target: string): void {
+    rtLoad(f, "x", L(o), 0, 4);
+    rtOp(f, "x", L("x"), "and", I(OBJ_FLAG_FROZEN));
+    rtIf(f, L("x"), "ne", I(0), target);
+}
+
+// __tx_getfld / __tx_setfld / __tx_getidx / __tx_setidx(win, fn, pc, p4, [p5, p6])：
+// 读为 (目标槽, 容器槽, 选择子或下标槽)，写为 (容器槽, 选择子或下标槽, 值槽)。成功经 __tx_native_value_replace_v1 写入，
+// 失败调 __tx_native_object_handler_error_v1(op, 状态, fn, pc)：op 0 字段读、1 字段写、2 下标读、3 下标写；状态 1 类型、
+// 2 载荷、3 越界、4 下标不是 int、5 自动解引用但不是 Ref、6 Error 只有 message、7 切片越界、8 写冻结对象。返回最后一次调用的结果。
+function handlerFn(b: Ref<StructuredBuffer>, failures: List<string>, name: string, field: bool, write: bool): void {
+    const f = rtBegin(b, name, "win fn pc p4 p5 p6", "vt vp et ep ctag cp itag ip obj idx x t r st a", 4, MODULE);
+    rtOp(f, "fn", L("fn"), "and", I(MASK32));
+    rtOp(f, "pc", L("pc"), "and", I(MASK32));
+    rtOp(f, "p4", L("p4"), "and", I(MASK32));
+    rtOp(f, "p5", L("p5"), "and", I(MASK32));
+    rtOp(f, "p6", L("p6"), "and", I(MASK32));
+    let cont = "p5";
+    let sel = "p6";
+    if (write) {
+        cont = "p4";
+        sel = "p5";
+    }
+    // 入口先取快照（回调与写入都在其后）：容器的标签字节与载荷低 32 位、写入的整个值、下标值的标签字节与载荷。
+    slotAddr(f, "x", cont);
+    rtLoad(f, "ctag", L("x"), 0, 1);
+    rtLoad(f, "cp", L("x"), 8, 4);
+    if (write) {
+        slotAddr(f, "x", "p6");
+        rtLoad(f, "vt", L("x"), 0, 8);
+        rtLoad(f, "vp", L("x"), 8, 8);
+    }
+    if (!field) {
+        slotAddr(f, "x", sel);
+        rtLoad(f, "itag", L("x"), 0, 1);
+        rtLoad(f, "ip", L("x"), 8, 8);
+        rtIf(f, L("itag"), "ne", I(1), "index_type");
+    }
+    if (field) {
+        rtOp(f, "x", L(sel), "and", I(FIELD_AUTODEREF));
+        rtIf(f, L("x"), "eq", I(0), "autook");
+        rtIf(f, L("ctag"), "ne", I(9), "autoderef");
+        rtLabel(f, "autook");
+        if (!write) { rtIf(f, L("ctag"), "eq", I(5), "err_message"); }
+        rtIf(f, L("ctag"), "eq", I(7), "obj");
+        rtIf(f, L("ctag"), "eq", I(8), "obj");
+        rtIf(f, L("ctag"), "ne", I(9), "type");
+    } else {
+        rtIf(f, L("ctag"), "eq", I(10), "obj");
+        rtIf(f, L("ctag"), "ne", I(11), "type");
+    }
+    rtLabel(f, "obj");
+    rtCall1(f, "obj", "__tx_native_object_address_v1", L("cp"));
+    if (write) { frozenJump(f, "obj", "frozen"); }
+    if (field) {
+        rtLoad(f, "x", L("obj"), 16, 4);
+        rtIf(f, L("x"), "eq", I(1), "span");
+        rtIf(f, L("x"), "ne", I(2), "payload");
+        rtLabel(f, "span");
+        rtOp(f, "idx", L(sel), "and", I(FIELD_MASK));
+        rtLoad(f, "x", L("obj"), 40, 8);
+        rtIf(f, L("idx"), "uge", L("x"), "bounds");
+    } else {
+        rtSet(f, "idx", L("ip"));
+        rtIf(f, L("idx"), "lt", I(0), "bounds");
+        rtIf(f, L("ctag"), "eq", I(11), "slice");
+        rtLoad(f, "x", L("obj"), 24, 4);
+        rtIf(f, L("idx"), "uge", L("x"), "bounds");
+        rtJump(f, "span");
+        // 切片：长度 u32@28，底层数组的对象号 u32@24；元素按下标直接取底层数组的跨度（与手写版相同，不加起点）。
+        rtLabel(f, "slice");
+        rtLoad(f, "x", L("obj"), 28, 4);
+        rtIf(f, L("idx"), "uge", L("x"), "bounds");
+        rtLoad(f, "x", L("obj"), 24, 4);
+        rtCall1(f, "obj", "__tx_native_object_address_v1", L("x"));
+        if (write) { frozenJump(f, "obj", "frozen"); }
+        rtLabel(f, "span");
+    }
+    rtShift(f, "x", L("idx"), "shl", 4);
+    rtLoad(f, "t", L("obj"), 32, 8);
+    rtOp(f, "x", L("x"), "add", L("t"));
+    if (write) {
+        rtAddrOf(f, "a", "vt");
+        rtCall2(f, "r", "__tx_native_value_replace_v1", L("x"), L("a"));
+    } else {
+        slotAddr(f, "a", "p4");
+        rtCall2(f, "r", "__tx_native_value_replace_v1", L("a"), L("x"));
+    }
+    rtRet(f, L("r"));
+    if (field && !write) {
+        // Error 值只有字段 0（message）：取一份新字符串（rc=1）写入目标槽，replace 已 retain，再放掉暂存的那份（泄漏检查设计 §六-C）。
+        rtLabel(f, "err_message");
+        rtOp(f, "x", L(sel), "and", I(FIELD_MASK));
+        rtIf(f, L("x"), "ne", I(0), "err_field");
+        rtAddrOf(f, "a", "et");
+        rtCall4(f, "", "__tx_native_error_message_v1", L("cp"), L("fn"), L("pc"), L("a"));
+        slotAddr(f, "x", "p4");
+        rtCall2(f, "", "__tx_native_value_replace_v1", L("x"), L("a"));
+        rtCall1(f, "r", "__tx_release", L("a"));
+        rtRet(f, L("r"));
+    }
+    const statuses: List<string> = listNew();
+    listPush(statuses, "type");
+    listPush(statuses, "payload");
+    listPush(statuses, "bounds");
+    listPush(statuses, "index_type");
+    listPush(statuses, "autoderef");
+    listPush(statuses, "err_field");
+    let k = 0;
+    while (k < listLen(statuses)) {
+        rtLabel(f, listGet(statuses, k) catch "");
+        rtSet(f, "st", I(k + 1));
+        if (!field && k == 2) {
+            rtIf(f, L("ctag"), "ne", I(11), "error");
+            rtSet(f, "st", I(7));
+        }
+        rtJump(f, "error");
+        k = k + 1;
+    }
+    if (write) {
+        rtLabel(f, "frozen");
+        rtSet(f, "st", I(8));
+        rtJump(f, "error");
+    }
+    rtLabel(f, "error");
+    let op = 0;
+    if (!field) { op = 2; }
+    if (write) { op = op + 1; }
+    rtCall4(f, "r", "__tx_native_object_handler_error_v1", I(op), L("st"), L("fn"), L("pc"));
+    rtRet(f, L("r"));
+    done(f, failures);
+}
+
+// o = 对象号 idx（u32）的对象地址：[TB.__tx_nrt_slots + 48] + idx × 72，内联（不调 __tx_native_object_address_v1）。
+function objAddr(f: Ref<RtFn>): void {
+    rtOp(f, "o", L("idx"), "and", I(MASK32));
+    rtOp(f, "o", L("o"), "imul", I(72));
+    rtSet(f, "x", G("__tx_nrt_slots"));
+    rtLoad(f, "x", L("x"), 48, 8);
+    rtOp(f, "o", L("o"), "add", L("x"));
+}
+
+// 访问器(idx) → 对象内某处的地址，种类不符为 0（write：冻结对象也为 0，调用方转慢路径由内核报 4022）。
+// mode 0 字段跨度（pk 1、2）；1 通用列表的跨度（pk 7、form 1）；2 字节跨度（pk 0 字符串，或 pk 7、form 3、elem 4 的 Bytes）；
+// 3 序列长度（pk 3 数组得 &u32@24，pk 4 切片得 &u32@28）。跨度地址为对象 + 32（指针@32、长度@40）。
+function accessorFn(b: Ref<StructuredBuffer>, failures: List<string>, name: string, mode: int, write: bool): void {
+    const f = rtBegin(b, name, "idx", "o x", 0, MODULE);
+    objAddr(f);
+    if (write) { frozenJump(f, "o", "none"); }
+    rtLoad(f, "x", L("o"), 16, 4);
+    if (mode == 0) {
+        rtIf(f, L("x"), "eq", I(1), "span");
+        rtIf(f, L("x"), "ne", I(2), "none");
+    }
+    if (mode == 1) {
+        rtIf(f, L("x"), "ne", I(7), "none");
+        rtLoad(f, "x", L("o"), 28, 4);
+        rtIf(f, L("x"), "ne", I(1), "none");
+    }
+    if (mode == 2) {
+        rtIf(f, L("x"), "eq", I(0), "span");
+        rtIf(f, L("x"), "ne", I(7), "none");
+        rtLoad(f, "x", L("o"), 28, 4);
+        rtIf(f, L("x"), "ne", I(3), "none");
+        rtLoad(f, "x", L("o"), 24, 4);
+        rtIf(f, L("x"), "ne", I(4), "none");
+    }
+    if (mode == 3) {
+        rtIf(f, L("x"), "eq", I(3), "array");
+        rtIf(f, L("x"), "ne", I(4), "none");
+        rtOp(f, "o", L("o"), "add", I(28));
+        rtRet(f, L("o"));
+        rtLabel(f, "array");
+        rtOp(f, "o", L("o"), "add", I(24));
+        rtRet(f, L("o"));
+    } else {
+        rtLabel(f, "span");
+        rtOp(f, "o", L("o"), "add", I(32));
+        rtRet(f, L("o"));
+    }
+    rtLabel(f, "none");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// __tx_list_view[_w](idx, out) → form：列表（pk 7）写视图 {指针@0, 长度@8, elem u32@16} 后返回 form；不是列表、
+// 紧凑列表（form 3，视图已写）或（写用版）冻结时返回 0，调用方转通用路。
+function listViewFn(b: Ref<StructuredBuffer>, failures: List<string>, write: bool): void {
+    let name = "__tx_list_view";
+    if (write) { name = "__tx_list_view_w"; }
+    const f = rtBegin(b, name, "idx out", "o x", 0, MODULE);
+    objAddr(f);
+    if (write) { frozenJump(f, "o", "none"); }
+    rtLoad(f, "x", L("o"), 16, 4);
+    rtIf(f, L("x"), "ne", I(7), "none");
+    rtLoad(f, "x", L("o"), 32, 8);
+    rtStore(f, L("out"), 0, L("x"), 8);
+    rtLoad(f, "x", L("o"), 40, 8);
+    rtStore(f, L("out"), 8, L("x"), 8);
+    rtLoad(f, "x", L("o"), 24, 4);
+    rtStore(f, L("out"), 16, L("x"), 4);
+    rtLoad(f, "x", L("o"), 28, 4);
+    rtIf(f, L("x"), "eq", I(3), "none");
+    rtRet(f, L("x"));
+    rtLabel(f, "none");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// __tx_callee_fn_env(值*, fn, pc) → 闭包的函数号：值须为 Ref（标签 9）指向的 struct 载荷（pk 1）、至少两个字段、
+// 字段 0 为函数值（标签 12，函数号 u32@8）；否则调 __tx_native_object_handler_error_v1(4, 1, fn, pc)。
+function calleeFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_callee_fn_env", "v fn pc", "o x r", 4, MODULE);
+    rtOp(f, "fn", L("fn"), "and", I(MASK32));
+    rtOp(f, "pc", L("pc"), "and", I(MASK32));
+    rtLoad(f, "x", L("v"), 0, 1);
+    rtIf(f, L("x"), "ne", I(9), "bad");
+    rtLoad(f, "x", L("v"), 8, 4);
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("x"));
+    rtLoad(f, "x", L("o"), 16, 4);
+    rtIf(f, L("x"), "ne", I(1), "bad");
+    rtLoad(f, "x", L("o"), 40, 8);
+    rtIf(f, L("x"), "ult", I(2), "bad");
+    rtLoad(f, "o", L("o"), 32, 8);
+    rtLoad(f, "x", L("o"), 0, 1);
+    rtIf(f, L("x"), "ne", I(12), "bad");
+    rtLoad(f, "x", L("o"), 8, 4);
+    rtRet(f, L("x"));
+    rtLabel(f, "bad");
+    rtCall4(f, "r", "__tx_native_object_handler_error_v1", I(4), I(1), L("fn"), L("pc"));
+    rtRet(f, L("r"));
+    done(f, failures);
+}
+
+/// 发出对象字段与下标处理的函数；rtfn 的失败记进 failures。t 为目标编号（只在语义随目标不同时用）。
+export function objectHandlersGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    handlerFn(b, failures, "__tx_getfld", true, false);
+    handlerFn(b, failures, "__tx_setfld", true, true);
+    handlerFn(b, failures, "__tx_getidx", false, false);
+    handlerFn(b, failures, "__tx_setidx", false, true);
+    accessorFn(b, failures, "__tx_obj_fields", 0, false);
+    accessorFn(b, failures, "__tx_list_items", 1, false);
+    accessorFn(b, failures, "__tx_str_bytes", 2, false);
+    accessorFn(b, failures, "__tx_seq_len", 3, false);
+    listViewFn(b, failures, false);
+    calleeFn(b, failures);
+    // 写用访问器（线程第 4b 步）：字段写、bytesSet/bytesPush、listSet 的内联快路径用。
+    accessorFn(b, failures, "__tx_obj_fields_w", 0, true);
+    accessorFn(b, failures, "__tx_str_bytes_w", 2, true);
+    listViewFn(b, failures, true);
+}

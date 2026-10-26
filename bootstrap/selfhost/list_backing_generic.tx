@@ -1,0 +1,208 @@
+// 列表描述符的可移植版（rtfn 写，macOS 适配 M4 设计 A8）：语义与导出名同 list_backing.tx。
+// 描述符（List ABI v1）{指针@0, 长度@8, 容量@16, form u32@24, elem u32@28}，容量按元素个数计。form 1 通用（每元素 16 字节的值）、
+// 2 原始（每元素 8 字节载荷，elem 为标签 1 整数、2 浮点、3 布尔）、3 紧凑（转 list_compact 的例程）。长度与容量上限 2^60 − 1。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, L, I } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtShift, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtIf32, rtCall1, rtCall2, rtCall3, rtRet, rtRetVoid } from "./rtfn";
+import { LIST_FORM_COMPACT } from "./list_compact";
+import { tSysV } from "./target";
+
+const MODULE: string = "bootstrap/selfhost/list_backing_generic.tx";
+const LEN_LIMIT: int = 1152921504606846975;
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// generic(view) → 1（已是或已转为通用形态），或 0（视图为空、紧凑列表、描述符损坏、分配失败）。
+// 借追加引擎完成转换：以“不许原始”追加一个临时 None，再把长度减一。
+function genericFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_list_generic_v1", "v", "nt np r x", 3, MODULE);
+    rtIf(f, L("v"), "eq", I(0), "bad");
+    rtLoad(f, "x", L("v"), 24, 4);
+    rtIf(f, L("x"), "eq", I(LIST_FORM_COMPACT), "bad");
+    rtIf(f, L("x"), "eq", I(1), "ok");
+    rtSet(f, "nt", I(4));
+    rtSet(f, "np", I(0));
+    rtAddrOf(f, "x", "nt");
+    rtCall3(f, "r", "__tx_native_list_append_v1", L("v"), L("x"), I(0));
+    rtIf(f, L("r"), "eq", I(0), "out");
+    rtLoad(f, "x", L("v"), 8, 8);
+    rtOp(f, "x", L("x"), "sub", I(1));
+    rtStore(f, L("v"), 8, L("x"), 8);
+    rtRet(f, I(1));
+    rtLabel(f, "out");
+    rtRet(f, L("r"));
+    rtLabel(f, "ok");
+    rtRet(f, I(1));
+    rtLabel(f, "bad");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// destroy(view)：容量非零时归还元素块，描述符清为空的通用列表（form 1、elem 0）；视图为空时什么也不做。
+function destroyFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_list_destroy_v1", "v", "x", 1, MODULE);
+    rtIf(f, L("v"), "eq", I(0), "out");
+    rtLoad(f, "x", L("v"), 16, 8);
+    rtIf(f, L("x"), "eq", I(0), "clear");
+    rtLoad(f, "x", L("v"), 0, 8);
+    rtCall1(f, "", "__tx_native_mem_free", L("x"));
+    rtLabel(f, "clear");
+    rtStore(f, L("v"), 0, I(0), 8);
+    rtStore(f, L("v"), 8, I(0), 8);
+    rtStore(f, L("v"), 16, I(0), 8);
+    rtStore(f, L("v"), 24, I(1), 8);
+    rtRet(f, I(0));
+    rtLabel(f, "out");
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+// append(view, 值*, allowRaw u32) → 结果形态：1 通用、2 原始（elem 不变）、3 空的通用列表转为原始；0 失败（视图或值为空、
+// 描述符损坏、分配失败），失败时描述符不变。紧凑列表转 __tx_native_list_cappend_v1。
+// 选形态：允许原始、值的标签为 1..3、且（列表为同 elem 的原始形态，或为空的通用列表）时用原始，否则通用；布尔载荷规范为 0/1。
+// 形态不变且有余量时原地追加；否则另分配（容量按需倍增，不小于 8，上限 2^60 − 1）、拷贝或把原始元素转为通用的值，再归还旧块。
+function appendFn(b: Ref<StructuredBuffer>, failures: List<string>, copy: string): void {
+    const f = rtBegin(b, "__tx_native_list_append_v1", "v val allow", "tagw pay n cap form tag nform nelem res ncap buf src dst x y", 3, MODULE);
+    rtIf(f, L("v"), "eq", I(0), "full");
+    rtLoad(f, "x", L("v"), 24, 4);
+    rtIf(f, L("x"), "ne", I(LIST_FORM_COMPACT), "full");
+    rtCall3(f, "x", "__tx_native_list_cappend_v1", L("v"), L("val"), L("allow"));
+    rtRet(f, L("x"));
+    rtLabel(f, "full");
+    rtIf(f, L("v"), "eq", I(0), "fail");
+    rtIf(f, L("val"), "eq", I(0), "fail");
+    rtLoad(f, "tagw", L("val"), 0, 8);
+    rtLoad(f, "pay", L("val"), 8, 8);
+    rtLoad(f, "n", L("v"), 8, 8);
+    rtIf(f, L("n"), "uge", I(LEN_LIMIT), "fail");
+    rtLoad(f, "cap", L("v"), 16, 8);
+    rtIf(f, L("n"), "ugt", L("cap"), "fail");
+    rtIf(f, L("cap"), "ugt", I(LEN_LIMIT), "fail");
+    rtIf(f, L("cap"), "eq", I(0), "form");
+    rtLoad(f, "x", L("v"), 0, 8);
+    rtIf(f, L("x"), "eq", I(0), "fail");
+    rtLabel(f, "form");
+    rtLoad(f, "form", L("v"), 24, 4);
+    rtIf(f, L("form"), "eq", I(1), "choose");
+    rtIf(f, L("form"), "ne", I(2), "fail");
+    rtLoad(f, "x", L("v"), 28, 4);
+    rtIf(f, L("x"), "ult", I(1), "fail");
+    rtIf(f, L("x"), "ugt", I(3), "fail");
+    rtLabel(f, "choose");
+    rtOp(f, "tag", L("tagw"), "and", I(255));
+    rtIf32(f, L("allow"), "eq", I(0), "generic");
+    rtIf(f, L("tag"), "ult", I(1), "generic");
+    rtIf(f, L("tag"), "ugt", I(3), "generic");
+    rtIf(f, L("form"), "ne", I(2), "empty");
+    rtLoad(f, "x", L("v"), 28, 4);
+    rtIf(f, L("tag"), "ne", L("x"), "generic");
+    rtSet(f, "res", I(2));
+    rtJump(f, "raw");
+    rtLabel(f, "empty");
+    rtIf(f, L("n"), "ne", I(0), "generic");
+    rtSet(f, "res", I(3));
+    rtLabel(f, "raw");
+    rtSet(f, "nform", I(2));
+    rtSet(f, "nelem", L("tag"));
+    rtIf(f, L("tag"), "ne", I(3), "capacity");
+    rtIf(f, L("pay"), "eq", I(0), "capacity");
+    rtSet(f, "pay", I(1));
+    rtJump(f, "capacity");
+    rtLabel(f, "generic");
+    rtSet(f, "nform", I(1));
+    rtSet(f, "nelem", I(0));
+    rtSet(f, "res", I(1));
+    rtLabel(f, "capacity");
+    rtIf(f, L("nform"), "ne", L("form"), "allocate");
+    rtIf(f, L("n"), "uge", L("cap"), "allocate");
+    rtLoad(f, "buf", L("v"), 0, 8);
+    rtSet(f, "ncap", L("cap"));
+    rtJump(f, "append");
+    // 新容量：原容量已够（只换形态）时不变，否则翻倍并截到上限；至少 8。
+    rtLabel(f, "allocate");
+    rtSet(f, "ncap", L("cap"));
+    rtOp(f, "x", L("n"), "add", I(1));
+    rtIf(f, L("ncap"), "uge", L("x"), "min");
+    rtShift(f, "ncap", L("ncap"), "shl", 1);
+    rtIf(f, L("ncap"), "ule", I(LEN_LIMIT), "min");
+    rtSet(f, "ncap", I(LEN_LIMIT));
+    rtLabel(f, "min");
+    rtIf(f, L("ncap"), "uge", I(8), "alloc");
+    rtSet(f, "ncap", I(8));
+    rtLabel(f, "alloc");
+    rtShift(f, "x", L("ncap"), "shl", 3);
+    rtIf(f, L("nform"), "eq", I(2), "alloc_call");
+    rtShift(f, "x", L("x"), "shl", 1);
+    rtLabel(f, "alloc_call");
+    rtCall2(f, "buf", "__tx_native_mem_alloc", L("x"), I(8));
+    rtIf(f, L("buf"), "eq", I(0), "fail");
+    rtLoad(f, "y", L("v"), 8, 8);
+    rtIf(f, L("y"), "eq", I(0), "append");
+    rtIf(f, L("nform"), "ne", L("form"), "convert");
+    rtShift(f, "y", L("y"), "shl", 3);
+    rtIf(f, L("nform"), "eq", I(2), "copy");
+    rtShift(f, "y", L("y"), "shl", 1);
+    rtLabel(f, "copy");
+    rtLoad(f, "x", L("v"), 0, 8);
+    rtCall3(f, "", copy, L("buf"), L("x"), L("y"));
+    rtJump(f, "append");
+    // 原始 → 通用：每个 8 字节载荷展开为 {elem, 载荷}（布尔规范为 0/1）。
+    rtLabel(f, "convert");
+    rtLoad(f, "src", L("v"), 0, 8);
+    rtLoad(f, "tag", L("v"), 28, 4);
+    rtSet(f, "dst", L("buf"));
+    rtLabel(f, "convert_loop");
+    rtLoad(f, "x", L("src"), 0, 8);
+    rtIf(f, L("tag"), "ne", I(3), "convert_store");
+    rtIf(f, L("x"), "eq", I(0), "convert_store");
+    rtSet(f, "x", I(1));
+    rtLabel(f, "convert_store");
+    rtStore(f, L("dst"), 0, L("tag"), 8);
+    rtStore(f, L("dst"), 8, L("x"), 8);
+    rtOp(f, "dst", L("dst"), "add", I(16));
+    rtOp(f, "src", L("src"), "add", I(8));
+    rtOp(f, "y", L("y"), "sub", I(1));
+    rtIf(f, L("y"), "ne", I(0), "convert_loop");
+    rtLabel(f, "append");
+    rtLoad(f, "x", L("v"), 8, 8);
+    rtShift(f, "x", L("x"), "shl", 3);
+    rtIf(f, L("nform"), "eq", I(2), "append_raw");
+    rtShift(f, "x", L("x"), "shl", 1);
+    rtOp(f, "x", L("x"), "add", L("buf"));
+    rtStore(f, L("x"), 0, L("tagw"), 8);
+    rtOp(f, "x", L("x"), "add", I(8));
+    rtJump(f, "append_bits");
+    rtLabel(f, "append_raw");
+    rtOp(f, "x", L("x"), "add", L("buf"));
+    rtLabel(f, "append_bits");
+    rtStore(f, L("x"), 0, L("pay"), 8);
+    rtLoad(f, "y", L("v"), 0, 8);
+    rtIf(f, L("buf"), "eq", L("y"), "commit");
+    rtLoad(f, "x", L("v"), 16, 8);
+    rtIf(f, L("x"), "eq", I(0), "commit");
+    rtCall1(f, "", "__tx_native_mem_free", L("y"));
+    rtLabel(f, "commit");
+    rtStore(f, L("v"), 0, L("buf"), 8);
+    rtStore(f, L("v"), 16, L("ncap"), 8);
+    rtLoad(f, "x", L("v"), 8, 8);
+    rtOp(f, "x", L("x"), "add", I(1));
+    rtStore(f, L("v"), 8, L("x"), 8);
+    rtStore(f, L("v"), 24, L("nform"), 4);
+    rtStore(f, L("v"), 28, L("nelem"), 4);
+    rtRet(f, L("res"));
+    rtLabel(f, "fail");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+/// 发出列表描述符的函数；rtfn 的失败记进 failures。t 为目标编号：SysV 目标的内核内拷贝走私有约定的 __tx_linux_memcpy。
+export function listBackingGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    let copy = "memcpy";
+    if (tSysV(t)) { copy = "__tx_linux_memcpy"; }
+    genericFn(b, failures);
+    destroyFn(b, failures);
+    appendFn(b, failures, copy);
+}

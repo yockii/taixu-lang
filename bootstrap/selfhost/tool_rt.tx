@@ -1,0 +1,892 @@
+// 工具链进程与标准输入内建的程序对象例程（第 6 轮 6c-3，TOOL-103，docs/design/v052-round6-debug-v0.1-20261018.md §四-6）。
+// 发射器把 callbi 3584..3594 直调到 __tx_tool_<toolBiName>（参数同 __tx_callbi：win fn pc a，栈上另有内建号与实参数），
+// 例程只在程序用到这组内建时生成，内核不变。句柄表与公共件见 tool_base.tx，procSpawn 见 tool_spawn.tx。
+//
+// 约定：读写以调用方给的 Bytes 为缓冲，返回字节数；暂无数据或超时为 0，流尾为 −1。管道上的系统错误一律当作流尾，
+// 并关闭父进程这端。句柄无效、流号不对报 4010，写入冻结的 Bytes 报 4022。
+import { StructuredBuffer, asBufferSection, asBufferAlign, asBufferLabel, asBufferZero, asBufferInstruction, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem } from "./assemble";
+import { RtFn, RtOp, L, I, A, G, GAcq } from "./rtfn_base";
+import { rtBegin, rtSet, rtOp, rtShift, rtDivMod, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtIf32, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtSyscall, rtRet, rtRetVoid, rtLoadAcq, rtStoreRel, rtAtomicCas } from "./rtfn";
+import { nrtBaseReset, nrtLastError } from "./nrt_base";
+import { setWinImportTarget, callWinImport } from "./ffi_callbacks";
+import { TB_MASK } from "./thread_block_abi";
+import { budgetKill, budgetCloseWindows } from "./tool_budget";
+import { R_JOB, REC_COUNT, REC_SHIFT, REC_BYTES, R_GEN, R_STATE, R_OWNER, R_PROC, R_IN, R_OUT, R_ERR, R_CW, R_CR, R_DONE, R_CODE, TAG_INT, TAG_NONE, TAG_ERR, TAG_STR, TAG_BYTES, toolFailReset, toolLastError, toolCheck, xs0, xs1, xs2, xs3, xs4, xs5, xs6, xs7, toolTrap, toolArity, toolArgInt, toolArgSpan, toolFrozen } from "./tool_base";
+import { emitLocalFiles } from "./tool_local";
+import { emitToolSpawn } from "./tool_spawn";
+import { emitToolTryIo } from "./tool_try_io";
+import { emitToolClock } from "./tool_clock";
+import { emitCurrentDir, emitFileSize } from "./tool_cwd_size";
+import { T_X64_WINDOWS, tKernel32, tRawSyscall, tWindows, tUnix, tMacos } from "./target";
+import { uxSys, uxMac, uxErrno, uxConst } from "./unix_sys";
+
+const ARITY: string = "内建函数实参数目错误";
+const BAD_HANDLE: string = " 的句柄无效（已关闭、从未有效或属于别的线程）";
+const FROZEN: string = " 写入了冻结的 Bytes（来自 Shared，深度不可变）";
+const CHUNK: int = 1073741824;
+// procWait 的“子进程已被别处回收、状态不可知”（Linux）。
+export const LOST_CODE: int = -256;
+
+/// 全部例程与数据；返回空串表示成功，否则为生成错误（未知局部名等）。
+export function toolEmitRoutines(b: Ref<StructuredBuffer>, t: int): string {
+    toolFailReset();
+    // 按目标的常量与 errno（unix_sys 的 uxConst、uxErrno 等）在生成期出错时记在 nrt_base，与例程自己的失败一并报告。
+    nrtBaseReset(t);
+    setWinImportTarget(t);
+    emitData(b);
+    emitCopy(b);
+    emitCas(b);
+    emitToolClock(b, t);
+    if (tMacos(t)) { emitNoPipe(b); }
+    emitClose(b, t);
+    emitRec(b);
+    if (tKernel32(t)) { emitAvail(b); emitStdinReady(b); }
+    emitRd(b, t);
+    emitWr(b, t);
+    emitToolTryIo(b, t);
+    emitWait(b, t);
+    emitStdinRead(b, t);
+    emitStdoutWrite(b, t);
+    emitProcRw(b, true, false);
+    emitProcRw(b, false, false);
+    emitProcRw(b, true, true);
+    emitIoWait(b);
+    emitKill(b, t);
+    emitProcWait(b, t);
+    emitProcClose(b, t);
+    emitCurrentDir(b, t);
+    emitFileSize(b, t);
+    emitToolSpawn(b, t);
+    emitLocalFiles(b, t);
+    if (len(toolLastError()) == 0) { return nrtLastError(); }
+    return toolLastError();
+}
+
+function emitData(b: Ref<StructuredBuffer>): void {
+    asBufferSection(b, 3, 1);
+    asBufferAlign(b, 4, 1);
+    asBufferLabel(b, "__tx_tool_recs", 1);
+    asBufferZero(b, REC_COUNT * REC_BYTES, 1);
+    asBufferSection(b, 0, 1);
+}
+
+// macOS（M3 设计 G5）：__tx_tool_nopipe() 在第一次经工具链例程写管道之前，给 SIGPIPE 装空处理函数（sigaction，SA_RESTART）：
+// 进程内写坏管道得 EPIPE；exec 时已捕获的信号复位为缺省，子进程不受影响。只在处置为 SIG_DFL 时装——父进程交下的 SIG_IGN、
+// 程序经外部函数自装的处理函数原样保留（写坏管道本就得 EPIPE）。状态字 __tx_nrt_nopipe 在内核里（0 未定、1 正在装、2 已装
+// 空处理函数、3 保留原处置）：内核写标准输出／错误遇 EPIPE 时据它决定是否按 SIGPIPE 结束（同 Linux）。抢到 0→1 的线程装，
+// 其余线程等到 2 或 3 再写，免得在装好之前写坏管道被 SIGPIPE 结束。处理函数由内核按 C 约定调用，什么也不做。
+function emitNoPipe(b: Ref<StructuredBuffer>): void {
+    let f = rtBegin(b, "__tx_tool_nopipe_handler", "", "", 0, "bootstrap/selfhost/tool_rt.tx");
+    rtRetVoid(f);
+    toolCheck(f);
+    f = rtBegin(b, "__tx_tool_nopipe", "", "r act mask ap", 3, "bootstrap/selfhost/tool_rt.tx");
+    rtLabel(f, "check");
+    rtSet(f, "r", GAcq("__tx_nrt_nopipe"));
+    rtIf(f, L("r"), "ge", I(2), "done");
+    rtIf(f, L("r"), "eq", I(0), "claim");
+    uxMac(f, "", "sched_yield", xs0());
+    rtJump(f, "check");
+    rtLabel(f, "claim");
+    rtCall3(f, "r", "__tx_tool_cas", A("__tx_nrt_nopipe"), I(0), I(1));
+    rtIf(f, L("r"), "eq", I(0), "check");
+    // struct sigaction（macOS 用户态）：处理函数 8 字节、sa_mask 4 字节、sa_flags 4 字节；SA_RESTART 为 2。
+    rtSet(f, "act", I(0)); rtSet(f, "mask", I(0));
+    rtAddrOf(f, "ap", "act");
+    uxMac(f, "r", "sigaction", xs3(I(13), I(0), L("ap")));
+    rtIf(f, L("r"), "ne", I(0), "keep");
+    rtIf(f, L("act"), "ne", I(0), "keep");
+    rtSet(f, "act", A("__tx_tool_nopipe_handler"));
+    rtSet(f, "mask", I(2 << 32));
+    uxMac(f, "r", "sigaction", xs3(I(13), L("ap"), I(0)));
+    rtIf(f, L("r"), "ne", I(0), "keep");
+    rtStoreRel(f, A("__tx_nrt_nopipe"), 0, I(2));
+    rtRetVoid(f);
+    rtLabel(f, "keep");
+    rtStoreRel(f, A("__tx_nrt_nopipe"), 0, I(3));
+    rtLabel(f, "done");
+    rtRetVoid(f);
+    toolCheck(f);
+}
+
+// __tx_tool_copy(d, s, n)：逐字节拷贝（程序对象不能按名直调 memcpy）。
+function emitCopy(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "__tx_tool_copy", "d s n", "c", 0, "bootstrap/selfhost/tool_rt.tx");
+    rtLabel(f, "top");
+    rtIf(f, L("n"), "le", I(0), "done");
+    rtLoad(f, "c", L("s"), 0, 1);
+    rtStore(f, L("d"), 0, L("c"), 1);
+    rtOp(f, "d", L("d"), "add", I(1));
+    rtOp(f, "s", L("s"), "add", I(1));
+    rtOp(f, "n", L("n"), "sub", I(1));
+    rtJump(f, "top");
+    rtLabel(f, "done");
+    rtRetVoid(f);
+    toolCheck(f);
+}
+
+// __tx_tool_cas(p, expect, new) → 1 成功、0 失败（lock cmpxchg，全屏障）：领取句柄表的空槽。
+// A64（macOS 适配 M4e）：rtfn 的 CASAL，与 LDAR／STLR 合起来顺序一致。
+function emitCas(b: Ref<StructuredBuffer>): void {
+    if (b.a64) {
+        const f = rtBegin(b, "__tx_tool_cas", "p e n", "old r", 0, "bootstrap/selfhost/tool_rt.tx");
+        rtAtomicCas(f, "old", L("p"), 0, L("e"), L("n"));
+        rtSet(f, "r", I(0));
+        rtIf(f, L("old"), "ne", L("e"), "out");
+        rtSet(f, "r", I(1));
+        rtLabel(f, "out");
+        rtRet(f, L("r"));
+        toolCheck(f);
+        return;
+    }
+    asBufferLabel(b, "__tx_tool_cas", 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(0, 0), asStructuredReg(0, 2), asStructuredMissing(), 1);
+    asBufferInstruction(b, "lockcmpxchg", 2, asStructuredMem(2, 1, -1, 0, 0, 0, ""), asStructuredReg(0, 8), asStructuredMissing(), 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(1, 0), asStructuredImm(1), asStructuredMissing(), 1);
+    asBufferInstruction(b, "je", 1, asStructuredTarget("__tx_tool_cas_out"), asStructuredMissing(), asStructuredMissing(), 1);
+    asBufferInstruction(b, "xor", 2, asStructuredReg(1, 0), asStructuredReg(1, 0), asStructuredMissing(), 1);
+    asBufferLabel(b, "__tx_tool_cas_out", 1);
+    asBufferInstruction(b, "ret", 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1);
+}
+
+// __tx_tool_close(x)：x 为 −1 时无动作。
+function emitClose(b: Ref<StructuredBuffer>, t: int): void {
+    const f = rtBegin(b, "__tx_tool_close", "x", "gp ef", 1, "bootstrap/selfhost/tool_rt.tx");
+    rtIf(f, L("x"), "eq", I(-1), "done");
+    if (tUnix(t)) { uxSys(f, t, "", 3, xs1(L("x"))); } else { callWinImport(f, "", "CloseHandle", xs1(L("x"))); }
+    rtLabel(f, "done");
+    rtRetVoid(f);
+    toolCheck(f);
+}
+
+// __tx_tool_rec(win, h) → 句柄 h 的表项地址；从未有效、已关闭或不属于本线程时为 0。
+function emitRec(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "__tx_tool_rec", "win h", "slot g e x o", 0, "bootstrap/selfhost/tool_rt.tx");
+    rtIf(f, L("h"), "le", I(0), "bad");
+    rtOp(f, "slot", L("h"), "and", I(REC_COUNT - 1));
+    rtShift(f, "g", L("h"), "shr", REC_SHIFT);
+    rtOp(f, "e", L("slot"), "imul", I(REC_BYTES));
+    rtOp(f, "e", L("e"), "add", A("__tx_tool_recs"));
+    rtLoadAcq(f, "x", L("e"), R_STATE);
+    rtIf(f, L("x"), "ne", I(2), "bad");
+    rtLoad(f, "x", L("e"), R_GEN, 8);
+    rtIf(f, L("x"), "ne", L("g"), "bad");
+    rtOp(f, "o", L("win"), "and", I(TB_MASK));
+    rtLoad(f, "x", L("e"), R_OWNER, 8);
+    rtIf(f, L("x"), "ne", L("o"), "bad");
+    rtRet(f, L("e"));
+    rtLabel(f, "bad");
+    rtRet(f, I(0));
+    toolCheck(f);
+}
+
+// Windows：__tx_tool_avail(x) → 管道里可读的字节数；已到流尾或出错为 −1。
+function emitAvail(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "__tx_tool_avail", "x", "av ap r gp ef", 6, "bootstrap/selfhost/tool_rt.tx");
+    rtSet(f, "av", I(0));
+    rtAddrOf(f, "ap", "av");
+    callWinImport(f, "r", "PeekNamedPipe", xs6(L("x"), I(0), I(0), I(0), L("ap"), I(0)));
+    rtIf32(f, L("r"), "eq", I(0), "eof");
+    rtOp(f, "av", L("av"), "and", I(4294967295));
+    rtRet(f, L("av"));
+    rtLabel(f, "eof");
+    rtRet(f, I(-1));
+    toolCheck(f);
+}
+
+// Windows：__tx_tool_stdin_ready() → 本进程 stdin 可读（有数据或已到流尾）为 1。管道看 PeekNamedPipe；控制台看
+// WaitForSingleObject（按行读，就绪后 ReadFile 仍会等到整行）；磁盘文件、NUL 等其余字符设备与无效句柄恒就绪。
+function emitStdinReady(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "__tx_tool_stdin_ready", "", "h ty m mp r av gp ef", 2, "bootstrap/selfhost/tool_rt.tx");
+    callWinImport(f, "h", "GetStdHandle", xs1(I(-10)));
+    rtIf(f, L("h"), "eq", I(0), "yes");
+    rtIf(f, L("h"), "eq", I(-1), "yes");
+    callWinImport(f, "ty", "GetFileType", xs1(L("h")));
+    rtOp(f, "ty", L("ty"), "and", I(4294967295));
+    rtIf(f, L("ty"), "eq", I(3), "pipe");
+    rtIf(f, L("ty"), "ne", I(2), "yes");
+    rtSet(f, "m", I(0));
+    rtAddrOf(f, "mp", "m");
+    callWinImport(f, "r", "GetConsoleMode", xs2(L("h"), L("mp")));
+    rtIf32(f, L("r"), "eq", I(0), "yes");
+    callWinImport(f, "r", "WaitForSingleObject", xs2(L("h"), I(0)));
+    rtIf32(f, L("r"), "eq", I(0), "yes");
+    rtRet(f, I(0));
+    rtLabel(f, "pipe");
+    rtCall1(f, "av", "__tx_tool_avail", L("h"));
+    rtIf(f, L("av"), "ne", I(0), "yes");
+    rtRet(f, I(0));
+    rtLabel(f, "yes");
+    rtRet(f, I(1));
+    toolCheck(f);
+}
+
+// __tx_tool_rd(x, buf, n) → 不阻塞地读父进程这端：字节数、暂无数据 0、流尾或出错 −1。
+function emitRd(b: Ref<StructuredBuffer>, t: int): void {
+    const f = rtBegin(b, "__tx_tool_rd", "x buf n", "av k got gpp r gp ef", 5, "bootstrap/selfhost/tool_rt.tx");
+    rtIf(f, L("n"), "le", I(0), "zero");
+    if (tUnix(t)) {
+        rtLabel(f, "again");
+        uxSys(f, t, "r", 0, xs3(L("x"), L("buf"), L("n")));
+        rtIf(f, L("r"), "eq", I(-4), "again");
+        rtIf(f, L("r"), "eq", I(0 - uxErrno(t, "EAGAIN")), "zero");
+        rtIf(f, L("r"), "le", I(0), "eof");
+        rtRet(f, L("r"));
+    } else {
+        rtCall1(f, "av", "__tx_tool_avail", L("x"));
+        rtIf(f, L("av"), "lt", I(0), "eof");
+        rtIf(f, L("av"), "eq", I(0), "zero");
+        rtSet(f, "k", L("n"));
+        rtIf(f, L("k"), "le", L("av"), "sized");
+        rtSet(f, "k", L("av"));
+        rtLabel(f, "sized");
+        rtSet(f, "got", I(0));
+        rtAddrOf(f, "gpp", "got");
+        callWinImport(f, "r", "ReadFile", xs5(L("x"), L("buf"), L("k"), L("gpp"), I(0)));
+        rtIf32(f, L("r"), "eq", I(0), "eof");
+        rtOp(f, "got", L("got"), "and", I(4294967295));
+        rtRet(f, L("got"));
+    }
+    rtLabel(f, "zero");
+    rtRet(f, I(0));
+    rtLabel(f, "eof");
+    rtRet(f, I(-1));
+    toolCheck(f);
+}
+
+// __tx_tool_wr(x, buf, n) → 写满 n 字节后返回 n；对端已关闭或出错为 −1。Linux 在本线程屏蔽 SIGPIPE，遇 EPIPE 时
+// 用 sigtimedwait 消掉挂起的 SIGPIPE（调用前已被屏蔽的不动），再恢复屏蔽字：不改进程级的信号处置。
+function emitWr(b: Ref<StructuredBuffer>, t: int): void {
+    const f = rtBegin(b, "__tx_tool_wr", "x buf n", "tot k w wp r set old ts0 ts1 sp op tp t gp ef", 7, "bootstrap/selfhost/tool_rt.tx");
+    rtSet(f, "tot", L("n"));
+    if (tMacos(t)) {
+        // XNU 写坏管道发进程级 SIGPIPE，按线程屏蔽挡不住（M3 设计 G5）：首次写之前装空处理函数，写坏管道得 EPIPE。
+        rtCall0(f, "", "__tx_tool_nopipe");
+        rtLabel(f, "top");
+        rtIf(f, L("n"), "le", I(0), "ok");
+        uxSys(f, t, "r", 1, xs3(L("x"), L("buf"), L("n")));
+        rtIf(f, L("r"), "eq", I(-4), "top");
+        rtIf(f, L("r"), "ne", I(0 - uxErrno(t, "EAGAIN")), "checked");
+        rtCall1(f, "", "__tx_tool_sleep", I(1));
+        rtJump(f, "top");
+        rtLabel(f, "checked");
+        rtIf(f, L("r"), "le", I(0), "fail");
+        rtOp(f, "buf", L("buf"), "add", L("r"));
+        rtOp(f, "n", L("n"), "sub", L("r"));
+        rtJump(f, "top");
+        rtLabel(f, "ok");
+        rtRet(f, L("tot"));
+        rtLabel(f, "fail");
+        rtRet(f, I(-1));
+    } else if (tRawSyscall(t)) {
+        rtSet(f, "set", I(4096));
+        rtSet(f, "old", I(0));
+        rtAddrOf(f, "sp", "set");
+        rtAddrOf(f, "op", "old");
+        rtSyscall(f, "", 14, xs4(I(0), L("sp"), L("op"), I(8)));
+        rtLabel(f, "top");
+        rtIf(f, L("n"), "le", I(0), "ok");
+        rtSyscall(f, "r", 1, xs3(L("x"), L("buf"), L("n")));
+        rtIf(f, L("r"), "eq", I(-4), "top");
+        rtIf(f, L("r"), "ne", I(-11), "checked");
+        rtCall1(f, "", "__tx_tool_sleep", I(1));
+        rtJump(f, "top");
+        rtLabel(f, "checked");
+        rtIf(f, L("r"), "le", I(0), "fail");
+        rtOp(f, "buf", L("buf"), "add", L("r"));
+        rtOp(f, "n", L("n"), "sub", L("r"));
+        rtJump(f, "top");
+        rtLabel(f, "ok");
+        rtSyscall(f, "", 14, xs4(I(2), L("op"), I(0), I(8)));
+        rtRet(f, L("tot"));
+        rtLabel(f, "fail");
+        rtIf(f, L("r"), "ne", I(-32), "restore");
+        rtOp(f, "t", L("old"), "and", I(4096));
+        rtIf(f, L("t"), "ne", I(0), "restore");
+        rtSet(f, "ts0", I(0));
+        rtSet(f, "ts1", I(0));
+        rtAddrOf(f, "tp", "ts0");
+        rtSyscall(f, "", 128, xs4(L("sp"), I(0), L("tp"), I(8)));
+        rtLabel(f, "restore");
+        rtSyscall(f, "", 14, xs4(I(2), L("op"), I(0), I(8)));
+        rtRet(f, I(-1));
+    } else {
+        // procTryWrite 会把管道写端留在 PIPE_NOWAIT（tool_try_io.tx）：阻塞写之前切回 PIPE_WAIT（有排队数据时也能切）。
+        // 不是管道的句柄（控制台、文件）查询失败，照旧写。
+        rtSet(f, "old", I(0));
+        rtAddrOf(f, "op", "old");
+        callWinImport(f, "r", "GetNamedPipeHandleStateW", xs7(L("x"), L("op"), I(0), I(0), I(0), I(0), I(0)));
+        rtIf32(f, L("r"), "eq", I(0), "top");
+        rtOp(f, "t", L("old"), "and", I(1));
+        rtIf(f, L("t"), "eq", I(0), "top");
+        rtSet(f, "set", I(0));
+        rtAddrOf(f, "sp", "set");
+        callWinImport(f, "", "SetNamedPipeHandleState", xs4(L("x"), L("sp"), I(0), I(0)));
+        rtLabel(f, "top");
+        rtIf(f, L("n"), "le", I(0), "ok");
+        rtSet(f, "k", L("n"));
+        rtIf(f, L("k"), "le", I(CHUNK), "sized");
+        rtSet(f, "k", I(CHUNK));
+        rtLabel(f, "sized");
+        rtSet(f, "w", I(0));
+        rtAddrOf(f, "wp", "w");
+        callWinImport(f, "r", "WriteFile", xs5(L("x"), L("buf"), L("k"), L("wp"), I(0)));
+        rtIf32(f, L("r"), "eq", I(0), "fail");
+        rtOp(f, "w", L("w"), "and", I(4294967295));
+        rtIf(f, L("w"), "eq", I(0), "fail");
+        rtOp(f, "buf", L("buf"), "add", L("w"));
+        rtOp(f, "n", L("n"), "sub", L("w"));
+        rtJump(f, "top");
+        rtLabel(f, "ok");
+        rtRet(f, L("tot"));
+        rtLabel(f, "fail");
+        rtRet(f, I(-1));
+    }
+    toolCheck(f);
+}
+
+// 独立探针（bootstrap/native_try_io_probe.tx）单独发射 Windows 的 __tx_tool_wr，核对它写前把管道切回阻塞。
+export function emitToolWrWindows(b: Ref<StructuredBuffer>): void { emitWr(b, T_X64_WINDOWS); }
+
+// 同一探针在 macOS 上另发射 __tx_tool_try_wr 用到的 SIGPIPE 处置（__tx_tool_nopipe 及其处理函数）与 __tx_tool_cas；
+// 状态字 __tx_nrt_nopipe 由探针放进 .bss，libSystem 调用由 C 驱动提供。
+export function emitToolNoPipeProbe(b: Ref<StructuredBuffer>): void {
+    emitCas(b);
+    emitNoPipe(b);
+}
+
+// __tx_tool_wait(rec, mask, ms) → 就绪位的集合，超时 0。位 0 本进程 stdin，位 1–3 rec 的 stdout、stderr、控制通道读端
+// （已关闭的不计）；选中的来源都已关闭时立即返回 0。ms 为 −1 一直等。
+function emitWait(b: Ref<StructuredBuffer>, t: int): void {
+    if (tUnix(t)) { emitWaitUnix(b, t); return; }
+    const f = rtBegin(b, "__tx_tool_wait", "rec mask ms", "r x live start step el rem w av", 2, "bootstrap/selfhost/tool_rt.tx");
+    rtCall0Now(f, "start");
+    rtSet(f, "step", I(1));
+    rtLabel(f, "loop");
+    rtSet(f, "r", I(0));
+    rtSet(f, "live", I(0));
+    rtOp(f, "x", L("mask"), "and", I(1));
+    rtIf(f, L("x"), "eq", I(0), "s1");
+    rtSet(f, "live", I(1));
+    rtCall1(f, "x", "__tx_tool_stdin_ready", I(0));
+    rtIf(f, L("x"), "eq", I(0), "s1");
+    rtOp(f, "r", L("r"), "or", I(1));
+    let k = 1;
+    while (k <= 3) {
+        const bit = 1 << k;
+        const here = "s" + toStr(k);
+        const next = "s" + toStr(k + 1);
+        rtLabel(f, here);
+        rtOp(f, "x", L("mask"), "and", I(bit));
+        rtIf(f, L("x"), "eq", I(0), next);
+        rtLoad(f, "x", L("rec"), streamField(k), 8);
+        rtIf(f, L("x"), "eq", I(-1), next);
+        rtSet(f, "live", I(1));
+        rtCall1(f, "av", "__tx_tool_avail", L("x"));
+        rtIf(f, L("av"), "eq", I(0), next);
+        rtOp(f, "r", L("r"), "or", I(bit));
+        k = k + 1;
+    }
+    rtLabel(f, "s4");
+    rtIf(f, L("r"), "ne", I(0), "out");
+    rtIf(f, L("live"), "eq", I(0), "out");
+    rtIf(f, L("ms"), "eq", I(0), "out");
+    rtSet(f, "w", L("step"));
+    rtIf(f, L("ms"), "lt", I(0), "nap");
+    rtCall0Now(f, "el");
+    rtOp(f, "el", L("el"), "sub", L("start"));
+    rtIf(f, L("el"), "ge", L("ms"), "out");
+    rtOp(f, "rem", L("ms"), "sub", L("el"));
+    rtIf(f, L("w"), "le", L("rem"), "nap");
+    rtSet(f, "w", L("rem"));
+    rtLabel(f, "nap");
+    rtCall1(f, "", "__tx_tool_sleep", L("w"));
+    rtOp(f, "step", L("step"), "add", L("step"));
+    rtIf(f, L("step"), "le", I(10), "loop");
+    rtSet(f, "step", I(10));
+    rtJump(f, "loop");
+    rtLabel(f, "out");
+    rtRet(f, L("r"));
+    toolCheck(f);
+}
+
+function rtCall0Now(f: Ref<RtFn>, dst: string): void { rtCall1(f, dst, "__tx_tool_now", I(0)); }
+
+// 流号 → 父进程这端在表项里的偏移（1 stdout、2 stderr、3 控制通道读端）。
+function streamField(k: int): int {
+    if (k == 1) { return R_OUT; }
+    if (k == 2) { return R_ERR; }
+    return R_CR;
+}
+
+// Linux：poll。pollfd（fd u32、events u16、revents u16）每个占一个 8 字节局部，p0..p3 连续；m0..m3 记对应的位。
+function emitWaitUnix(b: Ref<StructuredBuffer>, t: int): void {
+    const f = rtBegin(b, "__tx_tool_wait", "rec mask ms", "p0 p1 p2 p3 m0 m1 m2 m3 n pp mp e x r res k tmo dl", 3, "bootstrap/selfhost/tool_rt.tx");
+    rtSet(f, "n", I(0));
+    rtAddrOf(f, "pp", "p0");
+    rtAddrOf(f, "mp", "m0");
+    rtOp(f, "x", L("mask"), "and", I(1));
+    rtIf(f, L("x"), "eq", I(0), "s1");
+    pushPoll(f, I(0), 1);
+    let k = 1;
+    while (k <= 3) {
+        const bit = 1 << k;
+        const next = "s" + toStr(k + 1);
+        rtLabel(f, "s" + toStr(k));
+        rtOp(f, "x", L("mask"), "and", I(bit));
+        rtIf(f, L("x"), "eq", I(0), next);
+        rtLoad(f, "x", L("rec"), streamField(k), 8);
+        rtIf(f, L("x"), "eq", I(-1), next);
+        pushPoll(f, L("x"), bit);
+        k = k + 1;
+    }
+    rtLabel(f, "s4");
+    rtIf(f, L("n"), "eq", I(0), "none");
+    rtSet(f, "tmo", L("ms"));
+    rtIf(f, L("tmo"), "le", I(2147483647), "capped");
+    rtSet(f, "tmo", I(2147483647));
+    rtLabel(f, "capped");
+    rtIf(f, L("ms"), "le", I(0), "poll");
+    rtCall0Now(f, "dl");
+    rtOp(f, "dl", L("dl"), "add", L("ms"));
+    rtLabel(f, "poll");
+    uxSys(f, t, "r", 7, xs3(L("pp"), L("n"), L("tmo")));
+    rtIf(f, L("r"), "ne", I(-4), "polled");
+    rtIf(f, L("ms"), "le", I(0), "poll");
+    rtCall0Now(f, "x");
+    rtOp(f, "tmo", L("dl"), "sub", L("x"));
+    rtIf(f, L("tmo"), "ge", I(0), "poll");
+    rtSet(f, "tmo", I(0));
+    rtJump(f, "poll");
+    rtLabel(f, "polled");
+    rtIf(f, L("r"), "le", I(0), "none");
+    rtSet(f, "res", I(0));
+    rtSet(f, "k", I(0));
+    rtLabel(f, "scan");
+    rtIf(f, L("k"), "ge", L("n"), "done");
+    rtShift(f, "e", L("k"), "shl", 3);
+    rtOp(f, "x", L("e"), "add", L("pp"));
+    rtLoad(f, "x", L("x"), 4, 4);
+    rtShift(f, "x", L("x"), "shr", 16);
+    rtIf(f, L("x"), "eq", I(0), "skip");
+    rtOp(f, "x", L("e"), "add", L("mp"));
+    rtLoad(f, "x", L("x"), 0, 8);
+    rtOp(f, "res", L("res"), "or", L("x"));
+    rtLabel(f, "skip");
+    rtOp(f, "k", L("k"), "add", I(1));
+    rtJump(f, "scan");
+    rtLabel(f, "done");
+    rtRet(f, L("res"));
+    rtLabel(f, "none");
+    rtRet(f, I(0));
+    toolCheck(f);
+}
+
+// 追加一个 pollfd（events＝POLLIN）与它对应的位。
+function pushPoll(f: Ref<RtFn>, fd: Ref<RtOp>, bit: int): void {
+    rtShift(f, "e", L("n"), "shl", 3);
+    rtOp(f, "e", L("e"), "add", L("pp"));
+    rtStore(f, L("e"), 0, fd, 4);
+    rtStore(f, L("e"), 4, I(1), 4);
+    rtShift(f, "e", L("n"), "shl", 3);
+    rtOp(f, "e", L("e"), "add", L("mp"));
+    rtStore(f, L("e"), 0, I(bit), 8);
+    rtOp(f, "n", L("n"), "add", I(1));
+}
+
+// stdinRead(buf: Bytes, timeoutMs: int): int。
+function emitStdinRead(b: Ref<StructuredBuffer>, t: int): void {
+    const f = rtBegin(b, "__tx_tool_stdin_read", "win fn pc a bi nargs", "s t o p n ms r h ty av k got gpp gp ef", 5, "bootstrap/selfhost/tool_rt.tx");
+    toolArity(f, 2);
+    toolArgSpan(f, 0, TAG_BYTES, "o", "p", "n", "t0bad");
+    toolFrozen(f, "o", "frozen");
+    toolArgInt(f, 1, "ms", "t1bad");
+    rtSet(f, "r", I(0));
+    rtIf(f, L("n"), "le", I(0), "out");
+    rtCall3(f, "r", "__tx_tool_wait", I(0), I(1), L("ms"));
+    rtIf(f, L("r"), "eq", I(0), "out");
+    if (tUnix(t)) {
+        rtLabel(f, "again");
+        uxSys(f, t, "r", 0, xs3(I(0), L("p"), L("n")));
+        rtIf(f, L("r"), "eq", I(-4), "again");
+        rtIf(f, L("r"), "ne", I(0 - uxErrno(t, "EAGAIN")), "read");
+        rtSet(f, "r", I(0));
+        rtJump(f, "out");
+        rtLabel(f, "read");
+        rtIf(f, L("r"), "le", I(0), "eof");
+        rtJump(f, "out");
+    } else {
+        callWinImport(f, "h", "GetStdHandle", xs1(I(-10)));
+        rtIf(f, L("h"), "eq", I(0), "eof");
+        rtIf(f, L("h"), "eq", I(-1), "eof");
+        callWinImport(f, "ty", "GetFileType", xs1(L("h")));
+        rtOp(f, "ty", L("ty"), "and", I(4294967295));
+        rtSet(f, "k", L("n"));
+        rtIf(f, L("k"), "le", I(CHUNK), "sized");
+        rtSet(f, "k", I(CHUNK));
+        rtLabel(f, "sized");
+        rtIf(f, L("ty"), "ne", I(3), "plain");
+        rtCall1(f, "av", "__tx_tool_avail", L("h"));
+        rtIf(f, L("av"), "lt", I(0), "eof");
+        rtSet(f, "r", I(0));
+        rtIf(f, L("av"), "eq", I(0), "out");
+        rtIf(f, L("k"), "le", L("av"), "plain");
+        rtSet(f, "k", L("av"));
+        rtLabel(f, "plain");
+        rtSet(f, "got", I(0));
+        rtAddrOf(f, "gpp", "got");
+        callWinImport(f, "r", "ReadFile", xs5(L("h"), L("p"), L("k"), L("gpp"), I(0)));
+        rtIf32(f, L("r"), "eq", I(0), "eof");
+        rtOp(f, "r", L("got"), "and", I(4294967295));
+        rtIf(f, L("r"), "eq", I(0), "eof");
+        rtJump(f, "out");
+    }
+    rtLabel(f, "eof");
+    rtSet(f, "r", I(-1));
+    rtLabel(f, "out");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_INT), L("r"));
+    rtRetVoid(f);
+    arityTrap(b, f);
+    toolTrap(b, f, "t0bad", 4010, "stdinRead 第一实参（缓冲）不是 Bytes");
+    toolTrap(b, f, "t1bad", 4010, "stdinRead 第二实参（毫秒）不是 int");
+    toolTrap(b, f, "frozen", 4022, "stdinRead" + FROZEN);
+    rtRetVoid(f);
+    toolCheck(f);
+}
+
+function arityTrap(b: Ref<StructuredBuffer>, f: Ref<RtFn>): void { toolTrap(b, f, "arity", 4010, ARITY); }
+
+// stdoutWrite(data: Bytes): int。控制台按 UTF-16 写出（同 print；非法 UTF-8 原样写字节），其余原样写字节。
+function emitStdoutWrite(b: Ref<StructuredBuffer>, t: int): void {
+    const f = rtBegin(b, "__tx_tool_stdout_write", "win fn pc a bi nargs", "s t o p n r h m mp wn wide off w wp c gp ef", 7, "bootstrap/selfhost/tool_rt.tx");
+    toolArity(f, 1);
+    toolArgSpan(f, 0, TAG_BYTES, "o", "p", "n", "t0bad");
+    rtSet(f, "r", I(0));
+    rtIf(f, L("n"), "le", I(0), "out");
+    if (tUnix(t)) {
+        rtCall3(f, "r", "__tx_tool_wr", I(1), L("p"), L("n"));
+    } else {
+        callWinImport(f, "h", "GetStdHandle", xs1(I(-11)));
+        rtSet(f, "r", I(-1));
+        rtIf(f, L("h"), "eq", I(0), "out");
+        rtIf(f, L("h"), "eq", I(-1), "out");
+        rtSet(f, "m", I(0));
+        rtAddrOf(f, "mp", "m");
+        callWinImport(f, "c", "GetConsoleMode", xs2(L("h"), L("mp")));
+        rtIf32(f, L("c"), "eq", I(0), "raw");
+        rtIf(f, L("n"), "gt", I(268435456), "raw");
+        callWinImport(f, "wn", "MultiByteToWideChar", xs6(I(65001), I(8), L("p"), L("n"), I(0), I(0)));
+        rtIf32(f, L("wn"), "le", I(0), "raw");
+        rtOp(f, "wn", L("wn"), "and", I(4294967295));
+        rtOp(f, "c", L("wn"), "add", L("wn"));
+        rtCall2(f, "wide", "__tx_native_mem_alloc", L("c"), I(2));
+        rtIf(f, L("wide"), "eq", I(0), "raw");
+        callWinImport(f, "", "MultiByteToWideChar", xs6(I(65001), I(8), L("p"), L("n"), L("wide"), L("wn")));
+        rtSet(f, "off", I(0));
+        rtLabel(f, "units");
+        rtIf(f, L("off"), "ge", L("wn"), "written");
+        rtOp(f, "c", L("wn"), "sub", L("off"));
+        rtOp(f, "s", L("off"), "add", L("off"));
+        rtOp(f, "s", L("s"), "add", L("wide"));
+        rtSet(f, "w", I(0));
+        rtAddrOf(f, "wp", "w");
+        callWinImport(f, "t", "WriteConsoleW", xs5(L("h"), L("s"), L("c"), L("wp"), I(0)));
+        rtIf32(f, L("t"), "eq", I(0), "wfail");
+        rtOp(f, "w", L("w"), "and", I(4294967295));
+        rtIf(f, L("w"), "eq", I(0), "wfail");
+        rtOp(f, "off", L("off"), "add", L("w"));
+        rtJump(f, "units");
+        rtLabel(f, "written");
+        rtCall1(f, "", "__tx_native_mem_free", L("wide"));
+        rtSet(f, "r", L("n"));
+        rtJump(f, "out");
+        rtLabel(f, "wfail");
+        rtCall1(f, "", "__tx_native_mem_free", L("wide"));
+        rtSet(f, "r", I(-1));
+        rtJump(f, "out");
+        rtLabel(f, "raw");
+        rtCall3(f, "r", "__tx_tool_wr", L("h"), L("p"), L("n"));
+    }
+    rtLabel(f, "out");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_INT), L("r"));
+    rtRetVoid(f);
+    arityTrap(b, f);
+    toolTrap(b, f, "t0bad", 4010, "stdoutWrite 的实参（数据）不是 Bytes");
+    rtRetVoid(f);
+    toolCheck(f);
+}
+
+// procWrite(h, stream, data): int 与 procRead(h, stream, buf): int。失败（对端已关闭、流尾、系统错误）时关闭父进程这端，
+// 此后同一流恒为 −1。
+function emitProcRw(b: Ref<StructuredBuffer>, write: bool, tryWrite: bool): void {
+    let name = "procRead";
+    let routine = "__tx_tool_proc_read";
+    if (write) { name = "procWrite"; routine = "__tx_tool_proc_write"; }
+    if (tryWrite) { name = "procTryWrite"; routine = "__tx_tool_proc_try_write"; }
+    const f = rtBegin(b, routine, "win fn pc a bi nargs", "s t o p n h st rec fa x r", 5, "bootstrap/selfhost/tool_rt.tx");
+    toolArity(f, 3);
+    toolArgInt(f, 0, "h", "t0bad");
+    toolArgInt(f, 1, "st", "t1bad");
+    toolArgSpan(f, 2, TAG_BYTES, "o", "p", "n", "t2bad");
+    if (!write) { toolFrozen(f, "o", "frozen"); }
+    rtCall2(f, "rec", "__tx_tool_rec", L("win"), L("h"));
+    rtIf(f, L("rec"), "eq", I(0), "badh");
+    if (write) {
+        rtOp(f, "fa", L("rec"), "add", I(R_IN));
+        rtIf(f, L("st"), "eq", I(0), "have");
+        rtOp(f, "fa", L("rec"), "add", I(R_CW));
+        rtIf(f, L("st"), "eq", I(3), "have");
+    } else {
+        let k = 1;
+        while (k <= 3) {
+            rtOp(f, "fa", L("rec"), "add", I(streamField(k)));
+            rtIf(f, L("st"), "eq", I(k), "have");
+            k = k + 1;
+        }
+    }
+    rtJump(f, "badst");
+    rtLabel(f, "have");
+    rtLoad(f, "x", L("fa"), 0, 8);
+    rtSet(f, "r", I(-1));
+    rtIf(f, L("x"), "eq", I(-1), "out");
+    if (tryWrite) { rtCall3(f, "r", "__tx_tool_try_wr", L("x"), L("p"), L("n")); }
+    else if (write) { rtCall3(f, "r", "__tx_tool_wr", L("x"), L("p"), L("n")); }
+    else { rtCall3(f, "r", "__tx_tool_rd", L("x"), L("p"), L("n")); }
+    rtIf(f, L("r"), "ge", I(0), "out");
+    rtCall1(f, "", "__tx_tool_close", L("x"));
+    rtStore(f, L("fa"), 0, I(-1), 8);
+    rtLabel(f, "out");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_INT), L("r"));
+    rtRetVoid(f);
+    arityTrap(b, f);
+    toolTrap(b, f, "t0bad", 4010, name + " 第一实参（句柄）不是 int");
+    toolTrap(b, f, "t1bad", 4010, name + " 第二实参（流号）不是 int");
+    if (write) { toolTrap(b, f, "t2bad", 4010, name + " 第三实参（数据）不是 Bytes"); }
+    else { toolTrap(b, f, "t2bad", 4010, name + " 第三实参（缓冲）不是 Bytes"); }
+    toolTrap(b, f, "badh", 4010, name + BAD_HANDLE);
+    if (write) { toolTrap(b, f, "badst", 4010, name + " 的流号须为 0（stdin）或 3（控制通道）"); }
+    else {
+        toolTrap(b, f, "badst", 4010, name + " 的流号须为 1（stdout）、2（stderr）或 3（控制通道）");
+        toolTrap(b, f, "frozen", 4022, name + FROZEN);
+    }
+    rtRetVoid(f);
+    toolCheck(f);
+}
+
+// ioWait(h, mask, timeoutMs): int。只选位 0 时不查句柄。
+function emitIoWait(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "__tx_tool_io_wait", "win fn pc a bi nargs", "s t h mask ms rec x r", 5, "bootstrap/selfhost/tool_rt.tx");
+    toolArity(f, 3);
+    toolArgInt(f, 0, "h", "t0bad");
+    toolArgInt(f, 1, "mask", "t1bad");
+    toolArgInt(f, 2, "ms", "t2bad");
+    rtIf(f, L("mask"), "lt", I(0), "badmask");
+    rtIf(f, L("mask"), "gt", I(15), "badmask");
+    rtSet(f, "rec", I(0));
+    rtOp(f, "x", L("mask"), "and", I(14));
+    rtIf(f, L("x"), "eq", I(0), "go");
+    rtCall2(f, "rec", "__tx_tool_rec", L("win"), L("h"));
+    rtIf(f, L("rec"), "eq", I(0), "badh");
+    rtLabel(f, "go");
+    rtCall3(f, "r", "__tx_tool_wait", L("rec"), L("mask"), L("ms"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_INT), L("r"));
+    rtRetVoid(f);
+    arityTrap(b, f);
+    toolTrap(b, f, "t0bad", 4010, "ioWait 第一实参（句柄）不是 int");
+    toolTrap(b, f, "t1bad", 4010, "ioWait 第二实参（来源位）不是 int");
+    toolTrap(b, f, "t2bad", 4010, "ioWait 第三实参（毫秒）不是 int");
+    toolTrap(b, f, "badmask", 4010, "ioWait 的来源位须在 0..15（位 0 stdin，位 1–3 子进程的 stdout、stderr、控制通道）");
+    toolTrap(b, f, "badh", 4010, "ioWait" + BAD_HANDLE);
+    rtRetVoid(f);
+    toolCheck(f);
+}
+
+// 公共头：一个 int 实参（句柄）查表到 rec，无效跳 badh。
+function handleHead(f: Ref<RtFn>, count: int): void {
+    toolArity(f, count);
+    toolArgInt(f, 0, "h", "t0bad");
+    rtCall2(f, "rec", "__tx_tool_rec", L("win"), L("h"));
+    rtIf(f, L("rec"), "eq", I(0), "badh");
+}
+
+function handleTraps(b: Ref<StructuredBuffer>, f: Ref<RtFn>, name: string): void {
+    arityTrap(b, f);
+    toolTrap(b, f, "t0bad", 4010, name + " 第一实参（句柄）不是 int");
+    toolTrap(b, f, "badh", 4010, name + BAD_HANDLE);
+}
+
+// __tx_tool_kill_rec(rec)：未回收时强制结束（Windows 退出码 1，Linux SIGKILL）。
+function emitKill(b: Ref<StructuredBuffer>, t: int): void {
+    let f = rtBegin(b, "__tx_tool_kill_rec", "rec", "x gp ef", 2, "bootstrap/selfhost/tool_rt.tx");
+    budgetKill(f, t);
+    rtLoadAcq(f, "x", L("rec"), R_DONE);
+    rtIf(f, L("x"), "ne", I(0), "done");
+    rtLoad(f, "x", L("rec"), R_PROC, 8);
+    if (tUnix(t)) { uxSys(f, t, "", 62, xs2(L("x"), I(9))); } else { callWinImport(f, "", "TerminateProcess", xs2(L("x"), I(1))); }
+    rtLabel(f, "done");
+    rtRetVoid(f);
+    toolCheck(f);
+
+    f = rtBegin(b, "__tx_tool_proc_kill", "win fn pc a bi nargs", "s t h rec", 5, "bootstrap/selfhost/tool_rt.tx");
+    handleHead(f, 1);
+    rtCall1(f, "", "__tx_tool_kill_rec", L("rec"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_NONE), I(0));
+    rtRetVoid(f);
+    handleTraps(b, f, "procKill");
+    rtRetVoid(f);
+    toolCheck(f);
+}
+
+// __tx_tool_reap(rec, ms) → 1 已回收（退出码在表项里）、0 超时。ms 为 −1 一直等。Linux 被信号终止为负的信号号。
+function emitProcWait(b: Ref<StructuredBuffer>, t: int): void {
+    let info = "";
+    let k = 0;
+    while (k < 16) { info = info + " wi" + toStr(k); k = k + 1; }
+    let f = rtBegin(b, "__tx_tool_reap", "rec ms", "x r w code cp st sp start step el rem gp ef group ip" + info, 5, "bootstrap/selfhost/tool_rt.tx");
+    rtLoadAcq(f, "x", L("rec"), R_DONE);
+    rtIf(f, L("x"), "ne", I(0), "yes");
+    rtLoad(f, "x", L("rec"), R_PROC, 8);
+    if (tUnix(t)) {
+        rtCall1(f, "start", "__tx_tool_now", I(0));
+        rtSet(f, "step", I(1));
+        rtLabel(f, "loop");
+        rtSet(f, "st", I(0));
+        rtAddrOf(f, "sp", "st");
+        rtSet(f, "w", I(1));
+        rtIf(f, L("ms"), "ge", I(0), "call");
+        rtSet(f, "w", I(0));
+        rtLabel(f, "call");
+        rtLoad(f, "group", L("rec"), R_JOB, 8);
+        rtIf(f, L("group"), "eq", I(0), "wait4");
+        // WNOWAIT 保留主进程的 zombie，进程组清理发生在 PID 仍归此子进程所有时。
+        k = 0;
+        while (k < 16) { rtSet(f, "wi" + toStr(k), I(0)); k = k + 1; }
+        rtAddrOf(f, "ip", "wi0");
+        rtOp(f, "group", L("w"), "or", I(uxConst(t, "WEXITED") | uxConst(t, "WNOWAIT")));
+        // waitid(P_PID, pid, &info, options)；Linux 的第五个实参（rusage）为 0，macOS 的 libc 函数只取前四个。
+        uxSys(f, t, "r", 247, xs5(I(1), L("x"), L("ip"), L("group"), I(0)));
+        rtIf(f, L("r"), "eq", I(-4), "loop");
+        rtIf(f, L("r"), "eq", I(0 - uxErrno(t, "ECHILD")), "lost");
+        rtIf(f, L("r"), "lt", I(0), "nopeek");
+        rtLoad(f, "group", L("ip"), uxConst(t, "SI_PID"), 4);
+        rtIf(f, L("group"), "eq", I(0), "notready");
+        rtIf(f, L("group"), "ne", L("x"), "lost");
+        rtOp(f, "group", I(0), "sub", L("x"));
+        uxSys(f, t, "", 62, xs2(L("group"), I(9)));
+        rtStore(f, L("rec"), R_JOB, I(0), 8);
+        rtLabel(f, "wait4");
+        uxSys(f, t, "r", 61, xs4(L("x"), L("sp"), L("w"), I(0)));
+        rtIf(f, L("r"), "eq", I(-4), "loop");
+        rtIf(f, L("r"), "gt", I(0), "exited");
+        rtIf(f, L("r"), "lt", I(0), "lost");
+        rtLabel(f, "notready");
+        rtIf(f, L("ms"), "eq", I(0), "no");
+        rtCall1(f, "el", "__tx_tool_now", I(0));
+        rtOp(f, "el", L("el"), "sub", L("start"));
+        rtIf(f, L("el"), "ge", L("ms"), "no");
+        rtOp(f, "rem", L("ms"), "sub", L("el"));
+        rtSet(f, "w", L("step"));
+        rtIf(f, L("w"), "le", L("rem"), "nap");
+        rtSet(f, "w", L("rem"));
+        rtLabel(f, "nap");
+        rtCall1(f, "", "__tx_tool_sleep", L("w"));
+        rtOp(f, "step", L("step"), "add", L("step"));
+        rtIf(f, L("step"), "le", I(10), "loop");
+        rtSet(f, "step", I(10));
+        rtJump(f, "loop");
+        // waitid 不可用（如沙箱里的 ENOSYS）：没法不回收地查看，改用 wait4，回收主进程后立即按组补杀。主进程的 PID 在
+        // 这两次系统调用之间被别的进程取得并自建同号进程组的窗口极小；放过组内存活后代则是确定的失败放行。
+        rtLabel(f, "nopeek");
+        uxSys(f, t, "r", 61, xs4(L("x"), L("sp"), L("w"), I(0)));
+        rtIf(f, L("r"), "eq", I(-4), "loop");
+        rtIf(f, L("r"), "lt", I(0), "lost");
+        rtIf(f, L("r"), "eq", I(0), "notready");
+        rtOp(f, "group", I(0), "sub", L("x"));
+        uxSys(f, t, "", 62, xs2(L("group"), I(9)));
+        rtStore(f, L("rec"), R_JOB, I(0), 8);
+        rtLabel(f, "exited");
+        rtOp(f, "st", L("st"), "and", I(4294967295));
+        rtOp(f, "w", L("st"), "and", I(127));
+        rtIf(f, L("w"), "eq", I(0), "normal");
+        rtSet(f, "code", I(0));
+        rtOp(f, "code", L("code"), "sub", L("w"));
+        rtJump(f, "store");
+        rtLabel(f, "normal");
+        rtShift(f, "code", L("st"), "shr", 8);
+        rtOp(f, "code", L("code"), "and", I(255));
+        rtJump(f, "store");
+        // 子进程已被别处回收（不应发生）：PID 可能已复用，不能再按组清理。记为 LOST_CODE（不与“被信号终止”的
+        // −1..−64 相撞），不再等待；调用方据此知道组内后代未确认清理。
+        rtLabel(f, "lost");
+        rtStore(f, L("rec"), R_JOB, I(0), 8);
+        rtSet(f, "code", I(LOST_CODE));
+    } else {
+        rtSet(f, "w", L("ms"));
+        rtIf(f, L("w"), "ge", I(0), "bounded");
+        rtSet(f, "w", I(4294967295));
+        rtJump(f, "wait");
+        rtLabel(f, "bounded");
+        rtIf(f, L("w"), "le", I(4294967294), "wait");
+        rtSet(f, "w", I(4294967294));
+        rtLabel(f, "wait");
+        callWinImport(f, "r", "WaitForSingleObject", xs2(L("x"), L("w")));
+        rtIf32(f, L("r"), "ne", I(0), "no");
+        rtSet(f, "code", I(0));
+        rtAddrOf(f, "cp", "code");
+        callWinImport(f, "", "GetExitCodeProcess", xs2(L("x"), L("cp")));
+        rtOp(f, "code", L("code"), "and", I(4294967295));
+    }
+    rtLabel(f, "store");
+    rtStore(f, L("rec"), R_CODE, L("code"), 8);
+    rtStoreRel(f, L("rec"), R_DONE, I(1));
+    rtLabel(f, "yes");
+    rtRet(f, I(1));
+    rtLabel(f, "no");
+    rtRet(f, I(0));
+    toolCheck(f);
+
+    f = rtBegin(b, "__tx_tool_proc_wait", "win fn pc a bi nargs", "s t h ms rec r x", 5, "bootstrap/selfhost/tool_rt.tx");
+    handleHead(f, 2);
+    toolArgInt(f, 1, "ms", "t1bad");
+    rtCall2(f, "r", "__tx_tool_reap", L("rec"), L("ms"));
+    rtIf(f, L("r"), "eq", I(0), "none");
+    rtLoad(f, "x", L("rec"), R_CODE, 8);
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_INT), L("x"));
+    rtRetVoid(f);
+    rtLabel(f, "none");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_NONE), I(0));
+    rtRetVoid(f);
+    handleTraps(b, f, "procWait");
+    toolTrap(b, f, "t1bad", 4010, "procWait 第二实参（毫秒）不是 int");
+    rtRetVoid(f);
+    toolCheck(f);
+}
+
+// procClose(h)：未回收时先结束并回收，再关闭进程句柄与全部管道，释放表项（状态归 0，句柄随即失效）。
+function emitProcClose(b: Ref<StructuredBuffer>, t: int): void {
+    const f = rtBegin(b, "__tx_tool_proc_close", "win fn pc a bi nargs", "s t h rec x gp ef", 5, "bootstrap/selfhost/tool_rt.tx");
+    handleHead(f, 1);
+    rtCall1(f, "", "__tx_tool_kill_rec", L("rec"));
+    rtCall2(f, "", "__tx_tool_reap", L("rec"), I(-1));
+    if (tWindows(t)) {
+        rtLoad(f, "x", L("rec"), R_PROC, 8);
+        callWinImport(f, "", "CloseHandle", xs1(L("x")));
+        budgetCloseWindows(f);
+    }
+    rtStore(f, L("rec"), R_JOB, I(0), 8);
+    const fields: List<int> = listNew();
+    listPush(fields, R_IN); listPush(fields, R_OUT); listPush(fields, R_ERR); listPush(fields, R_CW); listPush(fields, R_CR);
+    let k = 0;
+    while (k < listLen(fields)) {
+        const off = listGet(fields, k) catch R_IN;
+        rtLoad(f, "x", L("rec"), off, 8);
+        rtCall1(f, "", "__tx_tool_close", L("x"));
+        rtStore(f, L("rec"), off, I(-1), 8);
+        k = k + 1;
+    }
+    rtStoreRel(f, L("rec"), R_STATE, I(0));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_NONE), I(0));
+    rtRetVoid(f);
+    handleTraps(b, f, "procClose");
+    rtRetVoid(f);
+    toolCheck(f);
+}

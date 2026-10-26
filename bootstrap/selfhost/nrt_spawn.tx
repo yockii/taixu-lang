@@ -1,0 +1,605 @@
+// NRT 线程的创建、启动、join 与结束（线程第 2 步，docs/design/v052-threads-v0.1-20261015.md §十 第 2 步、
+// §十三、§十四）。threadSpawn(f) 建一页进程级的线程记录，由新线程在自己的线程区域里建启动对象（与主线程
+// 同序、逐项核对）、跑全部模块初始化、调用 f、跑完本线程的就绪任务，把标量结果写进记录，然后归还本线程的
+// 堆与区域。句柄 Thread<T> 是 Obj72 kind 13、payload kind 10，ptr@32 指向记录，值 tag 19（仅 NRT）。
+//
+// 记录（一页，初值全零）：引用数@0（句柄与线程各一份，原子增减；后放手的一方归还记录）、函数号@8、
+// 状态@16（0 运行中 1 已结束 2 创建失败）、结果值的两个字@24/@32、系统句柄@40（Windows 线程句柄、
+// pthread_t）、clone 的线程号@48（CLONE_PARENT_SETTID／CHILD_CLEARTID 写入，线程退出时由内核清零并
+// 唤醒 futex）、已 join@56、clone 栈的基址@64、Linux 线程的 TLS 区@72（槽）/@80（自指的线程控制块，
+// 线程指针＝记录＋80）、形态@88（0 Windows 1 clone 2 pthread）、参数转移块@512、结果转移块@520（第 3 步，
+// 闭包与堆引用结果经 nrt_send.tx 深拷贝；记录归还时一并归还未取走的块）。
+//
+// 平台形态（§五-5、§十一-5）：Windows CreateThread（8 MiB 保留）；Linux 静态产物 clone（自己 mmap 8 MiB
+// 栈并在低端留 64 KiB PROT_NONE 保护页）；Linux 动态产物（进程里有 libc）pthread_create（栈 8 MiB，经
+// 驱动登记的动态钩子槽取得函数地址；槽为 0 即静态产物，走 clone）。
+//
+// 进程级的存活线程数 __tx_thread_live：创建时加一、线程结束时减一；main 返回后等它归零再退出（§十三-4）。
+// 句柄被释放时线程照常运行到结束（§十三-5）。线程里 trap 经进程级致命锁终止整个进程（§四-2）。
+import { Operand, StructuredBuffer, asBufferLabel, asBufferZero, asBufferInstruction, asBufferBoundaryBegin, asBufferFunctionEnd, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem } from "./assemble";
+import { RtFn, RtOp, L, I, A, G, GAcq } from "./rtfn_base";
+import { rtBegin, rtSet, rtSetGlobal, rtSetRbx, rtOp, rtShift, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtIf32, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtCall5, rtCall6, rtCallC, rtSyscall, rtAtomicAdd, rtRet, rtRetVoid } from "./rtfn";
+import { a64Emit, a64B, a64Mem, a64MovImm } from "./a64_asm";
+import { a64AddSubImm, a64LdStPair, a64BranchReg } from "./a64_encode";
+import { check, text, arity, argTag, trapText, trapAt, ARITY, nrtTarget } from "./nrt_base";
+import { tSysV, tRawSyscall, tKernel32, tUnix, tMacos } from "./target";
+import { uxSys, uxMac, uxMapFlags } from "./unix_sys";
+import { TB_REGION, TB_RESERVATION, TB_MEM_PAGES, TB_BIG_CACHE, TB_BIG_LIST, PTHREAD_HOOKS } from "./thread_block_abi";
+
+const TAG_THREAD: int = 19;
+const REC_REFS: int = 0;
+const REC_FN: int = 8;
+const REC_STATE: int = 16;
+const REC_RTAG: int = 24;
+const REC_RVAL: int = 32;
+// 新线程没能建起自己的区域时的结果标签（值标签都是非负小数）：threadJoin 据此得“线程创建失败”。
+const RTAG_NOSTART: int = -1;
+const REC_OS: int = 40;
+const REC_CTID: int = 48;
+const REC_JOINED: int = 56;
+const REC_STACK: int = 64;
+const REC_TCB: int = 80;
+const REC_MODE: int = 88;
+// 第 3 步（发送，§十八）：f 是闭包时的参数转移块@512、堆引用结果的转移块@520（远离 Linux 线程控制块附近的偏移）。
+const REC_ARGBLK: int = 512;
+const REC_RBLK: int = 520;
+const REC_BYTES: int = 4096;
+const ST_DONE: int = 1;
+const ST_FAILED: int = 2;
+const MODE_CLONE: int = 1;
+const MODE_PTHREAD: int = 2;
+const STACK_BYTES: int = 8388608;
+const GUARD_BYTES: int = 65536;
+// CLONE_VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|SETTLS|PARENT_SETTID|CHILD_CLEARTID
+const CLONE_FLAGS: int = 4001536;
+// MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE|MAP_STACK
+const STACK_MAP: int = 147490;
+
+export function nrtSpawnExports(): string {
+    let out = "__tx_bi_thread_spawn __tx_bi_thread_join";
+    if (tRawSyscall(nrtTarget())) {
+        const hs = strSplit(PTHREAD_HOOKS, " ");
+        let k = 0;
+        while (k < listLen(hs)) { out = out + " __tx_libc_" + (listGet(hs, k) catch ""); k = k + 1; }
+    }
+    return out;
+}
+
+/// 进程级 .bss：存活线程数；Linux 的 pthread 钩子槽。
+export function nrtSpawnBss(b: Ref<StructuredBuffer>): void {
+    asBufferLabel(b, "__tx_thread_live", 1); asBufferZero(b, 8, 1);
+    if (tRawSyscall(nrtTarget())) {
+        const hs = strSplit(PTHREAD_HOOKS, " ");
+        let k = 0;
+        while (k < listLen(hs)) { asBufferLabel(b, "__tx_libc_" + (listGet(hs, k) catch ""), 1); asBufferZero(b, 8, 1); k = k + 1; }
+    }
+}
+
+function ins(b: Ref<StructuredBuffer>, mn: string, n: int, a: Ref<Operand>, c: Ref<Operand>): void {
+    asBufferInstruction(b, mn, n, a, c, asStructuredMissing(), 1);
+}
+function r64(n: int): Ref<Operand> { return asStructuredReg(0, n); }
+function r32(n: int): Ref<Operand> { return asStructuredReg(1, n); }
+function none(): Ref<Operand> { return asStructuredMissing(); }
+function callTo(b: Ref<StructuredBuffer>, name: string): void { ins(b, "call", 1, asStructuredTarget(name), none()); }
+
+// A64（macOS 适配 M4 设计 A5、A7）：原子加用 rtfn（LDADDAL）。线程入口是 pthread 以 C 约定调用的外壳：x0＝记录（同私有
+// 约定的第一个实参），存帧记录与 x19（__tx_thread_main 把它设为本线程的值槽窗口，C 约定要求被调方保存）后调用，返回 NULL。
+function stubsA64(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "__tx_atomic_add", "p d", "old", 0, "bootstrap/selfhost/nrt_spawn.tx");
+    rtAtomicAdd(f, "old", L("p"), 0, L("d"));
+    rtRet(f, L("old")); check(f);
+    asBufferBoundaryBegin(b, "bootstrap/selfhost/nrt_spawn.tx", "__tx_thread_entry", "thread-entry");
+    asBufferLabel(b, "__tx_thread_entry", 1);
+    a64Emit(b, a64LdStPair(2, 0, 0, 29, 30, 31, -32, 3), "stp x29, x30, [sp, #-32]!");
+    a64Emit(b, a64AddSubImm(1, 0, 0, 29, 31, 0, 0), "mov x29, sp");
+    a64Mem(b, 3, 0, 19, 31, 16);
+    a64B(b, 1, "__tx_thread_main");
+    a64Mem(b, 3, 1, 19, 31, 16);
+    a64Emit(b, a64LdStPair(2, 0, 1, 29, 30, 31, 32, 1), "ldp x29, x30, [sp], #32");
+    a64MovImm(b, 0, 0);
+    a64Emit(b, a64BranchReg(2, 30), "ret");
+    asBufferFunctionEnd(b);
+}
+
+function sysArgs(a: Ref<RtOp>, c: Ref<RtOp>): List<Ref<RtOp>> {
+    const xs: List<Ref<RtOp>> = listNew(); listPush(xs, a); listPush(xs, c); return xs;
+}
+
+/// 手写的入口与原语：原子加、线程入口蹦床、clone、自解映射退出。
+function emitStubs(b: Ref<StructuredBuffer>, t: int): void {
+    if (b.a64) { stubsA64(b); return; }
+    // __tx_atomic_add(p, d) → 旧值（lock xadd，全屏障）。
+    asBufferLabel(b, "__tx_atomic_add", 1);
+    ins(b, "mov", 2, r64(0), r64(2));
+    ins(b, "lockxadd", 2, asStructuredMem(2, 1, -1, 0, 0, 0, ""), r64(0));
+    ins(b, "ret", 0, none(), none());
+    // 线程入口：系统以平台 ABI 调用（Windows rcx＝记录；SysV rdi＝记录），保存 rbx 后转入
+    // __tx_thread_main（私有约定 rcx＝记录），返回 0。入口 rsp≡8，push 后 sub 32 使调用点 16 对齐。
+    asBufferBoundaryBegin(b, "bootstrap/selfhost/nrt_spawn.tx", "__tx_thread_entry", "thread-entry");
+    asBufferLabel(b, "__tx_thread_entry", 1);
+    ins(b, "push", 1, r64(3), none());
+    if (tSysV(t)) { ins(b, "mov", 2, r64(1), r64(7)); }
+    ins(b, "sub", 2, r64(4), asStructuredImm(32));
+    callTo(b, "__tx_thread_main");
+    ins(b, "add", 2, r64(4), asStructuredImm(32));
+    ins(b, "pop", 1, r64(3), none());
+    ins(b, "xor", 2, r32(0), r32(0));
+    ins(b, "ret", 0, none(), none());
+    asBufferFunctionEnd(b);
+    if (!tRawSyscall(t)) { return; }
+    // __tx_thread_clone(flags, top, ptid, ctid, tls) → 子线程号或 −errno（父线程）。子线程在新栈上
+    // 从 syscall 之后继续：[rsp]＝记录（父线程预先写好），调用 __tx_thread_main，它以 exit 结束、不返回。
+    asBufferBoundaryBegin(b, "bootstrap/selfhost/nrt_spawn.tx", "__tx_thread_clone", "stack-transition");
+    asBufferLabel(b, "__tx_thread_clone", 1);
+    ins(b, "mov", 2, r64(7), r64(1));
+    ins(b, "mov", 2, r64(6), r64(2));
+    ins(b, "mov", 2, r64(2), r64(8));
+    ins(b, "mov", 2, r64(10), r64(9));
+    ins(b, "mov", 2, r64(8), asStructuredMem(2, 4, -1, 0, 40, 0, ""));
+    ins(b, "mov", 2, r32(0), asStructuredImm(56));
+    asBufferInstruction(b, "syscall", 0, none(), none(), none(), 1);
+    ins(b, "test", 2, r64(0), r64(0));
+    ins(b, "je", 1, asStructuredTarget("__tx_thread_clone_child"), none());
+    ins(b, "ret", 0, none(), none());
+    asBufferLabel(b, "__tx_thread_clone_child", 1);
+    ins(b, "xor", 2, r32(5), r32(5));
+    ins(b, "mov", 2, r64(1), asStructuredMem(2, 4, -1, 0, 0, 0, ""));
+    ins(b, "sub", 2, r64(4), asStructuredImm(32));
+    callTo(b, "__tx_thread_main");
+    asBufferInstruction(b, "ud2", 0, none(), none(), none(), 1);
+    asBufferFunctionEnd(b);
+    // __tx_thread_unmap_exit(base, size)：归还自己正在用的栈后立即以 exit 结束本线程——munmap 之后
+    // 只用寄存器、不再碰栈。
+    asBufferBoundaryBegin(b, "bootstrap/selfhost/nrt_spawn.tx", "__tx_thread_unmap_exit", "stack-disposal");
+    asBufferLabel(b, "__tx_thread_unmap_exit", 1);
+    ins(b, "mov", 2, r64(7), r64(1));
+    ins(b, "mov", 2, r64(6), r64(2));
+    ins(b, "mov", 2, r32(0), asStructuredImm(11));
+    asBufferInstruction(b, "syscall", 0, none(), none(), none(), 1);
+    ins(b, "xor", 2, r32(7), r32(7));
+    ins(b, "mov", 2, r32(0), asStructuredImm(60));
+    asBufferInstruction(b, "syscall", 0, none(), none(), none(), 1);
+    asBufferInstruction(b, "ud2", 0, none(), none(), none(), 1);
+    asBufferFunctionEnd(b);
+}
+
+/// 归还一段映射：Windows VirtualFree(p, 0, MEM_RELEASE)；Linux munmap(p, n)。
+function unmap(f: Ref<RtFn>, p: Ref<RtOp>, n: Ref<RtOp>): void {
+    if (tUnix(nrtTarget())) { uxSys(f, nrtTarget(), "", 11, sysArgs(p, n)); }
+    else { rtCall3(f, "", "VirtualFree", p, I(0), I(32768)); }
+}
+
+/// 调 pthread 函数，结果 int 存入 r。Linux 动态产物：SysV 调钩子槽（hook 槽在局部 fp）；macOS：经 libSystem 的蹦床
+/// （unix_sys.tx，蹦床保存私有约定的被调方保存寄存器）。
+function pthreadCall(f: Ref<RtFn>, r: string, hook: string, args: List<Ref<RtOp>>): void {
+    if (tMacos(nrtTarget())) { uxMac(f, r, hook, args); return; }
+    rtSet(f, "fp", G("__tx_libc_" + hook));
+    const cls: List<int> = listNew();
+    let k = 0;
+    while (k < listLen(args)) { listPush(cls, 0); k = k + 1; }
+    rtCallC(f, r, "", "fp", args, cls, tSysV(nrtTarget()));
+}
+
+function oneArg(a: Ref<RtOp>): List<Ref<RtOp>> { const xs: List<Ref<RtOp>> = listNew(); listPush(xs, a); return xs; }
+
+/// 线程运行时（代码段）。
+export function emitNrtSpawn(b: Ref<StructuredBuffer>): void {
+    const t = nrtTarget();
+    emitStubs(b, t);
+
+    // __tx_thread_rec_new() → 一页全零的记录；失败为 0。__tx_thread_rec_free(rec)。
+    let f = rtBegin(b, "__tx_thread_rec_new", "", "p", 6, "bootstrap/selfhost/nrt_spawn.tx");
+    if (tUnix(t)) {
+        const xs: List<Ref<RtOp>> = listNew();
+        listPush(xs, I(0)); listPush(xs, I(REC_BYTES)); listPush(xs, I(3)); listPush(xs, I(uxMapFlags(t, 34))); listPush(xs, I(-1)); listPush(xs, I(0));
+        uxSys(f, t, "p", 9, xs);
+        rtIf(f, L("p"), "uge", I(-4095), "fail");
+    } else {
+        rtCall4(f, "p", "VirtualAlloc", I(0), I(REC_BYTES), I(12288), I(4));
+    }
+    rtRet(f, L("p"));
+    rtLabel(f, "fail"); rtRet(f, I(0));
+    check(f);
+    f = rtBegin(b, "__tx_thread_rec_free", "rec", "x", 4, "bootstrap/selfhost/nrt_spawn.tx");
+    rtLoad(f, "x", L("rec"), REC_ARGBLK, 8); rtCall1(f, "", "__tx_xblk_free", L("x"));
+    rtLoad(f, "x", L("rec"), REC_RBLK, 8); rtCall1(f, "", "__tx_xblk_free", L("x"));
+    unmap(f, L("rec"), I(REC_BYTES));
+    rtRetVoid(f); check(f);
+
+    // __tx_thread_os_start(rec) → 0 成功，非 0 失败（记录未交给任何线程）。
+    f = rtBegin(b, "__tx_thread_os_start", "rec", "h st top ct tl fp a0 a1 a2 a3 a4 a5 a6 a7 ap", 6, "bootstrap/selfhost/nrt_spawn.tx");
+    if (tUnix(t)) {
+        // macOS 总经 pthread；Linux 只有动态产物登记了 pthread 钩子，否则走 clone。
+        if (tRawSyscall(t)) {
+            rtSet(f, "fp", G("__tx_libc_pthread_create"));
+            rtIf(f, L("fp"), "eq", I(0), "clone");
+        }
+        // pthread：属性只设栈大小（8 MiB，与主线程的本机栈界限余量一致）；pthread_attr_t 用 a0..a7。
+        rtAddrOf(f, "ap", "a0");
+        pthreadCall(f, "h", "pthread_attr_init", oneArg(L("ap")));
+        rtIf32(f, L("h"), "ne", I(0), "fail");
+        pthreadCall(f, "h", "pthread_attr_setstacksize", sysArgs(L("ap"), I(STACK_BYTES)));
+        rtIf32(f, L("h"), "ne", I(0), "attrfail");
+        rtStore(f, L("rec"), REC_MODE, I(MODE_PTHREAD), 8);
+        rtOp(f, "ct", L("rec"), "add", I(REC_OS));
+        const xs: List<Ref<RtOp>> = listNew(); listPush(xs, L("ct")); listPush(xs, L("ap")); listPush(xs, A("__tx_thread_entry")); listPush(xs, L("rec"));
+        pthreadCall(f, "st", "pthread_create", xs);
+        pthreadCall(f, "", "pthread_attr_destroy", oneArg(L("ap")));
+        rtIf32(f, L("st"), "ne", I(0), "fail");
+        rtRet(f, I(0));
+        rtLabel(f, "attrfail");
+        pthreadCall(f, "", "pthread_attr_destroy", oneArg(L("ap")));
+        rtJump(f, "fail");
+    }
+    if (tRawSyscall(t)) {
+        // clone：栈＝保护页＋8 MiB；栈顶下 16 字节处放记录（子线程从那里取）。
+        rtLabel(f, "clone");
+        const ms: List<Ref<RtOp>> = listNew();
+        listPush(ms, I(0)); listPush(ms, I(STACK_BYTES + GUARD_BYTES)); listPush(ms, I(3)); listPush(ms, I(STACK_MAP)); listPush(ms, I(-1)); listPush(ms, I(0));
+        rtSyscall(f, "st", 9, ms);
+        rtIf(f, L("st"), "uge", I(-4095), "fail");
+        const ps: List<Ref<RtOp>> = listNew(); listPush(ps, L("st")); listPush(ps, I(GUARD_BYTES)); listPush(ps, I(0));
+        rtSyscall(f, "h", 10, ps);
+        rtIf(f, L("h"), "ne", I(0), "unstack");
+        rtStore(f, L("rec"), REC_STACK, L("st"), 8);
+        rtStore(f, L("rec"), REC_MODE, I(MODE_CLONE), 8);
+        rtOp(f, "top", L("st"), "add", I(STACK_BYTES + GUARD_BYTES - 16));
+        rtStore(f, L("top"), 0, L("rec"), 8);
+        rtOp(f, "ct", L("rec"), "add", I(REC_CTID));
+        rtOp(f, "tl", L("rec"), "add", I(REC_TCB));
+        rtCall5(f, "h", "__tx_thread_clone", I(CLONE_FLAGS), L("top"), L("ct"), L("ct"), L("tl"));
+        rtIf(f, L("h"), "lt", I(0), "unstack");
+        rtRet(f, I(0));
+        rtLabel(f, "unstack");
+        unmap(f, L("st"), I(STACK_BYTES + GUARD_BYTES));
+    } else if (tKernel32(t)) {
+        // CreateThread(0, 8 MiB, 入口, 记录, STACK_SIZE_PARAM_IS_A_RESERVATION, 0)。
+        rtCall6(f, "h", "CreateThread", I(0), I(STACK_BYTES), A("__tx_thread_entry"), L("rec"), I(65536), I(0));
+        rtIf(f, L("h"), "eq", I(0), "fail");
+        rtStore(f, L("rec"), REC_OS, L("h"), 8);
+        rtRet(f, I(0));
+    }
+    rtLabel(f, "fail"); rtRet(f, I(1));
+    check(f);
+
+    // __tx_thread_heap_free()：归还本线程的整个堆——小块页链（[0] 下一页、[8] 页长）、活着的大块链
+    // （[8] 下一块、[16] 总长）与大块缓存（[0] 项数，[16+16i] 基址、[24+16i] 页长）。之后本线程不能再分配。
+    f = rtBegin(b, "__tx_thread_heap_free", "", "t p nx n i e", 4, "bootstrap/selfhost/nrt_spawn.tx");
+    rtSet(f, "t", A("__tx_nrt_tb"));
+    rtLoad(f, "p", L("t"), TB_MEM_PAGES, 8);
+    rtLabel(f, "pages");
+    rtIf(f, L("p"), "eq", I(0), "bigs");
+    rtLoad(f, "nx", L("p"), 0, 8); rtLoad(f, "n", L("p"), 8, 8);
+    unmap(f, L("p"), L("n"));
+    rtSet(f, "p", L("nx")); rtJump(f, "pages");
+    rtLabel(f, "bigs");
+    rtLoad(f, "p", L("t"), TB_BIG_LIST, 8);
+    rtLabel(f, "big");
+    rtIf(f, L("p"), "eq", I(0), "cache");
+    rtLoad(f, "nx", L("p"), 8, 8); rtLoad(f, "n", L("p"), 16, 8);
+    unmap(f, L("p"), L("n"));
+    rtSet(f, "p", L("nx")); rtJump(f, "big");
+    rtLabel(f, "cache");
+    rtOp(f, "e", L("t"), "add", I(TB_BIG_CACHE));
+    rtLoad(f, "n", L("e"), 0, 8);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "cached");
+    rtIf(f, L("i"), "uge", L("n"), "done");
+    rtOp(f, "p", L("i"), "imul", I(16)); rtOp(f, "p", L("p"), "add", L("e"));
+    rtLoad(f, "nx", L("p"), 24, 8); rtLoad(f, "p", L("p"), 16, 8);
+    unmap(f, L("p"), L("nx"));
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "cached");
+    rtLabel(f, "done");
+    rtStore(f, L("t"), TB_MEM_PAGES, I(0), 8); rtStore(f, L("t"), TB_BIG_LIST, I(0), 8); rtStore(f, L("e"), 0, I(0), 8);
+    rtRetVoid(f); check(f);
+
+    // __tx_thread_drop_live()：线程结束、整堆归还之前，本线程槽表里仍活着的 Thread 句柄（模块级变量或由它
+    // 可达的对象持有，不会经释放路径归零）逐个放手——否则对应线程的记录与系统资源（Windows 线程句柄、未分离
+    // 的 pthread、clone 栈）要留到进程结束。共享块的计数同理（第 4c 步）：活着的 Shared 句柄（kind 14）与借用
+    // 载荷的对象（对象头位 32）各放掉一份。空闲槽的 payload kind 已被毒化，不会误认。
+    f = rtBegin(b, "__tx_thread_drop_live", "", "p n i o k", 2, "bootstrap/selfhost/nrt_spawn.tx");
+    rtSet(f, "p", G("__tx_nrt_slots")); rtLoad(f, "n", L("p"), 16, 8);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "scan");
+    rtIf(f, L("i"), "uge", L("n"), "done");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("i"));
+    rtLoad(f, "k", L("o"), 16, 4);
+    rtIf(f, L("k"), "eq", I(11), "shared");
+    rtIf(f, L("k"), "ugt", I(12), "next");
+    rtIf(f, L("k"), "ne", I(10), "borrowed");
+    rtLoad(f, "k", L("o"), 12, 4); rtIf(f, L("k"), "ne", I(13), "next");
+    rtLoad(f, "k", L("o"), 32, 8);
+    rtCall1(f, "", "__tx_thread_drop", L("k"));
+    rtJump(f, "next");
+    rtLabel(f, "shared");
+    rtLoad(f, "k", L("o"), 12, 4); rtIf(f, L("k"), "ne", I(14), "next");
+    rtLoad(f, "k", L("o"), 32, 8);
+    rtCall1(f, "", "__tx_shared_release", L("k"));
+    rtJump(f, "next");
+    rtLabel(f, "borrowed");
+    rtLoad(f, "k", L("o"), 0, 4); rtOp(f, "k", L("k"), "and", I(32)); rtIf(f, L("k"), "eq", I(0), "next");
+    rtLoad(f, "k", L("o"), 64, 8);
+    rtCall1(f, "", "__tx_shared_release", L("k"));
+    rtLabel(f, "next");
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "scan");
+    rtLabel(f, "done");
+    rtRetVoid(f); check(f);
+
+    // __tx_thread_main(rec)：线程体。rbx 此时无意义，建好本线程的区域之前不访问线程块。
+    f = rtBegin(b, "__tx_thread_main", "rec", "tb win tag v t res ct cp", 5, "bootstrap/selfhost/nrt_spawn.tx");
+    rtCall0(f, "tb", "__tx_nrt_region_new");
+    rtIf(f, L("tb"), "eq", I(0), "noregion");
+    rtSetRbx(f, L("tb"));
+    rtCall0(f, "", "__tx_nrt_thread_bind");
+    rtCall1(f, "", "__tx_nrt_thread_state", I(0));
+    rtCall0(f, "", "__tx_nrt_module_inits");
+    // 与 main 相同：入口窗口在值槽栈底，函数返回后跑完本线程的就绪任务（任务窗口从结果槽之后开始）。
+    rtSetGlobal(f, "__tx_task_main", I(1));
+    rtSetGlobal(f, "__tx_nrt_entry_win", G("__tx_nrt_stack"));
+    rtLoad(f, "t", L("rec"), REC_ARGBLK, 8);
+    rtIf(f, L("t"), "ne", I(0), "closure");
+    rtLoad(f, "t", L("rec"), REC_FN, 8);
+    rtCall1(f, "", "__tx_nrt_call_fn", L("t"));
+    rtJump(f, "ran");
+    // 闭包：在本线程物化（块随即归还），环境引用移交给入口窗口的 R0。
+    rtLabel(f, "closure");
+    rtStore(f, L("rec"), REC_ARGBLK, I(0), 8);
+    rtAddrOf(f, "v", "ct");
+    rtCall3(f, "", "__tx_recv_value", L("t"), L("v"), I(0));
+    rtCall1(f, "", "__tx_nrt_call_closure", L("cp"));
+    rtLabel(f, "ran");
+    rtCall0(f, "", "__tx_task_pump");
+    rtSet(f, "win", G("__tx_nrt_entry_win"));
+    rtLoad(f, "tag", L("win"), 0, 8); rtLoad(f, "v", L("win"), 8, 8);
+    // 标量照写进记录；堆引用的结果发送进转移块（本线程的堆随后整体归还，§十八）。
+    rtOp(f, "t", L("tag"), "and", I(255)); rtOp(f, "t", L("t"), "add", A("__tx_is_heapref")); rtLoad(f, "t", L("t"), 0, 1);
+    rtIf(f, L("t"), "eq", I(0), "scalar");
+    rtCall2(f, "t", "__tx_send_value", L("win"), I(0));
+    rtIf(f, L("t"), "ult", I(16), "unsend");
+    rtStore(f, L("rec"), REC_RBLK, L("t"), 8);
+    rtJump(f, "stored");
+    rtLabel(f, "scalar");
+    rtStore(f, L("rec"), REC_RTAG, L("tag"), 8); rtStore(f, L("rec"), REC_RVAL, L("v"), 8);
+    rtLabel(f, "stored");
+    // 泄漏检查（开启时）：放开结果槽与本线程的模块级变量后扫描本线程的对象表（nrt_leak.tx）。
+    rtCall0(f, "", "__tx_leak_thread");
+    rtCall0(f, "", "__tx_thread_drop_live");
+    rtCall0(f, "", "__tx_thread_heap_free");
+    rtSet(f, "t", A("__tx_nrt_tb")); rtLoad(f, "res", L("t"), TB_RESERVATION, 8);
+    rtCall1(f, "", "__tx_tls_tb_set", I(0));
+    // 归还区域（线程块与值槽栈）。此后不再访问线程块。
+    if (tUnix(t)) { uxSys(f, t, "", 11, sysArgs(L("tb"), I(TB_REGION))); }
+    else { rtCall3(f, "", "VirtualFree", L("res"), I(0), I(32768)); }
+    rtCall1(f, "", "__tx_thread_finish", L("rec"));
+    rtRetVoid(f);
+    // 结果含不可发送的成分（§十八）：trap 4021，位置记在线程函数的开头（结果发送时已没有调用点）。
+    rtLabel(f, "unsend");
+    rtLoad(f, "v", L("rec"), REC_FN, 8);
+    rtIf(f, L("t"), "eq", I(2), "unsend2");
+    rtCall5(f, "", "__tx_trap", L("v"), I(0), I(4021), A(text(b, "线程函数的结果含 Weak、Future、Gen、Thread 或 Atomic（经函数值或接口值带入）")), I(len("线程函数的结果含 Weak、Future、Gen、Thread 或 Atomic（经函数值或接口值带入）")));
+    rtLabel(f, "unsend2");
+    rtCall5(f, "", "__tx_trap", L("v"), I(0), I(4021), A(text(b, "线程函数的结果含不可发送的函数值或接口值（其捕获或具体类型含 Weak、Future、Gen、Thread、Atomic 或平台句柄）")), I(len("线程函数的结果含不可发送的函数值或接口值（其捕获或具体类型含 Weak、Future、Gen、Thread、Atomic 或平台句柄）")));
+    rtRetVoid(f);
+    rtLabel(f, "noregion");
+    // 新线程的区域（线程块＋值槽栈）分配失败：线程没跑起来，按附录 A 同系统层的创建失败——threadJoin 得错误值，不让
+    // 整个进程退出（原为内部错误 70）。结果标签记 RTAG_NOSTART，照常结束线程；这里没有线程块，结束只动记录与进程级
+    // 内存（参数转移块随记录释放）。
+    rtStore(f, L("rec"), REC_RTAG, I(RTAG_NOSTART), 8);
+    rtCall1(f, "", "__tx_thread_finish", L("rec"));
+    rtRetVoid(f); check(f);
+
+    // __tx_nrt_call_closure(h)：以闭包环境 h（Ref；调用方已持一份引用，移交给窗口）为 R0，在值槽栈底调用闭包体。
+    f = rtBegin(b, "__tx_nrt_call_closure", "h", "o x e fp reg win", 2, "bootstrap/selfhost/nrt_spawn.tx");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("h"));
+    rtLoad(f, "x", L("o"), 32, 8); rtLoad(f, "x", L("x"), 8, 4);
+    rtShift(f, "e", L("x"), "shl", 4); rtOp(f, "e", L("e"), "add", G("__tx_rt_table_ptr"));
+    rtLoad(f, "fp", L("e"), 0, 8); rtLoad(f, "reg", L("e"), 8, 4);
+    rtSet(f, "win", G("__tx_nrt_stack"));
+    rtCall2(f, "", "__tx_nrt_window", L("win"), L("reg"));
+    rtStore(f, L("win"), 0, I(9), 8); rtStore(f, L("win"), 8, L("h"), 8);
+    rtCall1(f, "", "*fp", L("win"));
+    rtRetVoid(f); check(f);
+
+    // __tx_thread_finish(rec)：线程的最后一步（不访问线程块）。先读形态再放手：放手之后记录可能已被句柄
+    // 一方归还。最后放手的线程归还记录；clone 线程还要归还自己的栈（先 set_tid_address(0)，免得内核在
+    // 线程退出时往已归还的记录里写线程号），然后以 exit 结束。
+    f = rtBegin(b, "__tx_thread_finish", "rec", "mode st old", 4, "bootstrap/selfhost/nrt_spawn.tx");
+    rtStore(f, L("rec"), REC_STATE, I(ST_DONE), 8);
+    rtLoad(f, "mode", L("rec"), REC_MODE, 8);
+    rtLoad(f, "st", L("rec"), REC_STACK, 8);
+    rtCall2(f, "", "__tx_atomic_add", A("__tx_thread_live"), I(-1));
+    rtCall2(f, "old", "__tx_atomic_add", L("rec"), I(-1));
+    rtIf(f, L("old"), "ne", I(1), "keep");
+    if (tRawSyscall(t)) {
+        rtIf(f, L("mode"), "eq", I(MODE_CLONE), "ownstack");
+        rtCall1(f, "", "__tx_thread_rec_free", L("rec"));
+        rtRetVoid(f);
+        rtLabel(f, "ownstack");
+        rtSyscall(f, "", 218, oneArg(I(0)));
+        rtCall1(f, "", "__tx_thread_rec_free", L("rec"));
+        rtCall2(f, "", "__tx_thread_unmap_exit", L("st"), I(STACK_BYTES + GUARD_BYTES));
+    } else {
+        rtCall1(f, "", "__tx_thread_rec_free", L("rec"));
+        rtRetVoid(f);
+    }
+    rtLabel(f, "keep");
+    if (tRawSyscall(t)) {
+        rtIf(f, L("mode"), "ne", I(MODE_CLONE), "out");
+        rtSyscall(f, "", 60, oneArg(I(0)));
+        rtLabel(f, "out");
+    }
+    rtRetVoid(f); check(f);
+
+    // __tx_thread_os_wait(rec)：等线程在系统层面结束（clone：等内核把线程号清零）。
+    f = rtBegin(b, "__tx_thread_os_wait", "rec", "mode h v p fp", 4, "bootstrap/selfhost/nrt_spawn.tx");
+    rtLoad(f, "mode", L("rec"), REC_MODE, 8);
+    rtLoad(f, "h", L("rec"), REC_OS, 8);
+    if (tRawSyscall(t)) {
+        rtIf(f, L("mode"), "eq", I(MODE_PTHREAD), "pthread");
+        rtOp(f, "p", L("rec"), "add", I(REC_CTID));
+        rtLabel(f, "wait");
+        rtLoad(f, "v", L("p"), 0, 4);
+        rtIf(f, L("v"), "eq", I(0), "done");
+        // futex(&ctid, FUTEX_WAIT, v, NULL)：值已变则立即返回，再读一次。
+        const fs: List<Ref<RtOp>> = listNew(); listPush(fs, L("p")); listPush(fs, I(0)); listPush(fs, L("v")); listPush(fs, I(0)); listPush(fs, I(0)); listPush(fs, I(0));
+        rtSyscall(f, "", 202, fs);
+        rtJump(f, "wait");
+        rtLabel(f, "pthread");
+        pthreadCall(f, "", "pthread_join", sysArgs(L("h"), I(0)));
+        rtLabel(f, "done");
+    } else if (tMacos(t)) {
+        pthreadCall(f, "", "pthread_join", sysArgs(L("h"), I(0)));
+    } else {
+        rtCall2(f, "", "WaitForSingleObject", L("h"), I(4294967295));
+        rtCall1(f, "", "CloseHandle", L("h"));
+        rtStore(f, L("rec"), REC_OS, I(0), 8);
+    }
+    rtRetVoid(f); check(f);
+
+    // __tx_thread_drop(rec)：句柄归零（__tx_rc_zero_cascade 调用）。未 join 的线程照常运行到结束（§十三-5）：
+    // Windows 关闭线程句柄，pthread 分离；引用数放手，句柄一方最后放手时线程已结束，归还记录（clone 先等
+    // 内核清零线程号再归还栈）。
+    f = rtBegin(b, "__tx_thread_drop", "rec", "st h j old fp", 4, "bootstrap/selfhost/nrt_spawn.tx");
+    rtLoad(f, "st", L("rec"), REC_STATE, 8);
+    rtIf(f, L("st"), "eq", I(ST_FAILED), "free");
+    rtLoad(f, "h", L("rec"), REC_OS, 8);
+    rtLoad(f, "j", L("rec"), REC_JOINED, 8);
+    if (tRawSyscall(t)) {
+        rtLoad(f, "st", L("rec"), REC_MODE, 8);
+        rtIf(f, L("st"), "ne", I(MODE_PTHREAD), "release");
+        rtIf(f, L("j"), "ne", I(0), "release");
+        pthreadCall(f, "", "pthread_detach", oneArg(L("h")));
+    } else if (tMacos(t)) {
+        // 只有 pthread 模式：未 join 的线程分离，照常运行到结束（§十三-5）。
+        rtIf(f, L("j"), "ne", I(0), "release");
+        pthreadCall(f, "", "pthread_detach", oneArg(L("h")));
+    } else {
+        rtIf(f, L("h"), "eq", I(0), "release");
+        rtCall1(f, "", "CloseHandle", L("h"));
+        rtStore(f, L("rec"), REC_OS, I(0), 8);
+    }
+    rtLabel(f, "release");
+    rtCall2(f, "old", "__tx_atomic_add", L("rec"), I(-1));
+    rtIf(f, L("old"), "ne", I(1), "out");
+    if (tRawSyscall(t)) {
+        rtLoad(f, "st", L("rec"), REC_MODE, 8);
+        rtIf(f, L("st"), "ne", I(MODE_CLONE), "free");
+        rtCall1(f, "", "__tx_thread_os_wait", L("rec"));
+        rtLoad(f, "h", L("rec"), REC_STACK, 8);
+        unmap(f, L("h"), I(STACK_BYTES + GUARD_BYTES));
+    }
+    rtLabel(f, "free");
+    rtCall1(f, "", "__tx_thread_rec_free", L("rec"));
+    rtLabel(f, "out");
+    rtRetVoid(f); check(f);
+
+    // __tx_thread_wait_all()：main 返回后等全部线程结束（§十三-4；1 ms 轮询，没有线程时只读一次计数）。
+    f = rtBegin(b, "__tx_thread_wait_all", "", "t0 t1 p", 4, "bootstrap/selfhost/nrt_spawn.tx");
+    rtLabel(f, "poll");
+    rtIf(f, GAcq("__tx_thread_live"), "eq", I(0), "done");
+    if (tUnix(t)) {
+        rtSet(f, "t0", I(0)); rtSet(f, "t1", I(1000000)); rtAddrOf(f, "p", "t0");
+        uxSys(f, t, "", 35, sysArgs(L("p"), I(0)));
+    } else {
+        rtCall1(f, "", "Sleep", I(1));
+    }
+    rtJump(f, "poll");
+    rtLabel(f, "done");
+    rtRetVoid(f); check(f);
+
+    // threadSpawn(f): Thread<T> — f 为函数值（tag 12）或闭包（tag 9，捕获发送进新线程）；前端只收无参、
+    // 结果可发送的函数（§十八）。创建失败不 trap：句柄照常返回，join 时得到错误值。
+    f = rtBegin(b, "__tx_bi_thread_spawn", "win fn pc a nargs", "s t fi rec r blk s0 s1 s2 s3 s4 s5 s6 s7 sp", 5, "bootstrap/selfhost/nrt_spawn.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", -1, "type");
+    rtSet(f, "blk", I(0));
+    rtIf(f, L("t"), "eq", I(9), "closure");
+    rtIf(f, L("t"), "ne", I(12), "type");
+    rtLoad(f, "fi", L("s"), 8, 4);
+    rtIf(f, L("fi"), "uge", G("__tx_rt_table_len"), "type");
+    rtJump(f, "record");
+    // 闭包（Ref → 环境，值 0 为闭包体函数）：连同捕获发送进转移块，新线程物化后调用（§十八）。
+    rtLabel(f, "closure");
+    rtLoad(f, "r", L("s"), 8, 4);
+    rtCall1(f, "r", "__tx_native_object_address_v1", L("r"));
+    rtLoad(f, "fi", L("r"), 16, 4); rtIf(f, L("fi"), "ne", I(1), "type");
+    rtLoad(f, "fi", L("r"), 40, 8); rtIf(f, L("fi"), "lt", I(2), "type");
+    rtLoad(f, "r", L("r"), 32, 8); rtLoad(f, "fi", L("r"), 0, 1); rtIf(f, L("fi"), "ne", I(12), "type");
+    rtLoad(f, "fi", L("r"), 8, 4); rtIf(f, L("fi"), "uge", G("__tx_rt_table_len"), "type");
+    rtCall2(f, "blk", "__tx_send_value", L("s"), I(0));
+    rtIf(f, L("blk"), "ult", I(16), "unsend");
+    rtLabel(f, "record");
+    rtCall0(f, "rec", "__tx_thread_rec_new");
+    rtIf(f, L("rec"), "eq", I(0), "oom");
+    rtStore(f, L("rec"), REC_REFS, I(2), 8);
+    rtStore(f, L("rec"), REC_FN, L("fi"), 8);
+    rtStore(f, L("rec"), REC_ARGBLK, L("blk"), 8);
+    if (tRawSyscall(t)) { rtOp(f, "r", L("rec"), "add", I(REC_TCB)); rtStore(f, L("rec"), REC_TCB, L("r"), 8); }
+    rtCall2(f, "", "__tx_atomic_add", A("__tx_thread_live"), I(1));
+    rtCall1(f, "r", "__tx_thread_os_start", L("rec"));
+    rtIf(f, L("r"), "eq", I(0), "make");
+    rtStore(f, L("rec"), REC_STATE, I(ST_FAILED), 8);
+    rtStore(f, L("rec"), REC_REFS, I(1), 8);
+    rtCall2(f, "", "__tx_atomic_add", A("__tx_thread_live"), I(-1));
+    rtLabel(f, "make");
+    rtSet(f, "s0", I(13)); rtSet(f, "s1", I(42949672960)); rtSet(f, "s2", L("rec")); rtSet(f, "s3", I(0));
+    rtSet(f, "s4", I(0)); rtSet(f, "s5", I(0)); rtSet(f, "s6", I(4)); rtSet(f, "s7", I(0));
+    rtAddrOf(f, "sp", "s0");
+    rtCall1(f, "s0", "__tx_native_object_create_v1", L("sp"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_THREAD), L("s0"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "threadSpawn 的实参不是函数");
+    rtLabel(f, "unsend");
+    rtIf(f, L("blk"), "eq", I(2), "unsend2");
+    trapText(b, f, 4021, "threadSpawn 的函数捕获了 Weak、Future、Gen、Thread 或 Atomic（经函数值或接口值带入）");
+    trapAt(b, f, "unsend2", 4021, "threadSpawn 的函数捕获了不可发送的函数值或接口值（其捕获或具体类型含 Weak、Future、Gen、Thread、Atomic 或平台句柄）");
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRetVoid(f); check(f);
+
+    // threadJoin(t): T | Error — 等线程结束，取回它的结果；同一线程第二次 join、或线程创建失败时得到错误值。
+    const again = "线程已经 join 过（每个线程只能 join 一次）";
+    const failed = "线程创建失败（系统资源不足）";
+    const againL = text(b, again);
+    const failedL = text(b, failed);
+    f = rtBegin(b, "__tx_bi_thread_join", "win fn pc a nargs", "s t h o rec ct cp", 5, "bootstrap/selfhost/nrt_spawn.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", TAG_THREAD, "type");
+    rtLoad(f, "h", L("s"), 8, 4);
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("h"));
+    rtLoad(f, "t", L("o"), 16, 4);
+    rtIf(f, L("t"), "ne", I(10), "type");
+    rtLoad(f, "rec", L("o"), 32, 8);
+    rtLoad(f, "t", L("rec"), REC_JOINED, 8);
+    rtIf(f, L("t"), "ne", I(0), "again");
+    rtStore(f, L("rec"), REC_JOINED, I(1), 8);
+    rtLoad(f, "t", L("rec"), REC_STATE, 8);
+    rtIf(f, L("t"), "eq", I(ST_FAILED), "failed");
+    rtCall1(f, "", "__tx_thread_os_wait", L("rec"));
+    rtLoad(f, "t", L("rec"), REC_RTAG, 8);
+    rtIf(f, L("t"), "eq", I(RTAG_NOSTART), "failed");
+    rtLoad(f, "t", L("rec"), REC_RBLK, 8);
+    rtIf(f, L("t"), "ne", I(0), "block");
+    rtLoad(f, "t", L("rec"), REC_RTAG, 8); rtLoad(f, "h", L("rec"), REC_RVAL, 8);
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), L("t"), L("h"));
+    rtRetVoid(f);
+    // 堆引用的结果：在本线程物化（块随即归还）。
+    rtLabel(f, "block");
+    rtStore(f, L("rec"), REC_RBLK, I(0), 8);
+    rtAddrOf(f, "h", "ct");
+    rtCall3(f, "", "__tx_recv_value", L("t"), L("h"), I(0));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), L("ct"), L("cp"));
+    rtRetVoid(f);
+    rtLabel(f, "again");
+    rtCall3(f, "o", "__tx_nrt_str_copy", A(againL), I(len(again)), I(2));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(5), L("o"));
+    rtRetVoid(f);
+    rtLabel(f, "failed");
+    rtCall3(f, "o", "__tx_nrt_str_copy", A(failedL), I(len(failed)), I(2));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(5), L("o"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "threadJoin 的实参不是 Thread");
+    rtRetVoid(f); check(f);
+}

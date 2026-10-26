@@ -1,0 +1,220 @@
+// 紧凑列表（O4 第二步，定宽数值第二步实施设计 §三-4）：form 3，元素按 1/2/4 字节存放，elem 存定宽种类码
+// （1 i8、2 i16、3 i32、4 u8、5 u16、6 u32、10 f32）。描述符同 List ABI v1：ptr@0 len@8 cap@16 form@24 elem@28，
+// cap 按元素个数计。读出时按种类符号扩展或零扩展成 int 载荷（f32 扩成 f64），写入时值已由 sema 保证在范围内，
+// 只核对标签（整数 1、f32 2）后截取低位；紧凑列表不转为通用形态。入口约定同 list_elements/list_backing：
+// rcx＝描述符，rdx＝下标或值指针，r8＝值指针；失败返回 0。
+import { Operand, StructuredBuffer, asBufferInstruction, asBufferLabel, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem } from "./assemble";
+import { TB_MASK, TB_SLOTS } from "./thread_block_abi";
+import { OBJ_FLAG_FROZEN } from "./store_abi";
+import { tSysV } from "./target";
+function r(n: int): Ref<Operand> { return asStructuredReg(0, n); }
+function d(n: int): Ref<Operand> { return asStructuredReg(1, n); }
+function x0(): Ref<Operand> { return asStructuredReg(3, 0); }
+function i(n: int): Ref<Operand> { return asStructuredImm(n); }
+function m(n: int, off: int): Ref<Operand> { return asStructuredMem(2, n, -1, 0, off, 0, ""); }
+function md(n: int, off: int): Ref<Operand> { return asStructuredMem(1, n, -1, 0, off, 0, ""); }
+function mb(n: int): Ref<Operand> { return asStructuredMem(0, n, -1, 0, 0, 0, ""); }
+function mw(n: int): Ref<Operand> { return asStructuredMem(3, n, -1, 0, 0, 0, ""); }
+function op(b: Ref<StructuredBuffer>, name: string, n: int, a: Ref<Operand>, c: Ref<Operand>): void { asBufferInstruction(b, name, n, a, c, asStructuredMissing(), 1); }
+function two(b: Ref<StructuredBuffer>, name: string, a: Ref<Operand>, c: Ref<Operand>): void { op(b, name, 2, a, c); }
+function mov(b: Ref<StructuredBuffer>, a: Ref<Operand>, c: Ref<Operand>): void { two(b, "mov", a, c); }
+function lab(b: Ref<StructuredBuffer>, name: string): void { asBufferLabel(b, name, 1); }
+function jump(b: Ref<StructuredBuffer>, cond: string, name: string): void { op(b, cond, 1, asStructuredTarget(name), asStructuredMissing()); }
+function call(b: Ref<StructuredBuffer>, name: string): void { jump(b, "call", name); }
+function ret(b: Ref<StructuredBuffer>): void { op(b, "ret", 0, asStructuredMissing(), asStructuredMissing()); }
+
+export const LIST_FORM_COMPACT: int = 3;
+
+// 入口分派：rcx 非空且 form 为 3 时转紧凑例程，否则落到原例程（原例程自己处理空描述符）。
+export function listCompactJump(b: Ref<StructuredBuffer>, skip: string, target: string): void {
+    two(b, "test", r(1), r(1)); jump(b, "jz", skip);
+    two(b, "cmp", md(1, 24), i(LIST_FORM_COMPACT)); jump(b, "je", target);
+    lab(b, skip);
+}
+
+// r10d＝种类 → r11＝元素宽度；种类非法跳 bad。
+function kindWidth(b: Ref<StructuredBuffer>, p: string, bad: string): void {
+    mov(b, r(11), i(1)); two(b, "cmp", d(10), i(1)); jump(b, "je", p + "_wok"); two(b, "cmp", d(10), i(4)); jump(b, "je", p + "_wok");
+    mov(b, r(11), i(2)); two(b, "cmp", d(10), i(2)); jump(b, "je", p + "_wok"); two(b, "cmp", d(10), i(5)); jump(b, "je", p + "_wok");
+    mov(b, r(11), i(4)); two(b, "cmp", d(10), i(3)); jump(b, "je", p + "_wok"); two(b, "cmp", d(10), i(6)); jump(b, "je", p + "_wok");
+    two(b, "cmp", d(10), i(10)); jump(b, "je", p + "_wok"); jump(b, "jmp", bad);
+    lab(b, p + "_wok");
+}
+
+// 描述符核对（form 3、len ≤ cap、种类合法）后按下标定址：rax＝元素地址，r10d＝种类，r11＝宽度。
+function element(b: Ref<StructuredBuffer>, p: string, bad: string): void {
+    two(b, "test", r(1), r(1)); jump(b, "jz", bad);
+    two(b, "cmp", md(1, 24), i(LIST_FORM_COMPACT)); jump(b, "jne", bad);
+    mov(b, r(0), m(1, 8)); two(b, "cmp", r(0), m(1, 16)); jump(b, "ja", bad);
+    two(b, "cmp", r(2), r(0)); jump(b, "jae", bad);
+    two(b, "cmp", m(1, 0), i(0)); jump(b, "je", bad);
+    mov(b, d(10), md(1, 28)); kindWidth(b, p, bad);
+    mov(b, r(0), r(2)); two(b, "imul", r(0), r(11)); two(b, "add", r(0), m(1, 0));
+}
+
+// rdx ← [rax] 的 r11 字节（零扩展的原始位）。
+function loadRaw(b: Ref<StructuredBuffer>, p: string): void {
+    two(b, "cmp", r(11), i(1)); jump(b, "jne", p + "_l2"); two(b, "movzx", d(2), mb(0)); jump(b, "jmp", p + "_ld");
+    lab(b, p + "_l2"); two(b, "cmp", r(11), i(2)); jump(b, "jne", p + "_l4"); two(b, "movzx", d(2), mw(0)); jump(b, "jmp", p + "_ld");
+    lab(b, p + "_l4"); mov(b, d(2), md(0, 0));
+    lab(b, p + "_ld");
+}
+
+// [rax] 的 r11 字节 ← rdx 的低位。
+function storeRaw(b: Ref<StructuredBuffer>, p: string, base: int): void {
+    two(b, "cmp", r(11), i(1)); jump(b, "jne", p + "_s2"); mov(b, mb(base), asStructuredReg(2, 2)); jump(b, "jmp", p + "_sd");
+    lab(b, p + "_s2"); two(b, "cmp", r(11), i(2)); jump(b, "jne", p + "_s4"); mov(b, mw(base), d(2)); jump(b, "jmp", p + "_sd");
+    lab(b, p + "_s4"); mov(b, md(base, 0), d(2));
+    lab(b, p + "_sd");
+}
+
+// 原始位 rdx → 值：r9＝标签（整数 1、f32 2），rdx＝载荷（按种类符号扩展；f32 扩成 f64 位）。
+function toValue(b: Ref<StructuredBuffer>, p: string): void {
+    mov(b, r(9), i(1));
+    two(b, "cmp", d(10), i(1)); jump(b, "jne", p + "_v2"); two(b, "shl", r(2), i(56)); two(b, "sar", r(2), i(56)); jump(b, "jmp", p + "_vd");
+    lab(b, p + "_v2"); two(b, "cmp", d(10), i(2)); jump(b, "jne", p + "_v3"); two(b, "shl", r(2), i(48)); two(b, "sar", r(2), i(48)); jump(b, "jmp", p + "_vd");
+    lab(b, p + "_v3"); two(b, "cmp", d(10), i(3)); jump(b, "jne", p + "_vf"); two(b, "shl", r(2), i(32)); two(b, "sar", r(2), i(32)); jump(b, "jmp", p + "_vd");
+    lab(b, p + "_vf"); two(b, "cmp", d(10), i(10)); jump(b, "jne", p + "_vd");
+    two(b, "movq", x0(), r(2)); two(b, "cvtss2sd", x0(), x0()); two(b, "movq", r(2), x0()); mov(b, r(9), i(2));
+    lab(b, p + "_vd");
+}
+
+// 值（r8 指向）→ 原始位 rdx：标签须为整数（f32 须为 2），不符跳 bad；f32 舍入为单精度位（值本就可精确表示）。
+function fromValue(b: Ref<StructuredBuffer>, p: string, bad: string): void {
+    mov(b, r(9), m(8, 0)); two(b, "and", d(9), i(255)); mov(b, r(2), m(8, 8));
+    two(b, "cmp", d(10), i(10)); jump(b, "je", p + "_ff");
+    two(b, "cmp", d(9), i(1)); jump(b, "jne", bad); jump(b, "jmp", p + "_fd");
+    lab(b, p + "_ff"); two(b, "cmp", d(9), i(2)); jump(b, "jne", bad);
+    two(b, "movq", x0(), r(2)); two(b, "cvtsd2ss", x0(), x0()); two(b, "movq", r(2), x0());
+    lab(b, p + "_fd");
+}
+
+export function listCompactEmit(b: Ref<StructuredBuffer>, t: int): void {
+    let copy = "memcpy"; if (tSysV(t)) { copy = "__tx_linux_memcpy"; }
+
+    // 读：rcx＝描述符，rdx＝下标，r8＝输出值；返回 3。
+    let p = "__tx_lc_get";
+    lab(b, "__tx_native_list_cget_v1"); two(b, "test", r(8), r(8)); jump(b, "jz", p + "_bad");
+    element(b, p, p + "_bad"); loadRaw(b, p); toValue(b, p);
+    mov(b, m(8, 0), r(9)); mov(b, m(8, 8), r(2)); mov(b, r(0), i(LIST_FORM_COMPACT)); ret(b);
+    lab(b, p + "_bad"); mov(b, r(0), i(0)); ret(b);
+
+    // 移除：取出元素写入 r8，其后的字节前移一个元素宽度，len 减一；返回 3。
+    p = "__tx_lc_remove";
+    lab(b, "__tx_native_list_cremove_v1"); two(b, "test", r(8), r(8)); jump(b, "jz", p + "_bad");
+    element(b, p, p + "_bad"); loadRaw(b, p); toValue(b, p);
+    mov(b, m(8, 0), r(9)); mov(b, m(8, 8), r(2));
+    mov(b, r(9), m(1, 8)); two(b, "imul", r(9), r(11)); two(b, "add", r(9), m(1, 0));
+    mov(b, r(10), r(0)); two(b, "add", r(10), r(11));
+    lab(b, p + "_loop"); two(b, "cmp", r(10), r(9)); jump(b, "jae", p + "_done");
+    two(b, "movzx", d(2), mb(10)); mov(b, mb(0), asStructuredReg(2, 2));
+    two(b, "add", r(0), i(1)); two(b, "add", r(10), i(1)); jump(b, "jmp", p + "_loop");
+    lab(b, p + "_done"); mov(b, r(0), m(1, 8)); two(b, "sub", r(0), i(1)); mov(b, m(1, 8), r(0));
+    mov(b, r(0), i(LIST_FORM_COMPACT)); ret(b);
+    lab(b, p + "_bad"); mov(b, r(0), i(0)); ret(b);
+
+    // 原位写：rcx＝描述符，rdx＝下标，r8＝新值；返回 2（同原始形态“已原位写入”，调用方不走通用槽）。
+    p = "__tx_lc_set";
+    lab(b, "__tx_native_list_cset_v1"); two(b, "test", r(8), r(8)); jump(b, "jz", p + "_bad");
+    element(b, p, p + "_bad"); fromValue(b, p, p + "_bad"); storeRaw(b, p, 0);
+    mov(b, r(0), i(2)); ret(b);
+    lab(b, p + "_bad"); mov(b, r(0), i(0)); ret(b);
+
+    // 追加：rcx＝描述符，rdx＝值；容量不足时按倍增（至少 8 个元素）另分配、拷贝、释放旧块；返回 1。
+    // 帧 72（入口 rsp≡8，调用时对齐 16）：描述符@32 宽度@40 原始位@48 新容量@56 新块@64。
+    p = "__tx_lc_append";
+    lab(b, "__tx_native_list_cappend_v1"); two(b, "sub", r(4), i(72)); mov(b, m(4, 32), r(1));
+    two(b, "test", r(1), r(1)); jump(b, "jz", p + "_fail");
+    two(b, "test", r(2), r(2)); jump(b, "jz", p + "_fail");
+    two(b, "cmp", md(1, 24), i(LIST_FORM_COMPACT)); jump(b, "jne", p + "_fail");
+    mov(b, d(10), md(1, 28)); kindWidth(b, p, p + "_fail"); mov(b, m(4, 40), r(11));
+    mov(b, r(8), r(2)); fromValue(b, p, p + "_fail"); mov(b, m(4, 48), r(2));
+    mov(b, r(1), m(4, 32)); mov(b, r(0), m(1, 8)); two(b, "cmp", r(0), m(1, 16)); jump(b, "ja", p + "_fail"); jump(b, "jb", p + "_store");
+    mov(b, r(0), m(1, 16)); two(b, "movabs", r(9), i(288230376151711744)); two(b, "cmp", r(0), r(9)); jump(b, "jae", p + "_fail");
+    two(b, "shl", r(0), i(1)); two(b, "cmp", r(0), i(8)); jump(b, "jae", p + "_cap"); mov(b, r(0), i(8));
+    lab(b, p + "_cap"); mov(b, m(4, 56), r(0)); two(b, "imul", r(0), m(4, 40));
+    mov(b, r(1), r(0)); mov(b, r(2), i(8)); call(b, "__tx_native_mem_alloc");
+    two(b, "test", r(0), r(0)); jump(b, "jz", p + "_fail"); mov(b, m(4, 64), r(0));
+    mov(b, r(9), m(4, 32)); mov(b, r(8), m(9, 8)); two(b, "imul", r(8), m(4, 40)); two(b, "test", r(8), r(8)); jump(b, "jz", p + "_nocopy");
+    mov(b, r(1), r(0)); mov(b, r(2), m(9, 0)); call(b, copy);
+    lab(b, p + "_nocopy"); mov(b, r(9), m(4, 32)); two(b, "cmp", m(9, 16), i(0)); jump(b, "je", p + "_nofree");
+    mov(b, r(1), m(9, 0)); call(b, "__tx_native_mem_free");
+    lab(b, p + "_nofree"); mov(b, r(9), m(4, 32)); mov(b, r(0), m(4, 64)); mov(b, m(9, 0), r(0)); mov(b, r(0), m(4, 56)); mov(b, m(9, 16), r(0));
+    lab(b, p + "_store"); mov(b, r(1), m(4, 32)); mov(b, r(0), m(1, 8)); two(b, "imul", r(0), m(4, 40)); two(b, "add", r(0), m(1, 0));
+    mov(b, r(11), m(4, 40)); mov(b, r(2), m(4, 48)); storeRaw(b, p, 0);
+    mov(b, r(0), m(1, 8)); two(b, "add", r(0), i(1)); mov(b, m(1, 8), r(0));
+    mov(b, r(0), i(1)); two(b, "add", r(4), i(72)); ret(b);
+    lab(b, p + "_fail"); mov(b, r(0), i(0)); two(b, "add", r(4), i(72)); ret(b);
+
+    // 插入：rcx＝描述符，rdx＝下标（≤ len），r8＝值；先追加到末尾，再把 [下标, 末尾) 的字节后移一个元素宽度、
+    // 新元素写到下标处；返回 1。帧 56：描述符@32 下标@40 原始位@48。
+    p = "__tx_lc_insert";
+    lab(b, "__tx_native_list_cinsert_v1"); two(b, "test", r(1), r(1)); jump(b, "jz", p + "_bad");
+    two(b, "cmp", r(2), m(1, 8)); jump(b, "ja", p + "_bad");
+    two(b, "sub", r(4), i(56)); mov(b, m(4, 32), r(1)); mov(b, m(4, 40), r(2));
+    mov(b, r(2), r(8)); call(b, "__tx_native_list_cappend_v1");
+    two(b, "test", r(0), r(0)); jump(b, "jz", p + "_return");
+    mov(b, r(1), m(4, 32)); mov(b, d(10), md(1, 28)); kindWidth(b, p, p + "_broken");
+    mov(b, r(0), m(1, 8)); two(b, "sub", r(0), i(1)); two(b, "imul", r(0), r(11)); two(b, "add", r(0), m(1, 0));
+    loadRaw(b, p); mov(b, m(4, 48), r(2));
+    mov(b, r(8), m(4, 40)); two(b, "imul", r(8), r(11)); two(b, "add", r(8), m(1, 0));
+    mov(b, r(9), r(0)); two(b, "sub", r(9), i(1));
+    lab(b, p + "_loop"); two(b, "cmp", r(9), r(8)); jump(b, "jb", p + "_place");
+    two(b, "movzx", d(2), mb(9)); mov(b, r(10), r(9)); two(b, "add", r(10), r(11)); mov(b, mb(10), asStructuredReg(2, 2));
+    two(b, "sub", r(9), i(1)); jump(b, "jmp", p + "_loop");
+    lab(b, p + "_place"); mov(b, r(0), r(8)); mov(b, r(2), m(4, 48)); storeRaw(b, p, 0);
+    mov(b, r(0), i(1)); jump(b, "jmp", p + "_return");
+    lab(b, p + "_broken"); mov(b, r(0), i(0));
+    lab(b, p + "_return"); two(b, "add", r(4), i(56)); ret(b);
+    lab(b, p + "_bad"); mov(b, r(0), i(0)); ret(b);
+
+    // 字节数（发送与接收用）：rcx＝种类，rdx＝元素个数 → rax＝个数×宽度；种类非法或个数 ≥ 2^61（运行时加固 H2：
+    // 宽度 ≤ 4，乘积因而不溢出）得 −1。
+    p = "__tx_lc_bytes";
+    lab(b, "__tx_lc_bytes"); mov(b, d(10), d(1)); kindWidth(b, p, p + "_bad");
+    mov(b, r(0), r(2)); two(b, "shr", r(0), i(61)); jump(b, "jne", p + "_bad");
+    mov(b, r(0), r(2)); two(b, "imul", r(0), r(11)); ret(b);
+    lab(b, p + "_bad"); mov(b, r(0), i(-1)); ret(b);
+}
+
+// 紧凑列表的内联叶子例程（NRT；O4 第二步 2c1b）：发射器对 codegen 发出的 callbi 71/72/73 直调，不经 __tx_callbi。
+// ecx＝列表对象下标（rbx 在本线程的值窗里，按线程块的槽表求对象地址）。非紧凑、越界、冻结等一律返回“走通用路”，
+// 由内建给出同一结果或同一 trap。只用 rax、rcx、rdx、r8..r11、xmm0。
+function objAddr(b: Ref<StructuredBuffer>): void {
+    mov(b, d(0), d(1)); mov(b, r(11), r(0)); two(b, "shl", r(11), i(3)); two(b, "shl", r(0), i(6)); two(b, "add", r(0), r(11));
+    mov(b, r(10), r(3)); two(b, "and", r(10), i(TB_MASK)); mov(b, r(10), m(10, TB_SLOTS)); two(b, "add", r(0), m(10, 48));
+}
+export function listCompactLeafEmit(b: Ref<StructuredBuffer>): void {
+    // 读：ecx＝对象下标，rdx＝下标 → rax＝载荷，r8＝标签（1 整数、2 f32）；r8＝0 表示走通用路。
+    let p = "__tx_lcl_get";
+    lab(b, "__tx_list_cget1"); objAddr(b);
+    two(b, "cmp", md(0, 16), i(7)); jump(b, "jne", p + "_slow");
+    two(b, "cmp", md(0, 28), i(LIST_FORM_COMPACT)); jump(b, "jne", p + "_slow");
+    two(b, "cmp", r(2), m(0, 40)); jump(b, "jae", p + "_slow");
+    mov(b, d(10), md(0, 24)); kindWidth(b, p, p + "_slow");
+    mov(b, r(9), r(2)); two(b, "imul", r(9), r(11)); two(b, "add", r(9), m(0, 32)); mov(b, r(0), r(9));
+    loadRaw(b, p); toValue(b, p);
+    mov(b, r(0), r(2)); mov(b, r(8), r(9)); ret(b);
+    lab(b, p + "_slow"); mov(b, r(8), i(0)); ret(b);
+
+    // 原位写：ecx＝对象下标，rdx＝下标，r8＝值 → eax＝1 已写，0 走通用路（冻结、越界、标签不符）。
+    p = "__tx_lcl_set";
+    lab(b, "__tx_list_cset1"); objAddr(b);
+    mov(b, d(10), md(0, 0)); two(b, "and", d(10), i(OBJ_FLAG_FROZEN)); jump(b, "jne", p + "_slow");
+    two(b, "cmp", md(0, 16), i(7)); jump(b, "jne", p + "_slow");
+    two(b, "cmp", md(0, 28), i(LIST_FORM_COMPACT)); jump(b, "jne", p + "_slow");
+    two(b, "cmp", r(2), m(0, 40)); jump(b, "jae", p + "_slow");
+    mov(b, d(10), md(0, 24)); kindWidth(b, p, p + "_slow");
+    mov(b, r(1), r(2)); fromValue(b, p, p + "_slow");
+    mov(b, r(9), r(1)); two(b, "imul", r(9), r(11)); two(b, "add", r(9), m(0, 32)); mov(b, r(0), r(9));
+    storeRaw(b, p, 0);
+    mov(b, r(0), i(1)); ret(b);
+    lab(b, p + "_slow"); mov(b, r(0), i(0)); ret(b);
+
+    // 长度：ecx＝对象下标 → rax＝长度；不是列表得 −1。
+    p = "__tx_lcl_len";
+    lab(b, "__tx_list_clen1"); objAddr(b);
+    two(b, "cmp", md(0, 16), i(7)); jump(b, "jne", p + "_slow");
+    mov(b, r(0), m(0, 40)); ret(b);
+    lab(b, p + "_slow"); mov(b, r(0), i(-1)); ret(b);
+}

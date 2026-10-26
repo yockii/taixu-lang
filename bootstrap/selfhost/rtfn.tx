@@ -1,0 +1,823 @@
+// Structured native function builder (NRT, docs/design/v052-native-runtime-nrt-v0.1-20261013.md).
+// Every named local lives in its own 8-byte stack slot; each statement loads
+// operands into volatile scratch registers, computes, and stores back before the
+// next statement. No value is ever kept in a register across a call, so the
+// clobbered-register and overlapping-scratch-slot accident classes cannot occur.
+// Calls follow the Win64-compatible private window ABI (rcx/rdx/r8/r9, stack
+// arguments from [rsp+32], 32-byte shadow space, 16-byte call alignment); Linux
+// kernel calls use rtSyscall* with the SysV syscall registers.
+// rbx is never written here: it holds the caller's value-slot window, from which
+// G()/A() of a thread-block field (thread_block_abi.tx) derive the current thread's
+// block (TB = rbx & TB_MASK).
+// A64 底层在 rtfn_a64.tx（缓冲由 asBufferNewA64 建时走那里，调用处不变）；类型、操作数与簿记在 rtfn_base.tx。
+import { TB_MASK, tbOffset } from "./thread_block_abi";
+import { Operand, StructuredBuffer, asBufferInstruction, asBufferLabel, asBufferSection, asBufferByte, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem } from "./assemble";
+import { asBufferFunctionBegin, asBufferFunctionEnd, asBufferFunctionPrologueEnd, asBufferFunctionEpilogueStart, asBufferFrame } from "./assemble";
+import { RtOp, RtFn, RtCall, OP_LOCAL, OP_IMM, OP_ADDR, L, I, rtfnFail, rtfnOpen, rtfnSlot, rtfnCache, rtfnCached, rtfnLabel, rtfnCFloat, rtfnCVar, rtfnCall, rtfnHome, rtfnGuardWrite } from "./rtfn_base";
+import { K_LOAD_REG, K_STORE_REG, K_SET, K_SET_GLOBAL, K_SET_RBX, K_OP, K_SHIFT, K_DIVMOD, K_LOAD, K_STORE, K_ADDR_OF, K_LABEL } from "./rtfn_base";
+import { K_JUMP, K_IF, K_IF32, K_CALL, K_CALL_C, K_F64_TO_F32, K_F32_TO_F64, K_SYSCALL, K_FOP, K_FIF, K_INT_TO_F64, K_LOAD_ACQ } from "./rtfn_base";
+import { K_STORE_REL, K_ATOMIC_ADD, K_ATOMIC_CAS, K_ATOMIC_XCHG, K_RET, K_RET2, K_RET_VOID, K_TRAP, K_RDATA } from "./rtfn_base";
+import { rtfnAllocate, rtfnParallelMoves } from "./rtfn_alloc";
+import { a64RtBegin, a64RtRetVoid, a64RtLoadX, a64RtLoadReg, a64RtStoreReg, a64RtSet, a64RtSetGlobal, a64RtSetRbx, a64RtOp, a64RtShift, a64RtDivMod, a64RtLoad, a64RtStore, a64RtAddrOf, a64RtJump, a64RtIf, a64RtCall, a64RtCallC } from "./rtfn_a64";
+import { a64RtF64ToF32Bits, a64RtF32BitsToF64, a64RtFop, a64RtFIf, a64RtIntToF64, a64RtLoadAcq, a64RtStoreRel, a64RtAtomicAdd, a64RtAtomicCas, a64RtAtomicXchg, a64RtTrap } from "./rtfn_a64";
+import { a64RtSpill } from "./rtfn_a64";
+
+function reg64(n: int): Ref<Operand> { return asStructuredReg(0, n); }
+function reg32(n: int): Ref<Operand> { return asStructuredReg(1, n); }
+function reg8(n: int): Ref<Operand> { return asStructuredReg(2, n); }
+function imm(n: int): Ref<Operand> { return asStructuredImm(n); }
+function mem64(base: int, off: int): Ref<Operand> { return asStructuredMem(2, base, -1, 0, off, 0, ""); }
+function mem32(base: int, off: int): Ref<Operand> { return asStructuredMem(1, base, -1, 0, off, 0, ""); }
+function mem8(base: int, off: int): Ref<Operand> { return asStructuredMem(0, base, -1, 0, off, 0, ""); }
+function mem16(base: int, off: int): Ref<Operand> { return asStructuredMem(3, base, -1, 0, off, 0, ""); }
+function rip64(symbol: string): Ref<Operand> { return asStructuredMem(2, -1, -1, 0, 0, 1, symbol); }
+function ins2(f: Ref<RtFn>, name: string, a: Ref<Operand>, c: Ref<Operand>): void { if (rtfnOpen(f)) { asBufferInstruction(f.b, name, 2, a, c, asStructuredMissing(), 1); } }
+function ins1(f: Ref<RtFn>, name: string, a: Ref<Operand>): void { if (rtfnOpen(f)) { asBufferInstruction(f.b, name, 1, a, asStructuredMissing(), asStructuredMissing(), 1); } }
+function ins0(f: Ref<RtFn>, name: string): void { if (rtfnOpen(f)) { asBufferInstruction(f.b, name, 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1); } }
+function jmpTo(f: Ref<RtFn>, cond: string, label: string): void { if (rtfnOpen(f)) { asBufferInstruction(f.b, cond, 1, asStructuredTarget(label), asStructuredMissing(), asStructuredMissing(), 1); } }
+
+/// Space-separated name list helper ("a b c" → ["a", "b", "c"]; "" → []).
+export function rtNames(text: string): List<string> {
+    const out: List<string> = listNew();
+    if (len(text) == 0) { return out; }
+    const parts = strSplit(text, " ");
+    let k = 0;
+    while (k < listLen(parts)) {
+        const p = listGet(parts, k) catch "";
+        if (len(p) > 0) { listPush(out, p); }
+        k = k + 1;
+    }
+    return out;
+}
+
+// 取页失败的故障注入（docs/design/v052-oom-fault-v0.1-20261025.md）：只由内核生成器的 --generic=oomfault 打开。打开后对取页原语的
+// 调用（下列目标名；Linux 的 mmap、mprotect 系统调用）在记录时就换成 kernel_oom_fault.tx 的包装 __tx_fault_<名>，寄存器分配
+// 按调用处理；包装自己（名字以 __tx_fault_ 开头）不再拦截。出参区至少留 6 个实参，原本只发裸系统调用的函数也能调 6 实参的包装。
+let rtFault: bool = false;
+const FAULT_PREFIX: string = "__tx_fault_";
+const FAULT_TARGETS: string = "VirtualAlloc CreateThread __tx_linux_page_alloc __tx_mac_mmap __tx_mac_mprotect __tx_mac_pthread_create";
+export function rtFaultEnable(on: bool): void { rtFault = on; }
+function rtFaultActive(f: Ref<RtFn>): bool { return rtFault && strIndexOf(f.name, FAULT_PREFIX) != 0; }
+function rtFaultTarget(f: Ref<RtFn>, target: string): string {
+    if (!rtFaultActive(f)) { return target; }
+    for (t in strSplit(FAULT_TARGETS, " ")) {
+        if (t == target) {
+            if (strIndexOf(target, "__tx_") == 0) { return FAULT_PREFIX + strSub(target, 5, len(target) - 5); }
+            return FAULT_PREFIX + target;
+        }
+    }
+    return target;
+}
+
+/// Begin a function. params are the first locals, filled from the ABI argument
+/// positions; maxArgs is the largest argument count of any call made inside.
+export function rtBegin(b: Ref<StructuredBuffer>, name: string, params: string, locals: string, maxArgs0: int, module: string): Ref<RtFn> {
+    const all: List<string> = rtNames(params);
+    const nparams = listLen(all);
+    const rest = rtNames(locals);
+    let k = 0;
+    while (k < listLen(rest)) { listPush(all, listGet(rest, k) catch ""); k = k + 1; }
+    let maxArgs = maxArgs0;
+    if (rtFault && maxArgs < 6) { maxArgs = 6; }
+    let outArgs = maxArgs - 4;
+    if (outArgs < 0) { outArgs = 0; }
+    const base = 32 + outArgs * 8;
+    let frame = base + listLen(all) * 8;
+    // On entry rsp ≡ 8 (mod 16); keep every call site 16-byte aligned.
+    if (frame % 16 != 8) { frame = frame + 8; }
+    if (frame % 16 != 8) { frame = frame + 8; }
+    let origin = "runtime-rtfn";
+    if (module == "bootstrap/selfhost/ffi_stubs.tx" || module == "bootstrap/selfhost/ffi_callbacks.tx") { origin = "ffi-rtfn"; }
+    if (module == "bootstrap/selfhost/dbg_rt.tx") { origin = "debug-rtfn"; }
+    if (module == "bootstrap/selfhost/tool_rt.tx" || module == "bootstrap/selfhost/tool_spawn.tx") { origin = "tool-rtfn"; }
+    // 函数开头当场写（漏了 rtEnd 照样被函数元数据查出）；函数体先记录，序言与函数体在 rtEnd 发出（寄存器分配设计 §七）。
+    asBufferFunctionBegin(b, module, name, origin);
+    const f = new RtFn { b: b, name: name, locals: all, frame: frame, base: base, failed: "", closed: false, raxSlot: -1, raxAt: -1, a64: b.a64, seq: 0,
+        rec: true, calls: listNew(), nparams: nparams, maxArgs: maxArgs, mark: listLen(b.entries), tags: 0, homes: listNew(), alloc: rtAllocates(module),
+        keep: 0 };
+    listPush(rtRecording, f);
+    return f;
+}
+
+// 寄存器分配按模块开启（设计 §八-8）：现为全部模块（可移植版内核、NRT、FFI 桩、工具链例程、调试运行时）；要对某模块关闭时在此列出。
+function rtAllocates(module: string): bool { return len(module) > 0; }
+
+// 正在记录的函数（rtRdataBytes 据缓冲找到它）。
+let rtRecording: List<Ref<RtFn>> = listNew();
+
+// 序言：x86 分配帧并把实参存进局部槽；A64 见 a64RtBegin。
+function rtPrologue(f: Ref<RtFn>): void {
+    if (f.a64) { a64RtBegin(f, f.nparams, f.maxArgs); return; }
+    const b = f.b;
+    const base = f.base;
+    const frame = f.frame;
+    asBufferLabel(b, f.name, 1);
+    asBufferFrame(b, "allocate-stack", 4, frame);
+    asBufferFunctionPrologueEnd(b);
+    const argRegs: List<int> = listNew(); listPush(argRegs, 1); listPush(argRegs, 2); listPush(argRegs, 8); listPush(argRegs, 9);
+    // 在栈槽的参数照旧入槽；落寄存器的，寄存器来的经并行赋值（成环经 rax）入家，栈上来的最后直接取。
+    const dsts: List<int> = listNew();
+    const srcs: List<int> = listNew();
+    let k = 0;
+    while (k < f.nparams) {
+        const home = rtfnHome(f, listGet(f.locals, k) catch "");
+        if (home >= 0) {
+            if (k < 4) { listPush(dsts, home); listPush(srcs, listGet(argRegs, k) catch 1); }
+        } else if (k < 4) {
+            ins2(f, "mov", mem64(4, base + k * 8), reg64(listGet(argRegs, k) catch 1));
+        } else {
+            ins2(f, "mov", reg64(0), mem64(4, frame + 40 + (k - 4) * 8));
+            ins2(f, "mov", mem64(4, base + k * 8), reg64(0));
+        }
+        k = k + 1;
+    }
+    const moves = rtfnParallelMoves(dsts, srcs, 0);
+    k = 0;
+    while (k < listLen(moves)) { ins2(f, "mov", reg64(listGet(moves, k) catch 0), reg64(listGet(moves, k + 1) catch 0)); k = k + 2; }
+    k = 4;
+    while (k < f.nparams) {
+        const home = rtfnHome(f, listGet(f.locals, k) catch "");
+        if (home >= 0) { ins2(f, "mov", reg64(home), mem64(4, frame + 40 + (k - 4) * 8)); }
+        k = k + 1;
+    }
+}
+
+export function rtFailed(f: Ref<RtFn>): string { return f.failed; }
+/// 函数内唯一的标号后缀（同一段标号要多次生成时用；不依赖缓冲的状态，函数体是先记录后发射的）。
+export function rtTag(f: Ref<RtFn>): string { f.tags = f.tags + 1; return "t" + toStr(f.tags); }
+export function rtEnd(f: Ref<RtFn>): void {
+    if (f.closed) { rtfnFail(f, "function already closed"); return; }
+    if (f.rec) {
+        f.rec = false;
+        const still: List<Ref<RtFn>> = listNew();
+        for (g in rtRecording) { if (g.rec) { listPush(still, g); } }
+        rtRecording = still;
+        // 记录期间别处直接写进缓冲的条目会落到序言之前：报错，不静默错位。
+        if (listLen(f.b.entries) != f.mark) { rtfnFail(f, "buffer written while the function was recording"); }
+        if (f.alloc) { rtfnAllocate(f); }
+        rtPrologue(f);
+        for (c in f.calls) { rtSpill(f, c, false); f.keep = c.keep; rtReplay(f, c); f.keep = 0; rtSpill(f, c, true); }
+    }
+    asBufferFunctionEnd(f.b); f.closed = true;
+}
+
+// 实参表按值记下（调用方之后改动自己的表不影响记录）。
+function rtCopyOps(xs: List<Ref<RtOp>>): List<Ref<RtOp>> { const out: List<Ref<RtOp>> = listNew(); for (x in xs) { listPush(out, x); } return out; }
+function rtCopyInts(xs: List<int>): List<int> { const out: List<int> = listNew(); for (x in xs) { listPush(out, x); } return out; }
+
+// 跨 c 仍活、家会被 c 改写的寄存器局部：c 之前存回自己的槽，之后取回（设计 §八-4）。
+function rtSpill(f: Ref<RtFn>, c: Ref<RtCall>, reload: bool): void {
+    for (k in c.saves) {
+        const h = listGet(f.homes, k) catch -1;
+        const slot = rtfnSlot(f, listGet(f.locals, k) catch "");
+        if (f.a64) { a64RtSpill(f, h, slot, reload); }
+        else if (reload) { ins2(f, "mov", reg64(h), mem64(4, slot)); }
+        else { ins2(f, "mov", mem64(4, slot), reg64(h)); }
+    }
+}
+
+// rtEnd 时按记录的次序重放（此时 rec 已为假，各接口照常发射）。
+function rtReplay(f: Ref<RtFn>, c: Ref<RtCall>): void {
+    const k = c.k;
+    if (k == K_LOAD_REG) { rtLoadReg(f, c.n1, c.o1); }
+    else if (k == K_STORE_REG) { rtStoreReg(f, c.s1, c.n1); }
+    else if (k == K_SET) { rtSet(f, c.s1, c.o1); }
+    else if (k == K_SET_GLOBAL) { rtSetGlobal(f, c.s1, c.o1); }
+    else if (k == K_SET_RBX) { rtSetRbx(f, c.o1); }
+    else if (k == K_OP) { rtOp(f, c.s1, c.o1, c.s2, c.o2); }
+    else if (k == K_SHIFT) { rtShift(f, c.s1, c.o1, c.s2, c.n1); }
+    else if (k == K_DIVMOD) { rtDivMod(f, c.s1, c.s2, c.o1, c.o2); }
+    else if (k == K_LOAD) { rtLoad(f, c.s1, c.o1, c.n1, c.n2); }
+    else if (k == K_STORE) { rtStore(f, c.o1, c.n1, c.o2, c.n2); }
+    else if (k == K_ADDR_OF) { rtAddrOf(f, c.s1, c.s2); }
+    else if (k == K_LABEL) { rtLabel(f, c.s1); }
+    else if (k == K_JUMP) { rtJump(f, c.s1); }
+    else if (k == K_IF) { rtIf(f, c.o1, c.s1, c.o2, c.s2); }
+    else if (k == K_IF32) { rtIf32(f, c.o1, c.s1, c.o2, c.s2); }
+    else if (k == K_CALL) { rtCallList(f, c.s1, c.s2, c.args); }
+    else if (k == K_CALL_C) { rtCallC(f, c.s1, c.s2, c.s3, c.args, c.cls, c.flag); }
+    else if (k == K_F64_TO_F32) { rtF64ToF32Bits(f, c.s1, c.o1); }
+    else if (k == K_F32_TO_F64) { rtF32BitsToF64(f, c.s1, c.o1); }
+    else if (k == K_SYSCALL) { rtSyscall(f, c.s1, c.n1, c.args); }
+    else if (k == K_FOP) { rtFop(f, c.s1, c.o1, c.s2, c.o2); }
+    else if (k == K_FIF) { rtFIf(f, c.o1, c.s1, c.o2, c.s2); }
+    else if (k == K_INT_TO_F64) { rtIntToF64(f, c.s1, c.o1); }
+    else if (k == K_LOAD_ACQ) { rtLoadAcq(f, c.s1, c.o1, c.n1); }
+    else if (k == K_STORE_REL) { rtStoreRel(f, c.o1, c.n1, c.o2); }
+    else if (k == K_ATOMIC_ADD) { rtAtomicAdd(f, c.s1, c.o1, c.n1, c.o2); }
+    else if (k == K_ATOMIC_CAS) { rtAtomicCas(f, c.s1, c.o1, c.n1, c.o2, c.o3); }
+    else if (k == K_ATOMIC_XCHG) { rtAtomicXchg(f, c.s1, c.o1, c.n1, c.o2); }
+    else if (k == K_RET) { rtRet(f, c.o1); }
+    else if (k == K_RET2) { rtRet2(f, c.o1, c.o2); }
+    else if (k == K_RET_VOID) { rtRetVoid(f); }
+    else if (k == K_TRAP) { rtTrap(f); }
+    else if (k == K_RDATA) { rdataBytes(f.b, c.s1, c.s2); }
+    else { rtfnFail(f, "BadRecordedCall"); }
+}
+
+/// Load an operand into a 64-bit scratch register (only that register is written).
+export function rtLoadReg(f: Ref<RtFn>, r: int, x: Ref<RtOp>): void {
+    if (f.rec) { const c = rtfnCall(K_LOAD_REG); c.n1 = r; c.o1 = x; listPush(f.calls, c); return; }
+    if (!rtfnOpen(f)) { return; }
+    if (f.a64) { a64RtLoadReg(f, r, x); return; }
+    if (xHome(f, x) != r) { rtfnGuardWrite(f, r); }
+    if (x.kind == OP_LOCAL) {
+        const home = rtfnHome(f, x.name);
+        if (home >= 0) {
+            // 落寄存器的局部：一条 mov；rax 里缓存的槽不受影响。
+            const keepSlot = f.raxSlot;
+            const keepIt = r != 0 && f.raxAt == listLen(f.b.entries);
+            if (r != home) { ins2(f, "mov", reg64(r), reg64(home)); }
+            if (keepIt) { rtfnCache(f, keepSlot); }
+            return;
+        }
+        const slot = rtfnSlot(f, x.name);
+        if (rtfnCached(f, slot)) {
+            // The slot was just stored from (or loaded into) rax: reuse it.
+            if (r != 0) { ins2(f, "mov", reg64(r), reg64(0)); rtfnCache(f, slot); }
+            return;
+        }
+        const keep = f.raxSlot;
+        const keepOk = f.raxAt == listLen(f.b.entries);
+        ins2(f, "mov", reg64(r), mem64(4, slot));
+        if (r == 0) { rtfnCache(f, slot); }
+        else if (keepOk) { rtfnCache(f, keep); }
+        return;
+    }
+    // Other registers leave a cached rax intact.
+    const keep = f.raxSlot;
+    const keepOk = r != 0 && f.raxAt == listLen(f.b.entries);
+    if (x.kind == OP_IMM) {
+        if (x.num >= -2147483648 && x.num <= 2147483647) { ins2(f, "mov", reg64(r), imm(x.num)); }
+        else { ins2(f, "movabs", reg64(r), imm(x.num)); }
+    } else {
+        const off = tbOffset(x.name);
+        if (off >= 0) {
+            tbInto(f, r);
+            if (x.kind == OP_ADDR) { if (off != 0) { ins2(f, "add", reg64(r), imm(off)); } }
+            else { ins2(f, "mov", reg64(r), mem64(r, off)); }
+        } else if (x.kind == OP_ADDR) { ins2(f, "lea", reg64(r), rip64(x.name)); }
+        else { ins2(f, "mov", reg64(r), rip64(x.name)); }
+    }
+    if (keepOk) { rtfnCache(f, keep); }
+}
+
+// r = the current thread's block (only r is written).
+function tbInto(f: Ref<RtFn>, r: int): void {
+    ins2(f, "mov", reg64(r), reg64(3));
+    ins2(f, "and", reg64(r), imm(TB_MASK));
+}
+
+export function rtStoreReg(f: Ref<RtFn>, dst: string, r: int): void {
+    if (f.rec) { const c = rtfnCall(K_STORE_REG); c.s1 = dst; c.n1 = r; listPush(f.calls, c); return; }
+    if (f.a64) { a64RtStoreReg(f, dst, r); return; }
+    const home = rtfnHome(f, dst);
+    if (home >= 0) { if (r != home) { ins2(f, "mov", reg64(home), reg64(r)); } return; }
+    const slot = rtfnSlot(f, dst);
+    ins2(f, "mov", mem64(4, slot), reg64(r));
+    if (r == 0) { rtfnCache(f, slot); }
+}
+
+/// dst = x
+export function rtSet(f: Ref<RtFn>, dst: string, x: Ref<RtOp>): void {
+    if (f.rec) { const r = rtfnCall(K_SET); r.s1 = dst; r.o1 = x; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtSet(f, dst, x); return; }
+    const hd = rtfnHome(f, dst);
+    if (hd >= 0) { rtLoadReg(f, hd, x); return; }
+    rtLoadReg(f, 0, x); rtStoreReg(f, dst, 0);
+}
+
+// 操作数所在的寄存器：落寄存器的局部直接用它的家，否则取进 r。
+function xSrc(f: Ref<RtFn>, r: int, x: Ref<RtOp>): int {
+    if (x.kind == OP_LOCAL) { const h = rtfnHome(f, x.name); if (h >= 0) { return h; } }
+    rtLoadReg(f, r, x);
+    return r;
+}
+function xHome(f: Ref<RtFn>, x: Ref<RtOp>): int { if (x.kind == OP_LOCAL) { return rtfnHome(f, x.name); } return -1; }
+// 分配的函数里，可作 32 位立即数（符号扩展）的常量操作数。
+function xImm(f: Ref<RtFn>, x: Ref<RtOp>): bool { return f.alloc && x.kind == OP_IMM && x.num >= -2147483648 && x.num <= 2147483647; }
+
+/// Store a 64-bit value to a global symbol (or a thread-block field, through r11).
+export function rtSetGlobal(f: Ref<RtFn>, symbol: string, x: Ref<RtOp>): void {
+    if (f.rec) { const r = rtfnCall(K_SET_GLOBAL); r.s1 = symbol; r.o1 = x; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtSetGlobal(f, symbol, x); return; }
+    rtLoadReg(f, 0, x);
+    const off = tbOffset(symbol);
+    if (off >= 0) {
+        tbInto(f, 11);
+        ins2(f, "mov", mem64(11, off), reg64(0));
+        return;
+    }
+    ins2(f, "mov", rip64(symbol), reg64(0));
+}
+
+/// rbx = x: makes x (a value-slot window) the base for thread-block addressing. Only for
+/// routines entered from foreign code whose shell saved rbx (FFI callbacks); every other
+/// routine inherits rbx from its caller and must leave it unchanged.
+export function rtSetRbx(f: Ref<RtFn>, x: Ref<RtOp>): void {
+    if (f.rec) { const r = rtfnCall(K_SET_RBX); r.o1 = x; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtSetRbx(f, x); return; }
+    rtLoadReg(f, 0, x);
+    ins2(f, "mov", reg64(3), reg64(0));
+}
+
+/// dst = a <op> c for op in add/sub/and/or/xor/imul.
+export function rtOp(f: Ref<RtFn>, dst: string, a: Ref<RtOp>, op: string, c: Ref<RtOp>): void {
+    if (f.rec) { const r = rtfnCall(K_OP); r.s1 = dst; r.o1 = a; r.s2 = op; r.o2 = c; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtOp(f, dst, a, op, c); return; }
+    const hd = rtfnHome(f, dst);
+    const ha = xHome(f, a);
+    const hc = xHome(f, c);
+    const twoOp = op == "add" || op == "sub" || op == "and" || op == "or" || op == "xor" || op == "imul";
+    const small = twoOp && op != "imul" && xImm(f, c);
+    if (twoOp && hd >= 0 && hc != hd) {
+        // 结果落寄存器：a 先进 dst 的家（已在即免），再与 c 就地运算。
+        if (ha != hd) { rtLoadReg(f, hd, a); }
+        if (small) { ins2(f, op, reg64(hd), imm(c.num)); } else { ins2(f, op, reg64(hd), reg64(xSrc(f, 1, c))); }
+        return;
+    }
+    if (small || (twoOp && (ha >= 0 || hc >= 0))) {
+        rtLoadReg(f, 0, a);
+        if (small) { ins2(f, op, reg64(0), imm(c.num)); } else { ins2(f, op, reg64(0), reg64(xSrc(f, 1, c))); }
+        rtStoreReg(f, dst, 0);
+        return;
+    }
+    rtLoadReg(f, 0, a);
+    rtLoadReg(f, 1, c);
+    ins2(f, op, reg64(0), reg64(1));
+    rtStoreReg(f, dst, 0);
+}
+
+/// dst = a shifted by a constant count (op in shl/shr/sar).
+export function rtShift(f: Ref<RtFn>, dst: string, a: Ref<RtOp>, op: string, count: int): void {
+    if (f.rec) { const r = rtfnCall(K_SHIFT); r.s1 = dst; r.o1 = a; r.s2 = op; r.n1 = count; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtShift(f, dst, a, op, count); return; }
+    const hd = rtfnHome(f, dst);
+    if (hd >= 0) { rtLoadReg(f, hd, a); ins2(f, op, reg64(hd), imm(count)); return; }
+    rtLoadReg(f, 0, a);
+    ins2(f, op, reg64(0), imm(count));
+    rtStoreReg(f, dst, 0);
+}
+
+/// dst = a / c, rem = a % c (signed; operands non-negative in all callers).
+export function rtDivMod(f: Ref<RtFn>, quot: string, rem: string, a: Ref<RtOp>, c: Ref<RtOp>): void {
+    if (f.rec) { const r = rtfnCall(K_DIVMOD); r.s1 = quot; r.s2 = rem; r.o1 = a; r.o2 = c; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtDivMod(f, quot, rem, a, c); return; }
+    rtLoadReg(f, 0, a);
+    rtLoadReg(f, 1, c);
+    ins0(f, "cqo");
+    ins1(f, "idiv", reg64(1));
+    if (len(quot) > 0) { rtStoreReg(f, quot, 0); }
+    if (len(rem) > 0) { rtStoreReg(f, rem, 2); }
+}
+
+/// dst = *(width*)(addr + off), zero-extended (width 1/2/4/8).
+export function rtLoad(f: Ref<RtFn>, dst: string, addr: Ref<RtOp>, off: int, width: int): void {
+    if (f.rec) { const r = rtfnCall(K_LOAD); r.s1 = dst; r.o1 = addr; r.n1 = off; r.n2 = width; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtLoad(f, dst, addr, off, width); return; }
+    const base = xSrc(f, 0, addr);
+    let rd = rtfnHome(f, dst);
+    if (rd < 0) { rd = 0; }
+    if (width == 8) { ins2(f, "mov", reg64(rd), mem64(base, off)); }
+    else if (width == 4) { ins2(f, "mov", reg32(rd), mem32(base, off)); }
+    else if (width == 2) { ins2(f, "movzx", reg32(rd), mem16(base, off)); }
+    else { ins2(f, "movzx", reg32(rd), mem8(base, off)); }
+    if (rd == 0) { rtStoreReg(f, dst, 0); }
+}
+
+/// *(width*)(addr + off) = value (width 1/2/4/8).
+export function rtStore(f: Ref<RtFn>, addr: Ref<RtOp>, off: int, value: Ref<RtOp>, width: int): void {
+    if (f.rec) { const r = rtfnCall(K_STORE); r.o1 = addr; r.n1 = off; r.o2 = value; r.n2 = width; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtStore(f, addr, off, value, width); return; }
+    const base = xSrc(f, 0, addr);
+    const v = xSrc(f, 1, value);
+    if (width == 8) { ins2(f, "mov", mem64(base, off), reg64(v)); }
+    else if (width == 4) { ins2(f, "mov", mem32(base, off), reg32(v)); }
+    else if (width == 2) { ins2(f, "mov", mem16(base, off), reg32(v)); }
+    else { ins2(f, "mov", mem8(base, off), reg8(v)); }
+}
+
+/// Address of a local slot (for out-parameters passed by pointer).
+export function rtAddrOf(f: Ref<RtFn>, dst: string, local: string): void {
+    if (f.rec) { const r = rtfnCall(K_ADDR_OF); r.s1 = dst; r.s2 = local; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtAddrOf(f, dst, local); return; }
+    if (rtfnHome(f, local) >= 0) { rtfnFail(f, "AddressOfRegisterLocal"); return; }
+    ins2(f, "lea", reg64(0), mem64(4, rtfnSlot(f, local)));
+    rtStoreReg(f, dst, 0);
+}
+
+export function rtLabel(f: Ref<RtFn>, label: string): void {
+    if (f.rec) { const r = rtfnCall(K_LABEL); r.s1 = label; listPush(f.calls, r); return; }
+    if (rtfnOpen(f)) { asBufferLabel(f.b, rtfnLabel(f, label), 1); }
+}
+export function rtJump(f: Ref<RtFn>, label: string): void {
+    if (f.rec) { const r = rtfnCall(K_JUMP); r.s1 = label; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtJump(f, label); return; }
+    jmpTo(f, "jmp", rtfnLabel(f, label));
+}
+
+function condJump(cc: string): string {
+    if (cc == "eq") { return "je"; }
+    if (cc == "ne") { return "jne"; }
+    if (cc == "lt") { return "jl"; }
+    if (cc == "le") { return "jle"; }
+    if (cc == "gt") { return "jg"; }
+    if (cc == "ge") { return "jge"; }
+    if (cc == "ult") { return "jb"; }
+    if (cc == "ule") { return "jbe"; }
+    if (cc == "ugt") { return "ja"; }
+    return "jae";
+}
+
+/// if (a <cc> c) goto label. cc: eq ne lt le gt ge (signed), ult ule ugt uge.
+export function rtIf(f: Ref<RtFn>, a: Ref<RtOp>, cc: string, c: Ref<RtOp>, label: string): void {
+    if (f.rec) { const r = rtfnCall(K_IF); r.o1 = a; r.s1 = cc; r.o2 = c; r.s2 = label; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtIf(f, 1, a, cc, c, label); return; }
+    const ra = xSrc(f, 0, a);
+    if (xImm(f, c)) { ins2(f, "cmp", reg64(ra), imm(c.num)); } else { ins2(f, "cmp", reg64(ra), reg64(xSrc(f, 1, c))); }
+    jmpTo(f, condJump(cc), rtfnLabel(f, label));
+}
+
+/// if ((a & 0xFFFFFFFF) <cc> c) goto label — for u32 fields such as tags/ids.
+export function rtIf32(f: Ref<RtFn>, a: Ref<RtOp>, cc: string, c: Ref<RtOp>, label: string): void {
+    if (f.rec) { const r = rtfnCall(K_IF32); r.o1 = a; r.s1 = cc; r.o2 = c; r.s2 = label; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtIf(f, 0, a, cc, c, label); return; }
+    const ra = xSrc(f, 0, a);
+    if (xImm(f, c)) { ins2(f, "cmp", reg32(ra), imm(c.num)); } else { ins2(f, "cmp", reg32(ra), reg32(xSrc(f, 1, c))); }
+    jmpTo(f, condJump(cc), rtfnLabel(f, label));
+}
+
+function rtArgRegs(): List<int> {
+    const regs: List<int> = listNew(); listPush(regs, 1); listPush(regs, 2); listPush(regs, 8); listPush(regs, 9);
+    return regs;
+}
+const ARG_REGS: List<int> = rtArgRegs();
+
+/// Generic call: target is a symbol, or "*local" for an indirect call through a local.
+export function rtCallList(f: Ref<RtFn>, result: string, target0: string, args: List<Ref<RtOp>>): void {
+    const target = rtFaultTarget(f, target0);
+    if (f.rec) { const r = rtfnCall(K_CALL); r.s1 = result; r.s2 = target; r.args = rtCopyOps(args); listPush(f.calls, r); return; }
+    if (f.a64) { a64RtCall(f, result, target, args); return; }
+    if (listLen(args) > 4 + (f.base - 32) / 8) {
+        rtfnFail(f, "OutgoingCallFrameTooSmall");
+        return;
+    }
+    let k = 4;
+    while (k < listLen(args)) {
+        rtLoadReg(f, 0, listGet(args, k) catch I(0));
+        ins2(f, "mov", mem64(4, 32 + (k - 4) * 8), reg64(0));
+        k = k + 1;
+    }
+    let indirect = 0;
+    if (len(target) > 1 && (byteAt(target, 0) catch 0) == 42) {
+        indirect = 1;
+        rtLoadReg(f, 10, L(strSub(target, 1, len(target) - 1)));
+    }
+    k = 0;
+    while (k < listLen(args) && k < 4) {
+        rtLoadReg(f, listGet(ARG_REGS, k) catch 1, listGet(args, k) catch I(0));
+        k = k + 1;
+    }
+    if (indirect == 1) { ins1(f, "call", reg64(10)); }
+    else { jmpTo(f, "call", target); }
+    if (len(result) > 0) { rtStoreReg(f, result, 0); }
+}
+
+function args0(): List<Ref<RtOp>> { return listNew(); }
+export function rtCall0(f: Ref<RtFn>, result: string, target: string): void { rtCallList(f, result, target, args0()); }
+export function rtCall1(f: Ref<RtFn>, result: string, target: string, a: Ref<RtOp>): void {
+    const xs = args0(); listPush(xs, a); rtCallList(f, result, target, xs);
+}
+export function rtCall2(f: Ref<RtFn>, result: string, target: string, a: Ref<RtOp>, c: Ref<RtOp>): void {
+    const xs = args0(); listPush(xs, a); listPush(xs, c); rtCallList(f, result, target, xs);
+}
+export function rtCall3(f: Ref<RtFn>, result: string, target: string, a: Ref<RtOp>, c: Ref<RtOp>, d: Ref<RtOp>): void {
+    const xs = args0(); listPush(xs, a); listPush(xs, c); listPush(xs, d); rtCallList(f, result, target, xs);
+}
+export function rtCall4(f: Ref<RtFn>, result: string, target: string, a: Ref<RtOp>, c: Ref<RtOp>, d: Ref<RtOp>, e: Ref<RtOp>): void {
+    const xs = args0(); listPush(xs, a); listPush(xs, c); listPush(xs, d); listPush(xs, e); rtCallList(f, result, target, xs);
+}
+export function rtCall5(f: Ref<RtFn>, result: string, target: string, a: Ref<RtOp>, c: Ref<RtOp>, d: Ref<RtOp>, e: Ref<RtOp>, g: Ref<RtOp>): void {
+    const xs = args0(); listPush(xs, a); listPush(xs, c); listPush(xs, d); listPush(xs, e); listPush(xs, g); rtCallList(f, result, target, xs);
+}
+export function rtCall6(f: Ref<RtFn>, result: string, target: string, a: Ref<RtOp>, c: Ref<RtOp>, d: Ref<RtOp>, e: Ref<RtOp>, g: Ref<RtOp>, h: Ref<RtOp>): void {
+    const xs = args0(); listPush(xs, a); listPush(xs, c); listPush(xs, d); listPush(xs, e); listPush(xs, g); listPush(xs, h); rtCallList(f, result, target, xs);
+}
+
+/// C ABI call through a function pointer held in local `fp` (D3 v0.23 FFI call stubs).
+/// cls[k] per argument: 0 integer/pointer, 1 floating (the local holds the 64-bit pattern
+/// to place in the vector register: double bits, or single bits in the low half for f32),
+/// 3／4／5 宽 32／16／8 位的整数、6 f32（与 0、1 同样传，只在 Apple arm64 的栈上按此宽度紧排），
+/// 2／7 变参位置上的整数／浮点（只能排在定参之后）：x86 两种约定都与定参同样传（SysV 的 al 计入 7），Win64 前四个位置上的
+/// 7 另把同一位模式装进对应的通用寄存器（被调方按 va_list 从影子空间读整数寄存器的副本）；Apple arm64 的变参一律在栈上，
+/// 每个占 8 字节，从 [sp] 起（Apple《Writing ARM64 code for Apple platforms》；Go 的 darwin/arm64 蹦床同样处理
+/// open、fcntl 的第三个实参），调用方的 rtBegin maxArgs 须按“8 个寄存器实参之后”把它们算进去。
+/// Win64: argument k goes to rcx/rdx/r8/r9 or xmm0..3 by position, the rest to [rsp+32+8*(k-4)].
+/// SysV: integers to rdi rsi rdx rcx r8 r9 and floats to xmm0..7 in class order, the rest to
+/// [rsp+8*j] in argument order; al = number of vector registers used (required only for
+/// variadic callees, harmless otherwise). Stores rax to `ri` and xmm0's 64 bits to `rf`
+/// (either may be empty). The caller's frame must hold the stack arguments (rtBegin maxArgs).
+/// SysV treats rsi, rdi and xmm6–15 as caller-saved, while the private ABI lists them as
+/// callee-saved; nothing is saved here. That holds only because no caller keeps a value in a
+/// register across a call (rtfn by construction; generated code only inside call-free runs,
+/// macOS M2 design F4). Any change that lets register values live across calls must first make
+/// this save them.
+export function rtCallC(f: Ref<RtFn>, ri: string, rf: string, fp: string, args: List<Ref<RtOp>>, cls: List<int>, sysv: bool): void {
+    if (f.rec) { const r = rtfnCall(K_CALL_C); r.s1 = ri; r.s2 = rf; r.s3 = fp; r.args = rtCopyOps(args); r.cls = rtCopyInts(cls); r.flag = sysv; listPush(f.calls, r); return; }
+    let bad = listLen(args) != listLen(cls);
+    let variadic = false;
+    for (c in cls) {
+        if (c < 0 || c > 7 || (variadic && !rtfnCVar(c))) { bad = true; }
+        if (rtfnCVar(c)) { variadic = true; }
+    }
+    if (bad) {
+        rtfnFail(f, "BadCArgumentClasses");
+        return;
+    }
+    if (f.a64) { a64RtCallC(f, ri, rf, fp, args, cls); return; }
+    const intRegs: List<int> = listNew();
+    if (sysv) { listPush(intRegs, 7); listPush(intRegs, 6); listPush(intRegs, 2); listPush(intRegs, 1); listPush(intRegs, 8); listPush(intRegs, 9); }
+    else { listPush(intRegs, 1); listPush(intRegs, 2); listPush(intRegs, 8); listPush(intRegs, 9); }
+    // Pass 1: stack arguments and floating registers (through rax), so that loading the
+    // integer registers last cannot be clobbered.
+    let ni = 0;
+    let nf = 0;
+    let ns = 0;
+    let k = 0;
+    while (k < listLen(args)) {
+        const c = listGet(cls, k) catch 0;
+        let inReg = false;
+        if (sysv) {
+            if (!rtfnCFloat(c)) { inReg = ni < 6; } else { inReg = nf < 8; }
+        } else {
+            inReg = k < 4;
+        }
+        if (!inReg) {
+            rtLoadReg(f, 0, listGet(args, k) catch I(0));
+            let off = 0;
+            if (sysv) { off = ns * 8; } else { off = 32 + (k - 4) * 8; }
+            if (off > f.base - 8) {
+                rtfnFail(f, "OutgoingCallFrameTooSmall");
+                return;
+            }
+            ins2(f, "mov", mem64(4, off), reg64(0));
+            ns = ns + 1;
+        } else if (rtfnCFloat(c)) {
+            rtLoadReg(f, 0, listGet(args, k) catch I(0));
+            let xr = nf;
+            if (!sysv) { xr = k; }
+            ins2(f, "movq", asStructuredReg(3, xr), reg64(0));
+        }
+        if (!rtfnCFloat(c)) { ni = ni + 1; } else { nf = nf + 1; }
+        k = k + 1;
+    }
+    rtLoadReg(f, 10, L(fp));
+    // Pass 2: integer registers.
+    ni = 0;
+    k = 0;
+    while (k < listLen(args)) {
+        const c = listGet(cls, k) catch 0;
+        if (!rtfnCFloat(c)) {
+            let r = -1;
+            if (sysv) { if (ni < 6) { r = listGet(intRegs, ni) catch 7; } }
+            else if (k < 4) { r = listGet(intRegs, k) catch 1; }
+            if (r >= 0) { rtLoadReg(f, r, listGet(args, k) catch I(0)); }
+            ni = ni + 1;
+        } else if (!sysv && c == 7 && k < 4) {
+            rtLoadReg(f, listGet(intRegs, k) catch 1, listGet(args, k) catch I(0));
+        }
+        k = k + 1;
+    }
+    if (sysv) {
+        let used = nf;
+        if (used > 8) { used = 8; }
+        ins2(f, "mov", reg32(0), imm(used));
+    }
+    ins1(f, "call", reg64(10));
+    f.raxSlot = -1;
+    if (len(rf) > 0) {
+        ins2(f, "movq", reg64(1), asStructuredReg(3, 0));
+        rtStoreReg(f, rf, 1);
+    }
+    if (len(ri) > 0) { rtStoreReg(f, ri, 0); }
+}
+
+/// dst = the single-precision bit pattern (low 32 bits, upper zero) of the double whose bits
+/// are in x, rounded to nearest (D3 v0.23 FFI f32 arguments).
+export function rtF64ToF32Bits(f: Ref<RtFn>, dst: string, x: Ref<RtOp>): void {
+    if (f.rec) { const r = rtfnCall(K_F64_TO_F32); r.s1 = dst; r.o1 = x; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtF64ToF32Bits(f, dst, x); return; }
+    rtLoadReg(f, 0, x);
+    ins2(f, "movq", asStructuredReg(3, 0), reg64(0));
+    ins2(f, "cvtsd2ss", asStructuredReg(3, 0), asStructuredReg(3, 0));
+    ins2(f, "movq", reg64(0), asStructuredReg(3, 0));
+    ins2(f, "mov", reg32(0), reg32(0));
+    f.raxSlot = -1;
+    rtStoreReg(f, dst, 0);
+}
+
+/// dst = the double bits of the single-precision value in the low 32 bits of x (exact).
+export function rtF32BitsToF64(f: Ref<RtFn>, dst: string, x: Ref<RtOp>): void {
+    if (f.rec) { const r = rtfnCall(K_F32_TO_F64); r.s1 = dst; r.o1 = x; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtF32BitsToF64(f, dst, x); return; }
+    rtLoadReg(f, 0, x);
+    ins2(f, "movq", asStructuredReg(3, 0), reg64(0));
+    ins2(f, "cvtss2sd", asStructuredReg(3, 0), asStructuredReg(3, 0));
+    ins2(f, "movq", reg64(0), asStructuredReg(3, 0));
+    f.raxSlot = -1;
+    rtStoreReg(f, dst, 0);
+}
+
+/// Linux raw syscall: rax=nr, args in rdi rsi rdx r10 r8 r9; result to a local.
+export function rtSyscall(f: Ref<RtFn>, result: string, nr: int, args: List<Ref<RtOp>>): void {
+    if ((nr == 9 || nr == 10) && rtFaultActive(f)) { rtCallList(f, result, FAULT_PREFIX + "sys" + toStr(nr), args); return; }
+    if (f.rec) { const r = rtfnCall(K_SYSCALL); r.s1 = result; r.n1 = nr; r.args = rtCopyOps(args); listPush(f.calls, r); return; }
+    if (f.a64) {
+        rtfnFail(f, "RawSyscallOnA64");
+        return;
+    }
+    if (listLen(args) > 6) {
+        rtfnFail(f, "TooManySyscallArguments");
+        return;
+    }
+    const regs: List<int> = listNew(); listPush(regs, 7); listPush(regs, 6); listPush(regs, 2); listPush(regs, 10); listPush(regs, 8); listPush(regs, 9);
+    let k = 0;
+    while (k < listLen(args) && k < 6) {
+        rtLoadReg(f, listGet(regs, k) catch 7, listGet(args, k) catch I(0));
+        k = k + 1;
+    }
+    ins2(f, "mov", reg64(0), imm(nr));
+    ins0(f, "syscall");
+    if (len(result) > 0) { rtStoreReg(f, result, 0); }
+}
+
+// ---------------------------------------------------------------------------
+// 浮点（局部里放双精度的 64 位模式；单精度按 D3 §6.21-18 以双精度计算后舍入，见 rtF64ToF32Bits）
+// ---------------------------------------------------------------------------
+
+/// dst = a <op> c，op 为 fadd／fsub／fmul／fdiv（IEEE 双精度，就近舍入）。
+export function rtFop(f: Ref<RtFn>, dst: string, a: Ref<RtOp>, op: string, c: Ref<RtOp>): void {
+    if (f.rec) { const r = rtfnCall(K_FOP); r.s1 = dst; r.o1 = a; r.s2 = op; r.o2 = c; listPush(f.calls, r); return; }
+    let opcode = -1;
+    let mn = "";
+    if (op == "fmul") { opcode = 0; mn = "mulsd"; }
+    if (op == "fdiv") { opcode = 1; mn = "divsd"; }
+    if (op == "fadd") { opcode = 2; mn = "addsd"; }
+    if (op == "fsub") { opcode = 3; mn = "subsd"; }
+    if (opcode < 0) { rtfnFail(f, "BadFloatOp " + op); return; }
+    if (f.a64) { a64RtFop(f, dst, a, opcode, op, c); return; }
+    rtLoadReg(f, 0, a);
+    rtLoadReg(f, 1, c);
+    ins2(f, "movq", asStructuredReg(3, 0), reg64(0));
+    ins2(f, "movq", asStructuredReg(3, 1), reg64(1));
+    ins2(f, mn, asStructuredReg(3, 0), asStructuredReg(3, 1));
+    ins2(f, "movq", reg64(0), asStructuredReg(3, 0));
+    f.raxSlot = -1;
+    rtStoreReg(f, dst, 0);
+}
+
+/// if (a <cc> c) goto label，按 IEEE 比较：cc 为 lt le gt ge eq ne；有 NaN 时只有 ne 成立。
+export function rtFIf(f: Ref<RtFn>, a: Ref<RtOp>, cc: string, c: Ref<RtOp>, label: string): void {
+    if (f.rec) { const r = rtfnCall(K_FIF); r.o1 = a; r.s1 = cc; r.o2 = c; r.s2 = label; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtFIf(f, a, cc, c, label); return; }
+    rtLoadReg(f, 0, a);
+    rtLoadReg(f, 1, c);
+    ins2(f, "movq", asStructuredReg(3, 0), reg64(0));
+    ins2(f, "movq", asStructuredReg(3, 1), reg64(1));
+    // ucomisd 无序时 ZF=PF=CF=1：a < b 写成 b > a（ja 要 CF=0、ZF=0，无序时不成立），其余同理。
+    const target = rtfnLabel(f, label);
+    if (cc == "lt" || cc == "le") {
+        ins2(f, "ucomisd", asStructuredReg(3, 1), asStructuredReg(3, 0));
+        if (cc == "lt") { jmpTo(f, "ja", target); } else { jmpTo(f, "jae", target); }
+    } else if (cc == "gt" || cc == "ge") {
+        ins2(f, "ucomisd", asStructuredReg(3, 0), asStructuredReg(3, 1));
+        if (cc == "gt") { jmpTo(f, "ja", target); } else { jmpTo(f, "jae", target); }
+    } else if (cc == "eq") {
+        f.seq = f.seq + 1;
+        const skip = f.name + "__feq" + toStr(f.seq);
+        ins2(f, "ucomisd", asStructuredReg(3, 0), asStructuredReg(3, 1));
+        jmpTo(f, "jp", skip);
+        jmpTo(f, "je", target);
+        if (rtfnOpen(f)) { asBufferLabel(f.b, skip, 1); }
+    } else if (cc == "ne") {
+        ins2(f, "ucomisd", asStructuredReg(3, 0), asStructuredReg(3, 1));
+        jmpTo(f, "jp", target);
+        jmpTo(f, "jne", target);
+    } else { rtfnFail(f, "BadFloatCondition " + cc); }
+    f.raxSlot = -1;
+}
+
+/// dst = (double) x（有符号 64 位整数，就近舍入）。
+export function rtIntToF64(f: Ref<RtFn>, dst: string, x: Ref<RtOp>): void {
+    if (f.rec) { const r = rtfnCall(K_INT_TO_F64); r.s1 = dst; r.o1 = x; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtIntToF64(f, dst, x); return; }
+    rtLoadReg(f, 0, x);
+    ins2(f, "cvtsi2sd", asStructuredReg(3, 0), reg64(0));
+    ins2(f, "movq", reg64(0), asStructuredReg(3, 0));
+    f.raxSlot = -1;
+    rtStoreReg(f, dst, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 原子与内存序（设计 A7）：8 字节、按 8 对齐的单元。x86 上读写本就有序（TSO），读改写用 lock 前缀；A64 用 LDAR／STLR 与
+// LSE 的 AL 形读改写，合起来顺序一致。跨线程共享的单元一律经这些接口读写。
+// ---------------------------------------------------------------------------
+
+/// dst = *(addr + off)，获取语义。
+export function rtLoadAcq(f: Ref<RtFn>, dst: string, addr: Ref<RtOp>, off: int): void {
+    if (f.rec) { const r = rtfnCall(K_LOAD_ACQ); r.s1 = dst; r.o1 = addr; r.n1 = off; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtLoadAcq(f, dst, addr, off); return; }
+    rtLoad(f, dst, addr, off, 8);
+}
+
+/// *(addr + off) = value，释放语义。
+export function rtStoreRel(f: Ref<RtFn>, addr: Ref<RtOp>, off: int, value: Ref<RtOp>): void {
+    if (f.rec) { const r = rtfnCall(K_STORE_REL); r.o1 = addr; r.n1 = off; r.o2 = value; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtStoreRel(f, addr, off, value); return; }
+    rtStore(f, addr, off, value, 8);
+}
+
+/// old = *(addr + off); *(addr + off) = old + v（环绕），原子。
+export function rtAtomicAdd(f: Ref<RtFn>, old: string, addr: Ref<RtOp>, off: int, v: Ref<RtOp>): void {
+    if (f.rec) { const r = rtfnCall(K_ATOMIC_ADD); r.s1 = old; r.o1 = addr; r.n1 = off; r.o2 = v; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtAtomicAdd(f, old, addr, off, v); return; }
+    rtLoadReg(f, 1, addr);
+    rtLoadReg(f, 0, v);
+    ins2(f, "lockxadd", mem64(1, off), reg64(0));
+    f.raxSlot = -1;
+    rtStoreReg(f, old, 0);
+}
+
+/// old = *(addr + off); 若 old == expect 则 *(addr + off) = desired，原子；成功与否看 old 是否等于 expect。
+export function rtAtomicCas(f: Ref<RtFn>, old: string, addr: Ref<RtOp>, off: int, expect: Ref<RtOp>, desired: Ref<RtOp>): void {
+    if (f.rec) { const r = rtfnCall(K_ATOMIC_CAS); r.s1 = old; r.o1 = addr; r.n1 = off; r.o2 = expect; r.o3 = desired; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtAtomicCas(f, old, addr, off, expect, desired); return; }
+    rtLoadReg(f, 1, addr);
+    rtLoadReg(f, 8, desired);
+    rtLoadReg(f, 0, expect);
+    ins2(f, "lockcmpxchg", mem64(1, off), reg64(8));
+    f.raxSlot = -1;
+    rtStoreReg(f, old, 0);
+}
+
+/// old = *(addr + off); *(addr + off) = v，原子。
+export function rtAtomicXchg(f: Ref<RtFn>, old: string, addr: Ref<RtOp>, off: int, v: Ref<RtOp>): void {
+    if (f.rec) { const r = rtfnCall(K_ATOMIC_XCHG); r.s1 = old; r.o1 = addr; r.n1 = off; r.o2 = v; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtAtomicXchg(f, old, addr, off, v); return; }
+    rtLoadReg(f, 1, addr);
+    rtLoadReg(f, 0, v);
+    ins2(f, "xchg", mem64(1, off), reg64(0));
+    f.raxSlot = -1;
+    rtStoreReg(f, old, 0);
+}
+
+/// Return (optionally with a value in rax).
+export function rtRet(f: Ref<RtFn>, x: Ref<RtOp>): void {
+    if (f.rec) { const r = rtfnCall(K_RET); r.o1 = x; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtLoadX(f, 0, x); rtRetVoid(f); return; }
+    rtLoadReg(f, 0, x);
+    rtRetVoid(f);
+}
+
+/// 返回两个值：x86 在 rax、r8，A64 在 x0、x1（私有约定的第二结果，设计 A4）。
+export function rtRet2(f: Ref<RtFn>, x: Ref<RtOp>, y: Ref<RtOp>): void {
+    if (f.rec) { const r = rtfnCall(K_RET2); r.o1 = x; r.o2 = y; listPush(f.calls, r); return; }
+    if (f.a64) { a64RtLoadX(f, 1, y); a64RtLoadX(f, 0, x); rtRetVoid(f); return; }
+    rtLoadReg(f, 8, y);
+    rtLoadReg(f, 0, x);
+    rtRetVoid(f);
+}
+
+export function rtRetVoid(f: Ref<RtFn>): void {
+    if (f.rec) { listPush(f.calls, rtfnCall(K_RET_VOID)); return; }
+    if (!rtfnOpen(f)) { return; }
+    if (f.a64) { a64RtRetVoid(f); return; }
+    asBufferFunctionEpilogueStart(f.b);
+    asBufferFrame(f.b, "release-stack", 4, f.frame);
+    asBufferFrame(f.b, "return", -1, 8);
+}
+
+/// 不可达处的陷阱（不返回的调用之后等）：x86 ud2（Windows 上未处理即以 0xC000001D 结束），A64 brk #1（同 clang 的
+/// __builtin_trap；macOS 上为 SIGTRAP）。
+export function rtTrap(f: Ref<RtFn>): void {
+    if (f.rec) { listPush(f.calls, rtfnCall(K_TRAP)); return; }
+    if (f.a64) { a64RtTrap(f); return; }
+    ins0(f, "ud2");
+}
+
+/// Read-only byte string in .rdata under a label (no terminator added).
+/// 缓冲上有函数在记录时，随该函数的记录在原位置发出（条目次序与当场写相同）。
+export function rtRdataBytes(b: Ref<StructuredBuffer>, label: string, text: string): void {
+    for (f in rtRecording) {
+        if (f.b.id == b.id) { const r = rtfnCall(K_RDATA); r.s1 = label; r.s2 = text; listPush(f.calls, r); return; }
+    }
+    rdataBytes(b, label, text);
+}
+function rdataBytes(b: Ref<StructuredBuffer>, label: string, text: string): void {
+    asBufferSection(b, 1, 1);
+    asBufferLabel(b, label, 1);
+    let k = 0;
+    if (len(text) == 0) { asBufferByte(b, 0, 1); }
+    while (k < len(text)) { asBufferByte(b, byteAt(text, k) catch 0, 1); k = k + 1; }
+    asBufferSection(b, 0, 1);
+}

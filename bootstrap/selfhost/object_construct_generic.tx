@@ -1,0 +1,100 @@
+// 堆／帧构造器的可移植版（rtfn 写，macOS 适配 M4 设计 A8）：语义与导出名同 object_construct.tx（导出名表仍由
+// object_construct.tx 的 objectConstructNames 给出）。入口 (win, fn u32, pc u32, dst u32, bx u32[, extra])：extra 只在帧形
+// （_fr，值缓冲指针）与 __tx_newarrsl（slice 旗标，调用处只写低 32 位）时有；fn、pc、dst、bx 与旗标都只取低 32 位。
+// 规格（ObjectSpec64）由 __tx_native_construct_facts_v1 填好，值区段帧形用调用方的缓冲（values_init），堆形新分配（values_alloc）；
+// 建对象后把 {标签, 对象号} 写进 win[dst]（先 release 旧值）。newslice 的数组再包一层切片对象（标签 11）。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, L, I } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtShift, rtLoad, rtStore, rtAddrOf, rtLabel, rtIf, rtIf32, rtCall0, rtCall1, rtCall2, rtCall5, rtRetVoid } from "./rtfn";
+
+const MODULE: string = "bootstrap/selfhost/object_construct_generic.tx";
+const M32: int = 4294967295;
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// mode：0 struct、1 enum、2 ref、3 数组（帧形为 newarr，堆形为 newarr／newslice）。s0..s7 是规格（连续的局部槽）。
+function construct(b: Ref<StructuredBuffer>, failures: List<string>, name: string, mode: int, frame: bool): void {
+    let params = "win fn pc dst bx";
+    if (frame || mode == 3) { params = params + " extra"; }
+    const f = rtBegin(b, name, params, "s0 s1 s2 s3 s4 s5 s6 s7 sp tag val x y", 5, MODULE);
+    rtOp(f, "fn", L("fn"), "and", I(M32));
+    rtOp(f, "pc", L("pc"), "and", I(M32));
+    rtOp(f, "dst", L("dst"), "and", I(M32));
+    rtOp(f, "bx", L("bx"), "and", I(M32));
+    rtAddrOf(f, "sp", "s0");
+    rtCall5(f, "", "__tx_native_construct_facts_v1", L("fn"), L("pc"), L("bx"), I(mode), L("sp"));
+    if (frame) {
+        // 帧形：值区段就是调用方的缓冲。
+        rtLoad(f, "x", L("sp"), 24, 8);
+        rtStore(f, L("sp"), 16, L("extra"), 8);
+        rtCall2(f, "x", "__tx_native_values_init_v1", L("extra"), L("x"));
+        rtIf32(f, L("x"), "eq", I(0), "oom");
+    } else {
+        rtLoad(f, "x", L("sp"), 24, 8);
+        rtCall1(f, "y", "__tx_native_values_alloc_v1", L("x"));
+        rtStore(f, L("sp"), 16, L("y"), 8);
+        rtIf(f, L("y"), "ne", I(0), "allocated");
+        rtLoad(f, "x", L("sp"), 24, 8);
+        rtIf(f, L("x"), "ne", I(0), "oom");
+        rtLabel(f, "allocated");
+    }
+    let stat = 0;
+    if (frame) { stat = 1; }
+    rtCall1(f, "", "__tx_native_construct_stat_v1", I(stat));
+    rtCall2(f, "x", "__tx_site_of", L("fn"), L("pc"));
+    rtStore(f, L("sp"), 8, L("x"), 4);
+    rtCall1(f, "val", "__tx_native_object_create_v1", L("sp"));
+    rtOp(f, "val", L("val"), "and", I(M32));
+    if (frame) {
+        // 帧对象：对象头 flags 置位 4。
+        rtCall1(f, "x", "__tx_native_object_address_v1", L("val"));
+        rtLoad(f, "y", L("x"), 0, 4);
+        rtOp(f, "y", L("y"), "or", I(4));
+        rtStore(f, L("x"), 0, L("y"), 4);
+    }
+    let tag = mode + 7;
+    if (mode == 3) { tag = 10; }
+    rtSet(f, "tag", I(tag));
+    if (mode == 3 && frame == false) {
+        rtOp(f, "x", L("extra"), "and", I(M32));
+        rtIf(f, L("x"), "eq", I(0), "result");
+        // 切片：最初的数组引用成为切片持有者的引用。
+        rtStore(f, L("sp"), 0, I(7), 4);
+        rtStore(f, L("sp"), 12, I(4), 4);
+        rtStore(f, L("sp"), 40, L("val"), 4);
+        rtLoad(f, "x", L("sp"), 24, 4);
+        rtStore(f, L("sp"), 44, L("x"), 4);
+        rtStore(f, L("sp"), 16, I(0), 8);
+        rtStore(f, L("sp"), 24, I(0), 8);
+        rtStore(f, L("sp"), 32, I(0), 8);
+        rtCall1(f, "val", "__tx_native_object_create_v1", L("sp"));
+        rtOp(f, "val", L("val"), "and", I(M32));
+        rtSet(f, "tag", I(11));
+    }
+    rtLabel(f, "result");
+    rtShift(f, "x", L("dst"), "shl", 4);
+    rtOp(f, "x", L("x"), "add", L("win"));
+    rtCall1(f, "", "__tx_release", L("x"));
+    rtStore(f, L("x"), 0, L("tag"), 8);
+    rtStore(f, L("x"), 8, L("val"), 8);
+    rtRetVoid(f);
+    rtLabel(f, "oom");
+    rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+/// 发出八个构造器；rtfn 的失败记进 failures。t 为目标编号（只在语义随目标不同时用；这里不用）。
+export function objectConstructGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    construct(b, failures, "__tx_newstruct", 0, false);
+    construct(b, failures, "__tx_newenum", 1, false);
+    construct(b, failures, "__tx_newref", 2, false);
+    construct(b, failures, "__tx_newarrsl", 3, false);
+    construct(b, failures, "__tx_newstruct_fr", 0, true);
+    construct(b, failures, "__tx_newenum_fr", 1, true);
+    construct(b, failures, "__tx_newref_fr", 2, true);
+    construct(b, failures, "__tx_newarr_fr", 3, true);
+}

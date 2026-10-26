@@ -1,0 +1,452 @@
+// 可移植渲染器（macOS 适配 M4 设计 A9 修订，docs/design/v052-macos-m4-arm64-v0.1-20261024.md）：读 emitmirror v3 记录流，经
+// gen_ops 的指令宏出 x86_64 或 A64 代码，每个函数一个缓冲。x86 上只供 --codegen=portable 对照验证（生产仍走 emitmirror）；
+// aarch64 目标只有这一条路。记录的形状校验与 emitmirror 共用；首版不做 run 内寄存器分配，每个定义直接写回值槽。
+import { validV2Shape } from "../emitmirror";
+import { PCtx, POp, pAt, pField, pRej, pcLbl, epiLbl, tagOff, payOff, ldPay, stPay, stPayI, stTag, releaseOld, trap, sblMat, sblRedirect } from "./emit_portable_core";
+import { pLop } from "./emit_portable_lop";
+import { genNew, genAppend, genSubmit, genAt, genFnBegin, genWinFromArg, genFnEpilogue, genLabel, genJmp, genMovI, genLd, genStI, genOpI, genOpO, genNegO, genDivRem, genBr, genBrI, genSet, genFop, genFBr, genFSet, genI2F, genCall, args0, G_W, G_T0, G_T1, G_SP } from "./gen_ops";
+import { asProducerInteger } from "./assemble";
+import { TB_MASK, TB_TASK_RESUME } from "./thread_block_abi";
+import { valueAbiCompatible } from "./value_abi";
+
+let epDiag: string = "";
+export function epDiagOut(): string { return epDiag; }
+
+function newCtx(a64: bool): Ref<PCtx> {
+    return new PCtx { g: genNew(a64), a64: a64, fnIdx: 0, regCount: 0, framePad: 0, frameTotal: 0, hasFn: false, sawFn: false,
+        escBuf: listNew(), escUnits: listNew(), escScalar: listNew(), escNTags: listNew(), escTagFirst: listNew(), escTagFlat: listNew(),
+        sblIdx: listNew(), sblCond: listNew(), sblExit: listNew(), sblAdd: listNew(), sblRoot: listNew(), sblBSlot: listNew(),
+        sblPrepend: listNew(), sblBase: listNew(), resumePcs: listNew(), resumeLand: listNew(), pendLbls: listNew(),
+        runLen: 0, runFused: 0, run: listNew(), runLbls: listNew(), pendingPayload: "", pendingLiveN: -1,
+        rejFn: listNew(), rejPc: listNew(), rejCode: listNew(), rejDetail: listNew() };
+}
+
+// 与 emitmirror.recordFields 同：去掉行尾 CR，空行与 # 注释跳过，按空格切分并去掉空字段。
+function fields(line: string): List<string> {
+    let body = line;
+    const n = len(line);
+    if (n > 0 && (byteAt(line, n - 1) catch 10) == 13) { body = strSub(line, 0, n - 1); }
+    const out: List<string> = listNew();
+    if (len(body) == 0 || (byteAt(body, 0) catch 35) == 35) { return out; }
+    const parts = strSplit(body, " ");
+    let i = 0;
+    while (i < listLen(parts)) {
+        const t = listGet(parts, i) catch "";
+        if (len(t) > 0) { listPush(out, t); }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// 渲染整份记录流到当前映像（代码节）；a64 选 A64 落地。成功 0；拒绝 1（原因见 epDiagOut）。
+export function emitPortableRecords(text: string, a64: bool): int {
+    epDiag = "";
+    if (!valueAbiCompatible()) { epDiag = "VALUE-ABI-REJECT incompatible revision1 layout\n"; return 1; }
+    const c = newCtx(a64);
+    const lines = strSplit(text, "\n");
+    let first = true;
+    let li = 0;
+    while (li < listLen(lines)) {
+        const rec = fields(listGet(lines, li) catch "");
+        li = li + 1;
+        if (listLen(rec) == 0) { continue; }
+        if (first) {
+            first = false;
+            if ((listGet(rec, 0) catch "") != "emitmirror_v3") { pRej(c, 0, "E011", "portable_needs_v3"); break; }
+        }
+        dispatch(c, rec);
+    }
+    if (c.pendingPayload != "") { pRej(c, 0, "E009", "missing_" + c.pendingPayload); }
+    if (c.runLen > 0) { pRej(c, 0, "E009", "missing_live"); }
+    if (c.hasFn) { pRej(c, 0, "E009", "missing_endf"); }
+    if (!c.sawFn && listLen(c.rejCode) == 0) { pRej(c, 0, "E010", "no_fn_records"); }
+    if (listLen(c.rejCode) > 0) {
+        let j = 0;
+        while (j < listLen(c.rejCode)) {
+            epDiag = epDiag + "PORTABLE-REJECT " + (listGet(c.rejCode, j) catch "") + " fn=" + toStr(pAt(c.rejFn, j)) + " pc=" + toStr(pAt(c.rejPc, j))
+            + " " + (listGet(c.rejDetail, j) catch "") + "\n";
+            j = j + 1;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+function isRunKind(k: string): bool {
+    return k == "move" || k == "loadk_int" || k == "add_i" || k == "sub_i" || k == "mul_i" || k == "lt_i" || k == "le_i" || k == "eq_i"
+    || k == "eq_b" || k == "lt_f" || k == "le_f" || k == "eq_f" || k == "jf_b" || k == "jt_b" || k == "add_f" || k == "sub_f"
+    || k == "mul_f" || k == "i2f_f" || k == "loadk_float" || k == "div_i" || k == "mod_i" || k == "neg_i" || k == "not_b"
+    || k == "ldbool" || k == "ldnone" || k == "neg_f";
+}
+
+function lastOp(c: Ref<PCtx>): Ref<POp> {
+    return listGet(c.run, listLen(c.run) - 1) catch new POp { pc: 0, kind: "", u0: 0, t0: 0, u1: 0, t1: 0, def: 0, ot: 0, nt: 0, bx: 0,
+        val: 0, fval: "", msgI: 0, msgL: 0, msg2I: 0, msg2L: 0, msgN: 0 };
+}
+
+function dispatch(c: Ref<PCtx>, rec: List<string>): void {
+    const op = listGet(rec, 0) catch "";
+    let accept = false;
+    if (c.pendingPayload != "") {
+        if (op == c.pendingPayload) {
+            accept = true;
+            // div_i 带两条消息（除零、溢出）。
+            let keep = false;
+            if (op == "msg" && listLen(c.run) > 0) {
+                const last = lastOp(c);
+                if (last.kind == "div_i" && last.msgN == 0) { keep = true; }
+            }
+            if (!keep) { c.pendingPayload = ""; }
+        } else {
+            pRej(c, 0, "E009", "missing_" + c.pendingPayload);
+            c.pendingPayload = "";
+        }
+    }
+    if ((op == "val" || op == "msg" || op == "fval") && !accept) { pRej(c, 0, "E009", "unexpected_" + op); return; }
+    if (!validV2Shape(rec)) { pRej(c, 0, "E009", "record_shape_" + op); return; }
+    if (op == "emitmirror_v3" || op == "entry") { return; }
+    if (op == "emitmirror_v2") { pRej(c, 0, "E011", "portable_needs_v3"); return; }
+    if (op == "target") {
+        const t = listGet(rec, 1) catch "";
+        if (t != "win64" && t != "x64_window") { pRej(c, 0, "E011", "target_" + t); }
+        return;
+    }
+    if (op == "frame_pad") { c.framePad = pField(rec, 1, 0); return; }
+    if (op == "esc") {
+        const si = pField(rec, 1, 0);
+        while (listLen(c.escBuf) <= si) {
+            listPush(c.escBuf, 0); listPush(c.escUnits, 0); listPush(c.escScalar, 0); listPush(c.escNTags, 0); listPush(c.escTagFirst, 0);
+        }
+        listSet(c.escUnits, si, pField(rec, 4, 0));
+        listSet(c.escScalar, si, pField(rec, 5, 0));
+        listSet(c.escBuf, si, 56 + pField(rec, 6, 0));
+        listSet(c.escNTags, si, pField(rec, 8, 0));
+        listSet(c.escTagFirst, si, listLen(c.escTagFlat));
+        return;
+    }
+    if (op == "etag") { listPush(c.escTagFlat, pField(rec, 1, 0)); return; }
+    if (op == "sbl") {
+        const sbi = pField(rec, 1, 0);
+        while (listLen(c.sblIdx) <= sbi) {
+            listPush(c.sblIdx, -1); listPush(c.sblCond, 0); listPush(c.sblExit, 0); listPush(c.sblAdd, 0); listPush(c.sblRoot, 0);
+            listPush(c.sblBSlot, 0); listPush(c.sblPrepend, 0); listPush(c.sblBase, 0);
+        }
+        listSet(c.sblIdx, sbi, sbi);
+        listSet(c.sblCond, sbi, pField(rec, 3, 0));
+        listSet(c.sblExit, sbi, pField(rec, 4, 0));
+        listSet(c.sblAdd, sbi, pField(rec, 5, 0));
+        listSet(c.sblRoot, sbi, pField(rec, 6, 0));
+        listSet(c.sblBSlot, sbi, pField(rec, 7, 0));
+        listSet(c.sblPrepend, sbi, pField(rec, 8, 0));
+        listSet(c.sblBase, sbi, pField(rec, 9, 0));
+        return;
+    }
+    if (op == "fn") { beginFn(c, rec); return; }
+    if (op == "lbl") {
+        if (c.runLen > 0) { listPush(c.runLbls, pField(rec, 1, 0)); } else { listPush(c.pendLbls, pField(rec, 1, 0)); }
+        return;
+    }
+    if (op == "run") {
+        const size = pField(rec, 1, 0);
+        const fused = pField(rec, 2, 0);
+        if (!c.hasFn || c.runLen > 0 || size < 0 || (fused != 0 && fused != 1)) { pRej(c, 0, "E009", "run_state"); return; }
+        c.runLen = size;
+        c.runFused = fused;
+        c.run = listNew();
+        c.runLbls = c.pendLbls;
+        c.pendLbls = listNew();
+        c.pendingLiveN = -1;
+        return;
+    }
+    if (op == "op") {
+        const kind = listGet(rec, 2) catch "";
+        const pc = pField(rec, 1, 0);
+        if (!c.hasFn || c.runLen <= 0 || listLen(c.run) >= c.runLen) { pRej(c, pc, "E009", "op_state"); return; }
+        if (!isRunKind(kind)) { pRej(c, pc, "E001", kind); return; }
+        listPush(c.run, new POp { pc: pc, kind: kind, u0: pField(rec, 3, 0), t0: pField(rec, 4, 0), u1: pField(rec, 5, 0), t1: pField(rec, 6, 0),
+                def: pField(rec, 7, 0), ot: pField(rec, 8, 0), nt: pField(rec, 9, 0), bx: pField(rec, 10, 0),
+                val: 0, fval: "", msgI: 0, msgL: 0, msg2I: 0, msg2L: 0, msgN: 0 });
+        if (kind == "loadk_int") { c.pendingPayload = "val"; }
+        if (kind == "loadk_float") { c.pendingPayload = "fval"; }
+        if (kind == "add_i" || kind == "sub_i" || kind == "mul_i" || kind == "neg_i" || kind == "div_i" || kind == "mod_i") { c.pendingPayload = "msg"; }
+        return;
+    }
+    if (op == "val") { const last = lastOp(c); last.val = pField(rec, 1, 0); return; }
+    if (op == "fval") { const last = lastOp(c); last.fval = listGet(rec, 1) catch ""; return; }
+    if (op == "msg") {
+        const last = lastOp(c);
+        if (last.msgN == 0) { last.msgI = pField(rec, 1, 0); last.msgL = pField(rec, 2, 0); last.msgN = 1; }
+        else if (last.msgN == 1 && last.kind == "div_i") { last.msg2I = pField(rec, 1, 0); last.msg2L = pField(rec, 2, 0); last.msgN = 2; }
+        else { pRej(c, last.pc, "E009", "msg_mult"); }
+        return;
+    }
+    if (op == "live") {
+        c.pendingLiveN = pField(rec, 1, 0);
+        if (!c.hasFn || c.runLen <= 0 || listLen(c.run) != c.runLen || c.pendingLiveN < 0 || c.pendingLiveN > c.regCount) {
+            pRej(c, 0, "E009", "live_shape");
+            return;
+        }
+        if (c.pendingLiveN == 0) { renderRun(c); }
+        return;
+    }
+    if (op == "liveslot") {
+        const slot = pField(rec, 1, 0);
+        if (c.pendingLiveN <= 0 || slot < 0 || slot >= c.regCount) { pRej(c, 0, "E009", "liveslot_shape"); return; }
+        c.pendingLiveN = c.pendingLiveN - 1;
+        if (c.pendingLiveN == 0) { renderRun(c); }
+        return;
+    }
+    if (op == "lop") {
+        if (!c.hasFn || c.runLen > 0) { pRej(c, pField(rec, 1, 0), "E009", "lop_state"); return; }
+        flushPendLbls(c);
+        pLop(c, rec);
+        return;
+    }
+    if (op == "rej") { pRej(c, pField(rec, 1, 0), listGet(rec, 2) catch "E009", listGet(rec, 3) catch "recorded"); return; }
+    if (op == "endf") { endFn(c); return; }
+    if (op == "resume") {
+        if (!c.hasFn) { pRej(c, 0, "E009", "resume_state"); return; }
+        listPush(c.resumePcs, pField(rec, 1, 0));
+        listPush(c.resumeLand, pField(rec, 2, -1));
+        return;
+    }
+    pRej(c, 0, "E009", "rec_" + op);
+}
+
+function beginFn(c: Ref<PCtx>, rec: List<string>): void {
+    if (c.hasFn) { pRej(c, c.fnIdx, "E009", "nested_fn"); return; }
+    c.hasFn = true;
+    c.sawFn = true;
+    c.fnIdx = pField(rec, 1, 0);
+    c.regCount = pField(rec, 2, 0);
+    const padEsc = pField(rec, 4, 0);
+    const padCache = pField(rec, 5, 0);
+    const padStrbld = pField(rec, 6, 0);
+    const padVh = pField(rec, 7, 0);
+    const isaGuard = pField(rec, 8, 0);
+    c.frameTotal = c.framePad + padEsc + padCache + padStrbld + padVh;
+    c.escBuf = listNew(); c.escUnits = listNew(); c.escScalar = listNew(); c.escNTags = listNew(); c.escTagFirst = listNew(); c.escTagFlat = listNew();
+    c.sblIdx = listNew(); c.sblCond = listNew(); c.sblExit = listNew(); c.sblAdd = listNew(); c.sblRoot = listNew(); c.sblBSlot = listNew();
+    c.sblPrepend = listNew(); c.sblBase = listNew();
+    c.resumePcs = listNew(); c.resumeLand = listNew();
+    c.runLen = 0;
+    c.g = genNew(c.a64);
+    if (isaGuard == 1) { pRej(c, 0, "E008", "isa_guard"); }
+    if (padCache > 0) { pRej(c, 0, "E005", "cache_pad"); }
+    if (padVh > 0) { pRej(c, 0, "E005", "vh_pad"); }
+}
+
+function flushPendLbls(c: Ref<PCtx>): void {
+    let i = 0;
+    while (i < listLen(c.pendLbls)) {
+        const pc = pAt(c.pendLbls, i);
+        genAt(c.g, pc);
+        sblMat(c, pc);
+        genLabel(c.g, pcLbl(c, pc));
+        i = i + 1;
+    }
+    c.pendLbls = listNew();
+}
+
+// —— run：类型已证的值形操作，逐条读写值槽 ——
+// 定义前：旧标签未知（ot＝0）的目标槽先释放旧值。
+function defMark(c: Ref<PCtx>, o: Ref<POp>): void {
+    if (o.ot == 0) { releaseOld(c, o.def, pcLbl(c, o.pc) + "nrl"); }
+}
+function storeDef(c: Ref<PCtx>, o: Ref<POp>, tag: int): void {
+    stPay(c, o.def, G_T0);
+    stTag(c, o.def, tag);
+}
+
+function renderRun(c: Ref<PCtx>): void {
+    const g = c.g;
+    const n = c.runLen;
+    let branchEnd = false;
+    if (n > 0) {
+        const lastKind = (listGet(c.run, n - 1) catch lastOp(c)).kind;
+        branchEnd = lastKind == "jf_b" || lastKind == "jt_b";
+    }
+    let pos = 0;
+    while (pos < n) {
+        const o = listGet(c.run, pos) catch lastOp(c);
+        const lbl = pcLbl(c, o.pc);
+        genAt(g, o.pc);
+        if (pos < listLen(c.runLbls) && pAt(c.runLbls, pos) == o.pc) {
+            sblMat(c, o.pc);
+            genLabel(g, lbl);
+        }
+        if (c.runFused == 1 && pos == n - 2) { pos = pos + 1; continue; }
+        if (c.runFused == 1 && pos == n - 1) { fusedBranch(c, listGet(c.run, pos - 1) catch o, o); pos = pos + 1; continue; }
+        if (branchEnd && pos == n - 1) {
+            ldPay(c, G_T0, o.u0);
+            let cc = "eq";
+            if (o.kind == "jt_b") { cc = "ne"; }
+            genBrI(g, cc, G_T0, 0, pcLbl(c, o.bx));
+            pos = pos + 1;
+            continue;
+        }
+        const k = o.kind;
+        defMark(c, o);
+        if (k == "move") {
+            ldPay(c, G_T0, o.u0);
+            storeDef(c, o, o.t0);
+        } else if (k == "loadk_int") {
+            genMovI(g, G_T0, o.val);
+            storeDef(c, o, 1);
+        } else if (k == "loadk_float") {
+            genMovI(g, G_T0, asProducerInteger(o.fval));
+            storeDef(c, o, 2);
+        } else if (k == "ldbool" || k == "ldnone") {
+            let v = o.bx;
+            let tag = 3;
+            if (k == "ldnone") { v = 0; tag = 4; }
+            stPayI(c, o.def, v);
+            stTag(c, o.def, tag);
+        } else if (k == "add_i" || k == "sub_i" || k == "mul_i") {
+            let op = "mul";
+            if (k == "add_i") { op = "add"; }
+            if (k == "sub_i") { op = "sub"; }
+            ldPay(c, G_T0, o.u0);
+            ldPay(c, G_T1, o.u1);
+            genOpO(g, op, G_T0, G_T0, G_T1, lbl + "tof");
+            storeDef(c, o, 1);
+            genJmp(g, lbl + "tend");
+            genLabel(g, lbl + "tof");
+            trap(c, o.pc, 4004, o.msgI, o.msgL);
+            genLabel(g, lbl + "tend");
+        } else if (k == "div_i" || k == "mod_i") {
+            ldPay(c, G_T0, o.u0);
+            ldPay(c, G_T1, o.u1);
+            genBrI(g, "eq", G_T1, 0, lbl + "tdz");
+            genBrI(g, "ne", G_T1, -1, lbl + "tidv");
+            if (k == "div_i") {
+                genNegO(g, G_T0, G_T0, lbl + "tov");
+                genJmp(g, lbl + "thv");
+                genLabel(g, lbl + "tov");
+                trap(c, o.pc, 4004, o.msg2I, o.msg2L);
+            } else {
+                genMovI(g, G_T0, 0);
+                genJmp(g, lbl + "thv");
+            }
+            genLabel(g, lbl + "tidv");
+            if (k == "div_i") { genDivRem(g, true, G_T0, -1, G_T0, G_T1); } else { genDivRem(g, true, -1, G_T0, G_T0, G_T1); }
+            genLabel(g, lbl + "thv");
+            storeDef(c, o, 1);
+            genJmp(g, lbl + "tend");
+            genLabel(g, lbl + "tdz");
+            trap(c, o.pc, 4001, o.msgI, o.msgL);
+            genLabel(g, lbl + "tend");
+        } else if (k == "neg_i") {
+            ldPay(c, G_T0, o.u0);
+            genNegO(g, G_T0, G_T0, lbl + "ngo");
+            storeDef(c, o, 1);
+            genJmp(g, lbl + "nge");
+            genLabel(g, lbl + "ngo");
+            trap(c, o.pc, 4004, o.msgI, o.msgL);
+            genLabel(g, lbl + "nge");
+        } else if (k == "not_b") {
+            ldPay(c, G_T0, o.u0);
+            genOpI(g, "xor", G_T0, G_T0, 1);
+            storeDef(c, o, 3);
+        } else if (k == "neg_f") {
+            ldPay(c, G_T0, o.u0);
+            genOpI(g, "xor", G_T0, G_T0, -9223372036854775807 - 1);
+            storeDef(c, o, 2);
+        } else if (k == "lt_i" || k == "le_i" || k == "eq_i" || k == "eq_b") {
+            ldPay(c, G_T0, o.u0);
+            ldPay(c, G_T1, o.u1);
+            genSet(g, strSub(k, 0, 2), G_T0, G_T0, G_T1);
+            storeDef(c, o, 3);
+        } else if (k == "lt_f" || k == "le_f" || k == "eq_f") {
+            ldPay(c, G_T0, o.u0);
+            ldPay(c, G_T1, o.u1);
+            genFSet(g, strSub(k, 0, 2), G_T0, G_T0, G_T1);
+            storeDef(c, o, 3);
+        } else if (k == "add_f" || k == "sub_f" || k == "mul_f") {
+            ldPay(c, G_T0, o.u0);
+            ldPay(c, G_T1, o.u1);
+            genFop(g, "f" + strSub(k, 0, 3), G_T0, G_T0, G_T1);
+            storeDef(c, o, 2);
+        } else if (k == "i2f_f") {
+            ldPay(c, G_T0, o.u0);
+            genI2F(g, G_T0, G_T0);
+            storeDef(c, o, 2);
+        } else {
+            pRej(c, o.pc, "E001", k);
+        }
+        pos = pos + 1;
+    }
+    c.runLen = 0;
+    c.run = listNew();
+    c.runLbls = listNew();
+}
+
+// 融合的比较＋分支：jt 在条件成立时转，jf 在不成立时转（浮点的“不成立”含无序）。
+function fusedBranch(c: Ref<PCtx>, cmp: Ref<POp>, br: Ref<POp>): void {
+    const g = c.g;
+    let target = pcLbl(c, br.bx);
+    const redir = sblRedirect(c, br.pc, br.bx);
+    if (len(redir) > 0) { target = redir; }
+    const jt = br.kind == "jt_b";
+    ldPay(c, G_T0, cmp.u0);
+    ldPay(c, G_T1, cmp.u1);
+    const k = cmp.kind;
+    if (k == "lt_i") { if (jt) { genBrCC(c, "lt", target); } else { genBrCC(c, "ge", target); } return; }
+    if (k == "le_i") { if (jt) { genBrCC(c, "le", target); } else { genBrCC(c, "gt", target); } return; }
+    if (k == "eq_i" || k == "eq_b") { if (jt) { genBrCC(c, "eq", target); } else { genBrCC(c, "ne", target); } return; }
+    if (k == "lt_f") { if (jt) { genFBr(g, "lt", G_T0, G_T1, target); } else { genFBr(g, "nlt", G_T0, G_T1, target); } return; }
+    if (k == "le_f") { if (jt) { genFBr(g, "le", G_T0, G_T1, target); } else { genFBr(g, "nle", G_T0, G_T1, target); } return; }
+    if (k == "eq_f") { if (jt) { genFBr(g, "eq", G_T0, G_T1, target); } else { genFBr(g, "ne", G_T0, G_T1, target); } return; }
+    pRej(c, br.pc, "E009", "fused_cmp_pair_" + k);
+}
+function genBrCC(c: Ref<PCtx>, cc: string, target: string): void { genBr(c.g, cc, G_T0, G_T1, target); }
+
+// —— 函数装配：开头（帧、字符串构建环的标志清零、W、可挂起函数的恢复分派）＋体＋尾 ——
+function endFn(c: Ref<PCtx>): void {
+    if (!c.hasFn || c.runLen > 0 || c.pendingPayload != "") { pRej(c, c.fnIdx, "E009", "endf_state"); return; }
+    // 同 emitmirror：函数尾挂起的标号不发（记录流不会让跳转落在函数尾之后）。
+    c.pendLbls = listNew();
+    const f = genNew(c.a64);
+    f.b.listFn = c.fnIdx; // 函数清单（A64）记在本函数名下；清单关闭时不起作用
+    genFnBegin(f, c.fnIdx, c.frameTotal);
+    let s = 0;
+    while (s < listLen(c.sblIdx)) {
+        if (pAt(c.sblIdx, s) == s) { genStI(f, 4, G_SP, pAt(c.sblBase, s) + s * 48 + 24, 0); }
+        s = s + 1;
+    }
+    genWinFromArg(f);
+    const fl = ".L" + toStr(c.fnIdx) + "_";
+    const hasResume = listLen(c.resumePcs) > 0;
+    if (hasResume) {
+        genOpI(f, "and", G_T0, G_W, TB_MASK);
+        genLd(f, 4, G_T0, G_T0, TB_TASK_RESUME);
+        genBrI(f, "ne", G_T0, 0, fl + "resume");
+    }
+    genAppend(f, c.g);
+    if (hasResume) {
+        // TB_TASK_RESUME＝pc+1 跳回挂起点；加 2^30 的是取消落点（defer）；≥2^30 而无落点的直接收尾；其他值是内核错误。
+        genJmp(f, epiLbl(c));
+        genLabel(f, fl + "resume");
+        genOpI(f, "and", G_T1, G_W, TB_MASK);
+        genStI(f, 4, G_T1, TB_TASK_RESUME, 0);
+        let ri = 0;
+        while (ri < listLen(c.resumePcs)) {
+            genBrI(f, "eq", G_T0, pAt(c.resumePcs, ri) + 1, fl + toStr(pAt(c.resumePcs, ri)));
+            ri = ri + 1;
+        }
+        ri = 0;
+        while (ri < listLen(c.resumeLand)) {
+            if (pAt(c.resumeLand, ri) >= 0) {
+                genBrI(f, "eq", G_T0, pAt(c.resumePcs, ri) + 1 + 1073741824, fl + toStr(pAt(c.resumeLand, ri)));
+            }
+            ri = ri + 1;
+        }
+        genBrI(f, "uge", G_T0, 1073741824, epiLbl(c));
+        genCall(f, "__tx_task_bad_resume", args0());
+    }
+    genLabel(f, epiLbl(c));
+    genFnEpilogue(f);
+    const why = genSubmit(f);
+    if (len(why) > 0) { pRej(c, c.fnIdx, "E009", "gen_" + why); }
+    c.hasFn = false;
+}

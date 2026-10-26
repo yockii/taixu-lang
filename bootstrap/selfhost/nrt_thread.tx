@@ -1,0 +1,394 @@
+// NRT 线程区域（线程第 1 步，docs/design/v052-threads-v0.1-20261015.md §十二；2d 改为惰性提交，§十七）：每个线程
+// 一块按 TB_REGION 对齐的区域，起点是线程块（初值全零），其后是值槽栈；已提交的值槽全部为 None 或活值，区域内
+// 未提交的部分不可访问。做法：保留两倍区域大小的地址空间，取其中按 TB_REGION 对齐的起点，只把线程块与值槽栈
+// 首段改为可读写，其余由 __tx_stack_more 按需提交。Windows 用 VirtualAlloc 保留后再提交；Linux 用
+// mmap(PROT_NONE) 后 mprotect，并把对齐区域外的头尾归还。
+//
+// 平台 TLS（§十二-5）：每个线程一个 8 字节的 TLS 槽存本线程的线程块地址（外来线程为 0），只给没有
+// 值槽窗口可用的外部入口（回调蹦床）用；热路径仍由 rbx 求线程块。Windows 为 PE 隐式 TLS：内核自带
+// IMAGE_TLS_DIRECTORY64（__tx_tls_directory，链接器只把数据目录 9 指向它），槽在本模块 TLS 块的偏移 0；
+// Linux 为 PT_TLS（模板 __tx_tls_template，8 字节、对齐 8），主程序的 TLS 块紧挨在线程指针之下，
+// 槽即 fs:[-8]——动态产物由动态加载器建立，静态产物由 _start 用 __tx_tls_static 自设（见 nrt.tx）；
+// macOS 为 TLV：链接器合成描述符 __tx_tls_tlv（link_macho.tx），叶子经 dyld 的取址函数得到槽地址。
+import { Operand, StructuredBuffer, asBufferLabel, asBufferSection, asBufferAlign, asBufferAddress, asBufferQuad, asBufferZero, asBufferInstruction, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem, asStructuredSegMem } from "./assemble";
+import { RtFn, RtOp, L, I, A, G } from "./rtfn_base";
+import { rtBegin, rtSet, rtSetGlobal, rtOp, rtShift, rtLoad, rtAddrOf, rtIf, rtLabel, rtJump, rtStore, rtCall0, rtCall1, rtCall2, rtCall4, rtCall5, rtCallC, rtSyscall, rtLoadAcq, rtStoreRel, rtAtomicAdd, rtRet, rtRetVoid } from "./rtfn";
+import { check, text } from "./nrt_base";
+import { tPe, tElf, tKernel32, tRawSyscall, tUnix, tMacos } from "./target";
+import { uxSys, uxMac, uxMapFlags } from "./unix_sys";
+import { TB_REGION, TB_MASK, TB_HEADER, TB_STACK_INIT, TB_USED, TB_RESERVATION, TB_OS_TID } from "./thread_block_abi";
+
+export const NRT_THREAD_EXPORTS: string = "__tx_tls_tb_get __tx_stack_more";
+
+const MEM_COMMIT: int = 4096;
+const MEM_RESERVE: int = 8192;
+const PAGE_NOACCESS: int = 1;
+const PAGE_READWRITE: int = 4;
+// MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
+const MAP_FLAGS: int = 16418;
+// 值槽栈按需提交的取整粒度。
+const COMMIT_ROUND: int = 65536;
+// 原生栈：上界留给内核例程、系统调用与 trap 输出的余量；Linux 主线程按 RLIMIT_STACK 软限，超过此值（含无限）按此值；
+// 工作线程的栈（同 nrt_spawn.tx 的 STACK_BYTES）；从当前帧往上估计栈顶时的余量。
+const NATIVE_MARGIN: int = 262144;
+const MAIN_STACK_CAP: int = 67108864;
+const THREAD_STACK_BYTES: int = 8388608;
+const TOP_SLACK: int = 65536;
+
+function sys2(n: int, a: Ref<RtOp>, c: Ref<RtOp>): List<Ref<RtOp>> {
+    const xs: List<Ref<RtOp>> = listNew();
+    listPush(xs, a); listPush(xs, c);
+    if (n == 3) { listPush(xs, I(3)); }
+    return xs;
+}
+
+/// __tx_nrt_region_new() → 新线程块的地址；失败为 0。只用局部量与系统调用，不访问任何线程块
+/// （进程入口调用它时 rbx 还没有意义）。
+export function emitNrtRegion(b: Ref<StructuredBuffer>, t: int): void {
+    // macOS 的 mmap 经蹦床按私有约定传 6 个实参（第 5、6 个在出参区），Linux 的系统调用全在寄存器里。
+    let maxArgs = 4;
+    if (tMacos(t)) { maxArgs = 6; }
+    const f = rtBegin(b, "__tx_nrt_region_new", "", "p a q e", maxArgs, "bootstrap/selfhost/nrt_thread.tx");
+    if (tUnix(t)) {
+        const xs: List<Ref<RtOp>> = listNew();
+        listPush(xs, I(0)); listPush(xs, I(2 * TB_REGION)); listPush(xs, I(0)); listPush(xs, I(uxMapFlags(t, MAP_FLAGS))); listPush(xs, I(-1)); listPush(xs, I(0));
+        uxSys(f, t, "p", 9, xs);
+        rtIf(f, L("p"), "uge", I(-4095), "fail");
+    } else {
+        rtCall4(f, "p", "VirtualAlloc", I(0), I(2 * TB_REGION), I(MEM_RESERVE), I(PAGE_NOACCESS));
+        rtIf(f, L("p"), "eq", I(0), "fail");
+    }
+    rtOp(f, "a", L("p"), "add", I(TB_REGION - 1));
+    rtOp(f, "a", L("a"), "and", I(TB_MASK));
+    if (tUnix(t)) {
+        // 头 [p, a)、尾 [a + R, p + 2R) 归还（尾总是非空：a − p < R）。
+        rtOp(f, "q", L("a"), "sub", L("p"));
+        rtIf(f, L("q"), "eq", I(0), "nohead");
+        uxSys(f, t, "", 11, sys2(2, L("p"), L("q")));
+        rtLabel(f, "nohead");
+        rtOp(f, "q", L("a"), "add", I(TB_REGION));
+        rtOp(f, "e", L("p"), "add", I(2 * TB_REGION)); rtOp(f, "e", L("e"), "sub", L("q"));
+        uxSys(f, t, "", 11, sys2(2, L("q"), L("e")));
+        // mprotect(a, TB_USED, PROT_READ | PROT_WRITE)
+        uxSys(f, t, "q", 10, sys2(3, L("a"), I(TB_USED)));
+        rtIf(f, L("q"), "ne", I(0), "fail");
+    } else {
+        rtCall4(f, "q", "VirtualAlloc", L("a"), I(TB_USED), I(MEM_COMMIT), I(PAGE_READWRITE));
+        rtIf(f, L("q"), "eq", I(0), "fail");
+    }
+    rtOp(f, "q", L("a"), "add", I(TB_HEADER));
+    rtCall2(f, "", "__tx_native_values_init_v1", L("q"), I(TB_STACK_INIT / 16));
+    rtStore(f, L("a"), TB_RESERVATION, L("p"), 8);
+    rtRet(f, L("a"));
+    rtLabel(f, "fail");
+    rtRet(f, I(0));
+    check(f);
+}
+
+/// 值槽栈按需提交与原生栈上界（2d，线程设计 §十七）。
+export function emitNrtStack(b: Ref<StructuredBuffer>, t: int): void {
+    // __tx_stack_more(need) → 1：本线程值槽栈的已提交末端已推进到 ≥ need（新段填 None）；0：原生栈已到上界或 need
+    // 超出区域（调用方报 4003）。提交失败是内存耗尽，不是栈深度超限：按附录 A 致命（taixu: 内存不足、退出码 3），不返回
+    // （取页失败注入扫描查出原报 4003，docs/design/v052-oom-fault-v0.1-20261025.md）。
+    // 生成代码的调用序列在上界检查失败时调用它，返回 1 即重做整条序列。
+    // 已提交量按倍增推进（至少到 need，按 64 KiB 取整，不超过区域末端），总填充量与实际用到的深度成正比。
+    let f = rtBegin(b, "__tx_stack_more", "need", "p lim tb hard nb n q", 4, "bootstrap/selfhost/nrt_thread.tx");
+    rtAddrOf(f, "p", "p");
+    rtIf(f, L("p"), "ule", G("__tx_native_stack_limit"), "no");
+    rtSet(f, "lim", G("__tx_stack_limit"));
+    rtIf(f, L("need"), "ule", L("lim"), "yes");
+    rtSet(f, "tb", A("__tx_nrt_tb"));
+    rtOp(f, "hard", L("tb"), "add", I(TB_REGION));
+    rtIf(f, L("need"), "ugt", L("hard"), "no");
+    rtOp(f, "n", L("lim"), "sub", L("tb"));
+    rtOp(f, "nb", L("lim"), "add", L("n"));
+    rtIf(f, L("nb"), "uge", L("need"), "big");
+    rtSet(f, "nb", L("need"));
+    rtLabel(f, "big");
+    rtOp(f, "nb", L("nb"), "add", I(COMMIT_ROUND - 1));
+    rtOp(f, "nb", L("nb"), "and", I(0 - COMMIT_ROUND));
+    rtIf(f, L("nb"), "ule", L("hard"), "fit");
+    rtSet(f, "nb", L("hard"));
+    rtLabel(f, "fit");
+    rtOp(f, "n", L("nb"), "sub", L("lim"));
+    if (tUnix(t)) {
+        // mprotect 的起点须在页边界：首次扩展时 lim 止于 TB_USED（4 KiB 头＋256 KiB 值槽），在 16 KiB 页的 arm64 macOS 上
+        // 不是页边界（EINVAL）。起点按 COMMIT_ROUND（64 KiB，不小于常见页大小）向下取整，多出的一段本已可读写。
+        rtOp(f, "p", L("lim"), "and", I(0 - COMMIT_ROUND));
+        rtOp(f, "hard", L("nb"), "sub", L("p"));
+        uxSys(f, t, "q", 10, sys2(3, L("p"), L("hard")));
+        rtIf(f, L("q"), "ne", I(0), "oom");
+    } else {
+        rtCall4(f, "q", "VirtualAlloc", L("lim"), L("n"), I(MEM_COMMIT), I(PAGE_READWRITE));
+        rtIf(f, L("q"), "eq", I(0), "oom");
+    }
+    rtShift(f, "q", L("n"), "shr", 4);
+    rtCall2(f, "", "__tx_native_values_init_v1", L("lim"), L("q"));
+    rtSetGlobal(f, "__tx_stack_limit", L("nb"));
+    rtLabel(f, "yes"); rtRet(f, I(1));
+    rtLabel(f, "no"); rtRet(f, I(0));
+    rtLabel(f, "oom");
+    rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRet(f, I(0));
+    check(f);
+
+    // __tx_stack_ensure(need)：内核开窗前确保值槽栈已提交到 need，做不到即 trap 4003（无源码位置）。
+    f = rtBegin(b, "__tx_stack_ensure", "need", "r", 5, "bootstrap/selfhost/nrt_thread.tx");
+    rtIf(f, L("need"), "ule", G("__tx_stack_limit"), "ok");
+    rtCall1(f, "r", "__tx_stack_more", L("need"));
+    rtIf(f, L("r"), "eq", I(0), "over");
+    rtLabel(f, "ok"); rtRetVoid(f);
+    rtLabel(f, "over");
+    const deep = "调用栈深度超限";
+    rtCall5(f, "", "__tx_trap", I(-1), I(0), I(4003), A(text(b, deep)), I(len(deep)));
+    rtRetVoid(f); check(f);
+
+    // __tx_nrt_native_limit(probe, main) → 本线程原生栈的检查上界：实际栈底＋余量。probe 是调用方当前帧里的地址。
+    // Windows 取 GetCurrentThreadStackLimits 的下界（主线程为 PE 头保留的 8 MiB，工作线程为 CreateThread 保留的 8 MiB）。
+    // Linux 从栈顶往下推：主线程的栈大小取 RLIMIT_STACK 软限（超过 64 MiB 或无限时按 64 MiB），栈顶按最高的参数或
+    // 环境字符串之上再留 8 KiB（execfn 与结束标记）估计；工作线程为 8 MiB，栈顶按 probe 之上 64 KiB 估计。上界不高于
+    // probe 之下 64 KiB。
+    f = rtBegin(b, "__tx_nrt_native_limit", "probe main", "c m e x n top size", 4, "bootstrap/selfhost/nrt_thread.tx");
+    if (tKernel32(t)) {
+        rtAddrOf(f, "x", "c");
+        rtAddrOf(f, "n", "m");
+        rtCall2(f, "", "GetCurrentThreadStackLimits", L("x"), L("n"));
+        rtOp(f, "c", L("c"), "add", I(NATIVE_MARGIN));
+        rtRet(f, L("c"));
+        check(f);
+        return;
+    }
+    if (tMacos(t)) {
+        // pthread_get_stackaddr_np 给栈的高端（栈从这里往下长），pthread_get_stacksize_np 给大小；主线程与工作线程同法。
+        const none: List<Ref<RtOp>> = listNew();
+        uxMac(f, "x", "pthread_self", none);
+        const one: List<Ref<RtOp>> = listNew(); listPush(one, L("x"));
+        uxMac(f, "top", "pthread_get_stackaddr_np", one);
+        uxMac(f, "size", "pthread_get_stacksize_np", one);
+    } else {
+        rtSet(f, "size", I(THREAD_STACK_BYTES));
+        rtOp(f, "top", L("probe"), "add", I(TOP_SLACK));
+        rtIf(f, L("main"), "eq", I(0), "calc");
+        rtAddrOf(f, "x", "c");
+        const rl: List<Ref<RtOp>> = listNew();
+        listPush(rl, I(3)); listPush(rl, L("x"));
+        rtSyscall(f, "n", 97, rl);
+        rtIf(f, L("n"), "ne", I(0), "toparea");
+        rtSet(f, "size", L("c"));
+        rtIf(f, L("size"), "ule", I(MAIN_STACK_CAP), "toparea");
+        rtSet(f, "size", I(MAIN_STACK_CAP));
+        rtLabel(f, "toparea");
+        // 最高的字符串：最后一个环境串；没有环境时为最后一个参数串（envp 之前隔一个空指针即 argv[argc−1]）。
+        rtSet(f, "e", G("__tx_nrt_envp"));
+        rtSet(f, "x", I(0));
+        rtIf(f, L("e"), "eq", I(0), "strs");
+        rtLabel(f, "scan");
+        rtLoad(f, "n", L("e"), 0, 8);
+        rtIf(f, L("n"), "eq", I(0), "scanned");
+        rtSet(f, "x", L("n"));
+        rtOp(f, "e", L("e"), "add", I(8)); rtJump(f, "scan");
+        rtLabel(f, "scanned");
+        rtIf(f, L("x"), "ne", I(0), "strs");
+        rtSet(f, "e", G("__tx_nrt_envp"));
+        rtOp(f, "e", L("e"), "sub", I(16));
+        rtLoad(f, "x", L("e"), 0, 8);
+        rtLabel(f, "strs");
+        rtIf(f, L("x"), "ule", L("probe"), "calc");
+        rtLabel(f, "len");
+        rtLoad(f, "n", L("x"), 0, 1);
+        rtIf(f, L("n"), "eq", I(0), "end");
+        rtOp(f, "x", L("x"), "add", I(1)); rtJump(f, "len");
+        rtLabel(f, "end");
+        rtOp(f, "top", L("x"), "add", I(8192));
+    }
+    rtLabel(f, "calc");
+    rtOp(f, "n", L("top"), "sub", L("size"));
+    rtOp(f, "n", L("n"), "add", I(NATIVE_MARGIN));
+    rtOp(f, "x", L("probe"), "sub", I(TOP_SLACK));
+    rtIf(f, L("n"), "ule", L("x"), "ok");
+    rtSet(f, "n", L("x"));
+    rtLabel(f, "ok");
+    rtRet(f, L("n"));
+    check(f);
+}
+
+function ins(b: Ref<StructuredBuffer>, mn: string, n: int, a: Ref<Operand>, c: Ref<Operand>): void {
+    asBufferInstruction(b, mn, n, a, c, asStructuredMissing(), 1);
+}
+
+/// TLS 静态部分：Windows 的 TLS 目录、回调表（空）与模板放 .rdata；Linux 的模板放 .rdata。
+export function emitNrtTls(b: Ref<StructuredBuffer>, t: int): void {
+    asBufferSection(b, 1, 1);
+    asBufferAlign(b, 3, 1);
+    if (tPe(t)) {
+        // IMAGE_TLS_DIRECTORY64：模板起止、索引槽、回调表、SizeOfZeroFill 与 Characteristics（均 0）。
+        asBufferLabel(b, "__tx_tls_directory", 1);
+        asBufferAddress(b, "__tx_tls_template", 1);
+        asBufferAddress(b, "__tx_tls_template_end", 1);
+        asBufferAddress(b, "__tx_tls_index", 1);
+        asBufferAddress(b, "__tx_tls_callbacks", 1);
+        asBufferQuad(b, 0, 1);
+        asBufferLabel(b, "__tx_tls_callbacks", 1);
+        asBufferQuad(b, 0, 1);
+    }
+    if (!tMacos(t)) {
+        asBufferLabel(b, "__tx_tls_template", 1);
+        asBufferQuad(b, 0, 1);
+    }
+    if (tPe(t)) { asBufferLabel(b, "__tx_tls_template_end", 1); }
+    asBufferSection(b, 0, 1);
+    if (b.a64) { tlsLeavesA64(b); } else { tlsLeavesX86(b, t); }
+
+    // __tx_nrt_thread_bind()：rbx 已是新线程的线程块；登记到本线程的 TLS 槽，并记下系统线程号
+    // （回调蹦床据此确认调用它的正是线程块的主人——Linux 上不带 CLONE_SETTLS 的裸 clone 线程与
+    // 父线程共用 fs，TLS 槽分辨不出）。
+    const f = rtBegin(b, "__tx_nrt_thread_bind", "", "t id", 1, "bootstrap/selfhost/nrt_thread.tx");
+    rtSet(f, "t", A("__tx_nrt_tb"));
+    rtCall1(f, "", "__tx_tls_tb_set", L("t"));
+    const none: List<Ref<RtOp>> = listNew();
+    if (tRawSyscall(t)) { rtSyscall(f, "id", 186, none); } else if (tMacos(t)) { rtCall0(f, "id", "__tx_mac_gettid"); } else { rtCall0(f, "id", "GetCurrentThreadId"); }
+    rtOp(f, "id", L("id"), "and", I(4294967295));
+    rtStore(f, L("t"), TB_OS_TID, L("id"), 8);
+    rtRetVoid(f);
+    check(f);
+}
+
+function tlsLeavesX86(b: Ref<StructuredBuffer>, t: int): void {
+    const r = asStructuredReg(0, 0);
+    // __tx_tls_tb_get() → 本线程的线程块（外来线程为 0）；__tx_tls_tb_set(tb)。只写 rax/rcx/rdx。
+    // 取法随文件格式的 TLS 模型：ELF 的 PT_TLS 槽在线程指针之下（fs:[-8]），PE 的经 TEB 的 TLS 表与 __tx_tls_index，
+    // Mach-O 的 TLV：rdi＝描述符，调描述符首字（dyld 的取址函数；快路径只写 rax，本线程首次访问的慢路径由 dyld 保存
+    // 寄存器，见 M1 设计 E6），rax＝槽地址。rdi 自行保存；调用点：入口 rsp ≡ 8，push 后 ≡ 0。
+    asBufferLabel(b, "__tx_tls_tb_get", 1);
+    if (tElf(t)) {
+        ins(b, "mov", 2, r, asStructuredSegMem("fs", -8));
+    } else if (tMacos(t)) {
+        tlvSlot(b);
+        ins(b, "mov", 2, r, asStructuredMem(2, 0, -1, 0, 0, 0, ""));
+    } else {
+        ins(b, "mov", 2, asStructuredReg(1, 0), asStructuredMem(1, -1, -1, 0, 0, 1, "__tx_tls_index"));
+        ins(b, "mov", 2, asStructuredReg(0, 1), asStructuredSegMem("gs", 88));
+        ins(b, "mov", 2, r, asStructuredMem(2, 1, 0, 3, 0, 0, ""));
+        ins(b, "mov", 2, r, asStructuredMem(2, 0, -1, 0, 0, 0, ""));
+    }
+    ins(b, "ret", 0, asStructuredMissing(), asStructuredMissing());
+    asBufferLabel(b, "__tx_tls_tb_set", 1);
+    if (tElf(t)) {
+        ins(b, "mov", 2, asStructuredSegMem("fs", -8), asStructuredReg(0, 1));
+    } else if (tMacos(t)) {
+        tlvSlot(b);
+        ins(b, "mov", 2, asStructuredMem(2, 0, -1, 0, 0, 0, ""), asStructuredReg(0, 1));
+    } else {
+        ins(b, "mov", 2, asStructuredReg(1, 0), asStructuredMem(1, -1, -1, 0, 0, 1, "__tx_tls_index"));
+        ins(b, "mov", 2, asStructuredReg(0, 2), asStructuredSegMem("gs", 88));
+        ins(b, "mov", 2, asStructuredReg(0, 2), asStructuredMem(2, 2, 0, 3, 0, 0, ""));
+        ins(b, "mov", 2, asStructuredMem(2, 2, -1, 0, 0, 0, ""), asStructuredReg(0, 1));
+    }
+    ins(b, "ret", 0, asStructuredMissing(), asStructuredMissing());
+}
+
+// A64（Mach-O 的 TLV，macOS 适配 M4 设计 A5）：x0＝描述符，按 C 约定调描述符首字（dyld 的取址函数），x0＝槽地址；
+// 调用方都是 rtfn 与生成代码，按私有约定看待调用即可。
+function tlvSlotA64(f: Ref<RtFn>): void {
+    rtSet(f, "p", A("__tx_tls_tlv"));
+    rtLoad(f, "fp", L("p"), 0, 8);
+    const xs: List<Ref<RtOp>> = listNew(); listPush(xs, L("p"));
+    const cls: List<int> = listNew(); listPush(cls, 0);
+    rtCallC(f, "p", "", "fp", xs, cls, true);
+}
+function tlsLeavesA64(b: Ref<StructuredBuffer>): void {
+    let f = rtBegin(b, "__tx_tls_tb_get", "", "p fp", 1, "bootstrap/selfhost/nrt_thread.tx");
+    tlvSlotA64(f);
+    rtLoad(f, "p", L("p"), 0, 8);
+    rtRet(f, L("p")); check(f);
+    f = rtBegin(b, "__tx_tls_tb_set", "tb", "p fp", 1, "bootstrap/selfhost/nrt_thread.tx");
+    tlvSlotA64(f);
+    rtStore(f, L("p"), 0, L("tb"), 8);
+    rtRetVoid(f); check(f);
+}
+
+// rax ＝ 本线程 TLV 槽的地址（rdi 保存恢复；TLV 取址函数不改其他寄存器）。
+function tlvSlot(b: Ref<StructuredBuffer>): void {
+    const rdi = asStructuredReg(0, 7);
+    asBufferInstruction(b, "push", 1, rdi, asStructuredMissing(), asStructuredMissing(), 1);
+    ins(b, "lea", 2, rdi, asStructuredMem(2, -1, -1, 0, 0, 1, "__tx_tls_tlv"));
+    ins(b, "mov", 2, asStructuredReg(0, 0), asStructuredMem(2, 7, -1, 0, 0, 0, ""));
+    asBufferInstruction(b, "call", 1, asStructuredReg(0, 0), asStructuredMissing(), asStructuredMissing(), 1);
+    asBufferInstruction(b, "pop", 1, rdi, asStructuredMissing(), asStructuredMissing(), 1);
+}
+
+/// __tx_nrt_die_enter()：进程级致命锁（线程设计 §十一-4）。trap、内核 fatal 与内存不足终局在输出
+/// 诊断之前调用它：第一个到达的线程记下自己的线程号后返回，继续输出并退出进程；别的线程永远等待，
+/// 直到进程退出（诊断不交错）；同一线程再次进入（终局途中又出错）直接返回，不自锁。不访问线程块
+/// （外来线程上的回调也经这里报 4020）。Windows 下入口 rsp≡8，帧 40 使内层调用 16 对齐。
+export function emitNrtDie(b: Ref<StructuredBuffer>, t: int): void {
+    if (b.a64) { dieA64(b); return; }
+    const none = asStructuredMissing();
+    const rax = asStructuredReg(0, 0);
+    const rcx = asStructuredReg(0, 1);
+    asBufferLabel(b, "__tx_nrt_die_enter", 1);
+    ins(b, "sub", 2, asStructuredReg(0, 4), asStructuredImm(40));
+    if (tRawSyscall(t)) {
+        ins(b, "mov", 2, asStructuredReg(1, 0), asStructuredImm(186));
+        asBufferInstruction(b, "syscall", 0, none, none, none, 1);
+    } else if (tMacos(t)) {
+        asBufferInstruction(b, "call", 1, asStructuredTarget("__tx_mac_gettid"), none, none, 1);
+    } else {
+        asBufferInstruction(b, "call", 1, asStructuredTarget("GetCurrentThreadId"), none, none, 1);
+    }
+    ins(b, "mov", 2, asStructuredReg(1, 0), asStructuredReg(1, 0));
+    ins(b, "mov", 2, asStructuredMem(2, 4, -1, 0, 32, 0, ""), rax);
+    ins(b, "mov", 2, rcx, asStructuredImm(1));
+    ins(b, "lockxadd", 2, asStructuredMem(2, -1, -1, 0, 0, 1, "__tx_nrt_die_count"), rcx);
+    ins(b, "test", 2, rcx, rcx);
+    asBufferInstruction(b, "jne", 1, asStructuredTarget("__tx_nrt_die_lost"), none, none, 1);
+    ins(b, "mov", 2, asStructuredMem(2, -1, -1, 0, 0, 1, "__tx_nrt_die_tid"), rax);
+    asBufferLabel(b, "__tx_nrt_die_mine", 1);
+    ins(b, "add", 2, asStructuredReg(0, 4), asStructuredImm(40));
+    ins(b, "ret", 0, none, none);
+    asBufferLabel(b, "__tx_nrt_die_lost", 1);
+    ins(b, "mov", 2, rax, asStructuredMem(2, 4, -1, 0, 32, 0, ""));
+    ins(b, "cmp", 2, rax, asStructuredMem(2, -1, -1, 0, 0, 1, "__tx_nrt_die_tid"));
+    asBufferInstruction(b, "je", 1, asStructuredTarget("__tx_nrt_die_mine"), none, none, 1);
+    asBufferLabel(b, "__tx_nrt_die_wait", 1);
+    if (tRawSyscall(t)) {
+        // pause(2)：睡到有信号；信号处理返回后接着等。
+        ins(b, "mov", 2, asStructuredReg(1, 0), asStructuredImm(34));
+        asBufferInstruction(b, "syscall", 0, none, none, none, 1);
+    } else if (tMacos(t)) {
+        asBufferInstruction(b, "call", 1, asStructuredTarget("__tx_mac_pause"), none, none, 1);
+    } else {
+        ins(b, "mov", 2, asStructuredReg(1, 1), asStructuredImm(-1));
+        asBufferInstruction(b, "call", 1, asStructuredTarget("Sleep"), none, none, 1);
+    }
+    asBufferInstruction(b, "jmp", 1, asStructuredTarget("__tx_nrt_die_wait"), none, none, 1);
+}
+
+// 致命锁的 A64 版（同上，rtfn 写）：取号为带 AL 的原子加；得主线程号以释放语义写、获取语义读（同一线程再入时读到的是
+// 自己写的值；别的线程读到 0 或得主的号都不等于自己的号）。
+function dieA64(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "__tx_nrt_die_enter", "", "id old", 1, "bootstrap/selfhost/nrt_thread.tx");
+    rtCall0(f, "id", "__tx_mac_gettid");
+    rtOp(f, "id", L("id"), "and", I(4294967295));
+    rtAtomicAdd(f, "old", A("__tx_nrt_die_count"), 0, I(1));
+    rtIf(f, L("old"), "ne", I(0), "lost");
+    rtStoreRel(f, A("__tx_nrt_die_tid"), 0, L("id"));
+    rtRetVoid(f);
+    rtLabel(f, "lost");
+    rtLoadAcq(f, "old", A("__tx_nrt_die_tid"), 0);
+    rtIf(f, L("old"), "ne", L("id"), "wait");
+    rtRetVoid(f);
+    rtLabel(f, "wait");
+    rtCall0(f, "", "__tx_mac_pause");
+    rtJump(f, "wait");
+    check(f);
+}
+
+/// 线程相关的进程级 .bss：致命锁的计数与得主线程号；Windows 的 TLS 索引槽（加载器写入）；
+/// Linux 静态产物的主线程 TLS 区（[0] 槽、[8] 线程控制块——自指的线程指针）。
+export function nrtThreadBss(b: Ref<StructuredBuffer>, t: int): void {
+    asBufferLabel(b, "__tx_nrt_die_count", 1); asBufferZero(b, 8, 1);
+    asBufferLabel(b, "__tx_nrt_die_tid", 1); asBufferZero(b, 8, 1);
+    if (tElf(t)) { asBufferLabel(b, "__tx_tls_static", 1); asBufferZero(b, 16, 1); }
+    else if (tPe(t)) { asBufferLabel(b, "__tx_tls_index", 1); asBufferZero(b, 8, 1); }
+}

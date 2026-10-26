@@ -1,0 +1,3302 @@
+// Runtime algorithms are defined here through the existing structured native
+// instruction protocol. ISA bytes and object layout remain in their shared modules.
+import { Operand, StructuredBuffer, asBufferNew, asBufferNewA64, asBufferInstruction, asBufferSection, asBufferLabel, asBufferByte, asBufferZero, asBufferSubmit, asStructuredBegin, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem, asFailedAs, asLastErrAs } from "./selfhost/assemble";
+import { coffCaptureAssembler, coffWriteFunctions, coffResultOk, coffResultBytes, coffResultError } from "./selfhost/emit_coff_storage";
+import { POINTER_BYTES, TAG_INT } from "./selfhost/value_abi";
+import { elfWriteObjectFunctions, elfObjectOk, elfObjectBytes, elfObjectError } from "./selfhost/emit_elf_object";
+import { nativeFunctionsEnable, nativeFunctionsSnapshot } from "./selfhost/native_function_data";
+import { linuxMemoryExports, linuxPageAdapters, linuxMemoryPanic, linuxAbort } from "./selfhost/runtime_linux";
+
+import { linuxFileEmit } from "./selfhost/file_linux";
+import { PAYLOAD_VIEW_BYTES, PAYLOAD_OFF_CHILDREN, PAYLOAD_OFF_LEN } from "./selfhost/payload_abi";
+import { windowsArgvEmit } from "./selfhost/windows_argv";
+import { linuxArgvEmit } from "./selfhost/linux_argv";
+import { objectConstructEmit, objectConstructNames } from "./selfhost/object_construct";
+import { nrtEmit, nrtBss, nrtExports, nrtGenericLeaves } from "./selfhost/nrt";
+import { TB_MASK, TB_SLOTS, TB_ZERO_DEPTH, TB_MEM_STATE, TB_MEM_PAGES, TB_BIG_CACHE, TB_BIG_LIST, TB_ZERO_PENDING } from "./selfhost/thread_block_abi";
+import { nrtLastError } from "./selfhost/nrt_base";
+import { objectHandlersEmit, objectHandlerNames } from "./selfhost/object_handlers";
+import { objectRecordEmit } from "./selfhost/object_record";
+import { scalarHandlersEmit, scalarHandlerNames } from "./selfhost/scalar_handlers";
+import { scalarOpsEmit } from "./selfhost/scalar_ops";
+import { valueEqualEmit } from "./selfhost/value_equal";
+import { weakTableEmit } from "./selfhost/weak_table";
+import { internTableEmit } from "./selfhost/intern_table";
+import { internTableGenericEmit } from "./selfhost/intern_table_generic";
+import { weakTableGenericEmit } from "./selfhost/weak_table_generic";
+import { payloadSpanGenericEmit } from "./selfhost/payload_span_generic";
+import { payloadCloneGenericEmit } from "./selfhost/payload_clone_generic";
+import { valueEqualGenericEmit } from "./selfhost/value_equal_generic";
+import { objectConstructGenericEmit } from "./selfhost/object_construct_generic";
+import { objectRecordGenericEmit } from "./selfhost/object_record_generic";
+import { objectHandlersGenericEmit } from "./selfhost/object_handlers_generic";
+import { SLOTS_QUARANTINE_RING, storeSlotsGenericEmit } from "./selfhost/store_slots_generic";
+import { listBackingGenericEmit } from "./selfhost/list_backing_generic";
+import { listElementsGenericEmit } from "./selfhost/list_elements_generic";
+import { listCompactGenericEmit } from "./selfhost/list_compact_generic";
+import { scalarOpsGenericEmit } from "./selfhost/scalar_ops_generic";
+import { scalarHandlersGenericEmit } from "./selfhost/scalar_handlers_generic";
+import { listPushGenericEmit } from "./selfhost/list_push_generic";
+import { allocGenericEmit } from "./selfhost/kernel_alloc_generic";
+import { allocCheckEmit, allocCheckBss } from "./selfhost/kernel_alloc_check";
+import { oomFaultEmit, oomFaultBss } from "./selfhost/kernel_oom_fault";
+import { rtFaultEnable } from "./selfhost/rtfn";
+import { rcGenericEmit, rcOverReleaseEmit } from "./selfhost/kernel_rc_generic";
+import { strGenericEmit } from "./selfhost/kernel_str_generic";
+import { zeroGenericEmit } from "./selfhost/kernel_zero_generic";
+import { copyGenericEmit } from "./selfhost/kernel_copy_generic";
+import { panicGenericEmit } from "./selfhost/kernel_panic_generic";
+import { fileGenericEmit } from "./selfhost/kernel_file_generic";
+import { entryGenericEmit } from "./selfhost/kernel_entry_generic";
+import { leavesGenericEmit } from "./selfhost/nrt_leaves_generic";
+import { macPageAdaptersGenericEmit, macAbortGenericEmit } from "./selfhost/unix_sys_generic";
+import { payloadCloneEmit } from "./selfhost/payload_clone";
+import { payloadSpanEmit } from "./selfhost/payload_span";
+import { listElementsEmit } from "./selfhost/list_elements";
+import { listBackingEmit } from "./selfhost/list_backing";
+import { listCompactEmit, listCompactLeafEmit } from "./selfhost/list_compact";
+import { storeSlotsEmit } from "./selfhost/store_slots";
+import { T_X64_WINDOWS, T_ARM64_MACOS, targetParseName, tElf, tSysV, tKernel32, tRawSyscall, tUnix, tMacos, tA64 } from "./selfhost/target";
+import { a64BufferSubmit, a64BufferX86Sites } from "./selfhost/a64_asm";
+import { macPageAdapters, macAbort, macKernelExports } from "./selfhost/unix_sys";
+
+// 内核的编译目标（selfhost/target.tx 的目标编号）。
+let rtTarget: int = T_X64_WINDOWS;
+// 不经 kernel32 的 NRT 内核：入口返回后经 __tx_nrt_exit 退出（动态产物由它转 libc exit）。
+let nrtExitCall = false;
+// NRT 内核（--with-nrt）：按线程的状态在线程块里；致命终局先过进程级致命锁（__tx_nrt_die_enter）。
+let nrtKernel = false;
+
+// std.debug.assert invokes unreachable in the identified Zig provider. The
+// existing ShimPanic prints this message, rather than an invented assertion label.
+const MEMORY_ASSERTION_MESSAGE: string = "reached unreachable code";
+
+function reg(n: int): Ref<Operand> { return asStructuredReg(0, n); }
+function reg32(n: int): Ref<Operand> { return asStructuredReg(1, n); }
+function reg8(n: int): Ref<Operand> { return asStructuredReg(2, n); }
+function immediate(n: int): Ref<Operand> { return asStructuredImm(n); }
+function nativeName(name: string): string {
+    // memcpy 系列随 C 约定：SysV 目标导出的 memcpy 等是给 C 的包装（runtime_linux.tx），内核内部改调私有约定的 __tx_linux_*。
+    if (tSysV(rtTarget) && (name == "memcpy" || name == "memset" || name == "memmove")) { return "__tx_linux_" + name; }
+    // 页分配随系统接口：不经 kernel32 的目标由页适配器（mmap/munmap）代替 VirtualAlloc/VirtualFree。
+    if (tRawSyscall(rtTarget)) {
+        if (name == "VirtualAlloc") { return "__tx_linux_page_alloc"; }
+        if (name == "VirtualFree") { return "__tx_linux_page_free"; }
+    }
+    // macOS 同理，页适配器经 libSystem 的 mmap/munmap（selfhost/unix_sys.tx）。
+    if (tMacos(rtTarget)) {
+        if (name == "VirtualAlloc") { return "__tx_mac_page_alloc"; }
+        if (name == "VirtualFree") { return "__tx_mac_page_free"; }
+    }
+    return name;
+}
+function target(name: string): Ref<Operand> { return asStructuredTarget(nativeName(name)); }
+function stackMemory(offset: int): Ref<Operand> { return asStructuredMem(2, 4, -1, 0, offset, 0, ""); }
+function ripMemory(name: string): Ref<Operand> { return asStructuredMem(2, -1, -1, 0, 0, 1, name); }
+
+function emit(buf: Ref<StructuredBuffer>, mnemonic: string, count: int, a: Ref<Operand>, b: Ref<Operand>): void {
+    asBufferInstruction(buf, mnemonic, count, a, b, asStructuredMissing(), 1);
+}
+function zero(buf: Ref<StructuredBuffer>, mnemonic: string): void {
+    emit(buf, mnemonic, 0, asStructuredMissing(), asStructuredMissing());
+}
+function one(buf: Ref<StructuredBuffer>, mnemonic: string, a: Ref<Operand>): void {
+    emit(buf, mnemonic, 1, a, asStructuredMissing());
+}
+function label(buf: Ref<StructuredBuffer>, name: string): void { asBufferLabel(buf, nativeName(name), 1); }
+
+// Win64 arguments: RCX=dst, RDX=src/value, R8=size_t. N=0 permits null.
+// After N!=0, require addr!=0 and N-1 <= UINT64_MAX-addr before any access.
+// R10/R11 are volatile; parameter registers and the saved result remain intact.
+function span(buf: Ref<StructuredBuffer>, address: int): void {
+    emit(buf, "test", 2, reg(address), reg(address));
+    one(buf, "jz", target("__tx_native_memory_span_panic"));
+    emit(buf, "mov", 2, reg(10), immediate(-1));
+    emit(buf, "sub", 2, reg(10), reg(address));
+    emit(buf, "mov", 2, reg(11), reg(8));
+    emit(buf, "sub", 2, reg(11), immediate(1));
+    emit(buf, "cmp", 2, reg(11), reg(10));
+    one(buf, "ja", target("__tx_native_memory_span_panic"));
+}
+
+function copy(buf: Ref<StructuredBuffer>): void {
+    label(buf, "memcpy");
+    emit(buf, "mov", 2, reg(0), reg(1));
+    emit(buf, "test", 2, reg(8), reg(8));
+    one(buf, "jz", target("__tx_native_copy_done"));
+    span(buf, 1); span(buf, 2);
+    one(buf, "push", reg(7)); one(buf, "push", reg(6));
+    emit(buf, "mov", 2, reg(7), reg(1));
+    emit(buf, "mov", 2, reg(6), reg(2));
+    emit(buf, "mov", 2, reg(1), reg(8));
+    zero(buf, "cld"); one(buf, "rep", target("movsb"));
+    one(buf, "pop", reg(6)); one(buf, "pop", reg(7));
+    label(buf, "__tx_native_copy_done"); zero(buf, "ret");
+}
+
+function fill(buf: Ref<StructuredBuffer>): void {
+    label(buf, "memset");
+    emit(buf, "mov", 2, reg(0), reg(1));
+    emit(buf, "test", 2, reg(8), reg(8));
+    one(buf, "jz", target("__tx_native_fill_done"));
+    span(buf, 1);
+    one(buf, "push", reg(7));
+    emit(buf, "mov", 2, reg(7), reg(1));
+    emit(buf, "mov", 2, reg(10), reg(1));
+    emit(buf, "mov", 2, reg(1), reg(8));
+    // STOSB reads AL; converting the C int to its low byte clobbers RAX,
+    // so preserve the original destination in volatile R10 and restore it.
+    emit(buf, "mov", 2, reg32(0), reg32(2));
+    zero(buf, "cld"); one(buf, "rep", target("stosb"));
+    emit(buf, "mov", 2, reg(0), reg(10));
+    one(buf, "pop", reg(7));
+    label(buf, "__tx_native_fill_done"); zero(buf, "ret");
+}
+
+// Preserve rtMemmove's ReleaseSafe evaluation order. Source-end arithmetic is
+// short-circuited when dst<src. Each byte computes/casts dst before src, then
+// reads src before writing dst. This intentionally is not copy's span check.
+function moveByte(buf: Ref<StructuredBuffer>): void {
+    emit(buf, "mov", 2, reg(10), reg(1));
+    emit(buf, "add", 2, reg(10), reg(9));
+    one(buf, "jb", target("__tx_native_move_overflow"));
+    emit(buf, "test", 2, reg(10), reg(10));
+    one(buf, "jz", target("__tx_native_move_null"));
+    emit(buf, "mov", 2, reg(11), reg(2));
+    emit(buf, "add", 2, reg(11), reg(9));
+    one(buf, "jb", target("__tx_native_move_overflow"));
+    emit(buf, "test", 2, reg(11), reg(11));
+    one(buf, "jz", target("__tx_native_move_null"));
+    emit(buf, "mov", 2, reg8(11), asStructuredMem(0, 11, -1, 0, 0, 0, ""));
+    emit(buf, "mov", 2, asStructuredMem(0, 10, -1, 0, 0, 0, ""), reg8(11));
+}
+
+function move(buf: Ref<StructuredBuffer>): void {
+    label(buf, "memmove");
+    emit(buf, "mov", 2, reg(0), reg(1));
+    emit(buf, "cmp", 2, reg(1), reg(2));
+    one(buf, "jb", target("__tx_native_move_forward"));
+    emit(buf, "mov", 2, reg(10), reg(2));
+    emit(buf, "add", 2, reg(10), reg(8));
+    one(buf, "jb", target("__tx_native_move_overflow"));
+    emit(buf, "cmp", 2, reg(1), reg(10));
+    one(buf, "jae", target("__tx_native_move_forward"));
+    emit(buf, "mov", 2, reg(9), reg(8));
+    label(buf, "__tx_native_move_backward_loop");
+    emit(buf, "test", 2, reg(9), reg(9));
+    one(buf, "jz", target("__tx_native_move_done"));
+    // i>0 proves decrement cannot underflow.
+    emit(buf, "sub", 2, reg(9), immediate(1));
+    moveByte(buf);
+    one(buf, "jmp", target("__tx_native_move_backward_loop"));
+    label(buf, "__tx_native_move_forward");
+    emit(buf, "xor", 2, reg32(9), reg32(9));
+    emit(buf, "test", 2, reg(8), reg(8));
+    one(buf, "jz", target("__tx_native_move_done"));
+    label(buf, "__tx_native_move_forward_loop");
+    moveByte(buf);
+    // i<n and n<=UINT64_MAX prove i+1 does not overflow.
+    emit(buf, "add", 2, reg(9), immediate(1));
+    emit(buf, "cmp", 2, reg(9), reg(8));
+    one(buf, "jb", target("__tx_native_move_forward_loop"));
+    label(buf, "__tx_native_move_done"); zero(buf, "ret");
+}
+
+// 内部断言类致命出口的入口（运行时加固 H3）：NRT 内核先过进程级致命锁，与 trap、内存不足终局一致；锁对同一线程可重入。
+// 入口经 call 或 jmp 到达，栈对齐未知：类 Unix 目标先对齐（Linux 的锁只发系统调用，照样对齐无害），之后接 entry_body；
+// Windows 对齐后留影子空间调用，再回到“刚被 call”的对齐（rsp ≡ 8），接原来的帧。返回后续写的入口名。
+function panicEntry(buf: Ref<StructuredBuffer>, entry: string): string {
+    if (!nrtKernel) { return entry; }
+    asBufferSection(buf, 0, 1);
+    label(buf, entry);
+    emit(buf, "and", 2, reg(4), immediate(-16));
+    if (tRawSyscall(rtTarget) || tMacos(rtTarget)) {
+        one(buf, "call", target("__tx_nrt_die_enter"));
+        return entry + "_body";
+    }
+    emit(buf, "sub", 2, reg(4), immediate(32));
+    one(buf, "call", target("__tx_nrt_die_enter"));
+    emit(buf, "add", 2, reg(4), immediate(24));
+    return "";
+}
+
+function movePanic(buf: Ref<StructuredBuffer>, entry: string, dataName: string, message: string): void {
+    const rest = panicEntry(buf, entry);
+    if (tRawSyscall(rtTarget)) { linuxMemoryPanic(buf, rest, dataName, message); return; }
+    if (tMacos(rtTarget)) { macAbortAt(buf, rest, dataName, message, 134); return; }
+    asBufferSection(buf, 0, 1);
+    if (len(rest) > 0) { label(buf, rest); }
+    emit(buf, "sub", 2, reg(4), immediate(40));
+    emit(buf, "lea", 2, reg(1), ripMemory(dataName));
+    emit(buf, "lea", 2, reg(2), ripMemory(dataName + "_wide"));
+    emit(buf, "mov", 2, reg32(8), immediate(len(message)));
+    one(buf, "call", target("__tx_native_memory_panic_write"));
+    emit(buf, "lea", 2, reg(1), ripMemory("__tx_native_memory_newline"));
+    emit(buf, "lea", 2, reg(2), ripMemory("__tx_native_memory_newline_wide"));
+    emit(buf, "mov", 2, reg32(8), immediate(1));
+    one(buf, "call", target("__tx_native_memory_panic_write"));
+    zero(buf, "ud2");
+    asBufferSection(buf, 1, 1);
+    label(buf, dataName);
+    let i = 0;
+    while (i < len(message)) { asBufferByte(buf, byteAt(message, i) catch 0, 1); i = i + 1; }
+    label(buf, dataName + "_wide");
+    i = 0;
+    while (i < len(message)) { asBufferByte(buf, byteAt(message, i) catch 0, 1); asBufferByte(buf, 0, 1); i = i + 1; }
+}
+
+// Same visible assertion message and abnormal termination as the old
+// execution host's ShimPanic. Only documented Win32 APIs perform the I/O.
+function panicBody(buf: Ref<StructuredBuffer>): void {
+    const rest = panicEntry(buf, "__tx_native_memory_span_panic");
+    if (tRawSyscall(rtTarget)) { linuxMemoryPanic(buf, rest, "__tx_native_memory_assertion", MEMORY_ASSERTION_MESSAGE); return; }
+    if (tMacos(rtTarget)) { macAbortAt(buf, rest, "__tx_native_memory_assertion", MEMORY_ASSERTION_MESSAGE, 134); return; }
+    if (len(rest) > 0) { label(buf, rest); }
+    emit(buf, "sub", 2, reg(4), immediate(40));
+    emit(buf, "lea", 2, reg(1), ripMemory("__tx_native_memory_assertion"));
+    emit(buf, "lea", 2, reg(2), ripMemory("__tx_native_memory_assertion_wide"));
+    emit(buf, "mov", 2, reg32(8), immediate(len(MEMORY_ASSERTION_MESSAGE)));
+    one(buf, "call", target("__tx_native_memory_panic_write"));
+    emit(buf, "lea", 2, reg(1), ripMemory("__tx_native_memory_newline"));
+    emit(buf, "lea", 2, reg(2), ripMemory("__tx_native_memory_newline_wide"));
+    emit(buf, "mov", 2, reg32(8), immediate(1));
+    one(buf, "call", target("__tx_native_memory_panic_write"));
+    zero(buf, "ud2");
+
+    label(buf, "__tx_native_memory_panic_write");
+    emit(buf, "sub", 2, reg(4), immediate(88));
+    emit(buf, "mov", 2, stackMemory(48), reg(1));
+    emit(buf, "mov", 2, stackMemory(56), reg(2));
+    emit(buf, "mov", 2, stackMemory(64), reg(8));
+    emit(buf, "mov", 2, reg32(1), immediate(-12));
+    one(buf, "call", target("GetStdHandle"));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_native_memory_write_done"));
+    emit(buf, "mov", 2, stackMemory(72), reg(0));
+    emit(buf, "mov", 2, reg(1), reg(0));
+    emit(buf, "lea", 2, reg(2), stackMemory(40));
+    emit(buf, "mov", 2, stackMemory(40), immediate(0));
+    one(buf, "call", target("GetConsoleMode"));
+    emit(buf, "test", 2, reg32(0), reg32(0));
+    one(buf, "jz", target("__tx_native_memory_write_bytes"));
+    emit(buf, "mov", 2, reg(1), stackMemory(72));
+    emit(buf, "mov", 2, reg(2), stackMemory(56));
+    emit(buf, "mov", 2, reg(8), stackMemory(64));
+    emit(buf, "lea", 2, reg(9), stackMemory(44));
+    emit(buf, "mov", 2, stackMemory(32), immediate(0));
+    one(buf, "call", target("WriteConsoleW"));
+    one(buf, "jmp", target("__tx_native_memory_write_done"));
+    label(buf, "__tx_native_memory_write_bytes");
+    emit(buf, "mov", 2, reg(1), stackMemory(72));
+    emit(buf, "mov", 2, reg(2), stackMemory(48));
+    emit(buf, "mov", 2, reg(8), stackMemory(64));
+    emit(buf, "lea", 2, reg(9), stackMemory(44));
+    emit(buf, "mov", 2, stackMemory(32), immediate(0));
+    one(buf, "call", target("WriteFile"));
+    label(buf, "__tx_native_memory_write_done");
+    emit(buf, "add", 2, reg(4), immediate(88));
+    zero(buf, "ret");
+    asBufferSection(buf, 1, 1);
+    label(buf, "__tx_native_memory_assertion");
+    const message = MEMORY_ASSERTION_MESSAGE;
+    let i = 0;
+    while (i < len(message)) { asBufferByte(buf, byteAt(message, i) catch 0, 1); i = i + 1; }
+    label(buf, "__tx_native_memory_assertion_wide");
+    i = 0;
+    while (i < len(message)) { asBufferByte(buf, byteAt(message, i) catch 0, 1); asBufferByte(buf, 0, 1); i = i + 1; }
+    label(buf, "__tx_native_memory_newline"); asBufferByte(buf, 10, 1);
+    label(buf, "__tx_native_memory_newline_wide"); asBufferByte(buf, 10, 1); asBufferByte(buf, 0, 1);
+}
+
+// ============================================================================
+// Allocator（v052-runtime-allocator-generation；D6 §8 语义序逐行移植自
+// src/runtime/runtime.zig Gen：16..16384 十一级尺寸类＋大块整页；块头 16B
+// 复用（分配态长度/空闲态链指针）；free 毒化 0xAB；状态自持零填充节。
+// Win64：RCX/RDX/R8/R9 传参、RAX 返回；仅用易失寄存器，跨系统调用后的
+// 活值经 [rsp+8..32] 暂存（阴影区调用前属调用方）。
+// ============================================================================
+
+function mem64(base: int, disp: int): Ref<Operand> { return asStructuredMem(2, base, -1, 0, disp, 0, ""); }
+
+function mem32(base: int, disp: int): Ref<Operand> { return asStructuredMem(1, base, -1, 0, disp, 0, ""); }
+
+// r = 分配器状态里 off 处的地址：NRT 内核为本线程线程块的字段（线程第 2 步：每线程一个堆，无锁），
+// 其余构建为 .bss 符号 sym。只写 r。
+function memStateAddr(buf: Ref<StructuredBuffer>, r: int, off: int, sym: string): void {
+    if (nrtKernel) {
+        emit(buf, "mov", 2, reg(r), reg(3));
+        emit(buf, "and", 2, reg(r), immediate(TB_MASK));
+        emit(buf, "add", 2, reg(r), immediate(off));
+        return;
+    }
+    emit(buf, "lea", 2, reg(r), ripMemory(sym));
+}
+
+// NRT 大块：块头 32 字节 {prev, next, 总长, 0}，用户指针＝基址＋32（[用户指针−16] 仍是总长，释放据此
+// 区分大小块）；活着的大块挂在本线程的大块链上，线程结束时整堆归还。基址在 base、总长在 total
+// （二者不是 r10/r11），写完头部 rax＝用户指针。用 r10、r11。
+function bigLink(buf: Ref<StructuredBuffer>, base: int, total: int, tag: string): void {
+    emit(buf, "mov", 2, mem64(base, 16), reg(total));
+    emit(buf, "mov", 2, mem64(base, 0), immediate(0));
+    memStateAddr(buf, 10, TB_BIG_LIST, "");
+    emit(buf, "mov", 2, reg(11), mem64(10, 0));
+    emit(buf, "mov", 2, mem64(base, 8), reg(11));
+    emit(buf, "test", 2, reg(11), reg(11));
+    one(buf, "jz", target("__tx_na_bl_" + tag));
+    emit(buf, "mov", 2, mem64(11, 0), reg(base));
+    label(buf, "__tx_na_bl_" + tag);
+    emit(buf, "mov", 2, mem64(10, 0), reg(base));
+    emit(buf, "lea", 2, reg(0), mem64(base, 32));
+}
+
+function ciWalk(buf: Ref<StructuredBuffer>, sizeReg: int, top: string, done: string): void {
+    // &free_lists[ci]：R8=state 起，R9=size/16 逐半至 1——等价 ctz(size/16)。
+    memStateAddr(buf, 8, TB_MEM_STATE, "__tx_native_mem_state");
+    emit(buf, "mov", 2, reg(9), reg(sizeReg));
+    emit(buf, "shr", 2, reg(9), immediate(4));
+    label(buf, top);
+    emit(buf, "cmp", 2, reg(9), immediate(1));
+    one(buf, "jbe", target(done));
+    emit(buf, "add", 2, reg(8), immediate(8));
+    emit(buf, "shr", 2, reg(9), immediate(1));
+    one(buf, "jmp", target(top));
+    label(buf, done);
+}
+
+function allocProc(buf: Ref<StructuredBuffer>): void {
+    label(buf, "__tx_native_mem_alloc");
+    // The shared size-class kernel guarantees alignment through 16 only.
+    // Reject unsupported requests instead of returning a misaligned pointer.
+    emit(buf, "cmp", 2, reg(1), immediate(0)); one(buf, "jl", target("__tx_na_null"));
+    emit(buf, "test", 2, reg(2), reg(2)); one(buf, "jz", target("__tx_na_null"));
+    emit(buf, "cmp", 2, reg(2), immediate(16)); one(buf, "ja", target("__tx_na_null"));
+    emit(buf, "mov", 2, reg(0), reg(2)); emit(buf, "sub", 2, reg(0), immediate(1));
+    emit(buf, "test", 2, reg(0), reg(2)); one(buf, "jne", target("__tx_na_null"));
+    emit(buf, "mov", 2, reg(0), reg(1));
+    emit(buf, "cmp", 2, reg(0), immediate(1));
+    one(buf, "jae", target("__tx_na_need1"));
+    emit(buf, "mov", 2, reg32(0), immediate(1));
+    label(buf, "__tx_na_need1");
+    emit(buf, "cmp", 2, reg(2), reg(0));
+    one(buf, "jbe", target("__tx_na_need2"));
+    emit(buf, "mov", 2, reg(0), reg(2));
+    label(buf, "__tx_na_need2");
+    emit(buf, "cmp", 2, reg(0), immediate(16384));
+    one(buf, "jbe", target("__tx_na_small"));
+    // 大块：total=(need+头+4095) & -4096（头 16 字节，NRT 32 字节）；VirtualAlloc(0,total,0x3000,4)。
+    if (nrtKernel) { emit(buf, "add", 2, reg(0), immediate(32)); } else { emit(buf, "add", 2, reg(0), immediate(16)); }
+    one(buf, "jo", target("__tx_na_null"));
+    emit(buf, "add", 2, reg(0), immediate(4095));
+    one(buf, "jo", target("__tx_na_null"));
+    emit(buf, "mov", 2, reg(1), immediate(-4096));
+    emit(buf, "and", 2, reg(0), reg(1));
+    // 大块缓存（16 项，精确页长匹配）：命中则移出、整块清零（与新映射页
+    // 同为全零）后复用，免系统调用与缺页。项布局：[0]=数 [8]=总字节，
+    // [16+16i]=块基址 [24+16i]=页长。
+    memStateAddr(buf, 10, TB_BIG_CACHE, "__tx_native_big_cache");
+    emit(buf, "mov", 2, reg(9), mem64(10, 0));
+    emit(buf, "xor", 2, reg32(11), reg32(11));
+    label(buf, "__tx_na_bc_scan");
+    emit(buf, "cmp", 2, reg(11), reg(9));
+    one(buf, "jae", target("__tx_na_bc_miss"));
+    emit(buf, "mov", 2, reg(8), reg(11));
+    emit(buf, "shl", 2, reg(8), immediate(4));
+    emit(buf, "add", 2, reg(8), reg(10));
+    emit(buf, "cmp", 2, reg(0), mem64(8, 24));
+    one(buf, "je", target("__tx_na_bc_hit"));
+    emit(buf, "add", 2, reg(11), immediate(1));
+    one(buf, "jmp", target("__tx_na_bc_scan"));
+    label(buf, "__tx_na_bc_hit");
+    emit(buf, "mov", 2, reg(2), mem64(8, 16));
+    emit(buf, "sub", 2, reg(9), immediate(1));
+    emit(buf, "mov", 2, mem64(10, 0), reg(9));
+    emit(buf, "mov", 2, reg(1), reg(9));
+    emit(buf, "shl", 2, reg(1), immediate(4));
+    emit(buf, "add", 2, reg(1), reg(10));
+    emit(buf, "mov", 2, reg(11), mem64(1, 16));
+    emit(buf, "mov", 2, mem64(8, 16), reg(11));
+    emit(buf, "mov", 2, reg(11), mem64(1, 24));
+    emit(buf, "mov", 2, mem64(8, 24), reg(11));
+    emit(buf, "mov", 2, reg(11), mem64(10, 8));
+    emit(buf, "sub", 2, reg(11), reg(0));
+    emit(buf, "mov", 2, mem64(10, 8), reg(11));
+    emit(buf, "sub", 2, reg(4), immediate(56));
+    emit(buf, "mov", 2, mem64(4, 40), reg(2));
+    emit(buf, "mov", 2, mem64(4, 48), reg(0));
+    emit(buf, "mov", 2, reg(1), reg(2));
+    emit(buf, "xor", 2, reg32(2), reg32(2));
+    emit(buf, "mov", 2, reg(8), reg(0));
+    one(buf, "call", target("memset"));
+    emit(buf, "mov", 2, reg(2), mem64(4, 40));
+    emit(buf, "mov", 2, reg(0), mem64(4, 48));
+    emit(buf, "add", 2, reg(4), immediate(56));
+    if (nrtKernel) { bigLink(buf, 2, 0, "hit"); zero(buf, "ret"); }
+    else {
+        emit(buf, "mov", 2, mem64(2, 0), reg(0));
+        emit(buf, "lea", 2, reg(0), mem64(2, 16));
+        zero(buf, "ret");
+    }
+    label(buf, "__tx_na_bc_miss");
+    emit(buf, "sub", 2, reg(4), immediate(56));
+    emit(buf, "mov", 2, mem64(4, 40), reg(0));
+    emit(buf, "xor", 2, reg32(1), reg32(1));
+    emit(buf, "mov", 2, reg(2), reg(0));
+    emit(buf, "mov", 2, reg32(8), immediate(12288));
+    emit(buf, "mov", 2, reg32(9), immediate(4));
+    one(buf, "call", target("VirtualAlloc"));
+    emit(buf, "mov", 2, reg(2), mem64(4, 40));
+    emit(buf, "add", 2, reg(4), immediate(56));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_na_null"));
+    if (nrtKernel) {
+        emit(buf, "mov", 2, reg(8), reg(0));
+        bigLink(buf, 8, 2, "new");
+        zero(buf, "ret");
+    } else {
+        emit(buf, "mov", 2, mem64(0, 0), reg(2));
+        emit(buf, "add", 2, reg(0), immediate(16));
+        zero(buf, "ret");
+    }
+    label(buf, "__tx_na_null");
+    emit(buf, "xor", 2, reg32(0), reg32(0));
+    zero(buf, "ret");
+    // 小块：data_size 16 倍增至 ≥need（16..16384）。
+    label(buf, "__tx_na_small");
+    emit(buf, "mov", 2, reg32(11), immediate(16));
+    label(buf, "__tx_na_grow");
+    emit(buf, "cmp", 2, reg(11), reg(0));
+    one(buf, "jae", target("__tx_na_grown"));
+    emit(buf, "add", 2, reg(11), reg(11));
+    one(buf, "jmp", target("__tx_na_grow"));
+    label(buf, "__tx_na_grown");
+    ciWalk(buf, 11, "__tx_na_ci", "__tx_na_cidone");
+    emit(buf, "mov", 2, reg(9), mem64(8, 0));
+    emit(buf, "test", 2, reg(9), reg(9));
+    one(buf, "jz", target("__tx_na_carve"));
+    emit(buf, "mov", 2, reg(10), mem64(9, 0));
+    emit(buf, "mov", 2, mem64(8, 0), reg(10));
+    emit(buf, "mov", 2, mem64(9, 0), reg(11));
+    emit(buf, "lea", 2, reg(0), mem64(9, 16));
+    zero(buf, "ret");
+    // 新页：per_page=max(data_size*8+144,65536)；PageLink 入链；自偏移 16
+    // 逐块雕刻（每块先写长度；首块留用，其余头改写链指针推入本类链）。
+    label(buf, "__tx_na_carve");
+    emit(buf, "mov", 2, reg(2), reg(11));
+    emit(buf, "add", 2, reg(2), reg(2));
+    emit(buf, "add", 2, reg(2), reg(2));
+    emit(buf, "add", 2, reg(2), reg(2));
+    emit(buf, "add", 2, reg(2), immediate(144));
+    emit(buf, "mov", 2, reg32(0), immediate(65536));
+    emit(buf, "cmp", 2, reg(2), reg(0));
+    one(buf, "jae", target("__tx_na_pp"));
+    emit(buf, "mov", 2, reg(2), reg(0));
+    label(buf, "__tx_na_pp");
+    emit(buf, "sub", 2, reg(4), immediate(56));
+    emit(buf, "mov", 2, mem64(4, 40), reg(11));
+    emit(buf, "xor", 2, reg32(1), reg32(1));
+    emit(buf, "mov", 2, reg32(8), immediate(12288));
+    emit(buf, "mov", 2, reg32(9), immediate(4));
+    one(buf, "call", target("VirtualAlloc"));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_na_carve_fail"));
+    if (nrtKernel) {
+        memStateAddr(buf, 2, TB_MEM_PAGES, "");
+        emit(buf, "mov", 2, reg(2), mem64(2, 0));
+    } else {
+        emit(buf, "mov", 2, reg(2), ripMemory("__tx_native_mem_state_pages"));
+    }
+    emit(buf, "mov", 2, mem64(0, 0), reg(2));
+    emit(buf, "mov", 2, reg(2), mem64(4, 40));
+    emit(buf, "add", 2, reg(2), reg(2));
+    emit(buf, "add", 2, reg(2), reg(2));
+    emit(buf, "add", 2, reg(2), reg(2));
+    emit(buf, "add", 2, reg(2), immediate(144));
+    emit(buf, "mov", 2, reg32(9), immediate(65536));
+    emit(buf, "cmp", 2, reg(2), reg(9));
+    one(buf, "jae", target("__tx_na_pl"));
+    emit(buf, "mov", 2, reg(2), reg(9));
+    label(buf, "__tx_na_pl");
+    emit(buf, "mov", 2, mem64(0, 8), reg(2));
+    if (nrtKernel) {
+        memStateAddr(buf, 2, TB_MEM_PAGES, "");
+        emit(buf, "mov", 2, mem64(2, 0), reg(0));
+    } else {
+        emit(buf, "mov", 2, ripMemory("__tx_native_mem_state_pages"), reg(0));
+    }
+    emit(buf, "mov", 2, reg(11), mem64(4, 40));
+    emit(buf, "add", 2, reg(4), immediate(56));
+    ciWalk(buf, 11, "__tx_na_ci2", "__tx_na_ci2done");
+    emit(buf, "lea", 2, reg(9), mem64(11, 16));
+    emit(buf, "lea", 2, reg(10), mem64(0, 16));
+    label(buf, "__tx_na_carve_loop");
+    emit(buf, "mov", 2, reg(1), reg(10));
+    emit(buf, "sub", 2, reg(1), reg(0));
+    emit(buf, "add", 2, reg(1), reg(9));
+    emit(buf, "mov", 2, reg(2), mem64(0, 8));
+    emit(buf, "cmp", 2, reg(1), reg(2));
+    one(buf, "ja", target("__tx_na_carve_done"));
+    emit(buf, "mov", 2, mem64(10, 0), reg(11));
+    emit(buf, "lea", 2, reg(1), mem64(0, 16));
+    emit(buf, "cmp", 2, reg(10), reg(1));
+    one(buf, "je", target("__tx_na_first"));
+    emit(buf, "mov", 2, reg(1), mem64(8, 0));
+    emit(buf, "mov", 2, mem64(10, 0), reg(1));
+    emit(buf, "mov", 2, mem64(8, 0), reg(10));
+    label(buf, "__tx_na_first");
+    emit(buf, "add", 2, reg(10), reg(9));
+    one(buf, "jmp", target("__tx_na_carve_loop"));
+    label(buf, "__tx_na_carve_done");
+    emit(buf, "lea", 2, reg(0), mem64(0, 32));
+    zero(buf, "ret");
+    label(buf, "__tx_na_carve_fail");
+    emit(buf, "add", 2, reg(4), immediate(56));
+    emit(buf, "xor", 2, reg32(0), reg32(0));
+    zero(buf, "ret");
+}
+
+function freeProc(buf: Ref<StructuredBuffer>): void {
+    label(buf, "__tx_native_mem_free");
+    emit(buf, "test", 2, reg(1), reg(1));
+    one(buf, "jz", target("__tx_nf_ret"));
+    emit(buf, "mov", 2, reg(0), reg(1));
+    emit(buf, "sub", 2, reg(0), immediate(16));
+    emit(buf, "mov", 2, reg(2), mem64(0, 0));
+    emit(buf, "cmp", 2, reg(2), immediate(16400));
+    one(buf, "jbe", target("__tx_nf_small"));
+    // 大块：缓存未满（≤16 项、≤64MB）则入缓存；否则整页归还（MEM_RELEASE=
+    // 0x8000）。即将解除映射的内存不再毒化（D6：毒化属 Debug 选项）。
+    // NRT：rax 改为块基址（用户指针−32），先从本线程的大块链摘下。
+    if (nrtKernel) {
+        emit(buf, "sub", 2, reg(0), immediate(16));
+        emit(buf, "mov", 2, reg(8), mem64(0, 0));
+        emit(buf, "mov", 2, reg(9), mem64(0, 8));
+        emit(buf, "test", 2, reg(8), reg(8));
+        one(buf, "jz", target("__tx_nf_unhead"));
+        emit(buf, "mov", 2, mem64(8, 8), reg(9));
+        one(buf, "jmp", target("__tx_nf_unnext"));
+        label(buf, "__tx_nf_unhead");
+        memStateAddr(buf, 10, TB_BIG_LIST, "");
+        emit(buf, "mov", 2, mem64(10, 0), reg(9));
+        label(buf, "__tx_nf_unnext");
+        emit(buf, "test", 2, reg(9), reg(9));
+        one(buf, "jz", target("__tx_nf_unlinked"));
+        emit(buf, "mov", 2, mem64(9, 0), reg(8));
+        label(buf, "__tx_nf_unlinked");
+    }
+    memStateAddr(buf, 10, TB_BIG_CACHE, "__tx_native_big_cache");
+    emit(buf, "mov", 2, reg(9), mem64(10, 0));
+    emit(buf, "cmp", 2, reg(9), immediate(16));
+    one(buf, "jae", target("__tx_nf_release"));
+    emit(buf, "mov", 2, reg(11), mem64(10, 8));
+    emit(buf, "add", 2, reg(11), reg(2));
+    emit(buf, "cmp", 2, reg(11), immediate(67108864));
+    one(buf, "ja", target("__tx_nf_release"));
+    emit(buf, "mov", 2, mem64(10, 8), reg(11));
+    emit(buf, "mov", 2, reg(8), reg(9));
+    emit(buf, "shl", 2, reg(8), immediate(4));
+    emit(buf, "add", 2, reg(8), reg(10));
+    emit(buf, "mov", 2, mem64(8, 16), reg(0));
+    emit(buf, "mov", 2, mem64(8, 24), reg(2));
+    emit(buf, "add", 2, reg(9), immediate(1));
+    emit(buf, "mov", 2, mem64(10, 0), reg(9));
+    zero(buf, "ret");
+    label(buf, "__tx_nf_release");
+    emit(buf, "sub", 2, reg(4), immediate(56));
+    emit(buf, "mov", 2, reg(1), reg(0));
+    if (tKernel32(rtTarget)) { emit(buf, "xor", 2, reg32(2), reg32(2)); }
+    emit(buf, "mov", 2, reg32(8), immediate(32768));
+    one(buf, "call", target("VirtualFree"));
+    emit(buf, "add", 2, reg(4), immediate(56));
+    label(buf, "__tx_nf_ret");
+    zero(buf, "ret");
+    // 小块：推入本类链（长度改写为链指针）。数据区不再毒化（D6：毒化属
+    // Debug 选项；发布运行时复用块内容本就无定义）。
+    label(buf, "__tx_nf_small");
+    emit(buf, "mov", 2, reg(11), reg(2));
+    ciWalk(buf, 11, "__tx_nf_ci", "__tx_nf_cidone");
+    emit(buf, "mov", 2, reg(9), mem64(8, 0));
+    emit(buf, "mov", 2, mem64(0, 0), reg(9));
+    emit(buf, "mov", 2, mem64(8, 0), reg(0));
+    zero(buf, "ret");
+}
+
+function reallocProc(buf: Ref<StructuredBuffer>): void {
+    // 语义序＝tx_mem_realloc：new 非法→null；alloc(new,align)；
+    // ptr 非空且 old>0 → memcpy(min(old,new))；free(ptr)。
+    label(buf, "__tx_native_mem_realloc");
+    emit(buf, "test", 2, reg(8), reg(8));
+    one(buf, "jz", target("__tx_nr_null"));
+    emit(buf, "sub", 2, reg(4), immediate(40));
+    emit(buf, "mov", 2, mem64(4, 32), reg(1));
+    emit(buf, "mov", 2, mem64(4, 24), reg(2));
+    emit(buf, "mov", 2, mem64(4, 16), reg(8));
+    emit(buf, "mov", 2, reg(1), reg(8));
+    emit(buf, "mov", 2, reg(2), reg(9));
+    one(buf, "call", target("__tx_native_mem_alloc"));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_nr_fail"));
+    emit(buf, "mov", 2, mem64(4, 8), reg(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 32));
+    emit(buf, "test", 2, reg(1), reg(1));
+    one(buf, "jz", target("__tx_nr_copydone"));
+    emit(buf, "mov", 2, reg(2), mem64(4, 24));
+    emit(buf, "test", 2, reg(2), reg(2));
+    one(buf, "jz", target("__tx_nr_copydone"));
+    emit(buf, "mov", 2, reg(8), reg(2));
+    emit(buf, "cmp", 2, reg(8), mem64(4, 16));
+    one(buf, "jbe", target("__tx_nr_n"));
+    emit(buf, "mov", 2, reg(8), mem64(4, 16));
+    label(buf, "__tx_nr_n");
+    emit(buf, "mov", 2, reg(2), reg(1));
+    emit(buf, "mov", 2, reg(1), mem64(4, 8));
+    one(buf, "call", target("memcpy"));
+    label(buf, "__tx_nr_copydone");
+    emit(buf, "mov", 2, reg(1), mem64(4, 32));
+    one(buf, "call", target("__tx_native_mem_free"));
+    emit(buf, "mov", 2, reg(0), mem64(4, 8));
+    emit(buf, "add", 2, reg(4), immediate(40));
+    zero(buf, "ret");
+    label(buf, "__tx_nr_fail");
+    emit(buf, "add", 2, reg(4), immediate(40));
+    label(buf, "__tx_nr_null");
+    emit(buf, "xor", 2, reg32(0), reg32(0));
+    zero(buf, "ret");
+}
+
+// ============================================================================
+// RC 计数面（v052-runtime-rc-weak-generation；store_abi.tx 契约钉死事实）：
+// __tx_retain/__tx_release/__tx_frame_release/__tx_is_heapref 四导出接管。
+// 状态经宿主接入面（__tx_rc_base/__tx_rc_scalar_flag/__tx_rc_probe_counts/
+// __tx_rc_zero_cascade）；原子臂＝lock xadd（isa-lockxadd-forms8 GNU 恒等）；
+// 值面 tag@0/idx@8（value_abi rev1）。寄存器约定：槽位指针驻 r10、idx 驻 r8、
+// 调用间活值在影子空间外（RC ptr@32、idx@40，帧sub56对齐）。
+// ============================================================================
+
+function rcHeapTag(buf: Ref<StructuredBuffer>, withNrt: bool): void {
+    // __tx_is_heapref：256 字节表（store_abi.tx TAG_* 位为 1）。
+    asBufferSection(buf, 1, 1);
+    label(buf, "__tx_is_heapref");
+    let i = 0;
+    while (i < 256) {
+        // 17＝Bytes（D3 v0.18）、18＝生成器（D3 v0.22）、19＝线程句柄（线程第 2 步）、20＝Shared、21＝Atomic（第 4c 步）
+        // 只在 NRT 内核中出现；非 NRT 内核的表保持原样。
+        const hit = (i == 5 || i == 6 || i == 7 || i == 8 || i == 9 || i == 10 || i == 11 || i == 14 || i == 15 || i == 16 || (withNrt && (i == 17 || i == 18 || i == 19 || i == 20 || i == 21)));
+        if (hit) { asBufferByte(buf, 1, 1); } else { asBufferByte(buf, 0, 1); }
+        i = i + 1;
+    }
+}
+
+// 公共头（rcx=*Value）：非堆引用 → rax=0 直返；命中 → r10=&rc[idx]、r8=idx。
+function rcHead(buf: Ref<StructuredBuffer>, done: string): void {
+    emit(buf, "mov", 2, reg(0), mem64(1, 0));
+    emit(buf, "and", 2, reg32(0), immediate(255));
+    emit(buf, "lea", 2, reg(2), ripMemory("__tx_is_heapref"));
+    emit(buf, "add", 2, reg(2), reg(0));
+    emit(buf, "mov", 2, reg8(9), asStructuredMem(0, 2, -1, 0, 0, 0, ""));
+    emit(buf, "test", 2, reg8(9), reg8(9));
+    one(buf, "jz", target(done));
+    emit(buf, "mov", 2, reg32(8), mem32(1, 8));
+    emit(buf, "mov", 2, mem64(4, 40), reg(8));
+    one(buf, "call", target("__tx_rc_base"));
+    emit(buf, "mov", 2, reg(8), mem64(4, 40));
+    emit(buf, "mov", 2, reg(9), reg(8));
+    emit(buf, "shl", 2, reg(9), immediate(2));
+    emit(buf, "add", 2, reg(0), reg(9));
+    emit(buf, "mov", 2, reg32(2), mem32(0, 0));
+    emit(buf, "test", 2, reg32(2), reg32(2));
+    one(buf, "js", target(done));
+}
+
+// NRT fast path (rcx=*Value): heap tag, then rc[idx] straight from the NRT
+// slot state, no frame and no helper calls. Any high-bit immortal is untouched; any
+// rc flag (scalar arm or probe counting) falls through to the generic body.
+// Leaves rax=&rc[idx], r8=idx for the release zero path.
+// r = 当前线程的槽表状态指针（线程块字段，线程块由 rbx 按对齐求出；只写 r）。
+function slotStateInto(buf: Ref<StructuredBuffer>, r: int): void {
+    emit(buf, "mov", 2, reg(r), reg(3));
+    emit(buf, "and", 2, reg(r), immediate(TB_MASK));
+    emit(buf, "mov", 2, reg(r), mem64(r, TB_SLOTS));
+}
+
+function rcNrtFastHead(buf: Ref<StructuredBuffer>, done: string, generic: string): void {
+    emit(buf, "mov", 2, reg(0), mem64(1, 0));
+    emit(buf, "and", 2, reg32(0), immediate(255));
+    emit(buf, "lea", 2, reg(2), ripMemory("__tx_is_heapref"));
+    emit(buf, "add", 2, reg(2), reg(0));
+    emit(buf, "mov", 2, reg8(9), asStructuredMem(0, 2, -1, 0, 0, 0, ""));
+    emit(buf, "test", 2, reg8(9), reg8(9));
+    one(buf, "jz", target(done));
+    emit(buf, "mov", 2, reg32(8), mem32(1, 8));
+    slotStateInto(buf, 0);
+    emit(buf, "mov", 2, reg(0), mem64(0, 0));
+    emit(buf, "mov", 2, reg(9), reg(8));
+    emit(buf, "shl", 2, reg(9), immediate(2));
+    emit(buf, "add", 2, reg(0), reg(9));
+    emit(buf, "mov", 2, reg32(2), mem32(0, 0));
+    emit(buf, "test", 2, reg32(2), reg32(2));
+    one(buf, "js", target(done));
+    emit(buf, "mov", 2, reg32(11), asStructuredMem(1, -1, -1, 0, 0, 1, "__tx_nrt_rc_flags"));
+    emit(buf, "test", 2, reg32(11), reg32(11));
+    one(buf, "jne", target(generic));
+}
+
+function rcRetain(buf: Ref<StructuredBuffer>, nrt: bool): void {
+    label(buf, "__tx_retain");
+    if (nrt) {
+        rcNrtFastHead(buf, "__tx_ret_fast_done", "__tx_retain_generic");
+        // Thread step 4a: objects belong to one thread (sending copies, shared blocks keep their own
+        // atomic counts), so the count is a plain add; edx already holds rc[idx].
+        emit(buf, "add", 2, reg32(2), immediate(1));
+        emit(buf, "mov", 2, mem32(0, 0), reg32(2));
+        label(buf, "__tx_ret_fast_done");
+        zero(buf, "ret");
+        label(buf, "__tx_retain_generic");
+    }
+    emit(buf, "sub", 2, reg(4), immediate(56));
+    rcHead(buf, "__tx_ret_done_j");
+    emit(buf, "mov", 2, mem64(4, 32), reg(0));
+    one(buf, "call", target("__tx_rc_scalar_flag"));
+    emit(buf, "mov", 2, reg(11), reg(0));
+    emit(buf, "mov", 2, reg(0), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(10), reg32(11));
+    emit(buf, "and", 2, reg32(10), immediate(1));
+    one(buf, "jne", target("__tx_ret_scalar"));
+    emit(buf, "mov", 2, reg32(2), immediate(1));
+    emit(buf, "lockxadd", 2, asStructuredMem(1, 0, -1, 0, 0, 0, ""), reg32(2));
+    emit(buf, "mov", 2, reg32(10), reg32(11));
+    emit(buf, "and", 2, reg32(10), immediate(2));
+    one(buf, "jz", target("__tx_ret_done"));
+    one(buf, "call", target("__tx_rc_probe_counts"));
+    emit(buf, "mov", 2, reg(9), mem64(0, 0));
+    emit(buf, "add", 2, reg(9), immediate(1));
+    emit(buf, "mov", 2, mem64(0, 0), reg(9));
+    one(buf, "jmp", target("__tx_ret_done"));
+    label(buf, "__tx_ret_scalar");
+    emit(buf, "mov", 2, reg32(2), mem32(0, 0));
+    emit(buf, "add", 2, reg32(2), immediate(1));
+    emit(buf, "mov", 2, mem32(0, 0), reg32(2));
+    emit(buf, "mov", 2, reg32(10), reg32(11));
+    emit(buf, "and", 2, reg32(10), immediate(2));
+    one(buf, "jz", target("__tx_ret_done"));
+    one(buf, "call", target("__tx_rc_probe_counts"));
+    emit(buf, "mov", 2, reg(9), mem64(0, 8));
+    emit(buf, "add", 2, reg(9), immediate(1));
+    emit(buf, "mov", 2, mem64(0, 8), reg(9));
+    label(buf, "__tx_ret_done");
+    emit(buf, "add", 2, reg(4), immediate(56));
+    zero(buf, "ret");
+    label(buf, "__tx_ret_done_j");
+    emit(buf, "add", 2, reg(4), immediate(56));
+    zero(buf, "ret");
+}
+
+function rcRelease(buf: Ref<StructuredBuffer>, withZero: bool, nrt: bool): void {
+    label(buf, "__tx_release");
+    if (nrt) {
+        rcNrtFastHead(buf, "__tx_rel_fast_done", "__tx_release_generic");
+        // Plain decrement (thread step 4a); the last reference leaves 0 behind like the atomic arm did.
+        // ≤ 0 rather than = 0: −1 means the count was already 0 (over-release, runtime hardening H1); the
+        // zero path tells the two apart, so the fast path keeps its instruction count.
+        emit(buf, "sub", 2, reg32(2), immediate(1));
+        emit(buf, "mov", 2, mem32(0, 0), reg32(2));
+        one(buf, "jle", target("__tx_rel_fast_zero"));
+        label(buf, "__tx_rel_fast_done");
+        zero(buf, "ret");
+        // Last reference: same frame and idx slot as the generic zero path.
+        label(buf, "__tx_rel_fast_zero");
+        emit(buf, "sub", 2, reg(4), immediate(56));
+        emit(buf, "mov", 2, mem64(4, 40), reg(8));
+        emit(buf, "test", 2, reg32(2), reg32(2));
+        one(buf, "jne", target("__tx_rel_over"));
+        one(buf, "jmp", target("__tx_rel_zero"));
+        label(buf, "__tx_release_generic");
+    }
+    emit(buf, "sub", 2, reg(4), immediate(56));
+    rcHead(buf, "__tx_rel_done_j");
+    emit(buf, "mov", 2, mem64(4, 32), reg(0));
+    one(buf, "call", target("__tx_rc_scalar_flag"));
+    emit(buf, "mov", 2, reg(11), reg(0));
+    emit(buf, "mov", 2, reg(0), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(10), reg32(11));
+    emit(buf, "and", 2, reg32(10), immediate(1));
+    one(buf, "jne", target("__tx_rel_scalar"));
+    emit(buf, "mov", 2, reg32(2), immediate(-1));
+    emit(buf, "lockxadd", 2, asStructuredMem(1, 0, -1, 0, 0, 0, ""), reg32(2));
+    emit(buf, "cmp", 2, reg32(2), immediate(1));
+    if (nrt) { one(buf, "jb", target("__tx_rel_over")); }
+    one(buf, "je", target("__tx_rel_zero"));
+    emit(buf, "mov", 2, reg32(10), reg32(11));
+    emit(buf, "and", 2, reg32(10), immediate(2));
+    one(buf, "jz", target("__tx_rel_done"));
+    one(buf, "call", target("__tx_rc_probe_counts"));
+    emit(buf, "mov", 2, reg(9), mem64(0, 16));
+    emit(buf, "add", 2, reg(9), immediate(1));
+    emit(buf, "mov", 2, mem64(0, 16), reg(9));
+    one(buf, "jmp", target("__tx_rel_done"));
+    label(buf, "__tx_rel_scalar");
+    emit(buf, "mov", 2, reg32(2), mem32(0, 0));
+    emit(buf, "sub", 2, reg32(2), immediate(1));
+    emit(buf, "mov", 2, mem32(0, 0), reg32(2));
+    emit(buf, "test", 2, reg32(2), reg32(2));
+    one(buf, "jz", target("__tx_rel_zero"));
+    if (nrt) { one(buf, "js", target("__tx_rel_over")); }
+    emit(buf, "mov", 2, reg32(10), reg32(11));
+    emit(buf, "and", 2, reg32(10), immediate(2));
+    one(buf, "jz", target("__tx_rel_done"));
+    one(buf, "call", target("__tx_rc_probe_counts"));
+    emit(buf, "mov", 2, reg(9), mem64(0, 24));
+    emit(buf, "add", 2, reg(9), immediate(1));
+    emit(buf, "mov", 2, mem64(0, 24), reg(9));
+    one(buf, "jmp", target("__tx_rel_done"));
+    label(buf, "__tx_rel_zero");
+    if (withZero) {
+        // 统一释零派发器（案乙一期 bytes＋二期容器）：idx 入垫后直入。
+        emit(buf, "mov", 2, reg32(1), mem32(4, 40));
+        emit(buf, "mov", 2, mem32(4, 32), reg32(1));
+        one(buf, "call", target("__tx_zero_dispatch"));
+    } else {
+        emit(buf, "mov", 2, reg32(1), mem32(4, 40));
+        one(buf, "call", target("__tx_rc_zero_cascade"));
+    }
+    label(buf, "__tx_rel_done");
+    emit(buf, "add", 2, reg(4), immediate(56));
+    zero(buf, "ret");
+    label(buf, "__tx_rel_done_j");
+    emit(buf, "add", 2, reg(4), immediate(56));
+    zero(buf, "ret");
+    if (nrt) {
+        // Over-release (count already 0): the frame above keeps the call aligned.
+        label(buf, "__tx_rel_over");
+        one(buf, "call", target("__tx_rc_over_release"));
+        zero(buf, "ud2");
+    }
+}
+
+function rcFrameRelease(buf: Ref<StructuredBuffer>): void {
+    // (rcx=win, rdx=count, r8=a)：逐槽非跳过位释放并清 None；win[a] 终清。
+    // __tx_frame_release_from 另带 r9=from：只处理 [from, count)，a < from 时
+    // 不清 win[a]（借用参数函数的参数槽留给调用方）。原入口即 from=0。
+    // 游标/计数/a/i 驻 rbx/r13/r14/r12（两种 ABI 下均为被调方保存；Linux
+    // syscall 包装会写 rdi/rsi，故不用）；win 存 [rsp+32]、from 存 [rsp+40]。
+    // 4 次 push＋sub 56 使内层调用点 16 对齐，[rsp+0..31] 为影子空间。
+    label(buf, "__tx_frame_release");
+    emit(buf, "xor", 2, reg32(9), reg32(9));
+    label(buf, "__tx_frame_release_from");
+    one(buf, "push", reg(3)); one(buf, "push", reg(13)); one(buf, "push", reg(14)); one(buf, "push", reg(12));
+    emit(buf, "sub", 2, reg(4), immediate(56));
+    emit(buf, "mov", 2, mem64(4, 32), reg(1));
+    emit(buf, "mov", 2, mem64(4, 40), reg(9));
+    emit(buf, "mov", 2, reg(12), reg(9));
+    emit(buf, "mov", 2, reg(3), reg(9));
+    emit(buf, "shl", 2, reg(3), immediate(4));
+    emit(buf, "add", 2, reg(3), reg(1));
+    emit(buf, "mov", 2, reg(13), reg(2));
+    emit(buf, "mov", 2, reg(14), reg(8));
+    label(buf, "__tx_fr_loop");
+    emit(buf, "cmp", 2, reg(12), reg(13));
+    one(buf, "jae", target("__tx_fr_end"));
+    emit(buf, "cmp", 2, reg(12), reg(14));
+    one(buf, "je", target("__tx_fr_next"));
+    emit(buf, "mov", 2, reg(0), mem64(3, 0));
+    emit(buf, "and", 2, reg32(0), immediate(255));
+    emit(buf, "lea", 2, reg(2), ripMemory("__tx_is_heapref"));
+    emit(buf, "add", 2, reg(2), reg(0));
+    emit(buf, "mov", 2, reg8(9), asStructuredMem(0, 2, -1, 0, 0, 0, ""));
+    emit(buf, "test", 2, reg8(9), reg8(9));
+    one(buf, "jz", target("__tx_fr_clear"));
+    emit(buf, "mov", 2, reg(1), reg(3));
+    one(buf, "call", target("__tx_release"));
+    label(buf, "__tx_fr_clear");
+    emit(buf, "mov", 2, mem64(3, 0), immediate(4));
+    emit(buf, "mov", 2, mem64(3, 8), immediate(0));
+    label(buf, "__tx_fr_next");
+    emit(buf, "add", 2, reg(3), immediate(16));
+    emit(buf, "add", 2, reg(12), immediate(1));
+    one(buf, "jmp", target("__tx_fr_loop"));
+    label(buf, "__tx_fr_end");
+    emit(buf, "cmp", 2, reg(14), mem64(4, 40));
+    one(buf, "jb", target("__tx_fr_keep_a"));
+    emit(buf, "mov", 2, reg(1), mem64(4, 32));
+    emit(buf, "mov", 2, reg(0), reg(14));
+    emit(buf, "shl", 2, reg(0), immediate(4));
+    emit(buf, "add", 2, reg(1), reg(0));
+    emit(buf, "mov", 2, mem64(1, 0), immediate(4));
+    emit(buf, "mov", 2, mem64(1, 8), immediate(0));
+    label(buf, "__tx_fr_keep_a");
+    emit(buf, "add", 2, reg(4), immediate(56));
+    one(buf, "pop", reg(12)); one(buf, "pop", reg(14)); one(buf, "pop", reg(13)); one(buf, "pop", reg(3));
+    zero(buf, "ret");
+}
+
+// ============================================================================
+// 字符串拼接面（v052-runtime-value-strlist-generation 案甲首期）：
+// __tx_str_concat 接管（concatStrings 双臂镜像）。Win64 C 签名：
+// rcx=win、edx=fn_idx、r8d=pc、r9d=dst、栈参 b@[进入 rsp+40]、c@[+48]。
+// 帧 sub 168（≡8 mod 16——内部调用点 16 对齐）：win@32、dst@40、fn_idx@48、
+// pc@56、b@64、c@72、idxA@80、idxB@88、len1@96、ptr1@104、len2@112、
+// ptr2@120、total@128、joined@136——溢出全部 ≥32（影子空间归内层被调方）。
+// 语义序镜像：tag 失配→尾跳 __tx_str_concat_host（陷阱单一事实源，原栈参
+// 原位）；独占复用判据 dst==b ∧ idxA≠idxB ∧ len1>0 ∧ reuse_ok（宿主判定
+// rc==1 非帧，驻留由永生哨兵排除）→原生 realloc(old,new,1)＋尾拷＋set_span；
+// 新串臂 alloc(n,1)＋双段拷＋site_of＋new_str_take＋释放旧槽值（__tx_release
+// 内自判非堆引用）＋槽写回（tag qword=6、idx 零扩展 qword）。
+// ============================================================================
+
+// r10 = &win[slotSpill]（win 基址＋16*slot——slot 溢出位零扩展 32 位读）。
+function strSlotAddr(buf: Ref<StructuredBuffer>, slotSpill: int): void {
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(11), mem32(4, slotSpill));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+}
+
+// NRT 独占复用臂（字符串原地追加，docs/design/v052-string-append-v0.1-20261016.md §四-A）：
+// 按容量几何追加——__tx_nrt_bytes_reserve（与 Bytes 共用：容量翻倍、至少 16、不足取所需；
+// len1>0 已由判据保证，走 realloc 分支）后把右段拷到 ptr+len1，写 len，清 ASCII 缓存位。
+// 帧位：o@136（原 joined 位，本臂不用）。之后宿主复用臂的指令不可达。
+function strConcatAppendNrt(buf: Ref<StructuredBuffer>): void {
+    emit(buf, "mov", 2, reg32(1), mem32(4, 80));
+    one(buf, "call", target("__tx_native_object_address_v1"));
+    emit(buf, "mov", 2, mem64(4, 136), reg(0));
+    emit(buf, "mov", 2, reg(1), reg(0));
+    emit(buf, "mov", 2, reg(2), mem64(4, 128));
+    one(buf, "call", target("__tx_nrt_bytes_reserve"));
+    emit(buf, "mov", 2, reg(10), mem64(4, 136));
+    emit(buf, "mov", 2, reg(1), mem64(10, 32));
+    emit(buf, "mov", 2, reg(9), mem64(4, 96));
+    emit(buf, "add", 2, reg(1), reg(9));
+    emit(buf, "mov", 2, reg(2), mem64(4, 120));
+    emit(buf, "mov", 2, reg(8), mem64(4, 112));
+    one(buf, "call", target("memcpy"));
+    emit(buf, "mov", 2, reg(10), mem64(4, 136));
+    emit(buf, "mov", 2, reg(11), mem64(4, 128));
+    emit(buf, "mov", 2, mem64(10, 40), reg(11));
+    emit(buf, "mov", 2, reg32(11), mem32(10, 0));
+    emit(buf, "and", 2, reg32(11), immediate(-9));
+    emit(buf, "mov", 2, mem32(10, 0), reg32(11));
+    one(buf, "jmp", target("__tx_str_done"));
+}
+
+function strConcat(buf: Ref<StructuredBuffer>): void {
+    label(buf, "__tx_str_concat");
+    emit(buf, "sub", 2, reg(4), immediate(168));
+    emit(buf, "mov", 2, mem64(4, 32), reg(1));
+    emit(buf, "mov", 2, mem32(4, 40), reg32(9));
+    emit(buf, "mov", 2, mem32(4, 48), reg32(2));
+    emit(buf, "mov", 2, mem32(4, 56), reg32(8));
+    emit(buf, "mov", 2, reg32(10), mem32(4, 208));
+    emit(buf, "mov", 2, mem32(4, 64), reg32(10));
+    emit(buf, "mov", 2, reg32(10), mem32(4, 216));
+    emit(buf, "mov", 2, mem32(4, 72), reg32(10));
+    // tag 失配→宿主全量路径（尾跳——原栈参 b/c 原位不动）。
+    strSlotAddr(buf, 64);
+    emit(buf, "mov", 2, reg(0), mem64(10, 0));
+    emit(buf, "and", 2, reg32(0), immediate(255));
+    emit(buf, "cmp", 2, reg32(0), immediate(6));
+    one(buf, "jne", target("__tx_str_concat_fallback"));
+    strSlotAddr(buf, 72);
+    emit(buf, "mov", 2, reg(0), mem64(10, 0));
+    emit(buf, "and", 2, reg32(0), immediate(255));
+    emit(buf, "cmp", 2, reg32(0), immediate(6));
+    one(buf, "jne", target("__tx_str_concat_fallback"));
+    strSlotAddr(buf, 64);
+    emit(buf, "mov", 2, reg32(11), mem32(10, 8));
+    emit(buf, "mov", 2, mem32(4, 80), reg32(11));
+    strSlotAddr(buf, 72);
+    emit(buf, "mov", 2, reg32(11), mem32(10, 8));
+    emit(buf, "mov", 2, mem32(4, 88), reg32(11));
+    // 跨度四读（ptr/len 双标量接入导出——Win64 C ABI 不保结构返回）。
+    emit(buf, "mov", 2, reg32(1), mem32(4, 80));
+    one(buf, "call", target("__tx_store_str_ptr"));
+    emit(buf, "mov", 2, mem64(4, 104), reg(0));
+    emit(buf, "mov", 2, reg32(1), mem32(4, 80));
+    one(buf, "call", target("__tx_store_str_len"));
+    emit(buf, "mov", 2, mem64(4, 96), reg(0));
+    emit(buf, "mov", 2, reg32(1), mem32(4, 88));
+    one(buf, "call", target("__tx_store_str_ptr"));
+    emit(buf, "mov", 2, mem64(4, 120), reg(0));
+    emit(buf, "mov", 2, reg32(1), mem32(4, 88));
+    one(buf, "call", target("__tx_store_str_len"));
+    emit(buf, "mov", 2, mem64(4, 112), reg(0));
+    // total = len1+len2（两串均为存活分配——u64 加法上界 2^63 不溢出）。
+    emit(buf, "mov", 2, reg(8), mem64(4, 96));
+    emit(buf, "mov", 2, reg(9), mem64(4, 112));
+    emit(buf, "add", 2, reg(8), reg(9));
+    emit(buf, "mov", 2, mem64(4, 128), reg(8));
+    // 独占复用判据（四与条件——顺序同 concatStrings）。
+    emit(buf, "mov", 2, reg32(10), mem32(4, 40));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 64));
+    emit(buf, "cmp", 2, reg(10), reg(11));
+    one(buf, "jne", target("__tx_str_new"));
+    emit(buf, "mov", 2, reg32(10), mem32(4, 80));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 88));
+    emit(buf, "cmp", 2, reg(10), reg(11));
+    one(buf, "je", target("__tx_str_new"));
+    emit(buf, "mov", 2, reg(10), mem64(4, 96));
+    emit(buf, "test", 2, reg(10), reg(10));
+    one(buf, "jz", target("__tx_str_new"));
+    emit(buf, "mov", 2, reg32(1), mem32(4, 80));
+    one(buf, "call", target("__tx_store_str_reuse_ok"));
+    emit(buf, "mov", 2, reg32(10), reg32(0));
+    emit(buf, "test", 2, reg(10), reg(10));
+    one(buf, "jz", target("__tx_str_new"));
+    if (nrtKernel) { strConcatAppendNrt(buf); }
+    // 独占复用臂：realloc 扩容（分配＋拷旧＋放旧）→尾拷→set_span（ascii
+    // 缓存清除在宿主导出内）。
+    emit(buf, "mov", 2, reg(1), mem64(4, 104));
+    emit(buf, "mov", 2, reg(2), mem64(4, 96));
+    emit(buf, "mov", 2, reg(8), mem64(4, 128));
+    emit(buf, "mov", 2, reg32(9), immediate(1));
+    one(buf, "call", target("__tx_native_mem_realloc"));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_str_oom"));
+    emit(buf, "mov", 2, mem64(4, 136), reg(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 136));
+    emit(buf, "mov", 2, reg(9), mem64(4, 96));
+    emit(buf, "add", 2, reg(1), reg(9));
+    emit(buf, "mov", 2, reg(2), mem64(4, 120));
+    emit(buf, "mov", 2, reg(8), mem64(4, 112));
+    one(buf, "call", target("memcpy"));
+    emit(buf, "mov", 2, reg32(1), mem32(4, 80));
+    emit(buf, "mov", 2, reg(2), mem64(4, 136));
+    emit(buf, "mov", 2, reg(8), mem64(4, 128));
+    one(buf, "call", target("__tx_store_str_set_span"));
+    one(buf, "jmp", target("__tx_str_done"));
+    // 新串臂：精确尺寸分配＋双段拷→分配点→take 接管→释放旧槽值→槽写回。
+    label(buf, "__tx_str_new");
+    emit(buf, "mov", 2, reg(1), mem64(4, 128));
+    emit(buf, "mov", 2, reg32(2), immediate(1));
+    one(buf, "call", target("__tx_native_mem_alloc"));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_str_oom"));
+    emit(buf, "mov", 2, mem64(4, 136), reg(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 136));
+    emit(buf, "mov", 2, reg(2), mem64(4, 104));
+    emit(buf, "mov", 2, reg(8), mem64(4, 96));
+    one(buf, "call", target("memcpy"));
+    emit(buf, "mov", 2, reg(1), mem64(4, 136));
+    emit(buf, "mov", 2, reg(9), mem64(4, 96));
+    emit(buf, "add", 2, reg(1), reg(9));
+    emit(buf, "mov", 2, reg(2), mem64(4, 120));
+    emit(buf, "mov", 2, reg(8), mem64(4, 112));
+    one(buf, "call", target("memcpy"));
+    emit(buf, "mov", 2, reg32(1), mem32(4, 48));
+    emit(buf, "mov", 2, reg32(2), mem32(4, 56));
+    one(buf, "call", target("__tx_site_of"));
+    emit(buf, "mov", 2, reg32(8), reg32(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 136));
+    emit(buf, "mov", 2, reg(2), mem64(4, 128));
+    one(buf, "call", target("__tx_store_new_str_take"));
+    emit(buf, "mov", 2, mem32(4, 144), reg32(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(9), mem32(4, 40));
+    emit(buf, "shl", 2, reg(9), immediate(4));
+    emit(buf, "add", 2, reg(1), reg(9));
+    one(buf, "call", target("__tx_release"));
+    strSlotAddr(buf, 40);
+    emit(buf, "mov", 2, mem64(10, 0), immediate(6));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 144));
+    emit(buf, "mov", 2, mem64(10, 8), reg(11));
+    label(buf, "__tx_str_done");
+    emit(buf, "add", 2, reg(4), immediate(168));
+    zero(buf, "ret");
+    // 宿主回退：还原四寄存器参后尾跳（原栈参 b@[rsp+40]/c@[rsp+48] 未动）。
+    label(buf, "__tx_str_concat_fallback");
+    emit(buf, "mov", 2, reg(1), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(2), mem32(4, 48));
+    emit(buf, "mov", 2, reg32(8), mem32(4, 56));
+    emit(buf, "mov", 2, reg32(9), mem32(4, 40));
+    emit(buf, "add", 2, reg(4), immediate(168));
+    one(buf, "jmp", target("__tx_str_concat_host"));
+}
+
+// ============================================================================
+// 字符串构建器面（v052-runtime-value-strlist-generation 首期 strb 批）：
+// strb 六符号接管（aot_shim StrbState 语义镜像；布局契约 store_abi.tx rev2：
+// ptr@0/len@8/cap@16/inited@24——溢出经 [rsp+32..]）。alloc=精确容量原生分配；
+// copy=尾跳内核 memcpy（零长守卫逐字同源）；append/prepend 几何增长
+// （nc=max(2cap,len+need)，旧缓冲释放；prepend 尾偏布局——内容恒靠缓冲
+// 末端）；finish/finish_pre=精确尺寸 dupe＋new_str_take 物化＋旧缓冲释放＋
+// 状态清零（inited 归零）＋stat(4)；统计计数经 __tx_strb_stat 位域
+// （appends=1/allocs=2/finishes=4——报告打印宿主单一事实源）。值语义：
+// append/prepend 只读 t 字节，t 槽 RC 不动。
+// ============================================================================
+
+function strbAlloc(buf: Ref<StructuredBuffer>): void {
+    label(buf, "__tx_strb_alloc");
+    emit(buf, "sub", 2, reg(4), immediate(40));
+    emit(buf, "mov", 2, reg32(2), immediate(1));
+    one(buf, "call", target("__tx_native_mem_alloc"));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_str_oom"));
+    emit(buf, "mov", 2, mem64(4, 32), reg(0));
+    emit(buf, "mov", 2, reg32(1), immediate(2));
+    one(buf, "call", target("__tx_strb_stat"));
+    emit(buf, "mov", 2, reg(0), mem64(4, 32));
+    emit(buf, "add", 2, reg(4), immediate(40));
+    zero(buf, "ret");
+}
+
+function strbCopy(buf: Ref<StructuredBuffer>): void {
+    // 尾跳内核 memcpy：零长守卫＋跨度检查逐字同源（dst/src/n 参序一致）。
+    label(buf, "__tx_strb_copy");
+    one(buf, "jmp", target("memcpy"));
+}
+
+function strbAppendPrepend(buf: Ref<StructuredBuffer>, isPrepend: int): void {
+    let tag = "_ap";
+    if (isPrepend == 1) { tag = "_pp"; }
+    const copyLabel = "__tx_sb" + tag + "_copy";
+    const ncLabel = "__tx_sb" + tag + "_nc";
+    const nofreeLabel = "__tx_sb" + tag + "_nofree";
+    if (isPrepend == 1) {
+        label(buf, "__tx_strb_prepend");
+    } else {
+        label(buf, "__tx_strb_append");
+    }
+    emit(buf, "sub", 2, reg(4), immediate(88));
+    emit(buf, "mov", 2, mem64(4, 32), reg(1));
+    emit(buf, "mov", 2, mem32(4, 40), reg32(2));
+    emit(buf, "mov", 2, reg32(1), mem32(4, 40));
+    one(buf, "call", target("__tx_store_str_len"));
+    emit(buf, "mov", 2, mem64(4, 48), reg(0));
+    emit(buf, "mov", 2, reg32(1), mem32(4, 40));
+    one(buf, "call", target("__tx_store_str_ptr"));
+    emit(buf, "mov", 2, mem64(4, 56), reg(0));
+    // 增长判据：cap < len+need
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg(11), mem64(10, 8));
+    emit(buf, "mov", 2, reg(9), mem64(4, 48));
+    emit(buf, "add", 2, reg(11), reg(9));
+    emit(buf, "mov", 2, reg(9), mem64(10, 16));
+    emit(buf, "cmp", 2, reg(9), reg(11));
+    one(buf, "jae", target(copyLabel));
+    // nc = max(2*cap, len+need) → rax；分配
+    emit(buf, "mov", 2, reg(0), reg(9));
+    emit(buf, "add", 2, reg(0), reg(0));
+    emit(buf, "cmp", 2, reg(0), reg(11));
+    one(buf, "jae", target(ncLabel));
+    emit(buf, "mov", 2, reg(0), reg(11));
+    label(buf, ncLabel);
+    emit(buf, "mov", 2, mem64(4, 64), reg(0));
+    emit(buf, "mov", 2, reg(1), reg(0));
+    emit(buf, "mov", 2, reg32(2), immediate(1));
+    one(buf, "call", target("__tx_native_mem_alloc"));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_str_oom"));
+    // new 指针入垫 @72——下述 free/stat 调用会改写易失 r9/r10/r11。
+    emit(buf, "mov", 2, mem64(4, 72), reg(0));
+    if (isPrepend == 1) {
+        // 旧内容贴新缓冲末端：memcpy(nb+(nc-len), old, len)
+        emit(buf, "mov", 2, reg(1), mem64(4, 72));
+        emit(buf, "mov", 2, reg(11), mem64(4, 64));
+        emit(buf, "mov", 2, reg(10), mem64(4, 32));
+        emit(buf, "mov", 2, reg(8), mem64(10, 8));
+        emit(buf, "sub", 2, reg(11), reg(8));
+        emit(buf, "add", 2, reg(1), reg(11));
+        emit(buf, "mov", 2, reg(10), mem64(4, 32));
+        emit(buf, "mov", 2, reg(2), mem64(10, 0));
+        one(buf, "call", target("memcpy"));
+    } else {
+        // 旧内容贴新缓冲前端：memcpy(nb, old, len)
+        emit(buf, "mov", 2, reg(1), mem64(4, 72));
+        emit(buf, "mov", 2, reg(10), mem64(4, 32));
+        emit(buf, "mov", 2, reg(2), mem64(10, 0));
+        emit(buf, "mov", 2, reg(10), mem64(4, 32));
+        emit(buf, "mov", 2, reg(8), mem64(10, 8));
+        one(buf, "call", target("memcpy"));
+    }
+    // 旧缓冲释放（cap>0）
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg(11), mem64(10, 16));
+    emit(buf, "test", 2, reg(11), reg(11));
+    one(buf, "jz", target(nofreeLabel));
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg(1), mem64(10, 0));
+    one(buf, "call", target("__tx_native_mem_free"));
+    label(buf, nofreeLabel);
+    // st.ptr=new（自垫重读——free 已改写易失寄存器）；st.cap=nc
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg(11), mem64(4, 72));
+    emit(buf, "mov", 2, mem64(10, 0), reg(11));
+    emit(buf, "mov", 2, reg(11), mem64(4, 64));
+    emit(buf, "mov", 2, mem64(10, 16), reg(11));
+    emit(buf, "mov", 2, reg32(1), immediate(2));
+    one(buf, "call", target("__tx_strb_stat"));
+    label(buf, copyLabel);
+    if (isPrepend == 1) {
+        // at = cap-len-need；memcpy(ptr+at, bytes, need)
+        emit(buf, "mov", 2, reg(10), mem64(4, 32));
+        emit(buf, "mov", 2, reg(1), mem64(10, 0));
+        emit(buf, "mov", 2, reg(11), mem64(10, 16));
+        emit(buf, "mov", 2, reg(9), mem64(10, 8));
+        emit(buf, "mov", 2, reg(0), mem64(4, 48));
+        emit(buf, "sub", 2, reg(11), reg(9));
+        emit(buf, "sub", 2, reg(11), reg(0));
+        emit(buf, "add", 2, reg(1), reg(11));
+        emit(buf, "mov", 2, reg(2), mem64(4, 56));
+        emit(buf, "mov", 2, reg(8), mem64(4, 48));
+        one(buf, "call", target("memcpy"));
+    } else {
+        // memcpy(ptr+len, bytes, need)
+        emit(buf, "mov", 2, reg(10), mem64(4, 32));
+        emit(buf, "mov", 2, reg(1), mem64(10, 0));
+        emit(buf, "mov", 2, reg(11), mem64(10, 8));
+        emit(buf, "add", 2, reg(1), reg(11));
+        emit(buf, "mov", 2, reg(2), mem64(4, 56));
+        emit(buf, "mov", 2, reg(8), mem64(4, 48));
+        one(buf, "call", target("memcpy"));
+    }
+    // st.len += need
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg(11), mem64(10, 8));
+    emit(buf, "mov", 2, reg(9), mem64(4, 48));
+    emit(buf, "add", 2, reg(11), reg(9));
+    emit(buf, "mov", 2, mem64(10, 8), reg(11));
+    emit(buf, "mov", 2, reg32(1), immediate(1));
+    one(buf, "call", target("__tx_strb_stat"));
+    emit(buf, "add", 2, reg(4), immediate(88));
+    zero(buf, "ret");
+}
+
+function strbFinishGen(buf: Ref<StructuredBuffer>, name: string, endBiased: int): void {
+    const nofreeLabel = name + "_nofree";
+    label(buf, name);
+    emit(buf, "sub", 2, reg(4), immediate(72));
+    emit(buf, "mov", 2, mem64(4, 32), reg(1));
+    emit(buf, "mov", 2, mem32(4, 40), reg32(2));
+    emit(buf, "mov", 2, mem32(4, 44), reg32(8));
+    emit(buf, "mov", 2, reg32(1), mem32(4, 40));
+    emit(buf, "mov", 2, reg32(2), mem32(4, 44));
+    one(buf, "call", target("__tx_site_of"));
+    emit(buf, "mov", 2, mem64(4, 48), reg(0));
+    // 精确尺寸 dupe：alloc(len,1)（len=0 → 类 16 非空指针，同 Zig dupe("")）
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg(1), mem64(10, 8));
+    emit(buf, "mov", 2, reg32(2), immediate(1));
+    one(buf, "call", target("__tx_native_mem_alloc"));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_str_oom"));
+    emit(buf, "mov", 2, mem64(4, 64), reg(0));
+    // src = st.ptr（尾偏形 +（cap-len））
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg(2), mem64(10, 0));
+    if (endBiased == 1) {
+        emit(buf, "mov", 2, reg(1), mem64(10, 16));
+        emit(buf, "mov", 2, reg(11), mem64(10, 8));
+        emit(buf, "sub", 2, reg(1), reg(11));
+        emit(buf, "add", 2, reg(2), reg(1));
+    }
+    emit(buf, "mov", 2, reg(1), mem64(4, 64));
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg(8), mem64(10, 8));
+    one(buf, "call", target("memcpy"));
+    // take 物化
+    emit(buf, "mov", 2, reg(1), mem64(4, 64));
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg(2), mem64(10, 8));
+    emit(buf, "mov", 2, reg(8), mem64(4, 48));
+    one(buf, "call", target("__tx_store_new_str_take"));
+    emit(buf, "mov", 2, mem64(4, 56), reg(0));
+    // 旧缓冲释放（cap>0）
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg(11), mem64(10, 16));
+    emit(buf, "test", 2, reg(11), reg(11));
+    one(buf, "jz", target(nofreeLabel));
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg(1), mem64(10, 0));
+    one(buf, "call", target("__tx_native_mem_free"));
+    label(buf, nofreeLabel);
+    // 状态清零（ptr/len/cap qword＋inited dword）
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, mem64(10, 0), immediate(0));
+    emit(buf, "mov", 2, mem64(10, 8), immediate(0));
+    emit(buf, "mov", 2, mem64(10, 16), immediate(0));
+    emit(buf, "mov", 2, reg32(11), immediate(0));
+    emit(buf, "mov", 2, mem32(10, 24), reg32(11));
+    emit(buf, "mov", 2, reg32(1), immediate(4));
+    one(buf, "call", target("__tx_strb_stat"));
+    emit(buf, "mov", 2, reg(0), mem64(4, 56));
+    emit(buf, "add", 2, reg(4), immediate(72));
+    zero(buf, "ret");
+}
+
+function strbEmit(buf: Ref<StructuredBuffer>): void {
+    strbAlloc(buf);
+    strbCopy(buf);
+    strbAppendPrepend(buf, 0);
+    strbAppendPrepend(buf, 1);
+    strbFinishGen(buf, "__tx_strb_finish", 0);
+    strbFinishGen(buf, "__tx_strb_finish_pre", 1);
+}
+
+// ============================================================================
+// list 推入面（v052-runtime-list）：__tx_list_push 接管——计数面原生镜像
+// retain（heapref 表先行、永生哨兵跳过、标量/原子臂同镜像＋探针 retain 槽
+// 0/8）；__tx_store_list_append 封装稳定 List 描述符，载荷增长/转换由
+// list_backing.tx 生成汇编执行。帧 72（≡8）：idx@32、v 槽址@40（v 传指针——生成代码契约）、
+// vtag@48、vidx@52（32 位读写防半初始化高半）。
+// ============================================================================
+
+// NRT 快路径（ecx=List 对象 idx，rdx=&值）：retain 后若容量足够直接写入——
+// 通用形态（aux=1）写 16 字节值（空表遇标量须转原始形态，走慢路径）；原始形态
+// （aux=2）且值 tag 与元素 tag 相同时写 8 字节载荷（bool 归一为 0/1）。其余
+// （扩容、形态转换）走 __tx_store_list_append。Obj72：elem@24 form@28 ptr@32
+// len@40 cap@48；对象基址＝槽表状态（线程块字段 __tx_nrt_slots）+48 处的指针＋idx*72。
+function listPushNrt(buf: Ref<StructuredBuffer>): void {
+    label(buf, "__tx_list_push");
+    emit(buf, "sub", 2, reg(4), immediate(56));
+    emit(buf, "mov", 2, mem32(4, 32), reg32(1));
+    emit(buf, "mov", 2, mem64(4, 40), reg(2));
+    // 线程第 4b 步：冻结的 List（来自 Shared）不动，返回 1，调用方转通用 callbi 由内建报 4022；外部调用借用中的
+    // List<u8>（flags 位 64）同样返回 1，由 listPush 按调用处报 4024（D3 v0.34 §6.8-16：借用期内不改长度，与容量无关）。
+    slotStateInto(buf, 0);
+    emit(buf, "mov", 2, reg(10), mem64(0, 48));
+    emit(buf, "mov", 2, reg32(9), reg32(1));
+    emit(buf, "mov", 2, reg(8), reg(9));
+    emit(buf, "shl", 2, reg(8), immediate(3));
+    emit(buf, "shl", 2, reg(9), immediate(6));
+    emit(buf, "add", 2, reg(9), reg(8));
+    emit(buf, "add", 2, reg(10), reg(9));
+    emit(buf, "mov", 2, reg32(11), mem32(10, 0));
+    emit(buf, "and", 2, reg32(11), immediate(80));
+    one(buf, "jne", target("__tx_lpn_guarded"));
+    // 对象地址留在帧 @48 跨过 retain（retain 不建对象，槽表不搬），不再重算。
+    emit(buf, "mov", 2, mem64(4, 48), reg(10));
+    emit(buf, "mov", 2, reg(1), reg(2));
+    one(buf, "call", target("__tx_retain"));
+    emit(buf, "mov", 2, reg(2), mem64(4, 40));
+    emit(buf, "mov", 2, reg(10), mem64(4, 48));
+    emit(buf, "mov", 2, reg(0), mem64(2, 0));
+    emit(buf, "and", 2, reg32(0), immediate(255));
+    emit(buf, "mov", 2, reg(8), mem64(10, 40));
+    emit(buf, "cmp", 2, reg(8), mem64(10, 48));
+    one(buf, "jae", target("__tx_lpn_slow"));
+    emit(buf, "mov", 2, reg32(9), mem32(10, 28));
+    emit(buf, "cmp", 2, reg32(9), immediate(1));
+    one(buf, "jne", target("__tx_lpn_raw"));
+    emit(buf, "test", 2, reg(8), reg(8));
+    one(buf, "jne", target("__tx_lpn_generic"));
+    emit(buf, "cmp", 2, reg32(0), immediate(1));
+    one(buf, "jb", target("__tx_lpn_generic"));
+    emit(buf, "cmp", 2, reg32(0), immediate(3));
+    one(buf, "jbe", target("__tx_lpn_slow"));
+    label(buf, "__tx_lpn_generic");
+    emit(buf, "mov", 2, reg(11), reg(8));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(11), mem64(10, 32));
+    emit(buf, "mov", 2, reg(9), mem64(2, 0));
+    emit(buf, "mov", 2, mem64(11, 0), reg(9));
+    emit(buf, "mov", 2, reg(9), mem64(2, 8));
+    emit(buf, "mov", 2, mem64(11, 8), reg(9));
+    one(buf, "jmp", target("__tx_lpn_bump"));
+    label(buf, "__tx_lpn_raw");
+    emit(buf, "cmp", 2, reg32(9), immediate(2));
+    one(buf, "jne", target("__tx_lpn_compact"));
+    emit(buf, "cmp", 2, reg32(0), mem32(10, 24));
+    one(buf, "jne", target("__tx_lpn_slow"));
+    emit(buf, "mov", 2, reg(9), mem64(2, 8));
+    emit(buf, "cmp", 2, reg32(0), immediate(3));
+    one(buf, "jne", target("__tx_lpn_raw_store"));
+    emit(buf, "test", 2, reg(9), reg(9));
+    one(buf, "je", target("__tx_lpn_raw_store"));
+    emit(buf, "mov", 2, reg32(9), immediate(1));
+    label(buf, "__tx_lpn_raw_store");
+    emit(buf, "mov", 2, reg(11), reg(8));
+    emit(buf, "shl", 2, reg(11), immediate(3));
+    emit(buf, "add", 2, reg(11), mem64(10, 32));
+    emit(buf, "mov", 2, mem64(11, 0), reg(9));
+    label(buf, "__tx_lpn_bump");
+    emit(buf, "add", 2, reg(8), immediate(1));
+    emit(buf, "mov", 2, mem64(10, 40), reg(8));
+    emit(buf, "xor", 2, reg32(0), reg32(0));
+    emit(buf, "add", 2, reg(4), immediate(56));
+    zero(buf, "ret");
+    // 紧凑列表（form 3，O4 第二步）：标签须为整数（f32 为 2），按种类码 elem 的宽度写入低位；f32 舍入为单精度位
+    //（值本就可精确表示）。其余情形（种类非法、标签不符）走慢路径由 __tx_store_list_append 处理。
+    label(buf, "__tx_lpn_compact");
+    emit(buf, "cmp", 2, reg32(9), immediate(3));
+    one(buf, "jne", target("__tx_lpn_slow"));
+    emit(buf, "mov", 2, reg32(9), mem32(10, 24));
+    emit(buf, "mov", 2, reg(11), mem64(2, 8));
+    emit(buf, "cmp", 2, reg32(9), immediate(10));
+    one(buf, "jne", target("__tx_lpn_c_int"));
+    emit(buf, "cmp", 2, reg32(0), immediate(2));
+    one(buf, "jne", target("__tx_lpn_slow"));
+    emit(buf, "movq", 2, asStructuredReg(3, 0), reg(11));
+    emit(buf, "cvtsd2ss", 2, asStructuredReg(3, 0), asStructuredReg(3, 0));
+    emit(buf, "movq", 2, reg(11), asStructuredReg(3, 0));
+    one(buf, "jmp", target("__tx_lpn_c4"));
+    label(buf, "__tx_lpn_c_int");
+    emit(buf, "cmp", 2, reg32(0), immediate(1));
+    one(buf, "jne", target("__tx_lpn_slow"));
+    emit(buf, "cmp", 2, reg32(9), immediate(1));
+    one(buf, "je", target("__tx_lpn_c1"));
+    emit(buf, "cmp", 2, reg32(9), immediate(4));
+    one(buf, "je", target("__tx_lpn_c1"));
+    emit(buf, "cmp", 2, reg32(9), immediate(2));
+    one(buf, "je", target("__tx_lpn_c2"));
+    emit(buf, "cmp", 2, reg32(9), immediate(5));
+    one(buf, "je", target("__tx_lpn_c2"));
+    emit(buf, "cmp", 2, reg32(9), immediate(3));
+    one(buf, "je", target("__tx_lpn_c4"));
+    emit(buf, "cmp", 2, reg32(9), immediate(6));
+    one(buf, "jne", target("__tx_lpn_slow"));
+    label(buf, "__tx_lpn_c4");
+    emit(buf, "mov", 2, reg(0), reg(8));
+    emit(buf, "shl", 2, reg(0), immediate(2));
+    emit(buf, "add", 2, reg(0), mem64(10, 32));
+    emit(buf, "mov", 2, mem32(0, 0), reg32(11));
+    one(buf, "jmp", target("__tx_lpn_bump"));
+    label(buf, "__tx_lpn_c2");
+    emit(buf, "mov", 2, reg(0), reg(8));
+    emit(buf, "shl", 2, reg(0), immediate(1));
+    emit(buf, "add", 2, reg(0), mem64(10, 32));
+    emit(buf, "mov", 2, asStructuredMem(3, 0, -1, 0, 0, 0, ""), reg32(11));
+    one(buf, "jmp", target("__tx_lpn_bump"));
+    label(buf, "__tx_lpn_c1");
+    emit(buf, "mov", 2, reg(0), reg(8));
+    emit(buf, "add", 2, reg(0), mem64(10, 32));
+    emit(buf, "mov", 2, asStructuredMem(0, 0, -1, 0, 0, 0, ""), reg8(11));
+    one(buf, "jmp", target("__tx_lpn_bump"));
+    label(buf, "__tx_lpn_slow");
+    emit(buf, "mov", 2, reg32(1), mem32(4, 32));
+    emit(buf, "mov", 2, reg(2), mem64(4, 40));
+    one(buf, "call", target("__tx_store_list_append"));
+    emit(buf, "xor", 2, reg32(0), reg32(0));
+    emit(buf, "add", 2, reg(4), immediate(56));
+    zero(buf, "ret");
+    label(buf, "__tx_lpn_guarded");
+    emit(buf, "mov", 2, reg32(0), immediate(1));
+    emit(buf, "add", 2, reg(4), immediate(56));
+    zero(buf, "ret");
+}
+
+function listPushEmit(buf: Ref<StructuredBuffer>): void {
+    label(buf, "__tx_list_push");
+    emit(buf, "sub", 2, reg(4), immediate(72));
+    emit(buf, "mov", 2, mem32(4, 32), reg32(1));
+    emit(buf, "mov", 2, mem64(4, 40), reg(2));
+    // v.tag → heapref 表
+    emit(buf, "mov", 2, reg(10), mem64(4, 40));
+    emit(buf, "mov", 2, reg(0), mem64(10, 0));
+    emit(buf, "and", 2, reg32(0), immediate(255));
+    emit(buf, "mov", 2, mem32(4, 48), reg32(0));
+    emit(buf, "lea", 2, reg(2), ripMemory("__tx_is_heapref"));
+    emit(buf, "add", 2, reg(2), reg(0));
+    emit(buf, "mov", 2, reg8(9), asStructuredMem(0, 2, -1, 0, 0, 0, ""));
+    emit(buf, "test", 2, reg8(9), reg8(9));
+    one(buf, "jz", target("__tx_lp_append"));
+    // v.idx（32 位）→ rc 槽；永生哨兵跳 retain
+    emit(buf, "mov", 2, reg(10), mem64(4, 40));
+    emit(buf, "mov", 2, reg32(11), mem32(10, 8));
+    emit(buf, "mov", 2, mem32(4, 52), reg32(11));
+    emit(buf, "mov", 2, reg32(1), mem32(4, 52));
+    one(buf, "call", target("__tx_rc_base"));
+    emit(buf, "mov", 2, reg32(9), mem32(4, 52));
+    emit(buf, "shl", 2, reg(9), immediate(2));
+    emit(buf, "add", 2, reg(0), reg(9));
+    emit(buf, "mov", 2, mem64(4, 64), reg(0));
+    emit(buf, "mov", 2, reg32(2), mem32(0, 0));
+    emit(buf, "test", 2, reg32(2), reg32(2));
+    one(buf, "js", target("__tx_lp_append"));
+    // 臂选择＋计数增（retain 镜像：lockxadd +1 / 标量 +1；探针槽 0/8）
+    one(buf, "call", target("__tx_rc_scalar_flag"));
+    emit(buf, "mov", 2, mem64(4, 56), reg(0));
+    emit(buf, "mov", 2, reg(0), mem64(4, 64));
+    emit(buf, "mov", 2, reg32(10), mem32(4, 56));
+    emit(buf, "and", 2, reg32(10), immediate(1));
+    one(buf, "jne", target("__tx_lp_scalar"));
+    emit(buf, "mov", 2, reg32(2), immediate(1));
+    emit(buf, "lockxadd", 2, asStructuredMem(1, 0, -1, 0, 0, 0, ""), reg32(2));
+    emit(buf, "mov", 2, reg32(10), mem32(4, 56));
+    emit(buf, "and", 2, reg32(10), immediate(2));
+    one(buf, "jz", target("__tx_lp_append"));
+    one(buf, "call", target("__tx_rc_probe_counts"));
+    emit(buf, "mov", 2, reg(9), mem64(0, 0));
+    emit(buf, "add", 2, reg(9), immediate(1));
+    emit(buf, "mov", 2, mem64(0, 0), reg(9));
+    one(buf, "jmp", target("__tx_lp_append"));
+    label(buf, "__tx_lp_scalar");
+    emit(buf, "mov", 2, reg32(2), mem32(0, 0));
+    emit(buf, "add", 2, reg32(2), immediate(1));
+    emit(buf, "mov", 2, mem32(0, 0), reg32(2));
+    emit(buf, "mov", 2, reg32(10), mem32(4, 56));
+    emit(buf, "and", 2, reg32(10), immediate(2));
+    one(buf, "jz", target("__tx_lp_append"));
+    one(buf, "call", target("__tx_rc_probe_counts"));
+    emit(buf, "mov", 2, reg(9), mem64(0, 8));
+    emit(buf, "add", 2, reg(9), immediate(1));
+    emit(buf, "mov", 2, mem64(0, 8), reg(9));
+    label(buf, "__tx_lp_append");
+    emit(buf, "mov", 2, reg32(1), mem32(4, 32));
+    emit(buf, "mov", 2, reg(2), mem64(4, 40));
+    one(buf, "call", target("__tx_store_list_append"));
+    emit(buf, "add", 2, reg(4), immediate(72));
+    zero(buf, "ret");
+}
+
+// ============================================================================
+// 文件面（v052-runtime-file）：readFile/writeFile/writeFileBytes 三内建接管。
+// 内核直调 kernel32（MultiByteToWideChar/CreateFileW/GetFileSizeEx/ReadFile/
+// WriteFile/CloseHandle/GetLastError）——路径转宽字符、读写按块循环（每块至多 1 GiB：长度参数是 DWORD；
+// 容量批 C4b 起 readFile 不设尺寸上限，分配失败得 enomem）、读写字节循环归原生；
+// 宿主保留：参数个数/类型失配与 raw 列表形态的陷阱
+// （回退 __tx_bi_*_host）、错误对象格式化（__tx_store_file_err/
+// __tx_store_wfb_elem_err 单一事实源）。状态码＝tx_Status（0 ok/1 einval/
+// 2 enomem/3 enoent/4 eacces/5 eio/6 etoobig）。
+// 寄存器纪律（五连教训）：跨调用活值一律入垫；判据读垫不读恢复值。
+// ============================================================================
+
+// GetLastError → tx_Status 映射：2/3→3(ENOENT)、5→4(EACCES)、87/123→1(EINVAL)、
+// 其余→5(EIO)。eax 进 eax 出。
+function fileMapErr(buf: Ref<StructuredBuffer>): void {
+    label(buf, "__tx_file_maperr");
+    emit(buf, "cmp", 2, reg32(0), immediate(2));
+    one(buf, "je", target("__tx_fme_enoent"));
+    emit(buf, "cmp", 2, reg32(0), immediate(3));
+    one(buf, "je", target("__tx_fme_enoent"));
+    emit(buf, "cmp", 2, reg32(0), immediate(5));
+    one(buf, "je", target("__tx_fme_eacc"));
+    emit(buf, "cmp", 2, reg32(0), immediate(87));
+    one(buf, "je", target("__tx_fme_einval"));
+    emit(buf, "cmp", 2, reg32(0), immediate(123));
+    one(buf, "je", target("__tx_fme_einval"));
+    emit(buf, "mov", 2, reg32(0), immediate(5));
+    zero(buf, "ret");
+    label(buf, "__tx_fme_enoent");
+    emit(buf, "mov", 2, reg32(0), immediate(3));
+    zero(buf, "ret");
+    label(buf, "__tx_fme_eacc");
+    emit(buf, "mov", 2, reg32(0), immediate(4));
+    zero(buf, "ret");
+    label(buf, "__tx_fme_einval");
+    emit(buf, "mov", 2, reg32(0), immediate(1));
+    zero(buf, "ret");
+}
+
+// 路径 UTF-8→UTF-16：rcx=path_ptr, rdx=path_len → rax=wbuf（原生分配，
+// 容量 path_len*2+2——UTF-8 最坏 4B→4B）；失败（含空路径）→ rax=0。
+// 帧布局（三原语共用约定）：[rsp+0x20/0x28/0x30]＝栈参区（调用时直写）；
+// 垫位自 56 起——pp@56 plen@64 wbuf@72（互不冲突）。
+function fileWidePath(buf: Ref<StructuredBuffer>): void {
+    label(buf, "__tx_file_wpath");
+    emit(buf, "sub", 2, reg(4), immediate(136));
+    emit(buf, "mov", 2, mem64(4, 56), reg(1));
+    emit(buf, "mov", 2, mem64(4, 64), reg(2));
+    emit(buf, "test", 2, reg(2), reg(2));
+    one(buf, "jz", target("__tx_fw_null"));
+    // 含 NUL 的串不转换（系统在 NUL 处截断，看到的是别的路径）：返回 0，文件原语据此报无效实参，其余调用方先行检查。
+    emit(buf, "xor", 2, reg32(0), reg32(0));
+    label(buf, "__tx_fw_scan");
+    emit(buf, "cmp", 2, asStructuredMem(0, 1, 0, 0, 0, 0, ""), immediate(0));
+    one(buf, "je", target("__tx_fw_null"));
+    emit(buf, "add", 2, reg(0), immediate(1));
+    emit(buf, "cmp", 2, reg(0), reg(2));
+    one(buf, "jb", target("__tx_fw_scan"));
+    // wbuf = alloc(len*2+2, 1)
+    emit(buf, "mov", 2, reg(1), mem64(4, 64));
+    emit(buf, "add", 2, reg(1), reg(1));
+    emit(buf, "add", 2, reg(1), immediate(2));
+    emit(buf, "mov", 2, reg32(2), immediate(1));
+    one(buf, "call", target("__tx_native_mem_alloc"));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_fw_null"));
+    emit(buf, "mov", 2, mem64(4, 72), reg(0));
+    // MultiByteToWideChar(CP_UTF8, 0, path, len, wbuf, cap)：
+    // rcx=cp rdx=flags r8=src r9=srclen arg5=wbuf@[rsp+0x20] arg6=cap@[rsp+0x28]
+    emit(buf, "mov", 2, mem64(4, 32), reg(0));
+    emit(buf, "mov", 2, reg(11), mem64(4, 64));
+    emit(buf, "add", 2, reg(11), immediate(1));
+    emit(buf, "mov", 2, mem64(4, 40), reg(11));
+    emit(buf, "mov", 2, reg32(1), immediate(65001));
+    emit(buf, "xor", 2, reg32(2), reg32(2));
+    emit(buf, "mov", 2, reg(8), mem64(4, 56));
+    emit(buf, "mov", 2, reg(9), mem64(4, 64));
+    one(buf, "call", target("MultiByteToWideChar"));
+    emit(buf, "test", 2, reg32(0), reg32(0));
+    one(buf, "jz", target("__tx_fw_failfree"));
+    // 转换不补 NUL——wbuf[ret]=0 显式终结（wbuf 源自未清零原生分配）。
+    emit(buf, "mov", 2, reg32(11), reg32(0));
+    emit(buf, "add", 2, reg(11), reg(11));
+    emit(buf, "add", 2, reg(11), mem64(4, 72));
+    emit(buf, "xor", 2, reg32(0), reg32(0));
+    emit(buf, "mov", 2, asStructuredMem(0, 11, -1, 0, 0, 0, ""), reg8(0));
+    emit(buf, "add", 2, reg(11), immediate(1));
+    emit(buf, "mov", 2, asStructuredMem(0, 11, -1, 0, 0, 0, ""), reg8(0));
+    emit(buf, "mov", 2, reg(0), mem64(4, 72));
+    emit(buf, "add", 2, reg(4), immediate(136));
+    zero(buf, "ret");
+    label(buf, "__tx_fw_failfree");
+    emit(buf, "mov", 2, reg(1), mem64(4, 72));
+    one(buf, "call", target("__tx_native_mem_free"));
+    label(buf, "__tx_fw_null");
+    emit(buf, "xor", 2, reg32(0), reg32(0));
+    emit(buf, "add", 2, reg(4), immediate(136));
+    zero(buf, "ret");
+}
+
+// __tx_native_file_read(path_ptr, path_len, out_ptr*, out_len*) -> status
+// 垫位：pp@56 plen@64 out8@72 out9@80 wbuf@88 handle@96 size@104 buf@112
+// read@120 errsave@128 total@136。
+function fileReadPrim(buf: Ref<StructuredBuffer>): void {
+    // 第九例（被调保存寄存器纪律；rbx 留给值槽窗口）：尺寸跨 CreateFileW/GetFileSizeEx/alloc/ReadFile
+    // 全程驻被调保存 r12——系统调用内部栈作业不再有机会改写裸栈垫位。
+    // 帧：push r12 + sub 144（16 对齐）；垫位：pp@56 plen@64 out8@72
+    // out9@80 wbuf@88 handle@96 read@120（read 必须经指针——留栈）。
+    label(buf, "__tx_native_file_read");
+    one(buf, "push", reg(12));
+    emit(buf, "sub", 2, reg(4), immediate(144));
+    emit(buf, "mov", 2, mem64(4, 56), reg(1));
+    emit(buf, "mov", 2, mem64(4, 64), reg(2));
+    emit(buf, "mov", 2, mem64(4, 72), reg(8));
+    emit(buf, "mov", 2, mem64(4, 80), reg(9));
+    emit(buf, "mov", 2, reg(1), mem64(4, 56));
+    emit(buf, "mov", 2, reg(2), mem64(4, 64));
+    one(buf, "call", target("__tx_file_wpath"));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_fr_einval"));
+    emit(buf, "mov", 2, mem64(4, 88), reg(0));
+    // CreateFileW：arg5=OPEN_EXISTING(3) arg6=FILE_ATTRIBUTE_NORMAL(0x80) arg7=0
+    emit(buf, "mov", 2, mem64(4, 32), immediate(3));
+    emit(buf, "mov", 2, mem64(4, 40), immediate(128));
+    emit(buf, "mov", 2, mem64(4, 48), immediate(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 88));
+    emit(buf, "mov", 2, reg(2), immediate(-2147483648));
+    emit(buf, "mov", 2, reg32(8), immediate(1));
+    emit(buf, "xor", 2, reg32(9), reg32(9));
+    one(buf, "call", target("CreateFileW"));
+    emit(buf, "cmp", 2, reg(0), immediate(-1));
+    one(buf, "je", target("__tx_fr_openfail"));
+    emit(buf, "mov", 2, mem64(4, 96), reg(0));
+    // GetFileSizeEx(h, &tmp) → r12（不设上限：分配失败即 enomem）。
+    emit(buf, "mov", 2, reg(1), mem64(4, 96));
+    emit(buf, "lea", 2, reg(2), stackMemory(104));
+    one(buf, "call", target("GetFileSizeEx"));
+    emit(buf, "test", 2, reg32(0), reg32(0));
+    one(buf, "jz", target("__tx_fr_iofail"));
+    emit(buf, "mov", 2, reg(12), mem64(4, 104));
+    // buf = alloc(size, 1)——size 取 r12
+    emit(buf, "mov", 2, reg(1), reg(12));
+    emit(buf, "mov", 2, reg32(2), immediate(1));
+    one(buf, "call", target("__tx_native_mem_alloc"));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_fr_closefail"));
+    emit(buf, "mov", 2, mem64(4, 112), reg(0));
+    // ReadFile(h, buf+total, chunk, &read, NULL) 循环到读满 r12：每块至多 1 GiB（长度参数是 DWORD），
+    // 读到 0 字节（文件变短）即 eio。total@136。
+    emit(buf, "mov", 2, mem64(4, 136), immediate(0));
+    label(buf, "__tx_frd_loop");
+    emit(buf, "mov", 2, reg(8), reg(12));
+    emit(buf, "mov", 2, reg(0), mem64(4, 136));
+    emit(buf, "sub", 2, reg(8), reg(0));
+    one(buf, "jz", target("__tx_frd_full"));
+    emit(buf, "cmp", 2, reg(8), immediate(1073741824));
+    one(buf, "jbe", target("__tx_frd_chunk"));
+    emit(buf, "mov", 2, reg32(8), immediate(1073741824));
+    label(buf, "__tx_frd_chunk");
+    emit(buf, "mov", 2, mem64(4, 32), immediate(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 96));
+    emit(buf, "mov", 2, reg(2), mem64(4, 112));
+    emit(buf, "add", 2, reg(2), reg(0));
+    emit(buf, "lea", 2, reg(9), stackMemory(120));
+    one(buf, "call", target("ReadFile"));
+    emit(buf, "test", 2, reg32(0), reg32(0));
+    one(buf, "jz", target("__tx_fr_readfail"));
+    emit(buf, "mov", 2, reg32(0), mem32(4, 120));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_fr_readfail"));
+    emit(buf, "mov", 2, reg(10), mem64(4, 136));
+    emit(buf, "add", 2, reg(0), reg(10));
+    emit(buf, "mov", 2, mem64(4, 136), reg(0));
+    one(buf, "jmp", target("__tx_frd_loop"));
+    label(buf, "__tx_frd_full");
+    // CloseHandle ＋ 出参（[out8]=buf [out9]=r12）＋ wbuf 释放 → OK
+    emit(buf, "mov", 2, reg(1), mem64(4, 96));
+    one(buf, "call", target("CloseHandle"));
+    emit(buf, "mov", 2, reg(10), mem64(4, 72));
+    emit(buf, "mov", 2, reg(11), mem64(4, 112));
+    emit(buf, "mov", 2, mem64(10, 0), reg(11));
+    emit(buf, "mov", 2, reg(10), mem64(4, 80));
+    emit(buf, "mov", 2, mem64(10, 0), reg(12));
+    emit(buf, "mov", 2, reg(1), mem64(4, 88));
+    one(buf, "call", target("__tx_native_mem_free"));
+    emit(buf, "xor", 2, reg32(0), reg32(0));
+    emit(buf, "add", 2, reg(4), immediate(144));
+    one(buf, "pop", reg(12));
+    zero(buf, "ret");
+    label(buf, "__tx_fr_readfail");
+    emit(buf, "mov", 2, reg(1), mem64(4, 112));
+    one(buf, "call", target("__tx_native_mem_free"));
+    emit(buf, "mov", 2, reg(1), mem64(4, 96));
+    one(buf, "call", target("CloseHandle"));
+    emit(buf, "mov", 2, reg32(0), immediate(5));
+    emit(buf, "add", 2, reg(4), immediate(144));
+    one(buf, "pop", reg(12));
+    zero(buf, "ret");
+    label(buf, "__tx_fr_iofail");
+    emit(buf, "mov", 2, reg(1), mem64(4, 96));
+    one(buf, "call", target("CloseHandle"));
+    emit(buf, "mov", 2, reg32(0), immediate(5));
+    emit(buf, "add", 2, reg(4), immediate(144));
+    one(buf, "pop", reg(12));
+    zero(buf, "ret");
+    label(buf, "__tx_fr_closefail");
+    emit(buf, "mov", 2, reg(1), mem64(4, 96));
+    one(buf, "call", target("CloseHandle"));
+    emit(buf, "mov", 2, reg32(0), immediate(2));
+    emit(buf, "add", 2, reg(4), immediate(144));
+    one(buf, "pop", reg(12));
+    zero(buf, "ret");
+    label(buf, "__tx_fr_openfail");
+    one(buf, "call", target("GetLastError"));
+    one(buf, "call", target("__tx_file_maperr"));
+    emit(buf, "mov", 2, mem64(4, 128), reg(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 88));
+    one(buf, "call", target("__tx_native_mem_free"));
+    emit(buf, "mov", 2, reg(0), mem64(4, 128));
+    emit(buf, "add", 2, reg(4), immediate(144));
+    one(buf, "pop", reg(12));
+    zero(buf, "ret");
+    label(buf, "__tx_fr_einval");
+    emit(buf, "mov", 2, reg32(0), immediate(1));
+    emit(buf, "add", 2, reg(4), immediate(144));
+    one(buf, "pop", reg(12));
+    zero(buf, "ret");
+}
+
+function fileWritePrim(buf: Ref<StructuredBuffer>): void {
+    // 第九例同源（被调保存寄存器纪律；rbx 留给值槽窗口）：datalen 跨 CreateFileW 驻被调保存 r12。
+    // 帧：push r12 + sub 144；垫位：pp@56 plen@64 data@72 wbuf@88
+    // handle@96 written@104 errsave@112 total@120。
+    // Windows has no executable bit: writeExecutable shares the primitive.
+    label(buf, "__tx_native_file_write_exec");
+    label(buf, "__tx_native_file_write");
+    one(buf, "push", reg(12));
+    emit(buf, "sub", 2, reg(4), immediate(144));
+    emit(buf, "mov", 2, mem64(4, 56), reg(1));
+    emit(buf, "mov", 2, mem64(4, 64), reg(2));
+    emit(buf, "mov", 2, mem64(4, 72), reg(8));
+    emit(buf, "mov", 2, reg(12), reg(9));
+    emit(buf, "mov", 2, reg(1), mem64(4, 56));
+    emit(buf, "mov", 2, reg(2), mem64(4, 64));
+    one(buf, "call", target("__tx_file_wpath"));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_fw2_einval"));
+    emit(buf, "mov", 2, mem64(4, 88), reg(0));
+    // CreateFileW(GENERIC_WRITE, 0, 0, CREATE_ALWAYS=2, 0x80, 0)
+    emit(buf, "mov", 2, mem64(4, 32), immediate(2));
+    emit(buf, "mov", 2, mem64(4, 40), immediate(128));
+    emit(buf, "mov", 2, mem64(4, 48), immediate(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 88));
+    emit(buf, "mov", 2, reg(2), immediate(1073741824));
+    emit(buf, "xor", 2, reg32(8), reg32(8));
+    emit(buf, "xor", 2, reg32(9), reg32(9));
+    one(buf, "call", target("CreateFileW"));
+    emit(buf, "cmp", 2, reg(0), immediate(-1));
+    one(buf, "je", target("__tx_fw2_openfail"));
+    emit(buf, "mov", 2, mem64(4, 96), reg(0));
+    // WriteFile(h, data+total, chunk, &written, NULL) 循环到写完 r12：每块至多 1 GiB（长度参数是 DWORD；原先
+    // 单次写，≥4 GiB 时写出半截并报 eio）。total@120。
+    emit(buf, "mov", 2, mem64(4, 120), immediate(0));
+    label(buf, "__tx_fw2_loop");
+    emit(buf, "mov", 2, reg(8), reg(12));
+    emit(buf, "mov", 2, reg(0), mem64(4, 120));
+    emit(buf, "sub", 2, reg(8), reg(0));
+    one(buf, "jz", target("__tx_fw2_full"));
+    emit(buf, "cmp", 2, reg(8), immediate(1073741824));
+    one(buf, "jbe", target("__tx_fw2_chunk"));
+    emit(buf, "mov", 2, reg32(8), immediate(1073741824));
+    label(buf, "__tx_fw2_chunk");
+    emit(buf, "mov", 2, mem64(4, 32), immediate(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 96));
+    emit(buf, "mov", 2, reg(2), mem64(4, 72));
+    emit(buf, "add", 2, reg(2), reg(0));
+    emit(buf, "lea", 2, reg(9), stackMemory(104));
+    one(buf, "call", target("WriteFile"));
+    emit(buf, "test", 2, reg32(0), reg32(0));
+    one(buf, "jz", target("__tx_fw2_wfail"));
+    emit(buf, "mov", 2, reg32(0), mem32(4, 104));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_fw2_wfail"));
+    emit(buf, "mov", 2, reg(10), mem64(4, 120));
+    emit(buf, "add", 2, reg(0), reg(10));
+    emit(buf, "mov", 2, mem64(4, 120), reg(0));
+    one(buf, "jmp", target("__tx_fw2_loop"));
+    label(buf, "__tx_fw2_full");
+    emit(buf, "mov", 2, reg(1), mem64(4, 96));
+    one(buf, "call", target("CloseHandle"));
+    emit(buf, "mov", 2, reg(1), mem64(4, 88));
+    one(buf, "call", target("__tx_native_mem_free"));
+    emit(buf, "xor", 2, reg32(0), reg32(0));
+    emit(buf, "add", 2, reg(4), immediate(144));
+    one(buf, "pop", reg(12));
+    zero(buf, "ret");
+    label(buf, "__tx_fw2_wfail");
+    emit(buf, "mov", 2, reg(1), mem64(4, 96));
+    one(buf, "call", target("CloseHandle"));
+    one(buf, "call", target("GetLastError"));
+    one(buf, "call", target("__tx_file_maperr"));
+    emit(buf, "mov", 2, mem64(4, 112), reg(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 88));
+    one(buf, "call", target("__tx_native_mem_free"));
+    emit(buf, "mov", 2, reg(0), mem64(4, 112));
+    emit(buf, "add", 2, reg(4), immediate(144));
+    one(buf, "pop", reg(12));
+    zero(buf, "ret");
+    label(buf, "__tx_fw2_openfail");
+    one(buf, "call", target("GetLastError"));
+    one(buf, "call", target("__tx_file_maperr"));
+    emit(buf, "mov", 2, mem64(4, 112), reg(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 88));
+    one(buf, "call", target("__tx_native_mem_free"));
+    emit(buf, "mov", 2, reg(0), mem64(4, 112));
+    emit(buf, "add", 2, reg(4), immediate(144));
+    one(buf, "pop", reg(12));
+    zero(buf, "ret");
+    label(buf, "__tx_fw2_einval");
+    emit(buf, "mov", 2, reg32(0), immediate(1));
+    emit(buf, "add", 2, reg(4), immediate(144));
+    one(buf, "pop", reg(12));
+    zero(buf, "ret");
+}
+
+function fileEmit(buf: Ref<StructuredBuffer>): void {
+    if (tUnix(rtTarget)) { linuxFileEmit(buf, rtTarget); }
+    else {
+        fileMapErr(buf);
+        fileWidePath(buf);
+        fileReadPrim(buf);
+        fileWritePrim(buf);
+    }
+}
+
+// —— 三内建壳（帧 120≡8：win@32 fn@40 pc@44 a@48 nargs@52；其余垫位见
+// 各臂）。nargs/类型失配 → 尾跳宿主全量路径（保栈参原位）。——
+
+function fileReadBi(buf: Ref<StructuredBuffer>): void {
+    label(buf, "__tx_bi_read_file");
+    emit(buf, "sub", 2, reg(4), immediate(120));
+    emit(buf, "mov", 2, mem64(4, 32), reg(1));
+    emit(buf, "mov", 2, mem32(4, 40), reg32(2));
+    emit(buf, "mov", 2, mem32(4, 44), reg32(8));
+    emit(buf, "mov", 2, mem32(4, 48), reg32(9));
+    emit(buf, "mov", 2, reg32(10), mem32(4, 160));
+    emit(buf, "mov", 2, mem32(4, 52), reg32(10));
+    emit(buf, "cmp", 2, reg32(10), immediate(1));
+    one(buf, "jne", target("__tx_rf_host"));
+    // 槽址＝win+16*(a+1)；tag==str(6)
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 48));
+    emit(buf, "add", 2, reg32(11), immediate(1));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, reg(0), mem64(10, 0));
+    emit(buf, "and", 2, reg32(0), immediate(255));
+    emit(buf, "cmp", 2, reg32(0), immediate(6));
+    one(buf, "jne", target("__tx_rf_host"));
+    emit(buf, "mov", 2, reg32(11), mem32(10, 8));
+    emit(buf, "mov", 2, mem32(4, 56), reg32(11));
+    // path 跨度
+    emit(buf, "mov", 2, reg32(1), mem32(4, 56));
+    one(buf, "call", target("__tx_store_str_ptr"));
+    emit(buf, "mov", 2, mem64(4, 64), reg(0));
+    emit(buf, "mov", 2, reg32(1), mem32(4, 56));
+    one(buf, "call", target("__tx_store_str_len"));
+    emit(buf, "mov", 2, mem64(4, 72), reg(0));
+    // 原生读：out_ptr@80、out_len@88
+    emit(buf, "mov", 2, reg(1), mem64(4, 64));
+    emit(buf, "mov", 2, reg(2), mem64(4, 72));
+    emit(buf, "lea", 2, reg(8), stackMemory(80));
+    emit(buf, "lea", 2, reg(9), stackMemory(88));
+    one(buf, "call", target("__tx_native_file_read"));
+    emit(buf, "test", 2, reg32(0), reg32(0));
+    one(buf, "jz", target("__tx_rf_ok"));
+    // 错误臂：err 对象（宿主格式化）→ 释放旧槽 → 写 {5, err}
+    emit(buf, "mov", 2, mem32(4, 96), reg32(0));
+    emit(buf, "mov", 2, reg32(1), mem32(4, 96));
+    emit(buf, "mov", 2, reg32(2), mem32(4, 56));
+    emit(buf, "mov", 2, reg32(8), mem32(4, 40));
+    emit(buf, "mov", 2, reg32(9), mem32(4, 44));
+    one(buf, "call", target("__tx_store_file_err"));
+    emit(buf, "mov", 2, mem32(4, 100), reg32(0));
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 48));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, reg(1), reg(10));
+    one(buf, "call", target("__tx_release"));
+    // release 改写易失 r10（第六例）——重导槽址再写。
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 48));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, mem64(10, 0), immediate(5));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 100));
+    emit(buf, "mov", 2, mem64(10, 8), reg(11));
+    one(buf, "jmp", target("__tx_rf_done"));
+    label(buf, "__tx_rf_ok");
+    // 成功臂：site→take→释放旧槽→写 {6, idx}
+    emit(buf, "mov", 2, reg32(1), mem32(4, 40));
+    emit(buf, "mov", 2, reg32(2), mem32(4, 44));
+    one(buf, "call", target("__tx_site_of"));
+    emit(buf, "mov", 2, reg32(8), reg32(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 80));
+    emit(buf, "mov", 2, reg(2), mem64(4, 88));
+    one(buf, "call", target("__tx_store_new_str_take"));
+    emit(buf, "mov", 2, mem32(4, 100), reg32(0));
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 48));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, reg(1), reg(10));
+    one(buf, "call", target("__tx_release"));
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 48));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, mem64(10, 0), immediate(6));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 100));
+    emit(buf, "mov", 2, mem64(10, 8), reg(11));
+    label(buf, "__tx_rf_done");
+    emit(buf, "add", 2, reg(4), immediate(120));
+    zero(buf, "ret");
+    label(buf, "__tx_rf_host");
+    emit(buf, "mov", 2, reg(1), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(2), mem32(4, 40));
+    emit(buf, "mov", 2, reg32(8), mem32(4, 44));
+    emit(buf, "mov", 2, reg32(9), mem32(4, 48));
+    emit(buf, "add", 2, reg(4), immediate(120));
+    one(buf, "jmp", target("__tx_bi_read_file_host"));
+}
+
+function fileWriteBi(buf: Ref<StructuredBuffer>): void {
+    label(buf, "__tx_bi_write_file");
+    emit(buf, "sub", 2, reg(4), immediate(136));
+    emit(buf, "mov", 2, mem64(4, 32), reg(1));
+    emit(buf, "mov", 2, mem32(4, 40), reg32(2));
+    emit(buf, "mov", 2, mem32(4, 44), reg32(8));
+    emit(buf, "mov", 2, mem32(4, 48), reg32(9));
+    emit(buf, "mov", 2, reg32(10), mem32(4, 176));
+    emit(buf, "mov", 2, mem32(4, 52), reg32(10));
+    emit(buf, "cmp", 2, reg32(10), immediate(2));
+    one(buf, "jne", target("__tx_wf_host"));
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 48));
+    emit(buf, "add", 2, reg32(11), immediate(1));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, reg(0), mem64(10, 0));
+    emit(buf, "and", 2, reg32(0), immediate(255));
+    emit(buf, "cmp", 2, reg32(0), immediate(6));
+    one(buf, "jne", target("__tx_wf_host"));
+    emit(buf, "mov", 2, reg32(11), mem32(10, 8));
+    emit(buf, "mov", 2, mem32(4, 56), reg32(11));
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 48));
+    emit(buf, "add", 2, reg32(11), immediate(2));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, reg(0), mem64(10, 0));
+    emit(buf, "and", 2, reg32(0), immediate(255));
+    emit(buf, "cmp", 2, reg32(0), immediate(6));
+    one(buf, "jne", target("__tx_wf_host"));
+    emit(buf, "mov", 2, reg32(11), mem32(10, 8));
+    emit(buf, "mov", 2, mem32(4, 60), reg32(11));
+    // 跨度四读
+    emit(buf, "mov", 2, reg32(1), mem32(4, 56));
+    one(buf, "call", target("__tx_store_str_ptr"));
+    emit(buf, "mov", 2, mem64(4, 64), reg(0));
+    emit(buf, "mov", 2, reg32(1), mem32(4, 56));
+    one(buf, "call", target("__tx_store_str_len"));
+    emit(buf, "mov", 2, mem64(4, 72), reg(0));
+    emit(buf, "mov", 2, reg32(1), mem32(4, 60));
+    one(buf, "call", target("__tx_store_str_ptr"));
+    emit(buf, "mov", 2, mem64(4, 80), reg(0));
+    emit(buf, "mov", 2, reg32(1), mem32(4, 60));
+    one(buf, "call", target("__tx_store_str_len"));
+    emit(buf, "mov", 2, mem64(4, 88), reg(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 64));
+    emit(buf, "mov", 2, reg(2), mem64(4, 72));
+    emit(buf, "mov", 2, reg(8), mem64(4, 80));
+    emit(buf, "mov", 2, reg(9), mem64(4, 88));
+    one(buf, "call", target("__tx_native_file_write"));
+    emit(buf, "test", 2, reg32(0), reg32(0));
+    one(buf, "jz", target("__tx_wf_ok"));
+    emit(buf, "mov", 2, mem32(4, 96), reg32(0));
+    emit(buf, "mov", 2, reg32(1), mem32(4, 96));
+    emit(buf, "mov", 2, reg32(2), mem32(4, 56));
+    emit(buf, "mov", 2, reg32(8), mem32(4, 40));
+    emit(buf, "mov", 2, reg32(9), mem32(4, 44));
+    one(buf, "call", target("__tx_store_file_err"));
+    emit(buf, "mov", 2, mem32(4, 100), reg32(0));
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 48));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, reg(1), reg(10));
+    one(buf, "call", target("__tx_release"));
+    // release 改写易失 r10（第六例）——重导槽址再写。
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 48));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, mem64(10, 0), immediate(5));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 100));
+    emit(buf, "mov", 2, mem64(10, 8), reg(11));
+    one(buf, "jmp", target("__tx_wf_done"));
+    label(buf, "__tx_wf_ok");
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 48));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, reg(1), reg(10));
+    one(buf, "call", target("__tx_release"));
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 48));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, mem64(10, 0), immediate(4));
+    emit(buf, "mov", 2, mem64(10, 8), immediate(0));
+    label(buf, "__tx_wf_done");
+    emit(buf, "add", 2, reg(4), immediate(136));
+    zero(buf, "ret");
+    label(buf, "__tx_wf_host");
+    emit(buf, "mov", 2, reg(1), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(2), mem32(4, 40));
+    emit(buf, "mov", 2, reg32(8), mem32(4, 44));
+    emit(buf, "mov", 2, reg32(9), mem32(4, 48));
+    emit(buf, "add", 2, reg(4), immediate(136));
+    one(buf, "jmp", target("__tx_bi_write_file_host"));
+}
+
+// writeFileBytes：路径＋generic/raw int 列表——元素 int 0..255
+// 校验与字节装填循环归原生；元素错误对象经宿主格式化。
+function fileWriteBytesBi(buf: Ref<StructuredBuffer>): void {
+    label(buf, "__tx_bi_write_file_bytes");
+    emit(buf, "sub", 2, reg(4), immediate(168));
+    emit(buf, "mov", 2, mem64(4, 32), reg(1));
+    emit(buf, "mov", 2, mem32(4, 40), reg32(2));
+    emit(buf, "mov", 2, mem32(4, 44), reg32(8));
+    emit(buf, "mov", 2, mem32(4, 48), reg32(9));
+    emit(buf, "mov", 2, reg32(10), mem32(4, 208));
+    emit(buf, "mov", 2, mem32(4, 52), reg32(10));
+    emit(buf, "cmp", 2, reg32(10), immediate(2));
+    one(buf, "jne", target("__tx_wb_host"));
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 48));
+    emit(buf, "add", 2, reg32(11), immediate(1));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, reg(0), mem64(10, 0));
+    emit(buf, "and", 2, reg32(0), immediate(255));
+    emit(buf, "cmp", 2, reg32(0), immediate(6));
+    one(buf, "jne", target("__tx_wb_host"));
+    emit(buf, "mov", 2, reg32(11), mem32(10, 8));
+    emit(buf, "mov", 2, mem32(4, 56), reg32(11));
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 48));
+    emit(buf, "add", 2, reg32(11), immediate(2));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, reg(0), mem64(10, 0));
+    emit(buf, "and", 2, reg32(0), immediate(255));
+    emit(buf, "cmp", 2, reg32(0), immediate(15));
+    one(buf, "jne", target("__tx_wb_host"));
+    emit(buf, "mov", 2, reg32(11), mem32(10, 8));
+    emit(buf, "mov", 2, mem32(4, 60), reg32(11));
+    // 视图：generic16B槽及raw int8B槽均原生打包；其他形态保留类型陷阱回退
+    emit(buf, "mov", 2, reg32(1), mem32(4, 60));
+    emit(buf, "lea", 2, reg(2), stackMemory(64));
+    one(buf, "call", target("__tx_list_view"));
+    emit(buf, "mov", 2, mem32(4, 120), reg32(0));
+    emit(buf, "cmp", 2, reg32(0), immediate(1));
+    one(buf, "je", target("__tx_wb_allocate"));
+    emit(buf, "cmp", 2, reg32(0), immediate(2));
+    one(buf, "jne", target("__tx_wb_host"));
+    emit(buf, "mov", 2, reg32(0), mem32(4, 80));
+    emit(buf, "cmp", 2, reg32(0), immediate(TAG_INT));
+    one(buf, "jne", target("__tx_wb_host"));
+    label(buf, "__tx_wb_allocate");
+    // buf = alloc(len,1)
+    emit(buf, "mov", 2, reg(1), mem64(4, 72));
+    emit(buf, "mov", 2, reg32(2), immediate(1));
+    one(buf, "call", target("__tx_native_mem_alloc"));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_str_oom"));
+    emit(buf, "mov", 2, mem64(4, 88), reg(0));
+    // 装填循环：cursor@96
+    emit(buf, "mov", 2, mem64(4, 96), immediate(0));
+    label(buf, "__tx_wb_loop");
+    emit(buf, "mov", 2, reg(0), mem64(4, 88 + PAYLOAD_OFF_LEN));
+    emit(buf, "cmp", 2, reg(0), mem64(4, 72));
+    one(buf, "jae", target("__tx_wb_packok"));
+    emit(buf, "mov", 2, reg32(0), mem32(4, 120));
+    emit(buf, "cmp", 2, reg32(0), immediate(2));
+    one(buf, "je", target("__tx_wb_raw"));
+    emit(buf, "mov", 2, reg(10), mem64(4, 64));
+    emit(buf, "mov", 2, reg(11), mem64(4, 96));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, reg(0), mem64(10, 0));
+    emit(buf, "and", 2, reg32(0), immediate(255));
+    emit(buf, "cmp", 2, reg32(0), immediate(TAG_INT));
+    one(buf, "jne", target("__tx_wb_badtype"));
+    emit(buf, "mov", 2, reg(11), mem64(10, 8));
+    one(buf, "jmp", target("__tx_wb_value"));
+    label(buf, "__tx_wb_raw");
+    emit(buf, "mov", 2, reg(10), mem64(4, 64));
+    emit(buf, "mov", 2, reg(11), mem64(4, 96));
+    emit(buf, "shl", 2, reg(11), immediate(3));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, reg(11), mem64(10, 0));
+    label(buf, "__tx_wb_value");
+    emit(buf, "mov", 2, mem64(4, 128), reg(11));
+    emit(buf, "cmp", 2, reg(11), immediate(0));
+    one(buf, "jl", target("__tx_wb_badrange"));
+    emit(buf, "cmp", 2, reg(11), immediate(255));
+    one(buf, "jg", target("__tx_wb_badrange"));
+    emit(buf, "mov", 2, reg(9), mem64(4, 88));
+    emit(buf, "mov", 2, reg(10), mem64(4, 96));
+    emit(buf, "add", 2, reg(9), reg(10));
+    emit(buf, "mov", 2, reg32(11), reg32(11));
+    emit(buf, "mov", 2, asStructuredMem(0, 9, -1, 0, 0, 0, ""), reg8(11));
+    emit(buf, "mov", 2, reg(11), mem64(4, 96));
+    emit(buf, "add", 2, reg(11), immediate(1));
+    emit(buf, "mov", 2, mem64(4, 96), reg(11));
+    one(buf, "jmp", target("__tx_wb_loop"));
+    label(buf, "__tx_wb_badtype");
+    emit(buf, "mov", 2, reg32(1), immediate(0));
+    emit(buf, "mov", 2, reg32(2), immediate(-1));
+    one(buf, "jmp", target("__tx_wb_elemerr"));
+    label(buf, "__tx_wb_badrange");
+    emit(buf, "mov", 2, reg(0), mem64(4, 128));
+    emit(buf, "mov", 2, reg32(1), immediate(1));
+    emit(buf, "mov", 2, reg(2), reg(0));
+    label(buf, "__tx_wb_elemerr");
+    emit(buf, "mov", 2, mem64(4, 104), reg(2));
+    emit(buf, "mov", 2, reg32(8), mem32(4, 40));
+    emit(buf, "mov", 2, reg32(9), mem32(4, 44));
+    one(buf, "call", target("__tx_store_wfb_elem_err"));
+    emit(buf, "mov", 2, mem32(4, 100), reg32(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 88));
+    one(buf, "call", target("__tx_native_mem_free"));
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 48));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, reg(1), reg(10));
+    one(buf, "call", target("__tx_release"));
+    // release 改写易失 r10（第六例）——重导槽址再写。
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 48));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, mem64(10, 0), immediate(5));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 100));
+    emit(buf, "mov", 2, mem64(10, 8), reg(11));
+    one(buf, "jmp", target("__tx_wb_done"));
+    label(buf, "__tx_wb_packok");
+    // 原生写：path 跨度
+    emit(buf, "mov", 2, reg32(1), mem32(4, 56));
+    one(buf, "call", target("__tx_store_str_ptr"));
+    emit(buf, "mov", 2, mem64(4, 64), reg(0));
+    emit(buf, "mov", 2, reg32(1), mem32(4, 56));
+    one(buf, "call", target("__tx_store_str_len"));
+    emit(buf, "mov", 2, mem64(4, 72), reg(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 64));
+    emit(buf, "mov", 2, reg(2), mem64(4, 72));
+    emit(buf, "mov", 2, reg(8), mem64(4, 88));
+    emit(buf, "mov", 2, reg(9), mem64(4, 96));
+    one(buf, "call", target("__tx_native_file_write"));
+    emit(buf, "mov", 2, mem64(4, 112), reg(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 88));
+    one(buf, "call", target("__tx_native_mem_free"));
+    emit(buf, "mov", 2, reg(0), mem64(4, 112));
+    emit(buf, "test", 2, reg32(0), reg32(0));
+    one(buf, "jz", target("__tx_wb_ok"));
+    emit(buf, "mov", 2, mem32(4, 96), reg32(0));
+    emit(buf, "mov", 2, reg32(1), mem32(4, 96));
+    emit(buf, "mov", 2, reg32(2), mem32(4, 56));
+    emit(buf, "mov", 2, reg32(8), mem32(4, 40));
+    emit(buf, "mov", 2, reg32(9), mem32(4, 44));
+    one(buf, "call", target("__tx_store_file_err"));
+    emit(buf, "mov", 2, mem32(4, 100), reg32(0));
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 48));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, reg(1), reg(10));
+    one(buf, "call", target("__tx_release"));
+    // release 改写易失 r10（第六例）——重导槽址再写。
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 48));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, mem64(10, 0), immediate(5));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 100));
+    emit(buf, "mov", 2, mem64(10, 8), reg(11));
+    one(buf, "jmp", target("__tx_wb_done"));
+    label(buf, "__tx_wb_ok");
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 48));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, reg(1), reg(10));
+    one(buf, "call", target("__tx_release"));
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(11), mem32(4, 48));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, mem64(10, 0), immediate(4));
+    emit(buf, "mov", 2, mem64(10, 8), immediate(0));
+    label(buf, "__tx_wb_done");
+    emit(buf, "add", 2, reg(4), immediate(168));
+    zero(buf, "ret");
+    label(buf, "__tx_wb_host");
+    emit(buf, "mov", 2, reg(1), mem64(4, 32));
+    emit(buf, "mov", 2, reg32(2), mem32(4, 40));
+    emit(buf, "mov", 2, reg32(8), mem32(4, 44));
+    emit(buf, "mov", 2, reg32(9), mem32(4, 48));
+    emit(buf, "add", 2, reg(4), immediate(168));
+    one(buf, "jmp", target("__tx_bi_write_file_bytes_host"));
+}
+
+// ============================================================================
+// 释零统一派发器＋容器递归臂（v052-runtime-zero 案乙二期）：rc==0 不变量下
+// 入 __tx_zero_dispatch(idx)。kind：0＝帧/结构特形（slice/weakbox/fnv/future）
+// →宿主 __tx_rc_zero_cascade 回落；1＝非空 bytes→str 跨度原生 free＋尾局；
+// 2＝零长 bytes→仅尾局（宿主 alloc(0) 非分配指针）；3＝容器（fields/enumv/
+// arr/list-generic 四类 []Value 同构）→子引用逐个原生计数减（标量/原子臂
+// 同 release 镜像＋探针 site3=release_child）、归零递归派发（youngest-first
+// DFS 与宿主 LIFO 工作表等价）；背板释放＋尾局。深度护栏 8192（.bss 计数，
+// 超限回落宿主——迭代工作表防炸栈语义保留）。
+// ============================================================================
+
+function zeroDispatch(buf: Ref<StructuredBuffer>): void {
+    label(buf, "__tx_zero_dispatch");
+    emit(buf, "sub", 2, reg(4), immediate(56));
+    emit(buf, "mov", 2, mem32(4, 32), reg32(1));
+    emit(buf, "mov", 2, reg32(1), mem32(4, 32));
+    one(buf, "call", target("__tx_store_zero_kind"));
+    emit(buf, "mov", 2, reg32(10), reg32(0));
+    emit(buf, "test", 2, reg(10), reg(10));
+    one(buf, "jz", target("__tx_zd_host"));
+    emit(buf, "cmp", 2, reg32(10), immediate(2));
+    one(buf, "je", target("__tx_zd_tail"));
+    emit(buf, "cmp", 2, reg32(10), immediate(3));
+    one(buf, "je", target("__tx_zd_container"));
+    // kind==1：非空 bytes 原生 free＋尾局。
+    emit(buf, "mov", 2, reg32(1), mem32(4, 32));
+    one(buf, "call", target("__tx_store_str_ptr"));
+    emit(buf, "mov", 2, reg(1), reg(0));
+    one(buf, "call", target("__tx_native_mem_free"));
+    label(buf, "__tx_zd_tail");
+    emit(buf, "mov", 2, reg32(1), mem32(4, 32));
+    one(buf, "call", target("__tx_store_zero_tail"));
+    one(buf, "jmp", target("__tx_zd_out"));
+    label(buf, "__tx_zd_container");
+    emit(buf, "mov", 2, reg32(1), mem32(4, 32));
+    one(buf, "call", target("__tx_zero_container"));
+    one(buf, "jmp", target("__tx_zd_out"));
+    label(buf, "__tx_zd_host");
+    emit(buf, "mov", 2, reg32(1), mem32(4, 32));
+    one(buf, "call", target("__tx_rc_zero_cascade"));
+    label(buf, "__tx_zd_out");
+    emit(buf, "add", 2, reg(4), immediate(56));
+    zero(buf, "ret");
+}
+
+// rax = 释放递归深度计数的地址：NRT 为本线程线程块的字段（TB = rbx & TB_MASK），其余为 .bss。
+function zeroDepthInto(buf: Ref<StructuredBuffer>): void {
+    if (nrtKernel) {
+        emit(buf, "mov", 2, reg(0), reg(3));
+        emit(buf, "and", 2, reg(0), immediate(TB_MASK));
+        emit(buf, "add", 2, reg(0), immediate(TB_ZERO_DEPTH));
+        return;
+    }
+    emit(buf, "lea", 2, reg(0), ripMemory("__tx_zero_depth"));
+}
+
+function zeroContainer(buf: Ref<StructuredBuffer>, withPayload: bool): void {
+    let frame = 88; if (withPayload) { frame = 88 + PAYLOAD_VIEW_BYTES; }
+    label(buf, "__tx_zero_container");
+    emit(buf, "sub", 2, reg(4), immediate(frame));
+    emit(buf, "mov", 2, mem32(4, 32), reg32(1));
+    // 深度护栏（4 字节计数，NRT 在线程块里；超限回落宿主迭代工作表）。
+    zeroDepthInto(buf);
+    emit(buf, "mov", 2, reg32(2), mem32(0, 0));
+    emit(buf, "add", 2, reg32(2), immediate(1));
+    emit(buf, "mov", 2, mem32(0, 0), reg32(2));
+    emit(buf, "cmp", 2, reg32(2), immediate(8192));
+    one(buf, "jbe", target("__tx_zc_ok"));
+    zeroDepthInto(buf);
+    emit(buf, "mov", 2, reg32(2), mem32(0, 0));
+    emit(buf, "sub", 2, reg32(2), immediate(1));
+    emit(buf, "mov", 2, mem32(0, 0), reg32(2));
+    emit(buf, "mov", 2, reg32(1), mem32(4, 32));
+    one(buf, "call", target("__tx_rc_zero_cascade"));
+    emit(buf, "add", 2, reg(4), immediate(frame));
+    zero(buf, "ret");
+    label(buf, "__tx_zc_ok");
+    // 臂旗标一次缓存（bit0 标量/bit1 探针）。
+    one(buf, "call", target("__tx_rc_scalar_flag"));
+    emit(buf, "mov", 2, mem64(4, 80), reg(0));
+    emit(buf, "mov", 2, reg(0), mem64(4, 64));
+    if (withPayload) {
+        emit(buf, "mov", 2, reg32(1), mem32(4, 32));
+        emit(buf, "lea", 2, reg(2), stackMemory(88));
+        one(buf, "call", target("__tx_store_payload_view"));
+        emit(buf, "mov", 2, reg(0), mem64(4, 88 + PAYLOAD_OFF_CHILDREN));
+        emit(buf, "mov", 2, mem64(4, 40), reg(0));
+        emit(buf, "mov", 2, reg(0), mem64(4, 88 + PAYLOAD_OFF_LEN));
+        emit(buf, "mov", 2, mem64(4, 48), reg(0));
+    } else {
+        // 子引用跨度（[]Value 同构四类单一事实源）。
+        emit(buf, "mov", 2, reg32(1), mem32(4, 32));
+        one(buf, "call", target("__tx_store_children_span_ptr"));
+        emit(buf, "mov", 2, mem64(4, 40), reg(0));
+        emit(buf, "mov", 2, reg32(1), mem32(4, 32));
+        one(buf, "call", target("__tx_store_children_span_len"));
+        emit(buf, "mov", 2, mem64(4, 48), reg(0));
+    }
+    emit(buf, "mov", 2, mem64(4, 56), immediate(0));
+    label(buf, "__tx_zc_loop");
+    emit(buf, "mov", 2, reg(0), mem64(4, 56));
+    emit(buf, "cmp", 2, reg(0), mem64(4, 48));
+    one(buf, "jae", target("__tx_zc_done"));
+    // 子槽址＝span+16*cursor；heapref 表先行。
+    emit(buf, "mov", 2, reg(10), mem64(4, 40));
+    emit(buf, "mov", 2, reg(11), mem64(4, 56));
+    emit(buf, "shl", 2, reg(11), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "mov", 2, reg(0), mem64(10, 0));
+    emit(buf, "and", 2, reg32(0), immediate(255));
+    emit(buf, "lea", 2, reg(2), ripMemory("__tx_is_heapref"));
+    emit(buf, "add", 2, reg(2), reg(0));
+    emit(buf, "mov", 2, reg8(9), asStructuredMem(0, 2, -1, 0, 0, 0, ""));
+    emit(buf, "test", 2, reg8(9), reg8(9));
+    one(buf, "jz", target("__tx_zc_next"));
+    emit(buf, "mov", 2, reg32(11), mem32(10, 8));
+    emit(buf, "mov", 2, mem32(4, 64), reg32(11));
+    // rc 槽＝base+4*idx；永生哨兵跳过。
+    emit(buf, "mov", 2, reg32(1), mem32(4, 64));
+    one(buf, "call", target("__tx_rc_base"));
+    // 32 位读零扩展——64 位读会带上槽内未初始化高半（易失寄存器跨调用
+    // 纪律第四例：野 cell 指针静默毒化计数与堆）。
+    emit(buf, "mov", 2, reg32(9), mem32(4, 64));
+    emit(buf, "shl", 2, reg(9), immediate(2));
+    emit(buf, "add", 2, reg(0), reg(9));
+    emit(buf, "mov", 2, reg32(2), mem32(0, 0));
+    emit(buf, "test", 2, reg32(2), reg32(2));
+    one(buf, "js", target("__tx_zc_next"));
+    // 计数减（臂同 __tx_release 镜像；原子臂 lockxadd）。
+    emit(buf, "mov", 2, reg(11), mem64(4, 80));
+    emit(buf, "mov", 2, reg32(10), reg32(11));
+    emit(buf, "and", 2, reg32(10), immediate(1));
+    one(buf, "jne", target("__tx_zc_scalar"));
+    emit(buf, "mov", 2, reg32(2), immediate(-1));
+    emit(buf, "lockxadd", 2, asStructuredMem(1, 0, -1, 0, 0, 0, ""), reg32(2));
+    emit(buf, "cmp", 2, reg32(2), immediate(1));
+    one(buf, "je", target("__tx_zc_childzero"));
+    emit(buf, "mov", 2, reg32(10), reg32(11));
+    emit(buf, "and", 2, reg32(10), immediate(2));
+    one(buf, "jz", target("__tx_zc_next"));
+    one(buf, "call", target("__tx_rc_probe_counts"));
+    emit(buf, "mov", 2, reg(9), mem64(0, 48));
+    emit(buf, "add", 2, reg(9), immediate(1));
+    emit(buf, "mov", 2, mem64(0, 48), reg(9));
+    one(buf, "jmp", target("__tx_zc_next"));
+    label(buf, "__tx_zc_scalar");
+    emit(buf, "mov", 2, reg32(2), mem32(0, 0));
+    emit(buf, "sub", 2, reg32(2), immediate(1));
+    emit(buf, "mov", 2, mem32(0, 0), reg32(2));
+    emit(buf, "test", 2, reg32(2), reg32(2));
+    one(buf, "jz", target("__tx_zc_childzero"));
+    emit(buf, "mov", 2, reg32(10), reg32(11));
+    emit(buf, "and", 2, reg32(10), immediate(2));
+    one(buf, "jz", target("__tx_zc_next"));
+    one(buf, "call", target("__tx_rc_probe_counts"));
+    emit(buf, "mov", 2, reg(9), mem64(0, 56));
+    emit(buf, "add", 2, reg(9), immediate(1));
+    emit(buf, "mov", 2, mem64(0, 56), reg(9));
+    one(buf, "jmp", target("__tx_zc_next"));
+    label(buf, "__tx_zc_childzero");
+    emit(buf, "mov", 2, reg32(1), mem32(4, 64));
+    one(buf, "call", target("__tx_zero_dispatch"));
+    label(buf, "__tx_zc_next");
+    emit(buf, "mov", 2, reg(11), mem64(4, 56));
+    emit(buf, "add", 2, reg(11), immediate(1));
+    emit(buf, "mov", 2, mem64(4, 56), reg(11));
+    one(buf, "jmp", target("__tx_zc_loop"));
+    label(buf, "__tx_zc_done");
+    // 背板释放＋尾局（weak 通知＋freeSlot）＋深度归还。
+    if (withPayload) {
+        emit(buf, "lea", 2, reg(1), stackMemory(88));
+        one(buf, "call", target("__tx_native_payload_dispose_v1"));
+    } else {
+        emit(buf, "mov", 2, reg32(1), mem32(4, 32));
+        one(buf, "call", target("__tx_store_free_backing")); }
+    emit(buf, "mov", 2, reg32(1), mem32(4, 32));
+    one(buf, "call", target("__tx_store_zero_tail"));
+    if (nrtKernel) {
+        // 深链待释放表非空：交 __tx_zero_drain（只在最外层帧、即深度仍为 1 时清空）。热路径多一次读与一次不跳的分支。
+        emit(buf, "mov", 2, reg(0), reg(3));
+        emit(buf, "and", 2, reg(0), immediate(TB_MASK));
+        emit(buf, "mov", 2, reg(0), mem64(0, TB_ZERO_PENDING + 8));
+        emit(buf, "test", 2, reg(0), reg(0));
+        one(buf, "jz", target("__tx_zc_nodrain"));
+        one(buf, "call", target("__tx_zero_drain"));
+        label(buf, "__tx_zc_nodrain");
+    }
+    zeroDepthInto(buf);
+    emit(buf, "mov", 2, reg32(2), mem32(0, 0));
+    emit(buf, "sub", 2, reg32(2), immediate(1));
+    emit(buf, "mov", 2, mem32(0, 0), reg32(2));
+    emit(buf, "add", 2, reg(4), immediate(frame));
+    zero(buf, "ret");
+}
+
+// OOM 终局（oomExit 逐字节镜像）：stderr 原始 UTF-8 字节（WriteFile——
+// 宿主 printStderr 同路径，不经 WriteConsoleW 宽转换）＋ExitProcess(3)。
+function strOom(buf: Ref<StructuredBuffer>): void {
+    if (tRawSyscall(rtTarget)) {
+        if (nrtKernel) {
+            label(buf, "__tx_str_oom");
+            one(buf, "call", target("__tx_nrt_die_enter"));
+            linuxAbort(buf, "__tx_str_oom_body", "__tx_str_oom_message", "taixu: 内存不足", 3);
+        } else {
+            linuxAbort(buf, "__tx_str_oom", "__tx_str_oom_message", "taixu: 内存不足", 3);
+        }
+        asBufferSection(buf, 0, 1); return;
+    }
+    if (tMacos(rtTarget)) {
+        // macOS：先过进程级致命锁（调用前对齐栈：本入口经 jz 跳入，对齐未知），再写诊断、_exit(3)。
+        label(buf, "__tx_str_oom");
+        emit(buf, "and", 2, reg(4), immediate(-16));
+        one(buf, "call", target("__tx_nrt_die_enter"));
+        macAbortAt(buf, "__tx_str_oom_body", "__tx_str_oom_message", "taixu: 内存不足", 3);
+        return;
+    }
+    // 经 jz 跳入（非 call）——入口 rsp≡0 mod 16，帧取 ≡0（48）保调用点对齐。
+    label(buf, "__tx_str_oom");
+    emit(buf, "sub", 2, reg(4), immediate(48));
+    if (nrtKernel) { one(buf, "call", target("__tx_nrt_die_enter")); }
+    emit(buf, "mov", 2, reg32(1), immediate(-12));
+    one(buf, "call", target("GetStdHandle"));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_str_oom_exit"));
+    emit(buf, "mov", 2, reg(1), reg(0));
+    emit(buf, "lea", 2, reg(2), ripMemory("__tx_str_oom_message"));
+    emit(buf, "mov", 2, reg32(8), immediate(20));
+    emit(buf, "lea", 2, reg(9), stackMemory(40));
+    emit(buf, "mov", 2, mem64(4, 40), immediate(0));
+    emit(buf, "mov", 2, mem64(4, 32), immediate(0));
+    one(buf, "call", target("WriteFile"));
+    label(buf, "__tx_str_oom_exit");
+    emit(buf, "mov", 2, reg32(1), immediate(3));
+    one(buf, "call", target("ExitProcess"));
+    // "taixu: 内存不足\n" UTF-8 字节（逐字节列出——不经 len/byteAt 的
+    // 源字面量路径，非 ASCII 字面量的长度语义零依赖）。
+    asBufferSection(buf, 1, 1);
+    label(buf, "__tx_str_oom_message");
+    asBufferByte(buf, 116, 1);
+    asBufferByte(buf, 97, 1);
+    asBufferByte(buf, 105, 1);
+    asBufferByte(buf, 120, 1);
+    asBufferByte(buf, 117, 1);
+    asBufferByte(buf, 58, 1);
+    asBufferByte(buf, 32, 1);
+    asBufferByte(buf, 229, 1);
+    asBufferByte(buf, 134, 1);
+    asBufferByte(buf, 133, 1);
+    asBufferByte(buf, 229, 1);
+    asBufferByte(buf, 173, 1);
+    asBufferByte(buf, 152, 1);
+    asBufferByte(buf, 228, 1);
+    asBufferByte(buf, 184, 1);
+    asBufferByte(buf, 141, 1);
+    asBufferByte(buf, 232, 1);
+    asBufferByte(buf, 182, 1);
+    asBufferByte(buf, 179, 1);
+    asBufferByte(buf, 10, 1);
+    asBufferSection(buf, 0, 1);
+}
+
+// ============================================================================
+// argv/进程入口面（v052-runtime-argv）：__tx_native_argv_acquire＋
+// __tx_native_entry 接管件。Win32 直调（GetCommandLineW、自拆分 __tx_win_cmdline_split、
+// WideCharToMultiByte 65001|0x80 两遍）；块＝原生分配（指针数组
+// ＋NUL 终结字节区，进程生命期——镜像宿主 native_windows_args 语义）。
+// 状态码＝tx_Status（5 eio/1 einval/2 enomem）。寄存器纪律（第九例谱系）：
+// 跨调用活值驻被调保存 rbx/r12/r13；帧 push×3＋sub 128/64（调用点 ≡0
+// mod 16）；WC2MB 栈参 arg5-8@[rsp+0x20..0x38]。
+// ============================================================================
+function idxMem64(base: int, idx: int): Ref<Operand> { return asStructuredMem(2, base, idx, 3, 0, 0, ""); }
+function idxMem8(base: int, idx: int): Ref<Operand> { return asStructuredMem(0, base, idx, 0, 0, 0, ""); }
+function push40(buf: Ref<StructuredBuffer>): void {
+    one(buf, "push", reg(0));
+    emit(buf, "sub", 2, reg(4), immediate(40));
+}
+function xor_v(buf: Ref<StructuredBuffer>, n: int): void {
+    emit(buf, "xor", 2, reg32(n), reg32(n));
+}
+
+function argvProc(buf: Ref<StructuredBuffer>): string {
+    let fail = "";
+    if (tUnix(rtTarget)) { linuxArgvEmit(buf); } else { fail = windowsArgvEmit(buf); }
+    // 入口接管件：setup → acquire → 逐参校验 UTF-8、newStrTake → stage → call main →
+    // ExitProcess(payload)。argv[0]（程序名）不入 args——镜像 mainImpl。参数表整块留给 std/os（D3 v0.41）。
+    if (tUnix(rtTarget)) { label(buf, "main"); }
+    // macOS 的 LC_MAIN 按 C 约定调 main(argc, argv, envp, apple)：envp 记下给 getEnv 等用（Linux 由 _start 记）。
+    if (tMacos(rtTarget)) { emit(buf, "mov", 2, ripMemory("__tx_nrt_envp"), reg(2)); }
+    // 线程第 1 步（threads §十二）：先建主线程的区域（线程块＋值槽栈），rbx＝线程块，之后的内核例程
+    // 都由 rbx 求出线程块；再把线程块登记到本线程的 TLS 槽并记下线程号（__tx_nrt_thread_bind）。
+    // rbx 不再作临时寄存器（argc 与 main 入口驻栈垫位 40/56）。
+    label(buf, "__tx_native_entry");
+    one(buf, "push", reg(3));
+    one(buf, "push", reg(12));
+    one(buf, "push", reg(13));
+    emit(buf, "sub", 2, reg(4), immediate(96));
+    // Unix 的进程入口按 C 的 main(argc, argv) 收参数：先按 C 约定的寄存器（SysV 的 edi/rsi）存下，再交给 Unix 的 argv 取法。
+    if (tSysV(rtTarget)) { emit(buf, "mov", 2, mem32(4, 80), reg32(7)); emit(buf, "mov", 2, mem64(4, 88), reg(6)); }
+    one(buf, "call", target("__tx_nrt_region_new"));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_ne_region_fail"));
+    emit(buf, "mov", 2, reg(3), reg(0));
+    one(buf, "call", target("__tx_nrt_thread_bind"));
+    one(buf, "call", target("__tx_host_entry_setup"));
+    emit(buf, "lea", 2, reg(1), stackMemory(32));
+    emit(buf, "lea", 2, reg(2), stackMemory(40));
+    if (tUnix(rtTarget)) { emit(buf, "mov", 2, reg32(8), mem32(4, 80)); emit(buf, "mov", 2, reg(9), mem64(4, 88)); }
+    one(buf, "call", target("__tx_native_argv_acquire"));
+    emit(buf, "test", 2, reg32(0), reg32(0));
+    one(buf, "jne", target("__tx_ne_fail"));
+    emit(buf, "mov", 2, reg32(0), mem32(4, 40));
+    emit(buf, "mov", 2, mem64(4, 40), reg(0));
+    emit(buf, "mov", 2, reg(12), reg(0));
+    emit(buf, "test", 2, reg(12), reg(12)); one(buf, "jz", target("__tx_ne_count_ready")); one(buf, "dec", reg(12)); label(buf, "__tx_ne_count_ready");
+    emit(buf, "mov", 2, reg(1), reg(12));
+    emit(buf, "shl", 2, reg(1), immediate(4));
+    emit(buf, "cmp", 2, reg(1), immediate(16));
+    one(buf, "jae", target("__tx_ne_have"));
+    emit(buf, "mov", 2, reg(1), immediate(16));
+    label(buf, "__tx_ne_have");
+    emit(buf, "mov", 2, reg32(2), immediate(1));
+    one(buf, "call", target("__tx_native_mem_alloc"));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_ne_oom"));
+    emit(buf, "mov", 2, reg(13), reg(0));
+    emit(buf, "mov", 2, mem64(4, 48), immediate(1));
+    label(buf, "__tx_ne_loop");
+    emit(buf, "mov", 2, reg(0), mem64(4, 48));
+    emit(buf, "cmp", 2, reg(0), mem64(4, 40));
+    one(buf, "jae", target("__tx_ne_call"));
+    emit(buf, "mov", 2, reg(10), mem64(4, 32));
+    emit(buf, "mov", 2, reg(10), idxMem64(10, 0));
+    emit(buf, "xor", 2, reg32(11), reg32(11));
+    label(buf, "__tx_ne_strlen");
+    emit(buf, "movzx", 2, reg32(2), idxMem8(10, 11));
+    emit(buf, "test", 2, reg8(2), reg8(2));
+    one(buf, "jz", target("__tx_ne_gotlen"));
+    one(buf, "inc", reg(11));
+    one(buf, "jmp", target("__tx_ne_strlen"));
+    label(buf, "__tx_ne_gotlen");
+    // 逐参拷贝入独立原生块再 take——argv 块为整块单分配，内部指针直
+    // 接移交会在释零时以文本为长度头毒化（mainImpl 同款 dupe 语义）。
+    // 垫位（8 对齐不重叠）：len@56(0x38)、拷贝块@64(0x40)、源指针@72(0x48)。
+    // 谱两例：第十三例 r10 跨 alloc 调用被毁（垫位重导）；slot 叠写例——
+    // 拷贝块曾垫 60(0x3c) 与源指针 64(0x40) 重叠四字节，低半改写致源址毁。
+    emit(buf, "mov", 2, mem64(4, 56), reg(11));
+    emit(buf, "mov", 2, mem64(4, 72), reg(10));
+    // string 恒为合法 UTF-8（同 bytesToStr 的严格规则）：码点数为负即拒绝启动（状态 1，D3 v0.41）。
+    emit(buf, "mov", 2, reg(1), reg(10));
+    emit(buf, "mov", 2, reg(2), reg(11));
+    one(buf, "call", target("__tx_nrt_utf8_count"));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "js", target("__tx_ne_badu"));
+    emit(buf, "mov", 2, reg(1), mem64(4, 56));
+    emit(buf, "mov", 2, reg32(2), immediate(1));
+    one(buf, "call", target("__tx_native_mem_alloc"));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_ne_oom"));
+    emit(buf, "mov", 2, mem64(4, 64), reg(0));
+    emit(buf, "mov", 2, reg(10), mem64(4, 72));
+    emit(buf, "xor", 2, reg32(11), reg32(11));
+    label(buf, "__tx_ne_copy");
+    emit(buf, "cmp", 2, reg(11), mem64(4, 56));
+    one(buf, "jae", target("__tx_ne_took"));
+    emit(buf, "movzx", 2, reg32(2), idxMem8(10, 11));
+    emit(buf, "mov", 2, reg(1), mem64(4, 64));
+    emit(buf, "mov", 2, idxMem8(1, 11), reg8(2));
+    one(buf, "inc", reg(11));
+    one(buf, "jmp", target("__tx_ne_copy"));
+    label(buf, "__tx_ne_took");
+    emit(buf, "mov", 2, reg(1), mem64(4, 64));
+    emit(buf, "mov", 2, reg(2), mem64(4, 56));
+    emit(buf, "xor", 2, reg32(8), reg32(8));
+    one(buf, "call", target("__tx_store_new_str_take"));
+    emit(buf, "mov", 2, reg(10), mem64(4, 48));
+    one(buf, "dec", reg(10));
+    emit(buf, "shl", 2, reg(10), immediate(4));
+    emit(buf, "add", 2, reg(10), reg(13));
+    emit(buf, "mov", 2, mem64(10, 0), immediate(6));
+    emit(buf, "mov", 2, reg32(0), reg32(0));
+    emit(buf, "mov", 2, mem64(10, 8), reg(0));
+    // .s 无 mem 目的 add——i++ 经取-增-存（rax 此刻已死）。
+    emit(buf, "mov", 2, reg(0), mem64(4, 48));
+    one(buf, "inc", reg(0));
+    emit(buf, "mov", 2, mem64(4, 48), reg(0));
+    one(buf, "jmp", target("__tx_ne_loop"));
+    // 参数表与项数（含程序名）记进 __tx_rt_argv／__tx_rt_argc，供 __rtArgCount／__rtArgAt 只读至进程结束。
+    label(buf, "__tx_ne_call");
+    emit(buf, "mov", 2, reg(0), mem64(4, 32));
+    emit(buf, "mov", 2, ripMemory("__tx_rt_argv"), reg(0));
+    emit(buf, "mov", 2, reg(0), mem64(4, 40));
+    emit(buf, "mov", 2, ripMemory("__tx_rt_argc"), reg(0));
+    emit(buf, "mov", 2, reg(1), reg(13));
+    emit(buf, "mov", 2, reg(2), reg(12));
+    one(buf, "call", target("__tx_entry_stage"));
+    emit(buf, "mov", 2, mem64(4, 56), reg(0));
+    one(buf, "call", target("__tx_entry_win_ptr"));
+    emit(buf, "mov", 2, reg(12), reg(0));
+    emit(buf, "mov", 2, reg(1), reg(0));
+    emit(buf, "mov", 2, reg(10), mem64(4, 56));
+    one(buf, "call", reg(10));
+    one(buf, "call", target("__tx_entry_finish"));
+    if (nrtExitCall) { emit(buf, "mov", 2, reg32(1), reg32(0)); one(buf, "call", target("__tx_nrt_exit")); }
+    else if (tRawSyscall(rtTarget)) { emit(buf, "mov", 2, reg32(7), reg32(0)); emit(buf, "mov", 2, reg32(0), immediate(231)); zero(buf, "syscall"); }
+    else { emit(buf, "mov", 2, reg32(1), reg32(0)); one(buf, "call", target("ExitProcess")); }
+    label(buf, "__tx_ne_region_fail");
+    one(buf, "call", target("__tx_nrt_std_init"));
+    one(buf, "call", target("__tx_native_object_oom_v1"));
+    label(buf, "__tx_ne_fail");
+    emit(buf, "mov", 2, reg32(1), reg32(0));
+    one(buf, "call", target("__tx_host_argv_fail"));
+    label(buf, "__tx_ne_badu");
+    emit(buf, "mov", 2, reg32(1), immediate(1));
+    one(buf, "call", target("__tx_host_argv_fail"));
+    label(buf, "__tx_ne_oom");
+    emit(buf, "mov", 2, reg32(1), immediate(2));
+    one(buf, "call", target("__tx_host_argv_fail"));
+    return fail;
+}
+
+// ============================================================================
+// 解释器 vmcore 件一（v052-runtime-vmcore）：__tx_vm_run1——单帧标量指令
+// 循环（解码骨架＋ldbool/ldnone/move/loadk＋jmp/jt/jf＋eq/lt/le＋int
+// add/sub/mul）。值面 value_abi rev1（tag@0/payload@8/16B 步长）；语义
+// 单一事实源留宿主五接入导出：__tx_vm_const_value（loadk 非标量）、
+// __tx_vm_arith_slow（float/mixed/overflow/trap——eq/lt/le 慢臂同经）、
+// __tx_vm_trap（trapReport 终局）、__tx_vm_slot_new/__tx_vm_slot_retain
+// （Store RC 面）。Op 表＝bytecode.zig（loadk=1 ldbool=2 ldnone=3 move=4
+// add=5 sub=6 mul=7 eq=12 lt=13 le=14 jmp=15 jt=16 jf=17）；Instr=u32：
+// op@0 a@8 b@16 c@24 bx@16；sbx=bx-32768（jmp/jt/jf 目标＝pc+1+sbx）。
+// 寄存器纪律（谱系十三例）：跨导出调用活值驻被调保存 rbx/r12..r15；
+// 帧 push×5（rsp≡0）＋sub 64 调用点恒对齐；垫位 8 对齐不重叠：
+// consts@0x20 fn_idx@0x30 out@0x38(16B)。
+// __tx_vm_run1(code_ptr, code_len, stack_ptr, base, consts_ptr, fn_idx)
+//   -> 最终 pc（指令流跑尽即返回）；trap 经 __tx_vm_trap 不归。
+// ============================================================================
+function vmcoreProc(buf: Ref<StructuredBuffer>): void {
+    label(buf, "__tx_vm_run1");
+    one(buf, "push", reg(3));
+    one(buf, "push", reg(12));
+    one(buf, "push", reg(13));
+    one(buf, "push", reg(14));
+    one(buf, "push", reg(15));
+    emit(buf, "sub", 2, reg(4), immediate(128));
+    // 垫位图（8 对齐、互不重叠、全在帧内 0x00..0x7F；第十四例：初版
+    // b/c 槽与结果垫越过 64 帧界改写压栈保存组——被调保存被毁）：
+    // consts@0x20 fn@0x30 op@0x38 out(tag@0x40/payload@0x48) b_slot@0x50
+    // c_slot@0x58 result@0x60 op净@0x68 a_slot@0x70。
+    emit(buf, "mov", 2, reg(12), reg(1));
+    emit(buf, "mov", 2, reg(13), reg(2));
+    emit(buf, "mov", 2, reg(14), reg(8));
+    emit(buf, "mov", 2, reg(15), reg(9));
+    // 参定位三算终版（此前两次反向）：调用点 [csp] 存 arg5@+0x20/arg6@+0x28；本帧
+    // rsp=csp-8-40-128=csp-176 → arg5 偏移 208、arg6 216。consts 槽@0x20 存 arg5
+    // （初版恒等对误存 arg1=code_ptr——tag 读到指令字低字节即此因）。
+    emit(buf, "mov", 2, reg(1), stackMemory(208));
+    emit(buf, "mov", 2, reg(2), stackMemory(216));
+    emit(buf, "mov", 2, mem64(4, 48), reg(2));
+    emit(buf, "mov", 2, mem64(4, 32), reg(1));
+    emit(buf, "shl", 2, reg(15), immediate(4));
+    emit(buf, "add", 2, reg(14), reg(15));
+    xor_v(buf, 15);
+    label(buf, "__tx_vc_loop");
+    emit(buf, "cmp", 2, reg(15), reg(13));
+    one(buf, "jae", target("__tx_vc_done"));
+    emit(buf, "mov", 2, reg32(0), asStructuredMem(1, 12, 15, 2, 0, 0, ""));
+    // 派发判 op 字节（ins&0xFF）经 r11——整字比较曾致全臂落 unsupported，
+    // 且掩码不得覆 rax（臂内解码以 rax=ins 为源）。
+    emit(buf, "mov", 2, reg(11), reg(0));
+    emit(buf, "movzx", 2, reg32(11), reg8(11));
+    emit(buf, "cmp", 2, reg32(11), immediate(1));
+    one(buf, "je", target("__tx_vc_loadk"));
+    emit(buf, "cmp", 2, reg32(11), immediate(2));
+    one(buf, "je", target("__tx_vc_ldbool"));
+    emit(buf, "cmp", 2, reg32(11), immediate(3));
+    one(buf, "je", target("__tx_vc_ldnone"));
+    emit(buf, "cmp", 2, reg32(11), immediate(4));
+    one(buf, "je", target("__tx_vc_move"));
+    emit(buf, "cmp", 2, reg32(11), immediate(5));
+    one(buf, "je", target("__tx_vc_arith_entry"));
+    emit(buf, "cmp", 2, reg32(11), immediate(6));
+    one(buf, "je", target("__tx_vc_arith_entry"));
+    emit(buf, "cmp", 2, reg32(11), immediate(7));
+    one(buf, "je", target("__tx_vc_arith_entry"));
+    emit(buf, "cmp", 2, reg32(11), immediate(12));
+    one(buf, "je", target("__tx_vc_cmp_entry"));
+    emit(buf, "cmp", 2, reg32(11), immediate(13));
+    one(buf, "je", target("__tx_vc_cmp_entry"));
+    emit(buf, "cmp", 2, reg32(11), immediate(14));
+    one(buf, "je", target("__tx_vc_cmp_entry"));
+    emit(buf, "cmp", 2, reg32(11), immediate(15));
+    one(buf, "je", target("__tx_vc_jmp"));
+    emit(buf, "cmp", 2, reg32(11), immediate(16));
+    one(buf, "je", target("__tx_vc_jt"));
+    emit(buf, "cmp", 2, reg32(11), immediate(17));
+    one(buf, "je", target("__tx_vc_jf"));
+    one(buf, "jmp", target("__tx_vc_unsupported"));
+
+    label(buf, "__tx_vc_loadk");
+    emit(buf, "mov", 2, reg(1), reg(0));
+    emit(buf, "shr", 2, reg(1), immediate(8));
+    emit(buf, "movzx", 2, reg32(1), reg8(1));
+    emit(buf, "mov", 2, mem64(4, 56), reg(1)); // a 先垫（第十五例：跨调用 rax 被毁不得复用）
+    emit(buf, "mov", 2, reg(1), mem64(4, 32));
+    emit(buf, "mov", 2, reg(2), reg(0));
+    emit(buf, "shr", 2, reg(2), immediate(16));
+    emit(buf, "lea", 2, reg(8), stackMemory(64));
+    one(buf, "call", target("__tx_vm_const_value"));
+    emit(buf, "mov", 2, reg(1), mem64(4, 56));
+    one(buf, "call", target("__tx_vc_slot_addr"));
+    emit(buf, "mov", 2, mem64(4, 112), reg(0));
+    emit(buf, "mov", 2, reg(2), mem64(4, 64));
+    emit(buf, "mov", 2, reg(8), mem64(4, 72));
+    emit(buf, "mov", 2, reg(1), mem64(4, 112));
+    one(buf, "call", target("__tx_vm_slot_retain"));
+    one(buf, "jmp", target("__tx_vc_next"));
+
+    label(buf, "__tx_vc_ldbool");
+    emit(buf, "mov", 2, reg(9), reg(0));
+    emit(buf, "shr", 2, reg(9), immediate(16));
+    emit(buf, "movzx", 2, reg32(9), reg8(9));
+    emit(buf, "mov", 2, mem64(4, 56), reg(9)); // b 先垫
+    emit(buf, "mov", 2, reg(1), reg(0));
+    emit(buf, "shr", 2, reg(1), immediate(8));
+    emit(buf, "movzx", 2, reg32(1), reg8(1));
+    one(buf, "call", target("__tx_vc_slot_addr"));
+    emit(buf, "mov", 2, mem64(4, 112), reg(0));
+    emit(buf, "mov", 2, reg(1), reg(0));
+    emit(buf, "mov", 2, reg(2), immediate(3));
+    emit(buf, "mov", 2, reg(8), immediate(0));
+    emit(buf, "mov", 2, reg(9), mem64(4, 56));
+    emit(buf, "test", 2, reg8(9), reg8(9));
+    one(buf, "jz", target("__tx_vc_ldb0"));
+    emit(buf, "mov", 2, reg(8), immediate(1));
+    label(buf, "__tx_vc_ldb0");
+    emit(buf, "mov", 2, reg(1), mem64(4, 112));
+    one(buf, "call", target("__tx_vm_slot_new"));
+    one(buf, "jmp", target("__tx_vc_next"));
+
+    label(buf, "__tx_vc_ldnone");
+    emit(buf, "mov", 2, reg(1), reg(0));
+    emit(buf, "shr", 2, reg(1), immediate(8));
+    emit(buf, "movzx", 2, reg32(1), reg8(1));
+    one(buf, "call", target("__tx_vc_slot_addr"));
+    emit(buf, "mov", 2, mem64(4, 112), reg(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 112));
+    emit(buf, "mov", 2, reg(2), immediate(4));
+    xor_v(buf, 8);
+    emit(buf, "mov", 2, reg(1), mem64(4, 112));
+    one(buf, "call", target("__tx_vm_slot_new"));
+    one(buf, "jmp", target("__tx_vc_next"));
+
+    label(buf, "__tx_vc_move");
+    emit(buf, "mov", 2, reg(1), reg(0));
+    emit(buf, "shr", 2, reg(1), immediate(8));
+    emit(buf, "movzx", 2, reg32(1), reg8(1));
+    emit(buf, "mov", 2, mem64(4, 56), reg(1)); // a 先垫
+    emit(buf, "mov", 2, reg(1), reg(0));
+    emit(buf, "shr", 2, reg(1), immediate(16));
+    emit(buf, "movzx", 2, reg32(1), reg8(1));
+    one(buf, "call", target("__tx_vc_slot_addr"));
+    emit(buf, "mov", 2, mem64(4, 64), reg(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 56));
+    one(buf, "call", target("__tx_vc_slot_addr"));
+    emit(buf, "mov", 2, mem64(4, 112), reg(0));
+    // 第十七例：move 臂把源槽**指针**当 tag 传——须经 r10 解引取 16B 值。
+    emit(buf, "mov", 2, reg(10), mem64(4, 64));
+    emit(buf, "mov", 2, reg(2), mem64(10, 0));
+    emit(buf, "mov", 2, reg(8), mem64(10, 8));
+    emit(buf, "mov", 2, reg(1), mem64(4, 112));
+    one(buf, "call", target("__tx_vm_slot_retain"));
+    one(buf, "jmp", target("__tx_vc_next"));
+
+    label(buf, "__tx_vc_arith_entry");
+    emit(buf, "mov", 2, mem64(4, 56), reg(0));
+    one(buf, "jmp", target("__tx_vc_bc"));
+    label(buf, "__tx_vc_cmp_entry");
+    emit(buf, "mov", 2, mem64(4, 56), reg(0));
+    label(buf, "__tx_vc_bc");
+    emit(buf, "mov", 2, reg(1), reg(0));
+    emit(buf, "shr", 2, reg(1), immediate(16));
+    emit(buf, "movzx", 2, reg32(1), reg8(1));
+    one(buf, "call", target("__tx_vc_slot_addr"));
+    emit(buf, "mov", 2, mem64(4, 80), reg(0));
+    emit(buf, "mov", 2, reg32(0), asStructuredMem(1, 12, 15, 2, 0, 0, ""));
+    emit(buf, "shr", 2, reg(0), immediate(24));
+    emit(buf, "movzx", 2, reg32(1), reg8(0));
+    one(buf, "call", target("__tx_vc_slot_addr"));
+    emit(buf, "mov", 2, mem64(4, 88), reg(0));
+    emit(buf, "mov", 2, reg(10), mem64(4, 80));
+    emit(buf, "mov", 2, reg(11), mem64(4, 88));
+    emit(buf, "movzx", 2, reg32(10), asStructuredMem(0, 10, -1, 0, 0, 0, ""));
+    emit(buf, "movzx", 2, reg32(11), asStructuredMem(0, 11, -1, 0, 0, 0, ""));
+    emit(buf, "cmp", 2, reg32(10), immediate(1));
+    one(buf, "jne", target("__tx_vc_slow"));
+    emit(buf, "cmp", 2, reg32(11), immediate(1));
+    one(buf, "jne", target("__tx_vc_slow"));
+    emit(buf, "mov", 2, reg(10), mem64(4, 80));
+    emit(buf, "mov", 2, reg(10), mem64(10, 8));
+    emit(buf, "mov", 2, reg(11), mem64(4, 88));
+    emit(buf, "mov", 2, reg(11), mem64(11, 8));
+    emit(buf, "mov", 2, reg(2), mem64(4, 56));
+    emit(buf, "movzx", 2, reg32(2), reg8(2)); // 判 op 字节（整字比较曾致算术臂漏斗入 setle 尾）
+    emit(buf, "cmp", 2, reg32(2), immediate(5));
+    one(buf, "jne", target("__tx_vc_nadd"));
+    emit(buf, "add", 2, reg(10), reg(11));
+    one(buf, "jo", target("__tx_vc_slow"));
+    emit(buf, "mov", 2, reg(2), immediate(1));
+    one(buf, "jmp", target("__tx_vc_store"));
+    label(buf, "__tx_vc_nadd");
+    emit(buf, "cmp", 2, reg32(2), immediate(6));
+    one(buf, "jne", target("__tx_vc_nsub"));
+    emit(buf, "sub", 2, reg(10), reg(11));
+    one(buf, "jo", target("__tx_vc_slow"));
+    emit(buf, "mov", 2, reg(2), immediate(1));
+    one(buf, "jmp", target("__tx_vc_store"));
+    label(buf, "__tx_vc_nsub");
+    emit(buf, "cmp", 2, reg32(2), immediate(7));
+    one(buf, "jne", target("__tx_vc_ncmp"));
+    emit(buf, "imul", 2, reg(10), reg(11));
+    one(buf, "jo", target("__tx_vc_slow"));
+    emit(buf, "mov", 2, reg(2), immediate(1));
+    one(buf, "jmp", target("__tx_vc_store"));
+    label(buf, "__tx_vc_ncmp");
+    emit(buf, "cmp", 2, reg32(2), immediate(12));
+    one(buf, "jne", target("__tx_vc_nlt"));
+    emit(buf, "cmp", 2, reg(10), reg(11));
+    one(buf, "sete", reg8(2));
+    one(buf, "jmp", target("__tx_vc_storeb"));
+    label(buf, "__tx_vc_nlt");
+    emit(buf, "cmp", 2, reg32(2), immediate(13));
+    one(buf, "jne", target("__tx_vc_nle"));
+    emit(buf, "cmp", 2, reg(10), reg(11));
+    one(buf, "setl", reg8(2));
+    one(buf, "jmp", target("__tx_vc_storeb"));
+    label(buf, "__tx_vc_nle");
+    emit(buf, "cmp", 2, reg(10), reg(11));
+    one(buf, "setle", reg8(2));
+    label(buf, "__tx_vc_storeb");
+    emit(buf, "movzx", 2, reg32(8), reg8(2));
+    emit(buf, "mov", 2, reg(10), reg(8));
+    emit(buf, "mov", 2, reg(2), immediate(3));
+    label(buf, "__tx_vc_store");
+    emit(buf, "mov", 2, mem64(4, 96), reg(10));
+    emit(buf, "mov", 2, reg(1), mem64(4, 56));
+    emit(buf, "shr", 2, reg(1), immediate(8));
+    emit(buf, "movzx", 2, reg32(1), reg8(1));
+    one(buf, "call", target("__tx_vc_slot_addr"));
+    emit(buf, "mov", 2, mem64(4, 112), reg(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 112));
+    emit(buf, "mov", 2, reg(8), mem64(4, 96));
+    emit(buf, "mov", 2, reg(1), mem64(4, 112));
+    one(buf, "call", target("__tx_vm_slot_new"));
+    one(buf, "jmp", target("__tx_vc_next"));
+
+    label(buf, "__tx_vc_slow");
+    emit(buf, "mov", 2, reg(1), mem64(4, 56));
+    emit(buf, "and", 2, reg32(1), immediate(255));
+    emit(buf, "mov", 2, mem64(4, 104), reg(1));
+    emit(buf, "mov", 2, reg(0), mem64(4, 56));
+    emit(buf, "shr", 2, reg(0), immediate(8));
+    emit(buf, "movzx", 2, reg32(2), reg8(0));
+    emit(buf, "shl", 2, reg(2), immediate(4));
+    emit(buf, "add", 2, reg(2), reg(14));
+    emit(buf, "mov", 2, mem64(4, 112), reg(2));
+    emit(buf, "mov", 2, reg(2), mem64(4, 104));
+    emit(buf, "mov", 2, reg(8), mem64(4, 80));
+    emit(buf, "mov", 2, reg(9), mem64(4, 88));
+    emit(buf, "mov", 2, reg(1), mem64(4, 48));
+    emit(buf, "mov", 2, mem64(4, 32), reg(1));
+    emit(buf, "mov", 2, mem64(4, 40), reg(15));
+    emit(buf, "mov", 2, reg(1), mem64(4, 112));
+    one(buf, "call", target("__tx_vm_arith_slow"));
+    one(buf, "jmp", target("__tx_vc_next"));
+
+    label(buf, "__tx_vc_jmp");
+    emit(buf, "mov", 2, mem64(4, 56), reg(0));
+    one(buf, "jmp", target("__tx_vc_jump_common"));
+    label(buf, "__tx_vc_jt");
+    emit(buf, "mov", 2, mem64(4, 56), reg(0));
+    one(buf, "jmp", target("__tx_vc_jtest"));
+    label(buf, "__tx_vc_jf");
+    emit(buf, "mov", 2, mem64(4, 56), reg(0));
+    label(buf, "__tx_vc_jtest");
+    emit(buf, "mov", 2, reg(1), reg(0));
+    emit(buf, "shr", 2, reg(1), immediate(8));
+    emit(buf, "movzx", 2, reg32(1), reg8(1));
+    one(buf, "call", target("__tx_vc_slot_addr"));
+    // 第十六例：movzx 读 tag 覆写槽址寄存器（读 [3+8]=0xB 崩）——tag 读入 r11 保 r10。
+    emit(buf, "mov", 2, reg(10), reg(0));
+    emit(buf, "movzx", 2, reg32(11), asStructuredMem(0, 10, -1, 0, 0, 0, ""));
+    emit(buf, "cmp", 2, reg32(11), immediate(3));
+    one(buf, "jne", target("__tx_vc_trap_badtype"));
+    emit(buf, "mov", 2, reg(11), mem64(10, 8));
+    emit(buf, "mov", 2, reg(0), mem64(4, 56));
+    emit(buf, "mov", 2, reg(2), reg(0));
+    emit(buf, "and", 2, reg32(2), immediate(255));
+    emit(buf, "cmp", 2, reg32(2), immediate(16));
+    one(buf, "jne", target("__tx_vc_jf_arm"));
+    emit(buf, "test", 2, reg(11), reg(11));
+    one(buf, "jz", target("__tx_vc_next"));
+    one(buf, "jmp", target("__tx_vc_jump_common"));
+    label(buf, "__tx_vc_jf_arm");
+    emit(buf, "test", 2, reg(11), reg(11));
+    one(buf, "jz", target("__tx_vc_jump_common"));
+    one(buf, "jmp", target("__tx_vc_next"));
+    label(buf, "__tx_vc_jump_common");
+    emit(buf, "mov", 2, reg(0), mem64(4, 56));
+    emit(buf, "mov", 2, reg(2), reg(0));
+    emit(buf, "shr", 2, reg(2), immediate(16));
+    emit(buf, "sub", 2, reg(2), immediate(32768));
+    emit(buf, "shl", 2, reg(2), immediate(32));
+    emit(buf, "sar", 2, reg(2), immediate(32));
+    emit(buf, "lea", 2, reg(2), asStructuredMem(2, 2, 15, 0, 1, 0, ""));
+    emit(buf, "cmp", 2, reg(2), immediate(0));
+    one(buf, "jl", target("__tx_vc_trap_corrupt"));
+    emit(buf, "cmp", 2, reg(2), reg(13));
+    one(buf, "jae", target("__tx_vc_trap_corrupt"));
+    emit(buf, "mov", 2, reg(15), reg(2));
+    one(buf, "jmp", target("__tx_vc_loop"));
+
+    label(buf, "__tx_vc_next");
+    one(buf, "inc", reg(15));
+    one(buf, "jmp", target("__tx_vc_loop"));
+
+    label(buf, "__tx_vc_done");
+    emit(buf, "mov", 2, reg(0), reg(15));
+    emit(buf, "add", 2, reg(4), immediate(128));
+    one(buf, "pop", reg(15));
+    one(buf, "pop", reg(14));
+    one(buf, "pop", reg(13));
+    one(buf, "pop", reg(12));
+    one(buf, "pop", reg(3));
+    zero(buf, "ret");
+
+    label(buf, "__tx_vc_unsupported");
+    emit(buf, "mov", 2, reg(1), reg(0));
+    emit(buf, "and", 2, reg32(1), immediate(255));
+    push40(buf);
+    one(buf, "call", target("__tx_vm_trap"));
+    label(buf, "__tx_vc_trap_badtype");
+    emit(buf, "mov", 2, reg(1), mem64(4, 48));
+    emit(buf, "mov", 2, reg(2), reg(15));
+    emit(buf, "mov", 2, reg32(8), immediate(2));
+    push40(buf);
+    one(buf, "call", target("__tx_vm_trap"));
+    label(buf, "__tx_vc_trap_corrupt");
+    emit(buf, "mov", 2, reg(1), mem64(4, 48));
+    emit(buf, "mov", 2, reg(2), reg(15));
+    emit(buf, "mov", 2, reg32(8), immediate(7));
+    push40(buf);
+    one(buf, "call", target("__tx_vm_trap"));
+
+    label(buf, "__tx_vc_slot_addr");
+    emit(buf, "mov", 2, reg(0), reg(1));
+    emit(buf, "shl", 2, reg(0), immediate(4));
+    emit(buf, "add", 2, reg(0), reg(14));
+    zero(buf, "ret");
+}
+
+// 可移植版（macOS 适配 M4 设计 A8）：--generic=名,名… 让所列模块用 rtfn 写的可移植版代替手写的 x86 版（all＝全部有可移植版的模块），
+// x86 上据此对照两版的行为；A64 目标只有可移植版。rtfn 的生成失败收在 genericFailures。
+let genericModules: List<string> = listNew();
+let genericFailures: List<string> = listNew();
+const GENERIC_AVAILABLE: string = "intern weak span clone equal construct record handlers slots backing elements compact scalarops scalarh listpush alloc rc str zero copy panic file entry leaves macsys heapcheck oomfault";
+function generic(name: string): bool {
+    for (m in genericModules) { if (m == name || m == "all") { return true; } }
+    return false;
+}
+// 测试专用页堆（docs/design/v052-heap-check-v0.1-20261024.md）：只在显式写 --generic=heapcheck 时代替分配器，all 不含它（不是等价的可移植版）。
+function heapCheck(): bool {
+    for (m in genericModules) { if (m == "heapcheck") { return true; } }
+    return false;
+}
+// 取页失败的故障注入（docs/design/v052-oom-fault-v0.1-20261025.md）：只在显式写 --generic=oomfault 时打开，all 不含它；其余模块
+// 一律取可移植版（手写的分配器与页适配器不经 rtfn 的拦截），不与 heapcheck 同用。
+function oomFault(): bool {
+    for (m in genericModules) { if (m == "oomfault") { return true; } }
+    return false;
+}
+// macOS 的致命终局（panicBody、movePanic、strOom 就地发出）：--generic=macsys 时用 rtfn 写的可移植版。
+function macAbortAt(buf: Ref<StructuredBuffer>, entry: string, data: string, message: string, status: int): void {
+    if (generic("macsys")) { macAbortGenericEmit(buf, genericFailures, entry, data, message, status); return; }
+    macAbort(buf, entry, data, message, status);
+}
+
+// Test-only exports use the actual production heads and retain/release bodies.
+export function runtimeRcBoundaryEmit(buf: Ref<StructuredBuffer>, nrt: bool): void {
+    rcHeapTag(buf, nrt); asBufferSection(buf, 0, 1);
+    rcRetain(buf, nrt); rcRelease(buf, false, nrt);
+    if (nrt) { rcOverReleaseEmit(buf, genericFailures); }
+}
+/// 同上，可移植版（rtfn 写；A64 内核与 --generic=rc 用的那份）。返回 rtfn 的生成失败（空串为无）。
+export function runtimeRcBoundaryEmitGeneric(buf: Ref<StructuredBuffer>, t: int): string {
+    const failures: List<string> = listNew();
+    rcGenericEmit(buf, failures, t);
+    return listGet(failures, 0) catch "";
+}
+
+function main(args: []string): int {
+    if (len(args) < 3 || len(args) > 15 || args[0] != "--target") {
+        eprint("usage: runtime_memory_gen --target <x86_64-windows|x86_64-linux|x86_64-macos|aarch64-macos> out.obj [--with-move] [--with-alloc] [--with-rc] [--with-str] [--with-strb] [--with-zero] [--with-list] [--with-file] [--with-store-slots] [--with-argv] [--with-vmcore]"); return 64;
+    }
+    let withMove = false;
+    let withAlloc = false;
+    let withRc = false;
+    let withStr = false;
+    let withStrb = false;
+    let withZero = false;
+    let withList = false;
+    let withFile = false;
+    let withSlots = false;
+    let withArgv = false;
+    let withVmcore = false;
+    let withNrt = false;
+    let i = 3;
+    while (i < len(args)) {
+        if (args[i] == "--with-move" && withMove == false) { withMove = true; }
+        else if (args[i] == "--with-alloc" && withAlloc == false) { withAlloc = true; }
+        else if (args[i] == "--with-rc" && withRc == false) { withRc = true; }
+        else if (args[i] == "--with-str" && withStr == false) { withStr = true; }
+        else if (args[i] == "--with-strb" && withStrb == false) { withStrb = true; }
+        else if (args[i] == "--with-zero" && withZero == false) { withZero = true; }
+        else if (args[i] == "--with-list" && withList == false) { withList = true; }
+        else if (args[i] == "--with-file" && withFile == false) { withFile = true; }
+        else if (args[i] == "--with-store-slots" && withSlots == false) { withSlots = true; }
+        else if (args[i] == "--with-argv" && withArgv == false) { withArgv = true; }
+        else if (args[i] == "--with-vmcore" && withVmcore == false) { withVmcore = true; }
+        else if (args[i] == "--with-nrt" && withNrt == false) { withNrt = true; }
+        else if (strIndexOf(args[i], "--generic=") == 0 && listLen(genericModules) == 0) {
+            const names = strSplit(strSub(args[i], 10, len(args[i]) - 10), ",");
+            for (n in names) {
+                let known = n == "all";
+                for (m in strSplit(GENERIC_AVAILABLE, " ")) { if (m == n) { known = true; } }
+                if (!known) { eprint("UnknownGenericModule:" + n); return 64; }
+                listPush(genericModules, n);
+            }
+        }
+        else { eprint("UnsupportedRuntimeCapability"); return 64; }
+        i = i + 1;
+    }
+    if (withStr && (withRc == false || withAlloc == false)) {
+        eprint("StrRequiresRcAlloc"); return 64;
+    }
+    if (withStrb && withAlloc == false) {
+        eprint("StrbRequiresAlloc"); return 64;
+    }
+    if (withZero && (withRc == false || withAlloc == false)) {
+        eprint("ZeroRequiresRcAlloc"); return 64;
+    }
+    if (withList && (withRc == false || withAlloc == false)) {
+        eprint("ListRequiresRcAlloc"); return 64;
+    }
+    if (withFile && withAlloc == false) {
+        eprint("FileRequiresAlloc"); return 64;
+    }
+    if (withSlots && withAlloc == false) { eprint("StoreSlotsRequiresAlloc"); return 64; }
+    if (withArgv && withAlloc == false) {
+        eprint("ArgvRequiresAlloc"); return 64;
+    }
+    if (withVmcore && (withRc == false || withAlloc == false)) {
+        eprint("VmcoreRequiresRcAlloc"); return 64;
+    }
+    // NRT replaces the Zig execution host and needs every native capability.
+    if (withNrt && (withMove == false || withAlloc == false || withRc == false || withStr == false || withStrb == false || withZero == false || withList == false || withFile == false || withSlots == false || withArgv == false)) {
+        eprint("NrtRequiresFullNativeRuntime"); return 64;
+    }
+    rtTarget = targetParseName(args[1]);
+    // 内核生成器先于产物命令认 aarch64-macos（macOS 适配 M4c）。
+    if (args[1] == "aarch64-macos") { rtTarget = T_ARM64_MACOS; }
+    nrtKernel = withNrt;
+    if (rtTarget < 0) { eprint("UnsupportedRuntimeTarget"); return 64; }
+    // 旧 VM 核心只做过 x86_64-windows。
+    if (rtTarget != T_X64_WINDOWS && withVmcore) {
+        eprint("LinuxRuntimeCapabilityNotMigrated"); return 64;
+    }
+    // macOS 只有 NRT 内核（产物经 libSystem 动态链接）；不带 NRT 的拆件内核只为 Windows/Linux 的独立测试驱动服务。
+    if (tMacos(rtTarget) && !withNrt) { eprint("MacosRequiresNrtKernel"); return 64; }
+    if (POINTER_BYTES != 8) { eprint("IncompatibleNativePointerAbi"); return 65; }
+    if (listLen(genericModules) > 0 && !withNrt) { eprint("GenericRequiresNrtKernel"); return 64; }
+    if (oomFault()) {
+        if (heapCheck()) { eprint("OomFaultWithHeapCheck"); return 64; }
+        if (!generic("all")) { listPush(genericModules, "all"); }
+        rtFaultEnable(true);
+    }
+    // A64 只有可移植版（设计 A8）：有可移植版的模块一律选用，不收部分列表；仍是手写 x86 的例程在提交前一次报出。
+    const a64 = tA64(rtTarget);
+    if (a64) {
+        // 页堆只换分配器，其余模块在 A64 上照旧全用可移植版。
+        if (heapCheck() && !generic("all")) { listPush(genericModules, "all"); }
+        if (listLen(genericModules) > 0 && !generic("all")) { eprint("A64KernelIsAllGeneric"); return 64; }
+        if (listLen(genericModules) == 0) { listPush(genericModules, "all"); }
+    }
+    // 函数与帧元数据（TXFN，供链接映射）：两种架构的内核都带（A64 的帧事件见 M4 设计 §A5）。
+    nativeFunctionsEnable(true);
+    let buf = asBufferNew();
+    if (a64) { buf = asBufferNewA64(); }
+    asBufferSection(buf, 0, 1);
+    if (generic("copy")) { copyGenericEmit(buf, genericFailures, rtTarget); } else { copy(buf); fill(buf); if (withMove) { move(buf); } }
+    if (tSysV(rtTarget)) { linuxMemoryExports(buf, withMove); }
+    if (tRawSyscall(rtTarget) && withAlloc) { linuxPageAdapters(buf); }
+    if (tMacos(rtTarget) && withAlloc) { if (generic("macsys")) { macPageAdaptersGenericEmit(buf, genericFailures, rtTarget); } else { macPageAdapters(buf); } }
+    if (withAlloc) { if (heapCheck()) { allocCheckEmit(buf, genericFailures, rtTarget); } else if (generic("alloc")) { allocGenericEmit(buf, genericFailures, rtTarget); } else { allocProc(buf); freeProc(buf); reallocProc(buf); } }
+    if (oomFault()) { oomFaultEmit(buf, genericFailures, rtTarget); }
+    // 页堆内核（--generic=heapcheck）一律用可移植版槽表并开对象号隔离（手写版没有隔离；设计 v052-heap-check-tool）。
+    let slotsRing = 0;
+    if (heapCheck()) { slotsRing = SLOTS_QUARANTINE_RING; }
+    if (withSlots) { if (generic("slots") || heapCheck()) { storeSlotsGenericEmit(buf, genericFailures, rtTarget, slotsRing); } else { storeSlotsEmit(buf, rtTarget); } }
+    if (withRc) { if (generic("rc")) { rcGenericEmit(buf, genericFailures, rtTarget); } else { rcHeapTag(buf, withNrt); asBufferSection(buf, 0, 1); rcRetain(buf, withNrt); rcRelease(buf, withZero, withNrt);
+            rcFrameRelease(buf); if (withNrt) { rcOverReleaseEmit(buf, genericFailures); } } }
+    if (generic("str")) { strGenericEmit(buf, genericFailures, rtTarget); } else {
+        if (withStr) { strConcat(buf); }
+        if (withStr || withStrb || withFile || withList) { strOom(buf); }
+        if (withStrb) { strbEmit(buf); }
+    }
+    if (withZero) { if (generic("zero")) { zeroGenericEmit(buf, genericFailures, rtTarget); } else { zeroDispatch(buf); zeroContainer(buf, withList); } }
+    if (withList) { if (generic("backing")) { listBackingGenericEmit(buf, genericFailures, rtTarget); } else { listBackingEmit(buf, rtTarget); } if (generic("elements")) { listElementsGenericEmit(buf, genericFailures, rtTarget); } else { listElementsEmit(buf); } if (generic("compact")) { listCompactGenericEmit(buf, genericFailures, rtTarget); } else { listCompactEmit(buf, rtTarget); if (withNrt) { listCompactLeafEmit(buf); } } if (generic("span")) { payloadSpanGenericEmit(buf, genericFailures, rtTarget); } else { payloadSpanEmit(buf); } if (generic("clone")) { payloadCloneGenericEmit(buf, genericFailures, rtTarget); } else { payloadCloneEmit(buf); } if (generic("weak")) { weakTableGenericEmit(buf, genericFailures); } else { weakTableEmit(buf); } if (generic("intern")) { internTableGenericEmit(buf, genericFailures); } else { internTableEmit(buf); } if (generic("scalarops")) { scalarOpsGenericEmit(buf, genericFailures, rtTarget); } else { scalarOpsEmit(buf); } if (generic("equal")) { valueEqualGenericEmit(buf, genericFailures, rtTarget); } else { valueEqualEmit(buf); } if (generic("scalarh")) { scalarHandlersGenericEmit(buf, genericFailures, rtTarget); } else { scalarHandlersEmit(buf); } if (generic("record")) { objectRecordGenericEmit(buf, genericFailures, rtTarget); } else { objectRecordEmit(buf); } if (generic("handlers")) { objectHandlersGenericEmit(buf, genericFailures, rtTarget); } else { objectHandlersEmit(buf, withNrt); } if (generic("construct")) { objectConstructGenericEmit(buf, genericFailures, rtTarget); } else { objectConstructEmit(buf); } if (withNrt) { if (generic("listpush")) { listPushGenericEmit(buf, genericFailures, rtTarget); } else { listPushNrt(buf); } } else { listPushEmit(buf); } }
+    // 文件读写的可移植版：Unix 目标的原语与三个内建外壳；Windows 的原语是 Win32 平台代码，仍发手写版，只换外壳。
+    if (withFile) { if (generic("file")) { if (!tUnix(rtTarget)) { fileEmit(buf); } fileGenericEmit(buf, genericFailures, rtTarget); } else { fileEmit(buf); fileReadBi(buf); fileWriteBi(buf); fileWriteBytesBi(buf); } }
+    nrtExitCall = (tRawSyscall(rtTarget) || tMacos(rtTarget)) && withNrt;
+    if (withArgv) {
+        // 可移植版的入口：Windows 的参数表仍用手写的 windows_argv.tx（不随 arm64 走）。
+        let argvFail = "";
+        if (generic("entry")) { if (!tUnix(rtTarget)) { argvFail = windowsArgvEmit(buf); } entryGenericEmit(buf, genericFailures, rtTarget); }
+        else { argvFail = argvProc(buf); }
+        if (len(argvFail) > 0) { eprint(argvFail); return 66; }
+    }
+    if (withVmcore) { vmcoreProc(buf); }
+    nrtGenericLeaves(generic("leaves"));
+    if (withNrt && nrtEmit(buf, rtTarget) != 0) { eprint(nrtLastError()); return 66; }
+    if (withNrt && generic("leaves")) { leavesGenericEmit(buf, genericFailures, rtTarget); }
+    if (generic("panic")) { panicGenericEmit(buf, genericFailures, rtTarget); } else {
+        panicBody(buf);
+        if (withMove) {
+            movePanic(buf, "__tx_native_move_overflow", "__tx_native_move_overflow_message", "integer overflow");
+            movePanic(buf, "__tx_native_move_null", "__tx_native_move_null_message", "cast causes pointer to be null");
+        }
+    }
+    if (withAlloc) {
+        // 单一 bss 块（多块节合并行为不信任）：state 88＋pages 8＋大块缓存 272＋（zero 时）
+        // 递归深度护栏 4＋垫 4。NRT 内核的这些状态在线程块里（每线程一个堆）。
+        asBufferSection(buf, 3, 1);
+        if (!withNrt) {
+            label(buf, "__tx_native_mem_state");
+            asBufferZero(buf, 88, 1);
+            label(buf, "__tx_native_mem_state_pages");
+            asBufferZero(buf, 8, 1);
+            label(buf, "__tx_native_big_cache");
+            asBufferZero(buf, 272, 1);
+        }
+        if (withZero && !withNrt) {
+            label(buf, "__tx_zero_depth");
+            asBufferZero(buf, 8, 1);
+        }
+        if (withNrt) { nrtBss(buf); }
+        if (heapCheck()) { allocCheckBss(buf); }
+        if (oomFault()) { oomFaultBss(buf, rtTarget); }
+    }
+
+    if (listLen(genericFailures) > 0) { eprint(listGet(genericFailures, 0) catch ""); return 66; }
+    if (a64) {
+        const sites = a64BufferX86Sites(buf);
+        if (listLen(sites) > 0) {
+            let names = "";
+            for (n in sites) { names = names + " " + n; }
+            eprint("A64KernelNotPorted:" + names); return 66;
+        }
+        asStructuredBegin(); a64BufferSubmit(buf);
+    } else { asStructuredBegin(); asBufferSubmit(buf); }
+    if (asFailedAs() != 0) { eprint(asLastErrAs()); return 66; }
+    const functions = nativeFunctionsSnapshot();
+    if (!functions.ok) { eprint(functions.error); return 66; }
+    const exports: List<string> = listNew(); listPush(exports, "memcpy"); listPush(exports, "memset");
+    if (withSlots) {
+        listPush(exports, "__tx_native_slots_create_v2"); listPush(exports, "__tx_native_slots_acquire_v2");
+        listPush(exports, "__tx_native_slots_free_v2"); listPush(exports, "__tx_native_slots_destroy_v2");
+    }
+    if (withMove) { listPush(exports, "memmove"); }
+    if (withAlloc) {
+        listPush(exports, "__tx_native_mem_alloc"); listPush(exports, "__tx_native_mem_free"); listPush(exports, "__tx_native_mem_realloc");
+    }
+    if (withRc) {
+        listPush(exports, "__tx_retain"); listPush(exports, "__tx_release"); listPush(exports, "__tx_frame_release"); listPush(exports, "__tx_frame_release_from"); listPush(exports, "__tx_is_heapref");
+    }
+    if (withStr) { listPush(exports, "__tx_str_concat"); }
+    if (withList) { listPush(exports, "__tx_list_push"); listPush(exports, "__tx_native_list_append_v1"); listPush(exports, "__tx_native_list_generic_v1"); listPush(exports, "__tx_native_list_destroy_v1"); listPush(exports, "__tx_native_list_get_v2"); listPush(exports, "__tx_native_list_remove_v2"); listPush(exports, "__tx_native_list_prepare_set_v2"); listPush(exports, "__tx_native_list_insert_v2"); }
+    if (withList) { listPush(exports, "__tx_native_values_alloc_v1"); listPush(exports, "__tx_native_values_init_v1"); listPush(exports, "__tx_native_values_read_v1"); listPush(exports, "__tx_native_values_free_v1"); listPush(exports, "__tx_native_value_replace_v1"); listPush(exports, "__tx_native_payload_dispose_v1"); listPush(exports, "__tx_native_clone_v1"); }
+    if (withList) { listPush(exports, "__tx_native_weak_link_v1"); listPush(exports, "__tx_native_weak_unlink_v1"); listPush(exports, "__tx_native_weak_notify_v1"); listPush(exports, "__tx_native_weak_destroy_v1"); listPush(exports, "__tx_native_intern_find_v1"); listPush(exports, "__tx_native_intern_prepare_v1"); listPush(exports, "__tx_native_intern_insert_v1"); listPush(exports, "__tx_native_intern_destroy_v1"); }
+    if (withList) { const handlers = scalarHandlerNames(); let hi = 0; while (hi < listLen(handlers)) { listPush(exports, listGet(handlers, hi) catch ""); hi = hi + 1; } }
+    if (withList) { const names = objectConstructNames(); let n = 0; while (n < listLen(names)) { listPush(exports, listGet(names, n) catch ""); n = n + 1; } }
+    if (withList) { const names = objectHandlerNames(); let n = 0; while (n < listLen(names)) { listPush(exports, listGet(names, n) catch ""); n = n + 1; } }
+    if (withList) { listPush(exports, "__tx_native_object_init_v1"); listPush(exports, "__tx_native_object_payload_v1"); listPush(exports, "__tx_native_object_clone_view_v1"); listPush(exports, "__tx_native_object_equal_view_v1"); listPush(exports, "__tx_native_object_weak_dead_v1"); }
+    if (withList && withNrt) { listPush(exports, "__tx_list_cget1"); listPush(exports, "__tx_list_cset1"); listPush(exports, "__tx_list_clen1"); }
+    if (withList) { listPush(exports, "__tx_native_scalar_binary_v1"); listPush(exports, "__tx_native_scalar_unary_v1"); listPush(exports, "__tx_native_scalar_fw_v1"); listPush(exports, "__tx_native_equal_v1"); }
+    if (withFile) {
+        if (tUnix(rtTarget)) { listPush(exports, "__tx_native_file_read"); listPush(exports, "__tx_native_file_write"); listPush(exports, "__tx_native_file_write_exec"); }
+        listPush(exports, "__tx_bi_read_file"); listPush(exports, "__tx_bi_write_file"); listPush(exports, "__tx_bi_write_file_bytes");
+    }
+    if (withArgv) {
+        listPush(exports, "__tx_native_argv_acquire"); listPush(exports, "__tx_native_entry"); if (tUnix(rtTarget)) { listPush(exports, "main"); }
+    }
+    if (withVmcore) {
+        listPush(exports, "__tx_vm_run1");
+    }
+    if (withNrt) { const names = nrtExports(); let n = 0; while (n < listLen(names)) { listPush(exports, listGet(names, n) catch ""); n = n + 1; } }
+    // 程序映像经内核的蹦床调 libSystem：外部函数回调核对线程号（M2 设计 F3）、工具链例程与调试运行时（M3 设计 G2）。
+    if (withNrt && tMacos(rtTarget)) { for (n in macKernelExports()) { listPush(exports, n); } }
+
+    if (withStrb) {
+        listPush(exports, "__tx_strb_alloc"); listPush(exports, "__tx_strb_copy"); listPush(exports, "__tx_strb_append");
+        listPush(exports, "__tx_strb_finish"); listPush(exports, "__tx_strb_prepend"); listPush(exports, "__tx_strb_finish_pre");
+    }
+    // macOS 内核同样写成我们自己的 ELF64 可重定位目标文件，由 link_macho.tx 链成 Mach-O（M1 设计 E1）。
+    if (tElf(rtTarget) || tMacos(rtTarget)) {
+        const result = elfWriteObjectFunctions(exports, functions);
+        if (elfObjectOk(result) != 1) { eprint(elfObjectError(result)); return 67; }
+        writeFileBytes(args[2], elfObjectBytes(result)) catch (e) { eprint(e.message); return 68; };
+    } else {
+        const image = coffCaptureAssembler(); const result = coffWriteFunctions(image, exports, functions);
+        if (coffResultOk(result) != 1) { eprint(coffResultError(result)); return 67; }
+        writeFileBytes(args[2], coffResultBytes(result)) catch (e) { eprint(e.message); return 68; };
+    }
+    let message = "GENERATED_NATIVE_MEMORY_COPY_FILL";
+    if (withSlots) { message = message + "_STORE_SLOTS"; }
+    if (withMove) { message = message + "_MOVE"; }
+    if (withAlloc) { message = message + "_ALLOC"; }
+    if (withRc) { message = message + "_RC"; }
+    if (withStr) { message = message + "_STR"; }
+    if (withStrb) { message = message + "_STRB"; }
+    if (withZero) { message = message + "_ZERO"; }
+    if (withList) { message = message + "_LIST"; }
+    if (withFile) { message = message + "_FILE"; }
+    if (withArgv) { message = message + "_ARGV"; }
+    if (withVmcore) { message = message + "_VMCORE"; }
+    if (withNrt) { message = message + "_NRT"; }
+    print(message);
+    return 0;
+}

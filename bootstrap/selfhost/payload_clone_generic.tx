@@ -1,0 +1,85 @@
+// 深克隆的可移植版（rtfn 写，macOS 适配 M4 设计 A8）：语义与导出名同 payload_clone.tx。
+// clone(src, depth u32, ctx, out)：先给输入 Value 拍快照（out 可与 src 相同）；深度超过 CLONE_MAX_DEPTH 报 resource_depth；
+// 嵌套的 Ref（标签 9，depth > 0）与描述符说“句柄复制”的值共享句柄（retain 后原样写出）；容器则按视图逐个元素递归克隆进新区段，
+// 再由 __tx_store_clone_materialize 建新对象。视图 32 字节（payload_abi 的 CLONE_OFF_*）。
+// 与手写版的一处差别：区段分配失败时手写版尾跳 __tx_str_oom（它在 Windows 上按“跳入、rsp≡0 mod 16”的入口写成，不能经 call
+// 调用，rtfn 也没有尾跳），这里改调 NRT 的内存不足终局 __tx_native_object_oom_v1（同一诊断文本“taixu: 内存不足”、退出码 3、
+// 同一进程级致命锁），都不返回。
+import { CLONE_OFF_KIND, CLONE_OFF_PTR, CLONE_OFF_LEN, CLONE_MAX_DEPTH } from "./payload_abi";
+import { StructuredBuffer } from "./assemble";
+import { RtFn, L, I } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtShift, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtIf32, rtCall0, rtCall1, rtCall3, rtCall4, rtRet, rtRetVoid } from "./rtfn";
+
+const MODULE: string = "bootstrap/selfhost/payload_clone_generic.tx";
+const M32: int = 4294967295;
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// s0 s1 是输入快照，v0..v3 是视图（各自连续的局部槽）。
+function cloneFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_clone_v1", "src depth ctx out", "s0 s1 v0 v1 v2 v3 sp vp r vals i n x y", 4, MODULE);
+    rtOp(f, "depth", L("depth"), "and", I(M32));
+    rtLoad(f, "s0", L("src"), 0, 8);
+    rtLoad(f, "s1", L("src"), 8, 8);
+    rtIf(f, L("depth"), "ugt", I(CLONE_MAX_DEPTH), "deep");
+    // 嵌套的 Ref 字段保持共享句柄（D3 的 Ref 语义）；只有顶层克隆 Ref 时取其值。
+    rtIf(f, L("depth"), "eq", I(0), "view");
+    rtOp(f, "x", L("s0"), "and", I(255));
+    rtIf(f, L("x"), "eq", I(9), "shared");
+    rtLabel(f, "view");
+    rtAddrOf(f, "sp", "s0");
+    rtAddrOf(f, "vp", "v0");
+    rtCall3(f, "r", "__tx_store_clone_view", L("sp"), L("ctx"), L("vp"));
+    rtIf32(f, L("r"), "eq", I(0), "shared");
+    rtLoad(f, "n", L("vp"), CLONE_OFF_LEN, 8);
+    rtCall1(f, "vals", "__tx_native_values_alloc_v1", L("n"));
+    rtIf(f, L("vals"), "eq", I(0), "oom");
+    rtSet(f, "i", I(0));
+    rtLabel(f, "loop");
+    rtLoad(f, "n", L("vp"), CLONE_OFF_LEN, 8);
+    rtIf(f, L("i"), "uge", L("n"), "new");
+    rtShift(f, "x", L("i"), "shl", 4);
+    rtLoad(f, "y", L("vp"), CLONE_OFF_PTR, 8);
+    rtOp(f, "y", L("y"), "add", L("x"));
+    rtOp(f, "x", L("vals"), "add", L("x"));
+    rtOp(f, "r", L("depth"), "add", I(1));
+    rtOp(f, "r", L("r"), "and", I(M32));
+    rtCall4(f, "", "__tx_native_clone_v1", L("y"), L("r"), L("ctx"), L("x"));
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "loop");
+    rtLabel(f, "new");
+    rtCall3(f, "r", "__tx_store_clone_materialize", L("vp"), L("vals"), L("ctx"));
+    rtOp(f, "r", L("r"), "and", I(M32));
+    rtStore(f, L("out"), 8, L("r"), 8);
+    // 结果标签：视图种类 1 字段 → 7，2 枚举 → 8，其余（数组）→ 10。
+    rtLoad(f, "x", L("vp"), CLONE_OFF_KIND, 4);
+    rtSet(f, "y", I(7));
+    rtIf(f, L("x"), "eq", I(1), "tag");
+    rtSet(f, "y", I(8));
+    rtIf(f, L("x"), "eq", I(2), "tag");
+    rtSet(f, "y", I(10));
+    rtLabel(f, "tag");
+    rtStore(f, L("out"), 0, L("y"), 8);
+    rtRet(f, L("r"));
+    rtLabel(f, "shared");
+    rtAddrOf(f, "sp", "s0");
+    rtCall1(f, "", "__tx_retain", L("sp"));
+    rtStore(f, L("out"), 0, L("s0"), 8);
+    rtStore(f, L("out"), 8, L("s1"), 8);
+    rtRetVoid(f);
+    // 深度超限：__tx_store_clone_depth 报 trap 4007，不返回。
+    rtLabel(f, "deep");
+    rtCall1(f, "", "__tx_store_clone_depth", L("ctx"));
+    rtLabel(f, "oom");
+    rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+/// 发出深克隆函数；rtfn 的失败记进 failures。t 为目标编号（只在语义随目标不同时用；这里不用）。
+export function payloadCloneGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    cloneFn(b, failures);
+}

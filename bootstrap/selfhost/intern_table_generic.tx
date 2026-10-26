@@ -1,0 +1,214 @@
+// 驻留表的可移植版（rtfn 写，macOS 适配 M4 设计 A8）：语义与导出名同 intern_table.tx，A64 目标用它，x86 可经内核生成器的
+// --generic 换上它做对照。表 {槽数组@0, 容量@8, 数目@16}，容量为 2 的幂；槽 32 字节 {哈希@0, 指针@8, 长度@16, 编号 u32@24,
+// 占用 u32@28}。键是借来的不可变字节，FNV-1a 64 位哈希、线性探查；扩容先 prepare（数目达到容量一半时翻倍），insert 不扩容。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, L, I } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtShift, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtCall1, rtCall2, rtCall3, rtRet } from "./rtfn";
+
+const MODULE: string = "bootstrap/selfhost/intern_table_generic.tx";
+const FNV_OFFSET: int = -3750763034362895579;
+const FNV_PRIME: int = 1099511628211;
+const NOT_FOUND: int = 4294967295;
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// __tx_itg_hash(ptr, len, out)：*out = FNV-1a(ptr[0..len))，返回 1；(ptr, len) 越过地址空间末端或 len 非零而 ptr 为空时返回 0。
+function hashFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_itg_hash", "ptr n out", "end h i c", 0, MODULE);
+    rtOp(f, "end", L("ptr"), "add", L("n"));
+    rtIf(f, L("end"), "ult", L("ptr"), "bad");
+    rtIf(f, L("n"), "eq", I(0), "start");
+    rtIf(f, L("ptr"), "eq", I(0), "bad");
+    rtLabel(f, "start");
+    rtSet(f, "h", I(FNV_OFFSET));
+    rtSet(f, "i", I(0));
+    rtLabel(f, "loop");
+    rtIf(f, L("i"), "uge", L("n"), "done");
+    rtOp(f, "c", L("ptr"), "add", L("i"));
+    rtLoad(f, "c", L("c"), 0, 1);
+    rtOp(f, "h", L("h"), "xor", L("c"));
+    rtOp(f, "h", L("h"), "imul", I(FNV_PRIME));
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "loop");
+    rtLabel(f, "done");
+    rtStore(f, L("out"), 0, L("h"), 8);
+    rtRet(f, I(1));
+    rtLabel(f, "bad");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// find(state, ptr, len) → 编号，找不到为 UINT32_MAX。
+function findFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_intern_find_v1", "state ptr n", "cap h hp ok mask idx slot x y p q k", 3, MODULE);
+    rtLoad(f, "cap", L("state"), 8, 8);
+    rtIf(f, L("cap"), "eq", I(0), "absent");
+    rtAddrOf(f, "hp", "h");
+    rtCall3(f, "ok", "__tx_itg_hash", L("ptr"), L("n"), L("hp"));
+    rtIf(f, L("ok"), "eq", I(0), "absent");
+    rtOp(f, "mask", L("cap"), "sub", I(1));
+    rtOp(f, "idx", L("h"), "and", L("mask"));
+    rtLabel(f, "probe");
+    rtLoad(f, "slot", L("state"), 0, 8);
+    rtShift(f, "x", L("idx"), "shl", 5);
+    rtOp(f, "slot", L("slot"), "add", L("x"));
+    rtLoad(f, "x", L("slot"), 28, 4);
+    rtIf(f, L("x"), "eq", I(0), "absent");
+    rtLoad(f, "x", L("slot"), 0, 8);
+    rtIf(f, L("x"), "ne", L("h"), "next");
+    rtLoad(f, "x", L("slot"), 16, 8);
+    rtIf(f, L("x"), "ne", L("n"), "next");
+    rtSet(f, "p", L("ptr"));
+    rtLoad(f, "q", L("slot"), 8, 8);
+    rtSet(f, "k", L("n"));
+    rtLabel(f, "bytes");
+    rtIf(f, L("k"), "eq", I(0), "found");
+    rtLoad(f, "x", L("p"), 0, 1);
+    rtLoad(f, "y", L("q"), 0, 1);
+    rtIf(f, L("x"), "ne", L("y"), "next");
+    rtOp(f, "p", L("p"), "add", I(1));
+    rtOp(f, "q", L("q"), "add", I(1));
+    rtOp(f, "k", L("k"), "sub", I(1));
+    rtJump(f, "bytes");
+    rtLabel(f, "next");
+    rtOp(f, "idx", L("idx"), "add", I(1));
+    rtOp(f, "idx", L("idx"), "and", L("mask"));
+    rtJump(f, "probe");
+    rtLabel(f, "found");
+    rtLoad(f, "x", L("slot"), 24, 4);
+    rtRet(f, L("x"));
+    rtLabel(f, "absent");
+    rtRet(f, I(NOT_FOUND));
+    done(f, failures);
+}
+
+// prepare(state) → 1，或 0（容量溢出、分配失败）：数目未达容量一半时什么也不做。
+function prepareFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_intern_prepare_v1", "state", "cap half count ncap fresh p i old slot mask idx s x", 2, MODULE);
+    rtLoad(f, "cap", L("state"), 8, 8);
+    rtShift(f, "half", L("cap"), "shr", 1);
+    rtLoad(f, "count", L("state"), 16, 8);
+    rtIf(f, L("count"), "ult", L("half"), "ok");
+    rtIf(f, L("cap"), "ugt", I(288230376151711743), "bad");
+    rtShift(f, "ncap", L("cap"), "shl", 1);
+    rtIf(f, L("ncap"), "uge", I(16), "alloc");
+    rtSet(f, "ncap", I(16));
+    rtLabel(f, "alloc");
+    rtShift(f, "x", L("ncap"), "shl", 5);
+    rtCall2(f, "fresh", "__tx_native_mem_alloc", L("x"), I(8));
+    rtIf(f, L("fresh"), "eq", I(0), "bad");
+    rtSet(f, "p", L("fresh"));
+    rtSet(f, "i", L("ncap"));
+    rtLabel(f, "clear");
+    rtStore(f, L("p"), 0, I(0), 8);
+    rtStore(f, L("p"), 8, I(0), 8);
+    rtStore(f, L("p"), 16, I(0), 8);
+    rtStore(f, L("p"), 24, I(0), 8);
+    rtOp(f, "p", L("p"), "add", I(32));
+    rtOp(f, "i", L("i"), "sub", I(1));
+    rtIf(f, L("i"), "ne", I(0), "clear");
+    rtLoad(f, "old", L("state"), 0, 8);
+    rtOp(f, "mask", L("ncap"), "sub", I(1));
+    rtSet(f, "slot", L("old"));
+    rtSet(f, "i", L("cap"));
+    rtLabel(f, "rehash");
+    rtIf(f, L("i"), "eq", I(0), "free");
+    rtLoad(f, "x", L("slot"), 28, 4);
+    rtIf(f, L("x"), "eq", I(0), "skip");
+    rtLoad(f, "idx", L("slot"), 0, 8);
+    rtOp(f, "idx", L("idx"), "and", L("mask"));
+    rtLabel(f, "probe");
+    rtShift(f, "s", L("idx"), "shl", 5);
+    rtOp(f, "s", L("s"), "add", L("fresh"));
+    rtLoad(f, "x", L("s"), 28, 4);
+    rtIf(f, L("x"), "eq", I(0), "store");
+    rtOp(f, "idx", L("idx"), "add", I(1));
+    rtOp(f, "idx", L("idx"), "and", L("mask"));
+    rtJump(f, "probe");
+    rtLabel(f, "store");
+    rtLoad(f, "x", L("slot"), 0, 8); rtStore(f, L("s"), 0, L("x"), 8);
+    rtLoad(f, "x", L("slot"), 8, 8); rtStore(f, L("s"), 8, L("x"), 8);
+    rtLoad(f, "x", L("slot"), 16, 8); rtStore(f, L("s"), 16, L("x"), 8);
+    rtLoad(f, "x", L("slot"), 24, 8); rtStore(f, L("s"), 24, L("x"), 8);
+    rtLabel(f, "skip");
+    rtOp(f, "slot", L("slot"), "add", I(32));
+    rtOp(f, "i", L("i"), "sub", I(1));
+    rtJump(f, "rehash");
+    rtLabel(f, "free");
+    rtIf(f, L("cap"), "eq", I(0), "commit");
+    rtCall1(f, "", "__tx_native_mem_free", L("old"));
+    rtLabel(f, "commit");
+    rtStore(f, L("state"), 0, L("fresh"), 8);
+    rtStore(f, L("state"), 8, L("ncap"), 8);
+    rtRet(f, I(1));
+    rtLabel(f, "bad");
+    rtRet(f, I(0));
+    rtLabel(f, "ok");
+    rtRet(f, I(1));
+    done(f, failures);
+}
+
+// insert(state, entry)：entry {指针@8, 长度@16, 编号 u32@24}；须先 prepare（数目已达容量一半时返回 0），键须不在表中。
+function insertFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_intern_insert_v1", "state entry", "ptr n h hp ok cap half count mask idx s x", 3, MODULE);
+    rtLoad(f, "ptr", L("entry"), 8, 8);
+    rtLoad(f, "n", L("entry"), 16, 8);
+    rtAddrOf(f, "hp", "h");
+    rtCall3(f, "ok", "__tx_itg_hash", L("ptr"), L("n"), L("hp"));
+    rtIf(f, L("ok"), "eq", I(0), "bad");
+    rtLoad(f, "cap", L("state"), 8, 8);
+    rtShift(f, "half", L("cap"), "shr", 1);
+    rtLoad(f, "count", L("state"), 16, 8);
+    rtIf(f, L("count"), "uge", L("half"), "bad");
+    rtOp(f, "mask", L("cap"), "sub", I(1));
+    rtOp(f, "idx", L("h"), "and", L("mask"));
+    rtLabel(f, "probe");
+    rtShift(f, "s", L("idx"), "shl", 5);
+    rtLoad(f, "x", L("state"), 0, 8);
+    rtOp(f, "s", L("s"), "add", L("x"));
+    rtLoad(f, "x", L("s"), 28, 4);
+    rtIf(f, L("x"), "eq", I(0), "store");
+    rtOp(f, "idx", L("idx"), "add", I(1));
+    rtOp(f, "idx", L("idx"), "and", L("mask"));
+    rtJump(f, "probe");
+    rtLabel(f, "store");
+    rtStore(f, L("s"), 0, L("h"), 8);
+    rtStore(f, L("s"), 8, L("ptr"), 8);
+    rtStore(f, L("s"), 16, L("n"), 8);
+    rtLoad(f, "x", L("entry"), 24, 4);
+    rtStore(f, L("s"), 24, L("x"), 4);
+    rtStore(f, L("s"), 28, I(1), 4);
+    rtOp(f, "count", L("count"), "add", I(1));
+    rtStore(f, L("state"), 16, L("count"), 8);
+    rtRet(f, I(1));
+    rtLabel(f, "bad");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// destroy(state)：归还槽数组，三个字段清零。
+function destroyFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_intern_destroy_v1", "state", "cap p", 1, MODULE);
+    rtLoad(f, "cap", L("state"), 8, 8);
+    rtIf(f, L("cap"), "eq", I(0), "clear");
+    rtLoad(f, "p", L("state"), 0, 8);
+    rtCall1(f, "", "__tx_native_mem_free", L("p"));
+    rtLabel(f, "clear");
+    rtStore(f, L("state"), 0, I(0), 8);
+    rtStore(f, L("state"), 8, I(0), 8);
+    rtStore(f, L("state"), 16, I(0), 8);
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+/// 发出驻留表的五个函数；rtfn 的失败（未知局部、调用帧不足等）记进 failures。
+export function internTableGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    hashFn(b, failures);
+    findFn(b, failures);
+    prepareFn(b, failures);
+    insertFn(b, failures);
+    destroyFn(b, failures);
+}

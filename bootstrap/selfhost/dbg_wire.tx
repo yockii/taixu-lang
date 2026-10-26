@@ -1,0 +1,221 @@
+// dbg_wire.tx —— 调试会话一侧的产物连接（第 6 轮 6c-4b，调试实施设计 §四-5）：私有控制协议的成帧与收发、
+// 产物 stdout／stderr 的收集。产物一侧见 dbg_rt.tx 文件头。
+//
+// 帧：u32 长度（不含本字段，小端）＋u8 操作码＋u64 字段（小端，紧排）。
+//   产物→会话：HELLO 1（版本、主线程块、映像地址、函数数）、STOP 2（原因、函数、pc、深度、窗口）、TIMEOUT 3、
+//              FRAMES 回执 4（总深度、存下的帧数、每帧窗口/函数/pc，帧 0 为最外层）、READ 回执 5（实读字节数、数据）。
+//   会话→产物：ARM 10（函数、pc、值）、RUN 11（模式、截止毫秒）、FRAMES 12、READ 13（地址、长度）、
+//              PAUSE 14（只在运行中发；产物运行中的 ARM 也立即生效，6c-5a）。
+
+export const OP_HELLO: int = 1;
+export const OP_STOP: int = 2;
+export const OP_TIMEOUT: int = 3;
+export const OP_FRAMES_R: int = 4;
+export const OP_READ_R: int = 5;
+export const OP_ARM: int = 10;
+export const OP_RUN: int = 11;
+export const OP_FRAMES: int = 12;
+export const OP_READ: int = 13;
+export const OP_PAUSE: int = 14;
+
+// 产物 stderr 只留最后这么多字节（trap 行在末尾）。
+const ERR_KEEP: int = 65536;
+
+export struct DbgProc {
+    h: int,
+    ctl: Bytes,
+    out: Bytes,
+    err: Bytes,
+    buf: Bytes,
+    ctlOpen: bool,
+    outOpen: bool,
+    errOpen: bool,
+}
+
+export function wireNew(h: int): Ref<DbgProc> {
+    return new DbgProc { h: h, ctl: bytesNew(0), out: bytesNew(0), err: bytesNew(0), buf: bytesNew(65536), ctlOpen: true, outOpen: true, errOpen: true };
+}
+
+// b[at..at+8) 的小端 u64（高位字节 ≥ 0x80 时得负数，地址与计数用不到）。
+export function wireU64(b: Bytes, at: int): int {
+    let v = 0;
+    let k = 7;
+    while (k >= 0) {
+        v = (v << 8) | (bytesGet(b, at + k) catch 0);
+        k = k - 1;
+    }
+    return v;
+}
+
+function wirePut(b: Bytes, v: int): void {
+    let x = v;
+    let k = 0;
+    while (k < 8) {
+        bytesPush(b, x & 255);
+        x = x >> 8;
+        k = k + 1;
+    }
+}
+
+// 发一帧（n 个字段）；控制通道已关闭得 false。
+export function wireSend(p: Ref<DbgProc>, op: int, a: int, b: int, c: int, n: int): bool {
+    const f = bytesNew(0);
+    const body = 1 + 8 * n;
+    bytesPush(f, body & 255);
+    bytesPush(f, (body >> 8) & 255);
+    bytesPush(f, 0);
+    bytesPush(f, 0);
+    bytesPush(f, op);
+    if (n >= 1) { wirePut(f, a); }
+    if (n >= 2) { wirePut(f, b); }
+    if (n >= 3) { wirePut(f, c); }
+    return procWrite(p.h, 3, f) == bytesLen(f);
+}
+
+// 已收齐的一帧（操作码＋字段），没有为长度 0 的 Bytes。
+export function wireFrame(p: Ref<DbgProc>): Bytes {
+    const have = bytesLen(p.ctl);
+    if (have < 4) { return bytesNew(0); }
+    const n = (bytesGet(p.ctl, 0) catch 0) | ((bytesGet(p.ctl, 1) catch 0) << 8) | ((bytesGet(p.ctl, 2) catch 0) << 16) | ((bytesGet(p.ctl, 3) catch 0) << 24);
+    if (have < 4 + n || n == 0) { return bytesNew(0); }
+    const body = bytesSlice(p.ctl, 4, n);
+    p.ctl = bytesSlice(p.ctl, 4 + n, have - 4 - n);
+    return body;
+}
+
+// 等到选中的流之一就绪或 ms 毫秒（负数一直等），把就绪的读进缓冲；返回读到数据或流尾的流位（1 stdout、2 stderr、
+// 4 控制通道），超时为 0。三路都已关闭时立即返回 0。
+export function wirePump(p: Ref<DbgProc>, ms: int): int {
+    return wirePumpIn(p, ms, false);
+}
+
+// 同 wirePump；withStdin 时也等本进程 stdin，它就绪时结果带位 8（stdin 由调用方去读）。
+export function wirePumpIn(p: Ref<DbgProc>, ms: int, withStdin: bool): int {
+    let mask = 0;
+    if (p.h != 0) {
+        if (p.outOpen) { mask = mask | 2; }
+        if (p.errOpen) { mask = mask | 4; }
+        if (p.ctlOpen) { mask = mask | 8; }
+    }
+    if (withStdin) { mask = mask | 1; }
+    if (mask == 0) { return 0; }
+    const r = ioWait(p.h, mask, ms);
+    let got = 0;
+    if ((r & 1) != 0) { got = got | 8; }
+    if ((r & 2) != 0) {
+        const n = procRead(p.h, 1, p.buf);
+        if (n < 0) { p.outOpen = false; } else if (n > 0) { bytesAppend(p.out, bytesSlice(p.buf, 0, n)); }
+        got = got | 1;
+    }
+    if ((r & 4) != 0) {
+        const n = procRead(p.h, 2, p.buf);
+        if (n < 0) { p.errOpen = false; } else if (n > 0) { bytesAppend(p.err, bytesSlice(p.buf, 0, n)); }
+        const e = bytesLen(p.err);
+        if (e > 2 * ERR_KEEP) { p.err = bytesSlice(p.err, e - ERR_KEEP, ERR_KEEP); }
+        got = got | 2;
+    }
+    if ((r & 8) != 0) {
+        const n = procRead(p.h, 3, p.buf);
+        if (n < 0) { p.ctlOpen = false; } else if (n > 0) { bytesAppend(p.ctl, bytesSlice(p.buf, 0, n)); }
+        got = got | 4;
+    }
+    return got;
+}
+
+// 不等待地读空 stdout（产物停在检查点上时，它此前写的输出都已在管道里）。
+export function wireDrainOut(p: Ref<DbgProc>): void {
+    while (p.outOpen) {
+        if (ioWait(p.h, 2, 0) == 0) { return; }
+        const n = procRead(p.h, 1, p.buf);
+        if (n < 0) { p.outOpen = false; } else if (n == 0) { return; } else { bytesAppend(p.out, bytesSlice(p.buf, 0, n)); }
+    }
+}
+
+// 从 stdout 缓冲取出一个完整行（不含换行符）；没有完整行时得 None。final 为真时连不完整的尾巴也取出。
+export function wireLine(p: Ref<DbgProc>, final: bool): string? {
+    const n = bytesLen(p.out);
+    let i = 0;
+    while (i < n) {
+        if ((bytesGet(p.out, i) catch 0) == 10) {
+            const line = bytesSlice(p.out, 0, i);
+            p.out = bytesSlice(p.out, i + 1, n - i - 1);
+            return wireText(line);
+        }
+        i = i + 1;
+    }
+    if (final && n > 0) {
+        const rest = p.out;
+        p.out = bytesNew(0);
+        return wireText(rest);
+    }
+    return None;
+}
+
+function wireIn(b: Bytes, at: int, lo: int, hi: int): bool {
+    const d = bytesGet(b, at) catch -1;
+    return d >= lo && d <= hi;
+}
+
+// 字节转串：合法的 UTF-8 原样，每个不能开始或完成合法序列的字节换成 U+FFFD（同 __tx_ffi_cstr_to_str）。
+export function wireText(b: Bytes): string {
+    const direct = bytesToStr(b) catch "";
+    if (len(direct) == bytesLen(b)) { return direct; }
+    const out = bytesNew(0);
+    const n = bytesLen(b);
+    let i = 0;
+    while (i < n) {
+        const c = bytesGet(b, i) catch 0;
+        let k = 0;
+        if (c < 128) {
+            k = 1;
+        } else if (c >= 194 && c <= 223) {
+            if (wireIn(b, i + 1, 128, 191)) { k = 2; }
+        } else if (c >= 224 && c <= 239) {
+            let lo = 128;
+            let hi = 191;
+            if (c == 224) { lo = 160; }
+            if (c == 237) { hi = 159; }
+            if (wireIn(b, i + 1, lo, hi) && wireIn(b, i + 2, 128, 191)) { k = 3; }
+        } else if (c >= 240 && c <= 244) {
+            let lo = 128;
+            let hi = 191;
+            if (c == 240) { lo = 144; }
+            if (c == 244) { hi = 143; }
+            if (wireIn(b, i + 1, lo, hi) && wireIn(b, i + 2, 128, 191) && wireIn(b, i + 3, 128, 191)) { k = 4; }
+        }
+        if (k == 0) {
+            bytesPush(out, 239);
+            bytesPush(out, 191);
+            bytesPush(out, 189);
+            i = i + 1;
+        } else {
+            bytesAppend(out, bytesSlice(b, i, k));
+            i = i + k;
+        }
+    }
+    return bytesToStr(out) catch "";
+}
+
+// READ addr n：读产物内存，得实读的字节（地址无效时长度 0）。
+export function wireRead(p: Ref<DbgProc>, addr: int, n: int): Bytes {
+    if (n <= 0 || !wireSend(p, OP_READ, addr, n, 0, 2)) { return bytesNew(0); }
+    const f = wireWait(p, OP_READ_R);
+    if (bytesLen(f) < 9) { return bytesNew(0); }
+    const got = wireU64(f, 1);
+    if (got <= 0 || 9 + got > bytesLen(f)) { return bytesNew(0); }
+    return bytesSlice(f, 9, got);
+}
+
+// 等一个操作码为 op 的回执（产物停在命令循环里时用）；通道关闭得长度 0 的 Bytes。
+export function wireWait(p: Ref<DbgProc>, op: int): Bytes {
+    while (true) {
+        const f = wireFrame(p);
+        if (bytesLen(f) > 0) {
+            if ((bytesGet(f, 0) catch 0) == op) { return f; }
+        } else {
+            if (!p.ctlOpen) { return bytesNew(0); }
+            wirePump(p, 1000);
+        }
+    }
+    return bytesNew(0);
+}

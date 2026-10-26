@@ -1,0 +1,1693 @@
+// driver.tx —— .tx 侧编译驱动编排（V0.50-S5-① 批 E；D102 §一——
+// bootstrap/taixu.tx 的必需职责件：模块发现、相对路径归一、全编译阶段调度）。
+//
+// 编排链＝loadGraph→SEIN→semamirror→loader→codegen→serialize 的 .tx 侧：
+//   1) 模块发现：入口源 DFS——import spec 逐层解析（txImports 读 TXB1 顶层
+//      import_d——semamirror 库面），后序＝导入先、入口末（SEIN 拓扑序）。
+//   2) SEIN1 组装：display（入口＝CWD 相对反斜杠形；导入＝spec 逻辑名——
+//      V0.39-P0 BUILD-05 同构）＋node_count（TXB1 头）＋AST-BIN＋导入映射。
+//   3) semamirror 库面 mirrorSein 进程内执行（SEB1+FAB1 字符串）。
+//   4) codegen 库面 codegenTxc（SEB1+FAB1→PROGDUMP→serializeDump→.txc 字节）。
+//
+// 锚＝驱动产物 .txc 与 seed 链（dev-load-compile）逐字节恒等（hello
+// 69b4e54b）。stdlib（"std/"）按导入根解析；原生 CLI 能力由 capabilities 明录。
+
+import { parseSourceBin } from "../parser";
+import { mirrorSein, mirrorCheck, mirrorCheckCached, SmCheckCache, smCheckCacheNew, smSeb1Out, smFab1Out, txImports } from "../semamirror";
+import { codegenTxc, cgLastError, parseSeb1, generateProgramContext, diagRenderSv, cgSetModulePaths, cgSetDebug, cgUsesToolBuiltins, cgEmbedSites, cgEmbedSiteFromRaw, CgEmbedSite } from "./codegen";
+import { DrvDiag, newDrvDiag, renderDrvDiags, parseLineDiag, textDiags, semaDiags, embedDiags, checkDiags, embedDiagsFor } from "./check_diag";
+import { CheckModule, CheckResult } from "./check_model";
+import { SourceCache, sourceCacheNew, sourceCacheBegin, sourceCacheFinish, sourceParse, sourceImports } from "./source_cache";
+import { serializeDump } from "./bytecode";
+import { ProgramContext } from "./program_context";
+import { compileProfileActive, compileProfileBegin, compileProfileEnd, compileProfilePhase, compileProfileProgram, compileProfileClock, compileProfileCodegenDetail, compileProfileTextHop } from "./compile_profile_data";
+import { recordProgramContext, recordMsgCount, recordMsgAt, recordSetBorrow } from "./emit_record";
+import { emSetListing, emitNativeRecords, emitRecords, emSOut, emReady, emDiagOut, emSetFfiStubs } from "../emitmirror";
+import { emitPortableRecords, epDiagOut } from "./emit_portable";
+import { asListingStart, asListingStop, asListingClear, asBufferNew, asBufferNewA64, asBufferSubmit, assembleText, asFailedAs, asLastErrAs, asLastLineAs, asStructuredSection, asStructuredAlign, asStructuredLabel, asStructuredByte, asStructuredQuad, asStructuredAddress, asStructuredBegin, asStructuredInstruction, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMissing, asResolveLocalFixups } from "./assemble";
+import { a64BufferSubmit } from "./a64_asm";
+import { linkExeObjects, exeBytesList, lkIsFailed, lkGetMissing, lkSetImportDll, lkClearImportDlls } from "./link_pe";
+import { ffiPrepare, ffiEmitStubs, ffiStubIndices, ffiStubError, ffiDllName, ffiLinkReport, ffiImportSymbol } from "./ffi_stubs";
+import { macDylib } from "./macos_symbols";
+import { T_X64_WINDOWS, targetName, targetFileSuffixes, tPe, tElf, tLinux, tMacos, tRawSyscall, tA64 } from "./target";
+import { linkMachO, machoBytes, machoError, machoImportReset, machoImportFrom, machoIdentifierFor } from "./link_macho";
+import { hostTargetId } from "./target_host";
+import { elfWriteObject, elfObjectOk, elfObjectBytes, elfObjectError } from "./emit_elf_object";
+import { linkElfObjects, elfObjectsBytes, elfObjectsError, elfDynReset, elfDynNeeded, elfDynImport, elfDynHook, elfDynThreadHooks } from "./link_elf_objects";
+import { filePath } from "./file_path";
+import { pathIsSep, pathHostShow } from "./path_sep";
+import { serviceAllows, serviceKind, serviceReadSource, serviceReadBytes, serviceListDir } from "./service_files";
+import { variantPath, variantDisplay, variantCandidates, variantFirstVisit, variantCompare, variantReset } from "./target_files";
+import { biName, EXTERN_ID_BASE, BI_TABLE_LEN } from "./builtin_names";
+import { emitNrtImage, nrtImageSetTests, nrtImageSetLeak, nrtImageSetDebug } from "./nrt_image";
+import { dbgEmitRoutines } from "./dbg_rt";
+import { toolEmitRoutines } from "./tool_rt";
+import { linkMapEnabled, linkMapClear } from "./link_map_data";
+import { linkMapAttachFunctions } from "./link_map_functions";
+import { nativeObjectFunctions } from "./native_function_object";
+import { linkMapData, linkMapFail } from "./link_map_data";
+import { NativeFunctionImage, nativeFunctionSource, nativeFunctionsSnapshot, nativeSymbolsBegin, nativeSymbolsTake } from "./native_function_data";
+import { imageSymbolName, linkSymbolsSet } from "./link_symbols";
+
+// —— 会话态（单次编译生命周期）——
+let drvBytes: Bytes = bytesNew(0);
+// NRT kernel object used when no --link-object is given (the CLI embeds one per target).
+let drvKernel: Bytes = bytesNew(0);
+let drvDiag: string = "";
+let drvOk: int = 0;
+let drvHasMain: int = 0;
+
+export struct DrvCheckCache {
+    sources: Ref<SourceCache>, sema: Ref<SmCheckCache>,
+}
+let drvActiveCache: Ref<DrvCheckCache>? = None;
+export function drvCheckCacheNew(): Ref<DrvCheckCache> {
+    return new DrvCheckCache { sources: sourceCacheNew(), sema: smCheckCacheNew() };
+}
+function drvSourceCache(): Ref<SourceCache>? {
+    if (drvActiveCache == None) { return None; }
+    return (drvActiveCache catch drvCheckCacheNew()).sources;
+}
+
+// 开发门核对实际工作量：解析、AST 解码、模块体检查、复用模块、失效闭包扩展次数、模块总数。
+export function drvCheckCacheStats(c: Ref<DrvCheckCache>): List<int> {
+    const out: List<int> = listNew();
+    listPush(out, c.sources.parsed); listPush(out, c.sema.decoded + c.sources.decoded); listPush(out, c.sema.checked);
+    listPush(out, c.sema.reused); listPush(out, c.sema.retries); listPush(out, c.sema.total);
+    return out;
+}
+export function drvCheckChanged(c: Ref<DrvCheckCache>): List<int> { return c.sema.changed; }
+
+export function drvDiagOut(): string {
+    // 收口剥一个尾换行（eprint 面再补——净效果每行恰一尾换行，seed
+    // 诊断流无尾空行）。
+    const n = len(drvDiag);
+    if (n > 0) {
+        const last = byteAt(drvDiag, n - 1) catch 0;
+        if (last == 10) { return strSub(drvDiag, 0, cpCountD(drvDiag) - 1); }
+    }
+    return drvDiag;
+}
+
+// 诊断码面（seed loader 3008/3009 同构；diagsig 提取域——语言码 error NNNN）。path 为诊断所在模块的归一路径。
+function diagCodeAt(path: string, display: string, line: int, col: int, code: int, msg: string): void {
+    const hint = code >= 3000 && code < 4000;
+    drvDiag = drvDiag + display + ":" + toStr(line) + ":" + toStr(col) + ": error " + toStr(code) + ": " + msg + "\n";
+    if (hint) { drvDiag = drvDiag + "  └─ 处置详见: taixu explain " + toStr(code) + "\n"; }
+    if (drvChecking) { listPush(dlDriver, newDrvDiag(code, path, display, line, col, msg, hint)); }
+}
+
+// —— LSP 检查（第 6 轮 6d-1，LSP 与 MCP 实施设计 §三-6）——
+// drvChecking 时：读源与存在检查先查覆盖层；导入失败记诊断后跳过该导入继续；每条诊断在写文本的同时记一条
+// 结构化记录——dlDriver 对应 drvDiag 里的条目，dlParse 对应 parseDiagAcc 里的条目（次序与文本相同）。
+let drvChecking: bool = false;
+const ovPaths: List<string> = listNew();
+const ovTexts: List<string> = listNew();
+let ovIndex: Map<string, int> = mapNew(); // 归一路径 → 首个同路径项的下标（LSP 可有上千个打开文档）
+let ovGen: int = 0; // 每次替换覆盖层加一：调用方据此判断覆盖层是否仍是自己上次设的
+let dlDriver: List<Ref<DrvDiag>> = listNew();
+let dlParse: List<Ref<DrvDiag>> = listNew();
+let dlAll: List<Ref<DrvDiag>> = listNew();
+const failedPaths: List<string> = listNew();
+// 分析节（6d-3a，§四-2）：drvAnalysis 时 SEIN 标志位 16 置位，检查后留下 ANA1 的行与 SEB1（开发命令自检用）。
+let drvAnalysis: bool = false;
+let drvAnaI: List<int> = listNew();
+let drvAnaN: List<string> = listNew();
+let drvAnaDI: List<int> = listNew();
+let drvAnaDS: List<string> = listNew();
+let drvSeb1Last: string = "";
+
+// 打开文档的覆盖层（路径按驱动的归一化比对）；每次调用整体替换，空表即无覆盖层。
+export function drvSetOverlay(paths: List<string>, texts: List<string>): void {
+    while (listLen(ovPaths) > 0) { listRemoveAt(ovPaths, listLen(ovPaths) - 1); }
+    while (listLen(ovTexts) > 0) { listRemoveAt(ovTexts, listLen(ovTexts) - 1); }
+    ovIndex = mapNew();
+    ovGen = ovGen + 1;
+    let i = 0;
+    while (i < listLen(paths) && i < listLen(texts)) {
+        const p = normalizePath(listGet(paths, i) catch "");
+        if (!mapHas(ovIndex, p)) { mapSet(ovIndex, p, i); }
+        listPush(ovPaths, p);
+        listPush(ovTexts, listGet(texts, i) catch "");
+        i = i + 1;
+    }
+}
+
+export function drvOverlayGen(): int { return ovGen; }
+
+function overlayIndex(path: string): int {
+    if (!drvChecking) { return -1; }
+    return mapGet(ovIndex, path) catch -1;
+}
+
+// 模块源是否存在：检查时覆盖层里的（含未保存的新文件）也算。
+function moduleExists(path: string): bool {
+    return serviceAllows(path) && (overlayIndex(path) >= 0 || serviceKind(path) == 1);
+}
+
+// 导入写法须与磁盘逐字节一致（D3 v0.35 §6.1-4；TypeScript forceConsistentCasingInFileNames 同理）：一个名字只有在
+// 它所在目录的列举结果里逐字节出现才算存在。大小写不敏感的 Windows、macOS 上按别的写法也能打开，到 Linux 就打不开；
+// 按目录列举比对后三个宿主行为一致。列举结果按目录缓存到本次驱动运行结束；列举不了（无权、不是目录）时不判定，
+// 交给随后的打开去报。
+const listedDirs: List<string> = listNew();
+const listedNames: List<List<string>> = listNew();
+const listedOk: List<bool> = listNew();
+
+function noNames(): List<string> {
+    const l: List<string> = listNew();
+    return l;
+}
+
+function namesOf(dir: string): List<string> | Error {
+    let i = 0;
+    while (i < listLen(listedDirs)) {
+        if ((listGet(listedDirs, i) catch "") == dir) {
+            if (!(listGet(listedOk, i) catch false)) { return err("unlisted: " + dir); }
+            return listGet(listedNames, i) catch noNames();
+        }
+        i = i + 1;
+    }
+    let where = dir;
+    if (len(where) == 0) { where = "."; }
+    const names: List<string> = serviceListDir(where) catch (e) {
+        listPush(listedDirs, dir); listPush(listedNames, noNames()); listPush(listedOk, false);
+        return e;
+    };
+    listPush(listedDirs, dir); listPush(listedNames, names); listPush(listedOk, true);
+    return names;
+}
+
+// path 的最后一段是否逐字节出现在其目录的列举里（覆盖层里的文件以编辑器给的写法为准；列举不了时不判定）。
+function nameListed(path: string): bool {
+    if (overlayIndex(path) >= 0) { return true; }
+    const names = namesOf(dirOf(path)) catch (e) { return true; };
+    const leaf = pathLeaf(path);
+    for (n in names) { if (n == leaf) { return true; } }
+    return false;
+}
+
+function pathLeaf(p: string): string {
+    const n = cpCountD(p);
+    let at = -1;
+    let i = 0;
+    while (i < n) {
+        if (pathIsSep(cpCharAtD(p, i))) { at = i; }
+        i = i + 1;
+    }
+    return strSub(p, at + 1, n - at - 1);
+}
+
+// 只差 ASCII 大小写的条目（报错时给出磁盘上的写法）；没有得空串。
+function caseTwin(names: List<string>, want: string): string {
+    const w = lowerAscii(want);
+    for (n in names) { if (lowerAscii(n) == w) { return n; } }
+    return "";
+}
+
+function lowerAscii(s: string): string {
+    const b = bytesFromStr(s);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) catch 0;
+        if (c >= 65 && c <= 90) { bytesSet(b, i, c + 32); }
+        i = i + 1;
+    }
+    return bytesToStr(b) catch s;
+}
+
+// 名字逐字节存在的模块源（按目标选文件与兄弟比对用：只差大小写的文件不算这个名字的目标文件）。
+function moduleExact(path: string): bool { return moduleExists(path) && nameListed(path); }
+
+// 导入写法逐段核对：写出来的每段目录名与最终选中的文件名（含目标后缀与 .tx）都须在所在目录逐字节出现。
+// 返回 3008 的消息；空串＝一致或无从判定（真正找不到的，由随后的打开报“找不到导入目标模块”）。
+function importSpelling(spec: string, importerDir: string, chosen: string): string {
+    if (strIndexOf(spec, "\\") >= 0) { return ""; }
+    let dir = importerDir;
+    let rel = spec;
+    if (strStartsWithCheck(spec, "std/")) { dir = stdlibRoot(); rel = strSub(spec, 4, cpCountD(spec) - 4); }
+    else if (strStartsWithCheck(spec, "gui/")) { dir = guiRoot(); rel = strSub(spec, 4, cpCountD(spec) - 4); }
+    const parts = strSplit(rel, "/");
+    const last = listLen(parts) - 1;
+    let i = 0;
+    while (i <= last) {
+        const part = listGet(parts, i) catch "";
+        if (part == "." || len(part) == 0) { i = i + 1; continue; }
+        if (part == "..") {
+            if (len(dir) == 0) { dir = ".."; } else { dir = normalizePath(dir + "/.."); }
+            i = i + 1;
+            continue;
+        }
+        let name = part;
+        if (i == last) {
+            if (overlayIndex(chosen) >= 0) { return ""; }
+            name = pathLeaf(chosen);
+        }
+        const names = namesOf(dir) catch (e) { return ""; };
+        let found = false;
+        for (n in names) { if (n == name) { found = true; } }
+        if (!found) {
+            const twin = caseTwin(names, name);
+            if (len(twin) == 0) { return ""; }
+            return "导入 '" + spec + "' 的写法与磁盘不一致：'" + name + "' 在磁盘上为 '" + twin + "'（导入写法须与磁盘逐字节一致，区分大小写的系统上按原写法找不到）";
+        }
+        if (len(dir) == 0) { dir = name; } else { dir = normalizePath(dir + "/" + name); }
+        i = i + 1;
+    }
+    return "";
+}
+
+// 同组兄弟文件导出面的比对：存在性与内容都经覆盖层（同 moduleExists、parseModule），读不到的按空源跳过；服务模式下
+// 只读受信根内的兄弟（tests/tool-security/service-policy.tx 核对根外的不被读取）。
+export function drvVariantSiblings(base: string, display: string, line: int, col: int): string {
+    if (!variantFirstVisit(base)) { return ""; }
+    const present: List<string> = listNew();
+    const sources: List<string> = listNew();
+    for (p in variantCandidates(base)) {
+        if (!moduleExact(p)) { continue; }
+        const oi = overlayIndex(p);
+        let src = "";
+        if (oi >= 0) { src = listGet(ovTexts, oi) catch ""; } else { src = serviceReadSource(p) catch ""; }
+        listPush(present, p);
+        listPush(sources, src);
+    }
+    return variantCompare(present, sources, display, line, col);
+}
+
+// 没有码、但属于某个模块的驱动消息（源读取失败等）。
+function diagPath(path: string, msg: string): void {
+    drvDiag = drvDiag + msg + "\n";
+    if (drvChecking) { listPush(dlDriver, newDrvDiag(0, path, "", 0, 0, msg, false)); }
+}
+
+function containsPath(xs: List<string>, p: string): bool {
+    for (x in xs) {
+        if (x == p) { return true; }
+    }
+    return false;
+}
+
+// 导入上下文（visitModule 递归面——cycle/缺失诊断的 importer 位置域）。
+let impCtxPath: string = "";
+let impCtxDisplay: string = "";
+let impCtxLine: int = 0;
+let impCtxCol: int = 0;
+let impCtxSpec: string = "";
+
+// parse 诊断留置（恢复续检基础设施——现态空置：parser 恢复对等在册）。
+let parseDiagAcc: string = "";
+export function drvOkOut(): int { return drvOk; }
+export function drvBytesOut(): Bytes { return drvBytes; }
+export function drvSetKernel(kernel: Bytes): void { drvKernel = kernel; }
+export function drvHasMainOut(): int { return drvHasMain; }
+
+function diag(msg: string): void {
+    drvDiag = drvDiag + msg + "\n";
+    if (drvChecking) { listPush(dlDriver, newDrvDiag(0, "", "", 0, 0, msg, false)); }
+}
+
+// —— render.escape 同构（转义集 \ " 空格 控制字符——\xNN 小写；非 ASCII
+// 码点直通；strSub 码点域——双游标字节/码点并行）——
+function hexByte(v: int): string {
+    const digits = "0123456789abcdef";
+    return strSub(digits, (v / 16) % 16, 1) + strSub(digits, v % 16, 1);
+}
+
+function escRender(sv: string): string {
+    let out = "";
+    let i = 0;
+    let cp = 0;
+    const total = len(sv);
+    while (i < total) {
+        const c = byteAt(sv, i) catch 0;
+        if (c == 92) { out = out + "\\\\"; i = i + 1; cp = cp + 1; }
+        else if (c == 34) { out = out + "\\\""; i = i + 1; cp = cp + 1; }
+        else if (c == 32) { out = out + "\\x20"; i = i + 1; cp = cp + 1; }
+        else if (c < 32 || c == 127) { out = out + "\\x" + hexByte(c); i = i + 1; cp = cp + 1; }
+        else if (c < 128) { out = out + strSub(sv, cp, 1); i = i + 1; cp = cp + 1; }
+        else {
+            let blen = 1;
+            if (c >= 240) { blen = 4; }
+            else if (c >= 224) { blen = 3; }
+            else if (c >= 192) { blen = 2; }
+            out = out + strSub(sv, cp, 1);
+            i = i + blen;
+            cp = cp + 1;
+        }
+    }
+    return out;
+}
+
+// —— 路径归一（正斜杠统一→反斜杠；剥 "./"；".." 逐段上卷）——
+function cpCountD(p: string): int {
+    let n = 0;
+    let i = 0;
+    while (i < len(p)) {
+        const c = byteAt(p, i) catch 0;
+        n = n + 1;
+        if (c >= 240) { i = i + 4; }
+        else if (c >= 224) { i = i + 3; }
+        else if (c >= 192) { i = i + 2; }
+        else { i = i + 1; }
+    }
+    return n;
+}
+
+function cpCharAtD(p: string, i: int): int {
+    const c = strSub(p, i, 1);
+    return byteAt(c, 0) catch 0;
+}
+
+// Entry display name = the entry file name (relative to its own directory), so
+// the module name compiled into products does not depend on checkout location,
+// working directory or absolute/relative spelling (compiler.zig Loader same rule).
+function entryDisplayName(normalized: string): string {
+    const n = cpCountD(normalized);
+    let at = -1;
+    let i = 0;
+    while (i < n) {
+        if (cpCharAtD(normalized, i) == 47) { at = i; }
+        i = i + 1;
+    }
+    if (at < 0) { return normalized; }
+    return strSub(normalized, at + 1, n - at - 1);
+}
+
+// 驱动的路径归一（LSP 的文档键与覆盖层比对用，第 6 轮 6d-2）。
+export function drvNormPath(p: string): string { return normalizePath(p); }
+
+// 上一次 drvCheck 的分析节：每行 10 个整数与名字（见 semamirror 的 AnaRow）；未带分析或未到语义分析时为空。
+export function drvAnaInts(): List<int> { return drvAnaI; }
+export function drvAnaNames(): List<string> { return drvAnaN; }
+// 上一次 drvCheck 的声明说明（ANT1，6d-3b）：每行 5 个整数与名字、文本两个串（见 semamirror 的 AnaDet）。
+export function drvAnaDetInts(): List<int> { return drvAnaDI; }
+export function drvAnaDetStrs(): List<string> { return drvAnaDS; }
+
+// 开发对照用：上一次 drvCheckFull 的 SEB1。普通检查不生成此文本。
+export function drvLastSeb1(): string { return drvSeb1Last; }
+
+// 上一次 drvCheck 里找不到或装载失败的模块路径（LSP 据此在这些路径上的文档打开、变更时重查导入方，6d-2）。
+export function drvFailedPathList(): List<string> {
+    const out: List<string> = listNew();
+    for (p in failedPaths) { listPush(out, p); }
+    return out;
+}
+
+// 路径的规范形（docs/design/v052-path-canonical-v0.1-20261025.md）：以 / 分隔、与宿主无关；Windows 宿主上 \ 也读作分隔符，
+// 类 Unix 上 \ 是名字里的普通字符。结果是模块身份、缓存键、覆盖层键、库根与 LSP 文档键。
+function normalizePath(p: string): string {
+    // F3：码点域游标（len 字节 vs strSub 码点——混用越界/错位清偿）。
+    let t = "";
+    let i = 0;
+    const n = cpCountD(p);
+    while (i < n) {
+        const c = cpCharAtD(p, i);
+        if (pathIsSep(c)) { t = t + "/"; } else { t = t + strSub(p, i, 1); }
+        i = i + 1;
+    }
+    // 段栈归一（文本面；目录域不涉盘）："." 去除、".." 上卷前一普通段——
+    // 含首段（"selfhost/../parser" → "parser"），与 std.fs.path.resolve 同义。
+    // 旧实现只在 ".." 前还有分隔符时上卷，入口不带目录前缀时同一文件会以
+    // 两个路径各载一次（产物随工作目录变化）。
+    const parts = strSplit(t, "/");
+    const kept: List<string> = listNew();
+    let k = 0;
+    while (k < listLen(parts)) {
+        const seg = listGet(parts, k) catch "";
+        k = k + 1;
+        if (seg == ".") { continue; }
+        // 空段：保留开头的（绝对路径根），折叠中间与结尾的重复分隔符。
+        if (seg == "" && listLen(kept) > 0) { continue; }
+        if (seg == "..") {
+            const top = listGet(kept, listLen(kept) - 1) catch "..";
+            const drive = cpCountD(top) > 0 && cpCharAtD(top, cpCountD(top) - 1) == 58;
+            if (listLen(kept) > 0 && top != ".." && top != "" && !drive) {
+                listRemoveAt(kept, listLen(kept) - 1);
+                continue;
+            }
+        }
+        listPush(kept, seg);
+    }
+    let out = "";
+    k = 0;
+    while (k < listLen(kept)) {
+        if (k > 0) { out = out + "/"; }
+        out = out + (listGet(kept, k) catch "");
+        k = k + 1;
+    }
+    return out;
+}
+
+function strStartsWithCheck(h: string, p: string): bool {
+    const hn = len(h);
+    const pn = len(p);
+    if (hn < pn) { return false; }
+    let i = 0;
+    while (i < pn) {
+        if ((byteAt(h, i) catch 0) != (byteAt(p, i) catch 0)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+function strEndsWithCheck(h: string, p: string): bool {
+    // p 域受限 ASCII（".tx"）——byteAt 尾扫安全。
+    const hn = len(h);
+    const pn = len(p);
+    if (hn < pn) { return false; }
+    let i = 0;
+    while (i < pn) {
+        if ((byteAt(h, hn - pn + i) catch 0) != (byteAt(p, i) catch 0)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+function strIndexOfRevCheck(h: string, needle: string, from: int): int {
+    // 从 from 起向左找 needle 首位（码点域）。
+    const nl = len(needle);
+    let i = from;
+    while (i >= 0) {
+        if (strIndexOfRevCheckAt(h, needle, i) == 1) { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
+function strIndexOfRevCheckAt(h: string, needle: string, at: int): int {
+    // R3：码点域清偿——at 由 strIndexOf 产出（码点位），byteAt 字节域直查在
+    // 中文段＋".." 归一面错位；改 cpCharAtD 同域比对（needle 短文本，代价可忽）。
+    const nl = cpCountD(needle);
+    if (at + nl > cpCountD(h)) { return 0; }
+    let i = 0;
+    while (i < nl) {
+        if (cpCharAtD(h, at + i) != cpCharAtD(needle, i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// 目录域（末段剥除——含扩展名文件路径）。
+function dirOf(p: string): string {
+    // F3：码点域扫描。
+    let at = -1;
+    let i = 0;
+    const n = cpCountD(p);
+    while (i < n) {
+        if (pathIsSep(cpCharAtD(p, i))) { at = i; }
+        i = i + 1;
+    }
+    if (at < 0) { return ""; }
+    return strSub(p, 0, at);
+}
+
+// —— TXB1 头解析：node_count（"TXB1 <nodes> <sbytes> ..."）——
+function txb1Nodes(bin: string): int {
+    let i = 5;
+    let v = 0;
+    while (i < len(bin)) {
+        const c = byteAt(bin, i) catch 32;
+        if (c == 32) { return v; }
+        if (c < 48 || c > 57) { return -1; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+function txb1Ok(bin: string): int {
+    if (len(bin) < 5) { return 0; }
+    if ((byteAt(bin, 0) catch 0) != 84) { return 0; }
+    if ((byteAt(bin, 1) catch 0) != 88) { return 0; }
+    if ((byteAt(bin, 2) catch 0) != 66) { return 0; }
+    if ((byteAt(bin, 3) catch 0) != 49) { return 0; }
+    if ((byteAt(bin, 4) catch 0) != 32) { return 0; }
+    return 1;
+}
+
+// —— 模块表（发现序＝拓扑后序：导入先、入口末）——
+struct DrvMod {
+    source: string, // 检查使用的真实源文本；普通构建不保留。
+    display: string,
+    path: string, // 归一相对路径（去重键）
+    astbin: string,
+    nodeCount: int,
+    specs: List<string>, // 原始 spec 序（声明序）
+    targets: List<int>, // 解析目标模块序（拓扑序号）
+}
+
+const mods: List<Ref<DrvMod>> = listNew();
+const modPaths: List<string> = listNew();
+const modVisiting: List<string> = listNew(); // F2：递归栈（正在访问——环检测）
+
+function resetDriver(): void {
+    linkMapClear();
+    drvTargetId = -1;
+    while (listLen(listedDirs) > 0) {
+        listRemoveAt(listedDirs, listLen(listedDirs) - 1);
+        listRemoveAt(listedNames, listLen(listedNames) - 1);
+        listRemoveAt(listedOk, listLen(listedOk) - 1);
+    }
+    preludeHit = false;
+    while (listLen(mods) > 0) { listRemoveAt(mods, listLen(mods) - 1); }
+    while (listLen(modPaths) > 0) { listRemoveAt(modPaths, listLen(modPaths) - 1); }
+    while (listLen(modVisiting) > 0) { listRemoveAt(modVisiting, listLen(modVisiting) - 1); }
+    variantReset();
+    stdRootDone = 0;
+    parseDiagAcc = "";
+    stdRootCache = "";
+    drvBytes = bytesNew(0);
+    drvDiag = "";
+    drvOk = 0;
+    drvHasMain = 0;
+    drvLastCtx = None;
+    dlDriver = listNew();
+    dlParse = listNew();
+    dlAll = listNew();
+    while (listLen(failedPaths) > 0) { listRemoveAt(failedPaths, listLen(failedPaths) - 1); }
+    drvAnaI = listNew();
+    drvAnaN = listNew();
+    drvAnaDI = listNew();
+    drvAnaDS = listNew();
+    drvSeb1Last = "";
+}
+
+function modIndexOf(path: string): int {
+    let i = 0;
+    while (i < listLen(modPaths)) {
+        if ((listGet(modPaths, i) catch "") == path) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+function modVisitingIndexOf(path: string): int {
+    let i = 0;
+    while (i < listLen(modVisiting)) {
+        if ((listGet(modVisiting, i) catch "") == path) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 库根（std/ 与 gui/ 的第二搜索根同一套机制，D20 §三同构）：1. 环境变量（非空即用，同
+// Zig CLI）；2. 编译器同级分发布局 <exe 目录>/<仓名>/src，再试 <exe 目录>/<alt>/src（alt 非空时；发布包与公开仓
+// taixu-lang 的标准库在 stdlib/，同 Go、Rust、Zig 按二进制位置找标准库，设计 v052-public-release §三）；3. 布局发现：
+// cwd 逐级上溯六层封顶，每层试 <anc>/<仓名>/src 与 <anc>/../<仓名>/src（entryKind 目录存在性；不试 alt——通用名
+// 容易撞上别的项目里的同名目录）。找不到返回空串。
+function libRoot(envName: string, repo: string, alt: string): string {
+    const env = getEnv(envName) catch "";
+    if (len(env) > 0) { return normalizePath(env); }
+    const exe = normalizePath(selfExePath());
+    const ne = cpCountD(exe);
+    let cut = -1;
+    let k = 0;
+    while (k < ne) {
+        if (cpCharAtD(exe, k) == 47) { cut = k; }
+        k = k + 1;
+    }
+    if (cut > 0) {
+        const sib = strSub(exe, 0, cut) + "/" + repo + "/src";
+        if (serviceKind(sib) == 2) { return normalizePath(sib); }
+        if (len(alt) > 0) {
+            const altSib = strSub(exe, 0, cut) + "/" + alt + "/src";
+            if (serviceKind(altSib) == 2) { return normalizePath(altSib); }
+        }
+    }
+    let anc = ".";
+    let depth = 0;
+    while (depth <= 6) {
+        const a = normalizePath(anc);
+        if (serviceKind(a + "/" + repo + "/src") == 2) { return normalizePath(a + "/" + repo + "/src"); }
+        if (serviceKind(a + "/../" + repo + "/src") == 2) { return normalizePath(a + "/../" + repo + "/src"); }
+        anc = anc + "/..";
+        depth = depth + 1;
+    }
+    return "";
+}
+
+let stdRootCache: string = "";
+let stdRootDone: int = 0;
+
+function stdlibRoot(): string {
+    if (stdRootDone == 1) { return stdRootCache; }
+    stdRootDone = 1;
+    stdRootCache = libRoot("TAIXU_STDLIB", "taixu-stdlib", "stdlib");
+    return stdRootCache;
+}
+
+// 标准库根与 gui 根（找得到的，驱动的路径形）。LSP 改名据此拒绝改动库里的声明（6d-3a2，§四-3）。
+export function drvLibRoots(): List<string> {
+    const out: List<string> = listNew();
+    if (len(stdlibRoot()) > 0) { listPush(out, stdlibRoot()); }
+    if (len(guiRoot()) > 0) { listPush(out, guiRoot()); }
+    return out;
+}
+
+// gui/ 第二搜索根（Zig CLI 的 gui_root.zig 同一机制；第 6 轮设计 v0.2 的 6b-2）：TAIXU_GUI_ROOT，或同级的
+// taixu-gui/src。GUI 框架属外部库：它的模块不在标准库根之下，不能调用 __rt 内部内建（buildSein 按路径打标）。
+let guiRootCache: string = "";
+let guiRootDone: int = 0;
+
+function guiRoot(): string {
+    if (guiRootDone == 1) { return guiRootCache; }
+    guiRootDone = 1;
+    guiRootCache = libRoot("TAIXU_GUI_ROOT", "taixu-gui", "");
+    return guiRootCache;
+}
+
+// spec→模块相对路径（导入方目录 join＋.tx 补全＋归一）。
+function resolveSpec(spec: string, importerDir: string): string {
+    if (strStartsWithCheck(spec, "std/")) {
+        // std/x → <根>/x.tx（compiler.zig :409 同构；缺失＝空串拒绝面）。
+        const root = stdlibRoot();
+        if (len(root) == 0) { return ""; }
+        const rest = strSub(spec, 4, cpCountD(spec) - 4);
+        let sp = root + "/" + rest;
+        if (strEndsWithCheck(sp, ".tx") == false) { sp = sp + ".tx"; }
+        return normalizePath(sp);
+    }
+    if (strStartsWithCheck(spec, "gui/")) {
+        // gui/x → <GUI 根>/x.tx（compiler.zig :421 同构；缺根＝空串拒绝面）。
+        const groot = guiRoot();
+        if (len(groot) == 0) { return ""; }
+        const grest = strSub(spec, 4, cpCountD(spec) - 4);
+        let gp = groot + "/" + grest;
+        if (strEndsWithCheck(gp, ".tx") == false) { gp = gp + ".tx"; }
+        return normalizePath(gp);
+    }
+    let rel = spec;
+    // R3：剥 "./" 用码点计数（len 字节域与 strSub 码点域混用在 "./中文" 面越界）。
+    while (strStartsWithCheck(rel, "./")) { rel = strSub(rel, 2, cpCountD(rel) - 2); }
+    let joined = rel;
+    if (len(importerDir) > 0) { joined = importerDir + "/" + rel; }
+    // .tx 补全（seed Loader 同构：已有 .tx 后缀不追加——中文 spec 活捉）。
+    let p = joined;
+    if (strEndsWithCheck(p, ".tx") == false) { p = p + ".tx"; }
+    return normalizePath(p);
+}
+
+// —— 编译器自带 prelude（D3 v0.20 §6.19）——
+// CLI 把嵌入的 prelude 源交给驱动；任一模块源码出现 prelude 的标志名时，才把它作为
+// 0 号模块（显示名 <prelude>）加入，其余程序的模块表与产物不变。
+let drvPrelude: string = "";
+let preludeHit: bool = false;
+export function drvSetPrelude(src: string): void { drvPrelude = src; }
+
+// 标志名分段拼出：编译器自身源码里不出现完整标志名，自举时不会误载 prelude。
+// 以 | 分隔（标志名本身可含空格）。
+// O4 第二步：定宽整数的哈希函数（i8 … usize 各加 Hash 后缀，标志名取其 8/16/32/64 与 size 结尾）。
+const PRELUDE_ANCHORS: List<string> = strSplit("Ma" + "p<|Ma" + "p <|Se" + "t<|Se" + "t <|map" + "New|set" + "New|Hash" + "able|int" + "Hash|string" + "Hash|bool" + "Hash|bytes" + "Hash|8Ha" + "sh|16Ha" + "sh|32Ha" + "sh|64Ha" + "sh|sizeHa" + "sh", "|");
+function preludeAnchor(src: string): bool {
+    let i = 0;
+    while (i < listLen(PRELUDE_ANCHORS)) {
+        const a = listGet(PRELUDE_ANCHORS, i) catch "";
+        if (len(a) > 0 && strIndexOf(src, a) >= 0) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// prelude 前置为 0 号模块：其余模块的导入目标序号整体加 1。
+function addPrelude(): int {
+    const raw = sourceParse(drvSourceCache(), "<prelude>", drvPrelude);
+    if (cpCountD(raw) > 0 && cpCharAtD(raw, 0) == 33) {
+        diag("driver: 内嵌 prelude 解析失败");
+        return 1;
+    }
+    if (txb1Ok(raw) == 0) {
+        diag("driver: 内嵌 prelude 无有效 AST");
+        return 1;
+    }
+    let i = 0;
+    while (i < listLen(mods)) {
+        const m = listGet(mods, i) catch new DrvMod { source: "", display: "", path: "", astbin: "", nodeCount: 0, specs: listNew(), targets: listNew() };
+        let j = 0;
+        while (j < listLen(m.targets)) {
+            listSet(m.targets, j, (listGet(m.targets, j) catch 0) + 1);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    const pm = new DrvMod { source: drvPrelude, display: "<prelude>", path: "<prelude>", astbin: raw, nodeCount: txb1Nodes(raw), specs: listNew(), targets: listNew() };
+    listInsert(mods, 0, pm);
+    listInsert(modPaths, 0, "<prelude>");
+    return 0;
+}
+
+// 解析期诊断协议行 `! 码 行 列 消息` 渲染成与语义诊断同形的
+// `显示名:行:列: error 码: 消息`（Zig CLI emitDiags 同形；3xxx 码随附
+// explain 行）。不合协议形的行原样保留。
+function cpSpaceFrom(s: string, from: int, n: int): int {
+    let i = from;
+    while (i < n && cpCharAtD(s, i) != 32) { i = i + 1; }
+    return i;
+}
+
+function renderParseDiag(display: string, ln: string): string {
+    const n = cpCountD(ln);
+    if (n < 2 || cpCharAtD(ln, 0) != 33 || cpCharAtD(ln, 1) != 32) { return ln + "\n"; }
+    const a = cpSpaceFrom(ln, 2, n);
+    const b = cpSpaceFrom(ln, a + 1, n);
+    const c = cpSpaceFrom(ln, b + 1, n);
+    if (c >= n) { return ln + "\n"; }
+    const code = strSub(ln, 2, a - 2);
+    let out = display + ":" + strSub(ln, a + 1, b - a - 1) + ":" + strSub(ln, b + 1, c - b - 1) + ": error " + code + ": " + strSub(ln, c + 1, n - c - 1) + "\n";
+    if (cpCountD(code) == 4 && cpCharAtD(code, 0) == 51) { out = out + "  └─ 处置详见: taixu explain " + code + "\n"; }
+    return out;
+}
+
+// 单模块装载（读源→TXB1→登记）；返回 0＝成。
+// 单模块解析（读源→TXB1——不入表；入表在后序点）。
+function parseModule(display: string, path: string, out: Ref<DrvMod>): int {
+    let src = "";
+    if (!serviceAllows(path)) { diagPath(path, "driver: path_not_trusted: " + pathHostShow(path)); return 1; }
+    const oi = overlayIndex(path);
+    if (oi >= 0) {
+        src = listGet(ovTexts, oi) catch "";
+    } else {
+        const disk: string = serviceReadSource(path) catch (e) {
+            diagPath(path, "driver: 源读取失败 " + pathHostShow(path) + ": " + e.message);
+            return 1;
+        };
+        src = disk;
+    }
+    if (!preludeHit && len(drvPrelude) > 0 && preludeAnchor(src)) { preludeHit = true; }
+    if (drvChecking) { out.source = src; }
+    const raw = sourceParse(drvSourceCache(), path, src);
+    // 组合协议：诊断在前，恢复 AST 在后。先留置诊断，仍检查恢复树，
+    // 最终出口统一阻断产物；不能把协议中的诊断等同于没有 AST。
+    let bin = raw;
+    if ((byteAt(raw, 0) catch 0) == 33) {
+        let start = 0;
+        const rawCp = cpCountD(raw);
+        while (start < rawCp && cpCharAtD(raw, start) == 33) {
+            let end = start;
+            while (end < rawCp && cpCharAtD(raw, end) != 10) { end = end + 1; }
+            const pln = strSub(raw, start, end - start);
+            parseDiagAcc = parseDiagAcc + renderParseDiag(display, pln);
+            if (drvChecking) { listPush(dlParse, parseLineDiag(path, display, pln)); }
+            start = end;
+            if (start < rawCp) { start = start + 1; }
+        }
+        bin = strSub(raw, start, rawCp - start);
+    }
+    if (txb1Ok(bin) == 0) {
+        // R3：bin 本身即诊断文本——不再 strSub(bin,0,len(bin)) 切片（len 字节域
+        // 传码点接口在中文诊断面越界 trap）。
+        // 已并入 drvDiag 的解析诊断从 parseDiagAcc 移走，免得出口处再加一遍（检查时继续分析其余模块；构建时
+        // 提前返回的出口也会并入 parseDiagAcc）。
+        drvDiag = drvDiag + parseDiagAcc;
+        parseDiagAcc = "";
+        if (drvChecking) {
+            for (d in dlParse) { listPush(dlDriver, d); }
+            dlParse = listNew();
+        }
+        diagPath(path, "driver: 无有效恢复 AST " + pathHostShow(path) + ":\n" + bin);
+        return 1;
+    }
+    out.display = display;
+    out.path = path;
+    out.astbin = bin;
+    out.nodeCount = txb1Nodes(bin);
+    return 0;
+}
+
+// —— 按目标选择文件（D3 v0.23；细节见 target_files.tx）——
+let drvTargetId: int = T_X64_WINDOWS;
+
+// 后序 DFS 发现（zig loadGraph 同构）：导入先、本模块后——SEIN 拓扑序且
+// 入口末位。display＝入口 CWD 相对形／导入 spec 逻辑名（BUILD-05）。
+function visitModule(display: string, path: string, viaSpec: int): int {
+    if (modIndexOf(path) >= 0) { return 0; }
+    // 检查时装载失败过的模块不再重试（其诊断已记）；导入方跳过它，semamirror 在导入语句上报 3008。
+    if (drvChecking && containsPath(failedPaths, path)) { return 1; }
+    // F2：循环导入检测（在访栈命中＝环——cyclic_import 可控诊断，非资源
+    // 耗尽；zig Loader visiting 同构）。
+    if (modVisitingIndexOf(path) >= 0) {
+        // seed loader 同构：3009 循环导入＋后续 3008 找不到（导入方视角目标
+        // 未完成装载）——码序 [3009,3008]，位置＝导入语句域。
+        diagCodeAt(impCtxPath, impCtxDisplay, impCtxLine, impCtxCol, 3009, "循环导入：" + pathHostShow(path));
+        diagCodeAt(impCtxPath, impCtxDisplay, impCtxLine, impCtxCol, 3008, "找不到导入目标模块 '" + impCtxSpec + "'");
+        return 1;
+    }
+    const m = new DrvMod { source: "", display: display, path: path, astbin: "", nodeCount: 0, specs: listNew(), targets: listNew() };
+    if (viaSpec == 1 && !moduleExists(path)) {
+        diagCodeAt(impCtxPath, impCtxDisplay, impCtxLine, impCtxCol, 3008, "找不到导入目标模块 '" + impCtxSpec + "'");
+        if (drvChecking) { listPush(failedPaths, path); }
+        return 1;
+    }
+    if (parseModule(display, path, m) != 0) {
+        if (drvChecking) { listPush(failedPaths, path); }
+        return 1;
+    }
+    listPush(modVisiting, path);
+    const head = sourceImports(drvSourceCache(), path, m.astbin);
+    // "n l1 s1 l2 s2 ..."——cp 前缀协议（R3：长度域＝码点数——len 字节域在
+    // 中文 spec 面与 strSub 码点切片错位；数字/空格域 ASCII 两域等价，
+    // cpCharAtD 同域扫描）。
+    const hcp = cpCountD(head);
+    let pos = 0; // 码点游标
+    let n = 0;
+    while (pos < hcp) {
+        const c = cpCharAtD(head, pos);
+        if (c >= 48 && c <= 57) { n = n * 10 + (c - 48); pos = pos + 1; continue; }
+        break;
+    }
+    const importerDir = dirOf(path);
+    let si = 0;
+    while (si < n) {
+        while (pos < hcp && cpCharAtD(head, pos) == 32) { pos = pos + 1; }
+        let l = 0;
+        while (pos < hcp) {
+            const c = cpCharAtD(head, pos);
+            if (c >= 48 && c <= 57) { l = l * 10 + (c - 48); pos = pos + 1; continue; }
+            break;
+        }
+        while (pos < hcp && cpCharAtD(head, pos) == 32) { pos = pos + 1; }
+        if (l > hcp - pos) {
+            diag("driver: import 协议坏形");
+            popVisiting(path);
+            return 1;
+        }
+        const spec = strSub(head, pos, l);
+        pos = pos + l;
+        // 协议 v2：每 import 附 impLine/impCol（位置域——3008/3009 面）。
+        let iln = 0;
+        let icl = 0;
+        while (pos < hcp && cpCharAtD(head, pos) == 32) { pos = pos + 1; }
+        while (pos < hcp) {
+            const cl = cpCharAtD(head, pos);
+            if (cl >= 48 && cl <= 57) { iln = iln * 10 + (cl - 48); pos = pos + 1; continue; }
+            break;
+        }
+        while (pos < hcp && cpCharAtD(head, pos) == 32) { pos = pos + 1; }
+        while (pos < hcp) {
+            const cc = cpCharAtD(head, pos);
+            if (cc >= 48 && cc <= 57) { icl = icl * 10 + (cc - 48); pos = pos + 1; continue; }
+            break;
+        }
+        impCtxPath = path;
+        impCtxDisplay = display;
+        impCtxLine = iln;
+        impCtxCol = icl;
+        impCtxSpec = spec;
+        // 导入分类（seed compiler.zig :409 同构——码面 3008）。构建时出错即止；检查时跳过这个导入继续。
+        let bad = false;
+        let rpath = "";
+        if (strStartsWithCheck(spec, "/")) {
+            diagCodeAt(path, display, iln, icl, 3008, "导入路径 '" + spec + "' 不受支持（S1 仅支持相对路径）");
+            bad = true;
+        } else if (strStartsWithCheck(spec, "./") || strStartsWithCheck(spec, "../")) {
+            rpath = resolveSpec(spec, importerDir);
+        } else if (strStartsWithCheck(spec, "std/")) {
+            rpath = resolveSpec(spec, importerDir);
+            if (len(rpath) == 0) {
+                if (len(stdlibRoot()) == 0) {
+                    diagCodeAt(path, display, iln, icl, 3008, "std/ 导入需要标准库根（TAIXU_STDLIB、编译器同目录的 stdlib/ 或 taixu-stdlib/，或核心仓同级的 taixu-stdlib）: " + spec);
+                } else {
+                    diagCodeAt(path, display, iln, icl, 3008, "找不到导入目标模块 '" + spec + "'");
+                }
+                bad = true;
+            }
+        } else if (strStartsWithCheck(spec, "gui/")) {
+            rpath = resolveSpec(spec, importerDir);
+            if (len(rpath) == 0) {
+                diagCodeAt(path, display, iln, icl, 3008, "gui/ 导入需要 GUI 框架根（TAIXU_GUI_ROOT 或核心仓同级 taixu-gui/src）: " + spec);
+                bad = true;
+            }
+        } else {
+            diagCodeAt(path, display, iln, icl, 3008, "标准库 '" + spec + "' 尚未提供（S1 仅支持 ./ ../ 相对导入与 std/ 前缀）");
+            bad = true;
+        }
+        if (bad) {
+            if (!drvChecking) { return 1; }
+            si = si + 1;
+            continue;
+        }
+        // 按目标选择（D3 v0.35）：x_<os>_<arch>.tx、x_<os>.tx、（类 Unix）x_unix.tx，都没有才用 x.tx；同组兄弟文件的
+        // 导出面不论当前目标选中哪份都比对（3033 随解析期诊断）。
+        const vtext = drvVariantSiblings(rpath, display, iln, icl);
+        parseDiagAcc = parseDiagAcc + vtext;
+        if (drvChecking && len(vtext) > 0) {
+            for (d in textDiags(vtext, path)) { listPush(dlParse, d); }
+        }
+        let vdisplay = spec;
+        for (sfx in targetFileSuffixes(drvTargetId)) {
+            const vpath = variantPath(rpath, sfx);
+            if (moduleExact(vpath)) {
+                rpath = vpath;
+                vdisplay = variantDisplay(spec, sfx);
+                break;
+            }
+        }
+        const spelling = importSpelling(spec, importerDir, rpath);
+        if (len(spelling) > 0) {
+            diagCodeAt(path, display, iln, icl, 3008, spelling);
+            if (!drvChecking) { return 1; }
+            si = si + 1;
+            continue;
+        }
+        listPush(m.specs, spec);
+        if (visitModule(vdisplay, rpath, 1) != 0) {
+            if (!drvChecking) { return 1; }
+            listRemoveAt(m.specs, listLen(m.specs) - 1);
+        } else {
+            listPush(m.targets, modIndexOf(rpath));
+        }
+        si = si + 1;
+    }
+    listPush(mods, m);
+    listPush(modPaths, path);
+    // 弹在访栈（后序完成——拓扑位）。
+    popVisiting(path);
+    return 0;
+}
+
+function popVisiting(path: string): void {
+    let vi = listLen(modVisiting) - 1;
+    while (vi >= 0) {
+        if ((listGet(modVisiting, vi) catch "") == path) { listRemoveAt(modVisiting, vi); vi = -1; continue; }
+        vi = vi - 1;
+    }
+}
+
+// SEB1 尾段 entry 读取（hasMain/mainFnIdx——require_main 3010 同位）。
+// Toolchain-only builtins (writeExecutable) are allowed when the CLI passes --toolchain.
+let drvToolchain: bool = false;
+export function drvSetToolchain(on: bool): void { drvToolchain = on; }
+export function drvToolchainOn(): bool { return drvToolchain; }
+// D3 v0.23 FFI：--static（Linux 产物须静态）与构建报告（产物形态、外部库）。
+let drvStatic: bool = false;
+let drvReport: string = "";
+export function drvSetStatic(on: bool): void { drvStatic = on; }
+export function drvLinkReport(): string { return drvReport; }
+
+// 原生 taixu test（D3 v0.21）：测试模式产物在映像里登记全部 test 块（程序以
+// <exe> <序号> 运行第几个），构建后 drvTestNames 给出按序的名字。
+let drvTestMode: bool = false;
+let drvTestNamesL: List<string> = listNew();
+export function drvSetTestMode(on: bool): void { drvTestMode = on; }
+
+// --leak-check（泄漏检查设计 §三-1）：产物在退出时做泄漏检查。
+let drvLeakCheck: bool = false;
+
+export function drvSetLeakCheck(on: bool): void { drvLeakCheck = on; }
+// --codegen=portable（开发用，macOS 适配 M4 设计 A9 修订）：生成代码改走可移植渲染器（x86 上供与 emitmirror 对照验证）。
+let drvPortable: bool = false;
+export function drvSetPortable(on: bool): void { drvPortable = on; }
+
+// --debug（第 6 轮 6c，调试实施设计 §四-2）：codegen 插检查点，检查点例程进程序对象，映像标调试构建；
+// 内核与不带 --debug 的产物不变。
+let drvDebug: bool = false;
+// --strip：ELF／Mach-O 产物不带函数符号（v052-image-symbols）。
+let drvStrip: bool = false;
+export function drvSetStrip(on: bool): void { drvStrip = on; }
+
+export function drvSetDebug(on: bool): void { drvDebug = on; cgSetDebug(on); }
+
+// 调试构建的 ProgramContext（第 6 轮 6c-4，调试实施设计 §四-3）：原生构建后留给同进程的调试会话做符号工作
+// （函数名、行表、变量表）。正常构建不留；每次构建开始时清掉。
+let drvLastCtx: Ref<ProgramContext>? = None;
+let drvListing: bool = false;
+// 只做前半（读入、sema、codegen）不发射链接：变量表探针用。
+let drvFrontOnly: bool = false;
+
+export function drvLastContext(): Ref<ProgramContext> | Error {
+    return drvLastCtx catch err("driver: 没有调试构建留下的 ProgramContext");
+}
+
+// 按调试构建编译到 ProgramContext 为止（不生成产物），结果经 drvLastContext 取；失败返回 1，诊断经 drvDiagOut 取。
+export function drvDebugContext(entryPath: string, t: int): int {
+    const saved = drvDebug;
+    drvSetDebug(true);
+    drvFrontOnly = true;
+    const rc = drvNativeProduct(entryPath, 0, drvEmptyPaths(), t);
+    drvFrontOnly = false;
+    drvSetDebug(saved);
+    return rc;
+}
+
+function drvEmptyPaths(): List<string> { return listNew(); }
+export function drvTestNames(): List<string> { return drvTestNamesL; }
+
+// --time: per-phase wall clock on stderr (diagnostic only; never in products).
+let drvTiming: bool = false;
+let drvTimeMark: int = 0;
+export function drvSetTiming(on: bool): void { drvTiming = on; drvTimeMark = nowMs(); }
+function phase(name: string): void {
+    if (compileProfileActive()) { compileProfilePhase(name); }
+    if (!drvTiming) { return; }
+    const now = nowMs();
+    eprint("[time] " + name + " " + dec(now - drvTimeMark) + " ms");
+    drvTimeMark = now;
+}
+
+// —— SEIN1 组装（buildSeinPayloadModules 同构）——
+// 模块真实路径（SEIN 模块序＝语义模块序）：embedBytes 按调用所在源文件解析相对路径。
+function drvModulePaths(): List<string> {
+    const out: List<string> = listNew();
+    let i = 0;
+    while (i < listLen(mods)) {
+        const m = listGet(mods, i) catch new DrvMod { source: "", display: "", path: "", astbin: "", nodeCount: 0, specs: listNew(), targets: listNew() };
+        listPush(out, m.path);
+        i = i + 1;
+    }
+    return out;
+}
+
+// 上一次构建的模块路径与显示名（模块序；调试会话据此给出绝对路径，6c-4b）。编译失败时为已装载的模块。
+export function drvModulePathList(): List<string> { return drvModulePaths(); }
+
+export function drvModuleTextList(): List<string> {
+    const out: List<string> = listNew();
+    for (m in mods) { listPush(out, m.source); }
+    return out;
+}
+
+export function drvModuleDisplayList(): List<string> {
+    const out: List<string> = listNew();
+    let i = 0;
+    while (i < listLen(mods)) {
+        const m = listGet(mods, i) catch new DrvMod { source: "", display: "", path: "", astbin: "", nodeCount: 0, specs: listNew(), targets: listNew() };
+        listPush(out, m.display);
+        i = i + 1;
+    }
+    return out;
+}
+// v2 头的标志：bit0＝工具链内建（同 devtools.zig）；bit1＝宽格式（原生链 TXC v6 的字段号上限）；bit2＝每个模块
+// 末尾带标准库标记——路径在标准库根之下的模块与内嵌 prelude 为 1，可调用 __rt 内部内建（线程设计 §十六）；
+// bit3＝调试构建（sema 记绑定的声明类型、SEB1 追加 DBG1 尾节，调试实施设计 §四-3）；bit4＝分析节（只在检查入口，
+// SEB1 追加 ANA1 尾节，LSP 与 MCP 实施设计 §四-2）。
+function drvSemaFlags(): int {
+    let flags = 6;
+    if (drvToolchain) { flags = 7; }
+    if (drvDebug) { flags = flags + 8; }
+    if (drvAnalysis) { flags = flags + 16; }
+    // 编译目标（编号＋1，32..224）：语义分析据此做外部函数的目标检查，检查模式与构建同一判定（D3 v0.35）。
+    if (drvTargetId >= 0) { flags = flags + (drvTargetId + 1) * 32; }
+    return flags;
+}
+
+function checkModulesInput(): List<Ref<CheckModule>> {
+    const out: List<Ref<CheckModule>> = listNew();
+    const root = stdlibRoot();
+    for (m in mods) {
+        listPush(out, new CheckModule { path: m.path, display: m.display, nodeCount: m.nodeCount, astbin: m.astbin,
+                specs: m.specs, targets: m.targets, std: m.path == "<prelude>" || (len(root) > 0 && strStartsWithCheck(m.path, root + "/")) });
+    }
+    return out;
+}
+
+function buildSein(): string {
+    const flags = drvSemaFlags();
+    const root = stdlibRoot();
+    let out = "SEIN1 2 " + toStr(flags) + " " + toStr(listLen(mods)) + " ";
+    let i = 0;
+    while (i < listLen(mods)) {
+        const m = listGet(mods, i) catch new DrvMod { source: "", display: "", path: "", astbin: "", nodeCount: 0, specs: listNew(), targets: listNew() };
+        const esc = escRender(m.display);
+        out = out + toStr(len(esc)) + " " + esc + " " + toStr(m.nodeCount) + " " + toStr(len(m.astbin)) + " " + m.astbin + " ";
+        out = out + toStr(listLen(m.specs)) + " ";
+        let j = 0;
+        while (j < listLen(m.specs)) {
+            const esp = escRender(listGet(m.specs, j) catch "");
+            out = out + toStr(len(esp)) + " " + esp + " " + toStr(listGet(m.targets, j) catch 0) + " ";
+            j = j + 1;
+        }
+        if (m.path == "<prelude>" || (len(root) > 0 && strStartsWithCheck(m.path, root + "/"))) { out = out + "1 "; } else { out = out + "0 "; }
+        i = i + 1;
+    }
+    return out;
+}
+
+// 编排主体：entryPath＝用户给形（相对 CWD）；requireMain＝1 时缺 main 拒绝。
+// 成＝0（drvBytes 就绪）；失败＝1（drvDiag 就绪）。
+export function drvCompile(entryPath: string, requireMain: int): int {
+    resetDriver();
+    // 只在宿主上用（MCP compile 等）：目标即宿主。
+    drvTargetId = hostTargetId();
+    const path = normalizePath(entryPath);
+    const display = entryDisplayName(path);
+    // 后面的导入失败而提前返回时，前面已积累的 3033 与解析诊断一并报告。
+    if (visitModule(display, path, 0) != 0 || (preludeHit && addPrelude() != 0)) { drvDiag = drvDiag + parseDiagAcc; return 1; }
+    const sein = buildSein();
+    if (mirrorSein(sein) != 0) { diag("driver: semamirror 执行失败"); return 1; }
+    const seb1 = smSeb1Out();
+    const fab1 = smFab1Out();
+    // SEB1 全解析一次（diags 全量消费——协议执行成功≠语义检查无错误，
+    // semamirror checkModules 后仍返回 0）。
+    const sv = parseSeb1(seb1);
+    drvHasMain = sv.hasMain;
+    // 语义诊断阻断（产物前；seed sema_loader 红线 5 同位——诊断程序不进
+    // codegen）。诊断面先于 require_main（seed 检查序同位）。
+    const dtxt = diagRenderSv(sv);
+    if (len(dtxt) > 0 || len(parseDiagAcc) > 0) { drvDiag = drvDiag + parseDiagAcc + dtxt; return 1; }
+    // require_main（3010 同位——镜像 hasMain 缺席结构化拒绝）。
+    if (requireMain == 1 && sv.hasMain == 0) {
+        diag("driver: 入口模块缺少 function main(args: []string)（3010）");
+        return 1;
+    }
+    cgSetModulePaths(drvModulePaths());
+    const bytes = codegenTxc(seb1, fab1);
+    if (listLen(bytes) == 0) {
+        if (len(cgLastError()) > 0) { diag(cgLastError()); } else { diag("driver: codegen 产出为空"); }
+        return 1;
+    }
+    // 工具链进程与标准输入内建（TOOL-103）的例程只进原生产物，VM 不认识这组号。
+    if (cgUsesToolBuiltins()) {
+        diag("driver: stdinRead、procSpawn 等进程与标准输入内建只在原生构建中可用（字节码产物不支持）");
+        return 1;
+    }
+    let i = 0;
+    while (i < listLen(bytes)) {
+        bytesPush(drvBytes, listGet(bytes, i) catch 0);
+        i = i + 1;
+    }
+    drvOk = 1;
+    return 0;
+}
+
+// LSP 检查（第 6 轮 6d-1，LSP 与 MCP 实施设计 §三-6）：只做到语义分析，不生成代码。诊断与原生构建同源同序
+// （驱动的导入诊断、解析诊断与 3033、语义诊断），另加 embedBytes 的存在与大小；导入失败跳过该导入继续，
+// 入口不要求 main。按目标编号 t 的系统名（targetOs）选择 x_<系统>.tx 文件；analysis 时另留分析节（drvAnaInts、drvAnaNames，6d-3a）。
+// 返回诊断条数；结构化记录见 drvCheckDiags，文本见 drvDiagOut。
+export function drvCheck(entryPath: string, t: int, analysis: bool): int {
+    return drvCheckMode(entryPath, t, analysis, false);
+}
+
+export function drvCheckCached(entryPath: string, t: int, analysis: bool, cache: Ref<DrvCheckCache>): int {
+    drvActiveCache = cache;
+    sourceCacheBegin(cache.sources);
+    cache.sema.decoded = 0; cache.sema.checked = 0; cache.sema.reused = 0; cache.sema.retries = 0; cache.sema.total = 0;
+    cache.sema.changed = listNew();
+    const n = drvCheckMode(entryPath, t, analysis, false);
+    sourceCacheFinish(cache.sources);
+    drvActiveCache = None;
+    return n;
+}
+
+// 原序列化入口，供开发门验证新检查的数据与完整 SEB1/FAB1 相同。
+export function drvCheckFull(entryPath: string, t: int, analysis: bool): int {
+    return drvCheckMode(entryPath, t, analysis, true);
+}
+
+function drvCheckMode(entryPath: string, t: int, analysis: bool, full: bool): int {
+    resetDriver();
+    drvChecking = true;
+    drvAnalysis = analysis;
+    drvTargetId = t;
+    if (full) { checkProgramFull(entryPath); } else { checkProgram(entryPath); }
+    drvChecking = false;
+    drvAnalysis = false;
+    return listLen(dlAll);
+}
+
+export function drvCheckDiags(): List<Ref<DrvDiag>> { return dlAll; }
+
+function checkProgram(entryPath: string): void {
+    const path = normalizePath(entryPath);
+    const later: List<Ref<DrvDiag>> = listNew();
+    if (visitModule(entryDisplayName(path), path, 0) != 0 || (preludeHit && addPrelude() != 0)) {
+        finishCheck(later);
+        return;
+    }
+    const inputs = checkModulesInput();
+    const result = mirrorCheckResult(inputs);
+    if (result.hasMain) { drvHasMain = 1; }
+    drvAnaI = result.anaInts;
+    drvAnaN = result.anaNames;
+    drvAnaDI = result.detInts;
+    drvAnaDS = result.detStrs;
+    const paths = drvModulePaths();
+    const displays = drvModuleDisplayList();
+    for (d in checkDiags(result.diags, displays, paths, dlDriver)) { listPush(later, d); }
+    const sites: List<Ref<CgEmbedSite>> = listNew();
+    for (e in result.embeds) { listPush(sites, cgEmbedSiteFromRaw(e.module, e.line, e.col, e.raw, paths)); }
+    for (d in embedDiagsFor(sites, displays, paths)) { listPush(later, d); }
+    finishCheck(later);
+}
+
+function mirrorCheckResult(inputs: List<Ref<CheckModule>>): Ref<CheckResult> {
+    if (drvActiveCache == None) { return mirrorCheck(inputs, drvSemaFlags()); }
+    const c = drvActiveCache catch drvCheckCacheNew();
+    return mirrorCheckCached(inputs, drvSemaFlags(), targetName(drvTargetId), c.sema);
+}
+
+function checkProgramFull(entryPath: string): void {
+    const path = normalizePath(entryPath);
+    const later: List<Ref<DrvDiag>> = listNew();
+    if (visitModule(entryDisplayName(path), path, 0) != 0 || (preludeHit && addPrelude() != 0)) {
+        finishCheck(later);
+        return;
+    }
+    if (mirrorSein(buildSein()) != 0) {
+        diag("driver: semamirror 执行失败");
+        finishCheck(later);
+        return;
+    }
+    drvSeb1Last = smSeb1Out();
+    const sv = parseSeb1(drvSeb1Last);
+    drvHasMain = sv.hasMain;
+    drvAnaI = sv.anaInts;
+    drvAnaN = sv.anaNames;
+    drvAnaDI = sv.anaDetInts;
+    drvAnaDS = sv.anaDetStrs;
+    const paths = drvModulePaths();
+    for (d in semaDiags(sv, paths, dlDriver)) { listPush(later, d); }
+    for (d in embedDiags(cgEmbedSites(sv, smFab1Out(), paths), sv, paths)) { listPush(later, d); }
+    finishCheck(later);
+}
+
+function finishCheck(later: List<Ref<DrvDiag>>): void {
+    drvDiag = drvDiag + parseDiagAcc + renderDrvDiags(later);
+    dlAll = listNew();
+    for (d in dlDriver) { listPush(dlAll, d); }
+    for (d in dlParse) { listPush(dlAll, d); }
+    for (d in later) { listPush(dlAll, d); }
+}
+
+// ============================================================================
+// §10 native 面（S5-③ 批 E 尾）：.txc → 记录流 → .s → 装配 → PE 直写。
+// 数据段＝emitDataShared 同构（rdata：prog_data/prog_len/fn_table/bi_table/
+// msg 池）；入口桩＋头部前缀（aot.zig asm_for_build 同构）。
+// ============================================================================
+
+// 数据段分块（O(total×log n)——批 E 尾 2 同法；NL 为 S1 转义常量）。
+const NL: string = "\n";
+const spParts: List<string> = listNew();
+
+function dec(v: int): string {
+    return toStr(v);
+}
+
+function sp(piece: string): void {
+    listPush(spParts, piece);
+}
+
+function spJoinRange(lo: int, hi: int): string {
+    if (hi - lo == 1) {
+        return listGet(spParts, lo) catch "";
+    }
+    const mid = lo + (hi - lo) / 2;
+    return spJoinRange(lo, mid) + spJoinRange(mid, hi);
+}
+
+function spJoin(): string {
+    const n = listLen(spParts);
+    if (n == 0) { return ""; }
+    return spJoinRange(0, n);
+}
+
+struct NumPos {
+    pos: int,
+}
+
+// 行内十进制读取（自 start 起；值经返回，游标经 outPos）。
+function lineNum(line: string, start: int, outPos: Ref<NumPos>): int {
+    let pos = start;
+    while (pos < len(line) && (byteAt(line, pos) catch 32) == 32) { pos = pos + 1; }
+    let v = 0;
+    let any = 0;
+    while (pos < len(line)) {
+        const c = byteAt(line, pos) catch 32;
+        if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); any = 1; pos = pos + 1; continue; }
+        break;
+    }
+    outPos.pos = pos;
+    if (any == 1) { return v; }
+    return -1;
+}
+
+// NRT 全链尾：ProgramContext → 记录流 → 发射＋装配（代码＋程序映像）→ 与内核链接成 PE/ELF。
+// 内核＝objectPaths 首件，缺省为 CLI 内嵌的内核（drvSetKernel）。成＝0（drvBytes 就绪）；失败＝1（drvDiag）。
+function nativeFinish(context: Ref<ProgramContext>, objectPaths: List<string>, t: int): int {
+    const fnCount = listLen(context.fnCode);
+    const biUsed: List<int> = listNew(); let bi = 0;
+    while (bi < BI_TABLE_LEN) { listPush(biUsed, 0); bi = bi + 1; }
+    // 程序代码实际调用的外部函数（callbi EXTERN_ID_BASE+序）；只为它们检查目标、生成桩与导入。下面按 TXC v6 字解码（C 置第 15 位时字为负，判非零）。
+    const ffiUsed: List<int> = listNew(); bi = 0;
+    while (bi < listLen(context.ffiExt)) { listPush(ffiUsed, 0); bi = bi + 1; }
+    let fiInput = 0;
+    while (fiInput < fnCount) {
+        const instructions = listGet(context.fnCode, fiInput) catch drvEmptyInts(); let pcInput = 0;
+        while (pcInput < listLen(instructions)) {
+            const ins = listGet(instructions, pcInput) catch 0;
+            if (ins != 0 && (ins & 0xFFFF) == 31) {
+                const bval = (ins >>> 32) & 0xFFFF;
+                if (bval < BI_TABLE_LEN) { listSet(biUsed, bval, 1); } else if (bval >= EXTERN_ID_BASE && bval - EXTERN_ID_BASE < listLen(ffiUsed)) { listSet(ffiUsed, bval - EXTERN_ID_BASE, 1); }
+            }
+            pcInput = pcInput + 1;
+        }
+        fiInput = fiInput + 1;
+    }
+    // D3 v0.23 FFI：按目标检查被调用的外部函数并登记调用桩（callbi EXTERN_ID_BASE+序 改调 __tx_ffi_<序>）。
+    const ffiDiags = ffiPrepare(context, ffiUsed, t, drvStatic);
+    drvReport = ffiLinkReport(context, t);
+    if (len(ffiDiags) > 0) { drvDiag = drvDiag + ffiDiags; return 1; }
+    emSetFfiStubs(ffiStubIndices());
+    // —— 记录流→.s 代码段——
+    // Borrowed (+0) parameters need the NRT kernel's __tx_frame_release_from.
+    recordSetBorrow(true);
+    const recs = recordProgramContext(context);
+    if (len(recs) == 0) { diag("driver: recordDump 产出为空"); return 1; }
+    phase("records");
+    const img = asStructuredBegin();
+    // 程序函数的源码名：--map 的函数帧收集用，ELF／Mach-O 产物的函数符号每次都用（v052-image-symbols）。
+    const symbolNames: List<string> = listNew();
+    let id = 0;
+    while (id < fnCount) {
+        const moduleId = listGet(context.fnModule, id) catch -1;
+        const moduleName = listGet(context.cgStrings, listGet(context.modOutPath, moduleId) catch -1) catch "";
+        const name = listGet(context.cgStrings, listGet(context.fnNameIdx, id) catch -1) catch "";
+        if (linkMapEnabled()) { nativeFunctionSource(id, moduleName, name); }
+        listPush(symbolNames, imageSymbolName(moduleName, name)); id = id + 1;
+    }
+    if (tElf(t) || tMacos(t)) { nativeSymbolsBegin(symbolNames); }
+    const missing = asStructuredMissing();
+    // PE entry stub: the generated kernel owns the process entry (Linux enters at _start).
+    if (tPe(t)) {
+        asStructuredLabel("__tx_entry");
+        asStructuredInstruction("sub", 2, asStructuredReg(0, 4), asStructuredImm(40), missing, 1);
+        asStructuredInstruction("call", 1, asStructuredTarget("__tx_native_entry"), missing, missing, 2);
+        asStructuredInstruction("ret", 0, missing, missing, missing, 3);
+    }
+    // A64 只有可移植渲染器（macOS 适配 M4 设计 A9 修订）；外部函数桩、调试薄桩与工具链例程写进 A64 缓冲。
+    if (drvPortable || tA64(t)) {
+        // A64 的清单在 a64BufferSubmit 里逐字记（设计 A11）；x86 上选 --codegen=portable 时没有清单。
+        if (drvListing && !tA64(t)) { diag("driver: --codegen=portable 不支持汇编清单"); return 1; }
+        if (emitPortableRecords(recs, tA64(t)) != 0) {
+            diag("driver: 可移植渲染器拒绝（记录流结构化面）\n" + epDiagOut());
+            return 1;
+        }
+    } else if (emitNativeRecords(recs) != 0 || emReady() != 1) {
+        diag("driver: emit 拒绝（记录流结构化面）\n" + emDiagOut());
+        return 1;
+    }
+    if (drvListing) {
+        if (asFailedAs() == 1) { diag("driver: 装配失败 " + asLastErrAs()); return 1; }
+        return 0;
+    }
+    if (listLen(ffiStubIndices()) > 0) {
+        let fb = asBufferNew();
+        if (tA64(t)) { fb = asBufferNewA64(); }
+        ffiEmitStubs(fb, context, t);
+        if (len(ffiStubError()) > 0) { diag("driver: 外部函数调用桩生成失败 " + ffiStubError()); return 1; }
+        asStructuredSection(0);
+        if (tA64(t)) { a64BufferSubmit(fb); } else { asBufferSubmit(fb); }
+    }
+    if (drvDebug) {
+        let db = asBufferNew();
+        if (tA64(t)) { db = asBufferNewA64(); }
+        const dbgErr = dbgEmitRoutines(db, t);
+        if (len(dbgErr) > 0) { diag("driver: 调试薄桩生成失败 " + dbgErr); return 1; }
+        asStructuredSection(0);
+        if (tA64(t)) { a64BufferSubmit(db); } else { asBufferSubmit(db); }
+    }
+    if (cgUsesToolBuiltins()) {
+        let tb = asBufferNew();
+        if (tA64(t)) { tb = asBufferNewA64(); }
+        const toolErr = toolEmitRoutines(tb, t);
+        if (len(toolErr) > 0) { diag("driver: 工具链进程例程生成失败 " + toolErr); return 1; }
+        asStructuredSection(0);
+        if (tA64(t)) { a64BufferSubmit(tb); } else { asBufferSubmit(tb); }
+    }
+    phase("emit+assemble");
+    if (asFailedAs() == 1) {
+        diag("driver: 装配失败 " + asLastErrAs() + " @record " + dec(asLastLineAs()));
+        return 1;
+    }
+    asStructuredSection(1);
+    asStructuredAlign(3);
+    let bi2 = 0;
+    // The kernel reads the static program image (no .txc at run time).
+    nrtImageSetTests(drvTestMode);
+    nrtImageSetLeak(drvLeakCheck);
+    nrtImageSetDebug(drvDebug);
+    drvTestNamesL = listNew();
+    let ti = 0;
+    while (ti < listLen(context.testOutName)) {
+        listPush(drvTestNamesL, listGet(context.cgStrings, listGet(context.testOutName, ti) catch 0) catch "");
+        ti = ti + 1;
+    }
+    emitNrtImage(context);
+    asStructuredSection(1);
+    asStructuredAlign(3);
+    asStructuredLabel("__tx_fn_table_data");
+    let fi = 0;
+    while (fi < fnCount) { asStructuredAddress("f_" + dec(fi)); fi = fi + 1; }
+    asStructuredAlign(3);
+    asStructuredLabel("__tx_bi_table");
+    bi2 = 0;
+    while (bi2 < BI_TABLE_LEN) {
+        if ((listGet(biUsed, bi2) catch 0) == 1) { asStructuredAddress("__tx_bi_" + biName(bi2)); }
+        else { asStructuredQuad(0); }
+        bi2 = bi2 + 1;
+    }
+    const mn = recordMsgCount();
+    let ms = 0;
+    while (ms < mn) {
+        const mtext = recordMsgAt(ms);
+        asStructuredLabel(".Lmsg" + dec(ms));
+        let k2 = 0;
+        // Preserve the text parser's empty .byte field semantics.
+        if (len(mtext) == 0) { asStructuredByte(0); }
+        while (k2 < len(mtext)) { asStructuredByte(byteAt(mtext, k2) catch 0); k2 = k2 + 1; }
+        ms = ms + 1;
+    }
+    if (asFailedAs() == 1) {
+        diag("driver: 装配失败 " + asLastErrAs() + " @line " + dec(asLastLineAs()));
+        return 1;
+    }
+    // Same-section rel32 fixups need no linker.
+    asResolveLocalFixups();
+    let functions = new NativeFunctionImage { ok: false, error: "", isa: "", functions: listNew() };
+    if (linkMapEnabled()) {
+        functions = nativeFunctionsSnapshot();
+        if (!functions.ok) { diag("driver: 函数帧信息失败 " + functions.error); return 1; }
+    }
+    // Linux 与 macOS 的程序都写成我们自己的 ELF64 可重定位目标文件（macOS 适配 M1 设计 E1），再按目标链接。
+    if (tElf(t) || tMacos(t)) {
+        linkSymbolsSet(nativeSymbolsTake(), drvStrip);
+        const exports: List<string> = listNew();
+        listPush(exports, "__tx_nrt_image");
+        listPush(exports, "__tx_fn_table_data"); listPush(exports, "__tx_bi_table");
+        let f = 0;
+        while (f < fnCount) { listPush(exports, "f_" + dec(f)); f = f + 1; }
+        const result = elfWriteObject(exports);
+        if (elfObjectOk(result) != 1) { diag("driver: ELF 对象失败 " + elfObjectError(result)); return 1; }
+        // Kernel object(s) + program object → static ELF executable.
+        const inputs: List<Bytes> = listNew();
+        if (listLen(objectPaths) == 0) {
+            if (bytesLen(drvKernel) == 0) { diag("driver: 原生运行时缺少内核对象（--link-object）"); return 1; }
+            listPush(inputs, drvKernel);
+        }
+        let oi = 0;
+        while (oi < listLen(objectPaths)) {
+            const objPath = listGet(objectPaths, oi) catch "";
+            const bytes = serviceReadBytes(objPath, 536870912) catch (e) {
+                diag("driver: 运行时对象读取失败 " + objPath + ": " + e.message);
+                return 1;
+            };
+            listPush(inputs, bytes);
+            oi = oi + 1;
+        }
+        listPush(inputs, elfObjectBytes(result));
+        if (tMacos(t)) {
+            // 内核的 main（C 约定）即 LC_MAIN 的入口；导入（__imp_<名>）由链接器从目标文件收集，外部函数的按声明的库绑定，
+            // 其余绑定 libSystem（M2 设计 F2）。
+            machoImportReset();
+            let mx = 0;
+            while (mx < listLen(ffiStubIndices())) {
+                const xi = listGet(ffiStubIndices(), mx) catch 0;
+                const xr = listGet(context.ffiExt, xi) catch drvEmptyInts();
+                if ((listGet(xr, 0) catch 0) == 1) {
+                    const lib = listGet(context.ffiLibs, (listGet(xr, 1) catch 1) - 1) catch "";
+                    machoImportFrom(ffiImportSymbol(listGet(context.extNames, xi) catch "", lib, t), macDylib(lib));
+                }
+                mx = mx + 1;
+            }
+            phase("data+tables");
+            if (linkMachO(inputs, "main") != 0) { diag("driver: Mach-O 链接失败 " + machoError()); return 1; }
+            if (linkMapEnabled()) {
+                const error = linkMapAttachFunctions(functions, listLen(inputs) - 1, 1);
+                if (len(error) > 0) { diag("driver: Mach-O 函数放置失败 " + error); return 1; }
+            }
+            let mo = 0;
+            while (linkMapEnabled() && mo < listLen(inputs) - 1) {
+                const error = attachObjectFunctions(listGet(inputs, mo) catch bytesNew(0), mo, t);
+                if (len(error) > 0) { diag("driver: Mach-O 对象函数失败 " + error); return 1; } mo = mo + 1;
+            }
+            phase("link");
+            drvBytes = machoBytes(); drvOk = 1; return 0;
+        }
+        // D3 v0.23 FFI：调用了 from "库" 的外部函数时产物动态链接（库按声明名，另加 libc：errno 与 exit；用到线程时另加 pthread，线程第 2 步）。
+        elfDynReset();
+        let dynamicLink = false;
+        let fx = 0;
+        while (fx < listLen(ffiStubIndices())) {
+            const xr = listGet(context.ffiExt, listGet(ffiStubIndices(), fx) catch 0) catch drvEmptyInts();
+            if ((listGet(xr, 0) catch 0) == 1) {
+                elfDynNeeded(listGet(context.ffiLibs, (listGet(xr, 1) catch 1) - 1) catch "");
+                elfDynImport(listGet(context.extNames, listGet(ffiStubIndices(), fx) catch 0) catch "");
+                dynamicLink = true;
+            }
+            fx = fx + 1;
+        }
+        if (dynamicLink) {
+            // ELF 的动态段里按维度分开：glibc 的 soname 与 errno 取址（Linux）；exit 与 pthread 钩子只在不经 kernel32、
+            // 静态时自己发系统调用的目标上需要（nrt_ffi.tx、nrt_spawn.tx 的钩子槽）。
+            if (tLinux(t)) {
+                elfDynNeeded("libc.so.6");
+                elfDynImport("__errno_location");
+            }
+            if (tRawSyscall(t)) {
+                elfDynHook("exit", "__tx_libc_exit");
+                if ((listGet(biUsed, 61) catch 0) == 1) { elfDynThreadHooks(); }
+            }
+        }
+        phase("data+tables");
+        if (linkElfObjects(inputs, "_start") != 0) { diag("driver: ELF 链接失败 " + elfObjectsError()); return 1; }
+        if (linkMapEnabled()) {
+            const error = linkMapAttachFunctions(functions, listLen(inputs) - 1, 1);
+            if (len(error) > 0) { diag("driver: ELF 函数放置失败 " + error); return 1; }
+        }
+        let objectIndex = 0;
+        while (linkMapEnabled() && objectIndex < listLen(inputs) - 1) {
+            const error = attachObjectFunctions(listGet(inputs, objectIndex) catch bytesNew(0), objectIndex, t);
+            if (len(error) > 0) { diag("driver: ELF 对象函数失败 " + error); return 1; } objectIndex = objectIndex + 1;
+        }
+        phase("link");
+        drvBytes = elfObjectsBytes(); drvOk = 1; return 0;
+    }
+    // The kernel object comes first: the embedded one, or the first --link-object.
+    let ob = 0;
+    let obj = drvKernel;
+    if (listLen(objectPaths) == 0) {
+        if (bytesLen(drvKernel) == 0) { diag("driver: 原生运行时缺少内核对象（--link-object）"); return 1; }
+    } else {
+        const firstObject = listGet(objectPaths, 0) catch "";
+        ob = 1;
+        obj = serviceReadBytes(firstObject, 536870912) catch (e) {
+            diag("driver: 内核对象读取失败 " + firstObject + ": " + e.message);
+            return 1;
+        };
+    }
+    const objects: List<Bytes> = listNew();
+    while (ob < listLen(objectPaths)) {
+        const path = listGet(objectPaths, ob) catch "";
+        const bytes = serviceReadBytes(path, 536870912) catch (e) {
+            diag("driver: 静态对象读取失败 " + path + ": " + e.message);
+            return 1;
+        };
+        listPush(objects, bytes);
+        ob = ob + 1;
+    }
+    phase("data+tables");
+    // D3 v0.23 FFI：外部函数按声明的库名导入。
+    lkClearImportDlls();
+    let fi3 = 0;
+    while (fi3 < listLen(ffiStubIndices())) {
+        const xi3 = listGet(ffiStubIndices(), fi3) catch 0;
+        const row3 = listGet(context.ffiExt, xi3) catch drvEmptyInts();
+        if ((listGet(row3, 0) catch 0) == 1) {
+            lkSetImportDll(listGet(context.extNames, xi3) catch "", ffiDllName(listGet(context.ffiLibs, (listGet(row3, 1) catch 1) - 1) catch ""));
+        }
+        fi3 = fi3 + 1;
+    }
+    if (linkExeObjects(obj, 0, objects) != 0) {
+        diag("driver: 链接失败 " + lkGetMissing());
+        return 1;
+    }
+    if (linkMapEnabled()) {
+        const error = linkMapAttachFunctions(functions, -1, 0);
+        if (len(error) > 0) { diag("driver: PE 函数放置失败 " + error); return 1; }
+        const kernelError = attachObjectFunctions(obj, 0, t);
+        if (len(kernelError) > 0) { diag("driver: PE 内核函数失败 " + kernelError); return 1; }
+        let oi = 0;
+        while (oi < listLen(objects)) {
+            const objectError = attachObjectFunctions(listGet(objects, oi) catch bytesNew(0), oi + 1, t);
+            if (len(objectError) > 0) { diag("driver: PE 对象函数失败 " + objectError); return 1; } oi = oi + 1;
+        }
+    }
+    phase("link");
+    drvBytes = exeBytesList();
+    drvOk = 1;
+    return 0;
+}
+
+function attachObjectFunctions(bytes: Bytes, objectIndex: int, t: int): string {
+    const object = nativeObjectFunctions(bytes, t);
+    if (!object.image.ok) { linkMapFail(object.image.error); return object.image.error; }
+    const d = linkMapData();
+    if (!object.present) { d.unknownObjects = d.unknownObjects + 1; return ""; }
+    d.metadataObjects = d.metadataObjects + 1;
+    let placed = false;
+    for (p in d.placements) { if (p.objectIndex == objectIndex && p.inputSection == object.inputSection) { placed = true; break; } }
+    // A discarded input section contributes no executable functions.
+    if (!placed) { return ""; }
+    return linkMapAttachFunctions(object.image, objectIndex, object.inputSection);
+}
+/// NRT product for target t: a PE from the kernel COFF object(s) and the program (tPe), or a static or dynamic
+/// ELF executable from the kernel ELF object(s) and the program (tElf).
+export function drvNativeRuntime(entryPath: string, requireMain: int, objectPaths: List<string>, t: int): int {
+    return drvNativeProduct(entryPath, requireMain, objectPaths, t);
+}
+
+function drvNativeProduct(entryPath: string, requireMain: int, objectPaths: List<string>, t: int): int {
+    resetDriver();
+    drvTargetId = t;
+    machoIdentifierFor(entryPath);
+    const path = normalizePath(entryPath);
+    const display = entryDisplayName(path);
+    if (visitModule(display, path, 0) != 0 || (preludeHit && addPrelude() != 0)) { drvDiag = drvDiag + parseDiagAcc; return 1; }
+    phase("load+parse");
+    const sein = buildSein();
+    if (mirrorSein(sein) != 0) { diag("driver: semamirror 执行失败"); return 1; }
+    phase("sema");
+    const seb1 = smSeb1Out();
+    const fab1 = smFab1Out();
+    let tParse = 0; if (compileProfileActive()) { compileProfileTextHop(len(seb1), len(fab1)); tParse = compileProfileClock(); }
+    const sv = parseSeb1(seb1);
+    // 驱动为诊断与入口检查先解析一次 SEB1，generateProgramContext 再解析一次（画像分开记这一次）。
+    if (compileProfileActive()) { compileProfileCodegenDetail("seb1-parse-diagnostics", compileProfileClock() - tParse); }
+    drvHasMain = sv.hasMain;
+    const dtxtN = diagRenderSv(sv);
+    if (len(dtxtN) > 0 || len(parseDiagAcc) > 0) { drvDiag = drvDiag + parseDiagAcc + dtxtN; return 1; }
+    if (requireMain == 1 && sv.hasMain == 0) {
+        diag("driver: 入口模块缺少 function main(args: []string)（3010）");
+        return 1;
+    }
+    cgSetModulePaths(drvModulePaths());
+    const context = generateProgramContext(seb1, fab1);
+    if (context.ok != 1) { if (len(cgLastError()) > 0) { diag(cgLastError()); } else { diag("driver: codegen context rejected"); } return 1; }
+    phase("codegen");
+    if (compileProfileActive()) { compileProfileProgram(context); }
+    if (drvDebug || drvListing) { drvLastCtx = context; }
+    if (drvFrontOnly) { return 0; }
+    return nativeFinish(context, objectPaths, t);
+}
+
+function drvEmptyInts(): List<int> { return listNew(); }
+
+// Same complete production pipeline; only the observation mode differs.
+export function drvCompileProfile(entryPath: string, t: int): int {
+    drvSetDebug(false); drvSetTestMode(false); drvSetLeakCheck(false);
+    emSetListing(true); asListingStart(0);
+    compileProfileBegin(drvProfileClock);
+    const rc = drvNativeProduct(entryPath, 0, drvEmptyPaths(), t);
+    compileProfileEnd();
+    emSetListing(false); asListingClear();
+    return rc;
+}
+function drvProfileClock(): int { return monoNs(); }
+
+// 与普通原生构建共用到函数装配结束；不链接、不写文件。由 disasm 渲染后释放上下文和捕获行。
+export function drvDisasm(entryPath: string, t: int, limit: int): int {
+    drvSetDebug(false); drvSetTestMode(false);
+    drvListing = true; emSetListing(true); asListingStart(limit);
+    const rc = drvNativeProduct(entryPath, 0, drvEmptyPaths(), t);
+    drvListing = false; emSetListing(false); asListingStop();
+    if (rc != 0) { drvDisasmRelease(); }
+    return rc;
+}
+export function drvDisasmRelease(): void { asListingClear(); drvLastCtx = None; }

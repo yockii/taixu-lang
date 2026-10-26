@@ -1,0 +1,614 @@
+// 可重定位目标文件链接的公共核心（macOS 适配 M1 设计 E2，docs/design/v052-macos-m1-macho-v0.1-20261024.md）：
+// 读入并校验我们自己的 ELF64 x86-64 可重定位目标文件，按节标志分成 text/rodata/data/bss 四组放置，全局符号解析，
+// 拷贝节字节，应用 RELA（R_X86_64_64/PC32/PLT32/32/32S；arm64 的 R_AARCH64_*，见 a64Relocate，macOS 适配 M4 设计 A3）。可执行文件格式（ELF、Mach-O）由各自的写出器决定：
+// 写出器定各组的虚拟地址，再调这里拷节与重定位。约定：映像里虚拟地址与文件偏移只差一个常数 base（写出器给出），
+// 即 文件偏移 = 虚拟地址 − base。本模块从 link_elf_objects.tx 原样搬出，检查与先后次序不变（Linux 产物逐字节不变）。
+import { BinaryName, rawName, rawNameOf, rawNameNone, rawNameSize, rawNameEqual, rawNameText } from "./binary_name";
+import { linkMapSymbolsEnabled, linkMapAddPlacement, linkMapEnabled, linkMapBegin, linkMapFail, linkMapLayout, linkMapAddSection, linkMapRow, linkMapInput, linkMapAdd } from "./link_map_data";
+
+const PAGE: int = 4096;
+// 映像上限：代码一律用 32 位相对重定位（small code model），超过 2 GiB 即够不着；对象文件给的尺寸先按它核对再参与运算。
+export const LKO_IMAGE_LIMIT: int = 2147483648;
+const SHN_UNDEF: int = 0;
+const SHN_ABS: int = 65521;
+
+struct InSec { obj: int, index: int, group: int, off: int, size: int }
+
+let failure: string = "";
+let objs: List<Bytes> = listNew();
+let placed: List<Ref<InSec>> = listNew();
+let groupSize: List<int> = listNew();
+let groupAlign: List<int> = listNew();
+let groupBase: List<int> = listNew();
+let globalNames: List<Ref<BinaryName>> = listNew();
+let globalAddrs: List<int> = listNew();
+let globalKinds: List<int> = listNew(); // 0 link VA, 1 absolute value
+let buckets: List<List<int>> = listNew();
+let symCache: List<List<int>> = listNew();
+let symResolvedCache: List<List<int>> = listNew();
+let placedAt: List<List<int>> = listNew(); // [对象][节号] → placed 下标，未放置 −1
+let symtabAt: List<int> = listNew(); // 各对象的符号表节号；checkObject 全部通过后才填
+let machine: int = 62; // 第一个对象的 e_machine（62 x86-64、183 aarch64），其余须相同
+const BUCKETS: int = 16384;
+
+/// 目标文件的 e_machine（不是 ELF 时得 -1）：写出器据此在 lkoBegin 之前选格式参数。
+export function lkoObjectMachine(object: Bytes): int {
+    if (bytesLen(object) < 20) { return -1; }
+    return (bytesGet(object, 18) catch 0) | ((bytesGet(object, 19) catch 0) << 8);
+}
+/// 本次链接的 e_machine。
+export function lkoMachine(): int { return machine; }
+
+function noInts(): List<int> { return listNew(); }
+function noBytes(): Bytes { return bytesNew(0); }
+
+/// 记下第一条失败原因（链接表同步记失败）；返回 1。
+export function lkoReject(message: string): int {
+    if (len(failure) == 0) { failure = message; }
+    linkMapFail(message);
+    return 1;
+}
+export function lkoFailure(): string { return failure; }
+
+function rd(o: int, at: int, width: int): int {
+    const data = listGet(objs, o) catch noBytes();
+    let v = 0;
+    let i = width - 1;
+    while (i >= 0) {
+        v = (v << 8) | (bytesGet(data, at + i) catch 0);
+        i = i - 1;
+    }
+    return v;
+}
+
+function boundedName(o: int, base: int, size: int, offset: int): Ref<BinaryName> {
+    const data = listGet(objs, o) catch noBytes();
+    if (!fits(base, size, bytesLen(data)) || offset < 0 || offset >= size) { return rawNameNone(); }
+    let i = offset;
+    while (i < size) {
+        if ((bytesGet(data, base + i) catch -1) == 0) { return rawName(data, base + offset, i - offset); }
+        i = i + 1;
+    }
+    return rawNameNone();
+}
+export function lkoFits(at: int, size: int, total: int): bool { return at >= 0 && size >= 0 && at <= total && size <= total - at; }
+function fits(at: int, size: int, total: int): bool { return lkoFits(at, size, total); }
+
+function shdr(o: int, index: int): int { return rd(o, 40, 8) + index * rd(o, 58, 2); }
+function shCount(o: int): int { return rd(o, 60, 2); }
+function shType(o: int, index: int): int { return rd(o, shdr(o, index) + 4, 4); }
+function shFlags(o: int, index: int): int { return rd(o, shdr(o, index) + 8, 8); }
+function shOffset(o: int, index: int): int { return rd(o, shdr(o, index) + 24, 8); }
+function shSize(o: int, index: int): int { return rd(o, shdr(o, index) + 32, 8); }
+function shLink(o: int, index: int): int { return rd(o, shdr(o, index) + 40, 4); }
+function shInfo(o: int, index: int): int { return rd(o, shdr(o, index) + 44, 4); }
+function shAlign(o: int, index: int): int { return rd(o, shdr(o, index) + 48, 8); }
+
+/// Output group of an input section: 0 text, 1 rodata, 2 data, 3 bss, -1 not loaded.
+function groupOf(o: int, index: int): int {
+    const t = shType(o, index);
+    const flags = shFlags(o, index);
+    if ((flags & 2) == 0) { return -1; }
+    if (t == 8) { return 3; }
+    if (t != 1) { return -1; }
+    if ((flags & 4) != 0) { return 0; }
+    if ((flags & 1) != 0) { return 2; }
+    return 1;
+}
+
+export function lkoAlignUp(value: int, alignment: int): int {
+    if (alignment <= 1) { return value; }
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
+// placed 里的下标按（对象, 节号）直接索引，放置时登记；逐符号、逐重定位都要查，线性扫描是符号数×节数。
+function findPlaced(o: int, index: int): int {
+    return listGet(listGet(placedAt, o) catch noInts(), index) catch -1;
+}
+
+/// Address of input section (o, index), or -1.
+function sectionAddress(o: int, index: int): int {
+    const k = findPlaced(o, index);
+    if (k < 0) { return -1; }
+    const p = listGet(placed, k) catch new InSec { obj: -1, index: -1, group: -1, off: 0, size: 0 };
+    return (listGet(groupBase, p.group) catch 0) + p.off;
+}
+
+// 产物函数符号用（link_symbols.tx）：对象个数、按名字找节、节的链接地址与内容。
+export function lkoObjectCount(): int { return listLen(objs); }
+/// 对象 o 里名为 name 的节号；没有得 −1。
+export function lkoSectionNamed(o: int, name: string): int {
+    let i = 1;
+    while (i < shCount(o)) { if (rawNameText(sectionName(o, i)) == name) { return i; } i = i + 1; }
+    return -1;
+}
+/// 输入节 (o, index) 的链接地址；未放置得 −1。
+export function lkoSectionAddress(o: int, index: int): int { return sectionAddress(o, index); }
+/// 对象 o 的节头数与节 index 的名字。
+export function lkoSectionCount(o: int): int { return shCount(o); }
+export function lkoSectionName(o: int, index: int): string { return rawNameText(sectionName(o, index)); }
+/// 输入节 (o, index) 已放置在代码组（可执行）。
+export function lkoSectionIsCode(o: int, index: int): bool { return index > 0 && index < shCount(o) && groupOf(o, index) == 0 && sectionAddress(o, index) >= 0; }
+/// 输入节 (o, index) 的大小。
+export function lkoSectionSize(o: int, index: int): int { return shSize(o, index); }
+/// 输入节 (o, index) 的文件内容（越界得空）。
+export function lkoSectionBytes(o: int, index: int): Bytes {
+    const data = listGet(objs, o) catch noBytes();
+    if (index <= 0 || index >= shCount(o) || !fits(shOffset(o, index), shSize(o, index), bytesLen(data))) { return noBytes(); }
+    return bytesSlice(data, shOffset(o, index), shSize(o, index));
+}
+export struct LkoFunction { name: string, va: int, size: int }
+/// 对象 o 符号表里定义在已放置代码节上的具名 STT_FUNC 符号（不带函数目录的对象据此出产物符号）。
+export function lkoObjectFunctions(o: int): List<Ref<LkoFunction>> {
+    const out: List<Ref<LkoFunction>> = listNew();
+    const st = symtabOf(o); if (st < 0) { return out; }
+    let s = 1;
+    while (s < shSize(o, st) / 24) {
+        const at = symAt(o, s); const section = rd(o, at + 6, 2); const value = rd(o, at + 8, 8);
+        if ((rd(o, at + 4, 1) & 15) == 2 && section != SHN_UNDEF && section < shCount(o) && groupOf(o, section) == 0
+            && sectionAddress(o, section) >= 0 && value <= shSize(o, section)) {
+            const name = rawNameText(symName(o, s));
+            if (len(name) > 0) { listPush(out, new LkoFunction { name: name, va: sectionAddress(o, section) + value, size: rd(o, at + 16, 8) }); }
+        }
+        s = s + 1;
+    }
+    return out;
+}
+
+function symtabOf(o: int): int {
+    if (o < listLen(symtabAt)) { return listGet(symtabAt, o) catch -1; }
+    let i = 0;
+    while (i < shCount(o)) { if (shType(o, i) == 2) { return i; } i = i + 1; }
+    return -1;
+}
+
+function symAt(o: int, sym: int): int { const st = symtabOf(o); return shOffset(o, st) + sym * 24; }
+
+function symName(o: int, sym: int): Ref<BinaryName> {
+    const st = symtabOf(o);
+    const strings = shLink(o, st);
+    return boundedName(o, shOffset(o, strings), shSize(o, strings), rd(o, symAt(o, sym), 4));
+}
+
+function nameHash(name: Ref<BinaryName>): int { return (name.hash >>> 0) & (BUCKETS - 1); }
+
+function globalLookupName(name: Ref<BinaryName>): int {
+    const bucket = listGet(buckets, nameHash(name)) catch noInts();
+    let k = 0;
+    while (k < listLen(bucket)) {
+        const at = listGet(bucket, k) catch 0;
+        if (rawNameEqual(listGet(globalNames, at) catch rawNameNone(), name)) { return at; }
+        k = k + 1;
+    }
+    return -1;
+}
+
+/// 全局符号的下标，没有为 −1。
+export function lkoLookup(name: string): int { return globalLookupName(rawNameOf(name)); }
+/// 下标 k 的全局符号的值（链接虚拟地址或绝对值）。
+export function lkoAddress(k: int): int { return listGet(globalAddrs, k) catch 0; }
+function globalAddName(name: Ref<BinaryName>, addr: int, kind: int): void {
+    const bucket = listGet(buckets, nameHash(name)) catch noInts();
+    listPush(bucket, listLen(globalNames));
+    listPush(globalNames, name); listPush(globalAddrs, addr); listPush(globalKinds, kind);
+}
+/// 写出器合成的全局符号（导入槽等），值为链接虚拟地址。
+export function lkoAddGlobal(name: string, addr: int): void { globalAddName(rawNameOf(name), addr, 0); }
+/// 全局符号表的枚举（登记次序）：个数、名字、种类（0 链接虚拟地址，1 绝对值）。
+export function lkoGlobalCount(): int { return listLen(globalNames); }
+export function lkoGlobalName(k: int): string { return rawNameText(listGet(globalNames, k) catch rawNameNone()); }
+export function lkoGlobalKind(k: int): int { return listGet(globalKinds, k) catch 0; }
+
+/// 各目标文件里引用（未定义、非 LOCAL）且以 prefix 开头的符号名，按首次出现的次序去重。不看全局表：
+/// 由写出器在登记合成符号时核对重名（导入槽 `__imp_<名>` 即由此收集）。须在 lkoBegin 成功之后调用。
+export function lkoUndefinedWithPrefix(prefix: string): List<string> {
+    const names: List<string> = listNew();
+    let o = 0;
+    while (o < listLen(objs)) {
+        const st = symtabOf(o);
+        const count = shSize(o, st) / 24;
+        let s = shInfo(o, st);
+        while (s < count) {
+            const at = symAt(o, s);
+            if (rd(o, at + 6, 2) == SHN_UNDEF && (rd(o, at + 4, 1) >>> 4) != 0) {
+                const text = rawNameText(symName(o, s));
+                if (strIndexOf(text, prefix) == 0 && !hasName(names, text)) { listPush(names, text); }
+            }
+            s = s + 1;
+        }
+        o = o + 1;
+    }
+    return names;
+}
+
+function hasName(names: List<string>, x: string): bool {
+    for (n in names) { if (n == x) { return true; } }
+    return false;
+}
+
+// Presence is separate from all 64 bits of an absolute symbol's value.
+function symResolved(o: int, sym: int): bool {
+    const at = symAt(o, sym); const shndx = rd(o, at + 6, 2);
+    if (shndx == SHN_UNDEF) { return (rd(o, at + 4, 1) >>> 4) != 0 && globalLookupName(symName(o, sym)) >= 0; }
+    if (shndx == SHN_ABS) { return true; }
+    return sectionAddress(o, shndx) >= 0;
+}
+
+// symAddress 与 symResolved 一次算出并记入缓存：未定义符号只取一次名字、查一次全局表。
+function cacheSymbol(o: int, sym: int, cache: List<int>, resolved: List<int>): void {
+    const at = symAt(o, sym);
+    const shndx = rd(o, at + 6, 2);
+    if (shndx == SHN_UNDEF) {
+        let k = -1;
+        if ((rd(o, at + 4, 1) >>> 4) != 0) { k = globalLookupName(symName(o, sym)); }
+        if (k < 0) { listPush(cache, -1); listPush(resolved, 0); return; }
+        listPush(cache, listGet(globalAddrs, k) catch -1); listPush(resolved, 1);
+        return;
+    }
+    if (shndx == SHN_ABS) { listPush(cache, rd(o, at + 8, 8)); listPush(resolved, 1); return; }
+    const base = sectionAddress(o, shndx);
+    if (base < 0) { listPush(cache, -1); listPush(resolved, 0); return; }
+    listPush(cache, base + rd(o, at + 8, 8)); listPush(resolved, 1);
+}
+
+// 字符串表非空且末字节为 NUL（ELF gABI 的规定；同 LLVM ELFFile::getStringTable），此后任一偏移小于表长的名字都有终止符，
+// 名字的边界检查只需比较偏移，不必逐个扫描。
+function stringTableOk(o: int, section: int): bool {
+    const size = shSize(o, section);
+    return size > 0 && (rd(o, shOffset(o, section) + size - 1, 1)) == 0;
+}
+
+/// Full value bits; use symResolved separately to distinguish an absent value.
+function symAddress(o: int, sym: int): int {
+    const at = symAt(o, sym);
+    const bind = rd(o, at + 4, 1) >>> 4;
+    const shndx = rd(o, at + 6, 2);
+    const value = rd(o, at + 8, 8);
+    if (shndx == SHN_UNDEF) {
+        if (bind == 0) { return -1; }
+        const k = globalLookupName(symName(o, sym));
+        if (k < 0) { return -1; }
+        return listGet(globalAddrs, k) catch -1;
+    }
+    if (shndx == SHN_ABS) { return value; }
+    const base = sectionAddress(o, shndx);
+    if (base < 0) { return -1; }
+    return base + value;
+}
+
+function checkObject(o: int): int {
+    const data = listGet(objs, o) catch noBytes();
+    if (bytesLen(data) < 64) { return lkoReject("ElfObjectTooSmall"); }
+    if (rd(o, 0, 4) != 1179403647 || rd(o, 4, 1) != 2 || rd(o, 5, 1) != 1) { return lkoReject("NotElf64LittleEndian"); }
+    if (rd(o, 16, 2) != 1 || rd(o, 18, 2) != machine) {
+        if (machine == 183) { return lkoReject("NotAArch64Relocatable"); }
+        return lkoReject("NotX8664Relocatable");
+    }
+    if (rd(o, 58, 2) != 64 || shCount(o) == 0 || !fits(rd(o, 40, 8), shCount(o) * 64, bytesLen(data))) { return lkoReject("BadSectionHeaders"); }
+    const st = symtabOf(o); if (st < 0) { return lkoReject("MissingSymtab"); }
+    let section = 1;
+    while (section < shCount(o)) {
+        if (shSize(o, section) < 0 || shAlign(o, section) < 0) { return lkoReject("BadSectionBounds"); }
+        if (shType(o, section) != 8 && !fits(shOffset(o, section), shSize(o, section), bytesLen(data))) { return lkoReject("BadSectionBounds"); }
+        if ((shFlags(o, section) & 1024) != 0) { return lkoReject("UnsupportedTlsSection"); }
+        if (shType(o, section) == 9) { return lkoReject("UnsupportedRelSection"); }
+        if (shType(o, section) == 4 && (rd(o, shdr(o, section) + 56, 8) != 24 || shSize(o, section) % 24 != 0 || shLink(o, section) != st || shInfo(o, section) <= 0 || shInfo(o, section) >= shCount(o))) { return lkoReject("BadRelocationTable"); }
+        section = section + 1;
+    }
+    if (rd(o, shdr(o, st) + 56, 8) != 24 || shSize(o, st) % 24 != 0 || shInfo(o, st) > shSize(o, st) / 24) { return lkoReject("BadSymtab"); }
+    const strings = shLink(o, st);
+    if (strings <= 0 || strings >= shCount(o) || shType(o, strings) != 3 || !stringTableOk(o, strings)) { return lkoReject("BadStringTable"); }
+    const shstrings = rd(o, 62, 2);
+    if (shstrings >= shCount(o) || (shstrings > 0 && (shType(o, shstrings) != 3 || !stringTableOk(o, shstrings)))) { return lkoReject("BadSectionNames"); }
+    section = 1;
+    while (shstrings > 0 && section < shCount(o)) {
+        if (rd(o, shdr(o, section), 4) >= shSize(o, shstrings)) { return lkoReject("BadSectionName"); }
+        section = section + 1;
+    }
+    const nameLimit = shSize(o, strings);
+    let s = 0;
+    while (s < shSize(o, st) / 24) {
+        const at = symAt(o, s); const index = rd(o, at + 6, 2); const value = rd(o, at + 8, 8); const size = rd(o, at + 16, 8);
+        if (rd(o, at, 4) >= nameLimit) { return lkoReject("BadSymbolName"); }
+        if ((rd(o, at + 4, 1) & 15) == 6) { return lkoReject("UnsupportedTlsSymbol"); }
+        if (index != SHN_UNDEF && index != SHN_ABS && (index >= shCount(o) || !fits(value, size, shSize(o, index)))) { return lkoReject("BadSymbolSection"); }
+        s = s + 1;
+    }
+    return 0;
+}
+
+/// 开始一次链接：重置状态、校验全部目标文件、建（对象, 节号）索引。mapTarget 为链接表的目标名。
+export function lkoBegin(objects: List<Bytes>, mapTarget: string): int {
+    linkMapBegin(mapTarget);
+    failure = ""; objs = objects; placed = listNew();
+    groupSize = listNew(); groupAlign = listNew(); groupBase = listNew();
+    globalNames = listNew(); globalAddrs = listNew(); globalKinds = listNew(); buckets = listNew(); symCache = listNew(); symResolvedCache = listNew();
+    placedAt = listNew(); symtabAt = listNew();
+    machine = 62;
+    if (listLen(objs) > 0 && lkoObjectMachine(listGet(objs, 0) catch noBytes()) == 183) { machine = 183; }
+    let h = 0;
+    while (h < BUCKETS) { listPush(buckets, listNew()); h = h + 1; }
+    let g = 0;
+    while (g < 4) { listPush(groupSize, 0); listPush(groupAlign, 16); listPush(groupBase, 0); g = g + 1; }
+    let o = 0;
+    while (o < listLen(objs)) {
+        if (checkObject(o) != 0) { return 1; }
+        o = o + 1;
+    }
+    const symtabs: List<int> = listNew();
+    o = 0;
+    while (o < listLen(objs)) {
+        listPush(symtabs, symtabOf(o));
+        const slots: List<int> = listNew();
+        let i = 0;
+        while (i < shCount(o)) { listPush(slots, -1); i = i + 1; }
+        listPush(placedAt, slots);
+        o = o + 1;
+    }
+    symtabAt = symtabs;
+    return 0;
+}
+
+/// Place loaded sections, group by group, objects in order（组内偏移；组的虚拟地址由写出器经 lkoSetGroupBase 给出）。
+export function lkoPlace(): int {
+    let g = 0;
+    while (g < 4) {
+        let o = 0;
+        while (o < listLen(objs)) {
+            let i = 1;
+            while (i < shCount(o)) {
+                if (groupOf(o, i) == g) {
+                    let a = shAlign(o, i);
+                    if (a < 1) { a = 1; }
+                    // gABI：sh_addralign 只能是 0 或 2 的幂（同 lld）；组基址按页对齐，别的值在绝对地址上兑现不了。
+                    if (a > PAGE || (a & (a - 1)) != 0) { return lkoReject("UnsupportedSectionAlignment"); }
+                    if (a > (listGet(groupAlign, g) catch 16)) { listSet(groupAlign, g, a); }
+                    const at = lkoAlignUp(listGet(groupSize, g) catch 0, a);
+                    const size = shSize(o, i);
+                    // 偏移与尺寸都是对象文件里的 64 位字段：用不会溢出的 fits 核对；NOBITS（.bss）没有文件字节，另以映像上限为界。
+                    if (g != 3 && !fits(shOffset(o, i), size, bytesLen(listGet(objs, o) catch noBytes()))) { return lkoReject("SectionOutOfFile"); }
+                    if (size < 0 || size > LKO_IMAGE_LIMIT - at) { return lkoReject("ImageTooLarge"); }
+                    listSet(listGet(placedAt, o) catch noInts(), i, listLen(placed));
+                    listPush(placed, new InSec { obj: o, index: i, group: g, off: at, size: size });
+                    listSet(groupSize, g, at + size);
+                }
+                i = i + 1;
+            }
+            o = o + 1;
+        }
+        g = g + 1;
+    }
+    return 0;
+}
+
+export function lkoGroupSize(g: int): int { return listGet(groupSize, g) catch 0; }
+export function lkoGroupAlign(g: int): int { return listGet(groupAlign, g) catch 16; }
+export function lkoGroupBase(g: int): int { return listGet(groupBase, g) catch 0; }
+/// 写出器在组尾追加自己的结构（动态段、导入槽等）后改写组的尺寸与对齐。
+export function lkoSetGroupSize(g: int, size: int): void { listSet(groupSize, g, size); }
+export function lkoSetGroupAlign(g: int, alignment: int): void { listSet(groupAlign, g, alignment); }
+export function lkoSetGroupBase(g: int, va: int): void { listSet(groupBase, g, va); }
+
+/// Global definitions（各组虚拟地址定好之后）。
+export function lkoDefineGlobals(): int {
+    let o = 0;
+    while (o < listLen(objs)) {
+        const st = symtabOf(o);
+        const count = shSize(o, st) / 24;
+        let s = shInfo(o, st);
+        while (s < count) {
+            const at = symAt(o, s);
+            const shndx = rd(o, at + 6, 2);
+            const bind = rd(o, at + 4, 1) >>> 4;
+            if (shndx != SHN_UNDEF && (bind == 1 || bind == 2)) {
+                const name = symName(o, s);
+                const addr = symAddress(o, s);
+                if (!symResolved(o, s)) { return lkoReject("BadSymbol:" + rawNameText(name)); }
+                const k = globalLookupName(name);
+                if (k >= 0) {
+                    if (bind == 1) { return lkoReject("DuplicateSymbol:" + rawNameText(name)); }
+                } else {
+                    let kind = 0; if (shndx == SHN_ABS) { kind = 1; } globalAddName(name, addr, kind);
+                }
+            }
+            s = s + 1;
+        }
+        o = o + 1;
+    }
+    return 0;
+}
+
+/// 合成符号登记完之后，逐对象缓存每个符号的值与是否已解析。
+export function lkoCacheSymbols(): void {
+    let o = 0;
+    while (o < listLen(objs)) {
+        const st = symtabOf(o);
+        const count = shSize(o, st) / 24;
+        const cache: List<int> = listNew();
+        const resolved: List<int> = listNew();
+        let s = 0;
+        while (s < count) { cacheSymbol(o, s, cache, resolved); s = s + 1; }
+        listPush(symCache, cache);
+        listPush(symResolvedCache, resolved);
+        o = o + 1;
+    }
+}
+
+/// Section bytes（bss 不占文件）：拷到 out 的 虚拟地址 − base 处。
+export function lkoCopySections(out: Bytes, base: int): void {
+    let k = 0;
+    while (k < listLen(placed)) {
+        const p = listGet(placed, k) catch new InSec { obj: -1, index: -1, group: -1, off: 0, size: 0 };
+        if (p.group != 3) {
+            const data = listGet(objs, p.obj) catch noBytes();
+            const src = shOffset(p.obj, p.index);
+            const dst = (listGet(groupBase, p.group) catch 0) - base + p.off;
+            let i = 0;
+            while (i < p.size) { bytesSet(out, dst + i, bytesGet(data, src + i) catch 0); i = i + 1; }
+        }
+        k = k + 1;
+    }
+}
+
+function patch(out: Bytes, at: int, value: int, width: int): void {
+    let i = 0;
+    while (i < width) { bytesSet(out, at + i, (value >>> (i * 8)) & 255); i = i + 1; }
+}
+
+/// Relocations。absSites 收集每个 64 位绝对地址重定位的位置（虚拟地址），供需要加载期 rebase 的格式使用（PIE 的 Mach-O）。
+export function lkoRelocate(out: Bytes, base: int, absSites: List<int>): int {
+    let o = 0;
+    while (o < listLen(objs)) {
+        let r = 1;
+        while (r < shCount(o)) {
+            if (shType(o, r) == 4) {
+                const target = shInfo(o, r);
+                const sbase = sectionAddress(o, target);
+                if (sbase >= 0) {
+                    const count = shSize(o, r) / 24;
+                    // 逐条不变的量先取出（检查与先后次序不变）。
+                    const table = shOffset(o, r);
+                    const symCount = shSize(o, symtabOf(o)) / 24;
+                    const targetSize = shSize(o, target);
+                    const targetNobits = shType(o, target) == 8;
+                    const outLen = bytesLen(out);
+                    const cacheO = listGet(symCache, o) catch noInts();
+                    const resolvedO = listGet(symResolvedCache, o) catch noInts();
+                    let e = 0;
+                    while (e < count) {
+                        const at = table + e * 24;
+                        const where = rd(o, at, 8);
+                        const info = rd(o, at + 8, 8);
+                        const addend = rd(o, at + 16, 8);
+                        const kind = info & 4294967295;
+                        const sym = info >>> 32;
+                        if (sym >= symCount) { return lkoReject("BadRelocationSymbol"); }
+                        const s = listGet(cacheO, sym) catch -1;
+                        if ((listGet(resolvedO, sym) catch 0) == 0) { return lkoReject("MissingSymbol:" + rawNameText(symName(o, sym))); }
+                        let width = 4; if (kind == 1 || (machine == 183 && kind == 257)) { width = 8; }
+                        // 先核对位置再求地址：where 取自对象文件，核对之前相加可能溢出（结构化变异查出）。
+                        if (!fits(where, width, targetSize) || targetNobits) { return lkoReject("BadRelocationSite"); }
+                        const site = sbase + where;
+                        const fileAt = site - base;
+                        if (!fits(fileAt, width, outLen)) { return lkoReject("BadRelocationSite"); }
+                        // S+A（与 S+A−P）按 x86-64 psABI 以 64 位环绕计算，32 位的几种再核对范围，同 lld；加数取自对象文件，
+                        // 带检查的 int 加法会在极端加数上 trap 4004，而不是拒绝这个对象。
+                        const sa = wrapAdd(s, addend);
+                        if (machine == 183) {
+                            if (a64Relocate(out, fileAt, site, kind, sa, absSites) != 0) { return 1; }
+                        } else if (kind == 1) {
+                            patch(out, fileAt, sa, 8);
+                            listPush(absSites, site);
+                        } else if (kind == 2 || kind == 4) {
+                            const v = wrapSub(sa, site);
+                            if (v < -2147483648 || v > 2147483647) { return lkoReject("RelativeRelocationOutOfRange"); }
+                            patch(out, fileAt, v, 4);
+                        } else if (kind == 10) {
+                            const v = sa;
+                            if (v < 0 || v > 4294967295) { return lkoReject("AbsoluteRelocationOutOfRange"); }
+                            patch(out, fileAt, v, 4);
+                        } else if (kind == 11) {
+                            const v = sa;
+                            if (v < -2147483648 || v > 2147483647) { return lkoReject("AbsoluteRelocationOutOfRange"); }
+                            patch(out, fileAt, v, 4);
+                        } else {
+                            return lkoReject("UnsupportedRelocation:" + toStr(kind));
+                        }
+                        e = e + 1;
+                    }
+                }
+            }
+            r = r + 1;
+        }
+        o = o + 1;
+    }
+    return 0;
+}
+
+function word32(out: Bytes, at: int): int {
+    return (bytesGet(out, at) catch 0) | ((bytesGet(out, at + 1) catch 0) << 8) | ((bytesGet(out, at + 2) catch 0) << 16) | ((bytesGet(out, at + 3) catch 0) << 24);
+}
+
+// AArch64 的 RELA（ELF for the Arm 64-bit Architecture）：sa = S+A，site = P。指令里的操作码位保留，只改立即数位；
+// 范围与对齐不合即拒绝（不截断）。PAGE21 以 4 KiB 页计；LDSTn 的页内偏移按访问宽度缩放，须对齐。
+function a64Relocate(out: Bytes, fileAt: int, site: int, kind: int, sa: int, absSites: List<int>): int {
+    if (kind == 257) { patch(out, fileAt, sa, 8); listPush(absSites, site); return 0; }
+    if (kind == 261) {
+        const v = wrapSub(sa, site);
+        if (v < -2147483648 || v > 2147483647) { return lkoReject("RelativeRelocationOutOfRange"); }
+        patch(out, fileAt, v, 4); return 0;
+    }
+    const insn = word32(out, fileAt);
+    if (kind == 282 || kind == 283 || kind == 280 || kind == 279) {
+        const v = wrapSub(sa, site);
+        let limit = 134217728; let bits = 67108863; let shift = 0;
+        if (kind == 280) { limit = 1048576; bits = 524287; shift = 5; }
+        if (kind == 279) { limit = 32768; bits = 16383; shift = 5; }
+        if (v % 4 != 0 || v < -limit || v >= limit) { return lkoReject("BranchRelocationOutOfRange"); }
+        patch(out, fileAt, (insn & ~(bits << shift)) | (((v / 4) & bits) << shift), 4); return 0;
+    }
+    if (kind == 275) {
+        const pages = wrapSub(sa & -4096, site & -4096) / 4096;
+        if (pages < -1048576 || pages > 1048575) { return lkoReject("PageRelocationOutOfRange"); }
+        const v = pages & 2097151;
+        patch(out, fileAt, (insn & 2667577375) | ((v & 3) << 29) | ((v >>> 2) << 5), 4); return 0;
+    }
+    let scale = -1;
+    if (kind == 277 || kind == 278) { scale = 0; }
+    if (kind == 284) { scale = 1; }
+    if (kind == 285) { scale = 2; }
+    if (kind == 286) { scale = 3; }
+    if (kind == 299) { scale = 4; }
+    if (scale < 0) { return lkoReject("UnsupportedRelocation:" + toStr(kind)); }
+    const low = sa & 4095;
+    if ((low & ((1 << scale) - 1)) != 0) { return lkoReject("MisalignedPageOffset"); }
+    patch(out, fileAt, (insn & ~(4095 << 10)) | ((low >>> scale) << 10), 4);
+    return 0;
+}
+
+function sectionName(o: int, section: int): Ref<BinaryName> {
+    const strings = rd(o, 62, 2); if (strings == 0) { return rawNameNone(); }
+    return boundedName(o, shOffset(o, strings), shSize(o, strings), rd(o, shdr(o, section), 4));
+}
+
+/// 链接表：四组的实际放置与各输入符号（base 为 文件偏移 = 虚拟地址 − base 的常数）。
+export function lkoCollectMap(base: int, entry: int): void {
+    linkMapLayout(base, entry);
+    // Actual producer groups; BSS is a virtual tail of the data segment.
+    const names = ["text", "rodata", "data", "bss"]; let g = 0;
+    while (g < 4) {
+        const va = listGet(groupBase, g) catch 0; const size = listGet(groupSize, g) catch 0;
+        let file = size; let at = va - base; if (g == 3) { file = 0; at = -1; }
+        linkMapAddSection(g, rawNameOf(names[g]), va, at, file, size); g = g + 1;
+    }
+    for (p in placed) { linkMapAddPlacement(p.obj, p.index, p.group, (listGet(groupBase, p.group) catch 0) + p.off, p.size); }
+    if (!linkMapSymbolsEnabled()) { return; }
+    let o = 0;
+    while (o < listLen(objs)) {
+        const st = symtabOf(o); let s = 1;
+        while (s < shSize(o, st) / 24) {
+            const name = symName(o, s);
+            if (rawNameSize(name) == 0) { s = s + 1; continue; }
+            const at = symAt(o, s); const section = rd(o, at + 6, 2); const value = rd(o, at + 8, 8);
+            const row = linkMapRow(name, "input", o, s); const binding = rd(o, at + 4, 1) >>> 4;
+            row.binding = "elf:" + toStr(binding); if (binding == 0) { row.binding = "local"; } if (binding == 1) { row.binding = "global"; } if (binding == 2) { row.binding = "weak"; }
+            row.symbolType = "elf:" + toStr(rd(o, at + 4, 1) & 15); row.declaredSize = rd(o, at + 16, 8); row.hasDeclaredSize = true;
+            if (section == SHN_ABS) { row.valueKind = "absolute"; row.value = value; row.state = "absolute"; }
+            else if (section != SHN_UNDEF) {
+                linkMapInput(row, section, sectionName(o, section), value);
+                row.valueKind = "section-relative"; row.value = value; row.state = "not-placed";
+                const p = findPlaced(o, section);
+                if (p >= 0) {
+                    row.valueKind = "link-va"; row.value = symAddress(o, s); row.state = "defined";
+                    row.outputSection = (listGet(placed, p) catch new InSec { obj: -1, index: -1, group: -1, off: 0, size: 0 }).group;
+                }
+            } else if (symResolved(o, s)) {
+                row.valueKind = "link-va"; row.value = symAddress(o, s); row.state = "resolved-reference";
+                const winner = globalLookupName(name);
+                if ((listGet(globalKinds, winner) catch 0) == 1) { row.valueKind = "absolute"; }
+            }
+            linkMapAdd(row); s = s + 1;
+        }
+        o = o + 1;
+    }
+}

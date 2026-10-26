@@ -1,0 +1,714 @@
+// NRT 线程间发送（线程第 3 步，docs/design/v052-threads-v0.1-20261015.md §十八）：把一个值可达的对象图深拷贝
+// 成与线程无关的转移块，接收线程在自己的槽表里物化。图内的共享与环保持原样（同结构化克隆）。
+//
+// 转移块（进程级内存，系统直接分配；发送方建、接收方物化后归还）：
+//   头 80 字节（版本 2，线程第 4c 步）：魔数@0、版本@4、总字节@8（归还用）、对象数@16、数据区字节@24、根值@32/@40、
+//   内嵌共享块数@48、共享块表偏移@56（相对块首）、引用数@64（共享块用；转移块为 0）、保留@72。
+//   对象表：每个对象 48 字节——种类@0、类型号@4、分配点@8、载荷种类@12、meta@16、aux@20、len@24、cap@32、
+//   数据偏移@40（相对数据区）。
+//   数据区：字节载荷（按 8 对齐）、值数组（每值 16 字节）、紧凑 List 的 8 字节载荷、Atomic 的 8 字节值单元。
+//   共享块表：块里每个 Shared 值占一项（8 字节共享块地址），每项持被引块的一份计数；归还块时逐项放手，转移块的
+//   接收方接管这些计数后把项数清零。
+// 值的编码：非堆引用照抄 16 字节；堆引用的载荷改写为块内对象号，启动对象（字符串常量、模块状态）改写为
+// 原序号并置第 62 位——各线程的启动对象序号逐一相同（§十三-1），接收方直接用自己的那一份，模块级状态因此
+// 跟随接收线程。判定依据是序号小于主线程启动后的槽表长度（启动阶段只建永生对象，这一段槽位从不归还复用）。
+//
+// 发送方按对象号顺序处理（对象表即工作表，不递归），散列表记已访问的源对象。物化分三遍：先按记录建出全部
+// 对象（值槽先填 None），再改写引用并逐个 retain，最后放掉每个对象的创建引用（根值另持一份）。物化前逐项
+// 校验块内对象号、标签、载荷种类与数据范围（§十一-7：块只由本进程生成，这是防实现缺陷的断言）。
+//
+// 可发送核对（第 3b 步）：发送点静态类型里直接出现的 Weak、Future、Gen、Thread 与句柄，前端已报 3035；经函数值、
+// 接口值（擦除了捕获与具体类型）带入的，发送时核对——遇到这四种标签，或 struct、enum 及其 Ref（含闭包环境与接口
+// 装入）的类型号在镜像的可发送表里标为 0，发送即停下，返回原因码（1 标签、2 类型号表），由调用方 trap 4021。
+//
+// 共享（第 4c 步，§二十一）：同一个发送方按模式 1 编出 sharedNew 的共享块——可发送表项 2（只可共享，含 Atomic）
+// 放行，Atomic 的值单元拷进数据区。Shared 值（标签 20）在两种模式下都只编块地址并给被引块加一份计数，不拷内容。
+// 接收方按模式 1 在本线程“借用物化”共享块（nrt_shared.tx 的 sharedGet）：对象一律冻结（对象头位 16）；字节载荷、
+// 紧凑 List 的数值载荷与 Atomic 的值单元不拷贝，直接指向块的数据区，对象头再置借用位 32、在结果载荷位 @64 记下
+// 块地址并各持块的一份计数；值数组照常每线程一份。
+import { StructuredBuffer, asBufferLabel, asBufferZero } from "./assemble";
+import { RtFn, RtOp, L, I, A, G } from "./rtfn_base";
+import { rtBegin, rtSet, rtSetGlobal, rtOp, rtShift, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtCall5, rtSyscall, rtRet, rtRetVoid } from "./rtfn";
+import { check, fatal, memcpyName, nrtTarget } from "./nrt_base";
+import { tSysV, tRawSyscall, tUnix } from "./target";
+import { uxSys, uxMapFlags } from "./unix_sys";
+
+const MAGIC: int = 1112752212; // "TXSB"
+const VERSION: int = 2;
+const HDR: int = 80;
+
+// 接收侧的区段核对（运行时加固 H2，同 Go encoding/gob 先核对 元素数×宽度 不溢出再分配）：
+// [doff, doff + 局部 n) 须落在数据区 [0, datab) 里，写成 n ≤ datab 且 doff ≤ datab − n（不会绕回）；否则转 bad。
+function inData(f: Ref<RtFn>, n: string): void {
+    rtIf(f, L(n), "ugt", L("datab"), "bad");
+    rtOp(f, "x", L("datab"), "sub", L(n));
+    rtIf(f, L("doff"), "ugt", L("x"), "bad");
+}
+// 元素数 len 左移 shift 位不超过数据区（因而不溢出）；否则转 bad。
+function lenFits(f: Ref<RtFn>, shift: int): void {
+    rtShift(f, "x", L("datab"), "shr", shift);
+    rtIf(f, L("len"), "ugt", L("x"), "bad");
+}
+const REC: int = 48;
+const STARTUP_BIT: int = 4611686018427387904; // 2^62
+const LOW32: int = 4294967295;
+// 发送方状态（堆上 152 字节）：对象表 {ptr,len,cap}@0、源对象号表@24、数据区@48、散列表 {ptr,cap,count}@72、
+// 启动对象界@96、对象数@104、失败原因@112、模式@120（0 发送 1 共享）、共享块表 {ptr,count,cap}@128。
+const ST_TAB: int = 0;
+const ST_SRC: int = 24;
+const ST_DATA: int = 48;
+const ST_MAP: int = 72;
+const ST_MAPCAP: int = 80;
+const ST_MAPN: int = 88;
+const ST_STARTUP: int = 96;
+const ST_NOBJ: int = 104;
+const ST_WHY: int = 112;
+const ST_MODE: int = 120;
+const ST_SHR: int = 128;
+const ST_BYTES: int = 152;
+// 原生镜像 v3 的可发送表：表项数@88、表指针@96（须与 ./nrt 的 NRT_IMAGE_VERSION、NRT_IMG_NTYPES、NRT_IMG_SENDABLE
+// 一致；不引 ./nrt 以免成环）。v2 镜像没有此表，全部按可发送。
+const IMG_SEND_VERSION: int = 3;
+const IMG_NTYPES: int = 88;
+const IMG_SENDABLE: int = 96;
+
+function memsetName(): string { if (tSysV(nrtTarget())) { return "__tx_linux_memset"; } return "memset"; }
+
+function sysArgs6(a: Ref<RtOp>, c: Ref<RtOp>, d: Ref<RtOp>, e: Ref<RtOp>, g: Ref<RtOp>, h: Ref<RtOp>): List<Ref<RtOp>> {
+    const xs: List<Ref<RtOp>> = listNew();
+    listPush(xs, a); listPush(xs, c); listPush(xs, d); listPush(xs, e); listPush(xs, g); listPush(xs, h);
+    return xs;
+}
+
+function sysArgs2(a: Ref<RtOp>, c: Ref<RtOp>): List<Ref<RtOp>> {
+    const xs: List<Ref<RtOp>> = listNew(); listPush(xs, a); listPush(xs, c); return xs;
+}
+
+/// 进程级 .bss：主线程启动后的槽表长度（启动对象界）。
+export function nrtSendBss(b: Ref<StructuredBuffer>): void {
+    asBufferLabel(b, "__tx_nrt_startup_slots", 1); asBufferZero(b, 8, 1);
+}
+
+/// 线程间发送的内核例程。
+export function emitNrtSend(b: Ref<StructuredBuffer>): void {
+    emitBlocks(b, nrtTarget());
+    emitSender(b);
+    emitReceiver(b);
+}
+
+function emitBlocks(b: Ref<StructuredBuffer>, t: int): void {
+    // __tx_xblk_alloc(n) → 进程级内存（系统直接分配，已清零）；失败即内存不足终局。
+    let f = rtBegin(b, "__tx_xblk_alloc", "n", "p", 6, "bootstrap/selfhost/nrt_send.tx");
+    if (tUnix(t)) {
+        uxSys(f, t, "p", 9, sysArgs6(I(0), L("n"), I(3), I(uxMapFlags(t, 34)), I(-1), I(0)));
+        rtIf(f, L("p"), "lt", I(0), "oom");
+    } else {
+        rtCall4(f, "p", "VirtualAlloc", I(0), L("n"), I(12288), I(4));
+        rtIf(f, L("p"), "eq", I(0), "oom");
+    }
+    rtRet(f, L("p"));
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRet(f, I(0)); check(f);
+
+    // __tx_xblk_free(blk)：归还转移块或共享块（总字节在头 @8），以及因此归零的共享块。块里内嵌的共享块引用（项数@48、
+    // 表偏移@56）逐项放手；放掉最后一份的被引块已无别的持有者，以头的保留字 @72 串进待放链，循环归还——嵌套多深都不
+    // 递归（同 CPython trashcan 把待释放对象串起来延后处理）。只用原子操作与系统调用、不碰堆与线程块：线程结束时
+    // 本线程的堆已归还后仍经这里放手（nrt_spawn.tx 的 __tx_thread_finish）。
+    f = rtBegin(b, "__tx_xblk_free", "blk", "head n p q last", 3, "bootstrap/selfhost/nrt_send.tx");
+    rtIf(f, L("blk"), "eq", I(0), "done");
+    rtStore(f, L("blk"), 72, I(0), 8);
+    rtSet(f, "head", L("blk"));
+    rtLabel(f, "next");
+    rtIf(f, L("head"), "eq", I(0), "done");
+    rtSet(f, "blk", L("head")); rtLoad(f, "head", L("blk"), 72, 8);
+    rtLoad(f, "n", L("blk"), 48, 8); rtLoad(f, "p", L("blk"), 56, 8); rtOp(f, "p", L("p"), "add", L("blk"));
+    rtLabel(f, "shr");
+    rtIf(f, L("n"), "eq", I(0), "free");
+    rtLoad(f, "q", L("p"), 0, 8);
+    rtCall1(f, "last", "__tx_shared_dec", L("q"));
+    rtIf(f, L("last"), "eq", I(0), "kept");
+    rtStore(f, L("q"), 72, L("head"), 8); rtSet(f, "head", L("q"));
+    rtLabel(f, "kept");
+    rtOp(f, "p", L("p"), "add", I(8)); rtOp(f, "n", L("n"), "sub", I(1));
+    rtJump(f, "shr");
+    rtLabel(f, "free");
+    if (tUnix(t)) {
+        rtLoad(f, "n", L("blk"), 8, 8);
+        uxSys(f, t, "", 11, sysArgs2(L("blk"), L("n")));
+    } else {
+        rtCall3(f, "", "VirtualFree", L("blk"), I(0), I(32768));
+    }
+    rtJump(f, "next");
+    rtLabel(f, "done"); rtRetVoid(f); check(f);
+
+    // __tx_sx_reserve(vec, n) → 向量 {ptr,len,cap} 末尾新增 n 字节的地址（容量按需翻倍；下次 reserve 后失效）。
+    f = rtBegin(b, "__tx_sx_reserve", "vec n", "len cap need p q", 3, "bootstrap/selfhost/nrt_send.tx");
+    rtLoad(f, "len", L("vec"), 8, 8); rtLoad(f, "cap", L("vec"), 16, 8);
+    rtOp(f, "need", L("len"), "add", L("n"));
+    rtIf(f, L("need"), "ule", L("cap"), "have");
+    rtIf(f, L("cap"), "ne", I(0), "grow");
+    rtSet(f, "cap", I(256));
+    rtLabel(f, "grow");
+    rtIf(f, L("cap"), "uge", L("need"), "alloc");
+    rtOp(f, "cap", L("cap"), "add", L("cap"));
+    rtJump(f, "grow");
+    rtLabel(f, "alloc");
+    rtCall2(f, "p", "__tx_native_mem_alloc", L("cap"), I(8));
+    rtIf(f, L("p"), "eq", I(0), "oom");
+    rtIf(f, L("len"), "eq", I(0), "store");
+    rtLoad(f, "q", L("vec"), 0, 8);
+    rtCall3(f, "", memcpyName(), L("p"), L("q"), L("len"));
+    rtCall1(f, "", "__tx_native_mem_free", L("q"));
+    rtLabel(f, "store");
+    rtStore(f, L("vec"), 0, L("p"), 8); rtStore(f, L("vec"), 16, L("cap"), 8);
+    rtLabel(f, "have");
+    rtStore(f, L("vec"), 8, L("need"), 8);
+    rtLoad(f, "p", L("vec"), 0, 8); rtOp(f, "p", L("p"), "add", L("len"));
+    rtRet(f, L("p"));
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRet(f, I(0)); check(f);
+}
+
+function emitSender(b: Ref<StructuredBuffer>): void {
+    // __tx_sx_map_put(st, key, id)：开放寻址插入（键＝源对象号＋1，0＝空位；不查重，调用方已查过）。
+    let f = rtBegin(b, "__tx_sx_map_put", "st key id", "p cap h e k", 0, "bootstrap/selfhost/nrt_send.tx");
+    rtLoad(f, "p", L("st"), ST_MAP, 8); rtLoad(f, "cap", L("st"), ST_MAPCAP, 8);
+    rtOp(f, "h", L("key"), "imul", I(2654435761)); rtShift(f, "h", L("h"), "shr", 7);
+    rtOp(f, "cap", L("cap"), "sub", I(1));
+    rtLabel(f, "probe");
+    rtOp(f, "h", L("h"), "and", L("cap"));
+    rtShift(f, "e", L("h"), "shl", 3); rtOp(f, "e", L("e"), "add", L("p"));
+    rtLoad(f, "k", L("e"), 0, 4);
+    rtIf(f, L("k"), "eq", I(0), "put");
+    rtOp(f, "h", L("h"), "add", I(1)); rtJump(f, "probe");
+    rtLabel(f, "put");
+    rtStore(f, L("e"), 0, L("key"), 4); rtStore(f, L("e"), 4, L("id"), 4);
+    rtRetVoid(f); check(f);
+
+    // __tx_sx_ref(st, idx) → 源对象 idx 的块内对象号；初次遇到即分配新号、记入源对象号表（散列表负载过半时翻倍重建）。
+    f = rtBegin(b, "__tx_sx_ref", "st idx", "p cap h e k key id old oldcap i", 3, "bootstrap/selfhost/nrt_send.tx");
+    rtOp(f, "key", L("idx"), "add", I(1));
+    rtLoad(f, "p", L("st"), ST_MAP, 8); rtLoad(f, "cap", L("st"), ST_MAPCAP, 8);
+    rtOp(f, "h", L("key"), "imul", I(2654435761)); rtShift(f, "h", L("h"), "shr", 7);
+    rtOp(f, "cap", L("cap"), "sub", I(1));
+    rtLabel(f, "probe");
+    rtOp(f, "h", L("h"), "and", L("cap"));
+    rtShift(f, "e", L("h"), "shl", 3); rtOp(f, "e", L("e"), "add", L("p"));
+    rtLoad(f, "k", L("e"), 0, 4);
+    rtIf(f, L("k"), "eq", I(0), "miss");
+    rtIf(f, L("k"), "eq", L("key"), "hit");
+    rtOp(f, "h", L("h"), "add", I(1)); rtJump(f, "probe");
+    rtLabel(f, "hit");
+    rtLoad(f, "id", L("e"), 4, 4); rtRet(f, L("id"));
+    rtLabel(f, "miss");
+    // 新对象号；源对象号入表。
+    rtLoad(f, "id", L("st"), ST_NOBJ, 8);
+    rtOp(f, "k", L("id"), "add", I(1)); rtStore(f, L("st"), ST_NOBJ, L("k"), 8);
+    rtOp(f, "e", L("st"), "add", I(ST_SRC));
+    rtCall2(f, "", "__tx_task_vpush", L("e"), L("idx"));
+    // 负载过半：翻倍重建。
+    rtLoad(f, "k", L("st"), ST_MAPN, 8); rtOp(f, "k", L("k"), "add", I(1)); rtStore(f, L("st"), ST_MAPN, L("k"), 8);
+    rtOp(f, "k", L("k"), "add", L("k"));
+    rtLoad(f, "cap", L("st"), ST_MAPCAP, 8);
+    rtIf(f, L("k"), "lt", L("cap"), "insert");
+    rtLoad(f, "old", L("st"), ST_MAP, 8); rtSet(f, "oldcap", L("cap"));
+    rtOp(f, "cap", L("cap"), "add", L("cap"));
+    rtShift(f, "e", L("cap"), "shl", 3);
+    rtCall2(f, "p", "__tx_native_mem_alloc", L("e"), I(8));
+    rtIf(f, L("p"), "eq", I(0), "oom");
+    rtCall3(f, "", memsetName(), L("p"), I(0), L("e"));
+    rtStore(f, L("st"), ST_MAP, L("p"), 8); rtStore(f, L("st"), ST_MAPCAP, L("cap"), 8);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "rehash");
+    rtIf(f, L("i"), "ge", L("oldcap"), "rehashed");
+    rtShift(f, "e", L("i"), "shl", 3); rtOp(f, "e", L("e"), "add", L("old"));
+    rtLoad(f, "k", L("e"), 0, 4);
+    rtIf(f, L("k"), "eq", I(0), "next");
+    rtLoad(f, "h", L("e"), 4, 4);
+    rtCall3(f, "", "__tx_sx_map_put", L("st"), L("k"), L("h"));
+    rtLabel(f, "next");
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "rehash");
+    rtLabel(f, "rehashed");
+    rtCall1(f, "", "__tx_native_mem_free", L("old"));
+    rtLabel(f, "insert");
+    rtCall3(f, "", "__tx_sx_map_put", L("st"), L("key"), L("id"));
+    rtRet(f, L("id"));
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRet(f, I(0)); check(f);
+
+    // __tx_sx_value(st, vp, op)：把 *vp 编码进 *op（16 字节）。
+    f = rtBegin(b, "__tx_sx_value", "st vp op", "tag t idx", 3, "bootstrap/selfhost/nrt_send.tx");
+    rtLoad(f, "tag", L("vp"), 0, 1);
+    rtOp(f, "t", L("tag"), "add", A("__tx_is_heapref")); rtLoad(f, "t", L("t"), 0, 1);
+    rtIf(f, L("t"), "ne", I(0), "heap");
+    rtLoad(f, "t", L("vp"), 0, 8); rtStore(f, L("op"), 0, L("t"), 8);
+    rtLoad(f, "t", L("vp"), 8, 8); rtStore(f, L("op"), 8, L("t"), 8);
+    rtRetVoid(f);
+    rtLabel(f, "heap");
+    rtIf(f, L("tag"), "eq", I(14), "bad"); rtIf(f, L("tag"), "eq", I(16), "bad");
+    rtIf(f, L("tag"), "eq", I(18), "bad"); rtIf(f, L("tag"), "eq", I(19), "bad");
+    rtIf(f, L("tag"), "eq", I(20), "shared"); rtIf(f, L("tag"), "eq", I(21), "atomic");
+    rtLabel(f, "obj");
+    rtStore(f, L("op"), 0, L("tag"), 8);
+    rtLoad(f, "idx", L("vp"), 8, 4);
+    rtLoad(f, "t", L("st"), ST_STARTUP, 8);
+    rtIf(f, L("idx"), "uge", L("t"), "copy");
+    rtOp(f, "idx", L("idx"), "or", I(STARTUP_BIT));
+    rtStore(f, L("op"), 8, L("idx"), 8);
+    rtRetVoid(f);
+    rtLabel(f, "copy");
+    rtCall2(f, "idx", "__tx_sx_ref", L("st"), L("idx"));
+    rtStore(f, L("op"), 8, L("idx"), 8);
+    rtRetVoid(f);
+    // Shared（第 4c 步）：只编共享块地址，块计数加一并记进共享块表（随块归还或由接收方接管）。
+    rtLabel(f, "shared");
+    rtLoad(f, "idx", L("vp"), 8, 4);
+    rtCall1(f, "idx", "__tx_native_object_address_v1", L("idx"));
+    rtLoad(f, "idx", L("idx"), 32, 8);
+    rtCall2(f, "", "__tx_shared_inc", L("idx"), I(1));
+    rtOp(f, "t", L("st"), "add", I(ST_SHR));
+    rtCall2(f, "", "__tx_task_vpush", L("t"), L("idx"));
+    rtStore(f, L("op"), 0, I(20), 8); rtStore(f, L("op"), 8, L("idx"), 8);
+    rtRetVoid(f);
+    // Atomic（第 4c 步）只随共享块走（值单元拷进块）；发送模式下同下面四种。
+    rtLabel(f, "atomic");
+    rtLoad(f, "t", L("st"), ST_MODE, 8);
+    rtIf(f, L("t"), "ne", I(0), "obj");
+    // Weak、Future、Gen、Thread（发送模式下还有 Atomic）：只能经函数值或接口值带入（静态类型里直接出现的前端已拒绝）。记下原因 1，值写成
+    // None，发送方在处理下一个对象前停下。
+    rtLabel(f, "bad");
+    rtStore(f, L("st"), ST_WHY, I(1), 8);
+    rtStore(f, L("op"), 0, I(4), 8); rtStore(f, L("op"), 8, I(0), 8);
+    rtRetVoid(f); check(f);
+
+    // __tx_sx_values(st, src, n)：n 个值编码进数据区末尾（先占位再逐个编码；编码只动对象表与散列表，不动数据区）。
+    f = rtBegin(b, "__tx_sx_values", "st src n", "d i sz", 3, "bootstrap/selfhost/nrt_send.tx");
+    rtIf(f, L("n"), "eq", I(0), "done");
+    rtShift(f, "sz", L("n"), "shl", 4);
+    rtOp(f, "d", L("st"), "add", I(ST_DATA));
+    rtCall2(f, "d", "__tx_sx_reserve", L("d"), L("sz"));
+    rtSet(f, "i", I(0));
+    rtLabel(f, "loop");
+    rtIf(f, L("i"), "ge", L("n"), "done");
+    rtCall3(f, "", "__tx_sx_value", L("st"), L("src"), L("d"));
+    rtOp(f, "src", L("src"), "add", I(16)); rtOp(f, "d", L("d"), "add", I(16));
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "loop");
+    rtLabel(f, "done"); rtRetVoid(f); check(f);
+
+    // __tx_sx_raw(st, src, n)：n 字节照抄进数据区末尾（按 8 对齐）。
+    f = rtBegin(b, "__tx_sx_raw", "st src n", "d sz", 3, "bootstrap/selfhost/nrt_send.tx");
+    rtIf(f, L("n"), "eq", I(0), "done");
+    rtOp(f, "sz", L("n"), "add", I(7)); rtOp(f, "sz", L("sz"), "and", I(-8));
+    rtOp(f, "d", L("st"), "add", I(ST_DATA));
+    rtCall2(f, "d", "__tx_sx_reserve", L("d"), L("sz"));
+    rtCall3(f, "", memcpyName(), L("d"), L("src"), L("n"));
+    rtLabel(f, "done"); rtRetVoid(f); check(f);
+
+    // __tx_sx_unshare(st)：发送失败时放掉共享块表里已加的计数。
+    f = rtBegin(b, "__tx_sx_unshare", "st", "n p q", 1, "bootstrap/selfhost/nrt_send.tx");
+    rtLoad(f, "n", L("st"), ST_SHR + 8, 8); rtLoad(f, "p", L("st"), ST_SHR, 8);
+    rtLabel(f, "loop");
+    rtIf(f, L("n"), "eq", I(0), "done");
+    rtLoad(f, "q", L("p"), 0, 8);
+    rtCall1(f, "", "__tx_shared_release", L("q"));
+    rtOp(f, "p", L("p"), "add", I(8)); rtOp(f, "n", L("n"), "sub", I(1));
+    rtJump(f, "loop");
+    rtLabel(f, "done"); rtRetVoid(f); check(f);
+
+    // __tx_send_value(vp, mode) → 转移块（模式 0）或共享块（模式 1，引用数由调用方置）：*vp 可达的对象图深拷贝成
+    // 进程级的块；含不可发送（共享模式下为不可共享）的成分时不建块，返回原因码（1 标签、2 类型号表；块地址不会小于 16）。
+    f = rtBegin(b, "__tx_send_value", "vp mode", "st rt rp i n idx o r pk meta len doff x p blk tabb datab total img nty tbl nshr shro", 3, "bootstrap/selfhost/nrt_send.tx");
+    rtCall2(f, "st", "__tx_native_mem_alloc", I(ST_BYTES), I(8));
+    rtIf(f, L("st"), "eq", I(0), "oom");
+    rtCall3(f, "", memsetName(), L("st"), I(0), I(ST_BYTES));
+    rtStore(f, L("st"), ST_MODE, L("mode"), 8);
+    rtSet(f, "x", G("__tx_nrt_startup_slots")); rtStore(f, L("st"), ST_STARTUP, L("x"), 8);
+    rtCall2(f, "p", "__tx_native_mem_alloc", I(512), I(8));
+    rtIf(f, L("p"), "eq", I(0), "oom");
+    rtCall3(f, "", memsetName(), L("p"), I(0), I(512));
+    rtStore(f, L("st"), ST_MAP, L("p"), 8); rtStore(f, L("st"), ST_MAPCAP, I(64), 8);
+    rtSet(f, "nty", I(0)); rtSet(f, "tbl", I(0));
+    rtSet(f, "img", A("__tx_nrt_image"));
+    rtLoad(f, "x", L("img"), 8, 8);
+    // 版本字的高 32 位是构建标志（--leak-check，nrt_leak.tx），只比低 32 位。
+    rtOp(f, "x", L("x"), "and", I(4294967295));
+    rtIf(f, L("x"), "ne", I(IMG_SEND_VERSION), "notbl");
+    rtLoad(f, "nty", L("img"), IMG_NTYPES, 8); rtLoad(f, "tbl", L("img"), IMG_SENDABLE, 8);
+    rtLabel(f, "notbl");
+    rtAddrOf(f, "x", "rt");
+    rtCall3(f, "", "__tx_sx_value", L("st"), L("vp"), L("x"));
+    rtSet(f, "i", I(0));
+    rtLabel(f, "obj");
+    rtLoad(f, "x", L("st"), ST_WHY, 8); rtIf(f, L("x"), "ne", I(0), "unsend");
+    rtLoad(f, "n", L("st"), ST_NOBJ, 8);
+    rtIf(f, L("i"), "ge", L("n"), "built");
+    rtLoad(f, "x", L("st"), ST_SRC, 8); rtShift(f, "idx", L("i"), "shl", 3); rtOp(f, "x", L("x"), "add", L("idx"));
+    rtLoad(f, "idx", L("x"), 0, 8);
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("idx"));
+    rtLoad(f, "pk", L("o"), 16, 4); rtLoad(f, "meta", L("o"), 24, 4); rtLoad(f, "len", L("o"), 40, 8);
+    rtLoad(f, "doff", L("st"), ST_DATA + 8, 8);
+    // struct、enum 及其 Ref（种类 3–5、载荷种类 1–2；含闭包环境与接口装入）按类型号查可发送表。
+    rtIf(f, L("pk"), "eq", I(0), "typed"); rtIf(f, L("pk"), "ugt", I(2), "typed");
+    rtLoad(f, "x", L("o"), 12, 4); rtIf(f, L("x"), "ult", I(3), "typed"); rtIf(f, L("x"), "ugt", I(5), "typed");
+    rtLoad(f, "x", L("o"), 4, 4); rtIf(f, L("x"), "uge", L("nty"), "typed");
+    rtOp(f, "x", L("x"), "add", L("tbl")); rtLoad(f, "x", L("x"), 0, 1);
+    rtIf(f, L("x"), "eq", I(0), "untable");
+    // 表项 2＝只可共享（含 Atomic，第 4c 步）：发送模式下同 0。
+    rtIf(f, L("x"), "eq", I(1), "typed");
+    rtLoad(f, "x", L("st"), ST_MODE, 8); rtIf(f, L("x"), "eq", I(0), "untable");
+    rtLabel(f, "typed");
+    rtIf(f, L("pk"), "eq", I(0), "bytes");
+    rtIf(f, L("pk"), "eq", I(1), "values"); rtIf(f, L("pk"), "eq", I(2), "values"); rtIf(f, L("pk"), "eq", I(3), "values");
+    rtIf(f, L("pk"), "eq", I(4), "slice");
+    rtIf(f, L("pk"), "eq", I(5), "record");
+    rtIf(f, L("pk"), "eq", I(7), "list");
+    rtIf(f, L("pk"), "eq", I(12), "acell");
+    rtJump(f, "bad");
+    // Atomic 的值单元（只在共享模式下出现）：一次 8 字节读（单元 8 字节对齐，读不会撕裂——它可能借用自别的共享块、
+    // 正被其他线程写）拷进数据区。
+    rtLabel(f, "acell");
+    rtLoad(f, "p", L("o"), 32, 8);
+    rtLoad(f, "x", L("p"), 0, 8);
+    rtOp(f, "p", L("st"), "add", I(ST_DATA));
+    rtCall2(f, "p", "__tx_sx_reserve", L("p"), I(8));
+    rtStore(f, L("p"), 0, L("x"), 8);
+    rtJump(f, "record");
+    rtLabel(f, "bytes");
+    rtLoad(f, "p", L("o"), 32, 8);
+    rtCall3(f, "", "__tx_sx_raw", L("st"), L("p"), L("len"));
+    rtJump(f, "record");
+    rtLabel(f, "values");
+    rtLoad(f, "p", L("o"), 32, 8);
+    rtCall3(f, "", "__tx_sx_values", L("st"), L("p"), L("len"));
+    rtJump(f, "record");
+    rtLabel(f, "slice");
+    rtCall2(f, "meta", "__tx_sx_ref", L("st"), L("meta"));
+    rtJump(f, "record");
+    rtLabel(f, "list");
+    rtLoad(f, "x", L("o"), 28, 4);
+    rtIf(f, L("len"), "eq", I(0), "record");
+    rtLoad(f, "p", L("o"), 32, 8);
+    rtIf(f, L("x"), "eq", I(1), "lvalues");
+    rtIf(f, L("x"), "eq", I(3), "lcompact");
+    rtIf(f, L("x"), "ne", I(2), "bad");
+    rtShift(f, "x", L("len"), "shl", 3);
+    rtCall3(f, "", "__tx_sx_raw", L("st"), L("p"), L("x"));
+    rtJump(f, "record");
+    // 紧凑列表（O4 第二步）：len×元素宽度个字节。
+    rtLabel(f, "lcompact");
+    rtLoad(f, "x", L("o"), 24, 4);
+    rtCall2(f, "x", "__tx_lc_bytes", L("x"), L("len"));
+    rtIf(f, L("x"), "lt", I(0), "bad");
+    rtCall3(f, "", "__tx_sx_raw", L("st"), L("p"), L("x"));
+    rtJump(f, "record");
+    rtLabel(f, "lvalues");
+    rtCall3(f, "", "__tx_sx_values", L("st"), L("p"), L("len"));
+    rtLabel(f, "record");
+    // 对象表记录（对象地址在编码子值时不变：发送方此间不建对象）。
+    rtOp(f, "r", L("st"), "add", I(ST_TAB));
+    rtCall2(f, "r", "__tx_sx_reserve", L("r"), I(REC));
+    rtLoad(f, "x", L("o"), 12, 4); rtStore(f, L("r"), 0, L("x"), 4);
+    rtLoad(f, "x", L("o"), 4, 4); rtStore(f, L("r"), 4, L("x"), 4);
+    rtLoad(f, "x", L("o"), 8, 4); rtStore(f, L("r"), 8, L("x"), 4);
+    rtStore(f, L("r"), 12, L("pk"), 4);
+    rtStore(f, L("r"), 16, L("meta"), 4);
+    rtLoad(f, "x", L("o"), 28, 4); rtStore(f, L("r"), 20, L("x"), 4);
+    rtStore(f, L("r"), 24, L("len"), 8);
+    rtLoad(f, "x", L("o"), 48, 8); rtStore(f, L("r"), 32, L("x"), 8);
+    rtStore(f, L("r"), 40, L("doff"), 8);
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "obj");
+    rtLabel(f, "built");
+    // 拼成进程级的块：头、对象表、数据区、共享块表（引用数@64 与保留@72 随系统分配为 0）。
+    rtLoad(f, "n", L("st"), ST_NOBJ, 8);
+    rtOp(f, "tabb", L("n"), "imul", I(REC));
+    rtLoad(f, "datab", L("st"), ST_DATA + 8, 8);
+    rtOp(f, "total", L("tabb"), "add", L("datab")); rtOp(f, "total", L("total"), "add", I(HDR));
+    rtSet(f, "shro", L("total"));
+    rtLoad(f, "nshr", L("st"), ST_SHR + 8, 8);
+    rtShift(f, "x", L("nshr"), "shl", 3); rtOp(f, "total", L("total"), "add", L("x"));
+    rtCall1(f, "blk", "__tx_xblk_alloc", L("total"));
+    rtStore(f, L("blk"), 0, I(MAGIC), 4); rtStore(f, L("blk"), 4, I(VERSION), 4);
+    rtStore(f, L("blk"), 8, L("total"), 8); rtStore(f, L("blk"), 16, L("n"), 8); rtStore(f, L("blk"), 24, L("datab"), 8);
+    rtStore(f, L("blk"), 32, L("rt"), 8); rtStore(f, L("blk"), 40, L("rp"), 8);
+    rtStore(f, L("blk"), 48, L("nshr"), 8); rtStore(f, L("blk"), 56, L("shro"), 8);
+    rtOp(f, "x", L("blk"), "add", I(HDR));
+    rtIf(f, L("tabb"), "eq", I(0), "notab");
+    rtLoad(f, "p", L("st"), ST_TAB, 8);
+    rtCall3(f, "", memcpyName(), L("x"), L("p"), L("tabb"));
+    rtLabel(f, "notab");
+    rtOp(f, "x", L("x"), "add", L("tabb"));
+    rtIf(f, L("datab"), "eq", I(0), "nodata");
+    rtLoad(f, "p", L("st"), ST_DATA, 8);
+    rtCall3(f, "", memcpyName(), L("x"), L("p"), L("datab"));
+    rtLabel(f, "nodata");
+    rtIf(f, L("nshr"), "eq", I(0), "noshr");
+    rtOp(f, "x", L("blk"), "add", L("shro"));
+    rtLoad(f, "p", L("st"), ST_SHR, 8);
+    rtShift(f, "nshr", L("nshr"), "shl", 3);
+    rtCall3(f, "", memcpyName(), L("x"), L("p"), L("nshr"));
+    rtLabel(f, "noshr");
+    // 归还发送方的临时表。
+    rtLabel(f, "release");
+    rtLoad(f, "p", L("st"), ST_TAB, 8); rtIf(f, L("p"), "eq", I(0), "f1"); rtCall1(f, "", "__tx_native_mem_free", L("p"));
+    rtLabel(f, "f1");
+    rtLoad(f, "p", L("st"), ST_SRC, 8); rtIf(f, L("p"), "eq", I(0), "f2"); rtCall1(f, "", "__tx_native_mem_free", L("p"));
+    rtLabel(f, "f2");
+    rtLoad(f, "p", L("st"), ST_DATA, 8); rtIf(f, L("p"), "eq", I(0), "f3"); rtCall1(f, "", "__tx_native_mem_free", L("p"));
+    rtLabel(f, "f3");
+    rtLoad(f, "p", L("st"), ST_SHR, 8); rtIf(f, L("p"), "eq", I(0), "f4"); rtCall1(f, "", "__tx_native_mem_free", L("p"));
+    rtLabel(f, "f4");
+    rtLoad(f, "p", L("st"), ST_MAP, 8); rtCall1(f, "", "__tx_native_mem_free", L("p"));
+    rtCall1(f, "", "__tx_native_mem_free", L("st"));
+    rtRet(f, L("blk"));
+    rtLabel(f, "untable");
+    rtStore(f, L("st"), ST_WHY, I(2), 8);
+    rtLabel(f, "unsend");
+    rtCall1(f, "", "__tx_sx_unshare", L("st"));
+    rtLoad(f, "blk", L("st"), ST_WHY, 8);
+    rtJump(f, "release");
+    rtLabel(f, "bad");
+    fatal(b, f, "taixu NRT: 发送遇到不支持的载荷种类（内部错误）\n", 70);
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRet(f, I(0)); check(f);
+}
+
+function emitReceiver(b: Ref<StructuredBuffer>): void {
+    // __tx_rx_value(blk, ids, sp, dp, mode)：解码块里的一个值到 *dp（堆引用改写为本线程对象号并 retain；Shared 值经
+    // 本线程的句柄缓存取得句柄——模式 0 接管转移块的那份块计数，模式 1 由句柄另持一份）。
+    let f = rtBegin(b, "__tx_rx_value", "blk ids sp dp mode", "tag t pay n", 2, "bootstrap/selfhost/nrt_send.tx");
+    rtLoad(f, "tag", L("sp"), 0, 1);
+    rtOp(f, "t", L("tag"), "add", A("__tx_is_heapref")); rtLoad(f, "t", L("t"), 0, 1);
+    rtIf(f, L("t"), "ne", I(0), "heap");
+    rtLoad(f, "t", L("sp"), 0, 8); rtStore(f, L("dp"), 0, L("t"), 8);
+    rtLoad(f, "t", L("sp"), 8, 8); rtStore(f, L("dp"), 8, L("t"), 8);
+    rtRetVoid(f);
+    rtLabel(f, "heap");
+    rtIf(f, L("tag"), "eq", I(14), "bad"); rtIf(f, L("tag"), "eq", I(16), "bad");
+    rtIf(f, L("tag"), "eq", I(18), "bad"); rtIf(f, L("tag"), "eq", I(19), "bad");
+    rtIf(f, L("tag"), "eq", I(20), "shared");
+    rtIf(f, L("tag"), "eq", I(21), "atomic");
+    rtLabel(f, "obj");
+    rtLoad(f, "pay", L("sp"), 8, 8);
+    rtSet(f, "t", L("pay")); rtShift(f, "t", L("t"), "shr", 62);
+    rtIf(f, L("t"), "eq", I(0), "local");
+    rtIf(f, L("t"), "ne", I(1), "bad");
+    rtOp(f, "pay", L("pay"), "and", I(LOW32));
+    rtIf(f, L("pay"), "uge", G("__tx_nrt_startup_slots"), "bad");
+    rtJump(f, "store");
+    rtLabel(f, "local");
+    rtLoad(f, "n", L("blk"), 16, 8);
+    rtIf(f, L("pay"), "uge", L("n"), "bad");
+    rtShift(f, "t", L("pay"), "shl", 2); rtOp(f, "t", L("t"), "add", L("ids"));
+    rtLoad(f, "pay", L("t"), 0, 4);
+    rtLabel(f, "store");
+    rtStore(f, L("dp"), 0, L("tag"), 8); rtStore(f, L("dp"), 8, L("pay"), 8);
+    rtCall1(f, "", "__tx_retain", L("dp"));
+    rtRetVoid(f);
+    rtLabel(f, "shared");
+    rtLoad(f, "pay", L("sp"), 8, 8);
+    rtLoad(f, "t", L("pay"), 0, 4); rtIf(f, L("t"), "ne", I(MAGIC), "bad");
+    rtSet(f, "t", I(1));
+    rtIf(f, L("mode"), "eq", I(0), "take");
+    rtSet(f, "t", I(0));
+    rtLabel(f, "take");
+    rtCall2(f, "pay", "__tx_shared_handle", L("pay"), L("t"));
+    rtStore(f, L("dp"), 0, I(20), 8); rtStore(f, L("dp"), 8, L("pay"), 8);
+    rtRetVoid(f);
+    rtLabel(f, "atomic");
+    rtIf(f, L("mode"), "ne", I(0), "obj");
+    rtLabel(f, "bad");
+    fatal(b, f, "taixu NRT: 转移块损坏（值）\n", 70);
+    rtRetVoid(f); check(f);
+
+    // __tx_recv_value(blk, out, mode)：在本线程物化块，根值（已持一份引用）写进 *out。模式 0（转移块）：拷贝物化，
+    // 然后归还块；模式 1（共享块，第 4c 步）：借用物化（对象冻结，字节载荷、紧凑 List 载荷与 Atomic 值单元指向块），
+    // 块留给句柄。
+    f = rtBegin(b, "__tx_recv_value", "blk out mode", "n datab tab data ids i r pk len doff kind p q sz cap x o meta aux j fl bw nb s0 s1 s2 s3 s4 s5 s6 s7 sp vt vp va", 5, "bootstrap/selfhost/nrt_send.tx");
+    rtLoad(f, "x", L("blk"), 0, 4); rtIf(f, L("x"), "ne", I(MAGIC), "bad");
+    rtLoad(f, "x", L("blk"), 4, 4); rtIf(f, L("x"), "ne", I(VERSION), "bad");
+    rtLoad(f, "n", L("blk"), 16, 8); rtLoad(f, "datab", L("blk"), 24, 8);
+    // 运行时加固 H2：各量先给上界（记录数、共享块数 < 2^32，数据区 < 2^56），其后的乘加不会绕回。
+    rtShift(f, "x", L("n"), "shr", 32); rtIf(f, L("x"), "ne", I(0), "bad");
+    rtShift(f, "x", L("datab"), "shr", 56); rtIf(f, L("x"), "ne", I(0), "bad");
+    rtOp(f, "x", L("n"), "imul", I(REC)); rtOp(f, "x", L("x"), "add", L("datab")); rtOp(f, "x", L("x"), "add", I(HDR));
+    rtLoad(f, "q", L("blk"), 56, 8); rtIf(f, L("x"), "ne", L("q"), "bad");
+    rtLoad(f, "q", L("blk"), 48, 8); rtShift(f, "sz", L("q"), "shr", 32); rtIf(f, L("sz"), "ne", I(0), "bad");
+    rtShift(f, "q", L("q"), "shl", 3); rtOp(f, "x", L("x"), "add", L("q"));
+    rtLoad(f, "sz", L("blk"), 8, 8); rtIf(f, L("x"), "ne", L("sz"), "bad");
+    rtOp(f, "tab", L("blk"), "add", I(HDR));
+    rtOp(f, "data", L("n"), "imul", I(REC)); rtOp(f, "data", L("data"), "add", L("tab"));
+    rtShift(f, "x", L("n"), "shl", 2); rtOp(f, "x", L("x"), "add", I(4));
+    rtCall2(f, "ids", "__tx_native_mem_alloc", L("x"), I(4));
+    rtIf(f, L("ids"), "eq", I(0), "oom");
+    // 第一遍：按记录建对象（值槽先填 None）。模式 1 的对象一律冻结（fl 16）；借用载荷的对象另置借用位并记下块
+    // （bw，写进结果载荷位 @64），块计数在这一遍结束时按借用数 nb 一次加齐。
+    rtSet(f, "i", I(0)); rtSet(f, "nb", I(0));
+    rtLabel(f, "make");
+    rtIf(f, L("i"), "ge", L("n"), "made");
+    rtOp(f, "r", L("i"), "imul", I(REC)); rtOp(f, "r", L("r"), "add", L("tab"));
+    rtLoad(f, "kind", L("r"), 0, 4); rtLoad(f, "pk", L("r"), 12, 4);
+    rtLoad(f, "meta", L("r"), 16, 4); rtLoad(f, "aux", L("r"), 20, 4);
+    rtLoad(f, "len", L("r"), 24, 8); rtLoad(f, "doff", L("r"), 40, 8);
+    rtSet(f, "p", I(0)); rtSet(f, "cap", I(0)); rtSet(f, "bw", I(0));
+    rtSet(f, "fl", I(0));
+    rtIf(f, L("mode"), "eq", I(0), "plain");
+    rtSet(f, "fl", I(16));
+    rtLabel(f, "plain");
+    rtIf(f, L("pk"), "eq", I(0), "mbytes");
+    rtIf(f, L("pk"), "eq", I(1), "mvalues"); rtIf(f, L("pk"), "eq", I(2), "mvalues"); rtIf(f, L("pk"), "eq", I(3), "mvalues");
+    rtIf(f, L("pk"), "eq", I(4), "mslice");
+    rtIf(f, L("pk"), "eq", I(5), "create");
+    rtIf(f, L("pk"), "eq", I(7), "mlist");
+    rtIf(f, L("pk"), "eq", I(12), "matomic");
+    rtJump(f, "bad");
+    // 借用（模式 1）：载荷直接指向块的数据区。
+    rtLabel(f, "borrow");
+    rtOp(f, "p", L("data"), "add", L("doff"));
+    rtSet(f, "fl", I(48)); rtSet(f, "bw", L("blk")); rtOp(f, "nb", L("nb"), "add", I(1));
+    rtJump(f, "create");
+    // Atomic 的值单元（只在共享块里）：借用，不冻结（Atomic 自带同步）。
+    rtLabel(f, "matomic");
+    rtIf(f, L("mode"), "eq", I(0), "bad");
+    rtIf(f, L("len"), "ne", I(8), "bad");
+    inData(f, "len");
+    rtOp(f, "p", L("data"), "add", L("doff"));
+    rtSet(f, "fl", I(32)); rtSet(f, "bw", L("blk")); rtOp(f, "nb", L("nb"), "add", I(1));
+    rtJump(f, "create");
+    rtLabel(f, "mbytes");
+    // 字节载荷：cap 0＝恰好 len；空串与空 Bytes 用哨兵指针 1（同 __tx_store_new_str_take）。
+    rtSet(f, "p", I(1));
+    rtIf(f, L("len"), "eq", I(0), "create");
+    inData(f, "len");
+    rtIf(f, L("mode"), "ne", I(0), "borrow");
+    rtCall2(f, "p", "__tx_native_mem_alloc", L("len"), I(1));
+    rtIf(f, L("p"), "eq", I(0), "oom");
+    rtOp(f, "q", L("data"), "add", L("doff"));
+    rtCall3(f, "", memcpyName(), L("p"), L("q"), L("len"));
+    rtJump(f, "create");
+    rtLabel(f, "mvalues");
+    rtIf(f, L("len"), "eq", I(0), "create");
+    lenFits(f, 4);
+    rtShift(f, "sz", L("len"), "shl", 4);
+    inData(f, "sz");
+    rtCall2(f, "p", "__tx_native_mem_alloc", L("sz"), I(8));
+    rtIf(f, L("p"), "eq", I(0), "oom");
+    rtCall2(f, "", "__tx_rx_none", L("p"), L("len"));
+    rtJump(f, "create");
+    rtLabel(f, "mslice");
+    rtSet(f, "meta", I(0));
+    rtJump(f, "create");
+    rtLabel(f, "mlist");
+    rtIf(f, L("len"), "eq", I(0), "create");
+    rtSet(f, "cap", L("len"));
+    rtIf(f, L("aux"), "eq", I(1), "mlvalues");
+    rtIf(f, L("aux"), "eq", I(3), "mlcompact");
+    rtIf(f, L("aux"), "ne", I(2), "bad");
+    lenFits(f, 3);
+    rtShift(f, "sz", L("len"), "shl", 3);
+    rtLabel(f, "mlraw");
+    inData(f, "sz");
+    rtIf(f, L("mode"), "ne", I(0), "borrow");
+    rtCall2(f, "p", "__tx_native_mem_alloc", L("sz"), I(8));
+    rtIf(f, L("p"), "eq", I(0), "oom");
+    rtOp(f, "q", L("data"), "add", L("doff"));
+    rtCall3(f, "", memcpyName(), L("p"), L("q"), L("sz"));
+    rtJump(f, "create");
+    // 紧凑列表（O4 第二步）：len×元素宽度个字节，其余同原始形态。
+    rtLabel(f, "mlcompact");
+    rtCall2(f, "sz", "__tx_lc_bytes", L("meta"), L("len"));
+    rtIf(f, L("sz"), "lt", I(0), "bad");
+    rtJump(f, "mlraw");
+    rtLabel(f, "mlvalues");
+    lenFits(f, 4);
+    rtShift(f, "sz", L("len"), "shl", 4);
+    inData(f, "sz");
+    rtCall2(f, "p", "__tx_native_mem_alloc", L("sz"), I(8));
+    rtIf(f, L("p"), "eq", I(0), "oom");
+    rtCall2(f, "", "__tx_rx_none", L("p"), L("len"));
+    rtLabel(f, "create");
+    // ObjectSpec64：kind|type<<32、site|pk<<32、ptr、len、cap、meta|aux<<32、结果值（None）。
+    rtLoad(f, "x", L("r"), 4, 4); rtShift(f, "x", L("x"), "shl", 32); rtOp(f, "s0", L("kind"), "or", L("x"));
+    rtLoad(f, "x", L("r"), 8, 4); rtShift(f, "s1", L("pk"), "shl", 32); rtOp(f, "s1", L("s1"), "or", L("x"));
+    rtSet(f, "s2", L("p")); rtSet(f, "s3", L("len")); rtSet(f, "s4", L("cap"));
+    rtShift(f, "s5", L("aux"), "shl", 32); rtOp(f, "s5", L("s5"), "or", L("meta"));
+    rtSet(f, "s6", I(4)); rtSet(f, "s7", L("bw"));
+    rtAddrOf(f, "sp", "s0");
+    rtCall1(f, "x", "__tx_native_object_create_v1", L("sp"));
+    rtShift(f, "q", L("i"), "shl", 2); rtOp(f, "q", L("q"), "add", L("ids")); rtStore(f, L("q"), 0, L("x"), 4);
+    rtIf(f, L("fl"), "eq", I(0), "nofl");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("x"));
+    rtStore(f, L("o"), 0, L("fl"), 4);
+    rtLabel(f, "nofl");
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "make");
+    rtLabel(f, "made");
+    rtIf(f, L("nb"), "eq", I(0), "nobw");
+    rtCall2(f, "", "__tx_shared_inc", L("blk"), L("nb"));
+    rtLabel(f, "nobw");
+    // 第二遍：改写引用。解码 Shared 值可能新建句柄对象、槽表随之搬移，所以对象地址每项重取，值写进的是载荷数组
+    // （单独分配，不随槽表搬移）。
+    rtSet(f, "i", I(0));
+    rtLabel(f, "link");
+    rtIf(f, L("i"), "ge", L("n"), "linked");
+    rtOp(f, "r", L("i"), "imul", I(REC)); rtOp(f, "r", L("r"), "add", L("tab"));
+    rtLoad(f, "pk", L("r"), 12, 4); rtLoad(f, "len", L("r"), 24, 8); rtLoad(f, "doff", L("r"), 40, 8);
+    rtShift(f, "q", L("i"), "shl", 2); rtOp(f, "q", L("q"), "add", L("ids")); rtLoad(f, "x", L("q"), 0, 4);
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("x"));
+    rtIf(f, L("pk"), "eq", I(4), "lslice");
+    rtIf(f, L("pk"), "eq", I(7), "llist");
+    rtIf(f, L("pk"), "eq", I(1), "lvalues"); rtIf(f, L("pk"), "eq", I(2), "lvalues"); rtIf(f, L("pk"), "eq", I(3), "lvalues");
+    rtJump(f, "lnext");
+    rtLabel(f, "llist");
+    rtLoad(f, "aux", L("r"), 20, 4);
+    rtIf(f, L("aux"), "ne", I(1), "lnext");
+    rtLabel(f, "lvalues");
+    rtLoad(f, "p", L("o"), 32, 8);
+    rtOp(f, "q", L("data"), "add", L("doff"));
+    rtSet(f, "j", I(0));
+    rtLabel(f, "lval");
+    rtIf(f, L("j"), "ge", L("len"), "lnext");
+    rtCall5(f, "", "__tx_rx_value", L("blk"), L("ids"), L("q"), L("p"), L("mode"));
+    rtOp(f, "p", L("p"), "add", I(16)); rtOp(f, "q", L("q"), "add", I(16));
+    rtOp(f, "j", L("j"), "add", I(1)); rtJump(f, "lval");
+    rtLabel(f, "lslice");
+    // 切片的 meta＝数组对象（计数引用）。
+    rtLoad(f, "meta", L("r"), 16, 4);
+    rtIf(f, L("meta"), "uge", L("n"), "bad");
+    rtShift(f, "q", L("meta"), "shl", 2); rtOp(f, "q", L("q"), "add", L("ids")); rtLoad(f, "vp", L("q"), 0, 4);
+    rtStore(f, L("o"), 24, L("vp"), 4);
+    rtSet(f, "vt", I(10)); rtAddrOf(f, "va", "vt"); rtCall1(f, "", "__tx_retain", L("va"));
+    rtLabel(f, "lnext");
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "link");
+    rtLabel(f, "linked");
+    // 根值（持一份引用）。
+    rtOp(f, "q", L("blk"), "add", I(32));
+    rtCall5(f, "", "__tx_rx_value", L("blk"), L("ids"), L("q"), L("out"), L("mode"));
+    // 第三遍：放掉每个对象的创建引用（每个对象都由图内引用或根值持有，不会在此归零）。
+    rtSet(f, "i", I(0));
+    rtLabel(f, "drop");
+    rtIf(f, L("i"), "ge", L("n"), "dropped");
+    rtShift(f, "q", L("i"), "shl", 2); rtOp(f, "q", L("q"), "add", L("ids")); rtLoad(f, "vp", L("q"), 0, 4);
+    rtSet(f, "vt", I(9)); rtAddrOf(f, "va", "vt"); rtCall1(f, "", "__tx_release", L("va"));
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "drop");
+    rtLabel(f, "dropped");
+    rtCall1(f, "", "__tx_native_mem_free", L("ids"));
+    rtIf(f, L("mode"), "ne", I(0), "kept");
+    // 转移块：内嵌的共享块计数已由句柄接管。
+    rtStore(f, L("blk"), 48, I(0), 8);
+    rtCall1(f, "", "__tx_xblk_free", L("blk"));
+    rtLabel(f, "kept");
+    rtRetVoid(f);
+    rtLabel(f, "bad");
+    fatal(b, f, "taixu NRT: 转移块损坏\n", 70);
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRetVoid(f); check(f);
+
+    // __tx_rx_none(p, n)：n 个值槽填 None。
+    f = rtBegin(b, "__tx_rx_none", "p n", "i", 0, "bootstrap/selfhost/nrt_send.tx");
+    rtSet(f, "i", I(0));
+    rtLabel(f, "loop");
+    rtIf(f, L("i"), "ge", L("n"), "done");
+    rtStore(f, L("p"), 0, I(4), 8); rtStore(f, L("p"), 8, I(0), 8);
+    rtOp(f, "p", L("p"), "add", I(16));
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "loop");
+    rtLabel(f, "done"); rtRetVoid(f); check(f);
+}

@@ -1,0 +1,220 @@
+// NRT 生成器运行时（去 Zig 第 4b 轮，D3 v0.22；docs/design/v052-generators-v0.1-20261015.md §五）：
+// 生成器对象、gen_new／gen_next／yield／gen_close 四个操作码的内核入口。复用原生异步的单帧挂起：
+// 生成器体按可挂起函数保守发射，每个 yield 是一个恢复点；取值方在自身帧之上开窗、把快照移入、
+// 置 __tx_task_resume 后调用体函数，体函数入口分派跳回挂起的 yield，重新执行该条即继续。
+// 快照的移入移出都是整块按位搬动，所有权随之转移，不增减 RC（与异步任务快照相同）。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, L, I, A, G } from "./rtfn_base";
+import { rtBegin, rtSet, rtSetGlobal, rtOp, rtShift, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtCall5, rtRet, rtRetVoid } from "./rtfn";
+import { check, text, memcpyName, trapAt } from "./nrt_base";
+
+export const NRT_GEN_EXPORTS: string = "__tx_gen_new __tx_gen_next __tx_gen_yield __tx_gen_close";
+
+// 值 tag 18＝生成器句柄（堆引用，仅 NRT）。生成器对象＝Obj72 kind 12、payload kind 9：
+// state u32@24（0 未开始 1 挂起 2 运行中 3 已结束）、体函数号 u32@28、快照缓冲 ptr@32、其中持有的
+// 值数 len@40（未开始／挂起时＝体函数槽数；运行中与已结束为 0——释放生成器按 len 释放快照，同
+// fields 容器）、恢复点 pc@48、产出值@56/64（只在 yield 与取值方之间暂存，平时为 None）。
+// 运行中的生成器只由取值方的槽引用（取值期间不会归零），缓冲留给下次 yield 复用；结束时释放。
+const TAG_GEN: int = 18;
+const GEN_STATE: int = 24;
+const GEN_FN: int = 28;
+const GEN_BUF: int = 32;
+const GEN_LEN: int = 40;
+const GEN_PC: int = 48;
+const GEN_OUT: int = 56;
+const GS_NEW: int = 0;
+const GS_SUSPENDED: int = 1;
+const GS_RUNNING: int = 2;
+const GS_DONE: int = 3;
+
+const RUNNING: string = "生成器运行中不能再取值或关闭（体内直接或间接对自身 genNext）";
+const NOT_GEN: string = "genNext 的操作数不是 Gen";
+const OUTSIDE: string = "yield 执行于生成器帧之外";
+
+// 运行时状态在线程块里（thread_block_abi.tx）：当前运行的生成器 __tx_gen_cur（对象号＋1，0＝无）、
+// 其窗口 __tx_gen_win、恢复标志 __tx_gen_resuming（取值方恢复挂起的生成器时置 1，被重新执行的 yield 取走）。
+
+// 取 R[x] 的生成器对象号；不是生成器时跳 notgen。o 为对象地址（任何可能分配对象的调用之后须重取）。
+function genOperand(f: Ref<RtFn>, slot: string): void {
+    rtOp(f, "p", L(slot), "and", I(4294967295)); rtShift(f, "p", L("p"), "shl", 4); rtOp(f, "p", L("p"), "add", L("win"));
+    rtLoad(f, "tag", L("p"), 0, 1);
+    rtIf(f, L("tag"), "ne", I(TAG_GEN), "notgen");
+    rtLoad(f, "h", L("p"), 8, 4);
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("h"));
+    rtLoad(f, "tag", L("o"), 16, 4);
+    rtIf(f, L("tag"), "ne", I(9), "notgen");
+}
+
+/// 生成器运行时（代码段）。
+export function emitNrtGen(b: Ref<StructuredBuffer>): void {
+    // __tx_gen_new(win, a, nargs, fn, pc)：R[A] 为体函数 fnv；快照按体函数槽数开辟、全置 None，R0 为
+    // 体函数所属模块的状态引用（永生），实参 R[A+1..A+nargs] 逐个 retain 进 R1..（源槽仍归调用方，
+    // 同 async_start）。R[A] 改写为生成器（rc 1）。
+    let f = rtBegin(b, "__tx_gen_new", "win a nargs fn pc", "p tag target e reg st sz buf i x s0 s1 s2 s3 s4 s5 s6 s7 sp", 5, "bootstrap/selfhost/nrt_gen.tx");
+    rtOp(f, "p", L("a"), "and", I(4294967295)); rtShift(f, "p", L("p"), "shl", 4); rtOp(f, "p", L("p"), "add", L("win"));
+    rtOp(f, "nargs", L("nargs"), "and", I(4294967295));
+    rtLoad(f, "tag", L("p"), 0, 1);
+    rtIf(f, L("tag"), "ne", I(12), "bad");
+    rtLoad(f, "target", L("p"), 8, 4);
+    rtIf(f, L("target"), "uge", G("__tx_rt_table_len"), "bad");
+    rtShift(f, "e", L("target"), "shl", 4); rtOp(f, "e", L("e"), "add", G("__tx_rt_table_ptr"));
+    rtLoad(f, "reg", L("e"), 8, 4); rtLoad(f, "st", L("e"), 12, 4);
+    rtOp(f, "x", L("nargs"), "add", I(1));
+    rtIf(f, L("x"), "ugt", L("reg"), "bad");
+    rtShift(f, "sz", L("reg"), "shl", 4);
+    rtCall2(f, "buf", "__tx_native_mem_alloc", L("sz"), I(8));
+    rtIf(f, L("buf"), "eq", I(0), "oom");
+    rtCall2(f, "", "__tx_nrt_window", L("buf"), L("reg"));
+    rtStore(f, L("buf"), 0, I(9), 8); rtStore(f, L("buf"), 8, L("st"), 8);
+    rtIf(f, L("nargs"), "eq", I(0), "make");
+    rtShift(f, "sz", L("nargs"), "shl", 4); rtOp(f, "x", L("buf"), "add", I(16)); rtOp(f, "p", L("p"), "add", I(16));
+    rtCall3(f, "", memcpyName(), L("x"), L("p"), L("sz"));
+    rtSet(f, "i", I(0));
+    rtLabel(f, "retain");
+    rtIf(f, L("i"), "ge", L("nargs"), "make");
+    rtOp(f, "x", L("i"), "add", I(1)); rtShift(f, "x", L("x"), "shl", 4); rtOp(f, "x", L("x"), "add", L("buf"));
+    rtCall1(f, "", "__tx_retain", L("x"));
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "retain");
+    rtLabel(f, "make");
+    rtSet(f, "s0", I(12)); rtSet(f, "s1", I(38654705664));
+    rtSet(f, "s2", L("buf")); rtSet(f, "s3", L("reg")); rtSet(f, "s4", I(0));
+    rtShift(f, "s5", L("target"), "shl", 32); rtOp(f, "s5", L("s5"), "or", I(GS_NEW));
+    rtSet(f, "s6", I(4)); rtSet(f, "s7", I(0));
+    rtAddrOf(f, "sp", "s0");
+    rtCall1(f, "s0", "__tx_native_object_create_v1", L("sp"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_GEN), L("s0"));
+    rtRetVoid(f);
+    trapAt(b, f, "bad", 4010, "生成器创建目标不是体函数");
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRetVoid(f); check(f);
+
+    // __tx_gen_next(win, a, b, fn, pc)：R[A] = genNext(R[B])。已结束得 None；运行中 trap；否则在取值方
+    // 帧（fn 的槽数）之上开窗（越界 trap 4003，同取消落点），快照移入，挂起者经 __tx_task_resume 跳回
+    // 挂起的 yield 并置恢复标志，然后调用体函数。体函数经 yield 返回：取出产出值；正常返回：置为已
+    // 结束，释放窗口剩余值与缓冲，得 None。当前生成器与其窗口在嵌套取值时保存、恢复。
+    f = rtBegin(b, "__tx_gen_next", "win a b fn pc", "p tag h o st target e fp reg lw x pcur pwin i rt rp", 5, "bootstrap/selfhost/nrt_gen.tx");
+    genOperand(f, "b");
+    rtLoad(f, "st", L("o"), GEN_STATE, 4);
+    rtIf(f, L("st"), "eq", I(GS_DONE), "none");
+    rtIf(f, L("st"), "eq", I(GS_RUNNING), "running");
+    rtLoad(f, "target", L("o"), GEN_FN, 4);
+    rtShift(f, "e", L("target"), "shl", 4); rtOp(f, "e", L("e"), "add", G("__tx_rt_table_ptr"));
+    rtLoad(f, "fp", L("e"), 0, 8); rtLoad(f, "reg", L("e"), 8, 4);
+    rtOp(f, "x", L("fn"), "and", I(4294967295)); rtShift(f, "x", L("x"), "shl", 4); rtOp(f, "x", L("x"), "add", G("__tx_rt_table_ptr"));
+    rtLoad(f, "x", L("x"), 8, 4); rtShift(f, "x", L("x"), "shl", 4);
+    rtOp(f, "lw", L("win"), "add", L("x"));
+    rtShift(f, "x", L("reg"), "shl", 4); rtOp(f, "x", L("x"), "add", L("lw"));
+    rtIf(f, L("x"), "ule", G("__tx_stack_limit"), "room");
+    rtCall1(f, "x", "__tx_stack_more", L("x"));
+    rtIf(f, L("x"), "eq", I(0), "overflow");
+    rtLabel(f, "room");
+    rtLoad(f, "p", L("o"), GEN_BUF, 8);
+    rtShift(f, "x", L("reg"), "shl", 4);
+    rtCall3(f, "", memcpyName(), L("lw"), L("p"), L("x"));
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("h"));
+    rtStore(f, L("o"), GEN_LEN, I(0), 8);
+    rtStore(f, L("o"), GEN_STATE, I(GS_RUNNING), 4);
+    rtIf(f, L("st"), "ne", I(GS_SUSPENDED), "call");
+    rtLoad(f, "x", L("o"), GEN_PC, 8); rtOp(f, "x", L("x"), "add", I(1));
+    rtSetGlobal(f, "__tx_task_resume", L("x"));
+    rtSetGlobal(f, "__tx_gen_resuming", I(1));
+    rtLabel(f, "call");
+    rtSet(f, "pcur", G("__tx_gen_cur")); rtSet(f, "pwin", G("__tx_gen_win"));
+    rtOp(f, "x", L("h"), "add", I(1)); rtSetGlobal(f, "__tx_gen_cur", L("x"));
+    rtSetGlobal(f, "__tx_gen_win", L("lw"));
+    rtCall1(f, "", "*fp", L("lw"));
+    rtSetGlobal(f, "__tx_gen_cur", L("pcur")); rtSetGlobal(f, "__tx_gen_win", L("pwin"));
+    rtSetGlobal(f, "__tx_gen_resuming", I(0));
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("h"));
+    rtLoad(f, "st", L("o"), GEN_STATE, 4);
+    rtIf(f, L("st"), "ne", I(GS_SUSPENDED), "finished");
+    // 经 yield 返回：产出值所有权移交 R[A]（对象内留 None）。
+    rtLoad(f, "rt", L("o"), GEN_OUT, 8); rtLoad(f, "rp", L("o"), GEN_OUT + 8, 8);
+    rtStore(f, L("o"), GEN_OUT, I(4), 8); rtStore(f, L("o"), GEN_OUT + 8, I(0), 8);
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), L("rt"), L("rp"));
+    rtRetVoid(f);
+    rtLabel(f, "finished");
+    rtStore(f, L("o"), GEN_STATE, I(GS_DONE), 4);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "release");
+    rtIf(f, L("i"), "ge", L("reg"), "released");
+    rtShift(f, "x", L("i"), "shl", 4); rtOp(f, "x", L("x"), "add", L("lw"));
+    rtCall1(f, "", "__tx_release", L("x"));
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "release");
+    rtLabel(f, "released");
+    rtCall2(f, "", "__tx_nrt_window", L("lw"), L("reg"));
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("h"));
+    rtLoad(f, "p", L("o"), GEN_BUF, 8);
+    rtStore(f, L("o"), GEN_BUF, I(0), 8); rtStore(f, L("o"), GEN_LEN, I(0), 8);
+    rtIf(f, L("p"), "eq", I(0), "none");
+    rtCall1(f, "", "__tx_native_mem_free", L("p"));
+    rtLabel(f, "none");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(4), I(0));
+    rtRetVoid(f);
+    trapAt(b, f, "notgen", 4010, NOT_GEN);
+    trapAt(b, f, "running", 4017, RUNNING);
+    rtLabel(f, "overflow");
+    const deep = "调用栈深度超限";
+    rtCall5(f, "", "__tx_trap", L("fn"), L("pc"), I(4003), A(text(b, deep)), I(len(deep)));
+    rtRetVoid(f); check(f);
+
+    // __tx_gen_yield(win, a, fn, pc) → 0 继续（恢复后重新执行本条）／1 已挂起（函数须立即经尾声返回）。
+    // 挂起：产出值 retain 一份暂存进生成器（R[A] 本身随窗口进快照），窗口整块移入快照缓冲并置 None，
+    // 记下恢复点。只有当前生成器的基帧能 yield（体函数只经 gen_next 进入，编译期已保证）。
+    f = rtBegin(b, "__tx_gen_yield", "win a fn pc", "h o p reg x", 5, "bootstrap/selfhost/nrt_gen.tx");
+    rtIf(f, G("__tx_gen_resuming"), "eq", I(0), "fresh");
+    rtSetGlobal(f, "__tx_gen_resuming", I(0));
+    rtRet(f, I(0));
+    rtLabel(f, "fresh");
+    rtSet(f, "h", G("__tx_gen_cur"));
+    rtIf(f, L("h"), "eq", I(0), "outside");
+    rtIf(f, L("win"), "ne", G("__tx_gen_win"), "outside");
+    rtOp(f, "h", L("h"), "sub", I(1));
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("h"));
+    rtLoad(f, "x", L("o"), GEN_FN, 4);
+    rtOp(f, "fn", L("fn"), "and", I(4294967295));
+    rtIf(f, L("x"), "ne", L("fn"), "outside");
+    rtShift(f, "x", L("fn"), "shl", 4); rtOp(f, "x", L("x"), "add", G("__tx_rt_table_ptr"));
+    rtLoad(f, "reg", L("x"), 8, 4);
+    rtOp(f, "p", L("a"), "and", I(4294967295)); rtShift(f, "p", L("p"), "shl", 4); rtOp(f, "p", L("p"), "add", L("win"));
+    rtLoad(f, "x", L("p"), 0, 8); rtStore(f, L("o"), GEN_OUT, L("x"), 8);
+    rtLoad(f, "x", L("p"), 8, 8); rtStore(f, L("o"), GEN_OUT + 8, L("x"), 8);
+    rtOp(f, "x", L("o"), "add", I(GEN_OUT));
+    rtCall1(f, "", "__tx_retain", L("x"));
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("h"));
+    rtLoad(f, "p", L("o"), GEN_BUF, 8);
+    rtShift(f, "x", L("reg"), "shl", 4);
+    rtCall3(f, "", memcpyName(), L("p"), L("win"), L("x"));
+    rtCall2(f, "", "__tx_nrt_window", L("win"), L("reg"));
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("h"));
+    rtStore(f, L("o"), GEN_LEN, L("reg"), 8);
+    rtOp(f, "pc", L("pc"), "and", I(4294967295)); rtStore(f, L("o"), GEN_PC, L("pc"), 8);
+    rtStore(f, L("o"), GEN_STATE, I(GS_SUSPENDED), 4);
+    rtRet(f, I(1));
+    trapAt(b, f, "outside", 4012, OUTSIDE);
+    rtRetVoid(f); check(f);
+
+    // __tx_gen_close(win, a, fn, pc)：for-in 提前离开时关闭生成器——已结束为空操作，运行中 trap，
+    // 否则先置为已结束、摘下快照，再逐个释放快照值（释放可能级联到别的生成器）并归还缓冲。
+    f = rtBegin(b, "__tx_gen_close", "win a fn pc", "p tag h o st n i x", 5, "bootstrap/selfhost/nrt_gen.tx");
+    genOperand(f, "a");
+    rtLoad(f, "st", L("o"), GEN_STATE, 4);
+    rtIf(f, L("st"), "eq", I(GS_DONE), "done");
+    rtIf(f, L("st"), "eq", I(GS_RUNNING), "running");
+    rtLoad(f, "p", L("o"), GEN_BUF, 8); rtLoad(f, "n", L("o"), GEN_LEN, 8);
+    rtStore(f, L("o"), GEN_STATE, I(GS_DONE), 4);
+    rtStore(f, L("o"), GEN_BUF, I(0), 8); rtStore(f, L("o"), GEN_LEN, I(0), 8);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "release");
+    rtIf(f, L("i"), "ge", L("n"), "free");
+    rtShift(f, "x", L("i"), "shl", 4); rtOp(f, "x", L("x"), "add", L("p"));
+    rtCall1(f, "", "__tx_release", L("x"));
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "release");
+    rtLabel(f, "free");
+    rtIf(f, L("p"), "eq", I(0), "done");
+    rtCall1(f, "", "__tx_native_mem_free", L("p"));
+    rtLabel(f, "done"); rtRetVoid(f);
+    trapAt(b, f, "notgen", 4010, NOT_GEN);
+    trapAt(b, f, "running", 4017, RUNNING);
+    rtRetVoid(f); check(f);
+}

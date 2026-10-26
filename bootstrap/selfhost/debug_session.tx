@@ -1,0 +1,370 @@
+// debug_session.tx —— 原生 `taixu run --debug` 的 NDJSON 前端（第 6 轮 6c-4b；6c-5a 起引擎在 dbg_core.tx；调试实施
+// 设计 §四-5；协议逐字规格见 docs/design/v052-round6-debug-protocol-ref-20261018.md，与 VM 的有意差别见调试实施设计 §五）。
+//
+// 客户端是 stdin/stdout 上的 NDJSON：
+// - 装填态：产物停在第一个检查点（HELLO 之后的命令循环里）；
+// - 运行中：不读客户端命令，等产物的 STOP、TIMEOUT 或退出，其间产物的 stdout 每行一条 stdout 事件；
+// - 停止态：frames、inspect 经 FRAMES 与 READ 在父进程里渲染；
+// - 结束：exited、trapped（产物以 3 退出且 stderr 有 trap 行）、compile_failed，或客户端 kill／EOF。
+// MCP（6c-6，调试实施设计 §四-9）的每个会话也经 sessionDispatch 执行同一套命令，事件收进 dbg_out 的队列。
+import { JsonValue, jsonParse, jsonGet, JSON_INT, JSON_STR, JSON_OBJ } from "./json_parse";
+import { dbgStr, dbgEmit, dbgError, dbgModulesOf } from "./dbg_out";
+import { DbgSlot, viewSlots, viewBrief, viewRcText, viewInspect, viewSlotTag } from "./dbg_view";
+import { Sess, DbgFrame, ST_LOADING, ST_STOPPED, ST_ENDED, PUMP_STOPPED, PUMP_ENDED, SESSION_MS, coreLaunch, coreLastCode, coreClose, corePoints, coreFnPoint, coreArm, coreRun, corePause, corePump, coreEnd, framesOf, regCount, varIdx, varTy, varName, varTyText, lineAt, colAt, fnText, nowMsS } from "./dbg_core";
+
+const LINE_MAX: int = 16777216;
+const PAUSE_GRACE_MS: int = 300;
+const UNKNOWN_CMD: string = "未知命令（可用：breakpoint_set/breakpoint_fn/continue/step/frames/inspect/stops/kill）";
+
+// 客户端输入：读缓冲、未成行的字节、是否已到流尾。
+let inBuf: Bytes = bytesNew(65536);
+let inPend: Bytes = bytesNew(0);
+let inEof: bool = false;
+
+// 编译 entry 的调试构建到 exe，起产物并驱动会话；返回进程退出码。
+export function debugSession(entry: string, progArgs: List<string>, exe: string, exeHost: string): int {
+    const cwd = currentDir() catch (e) {
+        dbgError("取当前目录失败：" + e.message);
+        return 1;
+    };
+    const s = coreLaunch(entry, cwd, progArgs, exe, exeHost, "") catch (e) { return coreLastCode(); };
+    let rc = s.code;
+    if (s.state != ST_ENDED) { rc = commandLoop(s); }
+    coreClose(s);
+    return rc;
+}
+
+// —— 客户端命令 ——
+
+// 下一条命令行（去掉全部 CR、两端的空格与 Tab，跳过空行）；EOF、读错或超长行时 inEof 为真并返回空。
+function readCmd(): Bytes {
+    while (true) {
+        const n = bytesLen(inPend);
+        let i = 0;
+        while (i < n) {
+            if ((bytesGet(inPend, i) catch 0) == 10) {
+                const raw = bytesSlice(inPend, 0, i);
+                inPend = bytesSlice(inPend, i + 1, n - i - 1);
+                const line = trimLine(raw);
+                if (bytesLen(line) > 0) { return line; }
+                i = -1;
+                break;
+            }
+            i = i + 1;
+        }
+        if (i >= 0) {
+            if (inEof || n > LINE_MAX) {
+                inEof = true;
+                return bytesNew(0);
+            }
+            const got = stdinRead(inBuf, -1);
+            if (got < 0) { inEof = true; } else if (got > 0) { bytesAppend(inPend, bytesSlice(inBuf, 0, got)); }
+        }
+    }
+    return bytesNew(0);
+}
+
+function trimLine(raw: Bytes): Bytes {
+    const out = bytesNew(0);
+    let k = 0;
+    while (k < bytesLen(raw)) {
+        const c = bytesGet(raw, k) catch 0;
+        if (c != 13) { bytesPush(out, c); }
+        k = k + 1;
+    }
+    let a = 0;
+    let z = bytesLen(out);
+    while (a < z && ((bytesGet(out, a) catch 0) == 32 || (bytesGet(out, a) catch 0) == 9)) { a = a + 1; }
+    while (z > a && ((bytesGet(out, z - 1) catch 0) == 32 || (bytesGet(out, z - 1) catch 0) == 9)) { z = z - 1; }
+    return bytesSlice(out, a, z - a);
+}
+
+// 命令循环（产物在装填态或停止态时）；返回会话退出码。
+function commandLoop(s: Ref<Sess>): int {
+    while (true) {
+        const line = readCmd();
+        if (inEof && bytesLen(line) == 0) { return coreEnd(s, "eof", 0); }
+        if (nowMsS() - s.start > SESSION_MS) {
+            return coreEnd(s, "session_limit", 3);
+        }
+        const rc = sessionDispatch(s, line);
+        if (rc >= 0) { return rc; }
+    }
+    return 0;
+}
+
+// 一条命令；会话结束时返回退出码，否则 −1。
+export function sessionDispatch(s: Ref<Sess>, line: Bytes): int {
+    const cmd = jsonParse(line) catch (e) {
+        dbgError("命令不是合法 JSON");
+        return -1;
+    };
+    if (cmd.kind != JSON_OBJ) {
+        dbgError("命令须为 JSON object");
+        return -1;
+    }
+    const cv = jsonGet(cmd, "cmd") catch None;
+    if (cv == None) {
+        dbgError("命令缺少 cmd 字段");
+        return -1;
+    }
+    const c = cv catch cmd;
+    if (c.kind != JSON_STR) {
+        dbgError(UNKNOWN_CMD);
+        return -1;
+    }
+    const name = c.s;
+    if (name == "continue") { return cmdContinue(s, cmd); }
+    if (name == "step") { return cmdStep(s, cmd); }
+    if (name == "kill") { return coreEnd(s, "kill", 0); }
+    if (name == "breakpoint_set") { cmdBreakLine(s, cmd); return -1; }
+    if (name == "breakpoint_fn") { cmdBreakFn(s, cmd); return -1; }
+    if (name == "frames") { cmdFrames(s); return -1; }
+    if (name == "inspect") { cmdInspect(s, cmd); return -1; }
+    if (name == "stops") {
+        dbgEmit("{\"event\":\"stops\",\"stops\":[" + joinStrs(s.stops) + "]}");
+        return -1;
+    }
+    dbgError(UNKNOWN_CMD);
+    return -1;
+}
+
+function joinStrs(xs: List<string>): string {
+    let out = "";
+    let k = 0;
+    while (k < listLen(xs)) {
+        if (k > 0) { out = out + ","; }
+        out = out + (listGet(xs, k) catch "");
+        k = k + 1;
+    }
+    return out;
+}
+
+// timeout_s 字段：缺省为 dflt；不是正整数时发 error 并得 −1；超过 1800 按 1800。
+function timeoutOf(cmd: Ref<JsonValue>, what: string, dflt: int): int {
+    const tv = jsonGet(cmd, "timeout_s") catch None;
+    if (tv == None) { return dflt; }
+    const t = tv catch cmd;
+    if (t.kind != JSON_INT || t.i <= 0) {
+        dbgError(what + " 的 timeout_s 需要正整数（秒）");
+        return -1;
+    }
+    if (t.i > 1800) { return 1800; }
+    return t.i;
+}
+
+// budget_ms 字段（MCP 内部用）：本次请求剩下的毫秒数；缺省 0 为不限，不是正整数时发 error 并得 −1。
+function budgetOf(cmd: Ref<JsonValue>, what: string): int {
+    const bv = jsonGet(cmd, "budget_ms") catch None;
+    if (bv == None) { return 0; }
+    const b = bv catch cmd;
+    if (b.kind != JSON_INT || b.i <= 0) {
+        dbgError(what + " 的 budget_ms 需要正整数（毫秒）");
+        return -1;
+    }
+    return b.i;
+}
+
+// 带截止地运行 secs 秒（不越过会话硬顶）；budget 毫秒内没停下就暂停（见 resume）。
+function resumeFor(s: Ref<Sess>, mode: int, secs: int, budget: int): int {
+    let deadline = nowMsS() + secs * 1000;
+    if (deadline > s.start + SESSION_MS) { deadline = s.start + SESSION_MS; }
+    let ms = deadline - nowMsS();
+    if (ms < 1) { ms = 1; }
+    return resume(s, mode, ms, deadline, budget);
+}
+
+function cmdContinue(s: Ref<Sess>, cmd: Ref<JsonValue>): int {
+    const secs = timeoutOf(cmd, "continue", 60);
+    if (secs < 0) { return -1; }
+    const budget = budgetOf(cmd, "continue");
+    if (budget < 0) { return -1; }
+    return resumeFor(s, 0, secs, budget);
+}
+
+function cmdStep(s: Ref<Sess>, cmd: Ref<JsonValue>): int {
+    let mode = 1;
+    const mv = jsonGet(cmd, "mode") catch None;
+    if (mv != None) {
+        const m = mv catch cmd;
+        if (m.kind != JSON_STR) {
+            dbgError("step 的 mode 需要字符串");
+            return -1;
+        }
+        if (m.s == "into") { mode = 1; }
+        else if (m.s == "over") { mode = 2; }
+        else if (m.s == "out") { mode = 3; }
+        else {
+            dbgError("step 的 mode 需要 into|over|out");
+            return -1;
+        }
+    }
+    // timeout_s（6c-6 增补，MCP 的 debug_step 用）：不带时没有截止（同 VM）；到点同 continue。
+    const secs = timeoutOf(cmd, "step", 0);
+    if (secs < 0) { return -1; }
+    const budget = budgetOf(cmd, "step");
+    if (budget < 0) { return -1; }
+    // 装填态的 over、out 相当于 continue（同 VM）。
+    if (s.state == ST_LOADING && mode != 1) { mode = 0; }
+    if (secs > 0) { return resumeFor(s, mode, secs, budget); }
+    return resume(s, mode, 0, 0, budget);
+}
+
+// RUN 之后不读客户端命令，等到停下、超时或产物结束；停下时返回 −1（回命令循环），否则返回会话退出码。
+// budget > 0（MCP 请求的剩余时限）：到点发暂停，产物以 reason pause 停下，会话保留、可再 continue；暂停在
+// PAUSE_GRACE_MS 内没落地（产物卡在外部调用或睡眠里）则结束产物，exited 的 reason 为 request_budget。
+// 这样一次长运行不会拖到父进程的请求墙钟而连带丢掉同一 worker 里的其他会话。
+function resume(s: Ref<Sess>, mode: int, ms: int, deadline: int, budget: int): int {
+    const begin = nowMsS();
+    if (!coreRun(s, mode, ms, deadline)) { return s.code; }
+    let pausedAt = 0;
+    while (true) {
+        let wait = 100;
+        if (budget > 0 && pausedAt == 0) {
+            const left = begin + budget - nowMsS();
+            if (left < wait) { wait = left; }
+            if (wait < 1) { wait = 1; }
+        }
+        const r = corePump(s, wait, false);
+        if (r == PUMP_STOPPED) { return -1; }
+        if (r == PUMP_ENDED) { return s.code; }
+        if (budget > 0) {
+            const now = nowMsS();
+            if (pausedAt == 0 && now >= begin + budget) {
+                corePause(s);
+                pausedAt = now;
+            } else if (pausedAt > 0 && now >= pausedAt + PAUSE_GRACE_MS) {
+                return coreEnd(s, "request_budget", 3);
+            }
+        }
+    }
+    return 3;
+}
+
+// —— 断点 ——
+
+function cmdBreakLine(s: Ref<Sess>, cmd: Ref<JsonValue>): void {
+    const mv = jsonGet(cmd, "module") catch None;
+    if (mv == None) {
+        dbgError("breakpoint_set 缺少 module");
+        return;
+    }
+    const lv = jsonGet(cmd, "line") catch None;
+    if (lv == None) {
+        dbgError("breakpoint_set 缺少 line");
+        return;
+    }
+    const mm = mv catch cmd;
+    const ll = lv catch cmd;
+    if (mm.kind != JSON_STR || ll.kind != JSON_INT) {
+        dbgError("breakpoint_set 的 module 须为字符串、line 须为整数");
+        return;
+    }
+    if (ll.i < 0 || ll.i > 4294967295) {
+        dbgError("breakpoint_set 的 line 需要非负整数");
+        return;
+    }
+    const mods = dbgModulesOf(s.absMods, s.specMods, mm.s);
+    if (listLen(mods) == 0) {
+        dbgError("未知模块（见 ready 事件的 modules 清单）");
+        return;
+    }
+    const points = corePoints(s, mods, ll.i);
+    let k = 0;
+    while (k < listLen(points)) {
+        coreArm(s, listGet(points, k) catch 0, 1);
+        k = k + 1;
+    }
+    dbgEmit("{\"event\":\"breakpoint_set\",\"ok\":true,\"count\":" + toStr(listLen(points)) + "}");
+}
+
+function cmdBreakFn(s: Ref<Sess>, cmd: Ref<JsonValue>): void {
+    const fv = jsonGet(cmd, "fn") catch None;
+    if (fv == None) {
+        dbgError("breakpoint_fn 缺少 fn");
+        return;
+    }
+    const ff = fv catch cmd;
+    if (ff.kind != JSON_STR) {
+        dbgError("breakpoint_fn 的 fn 须为字符串");
+        return;
+    }
+    const point = coreFnPoint(s, ff.s);
+    let count = 0;
+    if (point >= 0) {
+        coreArm(s, point, 1);
+        count = 1;
+    }
+    dbgEmit("{\"event\":\"breakpoint_fn\",\"ok\":true,\"count\":" + toStr(count) + "}");
+}
+
+// —— frames 与 inspect ——
+
+function varAt(s: Ref<Sess>, f: int, k: int): string {
+    if (k < 0) { return ""; }
+    return ",\"name\":" + dbgStr(varName(s, f, k)) + ",\"type\":" + dbgStr(varTyText(s, f, k));
+}
+
+function cmdFrames(s: Ref<Sess>): void {
+    const frames = framesOf(s);
+    let out = "";
+    let k = 0;
+    while (k < listLen(frames)) {
+        const fr = listGet(frames, k) catch new DbgFrame { win: 0, fn: 0, pc: 0 };
+        const reg = regCount(s, fr.fn);
+        const slots = viewSlots(s.v, fr.win, reg);
+        let sl = "";
+        let i = 0;
+        while (i < listLen(slots)) {
+            const v = listGet(slots, i) catch new DbgSlot { tag: 0, pay: 0 };
+            const vk = varIdx(s, fr.fn, fr.pc, i);
+            const ty = varTy(s, fr.fn, vk);
+            if (i > 0) { sl = sl + ","; }
+            sl = sl + "{\"idx\":" + toStr(i) + ",\"tag\":" + dbgStr(viewSlotTag(s.v, v, ty)) + ",\"brief\":" + dbgStr(viewBrief(s.v, v, ty)) + ",\"rc\":" + viewRcText(s.v, v) + varAt(s, fr.fn, vk) + "}";
+            i = i + 1;
+        }
+        const mi = listGet(s.ctx.fnModule, fr.fn) catch -1;
+        let mod = "?";
+        if (mi >= 0 && mi < listLen(s.absMods)) { mod = listGet(s.absMods, mi) catch "?"; }
+        if (k > 0) { out = out + ","; }
+        out = out + "{\"index\":" + toStr(k) + ",\"fn_index\":" + toStr(fr.fn) + ",\"fn\":" + dbgStr(fnText(s, fr.fn)) + ",\"module\":" + dbgStr(mod) + ",\"pc\":" + toStr(fr.pc) + ",\"line\":" + toStr(lineAt(s, fr.fn, fr.pc)) + ",\"col\":" + toStr(colAt(s, fr.fn, fr.pc)) + ",\"reg_count\":" + toStr(reg) + ",\"slots\":[" + sl + "]}";
+        k = k + 1;
+    }
+    dbgEmit("{\"event\":\"frames\",\"frames\":[" + out + "]}");
+}
+
+function cmdInspect(s: Ref<Sess>, cmd: Ref<JsonValue>): void {
+    if (s.state != ST_STOPPED) {
+        dbgError("inspect 仅在停止态可用");
+        return;
+    }
+    const fv = jsonGet(cmd, "frame") catch None;
+    if (fv == None) {
+        dbgError("inspect 缺少 frame");
+        return;
+    }
+    const sv = jsonGet(cmd, "slot") catch None;
+    if (sv == None) {
+        dbgError("inspect 缺少 slot");
+        return;
+    }
+    const fi = fv catch cmd;
+    const si = sv catch cmd;
+    if (fi.kind != JSON_INT || si.kind != JSON_INT || fi.i < 0 || si.i < 0) {
+        dbgError("inspect 的 frame/slot 须为非负整数");
+        return;
+    }
+    const frames = framesOf(s);
+    if (fi.i >= listLen(frames)) {
+        dbgError("frame 越界（见 frames 事件）");
+        return;
+    }
+    const fr = listGet(frames, fi.i) catch new DbgFrame { win: 0, fn: 0, pc: 0 };
+    if (si.i >= regCount(s, fr.fn)) {
+        dbgError("slot 越界（见 frames 事件的 reg_count）");
+        return;
+    }
+    const slot = listGet(viewSlots(s.v, fr.win + 16 * si.i, 1), 0) catch new DbgSlot { tag: 0, pay: 0 };
+    const ty = varTy(s, fr.fn, varIdx(s, fr.fn, fr.pc, si.i));
+    dbgEmit("{\"event\":\"inspect\",\"value\":" + viewInspect(s.v, slot, ty) + "}");
+}

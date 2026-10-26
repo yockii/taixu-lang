@@ -1,0 +1,166 @@
+// std/net TCP 系统面的 Windows 目标文件（D3 v0.23 按目标选择文件；导出面同 net_sys.tx）：ws2_32，
+// 首次使用时 WSAStartup(2.2)。句柄表与地址规则见 net_impl.tx。
+// recv：太虚的 string 恒为合法 UTF-8，先 MSG_PEEK 看已到的数据，只取到最后一个完整字符为止，半个字符
+// 留给下一次（已到的只是一个字符的开头时等它收齐，至多 4 字节）；非法字节替换为 U+FFFD——按文本
+// 收发的数据与 Zig 宿主逐字节相同，二进制数据不在 std/net 的接口内。
+// 套接字建成不可继承（WSASocketW 带 WSA_FLAG_NO_HANDLE_INHERIT，accept 得到的经 SetHandleInformation 清继承位；同 Rust）：
+// ws2_32 的 socket() 缺省可继承，别处以 bInheritHandles 起的子进程会拿走它（核心 D3 v0.40 的 runProcess 已只交标准三件）。
+import { slotAlloc, slotPeek, slotTake, sockaddrOf, sockaddrAny } from "./net_impl";
+import { lossyStr, utf8Complete, seqLen } from "./sys_text";
+
+declare function WSAStartup(version: u16, data: Bytes): i32 from "ws2_32";
+declare function WSASocketW(af: i32, kind: i32, proto: i32, info: usize, g: u32, flags: u32): isize from "ws2_32";
+declare function SetHandleInformation(h: isize, mask: u32, flags: u32): i32 from "kernel32";
+declare function connect(s: isize, addr: Bytes, alen: i32): i32 from "ws2_32";
+declare function bind(s: isize, addr: Bytes, alen: i32): i32 from "ws2_32";
+declare function listen(s: isize, backlog: i32): i32 from "ws2_32";
+declare function accept(s: isize, addr: Bytes, alen: Bytes): isize from "ws2_32";
+declare function send(s: isize, buf: Bytes, n: i32, flags: i32): i32 from "ws2_32";
+declare function recv(s: isize, buf: Bytes, n: i32, flags: i32): i32 from "ws2_32";
+declare function closesocket(s: isize): i32 from "ws2_32";
+
+const MSG_PEEK: int = 2;
+// WSA_FLAG_OVERLAPPED（socket() 的缺省）｜WSA_FLAG_NO_HANDLE_INHERIT。
+const SOCKET_FLAGS: int = 129;
+const MSG_WAITALL: int = 8;
+let wsaReady: bool = false;
+
+function wsaInit(): bool {
+    if (wsaReady) {
+        return true;
+    }
+    if (WSAStartup(514, bytesNew(512)) != 0) {
+        return false;
+    }
+    wsaReady = true;
+    return true;
+}
+
+// AF_INET 的 TCP 套接字，不可继承。
+function newSocket(): isize {
+    return WSASocketW(2, 1, 0, 0, 0, wrapTo<u32>(SOCKET_FLAGS));
+}
+
+// 新套接字登记进句柄表；表满时关闭它并报失败。
+function adopt(s: isize): int {
+    const slot = slotAlloc(s as int);
+    if (slot < 0) {
+        closesocket(s);
+    }
+    return slot;
+}
+
+export function sysTcpConnect(host: string, port: int): int {
+    if (!wsaInit() || port <= 0 || port > 65535) {
+        return -1;
+    }
+    const sa = sockaddrOf(host, port);
+    if (bytesLen(sa) == 0) {
+        return -1;
+    }
+    const s = newSocket();
+    if (s == -1) {
+        return -1;
+    }
+    if (connect(s, sa, 16) != 0) {
+        closesocket(s);
+        return -1;
+    }
+    return adopt(s);
+}
+
+export function sysTcpListen(port: int): int {
+    if (!wsaInit() || port < 0 || port > 65535) {
+        return -1;
+    }
+    const s = newSocket();
+    if (s == -1) {
+        return -1;
+    }
+    if (bind(s, sockaddrAny(port), 16) != 0 || listen(s, 8) != 0) {
+        closesocket(s);
+        return -1;
+    }
+    return adopt(s);
+}
+
+export function sysTcpAccept(l: int): int {
+    const ls = slotPeek(l);
+    if (ls < 0) {
+        return -1;
+    }
+    const alen = bytesNew(4);
+    bytesSet(alen, 0, 16);
+    const s = accept(ls as isize, bytesNew(16), alen);
+    if (s == -1) {
+        return -1;
+    }
+    // HANDLE_FLAG_INHERIT 清零：accept 得到的套接字不随监听套接字的标志走，显式设。
+    if (SetHandleInformation(s, 1, 0) == 0) {
+        closesocket(s);
+        return -1;
+    }
+    return adopt(s);
+}
+
+export function sysTcpSend(fd: int, data: string): int {
+    const s = slotPeek(fd);
+    if (s < 0) {
+        return -1;
+    }
+    const n = len(data);
+    if (n == 0) {
+        return 0;
+    }
+    if (n > 2147483647) {
+        return -1;
+    }
+    const r = send(s as isize, bytesFromStr(data), n as i32, 0) as int;
+    if (r < 0) {
+        return -1;
+    }
+    return r;
+}
+
+export function sysTcpRecv(fd: int, max: int): string | Error {
+    const s = slotPeek(fd);
+    if (s < 0) {
+        return err("net: bad socket");
+    }
+    if (max <= 0) {
+        return err("net: recv max must be positive");
+    }
+    let n: int = max;
+    if (n > 1048576) {
+        n = 1048576;
+    }
+    const buf = bytesNew(n + 4);
+    const got = recv(s as isize, buf, n as i32, MSG_PEEK as i32) as int;
+    if (got == 0) {
+        return "";
+    }
+    if (got < 0) {
+        return err("net: recv failed");
+    }
+    let keep: int = utf8Complete(buf, got);
+    let flags: int = 0;
+    if (keep == 0) {
+        keep = seqLen(bytesGet(buf, 0) catch 0);
+        flags = MSG_WAITALL;
+    }
+    const r = recv(s as isize, buf, keep as i32, flags as i32) as int;
+    if (r == 0) {
+        return "";
+    }
+    if (r < 0) {
+        return err("net: recv failed");
+    }
+    return lossyStr(bytesSlice(buf, 0, r));
+}
+
+export function sysTcpClose(fd: int): void {
+    const s = slotTake(fd);
+    if (s >= 0) {
+        closesocket(s as isize);
+    }
+}

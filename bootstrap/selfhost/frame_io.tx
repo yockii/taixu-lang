@@ -1,0 +1,124 @@
+// Content-Length 分帧。头块预算按原始传输字节（含换行与分隔空行）累计；正文另受调用方的 max 限制。
+// 保留跨分片的扫描位置，完整长行与大量短行遵守同一预算。一个进程里只有一个服务端使用它。
+const HEAD_MAX: int = 65536;
+const READ_MAX: int = 65536;
+
+let fioBuf: Bytes = bytesNew(65536);
+let fioPend: Bytes = bytesNew(0);
+let fioEnded: bool = false;
+let fioErr: string = "";
+let fioScan: int = 0;
+let fioPos: int = 0;
+let fioLength: int = -1;
+let fioBodyReady: bool = false;
+let fioMaxPending: int = 33554432 + 65536 + 65536;
+
+export function fioRead(ms: int): void {
+    if (len(fioErr) > 0 || fioEnded) { return; }
+    const got = stdinRead(fioBuf, ms);
+    if (got < 0) { fioEnded = true; }
+    else if (got > 0) {
+        if (got > fioMaxPending - bytesLen(fioPend)) { fioErr = "MessageTooLong"; return; }
+        bytesAppend(fioPend, bytesSlice(fioBuf, 0, got));
+    }
+}
+
+export function fioAtEof(): bool { return fioEnded; }
+export function fioError(): string { return fioErr; }
+export function fioPendingBytes(): int { return bytesLen(fioPend); }
+
+function lowerAscii(s: string): string {
+    const b = bytesFromStr(s);
+    let k = 0;
+    while (k < bytesLen(b)) {
+        const c = bytesGet(b, k) catch 0;
+        if (c >= 65 && c <= 90) { bytesSet(b, k, c + 32); }
+        k = k + 1;
+    }
+    return bytesToStr(b) catch s;
+}
+
+function trimText(s: string): string {
+    const b = bytesFromStr(s);
+    let a = 0;
+    let z = bytesLen(b);
+    while (a < z && ((bytesGet(b, a) catch 0) == 32 || (bytesGet(b, a) catch 0) == 9)) { a = a + 1; }
+    while (z > a && ((bytesGet(b, z - 1) catch 0) == 32 || (bytesGet(b, z - 1) catch 0) == 9)) { z = z - 1; }
+    return bytesToStr(bytesSlice(b, a, z - a)) catch "";
+}
+
+function parseLen(s: string): int {
+    if (len(s) == 0 || len(s) > 18) { return -1; }
+    let v = 0;
+    let k = 0;
+    while (k < len(s)) {
+        const c = byteAt(s, k) catch 0;
+        if (c < 48 || c > 57) { return -1; }
+        v = v * 10 + (c - 48);
+        k = k + 1;
+    }
+    return v;
+}
+
+// 完整消息正文；尚不完整为空 Bytes，错误记在 fioError。零长正文用单个空格与“不完整”区分。
+export function fioTake(max: int): Bytes {
+    if (len(fioErr) > 0) { return bytesNew(0); }
+    if (max < 0 || max > 9223372036854644735) { fioErr = "BadFrame"; return bytesNew(0); }
+    fioMaxPending = max + HEAD_MAX + READ_MAX;
+    const n = bytesLen(fioPend);
+    while (!fioBodyReady && fioScan < n) {
+        const c = bytesGet(fioPend, fioScan) catch 0;
+        fioScan = fioScan + 1;
+        if (fioScan > HEAD_MAX) { fioErr = "BadFrame"; return bytesNew(0); }
+        if (c != 10) { continue; }
+        let end = fioScan - 1;
+        if (end > fioPos && (bytesGet(fioPend, end - 1) catch 0) == 13) { end = end - 1; }
+        // 头部只收 ASCII（LSP 基础协议：头部按 ascii 编码）：行内 CR、≥0x80 与 HTAB 以外的控制字节都是坏帧。
+        // 不这样做时非 UTF-8 的头行会被当成空串略过，重复的 Content-Length 就能藏在里面。
+        let k = fioPos;
+        while (k < end) {
+            const b = bytesGet(fioPend, k) catch 0;
+            if (b == 13 || b >= 128 || (b < 32 && b != 9) || b == 127) { fioErr = "BadFrame"; return bytesNew(0); }
+            k = k + 1;
+        }
+        const line = bytesSlice(fioPend, fioPos, end - fioPos);
+        fioPos = fioScan;
+        if (bytesLen(line) == 0) {
+            if (fioLength < 0) { fioErr = "BadFrame"; return bytesNew(0); }
+            fioBodyReady = true;
+        } else {
+            const text = bytesToStr(line) catch "";
+            const colon = strIndexOf(text, ":");
+            if (colon >= 0 && lowerAscii(trimText(strSub(text, 0, colon))) == "content-length") {
+                if (fioLength >= 0) { fioErr = "BadFrame"; return bytesNew(0); }
+                fioLength = parseLen(trimText(strSub(text, colon + 1, len(text) - colon - 1)));
+                if (fioLength < 0) { fioErr = "BadFrame"; return bytesNew(0); }
+                if (fioLength > max) { fioErr = "MessageTooLong"; return bytesNew(0); }
+            }
+        }
+    }
+    if (!fioBodyReady) {
+        if ((fioScan >= HEAD_MAX && n > 0) || (fioEnded && n > 0)) { fioErr = "BadFrame"; }
+        return bytesNew(0);
+    }
+    if (fioLength > max) { fioErr = "MessageTooLong"; return bytesNew(0); }
+    if (n - fioPos < fioLength) {
+        if (fioEnded) { fioErr = "BadFrame"; }
+        return bytesNew(0);
+    }
+    const body = bytesSlice(fioPend, fioPos, fioLength);
+    fioPend = bytesSlice(fioPend, fioPos + fioLength, n - fioPos - fioLength);
+    fioPos = 0;
+    fioScan = 0;
+    fioLength = -1;
+    fioBodyReady = false;
+    if (bytesLen(body) == 0) { return bytesFromStr(" "); }
+    return body;
+}
+
+export function fioSend(body: string): int {
+    const b = bytesFromStr(body);
+    const frame = bytesFromStr("Content-Length: " + toStr(bytesLen(b)) + "\r\n\r\n");
+    bytesAppend(frame, b);
+    return stdoutWrite(frame);
+}

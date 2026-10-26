@@ -1,0 +1,220 @@
+// 取页失败的故障注入（docs/design/v052-oom-fault-v0.1-20261025.md）：内核生成器 --generic=oomfault 时发出闸门与各取页原语的包装。
+// 这种内核里 rtfn 把对取页原语的调用（rtCallList 的目标名；Linux 的 mmap、mprotect 系统调用）换成这里的包装 __tx_fault_<名>：
+// 先过闸门，放行即原样转交，拒绝即返回该原语的失败值，各调用点照原有的失败判断走下去。
+// - __tx_fault_gate() → 1 放行／0 拒绝：进程级次序计数（原子加）的第 N 次起一律拒绝，或只拒绝第 N..N+K−1 次；N、K 在首次进入时
+//   由 __tx_fault_init 从环境变量 TAIXU_TEST_FAIL_PAGES（“N” 或 “N:K”）读出，未设、为 0 或格式不对即从不拒绝。第一次取页是
+//   入口建主线程区域，那时还没有别的线程，也没有线程块与环境表：只用局部量与 bss，Unix 扫入口记下的 __tx_nrt_envp，Windows 经
+//   GetEnvironmentVariableW 读进 bss 缓冲。
+// - 第一次拒绝时向 stderr 写一行 “oomfault: injected”（原子标志，只写一次）；Unix 直接 write(2)，Windows 经 GetStdHandle、
+//   WriteFile，不依赖尚未建立的输出句柄。扫描据这一行判断本轮是否发生了注入。
+import { StructuredBuffer, asBufferSection, asBufferAlign, asBufferLabel, asBufferByte, asBufferZero } from "./assemble";
+import { RtFn, RtOp, L, I, A, G } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtSetGlobal, rtOp, rtLoad, rtAddrOf, rtLabel, rtJump, rtIf, rtCall0, rtCall1, rtCall3, rtCall5, rtCallList, rtSyscall, rtAtomicAdd, rtRet } from "./rtfn";
+import { tKernel32, tRawSyscall, tMacos, tUnix } from "./target";
+import { uxSys } from "./unix_sys";
+
+const MODULE: string = "bootstrap/selfhost/kernel_oom_fault.tx";
+const VAR: string = "TAIXU_TEST_FAIL_PAGES";
+const MARK: string = "oomfault: injected\n";
+// Windows 读环境变量的缓冲（UTF-16 单元）；取值至多 “18 位:18 位”，更长的按格式不对处理。
+const WIDE_UNITS: int = 64;
+// 十进制位数上限：两段相加仍远在 int 范围内。
+const MAX_DIGITS: int = 15;
+const ENOMEM: int = 12;
+// pthread_create 资源不足时直接返回的错误号（macOS 的 EAGAIN）。
+const MAC_EAGAIN: int = 35;
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+/// 发出闸门、读变量的初始化与本目标各取页原语的包装；rtfn 的失败记进 failures。t 为目标编号。
+export function oomFaultEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    asBufferSection(b, 0, 1);
+    emitGate(b, failures, t);
+    emitInit(b, failures, t);
+    if (tKernel32(t)) {
+        wrap(b, failures, "VirtualAlloc", "VirtualAlloc", 4, 0, -1);
+        wrap(b, failures, "CreateThread", "CreateThread", 6, 0, -1);
+    }
+    if (tRawSyscall(t)) {
+        wrap(b, failures, "linux_page_alloc", "__tx_linux_page_alloc", 4, 0, -1);
+        wrap(b, failures, "sys9", "", 6, 0 - ENOMEM, 9);
+        wrap(b, failures, "sys10", "", 3, 0 - ENOMEM, 10);
+    }
+    if (tMacos(t)) {
+        wrap(b, failures, "mac_mmap", "__tx_mac_mmap", 6, 0 - ENOMEM, -1);
+        wrap(b, failures, "mac_mprotect", "__tx_mac_mprotect", 3, 0 - ENOMEM, -1);
+        wrap(b, failures, "mac_pthread_create", "__tx_mac_pthread_create", 4, MAC_EAGAIN, -1);
+    }
+    emitData(b, t);
+}
+
+/// 闸门的 bss：次序计数、首个拒绝序号（0 未读、−1 从不）、拒绝区间末端（0 为持续）、已报告标志；Windows 另有读变量的缓冲。
+export function oomFaultBss(b: Ref<StructuredBuffer>, t: int): void {
+    asBufferAlign(b, 4, 1);
+    const names = strSplit("seq first end said", " ");
+    for (n in names) { asBufferLabel(b, "__tx_fault_" + n, 1); asBufferZero(b, 8, 1); }
+    if (tKernel32(t)) { asBufferLabel(b, "__tx_fault_wbuf", 1); asBufferZero(b, WIDE_UNITS * 2, 1); }
+}
+
+// __tx_fault_<name>(a0..)：过闸门后转交 target（sys ≥ 0 时为该号的裸系统调用），拒绝时返回 deny。包装自己的名字以 __tx_fault_
+// 开头，rtfn 不再拦截其中的调用。
+function wrap(b: Ref<StructuredBuffer>, failures: List<string>, name: string, target: string, nargs: int, deny: int, sys: int): void {
+    let params = "";
+    const args: List<Ref<RtOp>> = listNew();
+    let k = 0;
+    while (k < nargs) {
+        params = params + " a" + toStr(k);
+        listPush(args, L("a" + toStr(k)));
+        k = k + 1;
+    }
+    const f = rtBegin(b, "__tx_fault_" + name, params, "g r", 6, MODULE);
+    rtCall0(f, "g", "__tx_fault_gate");
+    rtIf(f, L("g"), "eq", I(0), "deny");
+    if (sys >= 0) { rtSyscall(f, "r", sys, args); } else { rtCallList(f, "r", target, args); }
+    rtRet(f, L("r"));
+    rtLabel(f, "deny");
+    rtRet(f, I(deny));
+    done(f, failures);
+}
+
+function emitGate(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    const f = rtBegin(b, "__tx_fault_gate", "", "n lim end old h w wp", 6, MODULE);
+    rtAtomicAdd(f, "n", A("__tx_fault_seq"), 0, I(1));
+    rtOp(f, "n", L("n"), "add", I(1));
+    rtSet(f, "lim", G("__tx_fault_first"));
+    rtIf(f, L("lim"), "ne", I(0), "have");
+    rtCall0(f, "lim", "__tx_fault_init");
+    rtLabel(f, "have");
+    rtIf(f, L("lim"), "lt", I(0), "allow");
+    rtIf(f, L("n"), "lt", L("lim"), "allow");
+    rtSet(f, "end", G("__tx_fault_end"));
+    rtIf(f, L("end"), "eq", I(0), "deny");
+    rtIf(f, L("n"), "ge", L("end"), "allow");
+    rtLabel(f, "deny");
+    rtAtomicAdd(f, "old", A("__tx_fault_said"), 0, I(1));
+    rtIf(f, L("old"), "ne", I(0), "quiet");
+    if (tUnix(t)) {
+        const xs: List<Ref<RtOp>> = listNew(); listPush(xs, I(2)); listPush(xs, A("__tx_fault_mark")); listPush(xs, I(len(MARK)));
+        uxSys(f, t, "", 1, xs);
+    } else {
+        rtCall1(f, "h", "GetStdHandle", I(-12));
+        rtSet(f, "w", I(0));
+        rtAddrOf(f, "wp", "w");
+        rtCall5(f, "", "WriteFile", L("h"), A("__tx_fault_mark"), I(len(MARK)), L("wp"), I(0));
+    }
+    rtLabel(f, "quiet");
+    rtRet(f, I(0));
+    rtLabel(f, "allow");
+    rtRet(f, I(1));
+    done(f, failures);
+}
+
+// __tx_fault_init() → 首个拒绝序号（−1 为从不）：找到变量的值（Unix 为 envp 里 “名字=” 之后的字节，Windows 为 UTF-16 单元，
+// 步长 w 字节、各单元须 < 128），按 “N” 或 “N:K” 解析，写 __tx_fault_first 与 __tx_fault_end。
+function emitInit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    const f = rtBegin(b, "__tx_fault_init", "", "kp p i c kc q w n k d end", 3, MODULE);
+    const klen = len(VAR) + 1;
+    if (tUnix(t)) {
+        rtSet(f, "w", I(1));
+        rtSet(f, "kp", G("__tx_nrt_envp"));
+        rtIf(f, L("kp"), "eq", I(0), "never");
+        rtLabel(f, "item");
+        rtLoad(f, "p", L("kp"), 0, 8);
+        rtIf(f, L("p"), "eq", I(0), "never");
+        rtOp(f, "kp", L("kp"), "add", I(8));
+        rtSet(f, "i", I(0));
+        rtLabel(f, "key");
+        rtIf(f, L("i"), "ge", I(klen), "found");
+        rtOp(f, "q", L("p"), "add", L("i")); rtLoad(f, "c", L("q"), 0, 1);
+        rtOp(f, "q", A("__tx_fault_key"), "add", L("i")); rtLoad(f, "kc", L("q"), 0, 1);
+        rtIf(f, L("c"), "ne", L("kc"), "item");
+        rtOp(f, "i", L("i"), "add", I(1));
+        rtJump(f, "key");
+        rtLabel(f, "found");
+        rtOp(f, "q", L("p"), "add", L("i"));
+    } else {
+        // 缓冲放得下时得到不含结尾 NUL 的单元数（并已写上结尾 NUL），放不下得所需单元数（≥ 缓冲），没有该变量得 0。
+        rtCall3(f, "n", "GetEnvironmentVariableW", A("__tx_fault_wname"), A("__tx_fault_wbuf"), I(WIDE_UNITS));
+        rtOp(f, "n", L("n"), "and", I(4294967295));
+        rtIf(f, L("n"), "eq", I(0), "never");
+        rtIf(f, L("n"), "ge", I(WIDE_UNITS), "never");
+        rtSet(f, "w", I(2));
+        rtSet(f, "q", A("__tx_fault_wbuf"));
+    }
+    // 第一段 N。
+    digits(f, "n", "one");
+    rtSet(f, "end", I(0));
+    rtIf(f, L("c"), "eq", I(0), "store");
+    rtIf(f, L("c"), "ne", I(58), "never");
+    // 冒号之后的第二段 K（≥ 1）：只拒绝 N..N+K−1。
+    rtOp(f, "q", L("q"), "add", L("w"));
+    digits(f, "k", "two");
+    rtIf(f, L("c"), "ne", I(0), "never");
+    rtIf(f, L("k"), "eq", I(0), "never");
+    rtOp(f, "end", L("n"), "add", L("k"));
+    rtLabel(f, "store");
+    rtIf(f, L("n"), "eq", I(0), "never");
+    rtSetGlobal(f, "__tx_fault_end", L("end"));
+    rtSetGlobal(f, "__tx_fault_first", L("n"));
+    rtRet(f, L("n"));
+    rtLabel(f, "never");
+    rtSetGlobal(f, "__tx_fault_end", I(0));
+    rtSetGlobal(f, "__tx_fault_first", I(-1));
+    rtRet(f, I(-1));
+    done(f, failures);
+}
+
+// 从 q 起按步长 w 读十进制数进 dst，至少一位、至多 MAX_DIGITS 位，否则转 never；结束时 c 为第一个非数字单元，q 指向它。
+// tag 使各段的标号互不相同。
+function digits(f: Ref<RtFn>, dst: string, tag: string): void {
+    rtSet(f, dst, I(0));
+    rtSet(f, "d", I(0));
+    rtLabel(f, tag);
+    rtLoad(f, "c", L("q"), 0, 1);
+    rtIf(f, L("w"), "eq", I(1), tag + "_unit");
+    rtLoad(f, "c", L("q"), 0, 2);
+    rtIf(f, L("c"), "uge", I(128), "never");
+    rtLabel(f, tag + "_unit");
+    rtIf(f, L("c"), "ult", I(48), tag + "_end");
+    rtIf(f, L("c"), "ugt", I(57), tag + "_end");
+    rtIf(f, L("d"), "ge", I(MAX_DIGITS), "never");
+    rtOp(f, dst, L(dst), "imul", I(10));
+    rtOp(f, "c", L("c"), "sub", I(48));
+    rtOp(f, dst, L(dst), "add", L("c"));
+    rtOp(f, "d", L("d"), "add", I(1));
+    rtOp(f, "q", L("q"), "add", L("w"));
+    rtJump(f, tag);
+    rtLabel(f, tag + "_end");
+    rtIf(f, L("d"), "eq", I(0), "never");
+}
+
+// 只读常量：注入标记；Unix 为 “名字=” 的字节，Windows 为以 NUL 结尾的 UTF-16 名字。
+function emitData(b: Ref<StructuredBuffer>, t: int): void {
+    asBufferSection(b, 1, 1);
+    asBufferLabel(b, "__tx_fault_mark", 1);
+    bytes(b, MARK, 1);
+    if (tUnix(t)) {
+        asBufferLabel(b, "__tx_fault_key", 1);
+        bytes(b, VAR + "=", 1);
+    } else {
+        asBufferAlign(b, 1, 1);
+        asBufferLabel(b, "__tx_fault_wname", 1);
+        bytes(b, VAR, 2);
+        asBufferByte(b, 0, 1);
+        asBufferByte(b, 0, 1);
+    }
+    asBufferSection(b, 0, 1);
+}
+
+// 逐字节写出 ASCII 文本；unit 为 2 时每字节后补一个 0（UTF-16LE）。
+function bytes(b: Ref<StructuredBuffer>, text: string, unit: int): void {
+    let i = 0;
+    while (i < len(text)) {
+        asBufferByte(b, byteAt(text, i) catch 0, 1);
+        if (unit == 2) { asBufferByte(b, 0, 1); }
+        i = i + 1;
+    }
+}

@@ -1,0 +1,138 @@
+// Value16 区段的可移植版（rtfn 写，macOS 适配 M4 设计 A8）：语义与导出名同 payload_span.tx。
+// 区段是 count 个 16 字节的 Value {标签@0, 载荷@8}；count 超过 2^60−1、count 非零而 base 为空、或 base＋count×16 越过地址空间末端
+// 都算坏区段；count 为 0 时任何指针都可。手写版尾跳 __tx_native_mem_free／__tx_native_list_destroy_v1 处改为调用后返回。
+import { PAYLOAD_OFF_KIND, PAYLOAD_OFF_BACKING, PAYLOAD_OFF_LIST } from "./payload_abi";
+import { StructuredBuffer } from "./assemble";
+import { RtFn, L, I } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtShift, rtLoad, rtStore, rtAddrOf, rtLabel, rtIf, rtCall1, rtCall2, rtRet, rtRetVoid } from "./rtfn";
+
+const MODULE: string = "bootstrap/selfhost/payload_span_generic.tx";
+const MAX_COUNT: int = 1152921504606846975;
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// 区段检查（手写版的 checked）：坏区段跳 bad，count 为 0 跳 empty，否则 end = base + count×16（不含）。
+function checked(f: Ref<RtFn>, base: string, n: string, end: string): void {
+    rtIf(f, L(n), "ugt", I(MAX_COUNT), "bad");
+    rtIf(f, L(n), "eq", I(0), "empty");
+    rtIf(f, L(base), "eq", I(0), "bad");
+    rtShift(f, end, L(n), "shl", 4);
+    rtOp(f, end, L(end), "add", L(base));
+    // 无符号进位：和小于加数即越过地址空间末端。
+    rtIf(f, L(end), "ult", L(base), "bad");
+}
+
+// values_alloc(count) → 已初始化为 None 的区段；count 为 0 时为哨兵 8；count 过大或分配失败为 0。
+function allocFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_values_alloc_v1", "n", "p x", 2, MODULE);
+    rtIf(f, L("n"), "ugt", I(MAX_COUNT), "bad");
+    rtIf(f, L("n"), "eq", I(0), "empty");
+    rtShift(f, "x", L("n"), "shl", 4);
+    rtCall2(f, "p", "__tx_native_mem_alloc", L("x"), I(8));
+    rtIf(f, L("p"), "eq", I(0), "out");
+    rtCall2(f, "", "__tx_native_values_init_v1", L("p"), L("n"));
+    rtLabel(f, "out");
+    rtRet(f, L("p"));
+    rtLabel(f, "empty");
+    rtRet(f, I(8));
+    rtLabel(f, "bad");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// values_init(base, count) → 1（每个 Value 置为 None：标签 4、载荷 0），坏区段为 0。
+function initFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_values_init_v1", "base n", "end p", 0, MODULE);
+    checked(f, "base", "n", "end");
+    rtSet(f, "p", L("base"));
+    rtLabel(f, "loop");
+    rtStore(f, L("p"), 0, I(4), 8);
+    rtStore(f, L("p"), 8, I(0), 8);
+    rtOp(f, "p", L("p"), "add", I(16));
+    rtIf(f, L("p"), "ult", L("end"), "loop");
+    rtLabel(f, "empty");
+    rtRet(f, I(1));
+    rtLabel(f, "bad");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// values_read(base, count, index, out) → 1 并把第 index 个 Value 拷到 out；坏区段、空区段、index 越界或 out 为空时为 0。
+function readFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_values_read_v1", "base n idx out", "end p x y", 0, MODULE);
+    checked(f, "base", "n", "end");
+    rtIf(f, L("idx"), "uge", L("n"), "bad");
+    rtIf(f, L("out"), "eq", I(0), "bad");
+    rtShift(f, "p", L("idx"), "shl", 4);
+    rtOp(f, "p", L("p"), "add", L("base"));
+    // 先读两半再写（同手写版的次序）。
+    rtLoad(f, "x", L("p"), 0, 8);
+    rtLoad(f, "y", L("p"), 8, 8);
+    rtStore(f, L("out"), 0, L("x"), 8);
+    rtStore(f, L("out"), 8, L("y"), 8);
+    rtRet(f, I(1));
+    rtLabel(f, "empty");
+    rtLabel(f, "bad");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// values_free(base, count)：区段完好且非空时归还 base；否则什么也不做。
+function freeFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_values_free_v1", "base n", "end", 1, MODULE);
+    checked(f, "base", "n", "end");
+    rtCall1(f, "", "__tx_native_mem_free", L("base"));
+    rtRetVoid(f);
+    rtLabel(f, "empty");
+    rtLabel(f, "bad");
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+// value_replace(slot, src)：先给两个 Value 各拍快照，再 retain 新值、release 旧值，最后把新值写进 slot（src 可与 slot 相同）。
+function replaceFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_value_replace_v1", "slot src", "n0 n1 o0 o1 p", 1, MODULE);
+    rtLoad(f, "n0", L("src"), 0, 8);
+    rtLoad(f, "n1", L("src"), 8, 8);
+    rtLoad(f, "o0", L("slot"), 0, 8);
+    rtLoad(f, "o1", L("slot"), 8, 8);
+    rtAddrOf(f, "p", "n0");
+    rtCall1(f, "", "__tx_retain", L("p"));
+    rtAddrOf(f, "p", "o0");
+    rtCall1(f, "", "__tx_release", L("p"));
+    rtStore(f, L("slot"), 0, L("n0"), 8);
+    rtStore(f, L("slot"), 8, L("n1"), 8);
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+// payload_dispose(payload)：载荷种类 2（列表）销毁内嵌列表；种类 1 归还非空的背板；其余什么也不做。
+function disposeFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_payload_dispose_v1", "pl", "k p", 1, MODULE);
+    rtLoad(f, "k", L("pl"), PAYLOAD_OFF_KIND, 4);
+    rtIf(f, L("k"), "eq", I(2), "list");
+    rtIf(f, L("k"), "ne", I(1), "out");
+    rtLoad(f, "p", L("pl"), PAYLOAD_OFF_BACKING, 8);
+    rtIf(f, L("p"), "eq", I(0), "out");
+    rtCall1(f, "", "__tx_native_mem_free", L("p"));
+    rtRetVoid(f);
+    rtLabel(f, "list");
+    rtOp(f, "p", L("pl"), "add", I(PAYLOAD_OFF_LIST));
+    rtCall1(f, "", "__tx_native_list_destroy_v1", L("p"));
+    rtLabel(f, "out");
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+/// 发出 Value16 区段的六个函数；rtfn 的失败记进 failures。t 为目标编号（只在语义随目标不同时用；这里不用）。
+export function payloadSpanGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    allocFn(b, failures);
+    initFn(b, failures);
+    readFn(b, failures);
+    freeFn(b, failures);
+    replaceFn(b, failures);
+    disposeFn(b, failures);
+}

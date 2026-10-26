@@ -1,0 +1,668 @@
+// 原生验证总控（docs/design/v052-gate-tx-v0.1-20261026.md；2026-10-26 取代 gate.py，步名、START／END／STATUS 行与 report.json 的
+// 字段不变）：逐步起子进程，每步的 stdout 与 stderr 合写 <运行目录>/<步名>.log，结果进 report.json。正式性能与跨机器验收另跑。
+// 用法（在仓库根运行）：taixu run --toolchain scripts/gate.tx --compiler <原生 taixu> [--quick] [--work <目录>] [--stdlib <目录>]
+//   [--other-compiler <另一宿主的不动点>] [--baseline-compiler <上一不动点>] [--keep-runs N] [--python <解释器>] [--root <仓库根>]
+// 门由种子编译器运行，只用种子已有的内建（同 Go 的 cmd/dist、Rust 的 bootstrap 由引导工具链运行）；给子进程的环境经 setEnv（D3 v0.42）。
+import { absolute, dirOf, exeName, findInPath, finishRunDir, freshRunDir, join, kindOf, list1, nat, nothing, onWindows, parseDigits,
+    plus, readBytes, shaOf } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { capture, linesOf } from "./test_lib";
+import { JSON_ARR, JSON_OBJ, JSON_STR, jsonGet, jsonParseStr } from "../bootstrap/selfhost/json_parse";
+import { jsonQuote } from "../bootstrap/selfhost/json_text";
+import { wireText } from "../bootstrap/selfhost/dbg_wire";
+
+// 每步至多两小时。
+const STEP_LIMIT_NS: int = 7200000000000;
+// 子进程退出后，后代进程仍占着输出管道时再读这么久，之后不再等（不判失败）。
+const DRAIN_NS: int = 30000000000;
+// 日志边跑边落盘：距上次至少 2 秒，日志每多 1 MiB 再加 1 秒（整份重写，写盘量至多约每秒 1 MiB）。
+const FLUSH_NS: int = 2000000000;
+const FLUSH_PER_MIB_NS: int = 1000000000;
+// tail 只看日志末尾这么多字节。
+const TAIL_BYTES: int = 65536;
+
+struct Opts {
+    root: string,
+    compiler: string,
+    work: string,
+    stdlib: string,
+    other: string,
+    baseline: string,
+    python: string,
+    quick: bool,
+    keepRuns: int,
+}
+
+// 一次门：当前编译器（自举后换成新的不动点）、本次运行目录与 report.json 的内容（checks 每项为序列化好的对象）。
+struct Gate {
+    o: Ref<Opts>,
+    compiler: string,
+    work: string,
+    scope: string,
+    initialSha: string,
+    checks: List<string>,
+    fails: int,
+    status: string,
+    compilerSha: string,
+}
+
+// 一步的结果：退出码（起不了或超时为 1）与合写的输出。
+struct Logged {
+    code: int,
+    log: Bytes,
+}
+
+function usage(msg: string): int {
+    eprint(msg);
+    eprint("用法：taixu run --toolchain scripts/gate.tx --compiler <原生 taixu> [--quick] [--work <目录>] [--stdlib <目录>]");
+    eprint("  [--other-compiler <另一宿主的不动点>] [--baseline-compiler <上一不动点>] [--keep-runs N] [--python <解释器>] [--root <仓库根>]");
+    return 2;
+}
+
+function parseOpts(args: []string): Ref<Opts> | Error {
+    const o = new Opts { root: "", compiler: "", work: "", stdlib: "", other: "", baseline: "", python: "", quick: false, keepRuns: 3 };
+    let i: int = 0;
+    while (i < len(args)) {
+        const a = args[i];
+        if (a == "--quick") {
+            o.quick = true;
+            i = i + 1;
+            continue;
+        }
+        if (i + 1 >= len(args)) {
+            return err("缺少取值或未知参数：" + a);
+        }
+        const v = args[i + 1];
+        if (a == "--compiler") {
+            o.compiler = v;
+        } else if (a == "--work") {
+            o.work = v;
+        } else if (a == "--stdlib") {
+            o.stdlib = v;
+        } else if (a == "--other-compiler") {
+            o.other = v;
+        } else if (a == "--baseline-compiler") {
+            o.baseline = v;
+        } else if (a == "--python") {
+            o.python = v;
+        } else if (a == "--root") {
+            o.root = v;
+        } else if (a == "--keep-runs") {
+            o.keepRuns = parseDigits(v);
+            if (o.keepRuns < 0) {
+                return err("--keep-runs 须为非负整数：" + v);
+            }
+        } else {
+            return err("未知参数：" + a);
+        }
+        i = i + 2;
+    }
+    if (len(o.root) == 0) {
+        o.root = currentDir() catch ".";
+    }
+    // 取真实路径：local* 内建拒绝路径里的符号链接（同 build.tx）。
+    o.root = osRealPath(absolute(o.root));
+    if (kindOf(join(o.root, "scripts/gate.tx")) != 1) {
+        return err("不在仓库根：" + o.root + "（请在仓库根运行或给出 --root）");
+    }
+    if (len(o.compiler) == 0) {
+        o.compiler = getEnv("TAIXU_NATIVE") ?? findInPath("taixu");
+    }
+    if (len(o.compiler) == 0) {
+        return err("请给出 --compiler <原生 taixu>（或设环境变量 TAIXU_NATIVE）");
+    }
+    o.compiler = osRealPath(absolute(o.compiler));
+    if (len(o.work) == 0) {
+        o.work = join(o.root, "work/native-gate");
+    }
+    o.work = absolute(o.work);
+    if (len(o.stdlib) == 0) {
+        // 公开仓 taixu-lang 把标准库并在仓内 stdlib/（设计 v052-public-release §三）；开发仓仍是同级的 taixu-stdlib。
+        o.stdlib = join(dirOf(o.root), "taixu-stdlib");
+        if (kindOf(join(o.root, "stdlib/verify.py")) == 1) {
+            o.stdlib = join(o.root, "stdlib");
+        }
+    }
+    o.stdlib = osRealPath(absolute(o.stdlib));
+    if (len(o.other) > 0) {
+        o.other = osRealPath(absolute(o.other));
+    }
+    if (len(o.baseline) > 0) {
+        o.baseline = osRealPath(absolute(o.baseline));
+    }
+    if (len(o.python) == 0) {
+        // PEP 394：类 Unix 上 python3 是确定的名字；Windows 的安装器只装 python。
+        if (onWindows()) {
+            o.python = findInPath("python");
+        } else {
+            o.python = findInPath("python3");
+            if (len(o.python) == 0) {
+                o.python = findInPath("python");
+            }
+        }
+    }
+    if (len(o.python) == 0) {
+        return err("PATH 里找不到 Python，请给出 --python <解释器>");
+    }
+    o.python = nat(absolute(o.python));
+    return o;
+}
+
+// 所选编译器须是原生太虚（同 build.py 的 native_compiler）。
+function checkNative(compiler: string, root: string): void | Error {
+    const r = capture(compiler, plus(list1("capabilities"), list1("--format=json")), root, 30000000000, 1048576) catch (e) {
+        return e;
+    };
+    const v = jsonParseStr(r.out) catch (e) {
+        return err("读不懂 " + compiler + " capabilities 的输出");
+    };
+    const caps = jsonGet(v, "capabilities") ?? v;
+    const c = jsonGet(caps, "compiler") ?? caps;
+    if (r.code != 0 || c.kind != JSON_STR || c.s != "native-tx") {
+        return err("所选编译器不是原生太虚：" + compiler);
+    }
+    return nothing();
+}
+
+// ---- 子进程与日志 ----
+
+function flush(path: string, log: Bytes): void {
+    writeFileBytes(nat(path), log) catch (e) {};
+}
+
+// 在 cwd 里运行一步：stdout 与 stderr 按读到的先后合写 path，边跑边落盘。标准输入接空设备。
+// 起不了或超时（STEP_LIMIT_NS）记退出码 1，原因追加在日志末尾。
+function logged(exe: string, args: List<string>, cwd: string, path: string): Ref<Logged> {
+    const r = new Logged { code: 0, log: bytesNew(0) };
+    const h = procSpawn(exe, args, cwd, 0) catch (e) {
+        bytesAppend(r.log, bytesFromStr("起不了 " + exe + "：" + e.message + "\n"));
+        flush(path, r.log);
+        r.code = 1;
+        return r;
+    };
+    const buf = bytesNew(65536);
+    const start = monoNs();
+    let flushedAt: int = start;
+    let flushedLen: int = 0;
+    let timedOut: bool = false;
+    let outOpen: bool = true;
+    let errOpen: bool = true;
+    let ended: bool = false;
+    let endedAt: int = 0;
+    let abandoned: bool = false;
+    while (true) {
+        if (!ended) {
+            const w = procWait(h, 0);
+            if (w != None) {
+                r.code = w ?? -1;
+                ended = true;
+                endedAt = monoNs();
+            }
+        }
+        const now = monoNs();
+        if (!ended && !timedOut && now - start >= STEP_LIMIT_NS) {
+            timedOut = true;
+            procKill(h);
+        }
+        if (ended && !outOpen && !errOpen) {
+            break;
+        }
+        if (ended && now - endedAt >= DRAIN_NS) {
+            abandoned = true;
+            break;
+        }
+        let mask: int = 0;
+        if (outOpen) {
+            mask = mask | 2;
+        }
+        if (errOpen) {
+            mask = mask | 4;
+        }
+        if (mask == 0) {
+            const waited = procWait(h, 100);
+            continue;
+        }
+        const ready = ioWait(h, mask, 100);
+        if ((ready & 2) != 0) {
+            const n = procRead(h, 1, buf);
+            if (n < 0) {
+                outOpen = false;
+            } else if (n > 0) {
+                bytesAppend(r.log, bytesSlice(buf, 0, n));
+            }
+        }
+        if ((ready & 4) != 0) {
+            const n = procRead(h, 2, buf);
+            if (n < 0) {
+                errOpen = false;
+            } else if (n > 0) {
+                bytesAppend(r.log, bytesSlice(buf, 0, n));
+            }
+        }
+        const size = bytesLen(r.log);
+        if (size != flushedLen && now - flushedAt >= FLUSH_NS + size / 1048576 * FLUSH_PER_MIB_NS) {
+            flush(path, r.log);
+            flushedAt = now;
+            flushedLen = size;
+        }
+    }
+    procClose(h);
+    if (timedOut) {
+        bytesAppend(r.log, bytesFromStr("超时：" + toStr(STEP_LIMIT_NS / 1000000000) + " 秒后结束了子进程\n"));
+        r.code = 1;
+    }
+    if (abandoned) {
+        bytesAppend(r.log, bytesFromStr("子进程已退出，后代进程仍占着输出管道；" + toStr(DRAIN_NS / 1000000000) + " 秒后不再读取\n"));
+    }
+    flush(path, r.log);
+    return r;
+}
+
+// 日志的末 n 行（非法 UTF-8 换成 U+FFFD）。
+function tailLines(log: Bytes, n: int): List<string> {
+    let from: int = 0;
+    if (bytesLen(log) > TAIL_BYTES) {
+        from = bytesLen(log) - TAIL_BYTES;
+    }
+    const lines = linesOf(wireText(bytesSlice(log, from, bytesLen(log) - from)));
+    const out: List<string> = listNew();
+    let i: int = listLen(lines) - n;
+    if (i < 0) {
+        i = 0;
+    }
+    while (i < listLen(lines)) {
+        listPush(out, listGet(lines, i) catch "");
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---- report.json ----
+
+function strArray(xs: List<string>): string {
+    let s = "[";
+    let first: bool = true;
+    for (x in xs) {
+        if (!first) {
+            s = s + ", ";
+        }
+        s = s + jsonQuote(x);
+        first = false;
+    }
+    return s + "]";
+}
+
+function record(g: Ref<Gate>, row: string, ok: bool): void {
+    listPush(g.checks, row);
+    if (!ok) {
+        g.fails = g.fails + 1;
+    }
+}
+
+// 字段依次为 scope、host、initial_compiler_sha256、other_host_reference、checks、status，自举后另有 compiler_sha256；每项检查占一行。
+function save(g: Ref<Gate>): void {
+    let other = "not supplied";
+    if (len(g.o.other) > 0) {
+        other = "provided";
+    }
+    let s = "{\n  \"scope\": " + jsonQuote(g.scope) + ",\n  \"host\": " + jsonQuote(hostTarget()) + ",\n  \"initial_compiler_sha256\": "
+    + jsonQuote(g.initialSha) + ",\n  \"other_host_reference\": " + jsonQuote(other) + ",\n  \"checks\": [";
+    let first: bool = true;
+    for (row in g.checks) {
+        if (first) {
+            s = s + "\n    " + row;
+        } else {
+            s = s + ",\n    " + row;
+        }
+        first = false;
+    }
+    s = s + "\n  ],\n  \"status\": " + jsonQuote(g.status);
+    if (len(g.compilerSha) > 0) {
+        s = s + ",\n  \"compiler_sha256\": " + jsonQuote(g.compilerSha);
+    }
+    writeFile(join(g.work, "report.json"), s + "\n}\n") catch (e) {};
+}
+
+// ---- 步 ----
+
+function run(g: Ref<Gate>, name: string, exe: string, args: List<string>): bool {
+    print("START " + name);
+    const r = logged(exe, args, g.o.root, join(g.work, name + ".log"));
+    const tail = tailLines(r.log, 4);
+    record(g, "{\"name\": " + jsonQuote(name) + ", \"exit\": " + toStr(r.code) + ", \"argv\": " + strArray(plus(list1(exe), args))
+        + ", \"tail\": " + strArray(tail) + "}", r.code == 0);
+    save(g);
+    let text = "";
+    for (line in tail) {
+        if (len(text) > 0) {
+            text = text + "\n";
+        }
+        text = text + line;
+    }
+    print("END " + name + " " + toStr(r.code) + " " + text);
+    return r.code == 0;
+}
+
+// Python 写的门步：scripts/<script>.py --compiler <当前编译器> 再加 flags。
+function gate(g: Ref<Gate>, name: string, script: string, flags: List<string>): bool {
+    const args = plus(list1(nat(join(g.o.root, "scripts/" + script + ".py"))), plus(list1("--compiler"), list1(g.compiler)));
+    return run(g, name, g.o.python, plus(args, flags));
+}
+
+function python(g: Ref<Gate>, name: string, script: string, args: List<string>): bool {
+    return run(g, name, g.o.python, plus(list1(script), args));
+}
+
+function at(g: Ref<Gate>, rel: string): string {
+    return nat(join(g.work, rel));
+}
+
+function work(g: Ref<Gate>, name: string): List<string> {
+    return plus(list1("--work"), list1(at(g, name)));
+}
+
+function args2(a: string, b: string): List<string> {
+    return plus(list1(a), list1(b));
+}
+
+function args3(a: string, b: string, c: string): List<string> {
+    return plus(args2(a, b), list1(c));
+}
+
+// ---- 产物对照 ----
+
+function strLess(a: string, b: string): bool {
+    const x = bytesFromStr(a);
+    const y = bytesFromStr(b);
+    let i: int = 0;
+    while (i < bytesLen(x) && i < bytesLen(y)) {
+        const c = bytesGet(x, i) ?? 0;
+        const d = bytesGet(y, i) ?? 0;
+        if (c != d) {
+            return c < d;
+        }
+        i = i + 1;
+    }
+    return bytesLen(x) < bytesLen(y);
+}
+
+// 按字节序（即码点序，同 Python 的 sorted）。
+function sorted(xs: List<string>): List<string> {
+    const out: List<string> = listNew();
+    for (x in xs) {
+        let k: int = listLen(out);
+        while (k > 0 && strLess(x, listGet(out, k - 1) catch "")) {
+            k = k - 1;
+        }
+        listInsert(out, k, x);
+    }
+    return out;
+}
+
+// 产物报告里各用例的 product_sha256；读不了为空表。
+function hashes(path: string): Map<string, string> {
+    const m: Map<string, string> = mapNew();
+    const text = readFile(path) catch (e) {
+        return m;
+    };
+    const v = jsonParseStr(text) catch (e) {
+        return m;
+    };
+    const rows = jsonGet(v, "rows") ?? v;
+    if (rows.kind != JSON_ARR) {
+        return m;
+    }
+    for (row in rows.items) {
+        if (row.kind == JSON_OBJ) {
+            const c = jsonGet(row, "case") ?? row;
+            const h = jsonGet(row, "product_sha256") ?? row;
+            if (c.kind == JSON_STR && h.kind == JSON_STR) {
+                mapSet(m, c.s, h.s);
+            }
+        }
+    }
+    return m;
+}
+
+// 新旧编译器产物逐字节比较。变化可能是有意的（改了代码生成或内核），所以不判失败；名单进报告，提交须逐一解释。
+// 内核变了时几乎全部产物都不同。
+function productIdentity(g: Ref<Gate>): void {
+    print("START product-identity");
+    const path = join(g.work, "products-baseline.json");
+    const r = logged(g.o.python, plus(args3(nat(join(g.o.root, "scripts/test-nrt-products.py")), "--compiler", g.o.baseline),
+            plus(work(g, "products-baseline"), args2("--report", nat(path)))), g.o.root, join(g.work, "products-baseline.log"));
+    const old = hashes(path);
+    const cur = hashes(join(g.work, "products.json"));
+    const oldKeys = sorted(mapKeys(old));
+    const curKeys = sorted(mapKeys(cur));
+    const both: List<string> = listNew();
+    const differing: List<string> = listNew();
+    const onlyBaseline: List<string> = listNew();
+    const onlyCandidate: List<string> = listNew();
+    for (k in oldKeys) {
+        if (mapHas(cur, k)) {
+            listPush(both, k);
+            if ((mapGet(old, k) ?? "") != (mapGet(cur, k) ?? "")) {
+                listPush(differing, k);
+            }
+        } else {
+            listPush(onlyBaseline, k);
+        }
+    }
+    for (k in curKeys) {
+        if (!mapHas(old, k)) {
+            listPush(onlyCandidate, k);
+        }
+    }
+    const same = listLen(both) - listLen(differing);
+    record(g, "{\"name\": \"product-identity\", \"exit\": 0, \"baseline_sha256\": " + jsonQuote(shaOf(g.o.baseline)) + ", \"compared\": "
+        + toStr(listLen(both)) + ", \"identical\": " + toStr(same) + ", \"differing\": " + strArray(differing) + ", \"only_candidate\": "
+        + strArray(onlyCandidate) + ", \"only_baseline\": " + strArray(onlyBaseline) + "}", true);
+    save(g);
+    print("END product-identity 0\n比较 " + toStr(listLen(both)) + " 个产物：相同 " + toStr(same) + "，不同 " + toStr(listLen(differing))
+        + "；只有新编译器编出 " + toStr(listLen(onlyCandidate)) + "，只有基线编出 " + toStr(listLen(onlyBaseline)));
+}
+
+// ---- 自举与交叉一致性 ----
+
+// 自举由太虚写的构建驱动完成（docs/design/v052-build-driver-v0.1-20261025.md）：种子编译器编出并运行它。失败时门到此为止。
+function bootstrap(g: Ref<Gate>): bool {
+    const root = g.o.root;
+    const args = plus(args3("run", "--toolchain", nat(join(root, "scripts/build.tx"))), args2("--root", root));
+    if (!run(g, "bootstrap", g.compiler, plus(plus(args, args2("--compiler", g.compiler)),
+                plus(work(g, "build"), args2("--out", at(g, "compiler")))))) {
+        return false;
+    }
+    g.compiler = at(g, "compiler/" + exeName("taixu"));
+    setEnv("TAIXU_NATIVE", g.compiler) catch (e) {
+        eprint("设不了 TAIXU_NATIVE：" + e.message);
+    };
+    // build.json 的 work 指向构建工作目录，其中 bootstrap/b 是嵌入新内核的 B；读不了时 cross-b 起不来、记失败。
+    let b = "";
+    const text = readFile(join(g.work, "compiler/build.json")) catch "";
+    const manifest = jsonParseStr(text) catch (e) {
+        return crossIdentity(g, b);
+    };
+    const w = jsonGet(manifest, "work") ?? manifest;
+    if (w.kind == JSON_STR) {
+        b = nat(join(join(w.s, "bootstrap/b"), exeName("taixu")));
+    }
+    return crossIdentity(g, b);
+}
+
+// B 与 D 交叉编出另一端的编译器，两份须逐字节相同；给了 --other-compiler 时还须等于另一宿主的不动点。
+function crossIdentity(g: Ref<Gate>, b: string): bool {
+    let target = "windows";
+    if (onWindows()) {
+        target = "linux";
+    }
+    let product = "taixu";
+    if (target == "windows") {
+        product = "taixu.exe";
+    }
+    const sums: List<string> = listNew();
+    const names = plus(list1("cross-b"), list1("cross-d"));
+    const builders = plus(list1(b), list1(g.compiler));
+    let i: int = 0;
+    while (i < 2) {
+        const name = listGet(names, i) catch "";
+        const dest = at(g, name);
+        const ok = run(g, name, listGet(builders, i) catch "", plus(args3("build", "bootstrap/taixu.tx", "--toolchain"),
+                args3("--target=" + target, "--out", dest)));
+        const out = join(dest, product);
+        if (ok && kindOf(out) == 1) {
+            listPush(sums, shaOf(out));
+        } else {
+            listPush(sums, "");
+        }
+        i = i + 1;
+    }
+    const first = listGet(sums, 0) catch "";
+    const second = listGet(sums, 1) catch "";
+    let same: bool = len(first) > 0 && first == second;
+    if (len(g.o.other) > 0) {
+        same = same && second == shaOf(g.o.other);
+    }
+    let shown = "[";
+    for (h in sums) {
+        if (len(shown) > 1) {
+            shown = shown + ", ";
+        }
+        if (len(h) == 0) {
+            shown = shown + "null";
+        } else {
+            shown = shown + jsonQuote(h);
+        }
+    }
+    let code: int = 1;
+    if (same) {
+        code = 0;
+    }
+    record(g, "{\"name\": \"cross-identity\", \"exit\": " + toStr(code) + ", \"hashes\": " + shown + "]}", same);
+    g.compilerSha = shaOf(g.compiler);
+    save(g);
+    return true;
+}
+
+// ---- 门 ----
+
+function steps(g: Ref<Gate>): int {
+    const root = g.o.root;
+    if (!g.o.quick) {
+        python(g, "validation-primitives", nat(join(root, "scripts/test-selfhost-validation.py")), listNew());
+        // 构建驱动的自检（太虚写）：解 tar 的拒绝规则、运行目录修剪等 bootstrap 步走不到的部分。
+        run(g, "build-driver", g.compiler, args3("run", "--toolchain", nat(join(root, "scripts/build_selftest.tx"))));
+        if (!bootstrap(g)) {
+            g.status = "FAIL";
+            save(g);
+            return 1;
+        }
+    }
+    gate(g, "products", "test-nrt-products", plus(work(g, "products"), args2("--report", at(g, "products.json"))));
+    if (len(g.o.baseline) > 0) {
+        productIdentity(g);
+    }
+    gate(g, "cli", "test-native-cli", args2("--report", at(g, "cli.json")));
+    gate(g, "fmt", "test-native-fmt", args2("--report", at(g, "fmt.json")));
+    gate(g, "toolchain-contract", "test-toolchain-contract", work(g, "toolchain-contract"));
+    gate(g, "asm-output", "test-native-asm-output", work(g, "asm-output"));
+    gate(g, "a64-encodings", "test-a64-encodings", work(g, "a64-encodings"));
+    gate(g, "a64-image", "test-a64-image", work(g, "a64-image"));
+    // arm64 产物（macOS 适配 M4c）：全量语料按 aarch64-macos 构建（内嵌的 A64 内核），只核对构建结果；在 M1 上运行另记。
+    gate(g, "a64-products", "test-nrt-products", plus(args3("--target", "aarch64-macos", "--build-only"),
+            plus(work(g, "a64-products"), args2("--report", at(g, "a64-products.json")))));
+    gate(g, "compile-profile", "test-native-compile-profile", work(g, "compile-profile"));
+    gate(g, "link-map", "test-native-link-map", work(g, "link-map"));
+    // 对象与函数元数据的结构化 fuzz（安全审查攻关第 3 项）：逐例受限进程，标准与页堆两个链接探针。
+    gate(g, "object-fuzz", "test-object-fuzz", work(g, "object-fuzz"));
+    gate(g, "functions", "test-native-functions", work(g, "functions"));
+    gate(g, "runtime-functions", "test-runtime-functions", work(g, "runtime-functions"));
+    if (!g.o.quick) {
+        gate(g, "console", "test-native-console", plus(work(g, "console"), args2("--report", at(g, "console.json"))));
+        gate(g, "leak", "test-nrt-products", plus(list1("--leak-check"), plus(work(g, "leak"), args2("--report", at(g, "leak.json")))));
+        gate(g, "instrumented", "test-nrt-products", plus(list1("--debug"),
+                plus(work(g, "instrumented"), args2("--report", at(g, "instrumented.json")))));
+        // 可移植渲染器（arm64 后端的渲染逻辑）在本宿主上与缺省渲染器逐例对照（macOS 适配 M4 设计 A9 修订）。
+        gate(g, "portable-codegen", "test-portable-codegen", plus(plus(args2("--leak-check", "--debug"), work(g, "portable-codegen")),
+                plus(plus(args2("--standard-normal", at(g, "products.json")), args2("--standard-leak", at(g, "leak.json"))),
+                    args2("--standard-debug", at(g, "instrumented.json")))));
+        // 测试专用页堆（安全审查攻关第 2 项）：驱动与产物正控制、变异体；全量语料在页堆内核下与 products 步的标准结果逐例对照。
+        gate(g, "heap-check", "test-heap-check", plus(work(g, "heap-check"), args2("--standard-normal", at(g, "products.json"))));
+        // 取页失败的注入扫描（docs/design/v052-oom-fault-v0.1-20261025.md）：测试内核里第 N 次取页起失败，逐个 N 穷举；太虚写的门步。
+        run(g, "oom-fault", g.compiler, plus(args3("run", "--toolchain", nat(join(root, "scripts/test_oom_fault.tx"))),
+                plus(args2("--compiler", g.compiler), work(g, "oom-fault"))));
+        gate(g, "capacity", "test-capacity-limits", work(g, "capacity"));
+        gate(g, "check", "test-native-check", work(g, "check"));
+        gate(g, "analysis", "test-ana", listNew());
+        gate(g, "frontend-frozen", "test-frontend-frozen", work(g, "frontend-frozen"));
+        gate(g, "sha256", "test-native-sha256", work(g, "sha256"));
+        gate(g, "json", "test-native-json", work(g, "json"));
+        gate(g, "debug-vars", "test-native-debug-vars", work(g, "debug-vars"));
+        gate(g, "debug-stub", "test-native-debug-stub", work(g, "debug-stub"));
+        gate(g, "debug", "test-native-debug", listNew());
+        gate(g, "dap", "dap-e2e", listNew());
+        gate(g, "disasm", "test-native-disasm", listNew());
+        gate(g, "mcp", "mcp-debug-e2e", listNew());
+        gate(g, "lsp", "lsp-e2e", listNew());
+        gate(g, "check-cache", "test-check-cache", work(g, "check-cache"));
+        gate(g, "lsp-cache", "test-lsp-cache", work(g, "lsp-cache"));
+        // 服务状态序列 fuzz（安全审查攻关第 4 项）：带种子的 MCP／LSP 请求序列，分片写入，对照模型与后代、临时根。
+        gate(g, "service-sequence", "test-service-sequence", work(g, "service-sequence"));
+        // LSP 聚合资源预算与输出背压（安全审查攻关第 5 项）：文档／编辑工作量／分析与热缓存预算、去抖最长等待、取消、诊断截断、停读矩阵。
+        gate(g, "lsp-resources", "test-lsp-resources", work(g, "lsp-resources"));
+        python(g, "lsp-readonly", nat(join(root, "scripts/test-lsp-readonly.py")), listNew());
+        python(g, "lsp-builtins", nat(join(root, "scripts/test-lsp-builtins.py")), listNew());
+        python(g, "stdlib", nat(join(g.o.stdlib, "verify.py")), plus(args2("--compiler", g.compiler), args2("--core", root)));
+    }
+    python(g, "run-retention", nat(join(root, "scripts/test-run-retention.py")), listNew());
+    python(g, "hygiene", nat(join(root, "scripts/repo_hygiene.py")), listNew());
+    g.status = "FAIL";
+    if (g.fails == 0) {
+        g.status = "PASS";
+    }
+    save(g);
+    print("STATUS " + g.status + " " + g.scope + " report " + nat(join(g.work, "report.json")));
+    finishRunDir(g.work);
+    if (g.fails == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+export function main(args: []string): int {
+    const o = parseOpts(args) catch (e) {
+        return usage(e.message);
+    };
+    checkNative(o.compiler, o.root) catch (e) {
+        eprint(e.message);
+        return 2;
+    };
+    const dir = freshRunDir(o.work, "gate-", o.keepRuns) catch (e) {
+        eprint(e.message);
+        return 1;
+    };
+    let scope = "full-host";
+    if (o.quick) {
+        scope = "quick";
+    }
+    const g = new Gate { o: o, compiler: o.compiler, work: dir, scope: scope, initialSha: shaOf(o.compiler), checks: listNew(), fails: 0,
+        status: "RUNNING", compilerSha: "" };
+    // 子进程的环境：Python 按 UTF-8 读写，编译器按 TAIXU_STDLIB 找标准库根。
+    setEnv("PYTHONUTF8", "1") catch (e) {
+        eprint("设不了 PYTHONUTF8：" + e.message);
+        return 1;
+    };
+    setEnv("TAIXU_STDLIB", nat(join(o.stdlib, "src"))) catch (e) {
+        eprint("设不了 TAIXU_STDLIB：" + e.message);
+        return 1;
+    };
+    // 既有测试遗留的同名文件须还给调用者；测试产物进入独立 work。
+    const fsTmp = join(o.root, "taixu-fs.tmp");
+    const had = kindOf(fsTmp) == 1;
+    const original = readBytes(fsTmp) catch bytesNew(0);
+    const code = steps(g);
+    if (had) {
+        flush(fsTmp, original);
+    }
+    return code;
+}

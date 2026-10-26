@@ -1,0 +1,222 @@
+// 数值窗口处理的可移植版（rtfn 写，macOS 适配 M4 设计 A8）：语义与导出名同 scalar_handlers.tx（导出名单仍由它的
+// scalarHandlerNames 给出）。生成代码按私有约定调用：win（值槽窗口，即 rbx）、fn（函数号）、pc，其后是槽号或操作码；生成代码只写
+// 这些实参的低 32 位（栈上的实参写成 dword），所以这里一律先取低 32 位。值槽 16 字节 {标签字节@0, 载荷@8}，槽地址 ＝ win + 槽号×16。
+// 结果经 __tx_native_value_replace_v1(目的槽, 新值) 写入（新值放在两个相邻的局部 vt vp 里：rtfn 按声明顺序给每个局部一个 8 字节槽，
+// 取 vt 的地址即得 16 字节的值）。运算失败时按（操作码, 状态, fn, pc）调 __tx_native_handler_error_v1（不返回）。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, L, I } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtShift, rtLoad, rtAddrOf, rtLabel, rtIf, rtCall2, rtCall3, rtCall4, rtCall6, rtRet } from "./rtfn";
+import { CVT_KINDS } from "./scalar_handlers";
+
+const MODULE: string = "bootstrap/selfhost/scalar_handlers_generic.tx";
+const MASK32: int = 4294967295;
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// 局部 name 只留低 32 位。
+function low32(f: Ref<RtFn>, name: string): void { rtOp(f, name, L(name), "and", I(MASK32)); }
+
+// dst ← 槽号 idx（低 32 位）的值槽地址。
+function slotAddr(f: Ref<RtFn>, dst: string, idx: string): void {
+    rtOp(f, dst, L(idx), "and", I(MASK32));
+    rtShift(f, dst, L(dst), "shl", 4);
+    rtOp(f, dst, L(dst), "add", L("win"));
+}
+
+// 把 vt vp 组成的新值写进槽 a，返回 value_replace 的结果（同手写版的 finish）。
+function finish(f: Ref<RtFn>, a: string): void {
+    rtAddrOf(f, "vptr", "vt");
+    slotAddr(f, "dst", a);
+    rtCall2(f, "r", "__tx_native_value_replace_v1", L("dst"), L("vptr"));
+    rtRet(f, L("r"));
+}
+
+// __tx_arith_slow／__tx_compare_slow(win, fn, pc, op, a, b, c)：R[a] = op(R[b], R[c]) 经 __tx_native_scalar_binary_v1。
+// 算术：+ 两侧都是 str 时转 __tx_str_concat(win, fn, pc, a, b, c)；% 两侧都是 float 的类型异常报状态 7（float 不支持 %）。
+// 比较：左侧不是 int/float 时状态改报 8（比较操作数不是数值）。
+function binaryFn(b: Ref<StructuredBuffer>, failures: List<string>, name: string, compare: bool): void {
+    const f = rtBegin(b, name, "win fn pc op a bb c", "xb xc tb tc st vt vp vptr dst r", 6, MODULE);
+    low32(f, "fn");
+    low32(f, "pc");
+    low32(f, "op");
+    low32(f, "a");
+    low32(f, "bb");
+    low32(f, "c");
+    slotAddr(f, "xb", "bb");
+    rtLoad(f, "tb", L("xb"), 0, 1);
+    slotAddr(f, "xc", "c");
+    rtLoad(f, "tc", L("xc"), 0, 1);
+    if (!compare) {
+        rtIf(f, L("op"), "ne", I(5), "numeric");
+        rtIf(f, L("tb"), "ne", I(6), "numeric");
+        rtIf(f, L("tc"), "eq", I(6), "string");
+    }
+    rtLabel(f, "numeric");
+    rtAddrOf(f, "vptr", "vt");
+    rtCall4(f, "st", "__tx_native_scalar_binary_v1", L("op"), L("xb"), L("xc"), L("vptr"));
+    low32(f, "st");
+    rtIf(f, L("st"), "ne", I(0), "error");
+    finish(f, "a");
+    rtLabel(f, "error");
+    if (compare) {
+        rtIf(f, L("tb"), "eq", I(1), "mismatch");
+        rtIf(f, L("tb"), "eq", I(2), "mismatch");
+        rtSet(f, "st", I(8));
+    } else {
+        rtIf(f, L("op"), "ne", I(9), "mismatch");
+        rtIf(f, L("tb"), "ne", I(2), "mismatch");
+        rtIf(f, L("tc"), "ne", I(2), "mismatch");
+        rtSet(f, "st", I(7));
+    }
+    rtLabel(f, "mismatch");
+    rtCall4(f, "r", "__tx_native_handler_error_v1", L("op"), L("st"), L("fn"), L("pc"));
+    // 出错适配不返回；万一返回也保持栈有效。
+    rtRet(f, L("r"));
+    if (!compare) {
+        rtLabel(f, "string");
+        rtCall6(f, "r", "__tx_str_concat", L("win"), L("fn"), L("pc"), L("a"), L("bb"), L("c"));
+        rtRet(f, L("r"));
+    }
+    done(f, failures);
+}
+
+// __tx_fw_slow(win, fn, pc, op, a, b, c)：定宽数值运算族的冷路径（同 __tx_arith_slow 的约定），经 __tx_native_scalar_fw_v1；
+// 状态非 0 时按（操作码, 状态）trap。
+function fwBinaryFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_fw_slow", "win fn pc op a bb c", "xb xc st vt vp vptr dst r", 4, MODULE);
+    low32(f, "fn");
+    low32(f, "pc");
+    low32(f, "op");
+    slotAddr(f, "xb", "bb");
+    slotAddr(f, "xc", "c");
+    rtAddrOf(f, "vptr", "vt");
+    rtCall4(f, "st", "__tx_native_scalar_fw_v1", L("op"), L("xb"), L("xc"), L("vptr"));
+    low32(f, "st");
+    rtIf(f, L("st"), "ne", I(0), "error");
+    finish(f, "a");
+    rtLabel(f, "error");
+    rtCall4(f, "r", "__tx_native_handler_error_v1", L("op"), L("st"), L("fn"), L("pc"));
+    rtRet(f, L("r"));
+    done(f, failures);
+}
+
+// 简单写槽（win, a, x, y）：kind 1 ldbool（R[a] = x≠0）、2 ldnone、3 move（R[a] = R[x] 的 16 字节）、4 istag（R[a] = R[x] 的标签字节
+// 等于 y 的低 8 位）。
+function simpleFn(b: Ref<StructuredBuffer>, failures: List<string>, name: string, kind: int): void {
+    const f = rtBegin(b, name, "win a x y", "xs t vt vp vptr dst r", 2, MODULE);
+    if (kind == 1) {
+        rtSet(f, "vt", I(3));
+        rtSet(f, "vp", I(1));
+        low32(f, "x");
+        rtIf(f, L("x"), "ne", I(0), "done");
+        rtSet(f, "vp", I(0));
+    } else if (kind == 2) {
+        rtSet(f, "vt", I(4));
+        rtSet(f, "vp", I(0));
+    } else if (kind == 3) {
+        slotAddr(f, "xs", "x");
+        rtLoad(f, "vt", L("xs"), 0, 8);
+        rtLoad(f, "vp", L("xs"), 8, 8);
+    } else {
+        slotAddr(f, "xs", "x");
+        rtLoad(f, "t", L("xs"), 0, 1);
+        rtOp(f, "y", L("y"), "and", I(255));
+        rtSet(f, "vt", I(3));
+        rtSet(f, "vp", I(1));
+        rtIf(f, L("t"), "eq", L("y"), "done");
+        rtSet(f, "vp", I(0));
+    }
+    rtLabel(f, "done");
+    finish(f, "a");
+    done(f, failures);
+}
+
+// 一元（win, fn, pc, a, b）：R[a] = op(R[b]) 经 __tx_native_scalar_unary_v1（op 为常数；定宽转换为 100＋种类）。
+function unaryFn(b: Ref<StructuredBuffer>, failures: List<string>, name: string, op: int): void {
+    const f = rtBegin(b, name, "win fn pc a src", "xs st vt vp vptr dst r", 4, MODULE);
+    low32(f, "fn");
+    low32(f, "pc");
+    slotAddr(f, "xs", "src");
+    rtAddrOf(f, "vptr", "vt");
+    rtCall3(f, "st", "__tx_native_scalar_unary_v1", I(op), L("xs"), L("vptr"));
+    low32(f, "st");
+    rtIf(f, L("st"), "ne", I(0), "error");
+    finish(f, "a");
+    rtLabel(f, "error");
+    rtCall4(f, "r", "__tx_native_handler_error_v1", I(op), L("st"), L("fn"), L("pc"));
+    rtRet(f, L("r"));
+    done(f, failures);
+}
+
+// __tx_jbool(win, fn, pc, idx, sense) → R[idx] 的真值（sense 为 0 时取反）；R[idx] 不是 bool 时按（16, 1, fn, pc）trap。
+function jboolFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_jbool", "win fn pc idx sense", "xs t r", 4, MODULE);
+    slotAddr(f, "xs", "idx");
+    rtLoad(f, "t", L("xs"), 0, 1);
+    rtIf(f, L("t"), "ne", I(3), "error");
+    rtLoad(f, "t", L("xs"), 8, 8);
+    rtSet(f, "r", I(1));
+    rtIf(f, L("t"), "ne", I(0), "truth");
+    rtSet(f, "r", I(0));
+    rtLabel(f, "truth");
+    low32(f, "sense");
+    rtIf(f, L("sense"), "ne", I(0), "out");
+    rtOp(f, "r", L("r"), "xor", I(1));
+    rtLabel(f, "out");
+    rtRet(f, L("r"));
+    rtLabel(f, "error");
+    low32(f, "fn");
+    low32(f, "pc");
+    rtCall4(f, "r", "__tx_native_handler_error_v1", I(16), I(1), L("fn"), L("pc"));
+    rtRet(f, L("r"));
+    done(f, failures);
+}
+
+// __tx_eq_slow(win, fn, pc, a, b, c)：R[a] = (R[b] == R[c]) 经 __tx_native_equal_v1(R[b], R[c], 深度 0)；结果 ≥ 2（深度超限等）时
+// 按（12, 结果）trap。
+function eqFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_eq_slow", "win fn pc a bb c", "xb xc st vt vp vptr dst r", 4, MODULE);
+    low32(f, "fn");
+    low32(f, "pc");
+    slotAddr(f, "xc", "c");
+    slotAddr(f, "xb", "bb");
+    rtCall3(f, "st", "__tx_native_equal_v1", L("xb"), L("xc"), I(0));
+    low32(f, "st");
+    rtIf(f, L("st"), "uge", I(2), "error");
+    rtSet(f, "vt", I(3));
+    rtSet(f, "vp", L("st"));
+    finish(f, "a");
+    rtLabel(f, "error");
+    rtCall4(f, "r", "__tx_native_handler_error_v1", I(12), L("st"), L("fn"), L("pc"));
+    rtRet(f, L("r"));
+    done(f, failures);
+}
+
+/// 发出数值窗口处理的函数；rtfn 的失败记进 failures。t 为目标编号（语义不随目标变，未用）。
+export function scalarHandlersGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    const f = rtBegin(b, "__tx_native_handlers_abi_v1", "", "", 0, MODULE);
+    rtRet(f, I(1));
+    done(f, failures);
+    binaryFn(b, failures, "__tx_arith_slow", false);
+    binaryFn(b, failures, "__tx_compare_slow", true);
+    fwBinaryFn(b, failures);
+    simpleFn(b, failures, "__tx_ldbool", 1);
+    simpleFn(b, failures, "__tx_ldnone", 2);
+    simpleFn(b, failures, "__tx_move", 3);
+    simpleFn(b, failures, "__tx_istag", 4);
+    unaryFn(b, failures, "__tx_not", 11);
+    unaryFn(b, failures, "__tx_neg", 10);
+    unaryFn(b, failures, "__tx_bnot", 43);
+    unaryFn(b, failures, "__tx_i2f", 36);
+    unaryFn(b, failures, "__tx_f2i", 37);
+    let k = 1;
+    while (k <= CVT_KINDS) {
+        unaryFn(b, failures, "__tx_cvt" + toStr(k), 100 + k);
+        k = k + 1;
+    }
+    jboolFn(b, failures);
+    eqFn(b, failures);
+}

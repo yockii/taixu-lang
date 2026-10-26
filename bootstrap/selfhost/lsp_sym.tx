@@ -1,0 +1,222 @@
+// lsp_sym.tx —— 原生 LSP 的 documentSymbol 与格式化（第 6 轮 6d-2，LSP 与 MCP 实施设计 §四-1）。
+//
+// documentSymbol 只看词法记号：深度 0 处的声明（可带 export、declare、async），名字取关键字之后的标识符（test 取串
+// 字面量），范围从声明起点到深度 0 处匹配的 `}`（块形声明）或 `;`（绑定、declare）。写到一半的声明照列。
+import { nextToken, Cur, Tok, Out, K_EOF, K_IDENT, K_STR, K_EXPORT, K_FUNCTION, K_STRUCT, K_ENUM, K_LET, K_CONST, K_TEST, K_IMPORT, K_INTERFACE, K_STAR, K_LPAREN, K_RPAREN, K_LBRACE, K_RBRACE, K_LBRACKET, K_RBRACKET, K_SEMI, K_COMMENT } from "../lexer";
+import { formatSource } from "./fmt";
+import { dbgStr } from "./dbg_out";
+import { LspDoc, lineStart, colUnits, endLine, endChar } from "./lsp_docs";
+
+struct Toks {
+    kinds: List<int>,
+    texts: List<string>,
+    lines: List<int>,
+    cols: List<int>,
+    elines: List<int>,
+    ecols: List<int>,
+}
+
+function lexAll(src: string): Ref<Toks> {
+    const t = new Toks { kinds: listNew(), texts: listNew(), lines: listNew(), cols: listNew(), elines: listNew(), ecols: listNew() };
+    const out: Ref<Out> = new Out { lines: "", errors: "", failed: false, coded: true };
+    const c: Ref<Cur> = new Cur { pos: 0, line: 1, col: 1 };
+    while (true) {
+        const k: Tok = nextToken(src, c, out);
+        if (k.kind == K_EOF) { break; }
+        if (k.kind != K_COMMENT) {
+            listPush(t.kinds, k.kind);
+            listPush(t.texts, k.text);
+            listPush(t.lines, k.line);
+            listPush(t.cols, k.col);
+            listPush(t.elines, c.line);
+            listPush(t.ecols, c.col);
+        }
+    }
+    return t;
+}
+
+function kindAt(t: Ref<Toks>, i: int): int { return listGet(t.kinds, i) catch K_EOF; }
+
+function identIs(t: Ref<Toks>, i: int, text: string): bool {
+    return kindAt(t, i) == K_IDENT && (listGet(t.texts, i) catch "") == text;
+}
+
+function isOpen(k: int): bool { return k == K_LPAREN || k == K_LBRACE || k == K_LBRACKET; }
+
+function isClose(k: int): bool { return k == K_RPAREN || k == K_RBRACE || k == K_RBRACKET; }
+
+// 深度 0 处能开始一个声明的记号。
+function declStart(t: Ref<Toks>, i: int): bool {
+    const k = kindAt(t, i);
+    return k == K_EXPORT || k == K_FUNCTION || k == K_STRUCT || k == K_ENUM || k == K_INTERFACE || k == K_LET || k == K_CONST || k == K_TEST || k == K_IMPORT || identIs(t, i, "declare") || (identIs(t, i, "async") && kindAt(t, i + 1) == K_FUNCTION);
+}
+
+// 串字面量的文本（去引号、处理常见转义）。
+function strText(raw: string): string {
+    const b = bytesFromStr(raw);
+    const out = bytesNew(0);
+    let i = 1;
+    const n = bytesLen(b) - 1;
+    while (i < n) {
+        const c = bytesGet(b, i) catch 0;
+        if (c == 92 && i + 1 < n) {
+            const e = bytesGet(b, i + 1) catch 0;
+            if (e == 110) { bytesPush(out, 10); } else if (e == 116) { bytesPush(out, 9); } else if (e == 114) { bytesPush(out, 13); } else { bytesPush(out, e); }
+            i = i + 2;
+        } else {
+            bytesPush(out, c);
+            i = i + 1;
+        }
+    }
+    return bytesToStr(out) catch raw;
+}
+
+function pos(d: Ref<LspDoc>, line: int, col: int, enc: int): string {
+    const l = line - 1;
+    return "{\"line\":" + toStr(l) + ",\"character\":" + toStr(colUnits(d.text, lineStart(d, l), col - 1, enc)) + "}";
+}
+
+function range(d: Ref<LspDoc>, t: Ref<Toks>, a: int, z: int, enc: int): string {
+    return "{\"start\":" + pos(d, listGet(t.lines, a) catch 1, listGet(t.cols, a) catch 1, enc) + ",\"end\":" + pos(d, listGet(t.elines, z) catch 1, listGet(t.ecols, z) catch 1, enc) + "}";
+}
+
+// 声明从记号 j 起的结束记号：块形到深度回 0 的 `}`，其余到深度 0 的 `;`。写到一半的声明：块形还没进块就遇到
+// 下一个声明的关键字（不论深度——参数表与返回类型里不会有这些关键字），非块形在深度 0 遇到，都止于其前。
+function declEnd(t: Ref<Toks>, j: int, block: bool): int {
+    const n = listLen(t.kinds);
+    let depth = 0;
+    let opened = false;
+    let i = j;
+    while (i < n) {
+        const k = kindAt(t, i);
+        if (isOpen(k)) {
+            depth = depth + 1;
+            if (k == K_LBRACE) { opened = true; }
+        } else if (isClose(k)) {
+            depth = depth - 1;
+            if (depth <= 0 && block && k == K_RBRACE && opened) { return i; }
+            if (depth < 0) { depth = 0; }
+        } else if (depth == 0 && k == K_SEMI && !block) {
+            return i;
+        } else if (i > j && declStart(t, i) && ((block && !opened) || (!block && depth == 0))) {
+            return i - 1;
+        }
+        i = i + 1;
+    }
+    return n - 1;
+}
+
+function sym(d: Ref<LspDoc>, t: Ref<Toks>, name: string, kind: int, a: int, z: int, nameTok: int, enc: int): string {
+    return "{\"name\":" + dbgStr(name) + ",\"kind\":" + toStr(kind) + ",\"range\":" + range(d, t, a, z, enc) + ",\"selectionRange\":" + range(d, t, nameTok, nameTok, enc) + "}";
+}
+
+// textDocument/documentSymbol 的结果（JSON 数组文本）。种类同设计 §四-1：function、extern、test 12，struct、
+// declare struct、declare type 23，enum 10，interface 11，const 14，let 13；import 不列。
+export function lspSymbols(d: Ref<LspDoc>, enc: int): string {
+    const t = lexAll(d.text);
+    const n = listLen(t.kinds);
+    const items: List<string> = listNew();
+    let depth = 0;
+    let i = 0;
+    while (i < n) {
+        const k = kindAt(t, i);
+        if (depth == 0 && declStart(t, i)) {
+            const a = i;
+            let j = i;
+            if (kindAt(t, j) == K_EXPORT) { j = j + 1; }
+            let declared = false;
+            if (identIs(t, j, "declare")) { declared = true; j = j + 1; }
+            if (identIs(t, j, "async")) { j = j + 1; }
+            const kw = kindAt(t, j);
+            let block = true;
+            if (kw == K_LET || kw == K_CONST || kw == K_IMPORT || declared) { block = false; }
+            if (kw == K_STRUCT && declared && kindAt(t, j + 2) == K_LBRACE) { block = true; }
+            const z = declEnd(t, j, block);
+            if (kw == K_FUNCTION) {
+                let nt = j + 1;
+                if (kindAt(t, nt) == K_STAR) { nt = nt + 1; }
+                if (kindAt(t, nt) == K_IDENT) { listPush(items, sym(d, t, listGet(t.texts, nt) catch "", 12, a, z, nt, enc)); }
+            } else if (kw == K_STRUCT || kw == K_ENUM || kw == K_INTERFACE) {
+                let sk = 23;
+                if (kw == K_ENUM) { sk = 10; }
+                if (kw == K_INTERFACE) { sk = 11; }
+                if (kindAt(t, j + 1) == K_IDENT) { listPush(items, sym(d, t, listGet(t.texts, j + 1) catch "", sk, a, z, j + 1, enc)); }
+            } else if (identIs(t, j, "type") && declared) {
+                if (kindAt(t, j + 1) == K_IDENT) { listPush(items, sym(d, t, listGet(t.texts, j + 1) catch "", 23, a, z, j + 1, enc)); }
+            } else if (kw == K_LET || kw == K_CONST) {
+                let bk = 14;
+                if (kw == K_LET) { bk = 13; }
+                if (kindAt(t, j + 1) == K_LPAREN) {
+                    // 顶层解构：逐个列出元素。
+                    let e = j + 2;
+                    while (e < z && kindAt(t, e) != K_RPAREN) {
+                        if (kindAt(t, e) == K_IDENT) { listPush(items, sym(d, t, listGet(t.texts, e) catch "", bk, a, z, e, enc)); }
+                        e = e + 1;
+                    }
+                } else if (kindAt(t, j + 1) == K_IDENT) {
+                    listPush(items, sym(d, t, listGet(t.texts, j + 1) catch "", bk, a, z, j + 1, enc));
+                }
+            } else if (kw == K_TEST) {
+                if (kindAt(t, j + 1) == K_STR) { listPush(items, sym(d, t, strText(listGet(t.texts, j + 1) catch "\"\""), 12, a, z, j + 1, enc)); }
+            }
+            if (z < a) {
+                i = a + 1;
+            } else {
+                i = z + 1;
+            }
+            continue;
+        }
+        if (isOpen(k)) { depth = depth + 1; }
+        if (isClose(k) && depth > 0) { depth = depth - 1; }
+        i = i + 1;
+    }
+    let out = "[";
+    let first = true;
+    for (s in items) {
+        if (!first) { out = out + ","; }
+        out = out + s;
+        first = false;
+    }
+    return out + "]";
+}
+
+// 文本按行切开，每段带着它的 LF（最后一段可以没有）。
+function splitLines(s: string): List<string> {
+    const out: List<string> = listNew();
+    const b = bytesFromStr(s);
+    let a = 0;
+    let i = 0;
+    while (i < bytesLen(b)) {
+        if ((bytesGet(b, i) catch 0) == 10) {
+            listPush(out, bytesToStr(bytesSlice(b, a, i + 1 - a)) catch "");
+            a = i + 1;
+        }
+        i = i + 1;
+    }
+    if (a < bytesLen(b)) { listPush(out, bytesToStr(bytesSlice(b, a, bytesLen(b) - a)) catch ""); }
+    return out;
+}
+
+// textDocument/formatting 的结果：拒绝时 null，没有变化时 []，否则一条编辑，只替换首尾相同的行之间的那段（§五：
+// Zig 版一条覆盖全文、无尾换行时重复最后一行，§二-2 第 6 条；gopls、rust-analyzer 按差异给多条编辑，记债）。
+// 相同的尾段至少含最后一行时，被替换段之前的每一行都以 LF 结束，终点即 (行号, 0)；否则终点为文末。
+export function lspFormat(d: Ref<LspDoc>, enc: int): string {
+    const r = formatSource(d.text);
+    if (r.rejected) { return "null"; }
+    if (r.text == d.text) { return "[]"; }
+    const ol = splitLines(d.text);
+    const nl = splitLines(r.text);
+    let p = 0;
+    while (p < listLen(ol) && p < listLen(nl) && (listGet(ol, p) catch "") == (listGet(nl, p) catch "")) { p = p + 1; }
+    let q = 0;
+    while (p + q < listLen(ol) && p + q < listLen(nl) && (listGet(ol, listLen(ol) - 1 - q) catch "") == (listGet(nl, listLen(nl) - 1 - q) catch "")) { q = q + 1; }
+    let mid = "";
+    let k = p;
+    while (k < listLen(nl) - q) {
+        mid = mid + (listGet(nl, k) catch "");
+        k = k + 1;
+    }
+    let end = "{\"line\":" + toStr(listLen(ol) - q) + ",\"character\":0}";
+    if (q == 0) { end = "{\"line\":" + toStr(endLine(d)) + ",\"character\":" + toStr(endChar(d, enc)) + "}"; }
+    return "[{\"range\":{\"start\":{\"line\":" + toStr(p) + ",\"character\":0},\"end\":" + end + "},\"newText\":" + dbgStr(mid) + "}]";
+}

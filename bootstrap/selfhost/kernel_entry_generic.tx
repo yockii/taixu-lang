@@ -1,0 +1,230 @@
+// 进程入口与命令行参数的可移植版（rtfn 写，macOS 适配 M4 设计 A8）：语义与导出名同 runtime_memory_gen.tx 的 argvProc（NRT 形）
+// 与 linux_argv.tx 的 linuxArgvEmit。Windows 的参数表仍由手写的 windows_argv.tx 取（它不随 arm64 走），本文件只写入口。
+// - main(argc, argv, envp)（Unix）：C 的入口。macOS 先把 envp 记进 __tx_nrt_envp（Linux 由 _start 记），再按 C 约定转入
+//   __tx_native_entry(argc, argv)。手写版的 main 与 __tx_native_entry 是同一段代码（macOS 多一条存 envp），这里是两个函数。
+// - __tx_native_entry：Unix 按 C 约定收 argc、argv（Linux 的 _start 也这样调它），Windows 不带参数（PE 入口桩调它）。
+//   建主线程的区域、线程块进 rbx／x19、登记线程、建立运行时，取参数表，逐个参数（跳过程序名）校验是合法 UTF-8（不合法以
+//   状态 1 拒绝启动，D3 v0.41）、拷进独立的原生块后转成字符串；参数表整块记进 __tx_rt_argv／__tx_rt_argc 留给 std/os
+//   （__rtArgAt），交 __tx_entry_stage 摆好入口窗口，调用程序的 main，__tx_entry_finish 得退出码后退出（Unix 经
+//   __tx_nrt_exit，Windows 经 ExitProcess）。不返回，所以 rbx／x19 不需保存。
+// - __tx_native_argv_acquire(&块, &个数, argc, argv)（Unix）→ 状态（0 成功、5 参数表无效、2 内存不足）：把 argv 连同字节拷进一个
+//   原生块 {指针数组（argc 项＋结尾 0）, 各串字节（含结尾 NUL）}，块地址写 8 字节、个数写 4 字节。
+// C 约定的实参：x86 SysV 在 rdi rsi rdx（rtfn 的私有约定是 rcx rdx r8 r9，所以在序言后立即经 rtStoreReg 存下），A64 的 x0..x2
+// 与私有约定一致（直接作参数）。32 位实参（argc、状态、退出码）先取低 32 位，同手写版的 dword 存取。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, RtOp, L, I, A } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtStoreReg, rtSet, rtSetGlobal, rtSetRbx, rtOp, rtShift, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtIf32, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtCallC, rtRet, rtRetVoid } from "./rtfn";
+import { tSysV, tUnix, tMacos, tKernel32 } from "./target";
+
+const MODULE: string = "bootstrap/selfhost/kernel_entry_generic.tx";
+const U32: int = 4294967295;
+// 参数表的取得状态（tx_Status）：参数表无效、内存不足、参数不是合法 UTF-8。
+const ST_BAD: int = 5;
+const ST_NOMEM: int = 2;
+const ST_UNICODE: int = 1;
+// 值的 tag：字符串。
+const TAG_STR: int = 6;
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// main(argc, argv, envp)：C 的入口，转入 __tx_native_entry（按 C 约定，同 _start 调它的方式），不返回。
+function cMain(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    const sysv = tSysV(t);
+    let params = "argc argv envp";
+    let locals = "fp";
+    if (sysv) { params = ""; locals = "argc argv envp fp"; }
+    const f = rtBegin(b, "main", params, locals, 2, MODULE);
+    if (sysv) { rtStoreReg(f, "argc", 7); rtStoreReg(f, "argv", 6); rtStoreReg(f, "envp", 2); }
+    // macOS 的 LC_MAIN 按 C 约定调 main(argc, argv, envp, apple)：envp 记下给 getEnv、子进程环境等用。
+    if (tMacos(t)) { rtSetGlobal(f, "__tx_nrt_envp", L("envp")); }
+    rtSet(f, "fp", A("__tx_native_entry"));
+    const args: List<Ref<RtOp>> = listNew(); listPush(args, L("argc")); listPush(args, L("argv"));
+    const cls: List<int> = listNew(); listPush(cls, 0); listPush(cls, 0);
+    rtCallC(f, "", "", "fp", args, cls, sysv);
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+// __tx_native_entry：见文件头。局部：region 区域；blk／cnt 参数表与个数（由 acquire 写入，个数只写低 4 字节）；count 参数表项数；
+// nargs 交给程序的参数个数（不含程序名）；vals 字符串值数组；i 参数序号；src／len／cp 当前参数的字节、长度与拷贝；h 字符串号；
+// st 取参数表的状态；fp／win 程序入口与窗口；code 退出码。
+function nativeEntry(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    const unix = tUnix(t);
+    const sysv = tSysV(t);
+    let params = "";
+    let locals = "region blk cnt pb pc st count nargs sz vals i k src len cp c h slot fp win code";
+    if (unix && sysv) { locals = "argc argv " + locals; }
+    if (unix && !sysv) { params = "argc argv"; }
+    const f = rtBegin(b, "__tx_native_entry", params, locals, 4, MODULE);
+    if (unix && sysv) { rtStoreReg(f, "argc", 7); rtStoreReg(f, "argv", 6); }
+    if (unix) { rtOp(f, "argc", L("argc"), "and", I(U32)); }
+    // 线程第 1 步（threads §十二）：先建主线程的区域（线程块＋值槽栈），线程块进 rbx／x19，之后的内核例程都由它求出线程块；
+    // 再登记到本线程的 TLS 槽并记下线程号，然后建立运行时（映像核对、输出句柄、运行时函数表、模块初始化）。
+    rtCall0(f, "region", "__tx_nrt_region_new");
+    rtIf(f, L("region"), "eq", I(0), "regionfail");
+    rtSetRbx(f, L("region"));
+    rtCall0(f, "", "__tx_nrt_thread_bind");
+    rtCall0(f, "", "__tx_host_entry_setup");
+    rtAddrOf(f, "pb", "blk");
+    rtAddrOf(f, "pc", "cnt");
+    if (unix) { rtCall4(f, "st", "__tx_native_argv_acquire", L("pb"), L("pc"), L("argc"), L("argv")); }
+    else { rtCall2(f, "st", "__tx_native_argv_acquire", L("pb"), L("pc")); }
+    rtOp(f, "st", L("st"), "and", I(U32));
+    rtIf(f, L("st"), "ne", I(0), "fail");
+    rtLoad(f, "count", L("pc"), 0, 4);
+    // argv[0]（程序名）不入参数（同 mainImpl）；值数组至少 16 字节。
+    rtSet(f, "nargs", L("count"));
+    rtIf(f, L("nargs"), "eq", I(0), "counted");
+    rtOp(f, "nargs", L("nargs"), "sub", I(1));
+    rtLabel(f, "counted");
+    rtShift(f, "sz", L("nargs"), "shl", 4);
+    rtIf(f, L("sz"), "uge", I(16), "sized");
+    rtSet(f, "sz", I(16));
+    rtLabel(f, "sized");
+    rtCall2(f, "vals", "__tx_native_mem_alloc", L("sz"), I(1));
+    rtIf(f, L("vals"), "eq", I(0), "oom");
+    rtSet(f, "i", I(1));
+    rtLabel(f, "loop");
+    rtIf(f, L("i"), "uge", L("count"), "call");
+    rtShift(f, "k", L("i"), "shl", 3);
+    rtOp(f, "k", L("k"), "add", L("blk"));
+    rtLoad(f, "src", L("k"), 0, 8);
+    rtSet(f, "len", I(0));
+    rtLabel(f, "strlen");
+    rtOp(f, "k", L("src"), "add", L("len"));
+    rtLoad(f, "c", L("k"), 0, 1);
+    rtIf(f, L("c"), "eq", I(0), "gotlen");
+    rtOp(f, "len", L("len"), "add", I(1));
+    rtJump(f, "strlen");
+    // 逐参拷进独立的原生块再交出（take）：参数表是整块的一次分配，内部指针直接移交会在释放时出错（同手写版）。
+    // 先校验：string 恒为合法 UTF-8（同 bytesToStr 的严格规则），不合法即拒绝启动。
+    rtLabel(f, "gotlen");
+    rtCall2(f, "c", "__tx_nrt_utf8_count", L("src"), L("len"));
+    rtIf(f, L("c"), "lt", I(0), "badu");
+    rtCall2(f, "cp", "__tx_native_mem_alloc", L("len"), I(1));
+    rtIf(f, L("cp"), "eq", I(0), "oom");
+    rtSet(f, "k", I(0));
+    rtLabel(f, "copy");
+    rtIf(f, L("k"), "uge", L("len"), "took");
+    rtOp(f, "c", L("src"), "add", L("k"));
+    rtLoad(f, "c", L("c"), 0, 1);
+    rtOp(f, "h", L("cp"), "add", L("k"));
+    rtStore(f, L("h"), 0, L("c"), 1);
+    rtOp(f, "k", L("k"), "add", I(1));
+    rtJump(f, "copy");
+    rtLabel(f, "took");
+    rtCall3(f, "h", "__tx_store_new_str_take", L("cp"), L("len"), I(0));
+    // vals[i − 1] = {tag 6（8 字节）, 字符串号（低 32 位零扩展，8 字节）}。
+    rtOp(f, "slot", L("i"), "sub", I(1));
+    rtShift(f, "slot", L("slot"), "shl", 4);
+    rtOp(f, "slot", L("slot"), "add", L("vals"));
+    rtStore(f, L("slot"), 0, I(TAG_STR), 8);
+    rtOp(f, "h", L("h"), "and", I(U32));
+    rtStore(f, L("slot"), 8, L("h"), 8);
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "loop");
+    // 参数表留给 std/os（__rtArgCount／__rtArgAt，只读至进程结束）；摆好入口窗口后调用程序的 main（私有约定：第一个实参是
+    // 窗口），退出码取低 32 位后退出。
+    rtLabel(f, "call");
+    rtSetGlobal(f, "__tx_rt_argv", L("blk"));
+    rtSetGlobal(f, "__tx_rt_argc", L("count"));
+    rtCall2(f, "fp", "__tx_entry_stage", L("vals"), L("nargs"));
+    rtCall0(f, "win", "__tx_entry_win_ptr");
+    rtCall1(f, "", "*fp", L("win"));
+    rtCall0(f, "code", "__tx_entry_finish");
+    rtOp(f, "code", L("code"), "and", I(U32));
+    if (tKernel32(t)) { rtCall1(f, "", "ExitProcess", L("code")); }
+    else { rtCall1(f, "", "__tx_nrt_exit", L("code")); }
+    rtRetVoid(f);
+    // 区域分配失败：先建好标准输出／错误，再按内存不足终局（不返回）。
+    rtLabel(f, "regionfail");
+    rtCall0(f, "", "__tx_nrt_std_init");
+    rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtLabel(f, "fail");
+    rtCall1(f, "", "__tx_host_argv_fail", L("st"));
+    rtLabel(f, "badu");
+    rtCall1(f, "", "__tx_host_argv_fail", I(ST_UNICODE));
+    rtLabel(f, "oom");
+    rtCall1(f, "", "__tx_host_argv_fail", I(ST_NOMEM));
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+// __tx_native_argv_acquire(outp, countp, argc, argv) → 状态。argc 取低 32 位、按 int 看（负即无效）；argc > 0 时 argv 不得为空，
+// 各项不得为空。先量总长：指针数组 (argc + 1) × 8 加各串字节（含 NUL），逐字节累加，总长或串指针环绕即无效；
+// 再分配（8 字节对齐）并拷贝：数组第 i 项指向字节区里第 i 串，末项为 0。
+function argvAcquire(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_argv_acquire", "outp countp argc argv", "head tot i p c blk q ent", 2, MODULE);
+    rtOp(f, "argc", L("argc"), "and", I(U32));
+    rtIf32(f, L("argc"), "lt", I(0), "bad");
+    rtIf(f, L("argc"), "eq", I(0), "sizestart");
+    rtIf(f, L("argv"), "eq", I(0), "bad");
+    rtLabel(f, "sizestart");
+    rtOp(f, "tot", L("argc"), "add", I(1));
+    rtShift(f, "tot", L("tot"), "shl", 3);
+    rtSet(f, "head", L("tot"));
+    rtSet(f, "i", I(0));
+    rtLabel(f, "size");
+    rtIf(f, L("i"), "uge", L("argc"), "alloc");
+    rtShift(f, "p", L("i"), "shl", 3);
+    rtOp(f, "p", L("p"), "add", L("argv"));
+    rtLoad(f, "p", L("p"), 0, 8);
+    rtIf(f, L("p"), "eq", I(0), "bad");
+    rtLabel(f, "strlen");
+    rtLoad(f, "c", L("p"), 0, 1);
+    // 手写版的 add 后 jb（进位）：加 1 后为 0 即进位。
+    rtOp(f, "tot", L("tot"), "add", I(1));
+    rtIf(f, L("tot"), "eq", I(0), "bad");
+    rtIf(f, L("c"), "eq", I(0), "next");
+    rtOp(f, "p", L("p"), "add", I(1));
+    rtIf(f, L("p"), "eq", I(0), "bad");
+    rtJump(f, "strlen");
+    rtLabel(f, "next");
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "size");
+    rtLabel(f, "alloc");
+    rtCall2(f, "blk", "__tx_native_mem_alloc", L("tot"), I(8));
+    rtIf(f, L("blk"), "eq", I(0), "oom");
+    rtOp(f, "q", L("blk"), "add", L("head"));
+    rtSet(f, "i", I(0));
+    rtLabel(f, "copy");
+    rtIf(f, L("i"), "uge", L("argc"), "commit");
+    rtShift(f, "ent", L("i"), "shl", 3);
+    rtOp(f, "p", L("ent"), "add", L("argv"));
+    rtLoad(f, "p", L("p"), 0, 8);
+    rtOp(f, "ent", L("ent"), "add", L("blk"));
+    rtStore(f, L("ent"), 0, L("q"), 8);
+    // 逐字节拷到 NUL 为止（NUL 也拷）。
+    rtLabel(f, "bytes");
+    rtLoad(f, "c", L("p"), 0, 1);
+    rtStore(f, L("q"), 0, L("c"), 1);
+    rtOp(f, "q", L("q"), "add", I(1));
+    rtOp(f, "p", L("p"), "add", I(1));
+    rtIf(f, L("c"), "ne", I(0), "bytes");
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "copy");
+    rtLabel(f, "commit");
+    rtShift(f, "ent", L("i"), "shl", 3);
+    rtOp(f, "ent", L("ent"), "add", L("blk"));
+    rtStore(f, L("ent"), 0, I(0), 8);
+    rtStore(f, L("outp"), 0, L("blk"), 8);
+    rtStore(f, L("countp"), 0, L("i"), 4);
+    rtRet(f, I(0));
+    rtLabel(f, "bad");
+    rtRet(f, I(ST_BAD));
+    rtLabel(f, "oom");
+    rtRet(f, I(ST_NOMEM));
+    done(f, failures);
+}
+
+/// 发出进程入口（Unix 另有 main 与参数表的取法）；rtfn 的失败记进 failures。t 为目标编号（入口的实参位置与退出方式随目标）。
+export function entryGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    if (tUnix(t)) {
+        argvAcquire(b, failures);
+        cMain(b, failures, t);
+    }
+    nativeEntry(b, failures, t);
+}

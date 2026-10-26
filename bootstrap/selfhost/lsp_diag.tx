@@ -1,0 +1,533 @@
+// lsp_diag.tx —— 原生 LSP 的入口与程序、分析、诊断发布（第 6 轮 6d-2，LSP 与 MCP 实施设计 §三-5、§四-1）。
+//
+// 打开的文档里，没被其它入口的程序（上一次分析得到的模块表）包含的作为入口，每个入口一次 drvCheck，覆盖层为全部
+// 打开文档。一个模块的诊断取自包含它的第一个入口（按入口登记的先后）；只在一个文件的诊断内容变化时发布。
+// 每次检查都带分析节（6d-3a2，§四-3）：入口另存各模块的路径、所用文本与解析后的出现，供跳转、引用与改名。
+// 资源预算（安全审查攻关第 5 项，设计 v052-lsp-resources §三-4、5、7）：检查缓存只给最近使用、程序源码累计不超过热缓存
+// 预算的入口保留，其余入口留分析节与诊断、下次冷查（结果不变）；全部入口的程序源码超出分析预算时，刚分析的入口记为超
+// 预算——丢分析节、为入口文档发 analysis_budget 诊断，别的入口不动。覆盖判断、诊断归属与发布记录按 Map 查；单文件诊断
+// 有条数与字节上限；发布逐文件写出，发布记录只存诊断文本的摘要。
+import { DrvCheckCache, drvCheckCacheNew, drvCheckCached, drvCheckChanged, drvCheckDiags, drvSetOverlay, drvOverlayGen, drvModulePathList, drvModuleTextList, drvFailedPathList, drvAnaInts, drvAnaNames, drvAnaDetInts, drvAnaDetStrs } from "./driver";
+import { AnaOcc, AnaDetail, anaDirtyModules, anaResolveCached, anaDetailsCached } from "./ana_index";
+import { serviceReadSource } from "./service_files";
+import { DrvDiag } from "./check_diag";
+import { nextToken, Cur, Tok, Out, K_EOF } from "../lexer";
+import { dbgStr } from "./dbg_out";
+import { sha256Hex } from "./sha256";
+import { LspDoc, docKey, keyPath, pathToUri, colUnits, lineStart, joinComma } from "./lsp_docs";
+
+export struct Root {
+    key: string,
+    path: string,
+    modules: List<string>, // 键
+    missing: List<string>, // 导入失败（找不到、装载失败）的模块的键：这些路径上的文档打开或变更时重查（同 tsserver 的 failedLookupLocations）
+    diags: List<Ref<DrvDiag>>,
+    dirty: bool,
+    paths: List<string>, // 分析节：按模块序的模块路径（含 <prelude>）
+    texts: List<string>, // 分析时各模块的文本（打开的文档取覆盖层；<prelude> 为空串）
+    occs: List<Ref<AnaOcc>>, // 解析后的出现（ana_index）
+    dets: List<Ref<AnaDetail>>, // 声明的说明表（ANT1，6d-3b，§四-5）
+    cache: Ref<DrvCheckCache>,
+    size: int, // 程序源码总字节（分析节各模块文本之和）：两项分析内存预算都按它计
+    used: int, // 最近一次分析或请求用到它的时刻（单调计数）：检查缓存按它保留
+    ran: int, // 最近一次分析的时刻：后台先挑最久没分析的脏入口（连续编辑一处时别的入口不饿死）
+    hot: bool, // 持有检查缓存
+    over: bool, // 超出分析预算：分析节已丢，模块表只剩入口自己的键
+}
+
+// 发布过的文件：URI 与最后一次发布的诊断数组的 SHA-256。
+struct Pub {
+    uri: string,
+    dig: string,
+}
+
+// 超预算文档（lsp.tx 登记）：URI 与代替分析结果发布的诊断数组。
+struct Held {
+    uri: string,
+    json: string,
+}
+
+// 一个文件的诊断（按文件分组时用）。
+struct Bucket {
+    ds: List<Ref<DrvDiag>>,
+}
+
+let roots: List<Ref<Root>> = listNew();
+let pubs: Map<string, Ref<Pub>> = mapNew();
+let held: Map<string, Ref<Held>> = mapNew();
+let cover: Map<string, int> = mapNew(); // 被某个入口的程序包含的键（covered 的索引，入口或模块表变了就重建）
+let coverStale: bool = true;
+let clock: int = 0;
+let docsGen: int = 0; // 打开文档的集合或文本的代数（lsp.tx 每次改动后加一）
+let ovDocsGen: int = -1; // setOverlay 上次设覆盖层时的文档代数，及当时驱动覆盖层的代数
+let ovDrvGen: int = -1;
+let maxAnalysis: int = 33554432;
+let maxHot: int = 4194304;
+let maxDiags: int = 1000;
+let maxDiagBytes: int = 1048576;
+
+// 预算（lsp.tx 在 initialize 时按客户端的收紧值设）。
+export function diagBudget(analysis: int, hot: int, diags: int, diagBytes: int): void {
+    maxAnalysis = analysis;
+    maxHot = hot;
+    maxDiags = diags;
+    maxDiagBytes = diagBytes;
+}
+
+// 打开文档的集合或文本变了（打开、变更、关闭、转为超预算）：下次分析前重设覆盖层。
+export function diagDocsChanged(): void { docsGen = docsGen + 1; }
+
+// 超预算文档：发布 json（诊断数组文本）代替分析结果；json 为空串即撤销。
+export function diagHold(key: string, uri: string, json: string): void {
+    if (len(json) == 0) {
+        mapRemove(held, key);
+        return;
+    }
+    mapSet(held, key, new Held { uri: uri, json: json });
+}
+
+function hasKey(xs: List<string>, k: string): bool {
+    for (x in xs) {
+        if (x == k) { return true; }
+    }
+    return false;
+}
+
+function covered(key: string): bool {
+    if (coverStale) {
+        cover = mapNew();
+        for (r in roots) {
+            for (k in r.modules) { mapSet(cover, k, 1); }
+        }
+        coverStale = false;
+    }
+    return mapHas(cover, key);
+}
+
+// 文档打开、变更或关闭后：模块表或缺失表含该文件的入口标脏；关闭的文档若是入口则移除。分析在防抖之后做。
+export function diagTouch(key: string, closed: bool): void {
+    const keep: List<Ref<Root>> = listNew();
+    let removed = false;
+    for (r in roots) {
+        if (closed && r.key == key) {
+            removed = true;
+            continue;
+        }
+        if (hasKey(r.modules, key) || hasKey(r.missing, key)) { r.dirty = true; }
+        listPush(keep, r);
+    }
+    roots = keep;
+    if (removed) { retryOver(""); }
+}
+
+// 有入口移除：分析预算可能有了余量，超预算的入口（除 except 外）再试一次。
+function retryOver(except: string): void {
+    coverStale = true;
+    for (r in roots) {
+        if (r.over && r.key != except) { r.dirty = true; }
+    }
+}
+
+// 还有要分析的：脏入口，或没被任何程序包含的打开文档。
+export function diagPending(docs: List<Ref<LspDoc>>): bool {
+    for (r in roots) {
+        if (r.dirty) { return true; }
+    }
+    for (d in docs) {
+        if (!covered(d.key)) { return true; }
+    }
+    return false;
+}
+
+function runRoot(r: Ref<Root>, docs: List<Ref<LspDoc>>, targetId: int): void {
+    // 先按最近使用腾出热缓存（连同 r 上次的规模不超预算；r 从未分析过、规模未知时腾空别的）：分配器留着释放的内存，
+    // 事后再丢峰值已经到了。
+    let room = r.size;
+    if (r.size == 0) { room = maxHot + 1; }
+    retainHot(r, room);
+    if (!r.hot) {
+        r.cache = drvCheckCacheNew();
+        r.hot = true;
+    }
+    drvCheckCached(r.path, targetId, true, r.cache);
+    const mods: List<string> = listNew();
+    const texts: List<string> = listNew();
+    const sourceTexts = drvModuleTextList(); let mi = 0;
+    for (p in drvModulePathList()) {
+        if (p == "<prelude>") {
+            listPush(texts, "");
+        } else {
+            listPush(mods, docKey(p));
+            listPush(texts, listGet(sourceTexts, mi) catch "");
+        }
+        mi = mi + 1;
+    }
+    const paths = drvModulePathList();
+    const dirty = anaDirtyModules(r.paths, paths, r.texts, texts, drvCheckChanged(r.cache));
+    r.occs = anaResolveCached(drvAnaInts(), drvAnaNames(), texts, r.occs, dirty);
+    r.dets = anaDetailsCached(drvAnaDetInts(), drvAnaDetStrs(), r.dets, dirty);
+    r.paths = paths;
+    r.texts = texts;
+    if (!hasKey(mods, r.key)) { listPush(mods, r.key); }
+    r.modules = mods;
+    const miss: List<string> = listNew();
+    for (p in drvFailedPathList()) { listPush(miss, docKey(p)); }
+    r.missing = miss;
+    const ds: List<Ref<DrvDiag>> = listNew();
+    for (d in drvCheckDiags()) { listPush(ds, d); }
+    r.diags = ds;
+    r.dirty = false;
+    let size = 0;
+    for (t in texts) { size = size + len(t); }
+    r.size = size;
+    clock = clock + 1;
+    r.used = clock;
+    r.ran = clock;
+    coverStale = true;
+    // 分析预算：本入口加上分析后仍在的入口（不含被它包含、将要移除的）。超出时本入口记为超预算，别的入口不动——
+    // 否则被它包含而移除的入口又会因它被丢而重新成为入口，来回反复。
+    let total = size;
+    for (x in roots) {
+        if (x.key != r.key && !x.over && !hasKey(mods, x.key)) { total = total + x.size; }
+    }
+    if (total > maxAnalysis) {
+        overRoot(r);
+        return;
+    }
+    r.over = false;
+    // 被这个程序导入的其它入口不再是入口。
+    const keep: List<Ref<Root>> = listNew();
+    let removed = false;
+    for (x in roots) {
+        if (x.key == r.key || !hasKey(mods, x.key)) {
+            listPush(keep, x);
+        } else {
+            removed = true;
+        }
+    }
+    roots = keep;
+    if (removed) { retryOver(r.key); }
+    retainHot(r, 0);
+}
+
+// 超出分析预算：丢掉分析节、缓存与诊断，只留入口自己的键（仍算覆盖，免得每轮为它再建入口）；size 留作诊断说明。
+function overRoot(r: Ref<Root>): void {
+    r.over = true;
+    r.hot = false;
+    r.cache = drvCheckCacheNew();
+    const own: List<string> = listNew();
+    listPush(own, r.key);
+    r.modules = own;
+    r.missing = listNew();
+    r.diags = listNew();
+    r.paths = listNew();
+    r.texts = listNew();
+    r.occs = listNew();
+    r.dets = listNew();
+    coverStale = true;
+}
+
+// 热缓存预算：持有检查缓存的入口按最近使用保留；连同 extra（将要分析的入口 keep 上次的规模）超出时，丢掉 keep 以外
+// 最久未用的，直到不超出或只剩 keep。峰值因此约为预算加上正在分析的一个入口。
+function retainHot(keep: Ref<Root>, extra: int): void {
+    let total = extra;
+    for (x in roots) {
+        if (x.hot && x.key != keep.key) { total = total + x.size; }
+    }
+    if (keep.hot && extra == 0) { total = total + keep.size; }
+    while (total > maxHot) {
+        let old: Ref<Root>? = None;
+        let least = 0;
+        for (x in roots) {
+            if (x.hot && x.key != keep.key && (old == None || x.used < least)) {
+                old = x;
+                least = x.used;
+            }
+        }
+        if (old == None) { return; }
+        const o = old catch lspEmptyRoot();
+        o.hot = false;
+        o.cache = drvCheckCacheNew();
+        total = total - o.size;
+    }
+}
+
+// 分析一步：重查最久没分析的脏入口，没有就给第一个没被包含的打开文档（按打开先后）做一次；做了得 true。覆盖层为
+// 全部打开文档。主循环在两步之间查一次输入，有新输入就停（剩下的仍待分析）。
+export function diagStep(docs: List<Ref<LspDoc>>, targetId: int): bool {
+    let target: Ref<Root>? = None;
+    let best = 0;
+    for (r in roots) {
+        if (r.dirty && (target == None || r.ran < best)) {
+            target = r;
+            best = r.ran;
+        }
+    }
+    if (target == None) {
+        for (d in docs) {
+            if (target == None && !covered(d.key)) {
+                const r = newRoot(d.key, d.path);
+                listPush(roots, r);
+                target = r;
+            }
+        }
+    }
+    if (target == None) { return false; }
+    setOverlay(docs);
+    runRoot(target catch newRoot("", ""), docs, targetId);
+    return true;
+}
+
+// 覆盖层设为全部打开文档；文档与驱动覆盖层都没变时不重设（上千个文档时每步重设要逐个归一路径）。
+export function setOverlay(docs: List<Ref<LspDoc>>): void {
+    if (ovDocsGen == docsGen && ovDrvGen == drvOverlayGen()) { return; }
+    const paths: List<string> = listNew();
+    const texts: List<string> = listNew();
+    for (d in docs) {
+        listPush(paths, d.path);
+        listPush(texts, d.text);
+    }
+    drvSetOverlay(paths, texts);
+    ovDocsGen = docsGen;
+    ovDrvGen = drvOverlayGen();
+}
+
+function newRoot(key: string, path: string): Ref<Root> {
+    return new Root { key: key, path: path, modules: listNew(), missing: listNew(), diags: listNew(), dirty: true, paths: listNew(), texts: listNew(), occs: listNew(), dets: listNew(), cache: drvCheckCacheNew(), size: 0, used: 0, ran: 0, hot: false, over: false };
+}
+
+export function lspEmptyRoot(): Ref<Root> {
+    const r = newRoot("", ""); r.dirty = false; return r;
+}
+
+// 请求前（definition、references、rename 等）：含 key 的入口若为脏先重查；没有入口包含 key 而它是打开的文档，就为它
+// 建入口并分析。每个入口之前调一次 stop（取消点：调用方收下输入、查请求是否已被取消），得 true 即不再分析。超预算的
+// 入口不在这里重试（交给后台）。分析过返回 true（调用方随后发布诊断）。
+export function diagSync(docs: List<Ref<LspDoc>>, targetId: int, key: string, stop: () => bool): bool {
+    let did = false;
+    setOverlay(docs);
+    for (r in roots) {
+        if (hasKey(r.modules, key)) {
+            clock = clock + 1;
+            r.used = clock;
+            if (r.dirty && !r.over) {
+                if (stop()) { return did; }
+                setOverlay(docs);
+                runRoot(r, docs, targetId);
+                did = true;
+            }
+        }
+    }
+    if (!covered(key) && docOf(docs, key) != None) {
+        if (stop()) { return did; }
+        const d = docOf(docs, key) catch newEmptyDoc();
+        const r = newRoot(d.key, d.path);
+        listPush(roots, r);
+        setOverlay(docs);
+        runRoot(r, docs, targetId);
+        did = true;
+    }
+    return did;
+}
+
+// key 只被超预算的入口包含：它上面的请求答不了。
+export function diagOverOnly(key: string): bool {
+    let over = false;
+    for (r in roots) {
+        if (hasKey(r.modules, key)) {
+            if (!r.over) { return false; }
+            over = true;
+        }
+    }
+    return over;
+}
+
+// 超预算的入口个数（改名在有超预算入口时拒绝：那些程序里的出现没分析，改名可能漏改）。
+export function diagOverCount(): int {
+    let n = 0;
+    for (r in roots) {
+        if (r.over) { n = n + 1; }
+    }
+    return n;
+}
+
+// 全部入口（按登记先后）。
+export function diagRoots(): List<Ref<Root>> { return roots; }
+
+// —— 发布 ——
+
+function docOf(docs: List<Ref<LspDoc>>, key: string): Ref<LspDoc>? {
+    for (d in docs) {
+        if (d.key == key) { return d; }
+    }
+    return None;
+}
+
+// 诊断的范围：起点按协商的编码换算；终点为起点处记号的末尾（从行首扫到起点；起点不是记号起点时零宽）。
+function rangeOf(text: string, starts: List<int>, line: int, col: int, enc: int): string {
+    if (line <= 0) { return "{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}}"; }
+    const l = line - 1;
+    const ls = listGet(starts, l) catch len(text);
+    const sc = colUnits(text, ls, col - 1, enc);
+    let el = l;
+    let ec = sc;
+    const out: Ref<Out> = new Out { lines: "", errors: "", failed: false, coded: true };
+    const c: Ref<Cur> = new Cur { pos: ls, line: line, col: 1 };
+    let going = true;
+    while (going) {
+        const t: Tok = nextToken(text, c, out);
+        if (t.kind == K_EOF || t.line > line || (t.line == line && t.col > col)) {
+            going = false;
+        } else if (t.line == line && t.col == col) {
+            el = c.line - 1;
+            ec = colUnits(text, listGet(starts, el) catch len(text), c.col - 1, enc);
+            going = false;
+        }
+    }
+    return "{\"start\":{\"line\":" + toStr(l) + ",\"character\":" + toStr(sc) + "},\"end\":{\"line\":" + toStr(el) + ",\"character\":" + toStr(ec) + "}}";
+}
+
+function startsOf(text: string): List<int> {
+    const s: List<int> = listNew();
+    listPush(s, 0);
+    let i = 0;
+    while (i < len(text)) {
+        if ((byteAt(text, i) catch 0) == 10) { listPush(s, i + 1); }
+        i = i + 1;
+    }
+    return s;
+}
+
+function diagJson(d: Ref<DrvDiag>, text: string, starts: List<int>, enc: int): string {
+    let out = "{\"range\":" + rangeOf(text, starts, d.line, d.col, enc) + ",\"severity\":1";
+    if (d.code != 0) { out = out + ",\"code\":" + toStr(d.code); }
+    return out + ",\"source\":\"taixu\",\"message\":" + dbgStr(d.msg) + "}";
+}
+
+// 服务自己的一条说明（预算类）：位于文首、警告级、码为字符串（机器可读的原因）、来源 taixu-lsp。
+function noteJson(code: string, message: string): string {
+    return "{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"severity\":2,\"code\":" + dbgStr(code) + ",\"source\":\"taixu-lsp\",\"message\":" + dbgStr(message) + "}";
+}
+
+// 只含一条说明的诊断数组（lsp.tx 为超预算文档登记时用）。
+export function diagNote(code: string, message: string): string { return "[" + noteJson(code, message) + "]"; }
+
+function overJson(r: Ref<Root>): string {
+    return diagNote("analysis_budget", "以本文件为入口的程序源码 " + toStr(r.size) + " 字节，与其它入口合计超出分析预算 " + toStr(maxAnalysis) + " 字节，未分析；关闭别的入口后自动重试");
+}
+
+// 一个文件的诊断数组：至多 maxDiags 条、约 maxDiagBytes 字节，截断时末条说明省略了多少。
+function diagArray(mine: List<Ref<DrvDiag>>, text: string, enc: int): string {
+    const starts = startsOf(text);
+    const parts: List<string> = listNew();
+    const total = listLen(mine);
+    let bytes = 0;
+    for (d in mine) {
+        if (listLen(parts) >= maxDiags || (total > maxDiags && listLen(parts) >= maxDiags - 1)) { break; }
+        const j = diagJson(d, text, starts, enc);
+        if (bytes + len(j) + 1 > maxDiagBytes - 1024) { break; }
+        listPush(parts, j);
+        bytes = bytes + len(j) + 1;
+    }
+    const shown = listLen(parts);
+    if (shown < total) {
+        listPush(parts, noteJson("diagnostics_truncated", "另有 " + toStr(total - shown) + " 条诊断未列出（单文件上限 " + toStr(maxDiags) + " 条、" + toStr(maxDiagBytes) + " 字节）"));
+    }
+    return "[" + joinComma(parts) + "]";
+}
+
+function newEmptyDoc(): Ref<LspDoc> {
+    return new LspDoc { uri: "", key: "", path: "", text: "", version: 0, seq: 0, starts: listNew() };
+}
+
+// 入口的诊断按文件（键）分组。
+function byFile(r: Ref<Root>): Map<string, Ref<Bucket>> {
+    const m: Map<string, Ref<Bucket>> = mapNew();
+    for (d in r.diags) {
+        let dk = r.key;
+        if (len(d.path) > 0) { dk = docKey(d.path); }
+        const b = mapGet(m, dk);
+        if (b == None) {
+            const nb = new Bucket { ds: listNew() };
+            listPush(nb.ds, d);
+            mapSet(m, dk, nb);
+        } else {
+            listPush((b catch new Bucket { ds: listNew() }).ds, d);
+        }
+    }
+    return m;
+}
+
+function uriOf(open: Map<string, Ref<LspDoc>>, key: string, windows: bool): string {
+    const od = mapGet(open, key);
+    if (od != None) { return (od catch newEmptyDoc()).uri; }
+    const h = mapGet(held, key);
+    if (h != None) { return (h catch new Held { uri: "", json: "" }).uri; }
+    return pathToUri(keyPath(key, windows), windows);
+}
+
+function sourceOf(open: Map<string, Ref<LspDoc>>, key: string, windows: bool): string {
+    const od = mapGet(open, key);
+    if (od != None) { return (od catch newEmptyDoc()).text; }
+    const disk: string = serviceReadSource(keyPath(key, windows)) catch "";
+    return disk;
+}
+
+// 与上次发布相比有变化的文件，各一条 publishDiagnostics，经 send 逐条写出（不先拼全表）。按入口先后、每个模块取第一个
+// 包含它的入口；超预算文档发登记的说明，超预算入口的入口文档发 analysis_budget。没有诊断、也从未发布过的文件不发；
+// 上次发过、这次没有的发空表。
+export function diagPublish(docs: List<Ref<LspDoc>>, enc: int, windows: bool, send: (string) => void): void {
+    const open: Map<string, Ref<LspDoc>> = mapNew();
+    for (d in docs) { mapSet(open, d.key, d); }
+    const seen: Map<string, int> = mapNew();
+    const next: Map<string, Ref<Pub>> = mapNew();
+    for (r in roots) {
+        const groups = byFile(r);
+        for (k in r.modules) {
+            if (mapHas(seen, k)) { continue; }
+            mapSet(seen, k, 1);
+            let arr = "[]";
+            const h = mapGet(held, k);
+            if (h != None) {
+                arr = (h catch new Held { uri: "", json: "[]" }).json;
+            } else if (r.over && k == r.key) {
+                arr = overJson(r);
+            } else {
+                const b = mapGet(groups, k);
+                if (b != None) {
+                    const mine = (b catch new Bucket { ds: listNew() }).ds;
+                    if (listLen(mine) > 0) { arr = diagArray(mine, sourceOf(open, k, windows), enc); }
+                }
+            }
+            publishOne(k, uriOf(open, k, windows), arr, next, send);
+        }
+    }
+    for (k in mapKeys(held)) {
+        if (!mapHas(seen, k)) {
+            mapSet(seen, k, 1);
+            const h = mapGet(held, k) catch new Held { uri: "", json: "[]" };
+            publishOne(k, h.uri, h.json, next, send);
+        }
+    }
+    for (k in mapKeys(pubs)) {
+        if (!mapHas(seen, k)) {
+            const p = mapGet(pubs, k) catch new Pub { uri: "", dig: "" };
+            send(notice(p.uri, "[]"));
+        }
+    }
+    pubs = next;
+}
+
+function publishOne(key: string, uri: string, arr: string, next: Map<string, Ref<Pub>>, send: (string) => void): void {
+    let dig = "";
+    if (arr != "[]") { dig = sha256Hex(bytesFromStr(arr)); }
+    let prev = "";
+    const p = mapGet(pubs, key);
+    if (p != None) { prev = (p catch new Pub { uri: "", dig: "" }).dig; }
+    if (dig != prev) { send(notice(uri, arr)); }
+    if (len(dig) > 0) { mapSet(next, key, new Pub { uri: uri, dig: dig }); }
+}
+
+function notice(uri: string, arr: string): string {
+    return "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":" + dbgStr(uri) + ",\"diagnostics\":" + arr + "}}";
+}

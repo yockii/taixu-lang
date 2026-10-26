@@ -1,0 +1,802 @@
+// NRT 工具链系统内建（D3 v0.21；docs/design/v052-native-run-test-async-v0.1-20261014.md §五）：
+// hostTarget/getEnv/setEnv（v0.42）/runProcess/tempDir/removeFile/selfExePath/monoNs，只在 --toolchain
+// 构建中可用（semamirror 3001 拒绝其余程序）。Windows 直调 kernel32，Linux 只用 syscall；
+// 环境变量经 nrt_rt.tx 的 __tx_rt_env_get（Linux 为进程级环境表，初值取自 _start 存入的 __tx_nrt_envp）；runProcess 的子进程
+// 环境取同一张表的当前内容（__tx_rt_env_block，D3 v0.39）。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, RtOp, L, I, A, G } from "./rtfn_base";
+import { rtBegin, rtSet, rtOp, rtShift, rtDivMod, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtIf32, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtCallList, rtSyscall, rtRet, rtRetVoid, rtStoreRel } from "./rtfn";
+import { ARITY, check, text, memcpyName, fatal, trapText, trapAt, arity, argTag, strSpan, nrtTarget } from "./nrt_base";
+import { targetOs, targetArch, tRawSyscall, tWindows, tLinux, tUnix, tMacos } from "./target";
+import { uxSys, uxMac, uxClock, uxErrno, uxAtFdcwd, uxOpenFlags, uxConst } from "./unix_sys";
+
+export const NRT_PROC_EXPORTS: string = "__tx_bi_host_target __tx_bi_host_arch __tx_bi_get_env __tx_bi_set_env __tx_bi_run_process __tx_bi_temp_dir __tx_bi_remove_file __tx_bi_self_exe_path __tx_bi_mono_ns";
+
+function one(a: Ref<RtOp>): List<Ref<RtOp>> { const xs: List<Ref<RtOp>> = listNew(); listPush(xs, a); return xs; }
+function two(a: Ref<RtOp>, c: Ref<RtOp>): List<Ref<RtOp>> { const xs = one(a); listPush(xs, c); return xs; }
+function three(a: Ref<RtOp>, c: Ref<RtOp>, d: Ref<RtOp>): List<Ref<RtOp>> { const xs = two(a, c); listPush(xs, d); return xs; }
+
+function ops(a: Ref<RtOp>, c: Ref<RtOp>, d: Ref<RtOp>, e: Ref<RtOp>): List<Ref<RtOp>> {
+    const xs: List<Ref<RtOp>> = listNew();
+    listPush(xs, a); listPush(xs, c); listPush(xs, d); listPush(xs, e);
+    return xs;
+}
+
+function locals(prefix: string, n: int): string {
+    let out = "";
+    let k = 0;
+    while (k < n) { out = out + " " + prefix + toStr(k); k = k + 1; }
+    return out;
+}
+
+function emitHelpers(b: Ref<StructuredBuffer>): void {
+    if (!tWindows(nrtTarget())) { return; }
+    // __tx_nrt_wide_to_str(w, wl) → new string from wl UTF-16 units.
+    let f = rtBegin(b, "__tx_nrt_wide_to_str", "w wl", "cap buf m q", 8, "bootstrap/selfhost/nrt_proc.tx");
+    rtIf(f, L("wl"), "le", I(0), "empty");
+    rtOp(f, "cap", L("wl"), "imul", I(3));
+    rtCall2(f, "buf", "__tx_native_mem_alloc", L("cap"), I(1));
+    rtIf(f, L("buf"), "eq", I(0), "oom");
+    const xs = ops(I(65001), I(0), L("w"), L("wl"));
+    listPush(xs, L("buf")); listPush(xs, L("cap")); listPush(xs, I(0)); listPush(xs, I(0));
+    rtCallList(f, "m", "WideCharToMultiByte", xs);
+    rtOp(f, "m", L("m"), "and", I(4294967295));
+    rtCall3(f, "q", "__tx_nrt_str_copy", L("buf"), L("m"), I(1));
+    rtCall1(f, "", "__tx_native_mem_free", L("buf"));
+    rtRet(f, L("q"));
+    rtLabel(f, "empty");
+    rtCall3(f, "q", "__tx_nrt_str_copy", L("w"), I(0), I(1));
+    rtRet(f, L("q"));
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRet(f, I(0)); check(f);
+
+    // __tx_nrt_quote(d, p, n) → d after appending one argument with the MSVC
+    // command-line quoting rules (CommandLineToArgvW reads it back verbatim).
+    f = emitMsvcQuote(b, "__tx_nrt_quote", memcpyName());
+    check(f);
+}
+
+/// MSVC 命令行引号规则（CommandLineToArgvW 原样读回）：name(d, p, n) 把一个参数追加到 d，返回新的末尾。
+/// copy(dst, src, n) 拷贝不需加引号的参数。内核的 __tx_nrt_quote 与程序对象里的工具链进程例程（tool_rt.tx）
+/// 共用这一份生成代码。
+export function emitMsvcQuote(b: Ref<StructuredBuffer>, name: string, copy: string): Ref<RtFn> {
+    const f = rtBegin(b, name, "d p n", "i c bs k", 3, "bootstrap/selfhost/nrt_proc.tx");
+    rtIf(f, L("n"), "eq", I(0), "quote");
+    rtSet(f, "i", I(0));
+    rtLabel(f, "scan");
+    rtIf(f, L("i"), "ge", L("n"), "plain");
+    rtOp(f, "c", L("p"), "add", L("i")); rtLoad(f, "c", L("c"), 0, 1);
+    rtIf(f, L("c"), "eq", I(32), "quote"); rtIf(f, L("c"), "eq", I(9), "quote");
+    rtIf(f, L("c"), "eq", I(10), "quote"); rtIf(f, L("c"), "eq", I(11), "quote");
+    rtIf(f, L("c"), "eq", I(34), "quote");
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "scan");
+    rtLabel(f, "plain");
+    rtCall3(f, "", copy, L("d"), L("p"), L("n"));
+    rtOp(f, "d", L("d"), "add", L("n")); rtRet(f, L("d"));
+    rtLabel(f, "quote");
+    rtStore(f, L("d"), 0, I(34), 1); rtOp(f, "d", L("d"), "add", I(1));
+    rtSet(f, "i", I(0)); rtSet(f, "bs", I(0));
+    rtLabel(f, "loop");
+    rtIf(f, L("i"), "ge", L("n"), "end");
+    rtOp(f, "c", L("p"), "add", L("i")); rtLoad(f, "c", L("c"), 0, 1);
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtIf(f, L("c"), "ne", I(92), "notbs");
+    rtOp(f, "bs", L("bs"), "add", I(1)); rtJump(f, "loop");
+    rtLabel(f, "notbs");
+    // Backslashes before a quote are doubled and the quote escaped; others stay.
+    rtSet(f, "k", L("bs"));
+    rtIf(f, L("c"), "ne", I(34), "emitbs");
+    rtOp(f, "k", L("bs"), "add", L("bs")); rtOp(f, "k", L("k"), "add", I(1));
+    rtLabel(f, "emitbs");
+    rtIf(f, L("k"), "le", I(0), "char");
+    rtStore(f, L("d"), 0, I(92), 1); rtOp(f, "d", L("d"), "add", I(1));
+    rtOp(f, "k", L("k"), "sub", I(1)); rtJump(f, "emitbs");
+    rtLabel(f, "char");
+    rtStore(f, L("d"), 0, L("c"), 1); rtOp(f, "d", L("d"), "add", I(1));
+    rtSet(f, "bs", I(0)); rtJump(f, "loop");
+    rtLabel(f, "end");
+    // Trailing backslashes precede the closing quote: double them.
+    rtOp(f, "k", L("bs"), "add", L("bs"));
+    rtLabel(f, "tail");
+    rtIf(f, L("k"), "le", I(0), "close");
+    rtStore(f, L("d"), 0, I(92), 1); rtOp(f, "d", L("d"), "add", I(1));
+    rtOp(f, "k", L("k"), "sub", I(1)); rtJump(f, "tail");
+    rtLabel(f, "close");
+    rtStore(f, L("d"), 0, I(34), 1); rtOp(f, "d", L("d"), "add", I(1));
+    rtRet(f, L("d"));
+    return f;
+}
+
+function emitSimple(b: Ref<StructuredBuffer>): void {
+    // hostTarget(): "windows" / "linux" — the target this kernel was generated for.
+    const name = targetOs(nrtTarget());
+    let f = rtBegin(b, "__tx_bi_host_target", "win fn pc a nargs", "q", 5, "bootstrap/selfhost/nrt_proc.tx");
+    arity(b, f, 0);
+    rtCall3(f, "q", "__tx_nrt_str_copy", A(text(b, name)), I(len(name)), I(1));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(6), L("q")); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    rtRetVoid(f); check(f);
+
+    // hostArch(): "x86_64" or "aarch64" — the architecture of the target this kernel was generated for.
+    const archName = targetArch(nrtTarget());
+    f = rtBegin(b, "__tx_bi_host_arch", "win fn pc a nargs", "q", 5, "bootstrap/selfhost/nrt_proc.tx");
+    arity(b, f, 0);
+    rtCall3(f, "q", "__tx_nrt_str_copy", A(text(b, archName)), I(len(archName)), I(1));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(6), L("q")); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    rtRetVoid(f); check(f);
+
+    // monoNs(): monotonic nanoseconds (arbitrary origin).
+    f = rtBegin(b, "__tx_bi_mono_ns", "win fn pc a nargs", "c fq hi lo r", 5, "bootstrap/selfhost/nrt_proc.tx");
+    arity(b, f, 0);
+    if (tUnix(nrtTarget())) {
+        // clock_gettime(CLOCK_MONOTONIC, &ts): ts = {sec, nsec} in (c, fq).
+        rtAddrOf(f, "r", "c");
+        const xs: List<Ref<RtOp>> = listNew(); listPush(xs, I(uxClock(nrtTarget(), 1))); listPush(xs, L("r"));
+        uxSys(f, nrtTarget(), "", 228, xs);
+        rtOp(f, "r", L("c"), "imul", I(1000000000));
+        rtOp(f, "r", L("r"), "add", L("fq"));
+    } else {
+        rtAddrOf(f, "r", "c"); rtCall1(f, "", "QueryPerformanceCounter", L("r"));
+        rtAddrOf(f, "r", "fq"); rtCall1(f, "", "QueryPerformanceFrequency", L("r"));
+        rtDivMod(f, "hi", "lo", L("c"), L("fq"));
+        rtOp(f, "hi", L("hi"), "imul", I(1000000000));
+        rtOp(f, "lo", L("lo"), "imul", I(1000000000));
+        rtDivMod(f, "lo", "", L("lo"), L("fq"));
+        rtOp(f, "r", L("hi"), "add", L("lo"));
+    }
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(1), L("r")); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    rtRetVoid(f); check(f);
+
+    // getEnv(name): string? — None when unset or for an invalid name (empty, '=' or NUL); same table as
+    // __rtEnvGet (nrt_rt.tx), so values set through std/os are visible here too.
+    f = rtBegin(b, "__tx_bi_get_env", "win fn pc a nargs", "s t p n q", 5, "bootstrap/selfhost/nrt_proc.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", 6, "type");
+    strSpan(f, "s", "p", "n");
+    rtCall2(f, "q", "__tx_rt_env_get", L("p"), L("n"));
+    rtIf(f, L("q"), "eq", I(0), "none");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(6), L("q")); rtRetVoid(f);
+    rtLabel(f, "none");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(4), I(0)); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "getEnv 的实参不是 string");
+    rtRetVoid(f); check(f);
+
+    // setEnv(name, value): void | Error（D3 v0.42）——写 getEnv 读的同一张表（__tx_rt_env_set：类 Unix 为持锁的进程级表，
+    // Windows 为 SetEnvironmentVariableW），此后起的子进程带上（v0.39）。名字为空、含 '=' 或 NUL，值含 NUL，或系统拒绝时
+    // 得 "invalid argument: <名字>"；内存不足同其余内建为致命错误。
+    f = rtBegin(b, "__tx_bi_set_env", "win fn pc a nargs", "s0 s1 t p n q m r", 5, "bootstrap/selfhost/nrt_proc.tx");
+    arity(b, f, 2);
+    argTag(f, 0, "s0", "t", 6, "type");
+    argTag(f, 1, "s1", "t", 6, "type");
+    strSpan(f, "s0", "p", "n");
+    strSpan(f, "s1", "q", "m");
+    rtCall4(f, "r", "__tx_rt_env_set", L("p"), L("n"), L("q"), L("m"));
+    rtIf(f, L("r"), "ne", I(0), "error");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(4), I(0)); rtRetVoid(f);
+    rtLabel(f, "error");
+    rtLoad(f, "t", L("s0"), 8, 4);
+    rtCall4(f, "q", "__tx_store_file_err", I(1), L("t"), L("fn"), L("pc"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(5), L("q")); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "setEnv 的实参不是 string");
+    rtRetVoid(f); check(f);
+
+    // tempDir(): the platform temporary directory, without a trailing separator.
+    let tempLocals = "r buf q t c";
+    if (tUnix(nrtTarget())) { tempLocals = tempLocals + " o p n bt bp"; }
+    f = rtBegin(b, "__tx_bi_temp_dir", "win fn pc a nargs", tempLocals, 5, "bootstrap/selfhost/nrt_proc.tx");
+    arity(b, f, 0);
+    if (tUnix(nrtTarget())) {
+        rtCall0(f, "q", "__tx_rt_env_tmpdir");
+        rtIf(f, L("q"), "eq", I(0), "deftmp");
+        // TMPDIR 可能带结尾的 /（macOS 的缺省值即 /var/folders/…/T/）：按合约去掉，只剩根 / 时保留。截掉的是 ASCII，
+        // 已校验过的 UTF-8 仍然合法；旧串交还 RC。
+        rtCall1(f, "o", "__tx_native_object_address_v1", L("q"));
+        rtLoad(f, "p", L("o"), 32, 8); rtLoad(f, "n", L("o"), 40, 8);
+        rtSet(f, "c", L("n"));
+        rtLabel(f, "trim");
+        rtIf(f, L("c"), "le", I(1), "trimmed");
+        rtOp(f, "t", L("p"), "add", L("c")); rtLoad(f, "t", L("t"), -1, 1);
+        rtIf(f, L("t"), "ne", I(47), "trimmed");
+        rtOp(f, "c", L("c"), "sub", I(1)); rtJump(f, "trim");
+        rtLabel(f, "trimmed");
+        rtIf(f, L("c"), "eq", L("n"), "set");
+        rtCall3(f, "r", "__tx_nrt_str_copy", L("p"), L("c"), I(1));
+        rtSet(f, "bt", I(6)); rtSet(f, "bp", L("q")); rtAddrOf(f, "o", "bt");
+        rtCall1(f, "", "__tx_release", L("o"));
+        rtSet(f, "q", L("r"));
+        rtJump(f, "set");
+        rtLabel(f, "deftmp");
+        rtCall3(f, "q", "__tx_nrt_str_copy", A(text(b, "/tmp")), I(4), I(1));
+    } else {
+        rtCall2(f, "buf", "__tx_native_mem_alloc", I(1024), I(2));
+        rtIf(f, L("buf"), "eq", I(0), "oom");
+        rtCall2(f, "r", "GetTempPathW", I(511), L("buf"));
+        rtOp(f, "r", L("r"), "and", I(4294967295));
+        rtIf(f, L("r"), "eq", I(0), "fail");
+        rtIf(f, L("r"), "gt", I(510), "fail");
+        // Drop the trailing backslash, but keep a drive root such as "C:\".
+        rtIf(f, L("r"), "le", I(3), "conv");
+        rtOp(f, "t", L("r"), "sub", I(1)); rtOp(f, "t", L("t"), "add", L("t")); rtOp(f, "t", L("t"), "add", L("buf"));
+        rtLoad(f, "c", L("t"), 0, 4); rtOp(f, "c", L("c"), "and", I(65535));
+        rtIf(f, L("c"), "ne", I(92), "conv");
+        rtOp(f, "r", L("r"), "sub", I(1));
+        rtLabel(f, "conv");
+        rtCall2(f, "q", "__tx_nrt_wide_to_str", L("buf"), L("r"));
+        rtCall1(f, "", "__tx_native_mem_free", L("buf"));
+        rtJump(f, "set");
+        rtLabel(f, "fail");
+        fatal(b, f, "taixu NRT: tempDir 取临时目录失败\n", 70);
+        rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRetVoid(f);
+    }
+    rtLabel(f, "set");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(6), L("q")); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    rtRetVoid(f); check(f);
+
+    // selfExePath(): the running executable's path.
+    f = rtBegin(b, "__tx_bi_self_exe_path", "win fn pc a nargs", "r buf q w", 5, "bootstrap/selfhost/nrt_proc.tx");
+    arity(b, f, 0);
+    if (tLinux(nrtTarget())) {
+        rtCall2(f, "buf", "__tx_native_mem_alloc", I(4096), I(1));
+        rtIf(f, L("buf"), "eq", I(0), "oom");
+        rtCall2(f, "w", "__tx_nrt_cpath", A(text(b, "/proc/self/exe")), I(14));
+        rtIf(f, L("w"), "eq", I(0), "oom");
+        const rl: List<Ref<RtOp>> = listNew(); listPush(rl, L("w")); listPush(rl, L("buf")); listPush(rl, I(4096));
+        rtSyscall(f, "r", 89, rl);
+        rtCall1(f, "", "__tx_native_mem_free", L("w"));
+        rtIf(f, L("r"), "le", I(0), "fail");
+        rtCall3(f, "q", "__tx_nrt_str_copy", L("buf"), L("r"), I(1));
+    } else if (tMacos(nrtTarget())) {
+        // _NSGetExecutablePath 给出装载时的路径（可含符号链接与 ..），再经 realpath 规范化，同 Linux /proc/self/exe 的
+        // 解析过符号链接的绝对路径（M2 设计 E7）。buf 前 4096 字节放原路径，后 4096 字节放结果；w 先作 uint32 长度槽，再作计数。
+        rtCall2(f, "buf", "__tx_native_mem_alloc", I(8192), I(1));
+        rtIf(f, L("buf"), "eq", I(0), "oom");
+        rtSet(f, "w", I(4096));
+        rtAddrOf(f, "q", "w");
+        uxMac(f, "r", "_NSGetExecutablePath", two(L("buf"), L("q")));
+        rtIf(f, L("r"), "ne", I(0), "fail");
+        rtOp(f, "r", L("buf"), "add", I(4096));
+        uxMac(f, "q", "realpath", two(L("buf"), L("r")));
+        rtIf(f, L("q"), "le", I(0), "fail");
+        rtSet(f, "w", I(0));
+        rtLabel(f, "len");
+        rtOp(f, "q", L("r"), "add", L("w")); rtLoad(f, "q", L("q"), 0, 1);
+        rtIf(f, L("q"), "eq", I(0), "lenok");
+        rtOp(f, "w", L("w"), "add", I(1)); rtJump(f, "len");
+        rtLabel(f, "lenok");
+        rtCall3(f, "q", "__tx_nrt_str_copy", L("r"), L("w"), I(1));
+    } else {
+        rtCall2(f, "buf", "__tx_native_mem_alloc", I(65536), I(2));
+        rtIf(f, L("buf"), "eq", I(0), "oom");
+        rtCall3(f, "r", "GetModuleFileNameW", I(0), L("buf"), I(32768));
+        rtOp(f, "r", L("r"), "and", I(4294967295));
+        rtIf(f, L("r"), "eq", I(0), "fail");
+        rtCall2(f, "q", "__tx_nrt_wide_to_str", L("buf"), L("r"));
+    }
+    rtCall1(f, "", "__tx_native_mem_free", L("buf"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(6), L("q")); rtRetVoid(f);
+    rtLabel(f, "fail");
+    fatal(b, f, "taixu NRT: selfExePath 取可执行文件路径失败\n", 70);
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    rtRetVoid(f); check(f);
+
+    // removeFile(path): void | Error "{status}: {path}".
+    f = rtBegin(b, "__tx_bi_remove_file", "win fn pc a nargs", "s t p n w r st q", 5, "bootstrap/selfhost/nrt_proc.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", 6, "type");
+    strSpan(f, "s", "p", "n");
+    rtSet(f, "st", I(1));
+    rtIf(f, L("n"), "eq", I(0), "error");
+    rtCall2(f, "r", "__tx_rt_nul_free", L("p"), L("n"));
+    rtIf(f, L("r"), "eq", I(0), "error");
+    const ut = nrtTarget();
+    if (tUnix(ut)) {
+        // unlinkat 经 uxSys。对目录：Linux 报 EISDIR（状态 1），macOS 报 EPERM（状态 4，同 Windows）——目标差异如实保留。
+        rtCall2(f, "w", "__tx_nrt_cpath", L("p"), L("n"));
+        rtIf(f, L("w"), "eq", I(0), "oom");
+        const ul: List<Ref<RtOp>> = listNew(); listPush(ul, I(uxAtFdcwd(ut))); listPush(ul, L("w")); listPush(ul, I(0));
+        uxSys(f, ut, "r", 263, ul);
+        rtCall1(f, "", "__tx_native_mem_free", L("w"));
+        rtIf(f, L("r"), "eq", I(0), "ok");
+        rtSet(f, "st", I(3)); rtIf(f, L("r"), "eq", I(-2), "error"); rtIf(f, L("r"), "eq", I(-20), "error");
+        rtSet(f, "st", I(4)); rtIf(f, L("r"), "eq", I(-13), "error"); rtIf(f, L("r"), "eq", I(-1), "error"); rtIf(f, L("r"), "eq", I(-30), "error");
+        rtSet(f, "st", I(1)); rtIf(f, L("r"), "eq", I(-21), "error"); rtIf(f, L("r"), "eq", I(0 - uxErrno(ut, "ENAMETOOLONG")), "error");
+        rtSet(f, "st", I(5));
+    } else {
+        rtCall2(f, "w", "__tx_file_wpath", L("p"), L("n"));
+        rtIf(f, L("w"), "eq", I(0), "oom");
+        rtCall1(f, "r", "DeleteFileW", L("w"));
+        rtIf32(f, L("r"), "ne", I(0), "okfree");
+        rtCall0(f, "r", "GetLastError");
+        rtOp(f, "r", L("r"), "and", I(4294967295));
+        rtCall1(f, "", "__tx_native_mem_free", L("w"));
+        rtSet(f, "st", I(3)); rtIf(f, L("r"), "eq", I(2), "error"); rtIf(f, L("r"), "eq", I(3), "error");
+        rtSet(f, "st", I(4)); rtIf(f, L("r"), "eq", I(5), "error");
+        rtSet(f, "st", I(1)); rtIf(f, L("r"), "eq", I(123), "error"); rtIf(f, L("r"), "eq", I(161), "error");
+        rtSet(f, "st", I(5)); rtJump(f, "error");
+        rtLabel(f, "okfree");
+        rtCall1(f, "", "__tx_native_mem_free", L("w"));
+    }
+    rtLabel(f, "ok");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(4), I(0)); rtRetVoid(f);
+    rtLabel(f, "error");
+    rtLoad(f, "t", L("s"), 8, 4);
+    rtCall4(f, "q", "__tx_store_file_err", L("st"), L("t"), L("fn"), L("pc"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(5), L("q")); rtRetVoid(f);
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "removeFile 的实参不是 string");
+    rtRetVoid(f); check(f);
+}
+
+// runProcess(exe, args: List<string>, stderrPath): int | Error — starts exe with
+// args (exe itself is argv[0]), inherits stdin/stdout, sends stderr to a new file
+// when stderrPath is not empty, waits, and returns the exit code. Linux and macOS: a
+// signal-terminated child yields -signal. A missing or non-executable program is
+// an Error "{status}: {exe}".
+function emitRunProcess(b: Ref<StructuredBuffer>): void {
+    const common = "s0 t0 s1 t1 s2 t2 ep en lo base cnt i e o p n x st q r t";
+    const ut = nrtTarget();
+    if (tUnix(ut)) {
+        // macOS 另需 file actions 与属性对象（fa、pa）与 posix_spawn 的 6 个实参；Linux 子进程关描述符的退路要 rlimit 两格。
+        let extra = " rl0 rl1";
+        let maxArgs = 5;
+        if (tMacos(ut)) { extra = " fa pa"; maxArgs = 6; }
+        const f = rtBegin(b, "__tx_bi_run_process", "win fn pc a nargs", common + " ce av fd pid status code ev eb" + extra, maxArgs, "bootstrap/selfhost/nrt_proc.tx");
+        unixRunProcess(b, f, ut);
+        rtRetVoid(f); check(f);
+        return;
+    }
+    const f = rtBegin(b, "__tx_bi_run_process", "win fn pc a nargs", common + " cap buf d w cw hin hout herr hf code d0 d1 d2 nh attr asz inh cfl" + locals("hl", 3) + locals("si", 14) + locals("pi", 3), 10, "bootstrap/selfhost/nrt_proc.tx");
+    // 出错路径（lasterr）统一收尾：复制出的句柄与属性表先置空。
+    rtSet(f, "d0", I(0)); rtSet(f, "d1", I(0)); rtSet(f, "d2", I(0)); rtSet(f, "attr", I(0)); rtSet(f, "hf", I(0));
+    argHead(f, b);
+    // Command line = quoted exe and args separated by spaces (UTF-8, then UTF-16).
+    rtOp(f, "cap", L("en"), "add", L("en")); rtOp(f, "cap", L("cap"), "add", I(4));
+    rtSet(f, "i", I(0));
+    rtLabel(f, "size");
+    rtIf(f, L("i"), "ge", L("cnt"), "sized");
+    elemSpan(f);
+    rtOp(f, "cap", L("cap"), "add", L("n")); rtOp(f, "cap", L("cap"), "add", L("n")); rtOp(f, "cap", L("cap"), "add", I(4));
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "size");
+    rtLabel(f, "sized");
+    rtCall2(f, "buf", "__tx_native_mem_alloc", L("cap"), I(1));
+    rtIf(f, L("buf"), "eq", I(0), "oom");
+    rtCall3(f, "d", "__tx_nrt_quote", L("buf"), L("ep"), L("en"));
+    rtSet(f, "i", I(0));
+    rtLabel(f, "build");
+    rtIf(f, L("i"), "ge", L("cnt"), "built");
+    elemSpan(f);
+    rtStore(f, L("d"), 0, I(32), 1); rtOp(f, "d", L("d"), "add", I(1));
+    rtCall3(f, "d", "__tx_nrt_quote", L("d"), L("p"), L("n"));
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "build");
+    rtLabel(f, "built");
+    rtOp(f, "n", L("d"), "sub", L("buf"));
+    rtCall2(f, "cw", "__tx_file_wpath", L("buf"), L("n"));
+    rtCall1(f, "", "__tx_native_mem_free", L("buf"));
+    rtIf(f, L("cw"), "eq", I(0), "oom");
+    rtCall2(f, "w", "__tx_file_wpath", L("ep"), L("en"));
+    rtIf(f, L("w"), "eq", I(0), "oom");
+    // 子进程只拿到标准三件（D3 v0.40）：本进程的标准句柄与 stderr 重定向文件各经 DuplicateHandle 复制成可继承的副本，
+    // 经 PROC_THREAD_ATTRIBUTE_HANDLE_LIST 只交这几个（同 Go 的 syscall.StartProcess）。父进程句柄的继承标志不动，
+    // 本进程其余可继承的句柄（ws2_32 缺省可继承的套接字、外部函数建的句柄、别的线程同时 runProcess 的 stderr 文件）
+    // 不进子进程。
+    rtCall1(f, "hin", "GetStdHandle", I(-10));
+    rtCall1(f, "hout", "GetStdHandle", I(-11));
+    rtCall1(f, "herr", "GetStdHandle", I(-12));
+    strSpan(f, "s2", "p", "n");
+    rtIf(f, L("n"), "eq", I(0), "spawn");
+    rtCall2(f, "x", "__tx_file_wpath", L("p"), L("n"));
+    rtIf(f, L("x"), "eq", I(0), "oom");
+    // stderr 文件建成不可继承（SECURITY_ATTRIBUTES 为空），随后同标准句柄复制一份可继承的交给子进程。
+    const cf = ops(L("x"), I(1073741824), I(3), I(0));
+    listPush(cf, I(2)); listPush(cf, I(128)); listPush(cf, I(0));
+    rtCallList(f, "hf", "CreateFileW", cf);
+    rtCall1(f, "", "__tx_native_mem_free", L("x"));
+    rtIf(f, L("hf"), "ne", I(-1), "redirected");
+    rtSet(f, "hf", I(0));
+    rtJump(f, "lasterr");
+    rtLabel(f, "redirected");
+    rtSet(f, "herr", L("hf"));
+    rtLabel(f, "spawn");
+    // 有效的（非 0、非 −1）才复制，副本依次进句柄表 hl0..（nh 个，各不相同，满足句柄表不许重复）；无效的以 0 交给子进程。
+    rtSet(f, "nh", I(0));
+    dupStd(f, "hin", "d0");
+    dupStd(f, "hout", "d1");
+    dupStd(f, "herr", "d2");
+    // STARTUPINFOEXW（112 字节）：cb、dwFlags@60＝STARTF_USESTDHANDLES、标准句柄@80/88/96、属性表@104。句柄表为空时
+    // 不带属性表、不继承（bInheritHandles 为假，同 Go）。
+    let k = 0;
+    while (k < 14) { rtSet(f, "si" + toStr(k), I(0)); k = k + 1; }
+    rtSet(f, "pi0", I(0)); rtSet(f, "pi1", I(0)); rtSet(f, "pi2", I(0));
+    rtAddrOf(f, "q", "si0");
+    rtStore(f, L("q"), 0, I(104), 4); rtStore(f, L("q"), 60, I(256), 4);
+    rtStore(f, L("q"), 80, L("d0"), 8); rtStore(f, L("q"), 88, L("d1"), 8); rtStore(f, L("q"), 96, L("d2"), 8);
+    rtSet(f, "inh", I(0)); rtSet(f, "cfl", I(0));
+    rtIf(f, L("nh"), "eq", I(0), "create");
+    rtSet(f, "asz", I(0));
+    rtAddrOf(f, "x", "asz");
+    rtCall4(f, "", "InitializeProcThreadAttributeList", I(0), I(1), I(0), L("x"));
+    rtIf(f, L("asz"), "eq", I(0), "lasterr");
+    rtCall2(f, "attr", "__tx_native_mem_alloc", L("asz"), I(16));
+    rtIf(f, L("attr"), "eq", I(0), "oom");
+    rtCall4(f, "r", "InitializeProcThreadAttributeList", L("attr"), I(1), I(0), L("x"));
+    rtIf32(f, L("r"), "ne", I(0), "attrok");
+    // 初始化失败的属性表不得 Delete：先释放、置空再报错。
+    rtCall1(f, "", "__tx_native_mem_free", L("attr"));
+    rtSet(f, "attr", I(0));
+    rtJump(f, "lasterr");
+    rtLabel(f, "attrok");
+    rtShift(f, "e", L("nh"), "shl", 3);
+    rtAddrOf(f, "x", "hl0");
+    const up = ops(L("attr"), I(0), I(131074), L("x"));
+    listPush(up, L("e")); listPush(up, I(0)); listPush(up, I(0));
+    rtCallList(f, "r", "UpdateProcThreadAttribute", up);
+    rtIf32(f, L("r"), "eq", I(0), "lasterr");
+    rtStore(f, L("q"), 0, I(112), 4); rtStore(f, L("q"), 104, L("attr"), 8);
+    // EXTENDED_STARTUPINFO_PRESENT。
+    rtSet(f, "inh", I(1)); rtSet(f, "cfl", I(524288));
+    rtLabel(f, "create");
+    rtAddrOf(f, "x", "pi0");
+    const cp = ops(L("w"), L("cw"), I(0), I(0));
+    listPush(cp, L("inh")); listPush(cp, L("cfl")); listPush(cp, I(0)); listPush(cp, I(0)); listPush(cp, L("q")); listPush(cp, L("x"));
+    rtCallList(f, "r", "CreateProcessW", cp);
+    rtIf32(f, L("r"), "eq", I(0), "lasterr");
+    // 子进程已有自己的一份：副本与属性表随即归还。
+    releaseSpawnHandles(f, "ok");
+    rtCall2(f, "", "WaitForSingleObject", L("pi0"), I(4294967295));
+    rtSet(f, "code", I(0));
+    rtAddrOf(f, "q", "code");
+    rtCall2(f, "", "GetExitCodeProcess", L("pi0"), L("q"));
+    rtCall1(f, "", "CloseHandle", L("pi0"));
+    rtCall1(f, "", "CloseHandle", L("pi1"));
+    rtIf(f, L("hf"), "eq", I(0), "done");
+    rtCall1(f, "", "CloseHandle", L("hf"));
+    rtLabel(f, "done");
+    rtCall1(f, "", "__tx_native_mem_free", L("w"));
+    rtCall1(f, "", "__tx_native_mem_free", L("cw"));
+    rtOp(f, "code", L("code"), "and", I(4294967295));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(1), L("code")); rtRetVoid(f);
+    rtLabel(f, "lasterr");
+    rtCall0(f, "r", "GetLastError");
+    rtOp(f, "r", L("r"), "and", I(4294967295));
+    releaseSpawnHandles(f, "err");
+    rtIf(f, L("hf"), "eq", I(0), "mapped");
+    rtCall1(f, "", "CloseHandle", L("hf"));
+    rtLabel(f, "mapped");
+    rtCall1(f, "", "__tx_native_mem_free", L("w"));
+    rtCall1(f, "", "__tx_native_mem_free", L("cw"));
+    rtSet(f, "st", I(3)); rtIf(f, L("r"), "eq", I(2), "error"); rtIf(f, L("r"), "eq", I(3), "error");
+    rtSet(f, "st", I(4)); rtIf(f, L("r"), "eq", I(5), "error");
+    rtSet(f, "st", I(1)); rtIf(f, L("r"), "eq", I(123), "error"); rtIf(f, L("r"), "eq", I(193), "error");
+    rtSet(f, "st", I(5));
+    argTail(f, b);
+    rtRetVoid(f); check(f);
+}
+
+// runProcess（Windows）：有效的标准句柄 h 经 DuplicateHandle 复制成可继承的副本写进 d，并接到句柄表 hl0.. 第 nh 项；
+// 无效的（0 或 −1）d 为 0。复制失败经 lasterr 报错（同 Go）。用 e、x、r。
+function dupStd(f: Ref<RtFn>, h: string, d: string): void {
+    const skip = "dup_" + d;
+    rtIf(f, L(h), "eq", I(0), skip);
+    rtIf(f, L(h), "eq", I(-1), skip);
+    rtAddrOf(f, "x", d);
+    // DuplicateHandle(当前进程, h, 当前进程, &d, 0, bInheritHandle=TRUE, DUPLICATE_SAME_ACCESS)；当前进程的伪句柄为 −1。
+    const dh = ops(I(-1), L(h), I(-1), L("x"));
+    listPush(dh, I(0)); listPush(dh, I(1)); listPush(dh, I(2));
+    rtCallList(f, "r", "DuplicateHandle", dh);
+    rtIf32(f, L("r"), "eq", I(0), "lasterr");
+    rtShift(f, "e", L("nh"), "shl", 3);
+    rtAddrOf(f, "x", "hl0");
+    rtOp(f, "x", L("x"), "add", L("e"));
+    rtStore(f, L("x"), 0, L(d), 8);
+    rtOp(f, "nh", L("nh"), "add", I(1));
+    rtLabel(f, skip);
+}
+
+// runProcess（Windows）：归还复制出的句柄与属性表并置空（成功起进程之后与出错路径各发一份，tag 区分标号）。
+function releaseSpawnHandles(f: Ref<RtFn>, tag: string): void {
+    const ds = strSplit("d0 d1 d2", " ");
+    let i = 0;
+    while (i < listLen(ds)) {
+        const d = listGet(ds, i) catch "d0";
+        const next = "rel_" + tag + "_" + d;
+        rtIf(f, L(d), "eq", I(0), next);
+        rtCall1(f, "", "CloseHandle", L(d));
+        rtSet(f, d, I(0));
+        rtLabel(f, next);
+        i = i + 1;
+    }
+    const done = "rel_" + tag + "_attr";
+    rtIf(f, L("attr"), "eq", I(0), done);
+    rtCall1(f, "", "DeleteProcThreadAttributeList", L("attr"));
+    rtCall1(f, "", "__tx_native_mem_free", L("attr"));
+    rtSet(f, "attr", I(0));
+    rtLabel(f, done);
+}
+
+// Argument checks shared by both targets: exe span (ep, en), the list (base, cnt).
+function argHead(f: Ref<RtFn>, b: Ref<StructuredBuffer>): void {
+    arity(b, f, 3);
+    argTag(f, 0, "s0", "t0", 6, "t0bad");
+    argTag(f, 1, "s1", "t1", 15, "t1bad");
+    argTag(f, 2, "s2", "t2", 6, "t2bad");
+    strSpan(f, "s0", "ep", "en");
+    rtSet(f, "st", I(1));
+    rtIf(f, L("en"), "eq", I(0), "error");
+    // 程序路径、参数与 stderr 路径里的 NUL 会在系统调用处截断成别的串：按无效实参拒绝（同 Go 的 EINVAL）。
+    rtCall2(f, "r", "__tx_rt_nul_free", L("ep"), L("en"));
+    rtIf(f, L("r"), "eq", I(0), "error");
+    strSpan(f, "s2", "p", "n");
+    rtCall2(f, "r", "__tx_rt_nul_free", L("p"), L("n"));
+    rtIf(f, L("r"), "eq", I(0), "error");
+    rtLoad(f, "lo", L("s1"), 8, 4);
+    rtCall1(f, "lo", "__tx_native_object_address_v1", L("lo"));
+    rtLoad(f, "base", L("lo"), 32, 8); rtLoad(f, "cnt", L("lo"), 40, 8);
+    // Every element must be a string (generic 16-byte slots: tag@0, handle@8).
+    rtSet(f, "i", I(0));
+    rtLabel(f, "elems");
+    rtIf(f, L("i"), "ge", L("cnt"), "elemsok");
+    rtShift(f, "e", L("i"), "shl", 4); rtOp(f, "e", L("e"), "add", L("base"));
+    rtLoad(f, "x", L("e"), 0, 1);
+    rtIf(f, L("x"), "ne", I(6), "elembad");
+    elemSpan(f);
+    rtCall2(f, "r", "__tx_rt_nul_free", L("p"), L("n"));
+    rtIf(f, L("r"), "eq", I(0), "error");
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "elems");
+    rtLabel(f, "elemsok");
+}
+
+// (p, n) of element i of the checked list.
+function elemSpan(f: Ref<RtFn>): void {
+    rtShift(f, "e", L("i"), "shl", 4); rtOp(f, "e", L("e"), "add", L("base"));
+    rtLoad(f, "o", L("e"), 8, 4);
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("o"));
+    rtLoad(f, "p", L("o"), 32, 8); rtLoad(f, "n", L("o"), 40, 8);
+}
+
+function argTail(f: Ref<RtFn>, b: Ref<StructuredBuffer>): void {
+    rtLabel(f, "error");
+    rtLoad(f, "t", L("s0"), 8, 4);
+    rtCall4(f, "q", "__tx_store_file_err", L("st"), L("t"), L("fn"), L("pc"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(5), L("q")); rtRetVoid(f);
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "t0bad", 4010, "runProcess 第一实参（程序路径）不是 string");
+    trapAt(b, f, "t1bad", 4010, "runProcess 第二实参（参数）不是 List");
+    trapAt(b, f, "elembad", 4010, "runProcess 第二实参的元素不是 string");
+    trapAt(b, f, "t2bad", 4010, "runProcess 第三实参（stderr 路径）不是 string");
+}
+
+// Linux 与 macOS 共用：系统调用经 uxSys，起进程处分开（Linux vfork＋execve，macOS posix_spawn；M2 设计 E8）。
+function unixRunProcess(b: Ref<StructuredBuffer>, f: Ref<RtFn>, ut: int): void {
+    argHead(f, b);
+    rtCall2(f, "ce", "__tx_nrt_cpath", L("ep"), L("en"));
+    rtIf(f, L("ce"), "eq", I(0), "oom");
+    // access(exe, X_OK): report a missing/non-executable program as an Error.
+    const ac: List<Ref<RtOp>> = listNew(); listPush(ac, L("ce")); listPush(ac, I(1));
+    uxSys(f, ut, "r", 21, ac);
+    rtIf(f, L("r"), "eq", I(0), "exec");
+    rtCall1(f, "", "__tx_native_mem_free", L("ce"));
+    rtSet(f, "st", I(3)); rtIf(f, L("r"), "eq", I(-2), "error"); rtIf(f, L("r"), "eq", I(-20), "error");
+    rtSet(f, "st", I(4)); rtIf(f, L("r"), "eq", I(-13), "error");
+    rtSet(f, "st", I(5)); rtJump(f, "error");
+    rtLabel(f, "exec");
+    // argv = [exe, args..., NULL] as NUL-terminated copies.
+    rtOp(f, "x", L("cnt"), "add", I(2)); rtShift(f, "x", L("x"), "shl", 3);
+    rtCall2(f, "av", "__tx_native_mem_alloc", L("x"), I(8));
+    rtIf(f, L("av"), "eq", I(0), "oom");
+    rtStore(f, L("av"), 0, L("ce"), 8);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "argv");
+    rtIf(f, L("i"), "ge", L("cnt"), "argvdone");
+    elemSpan(f);
+    rtCall2(f, "x", "__tx_nrt_cpath", L("p"), L("n"));
+    rtIf(f, L("x"), "eq", I(0), "oom");
+    rtOp(f, "e", L("i"), "add", I(1)); rtShift(f, "e", L("e"), "shl", 3); rtOp(f, "e", L("e"), "add", L("av"));
+    rtStore(f, L("e"), 0, L("x"), 8);
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "argv");
+    rtLabel(f, "argvdone");
+    rtOp(f, "e", L("cnt"), "add", I(1)); rtShift(f, "e", L("e"), "shl", 3); rtOp(f, "e", L("e"), "add", L("av"));
+    rtStore(f, L("e"), 0, I(0), 8);
+    rtSet(f, "eb", I(0));
+    // stderr file: openat(AT_FDCWD, path, O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0644).
+    rtSet(f, "fd", I(-1));
+    strSpan(f, "s2", "p", "n");
+    rtIf(f, L("n"), "eq", I(0), "fork");
+    rtCall2(f, "x", "__tx_nrt_cpath", L("p"), L("n"));
+    rtIf(f, L("x"), "eq", I(0), "oom");
+    const op: List<Ref<RtOp>> = listNew(); listPush(op, I(uxAtFdcwd(ut))); listPush(op, L("x")); listPush(op, I(uxOpenFlags(ut, 524865))); listPush(op, I(420));
+    uxSys(f, ut, "fd", 257, op);
+    rtCall1(f, "", "__tx_native_mem_free", L("x"));
+    rtIf(f, L("fd"), "ge", I(0), "opened");
+    rtSet(f, "st", I(3)); rtIf(f, L("fd"), "eq", I(-2), "freeerr"); rtIf(f, L("fd"), "eq", I(-20), "freeerr");
+    rtSet(f, "st", I(4)); rtIf(f, L("fd"), "eq", I(-13), "freeerr");
+    rtSet(f, "st", I(5)); rtJump(f, "freeerr");
+    // 文件落在 0／1／2 号（父进程关了标准描述符）时挪到 3 以上（D3 v0.40）：落在 2 号时 dup2(2, 2) 什么也不做、CLOEXEC 不清，
+    // exec 时子进程的 stderr 随之关掉；落在 0、1 号会被当成子进程的标准输入输出交出去。子进程的 0、1 须与父进程的实际状态一致
+    // （同 procSpawn 的 __tx_tool_lift、Python 的 _posixsubprocess）。挪不动（EMFILE 等）按启动失败报。
+    rtLabel(f, "opened");
+    rtIf(f, L("fd"), "ge", I(3), "fork");
+    uxSys(f, ut, "x", 72, three(L("fd"), I(uxConst(ut, "F_DUPFD_CLOEXEC")), I(3)));
+    uxSys(f, ut, "", 3, one(L("fd")));
+    rtSet(f, "fd", L("x"));
+    rtSet(f, "st", I(5));
+    rtIf(f, L("fd"), "lt", I(0), "freeerr");
+    rtLabel(f, "fork");
+    // 子进程环境取进程级环境表的当前内容（含 std/os 的 setenv；D3 v0.39，同 Windows 继承当前环境块）。在 vfork／
+    // posix_spawn 之前取好，子进程里不再调用。
+    rtCall0(f, "eb", "__tx_rt_env_block");
+    rtSet(f, "ev", L("eb"));
+    if (tMacos(ut)) {
+        // posix_spawn(&pid, exe, fa, pa, argv, envp)。子进程只拿到标准三件（D3 v0.40）：属性设 POSIX_SPAWN_CLOEXEC_DEFAULT
+        // （未经 file actions 列明的描述符在 exec 时一律关闭，不论是否带 CLOEXEC；procSpawn 已如此），0、1（stderr 不重定向
+        // 时含 2）经 addinherit_np 留下——先 fcntl(F_GETFD) 核对存在：对不存在的描述符 addinherit 会让 posix_spawn 得 EBADF，
+        // 父进程关了标准输入时不能因此起不了进程。stderr 文件经 adddup2 接到 2 号。失败（如 ENOEXEC）在父进程同步返回，
+        // 报 Error 状态 5（同 Windows）。
+        rtAddrOf(f, "x", "fa");
+        uxMac(f, "r", "posix_spawn_file_actions_init", one(L("x")));
+        rtIf(f, L("r"), "ne", I(0), "closefd");
+        rtAddrOf(f, "q", "pa");
+        uxMac(f, "r", "posix_spawnattr_init", one(L("q")));
+        rtIf(f, L("r"), "ne", I(0), "destroyfa");
+        uxMac(f, "r", "posix_spawnattr_setflags", two(L("q"), I(16384)));
+        rtIf(f, L("r"), "ne", I(0), "destroy");
+        inheritStd(f, 0);
+        inheritStd(f, 1);
+        rtIf(f, L("fd"), "ge", I(0), "redirect");
+        inheritStd(f, 2);
+        rtJump(f, "spawn");
+        rtLabel(f, "redirect");
+        uxMac(f, "r", "posix_spawn_file_actions_adddup2", three(L("x"), L("fd"), I(2)));
+        rtIf(f, L("r"), "ne", I(0), "destroy");
+        rtLabel(f, "spawn");
+        rtSet(f, "pid", I(0));
+        rtAddrOf(f, "e", "pid");
+        const sp: List<Ref<RtOp>> = listNew(); listPush(sp, L("e")); listPush(sp, L("ce")); listPush(sp, L("x")); listPush(sp, L("q")); listPush(sp, L("av")); listPush(sp, L("ev"));
+        rtCall0(f, "", "__tx_nrt_fork_lock");
+        uxMac(f, "r", "posix_spawn", sp);
+        rtCall0(f, "", "__tx_nrt_fork_unlock");
+        rtLabel(f, "destroy");
+        uxMac(f, "", "posix_spawnattr_destroy", one(L("q")));
+        rtLabel(f, "destroyfa");
+        uxMac(f, "", "posix_spawn_file_actions_destroy", one(L("x")));
+        rtLabel(f, "closefd");
+        rtIf(f, L("fd"), "lt", I(0), "macspawned");
+        uxSys(f, ut, "", 3, one(L("fd")));
+        rtLabel(f, "macspawned");
+        rtSet(f, "st", I(5));
+        rtIf(f, L("r"), "ne", I(0), "freeerr");
+    } else {
+        // vfork: the child shares this frame and stack until execve, so after the
+        // vfork result it only reads locals and issues raw syscalls (no calls); the
+        // parent resumes afterwards and overwrites pid with the child's id.
+        const none: List<Ref<RtOp>> = listNew();
+        rtSyscall(f, "pid", 58, none);
+        rtIf(f, L("pid"), "ne", I(0), "parent");
+        rtIf(f, L("fd"), "lt", I(0), "child");
+        const dp: List<Ref<RtOp>> = listNew(); listPush(dp, L("fd")); listPush(dp, I(2));
+        rtSyscall(f, "", 33, dp);
+        rtLabel(f, "child");
+        // 子进程只拿到标准三件（D3 v0.40）：3 以上的描述符一律关掉，不论是否带 CLOEXEC（含经外部函数打开的）。
+        linuxCloseRange(f, I(3), I(4294967295), "cf");
+        const ex: List<Ref<RtOp>> = listNew(); listPush(ex, L("ce")); listPush(ex, L("av")); listPush(ex, L("ev"));
+        rtSyscall(f, "", 59, ex);
+        const eg: List<Ref<RtOp>> = listNew(); listPush(eg, I(127));
+        rtSyscall(f, "", 231, eg);
+        rtLabel(f, "parent");
+        rtIf(f, L("fd"), "lt", I(0), "spawned");
+        const cl: List<Ref<RtOp>> = listNew(); listPush(cl, L("fd"));
+        rtSyscall(f, "", 3, cl);
+        rtLabel(f, "spawned");
+        rtSet(f, "st", I(5));
+        rtIf(f, L("pid"), "lt", I(0), "freeerr");
+    }
+    rtLabel(f, "wait");
+    rtSet(f, "status", I(0));
+    rtAddrOf(f, "x", "status");
+    const wt: List<Ref<RtOp>> = listNew(); listPush(wt, L("pid")); listPush(wt, L("x")); listPush(wt, I(0)); listPush(wt, I(0));
+    uxSys(f, ut, "r", 61, wt);
+    rtIf(f, L("r"), "eq", I(-4), "wait");
+    rtLoad(f, "status", L("x"), 0, 4);
+    rtOp(f, "x", L("status"), "and", I(127));
+    rtIf(f, L("x"), "eq", I(0), "exited");
+    rtSet(f, "code", I(0)); rtOp(f, "code", L("code"), "sub", L("x"));
+    rtJump(f, "reap");
+    rtLabel(f, "exited");
+    rtShift(f, "code", L("status"), "shr", 8); rtOp(f, "code", L("code"), "and", I(255));
+    rtLabel(f, "reap");
+    freeArgv(f, "fa");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(1), L("code")); rtRetVoid(f);
+    rtLabel(f, "freeerr");
+    freeArgv(f, "fb");
+    argTail(f, b);
+}
+
+// runProcess（macOS）：标准描述符 n 存在（fcntl(n, F_GETFD) 成功）时经 addinherit_np 列进 file actions（x）；结果进 r，
+// 失败到 destroy。用 t。
+function inheritStd(f: Ref<RtFn>, n: int): void {
+    const skip = "inh_" + toStr(n);
+    uxMac(f, "t", "fcntl", three(I(n), I(1), I(0)));
+    rtIf(f, L("t"), "lt", I(0), skip);
+    uxMac(f, "r", "posix_spawn_file_actions_addinherit_np", two(L("x"), I(n)));
+    rtIf(f, L("r"), "ne", I(0), "destroy");
+    rtLabel(f, skip);
+}
+
+// Linux 子进程（vfork 之后、execve 之前，只发系统调用）：关掉 [lo, hi] 里的全部描述符（hi 取 4294967295 即到底；lo > hi 时
+// 什么也不做）。close_range(lo, hi, 0)（Linux 5.9）；失败（ENOSYS 等）时逐个关到 hi 与 RLIMIT_NOFILE 软上限中较小者（软上限
+// 无限、取不到或超过 2^20 时取 2^20，同 Python 的退路）。用 i、rl0、rl1（父进程恢复后不读）；lo、hi 在其间不得改动。
+export function linuxCloseRange(f: Ref<RtFn>, lo: Ref<RtOp>, hi: Ref<RtOp>, tag: string): void {
+    rtSet(f, "rl1", hi);
+    rtIf(f, L("rl1"), "lt", lo, tag + "_done");
+    const cr: List<Ref<RtOp>> = listNew(); listPush(cr, lo); listPush(cr, hi); listPush(cr, I(0));
+    rtSyscall(f, "i", 436, cr);
+    rtIf(f, L("i"), "eq", I(0), tag + "_done");
+    rtSet(f, "rl0", I(0)); rtSet(f, "rl1", I(0));
+    rtAddrOf(f, "i", "rl0");
+    // getrlimit(RLIMIT_NOFILE＝7, &rl)：rl0 为软上限。
+    const gr: List<Ref<RtOp>> = listNew(); listPush(gr, I(7)); listPush(gr, L("i"));
+    rtSyscall(f, "", 97, gr);
+    rtIf(f, L("rl0"), "le", I(0), tag + "_cap");
+    rtIf(f, L("rl0"), "le", I(1048576), tag + "_capped");
+    rtLabel(f, tag + "_cap");
+    rtSet(f, "rl0", I(1048576));
+    rtLabel(f, tag + "_capped");
+    rtSet(f, "i", lo);
+    rtLabel(f, tag + "_loop");
+    rtIf(f, L("i"), "gt", hi, tag + "_done");
+    rtIf(f, L("i"), "ge", L("rl0"), tag + "_done");
+    const cl: List<Ref<RtOp>> = listNew(); listPush(cl, L("i"));
+    rtSyscall(f, "", 3, cl);
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, tag + "_loop");
+    rtLabel(f, tag + "_done");
+}
+
+// Free argv[0..cnt] (exe and args), the array and the child's environment block; tag keeps the labels unique.
+function freeArgv(f: Ref<RtFn>, tag: string): void {
+    rtIf(f, L("eb"), "eq", I(0), tag + "noenv");
+    rtCall1(f, "", "__tx_native_mem_free", L("eb"));
+    rtSet(f, "eb", I(0));
+    rtLabel(f, tag + "noenv");
+    rtSet(f, "i", I(0));
+    const top = tag + "loop";
+    rtLabel(f, top);
+    rtIf(f, L("i"), "gt", L("cnt"), top + "end");
+    rtShift(f, "e", L("i"), "shl", 3); rtOp(f, "e", L("e"), "add", L("av"));
+    rtLoad(f, "x", L("e"), 0, 8);
+    rtCall1(f, "", "__tx_native_mem_free", L("x"));
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, top);
+    rtLabel(f, top + "end");
+    rtCall1(f, "", "__tx_native_mem_free", L("av"));
+}
+
+export function emitNrtProc(b: Ref<StructuredBuffer>): void {
+    emitHelpers(b);
+    emitSimple(b);
+    emitRunProcess(b);
+    if (tMacos(nrtTarget())) { emitForkLock(b); }
+}
+
+// macOS 的 fork 锁（M3 设计 G3）：没有 pipe2，工具链例程建管道是先 pipe、再逐端置 FD_CLOEXEC；这段窗口里别的线程起子进程，
+// 子进程会继承还没置 CLOEXEC 的管道端（对端因此收不到 EOF）。建管道（不带 CLOEXEC 的描述符）与起子进程（runProcess 的
+// posix_spawn、受限子进程的 fork）共用这一把锁，同 Go 的 syscall.ForkLock。锁字 __tx_nrt_fork_flag 在内核 bss；拿不到时让出处理器。
+function emitForkLock(b: Ref<StructuredBuffer>): void {
+    let f = rtBegin(b, "__tx_nrt_fork_lock", "", "r", 3, "bootstrap/selfhost/nrt_proc.tx");
+    rtLabel(f, "try");
+    rtCall3(f, "r", "__tx_atomic_cas", A("__tx_nrt_fork_flag"), I(0), I(1));
+    rtIf(f, L("r"), "ne", I(0), "got");
+    const none: List<Ref<RtOp>> = listNew();
+    uxMac(f, "", "sched_yield", none);
+    rtJump(f, "try");
+    rtLabel(f, "got");
+    rtRetVoid(f); check(f);
+    f = rtBegin(b, "__tx_nrt_fork_unlock", "", "", 0, "bootstrap/selfhost/nrt_proc.tx");
+    rtStoreRel(f, A("__tx_nrt_fork_flag"), 0, I(0));
+    rtRetVoid(f); check(f);
+}

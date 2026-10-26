@@ -1,0 +1,594 @@
+// 构建驱动的通用部分（docs/design/v052-build-driver-v0.1-20261025.md）：路径、文件、子进程、运行目录与 tar；scripts/build.tx 与
+// scripts/build_selftest.tx 共用。删目录、改名、写出 Bytes 走按目标拆分的 build_os_{windows,linux,macos}.tx。
+import { sha256Hex } from "../bootstrap/selfhost/sha256";
+import { JSON_NULL, JSON_INT, JSON_NUM, jsonNew, jsonParseStr, jsonGet } from "../bootstrap/selfhost/json_parse";
+import { osRemoveDir, osRename, osWriteFile } from "./build_os";
+
+export const RUN_MARK: string = ".taixu-run";
+export const DONE_MARK: string = ".taixu-run-done";
+export const STALE_MS: int = 86400000;
+// 每步至多一小时（同 nrt-bootstrap.py）。
+export const STEP_NS: int = 3600000000000;
+export const READ_MAX: int = 1073741824;
+
+// 一次子进程运行的结果：退出码（超时为 −1）、stdout（keep 时完整，否则只留末尾）与 stdout、stderr 合在一起的末尾。
+export struct Ran {
+    code: int,
+    out: Bytes,
+    tail: Bytes,
+    timedOut: bool,
+}
+
+export function onWindows(): bool {
+    return hostTarget() == "windows";
+}
+
+export function exeName(stem: string): string {
+    if (onWindows()) {
+        return stem + ".exe";
+    }
+    return stem;
+}
+
+export function isSep(c: int): bool {
+    return c == 47 || c == 92;
+}
+
+export function isAbs(p: string): bool {
+    const c0 = byteAt(p, 0) ?? 0;
+    if (onWindows()) {
+        return (byteAt(p, 1) ?? 0) == 58 || (isSep(c0) && isSep(byteAt(p, 1) ?? 0));
+    }
+    return c0 == 47;
+}
+
+export function join(a: string, b: string): string {
+    if (len(a) == 0) {
+        return b;
+    }
+    if (isSep(byteAt(a, len(a) - 1) ?? 0)) {
+        return a + b;
+    }
+    return a + "/" + b;
+}
+
+// 最后一个分隔符的字节位置，没有为 −1。
+export function lastSep(p: string): int {
+    let i: int = len(p) - 1;
+    while (i >= 0) {
+        if (isSep(byteAt(p, i) ?? 0)) {
+            return i;
+        }
+        i = i - 1;
+    }
+    return -1;
+}
+
+export function byteSub(s: string, from: int, n: int): string {
+    const b = bytesFromStr(s);
+    return bytesToStr(bytesSlice(b, from, n)) catch "";
+}
+
+export function dirOf(p: string): string {
+    const i = lastSep(p);
+    if (i <= 0) {
+        return p;
+    }
+    return byteSub(p, 0, i);
+}
+
+export function baseOf(p: string): string {
+    const i = lastSep(p);
+    return byteSub(p, i + 1, len(p) - i - 1);
+}
+
+// 本机原生分隔符（Windows 的 local* 内建按反斜杠逐组件持有句柄）。
+export function nat(p: string): string {
+    if (!onWindows()) {
+        return p;
+    }
+    const b = bytesFromStr(p);
+    let i: int = 0;
+    while (i < bytesLen(b)) {
+        if ((bytesGet(b, i) ?? 0) == 47) {
+            bytesSet(b, i, 92);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(b) catch p;
+}
+
+export function absolute(p: string): string {
+    if (isAbs(p)) {
+        return p;
+    }
+    return join(currentDir() catch ".", p);
+}
+
+export function startsWith(s: string, prefix: string): bool {
+    return len(s) >= len(prefix) && byteSub(s, 0, len(prefix)) == prefix;
+}
+
+export function words(s: string): List<string> {
+    const out: List<string> = listNew();
+    for (w in strSplit(s, " ")) {
+        if (len(w) > 0) {
+            listPush(out, w);
+        }
+    }
+    return out;
+}
+
+export function kindOf(p: string): int {
+    return localEntryKind(nat(dirOf(p)), baseOf(p));
+}
+
+export function readBytes(p: string): Bytes | Error {
+    return readLocalFileBytes(nat(dirOf(p)), baseOf(p), READ_MAX);
+}
+
+export function shaOf(p: string): string {
+    const b = readBytes(p) catch (e) {
+        return "";
+    };
+    return sha256Hex(b);
+}
+
+export function mkdirs(p: string): bool {
+    if (kindOf(p) == 2) {
+        return true;
+    }
+    let ok: bool = true;
+    makeDir(p) catch (e) {
+        ok = false;
+    };
+    if (ok) {
+        return true;
+    }
+    const parent = dirOf(p);
+    if (parent == p || len(parent) == 0) {
+        return false;
+    }
+    if (!mkdirs(parent)) {
+        return false;
+    }
+    ok = true;
+    makeDir(p) catch (e) {
+        ok = false;
+    };
+    return ok;
+}
+
+export function copyFile(from: string, to: string, exec: bool): bool {
+    const b = readBytes(from) catch (e) {
+        return false;
+    };
+    return osWriteFile(to, b, exec);
+}
+
+// 删一棵目录树：不跟随链接（localEntryKind 对链接得 0，只删链接本身）。
+export function deleteTree(dir: string): bool {
+    const names = localListDir(nat(dir), "") catch (e) {
+        return false;
+    };
+    let ok: bool = true;
+    for (n in names) {
+        const p = join(dir, n);
+        const k = localEntryKind(nat(dir), n);
+        if (k == 2) {
+            if (!deleteTree(p)) {
+                ok = false;
+            }
+        } else {
+            let gone: bool = true;
+            removeFile(p) catch (e) {
+                gone = osRemoveDir(p);
+            };
+            if (!gone) {
+                ok = false;
+            }
+        }
+    }
+    if (!osRemoveDir(dir)) {
+        ok = false;
+    }
+    return ok;
+}
+
+// 先改名再删：删到一半失败时留下的是 .trash- 开头的目录，下次修剪再删（同 selfhost_validation.remove_tree）。
+export function removeTree(dir: string): bool {
+    const trash = join(dirOf(dir), ".trash-" + baseOf(dir));
+    if (!osRename(dir, trash)) {
+        return false;
+    }
+    return deleteTree(trash);
+}
+
+export function addTail(t: Bytes, chunk: Bytes): Bytes {
+    bytesAppend(t, chunk);
+    if (bytesLen(t) > 8192) {
+        return bytesSlice(t, bytesLen(t) - 4096, 4096);
+    }
+    return t;
+}
+
+export function quoteArg(a: string): string {
+    if (len(a) == 0 || strIndexOf(a, " ") >= 0) {
+        return "\"" + a + "\"";
+    }
+    return a;
+}
+
+// 在 cwd 里运行 exe，同时排空 stdout 与 stderr；keep 为真时留下完整的 stdout。
+export function runIn(exe: string, args: List<string>, cwd: string, keep: bool, echo: bool): Ref<Ran> | Error {
+    if (echo) {
+        let line = "+ " + quoteArg(exe);
+        for (a in args) {
+            line = line + " " + quoteArg(a);
+        }
+        print(line);
+    }
+    const h = procSpawn(exe, args, cwd, 0) catch (e) {
+        return err("起不了 " + exe + "：" + e.message);
+    };
+    const r = new Ran { code: 0, out: bytesNew(0), tail: bytesNew(0), timedOut: false };
+    const buf = bytesNew(65536);
+    const deadline = monoNs() + STEP_NS;
+    let outOpen: bool = true;
+    let errOpen: bool = true;
+    let ended: bool = false;
+    while (true) {
+        if (!ended) {
+            const w = procWait(h, 0);
+            if (w != None) {
+                r.code = w ?? -1;
+                ended = true;
+            }
+        }
+        if (!ended && monoNs() >= deadline) {
+            r.timedOut = true;
+            procKill(h);
+        }
+        if (ended && !outOpen && !errOpen) {
+            break;
+        }
+        let mask: int = 0;
+        if (outOpen) {
+            mask = mask | 2;
+        }
+        if (errOpen) {
+            mask = mask | 4;
+        }
+        if (mask == 0) {
+            const waited = procWait(h, 100);
+            continue;
+        }
+        const ready = ioWait(h, mask, 100);
+        if ((ready & 2) != 0) {
+            const n = procRead(h, 1, buf);
+            if (n < 0) {
+                outOpen = false;
+            } else if (n > 0) {
+                const chunk = bytesSlice(buf, 0, n);
+                if (keep) {
+                    bytesAppend(r.out, chunk);
+                }
+                r.tail = addTail(r.tail, chunk);
+            }
+        }
+        if ((ready & 4) != 0) {
+            const n = procRead(h, 2, buf);
+            if (n < 0) {
+                errOpen = false;
+            } else if (n > 0) {
+                r.tail = addTail(r.tail, bytesSlice(buf, 0, n));
+            }
+        }
+    }
+    procClose(h);
+    if (r.timedOut) {
+        r.code = -1;
+    }
+    return r;
+}
+
+// 运行一步，失败（含超时）时打印输出末尾并得 Error。
+export function step(exe: string, args: List<string>, cwd: string): void | Error {
+    const r = runIn(exe, args, cwd, false, true) catch (e) {
+        return e;
+    };
+    if (r.code != 0) {
+        stdoutWrite(r.tail);
+        print("");
+        if (r.timedOut) {
+            return err("超时：" + exe);
+        }
+        return err("退出码 " + toStr(r.code) + "：" + exe);
+    }
+    return nothing();
+}
+
+export function nothing(): void {
+}
+
+export function list1(a: string): List<string> {
+    const out: List<string> = listNew();
+    listPush(out, a);
+    return out;
+}
+
+export function plus(xs: List<string>, ys: List<string>): List<string> {
+    const out: List<string> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+    }
+    for (y in ys) {
+        listPush(out, y);
+    }
+    return out;
+}
+
+// 在 PATH 里找程序（Windows 依次试 .exe、.com）。
+export function findInPath(name: string): string {
+    const path = getEnv("PATH") ?? "";
+    let sep = ":";
+    if (onWindows()) {
+        sep = ";";
+    }
+    for (d in strSplit(path, sep)) {
+        if (len(d) == 0) {
+            continue;
+        }
+        const exts: List<string> = listNew();
+        if (onWindows()) {
+            listPush(exts, ".exe");
+            listPush(exts, ".com");
+        } else {
+            listPush(exts, "");
+        }
+        for (x in exts) {
+            const p = join(d, name + x);
+            const n = fileSize(p) catch -1;
+            if (n >= 0) {
+                return p;
+            }
+        }
+    }
+    return "";
+}
+
+export function markStarted(dir: string): int {
+    const text = readFile(join(dir, RUN_MARK)) catch "";
+    const v = jsonParseStr(text) catch (e) {
+        return -1;
+    };
+    // build.py 记的是秒（带小数），这里记同一格式；只取整数秒比较先后。
+    const s = jsonGet(v, "started") ?? jsonNew(JSON_NULL);
+    if (s.kind == JSON_INT) {
+        return s.i * 1000;
+    }
+    if (s.kind != JSON_NUM) {
+        return -1;
+    }
+    return parseDigits(listGet(strSplit(s.s, "."), 0) catch "") * 1000;
+}
+
+export function parseDigits(s: string): int {
+    let v: int = 0;
+    let i: int = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) ?? 0;
+        if (c < 48 || c > 57) {
+            return -1;
+        }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    if (len(s) == 0) {
+        return -1;
+    }
+    return v;
+}
+
+export function freshRunDir(base: string, prefix: string, keep: int): string | Error {
+    if (!mkdirs(base)) {
+        return err("建不了工作目录：" + base);
+    }
+    const before = localListDir(nat(base), "") catch (e) {
+        return err("列不出工作目录：" + base);
+    };
+    for (n in before) {
+        if (startsWith(n, ".trash-" + prefix)) {
+            deleteTree(join(base, n));
+        }
+    }
+    let name = prefix + toStr(nowMs());
+    let k: int = 0;
+    while (kindOf(join(base, name)) != 0) {
+        k = k + 1;
+        name = prefix + toStr(nowMs()) + "-" + toStr(k);
+    }
+    const current = join(base, name);
+    makeDir(current) catch (e) {
+        return err("建不了运行目录：" + current);
+    };
+    const now = nowMs();
+    writeFile(join(current, RUN_MARK), "{\"pid\": 0, \"started\": " + toStr(now / 1000) + "." + pad3(now % 1000) + "}\n") catch (e) {
+        return err("写不了运行标记：" + current);
+    };
+    if (keep > 0) {
+        // 按开始时间从新到旧，留最近 keep 次；只删已完成或一天未完成（视为中途崩溃）的。
+        const names: List<string> = listNew();
+        const starts: List<int> = listNew();
+        const all = localListDir(nat(base), "") catch (e) {
+            return current;
+        };
+        for (n in all) {
+            if (startsWith(n, prefix) && localEntryKind(nat(base), n) == 2 && kindOf(join(join(base, n), RUN_MARK)) == 1) {
+                const t = markStarted(join(base, n));
+                let at: int = 0;
+                while (at < listLen(starts) && (listGet(starts, at) catch 0) >= t) {
+                    at = at + 1;
+                }
+                listInsert(names, at, n);
+                listInsert(starts, at, t);
+            }
+        }
+        let i: int = keep;
+        while (i < listLen(names)) {
+            const old = join(base, listGet(names, i) catch "");
+            const t = listGet(starts, i) catch 0;
+            if (kindOf(join(old, DONE_MARK)) == 1 || now - t > STALE_MS) {
+                removeTree(old);
+            }
+            i = i + 1;
+        }
+    }
+    return current;
+}
+
+export function pad3(v: int): string {
+    let s = toStr(v);
+    while (len(s) < 3) {
+        s = "0" + s;
+    }
+    return s;
+}
+
+export function finishRunDir(dir: string): void {
+    writeFile(join(dir, DONE_MARK), "") catch (e) {};
+}
+
+export function trimLine(s: string): string {
+    let n: int = len(s);
+    while (n > 0) {
+        const c = byteAt(s, n - 1) ?? 0;
+        if (c != 10 && c != 13 && c != 32 && c != 9) {
+            break;
+        }
+        n = n - 1;
+    }
+    return byteSub(s, 0, n);
+}
+
+// ustar 头里以 NUL 结尾的字段。
+export function tarField(t: Bytes, at: int, n: int): string {
+    let k: int = 0;
+    while (k < n && (bytesGet(t, at + k) ?? 0) != 0) {
+        k = k + 1;
+    }
+    return bytesToStr(bytesSlice(t, at, k)) catch "";
+}
+
+export function tarOctal(t: Bytes, at: int, n: int): int {
+    let v: int = 0;
+    let k: int = 0;
+    while (k < n) {
+        const c = bytesGet(t, at + k) ?? 0;
+        if (c >= 48 && c <= 55) {
+            v = v * 8 + (c - 48);
+        } else if (c != 32 && c != 0) {
+            return -1;
+        }
+        k = k + 1;
+    }
+    return v;
+}
+
+// pax 扩展头（"长度 键=值\n" 逐条）里的 path。
+export function paxPath(t: Bytes, at: int, n: int): string {
+    let p: int = at;
+    const end = at + n;
+    while (p < end) {
+        let q: int = p;
+        let size: int = 0;
+        while (q < end && (bytesGet(t, q) ?? 0) != 32) {
+            size = size * 10 + ((bytesGet(t, q) ?? 48) - 48);
+            q = q + 1;
+        }
+        if (size <= 0 || p + size > end) {
+            return "";
+        }
+        const rec = bytesToStr(bytesSlice(t, q + 1, p + size - q - 2)) catch "";
+        if (startsWith(rec, "path=")) {
+            return byteSub(rec, 5, len(rec) - 5);
+        }
+        p = p + size;
+    }
+    return "";
+}
+
+// 只收相对、不含 .. 的正斜杠路径（git archive 的输出即如此）。
+// 以 / 开头的在任何平台上都按绝对路径拒绝（Windows 的 isAbs 只认盘符与 UNC，/x 在那里是“当前盘的根”）。
+export function safeRel(p: string): bool {
+    if (len(p) == 0 || (byteAt(p, 0) ?? 0) == 47 || isAbs(p) || strIndexOf(p, "\\") >= 0 || strIndexOf(p, ":") >= 0) {
+        return false;
+    }
+    for (c in strSplit(p, "/")) {
+        if (c == "..") {
+            return false;
+        }
+    }
+    return true;
+}
+
+export function untar(t: Bytes, dest: string): void | Error {
+    let off: int = 0;
+    let pending = "";
+    while (off + 512 <= bytesLen(t)) {
+        let zero: bool = true;
+        let z: int = 0;
+        while (z < 512) {
+            if ((bytesGet(t, off + z) ?? 0) != 0) {
+                zero = false;
+                break;
+            }
+            z = z + 1;
+        }
+        if (zero) {
+            return nothing();
+        }
+        let name = tarField(t, off, 100);
+        const size = tarOctal(t, off + 124, 12);
+        const kind = bytesGet(t, off + 156) ?? 0;
+        if (startsWith(tarField(t, off + 257, 6), "ustar")) {
+            const prefix = tarField(t, off + 345, 155);
+            if (len(prefix) > 0) {
+                name = prefix + "/" + name;
+            }
+        }
+        const data = off + 512;
+        if (size < 0 || data + size > bytesLen(t)) {
+            return err("tar 头损坏：" + name);
+        }
+        if (kind == 120) {
+            pending = paxPath(t, data, size);
+        } else if (kind != 103) {
+            let path = name;
+            if (len(pending) > 0) {
+                path = pending;
+            }
+            pending = "";
+            while (len(path) > 0 && (byteAt(path, len(path) - 1) ?? 0) == 47) {
+                path = byteSub(path, 0, len(path) - 1);
+            }
+            if (!safeRel(path)) {
+                return err("tar 里有不安全的路径：" + path);
+            }
+            const target = join(dest, path);
+            if (kind == 53) {
+                if (!mkdirs(target)) {
+                    return err("建不了目录：" + target);
+                }
+            } else if (kind == 48 || kind == 0) {
+                if (!mkdirs(dirOf(target)) || !osWriteFile(target, bytesSlice(t, data, size), false)) {
+                    return err("写不了：" + target);
+                }
+            } else {
+                return err("tar 里有不支持的条目（类型 " + toStr(kind) + "）：" + path);
+            }
+        }
+        off = data + ((size + 511) / 512) * 512;
+    }
+    return nothing();
+}

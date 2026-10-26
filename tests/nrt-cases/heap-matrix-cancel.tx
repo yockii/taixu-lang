@@ -1,0 +1,204 @@
+// 安全审查攻关第 2 项场景矩阵（docs/design/v052-heap-check-v0.1-20261024.md 四）：取消时机 × 持有物。
+// 每个受害任务按种类造一组对象（List、结构体对象图、运行期拼出的字符串、Bytes、闭包捕获、Weak、Shared、嵌套 Shared），
+// 经闭包 view 读出摘要，登记 defer 后挂起。四种时机：排队未启动即取消（不登记 defer）、挂起中被取消（defer 读持有物）、
+// 已唤醒尚在就绪队里被取消（同挂起）、已完成后再取消（空操作，结果不变）。哨兵对象只由任务帧持有（实参与闭包捕获），
+// 报告时其 Weak 须已失效——取消与完成都当帧释放；外部对象 outside 被每个闭包捕获，不得因取消被多释放。
+// scripts/test-heap-check.py 的语料部分在页堆内核下再跑本例（越界、释放后使用、重复释放即失败）。
+struct Leaf {
+    name: string,
+    n: int,
+}
+
+struct Graph {
+    title: string,
+    leaves: List< Ref< Leaf>>,
+}
+
+const KINDS: string = "list graph string bytes closure weak shared nested";
+const TIMINGS: string = "queued suspended woken completed";
+
+let log: List< string> = listNew();
+let suspended: List< Future< int>> = listNew();
+let woken: List< Future< int>> = listNew();
+let sentinels: List< Weak< Leaf>> = listNew();
+
+function nameOf(names: string, i: int): string {
+    return listGet(strSplit(names, " "), i) catch "?";
+}
+
+// 按种类造持有物，返回捕获它们（连同哨兵与外部对象）的闭包。
+function holding(kind: int, tag: string, outside: List< string>, sentinel: Ref< Leaf>): () => string {
+    const xs: List< string> = listNew();
+    listPush(xs, tag + ":a");
+    listPush(xs, tag + ":b");
+    const mark = sentinel.name + " outside " + toStr(listLen(outside));
+    if (kind == 1) {
+        const leaves: List< Ref< Leaf>> = listNew();
+        listPush(leaves, new Leaf { name: tag + ":leaf", n: 7 });
+        const g = new Graph { title: tag, leaves: leaves };
+        return (): string => {
+            const l = listGet(g.leaves, 0) catch new Leaf { name: "?", n: 0 };
+            return g.title + " " + l.name + "=" + toStr(l.n) + " " + mark;
+        };
+    }
+    if (kind == 2) {
+        const s = tag + "|" + tag + "|" + toStr(kind * 1000);
+        return (): string => s + " " + mark;
+    }
+    if (kind == 3) {
+        const b = bytesNew(24);
+        bytesFill(b, 0, 24, 65 + kind);
+        return (): string => "bytes " + toStr(bytesLen(b)) + " last " + toStr(bytesGet(b, 23) catch -1) + " " + mark;
+    }
+    if (kind == 4) {
+        const inner = (): string => (listGet(xs, 1) catch "?") + "!";
+        return (): string => "inner " + inner() + " " + mark;
+    }
+    if (kind == 5) {
+        const target = new Leaf { name: tag + ":target", n: 5 };
+        const w = weak(target);
+        return (): string => (deref(w) catch Leaf { name: "dead", n: -1 }).name + " held " + toStr(target.n) + " " + mark;
+    }
+    if (kind == 6) {
+        const sh = sharedNew(xs);
+        return (): string => "shared " + (listGet(sharedGet(sh), 0) catch "?") + " " + mark;
+    }
+    if (kind == 7) {
+        const outer = sharedNew(sharedNew(xs));
+        return (): string => "nested " + (listGet(sharedGet(sharedGet(outer)), 1) catch "?") + " " + mark;
+    }
+    return (): string => (listGet(xs, 0) catch "?") + " " + toStr(listLen(xs)) + " " + mark;
+}
+
+async function victim(kind: int, timing: int, outside: List< string>, sentinel: Ref< Leaf>): int {
+    const tag = nameOf(KINDS, kind) + "/" + nameOf(TIMINGS, timing);
+    const view = holding(kind, tag, outside, sentinel);
+    defer listPush(log, tag + " defer cancelled=" + toStr(taskCancelled()) + ": " + view());
+    let ms = 60000;
+    if (timing >= 2) {
+        ms = 0;
+    }
+    await sleepMs(ms) catch (e) {
+        return -1;
+    };
+    listPush(log, tag + " woke: " + view());
+    return kind * 10 + timing;
+}
+
+function cancelAll(fs: List< Future< int>>): void | Error {
+    let i = 0;
+    while (i < listLen(fs)) {
+        taskCancel((listGet(fs, i) catch err("none"))?);
+        i = i + 1;
+    }
+    return assert(true, "cancelAll");
+}
+
+async function canceller(): int {
+    listPush(log, "canceller runs");
+    cancelAll(suspended) catch (e) {
+        listPush(log, e.message);
+    };
+    return 0;
+}
+
+// 定时器先于“woken”受害者登记，同一轮先被唤醒：此时它们已被唤醒、尚在就绪队里。
+async function lateCanceller(): int {
+    await sleepMs(0) catch (e) {
+        return -1;
+    };
+    listPush(log, "late canceller runs");
+    cancelAll(woken) catch (e) {
+        listPush(log, e.message);
+    };
+    return 0;
+}
+
+async function outcome(f: Future < int >): string {
+    const v = await f catch (e) {
+        return e.message;
+    };
+    return toStr(v);
+}
+
+async function report(fs: List< Future< int>>, tags: List< string>, outside: List< string>): int {
+    const lines: List< string> = listNew();
+    let i = 0;
+    while (i < listLen(fs)) {
+        const f = (listGet(fs, i) catch err("none"))?;
+        let text = await outcome(f) catch "?";
+        if (i % 4 == 3) {
+            // 已完成后再取消：空操作，再 await 得同一结果。
+            taskCancel(f);
+            text = text + ", after cancel " + (await outcome(f) catch "?");
+        }
+        const w = (listGet(sentinels, i) catch err("none"))?;
+        const alive = (deref(w) catch Leaf { name: "dead", n: -1 }).n >= 0;
+        listPush(lines, (listGet(tags, i) catch "?") + " -> " + text + ", sentinel alive=" + toStr(alive));
+        i = i + 1;
+    }
+    for (l in log) {
+        print(l);
+    }
+    for (l in lines) {
+        print(l);
+    }
+    print("outside " + toStr(listLen(outside)) + " " + (listGet(outside, 0) catch "?"));
+    return 0;
+}
+
+function spawnVictim(kind: int, timing: int, outside: List< string>, fs: List< Future< int>>, tags: List< string>): Future < int > {
+    const tag = nameOf(KINDS, kind) + "/" + nameOf(TIMINGS, timing);
+    const s = new Leaf { name: tag + ":sentinel", n: kind };
+    listPush(sentinels, weak(s));
+    const f = victim(kind, timing, outside, s);
+    listPush(fs, f);
+    listPush(tags, tag);
+    return f;
+}
+
+function main(args: []string): int {
+    const outside: List< string> = listNew();
+    listPush(outside, "kept");
+    const fs: List< Future< int>> = listNew();
+    const tags: List< string> = listNew();
+    // 创建序即启动序（FIFO）：排队即取消的、挂起的、迟到取消者、就绪队里被取消的、正常完成的、取消者、报告者。
+    let k = 0;
+    while (k < 8) {
+        taskCancel(spawnVictim(k, 0, outside, fs, tags));
+        listPush(suspended, spawnVictim(k, 1, outside, fs, tags));
+        k = k + 1;
+    }
+    const late = lateCanceller();
+    k = 0;
+    while (k < 8) {
+        listPush(woken, spawnVictim(k, 2, outside, fs, tags));
+        spawnVictim(k, 3, outside, fs, tags);
+        k = k + 1;
+    }
+    const c = canceller();
+    // 报告按 种类×时机 排序：fs 里的创建序是 (k,0) (k,1) …、(k,2) (k,3) …，这里重排成每种类四个时机相邻。
+    const ordered: List< Future< int>> = listNew();
+    const orderedTags: List< string> = listNew();
+    const orderedWeak: List< Weak< Leaf>> = listNew();
+    k = 0;
+    while (k < 8) {
+        let t = 0;
+        while (t < 4) {
+            let j = k * 2 + t;
+            if (t >= 2) {
+                j = 16 + k * 2 + t - 2;
+            }
+            t = t + 1;
+            listPush(ordered, listGet(fs, j) catch late);
+            listPush(orderedTags, listGet(tags, j) catch "?");
+            const w = listGet(sentinels, j) catch weak(new Leaf { name: "?", n: -2 });
+            listPush(orderedWeak, w);
+        }
+        k = k + 1;
+    }
+    sentinels = orderedWeak;
+    report(ordered, orderedTags, outside);
+    print("spawned " + toStr(listLen(fs)));
+    return 0;
+}

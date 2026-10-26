@@ -1,0 +1,211 @@
+// MCP 外层的硬截止时间与持久受限 worker。资源限制不是不可信代码沙箱。
+import { ServiceOptions, serviceOptionsNew, workerArguments } from "./service_options";
+import { RunCap, runCapNew, runCapAddBytes, runCapText, runCapAddText, runCapTruncated } from "./run_core";
+import { scratchCreate, scratchClean } from "./mcp_scratch";
+import { dbgStr } from "./dbg_out";
+import { reaperStart, reaperSweep, reaperError } from "./mcp_reaper";
+
+const RESPONSE_MAX: int = 16777216;
+const CHUNK: int = 65536;
+// procWait 的“子进程已被别处回收、状态不可知”（Linux，tool_rt 的 LOST_CODE）：组内后代未确认清理，不算已回收。
+const PROC_LOST: int = -256;
+let config: Ref<ServiceOptions> = serviceOptionsNew();
+let worker: int = 0;
+let workerPid: int = 0;
+let generation: int = 0;
+let ready: bool = false;
+let retired: List<int> = listNew();
+let retiredRoots: List<string> = listNew();
+let retiredPids: List<int> = listNew();
+let pendingRoots: List<string> = listNew();
+let workerRoot: string = "";
+let pending: Bytes = bytesNew(0);
+let outScan: int = 0;
+let errors: Ref<RunCap> = runCapNew();
+let reason: string = "";
+let exitCode: int = 0;
+let reaped: bool = true;
+let terminationRequested: bool = false;
+let exitKnown: bool = false;
+let processPending: bool = false;
+
+export function proxyConfigure(c: Ref<ServiceOptions>): bool { config = c; return reaperStart(); }
+export function proxyReason(): string { return reason; }
+export function proxyStderr(): string { return runCapText(errors); }
+export function proxyStderrTruncated(): bool { runCapText(errors); return runCapTruncated(errors); }
+export function proxyStderrTextBytes(): int { runCapText(errors); return errors.total; }
+export function proxyExitCode(): int { return exitCode; }
+export function proxyGeneration(): int { return generation; }
+export function proxyReaped(): bool { return reaped; }
+export function proxyTerminationRequested(): bool { return terminationRequested; }
+export function proxyExitKnown(): bool { return exitKnown; }
+// 已启动的 worker 也需轮询：CPU退出／崩溃发生在空闲时，不能等下一条客户端请求才回收。
+export function proxyNeedsSweep(): bool { return worker != 0 || processPending || listLen(retired) > 0 || listLen(pendingRoots) > 0; }
+export function proxyProcessCleanupPending(): bool { return processPending || listLen(retired) > 0; }
+export function proxyProcessCleanupError(): string { return reaperError(); }
+export function proxyArtifactsCleaned(): bool { return listLen(retired) == 0 && listLen(pendingRoots) == 0; }
+export function proxyCleanupPathsJson(): string {
+    let out = "["; let first = true;
+    for (root in retiredRoots) { if (!first) { out = out + ","; } first = false; out = out + dbgStr(root); }
+    for (root in pendingRoots) { if (!first) { out = out + ","; } first = false; out = out + dbgStr(root); }
+    return out + "]";
+}
+
+function clean(root: string): void { if (!scratchClean(root)) { listPush(pendingRoots, root); } }
+
+export function proxySweep(): void {
+    const retry = pendingRoots; pendingRoots = listNew();
+    for (root in retry) { clean(root); }
+    const keep: List<int> = listNew();
+    const keepPids: List<int> = listNew();
+    const keepRoots: List<string> = listNew(); let i = 0;
+    for (h in retired) {
+        const root = listGet(retiredRoots, i) catch ""; const pid = listGet(retiredPids, i) catch 0; i = i + 1;
+        if (procWait(h, 0) != None) { procClose(h); clean(root); }
+        else { listPush(keep, h); listPush(keepRoots, root); listPush(keepPids, pid); }
+    }
+    retired = keep; retiredRoots = keepRoots; retiredPids = keepPids;
+    if (worker != 0 && procWait(worker, 0) != None) {
+        procClose(worker); clean(workerRoot); workerRoot = "";
+        worker = 0; workerPid = 0; ready = false; pending = bytesNew(0); outScan = 0;
+    }
+    const owners: List<int> = listNew();
+    if (worker != 0) { listPush(owners, workerPid); }
+    for (pid in retiredPids) { listPush(owners, pid); }
+    processPending = reaperSweep(owners);
+}
+
+function drainReaping(deadline: int): void {
+    while (worker == 0 && listLen(retired) == 0 && processPending && len(reaperError()) == 0 && nowMs() < deadline) {
+        processPending = reaperSweep(listNew());
+    }
+}
+
+function terminate(): void {
+    if (worker == 0) { return; }
+    const cleanupDeadline = nowMs() + 250;
+    terminationRequested = true;
+    procKill(worker);
+    const code = procWait(worker, 250);
+    if (code != None) {
+        exitCode = code catch -1; exitKnown = exitCode != PROC_LOST; reaped = exitKnown;
+        procClose(worker); clean(workerRoot);
+    }
+    else { listPush(retired, worker); listPush(retiredRoots, workerRoot); listPush(retiredPids, workerPid); reaped = false; }
+    workerRoot = "";
+    worker = 0; workerPid = 0; ready = false; pending = bytesNew(0); outScan = 0;
+    proxySweep(); drainReaping(cleanupDeadline);
+}
+function start(): bool {
+    proxySweep();
+    if (len(reaperError()) > 0) { reason = "worker_reaping_failed"; terminate(); return false; }
+    if (worker != 0) { return true; }
+    if (processPending && listLen(retired) == 0) { reason = "cleanup_pending"; return false; }
+    if (listLen(retired) + listLen(pendingRoots) >= 2) { reason = "cleanup_pending"; return false; }
+    if (generation >= 9223372036854775807) { reason = "generation_exhausted"; return false; }
+    generation = generation + 1;
+    workerRoot = scratchCreate(generation) catch (e) { reason = "worker_scratch_failed"; runCapAddText(errors, e.message); return false; };
+    const a = workerArguments(config, generation, workerRoot);
+    worker = procSpawnLimited(selfExePath(), a, "", 1, config.memoryMiB * 1048576, config.cpuSeconds) catch (e) {
+        reason = "worker_start_failed"; runCapAddText(errors, e.message); clean(workerRoot); workerRoot = ""; return false;
+    };
+    workerPid = 0; ready = false; pending = bytesNew(0); outScan = 0; return true;
+}
+function nowMs(): int { return monoNs() / 1000000; }
+function readyPid(line: string): int {
+    const prefix = "READY " + toStr(generation) + " "; const n = len(prefix);
+    if (len(line) <= n || len(line) > n + 10 || strSub(line, 0, n) != prefix) { return 0; }
+    let pid = 0; let i = n;
+    while (i < len(line)) {
+        const digit = (byteAt(line, i) catch 0) - 48;
+        if (digit < 0 || digit > 9 || pid > (4294967295 - digit) / 10) { return 0; }
+        pid = pid * 10 + digit; i = i + 1;
+    }
+    return pid;
+}
+
+// 取一条内部 NDJSON 行，完整／不完整与无效 UTF-8 分开记录。额外未请求输出会被下一次调用拒绝。
+function takeLine(): string {
+    let i = outScan;
+    while (i < bytesLen(pending)) {
+        if ((bytesGet(pending, i) catch 0) == 10) {
+            const line = bytesSlice(pending, 0, i); pending = bytesSlice(pending, i + 1, bytesLen(pending) - i - 1);
+            outScan = 0;
+            const text = bytesToStr(line) catch (e) { reason = "invalid_worker_output"; return ""; };
+            return text;
+        }
+        i = i + 1;
+    }
+    outScan = bytesLen(pending);
+    return "";
+}
+
+export function proxyCall(raw: Bytes, budget: int): string {
+    reason = ""; errors = runCapNew(); exitCode = 0; reaped = true; terminationRequested = false; exitKnown = false;
+    const begin = nowMs();
+    if (!start()) { return ""; }
+    if (bytesLen(pending) > 0) { reason = "unexpected_worker_output"; terminate(); return ""; }
+    const remaining = budget - (nowMs() - begin);
+    if (remaining <= 0) { reason = "request_timeout"; terminate(); return ""; }
+    const input = bytesFromStr("{\"budget_ms\":" + toStr(remaining) + ",\"request\":");
+    bytesAppend(input, raw); bytesAppend(input, bytesFromStr("}\n"));
+    let sent = 0; let inputChunk = bytesNew(0); let chunkAt = 0;
+    const buf = bytesNew(CHUNK);
+    while (true) {
+        if (nowMs() - begin >= budget) { reason = "request_timeout"; terminate(); return ""; }
+        let progress = false;
+        if (sent < bytesLen(input)) {
+            if (chunkAt >= bytesLen(inputChunk)) {
+                let count = bytesLen(input) - sent; if (count > 4096) { count = 4096; }
+                inputChunk = bytesSlice(input, sent, count); chunkAt = 0;
+            }
+            const n = procTryWrite(worker, 0, bytesSlice(inputChunk, chunkAt, bytesLen(inputChunk) - chunkAt));
+            if (n < 0) { reason = "worker_input_closed"; terminate(); return ""; }
+            sent = sent + n; chunkAt = chunkAt + n; if (n > 0) { progress = true; }
+        }
+        const out = procRead(worker, 1, buf);
+        if (out > 0) {
+            if (out > RESPONSE_MAX + 1 - bytesLen(pending)) { reason = "worker_output_limit"; terminate(); return ""; }
+            bytesAppend(pending, bytesSlice(buf, 0, out)); progress = true;
+        }
+        const er = procRead(worker, 2, buf);
+        if (er > 0) { runCapAddBytes(errors, buf, er); progress = true; }
+        let line = takeLine();
+        if (len(reason) > 0) { terminate(); return ""; }
+        if (!ready && len(line) > 0) {
+            const pid = readyPid(line);
+            if (pid <= 0) { reason = "worker_verification_failed"; terminate(); return ""; }
+            workerPid = pid; ready = true; line = takeLine();
+        }
+        if (len(line) > 0) {
+            if (sent != bytesLen(input) || bytesLen(pending) > 0) { reason = "unexpected_worker_output"; terminate(); return ""; }
+            return line;
+        }
+        if (bytesLen(pending) > RESPONSE_MAX) { reason = "worker_output_limit"; terminate(); return ""; }
+        const code = procWait(worker, 0);
+        if ((code != None || out < 0) && !progress) {
+            // 退出后的管道可能仍有最后一段输出；正常回复已在上方完整消费。
+            if (code != None) { exitCode = code catch -1; exitKnown = exitCode != PROC_LOST; }
+            reason = "worker_exit"; terminate(); return "";
+        }
+        if (!progress) { ioWait(worker, 6, 1); }
+    }
+    return "";
+}
+
+// 正常关闭时留给 worker 清扫现有调试会话的机会；不能因等待不可回收的进程而无限阻塞协议服务。
+export function proxyClose(): void {
+    if (worker == 0) { proxySweep(); drainReaping(nowMs() + 250); return; }
+    const quit = bytesFromStr("{\"shutdown_worker\":true}\n"); let sent = 0;
+    const begin = nowMs(); const buf = bytesNew(CHUNK);
+    while (nowMs() - begin < 1000) {
+        if (sent < bytesLen(quit)) {
+            const n = procTryWrite(worker, 0, bytesSlice(quit, sent, bytesLen(quit) - sent));
+            if (n > 0) { sent = sent + n; }
+        }
+        procRead(worker, 1, buf); procRead(worker, 2, buf);
+        if (procWait(worker, 0) != None) { procClose(worker); clean(workerRoot); workerRoot = ""; worker = 0; workerPid = 0; ready = false; proxySweep(); drainReaping(nowMs() + 250); return; }
+        ioWait(worker, 6, 1);
+    }
+    terminate(); proxySweep();
+}

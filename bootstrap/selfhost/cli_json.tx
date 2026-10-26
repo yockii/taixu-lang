@@ -1,0 +1,204 @@
+// 原生 CLI 的 `--format=json` 输出（去 Zig 第 6 轮 6a）：在 Zig CLI 的形状上加 schema 字段（jsonStart）——
+//   诊断  {"schema":"diag/1","diags":[{"severity":"error","code":N,"msg":"…","module":"…","line":N,"col":N}]}（stderr）
+//   test  {"schema":"tests/1","tests":[{"name":"…","ok":B,"duration_us":N,"diags":[…]}],"summary":{"total":N,"pass":N,"fail":N}}（stdout）
+// 编译诊断取驱动的文本（`模块:行:列: error 码: 消息`，提示行 `  └─ …` 略去；没有位置的驱动消息
+// 行列为 0，消息末尾带 `（码）` 的取该码，否则码为 0）；运行期诊断取产物的 trap 行
+// （`模块:行:列: [runtime:名] 消息`），名到码经 explain 表。
+
+import { jsonStart } from "./toolchain";
+import { runtimeCodeOf } from "./explain";
+import { jsonQuote } from "./json_text";
+
+function cpCountJ(s: string): int {
+    let pos = 0;
+    let count = 0;
+    while (pos < len(s)) {
+        const c = byteAt(s, pos) catch 0;
+        if (c >= 240) { pos = pos + 4; }
+        else if (c >= 224) { pos = pos + 3; }
+        else if (c >= 192) { pos = pos + 2; }
+        else { pos = pos + 1; }
+        count = count + 1;
+    }
+    return count;
+}
+
+function digitsOnly(s: string): bool {
+    if (len(s) == 0) { return false; }
+    let i = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) catch 0;
+        if (c < 48 || c > 57) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+function toIntJ(s: string): int {
+    let v = 0;
+    let i = 0;
+    while (i < len(s)) {
+        v = v * 10 + ((byteAt(s, i) catch 48) - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+// 最后一个 ':' 的码点下标；没有得 -1。
+function lastColon(s: string): int {
+    const n = cpCountJ(s);
+    let at = -1;
+    let i = 0;
+    while (i < n) {
+        if (strSub(s, i, 1) == ":") { at = i; }
+        i = i + 1;
+    }
+    return at;
+}
+
+function trimCr(s: string): string {
+    const n = cpCountJ(s);
+    if (n > 0 && strSub(s, n - 1, 1) == "\r") { return strSub(s, 0, n - 1); }
+    return s;
+}
+
+function diagJsonSev(sev: string, code: int, msg: string, module: string, line: int, col: int): string {
+    return "{\"severity\":\"" + sev + "\",\"code\":" + toStr(code) + ",\"msg\":" + jsonQuote(msg) + ",\"module\":" + jsonQuote(module) + ",\"line\":" + toStr(line) + ",\"col\":" + toStr(col) + "}";
+}
+
+function diagJson(code: int, msg: string, module: string, line: int, col: int): string {
+    return diagJsonSev("error", code, msg, module, line, col);
+}
+
+// 没有位置的诊断（如测试进程异常退出）：一个元素的 JSON 数组。
+export function plainDiagArray(code: int, msg: string): string {
+    return "[" + diagJson(code, msg, "", 0, 0) + "]";
+}
+
+// 驱动消息末尾的 `（NNNN）`（如入口缺 main 的 3010）取作码，否则 0。
+function tailCode(ln: string): int {
+    const n = cpCountJ(ln);
+    if (n < 6 || strSub(ln, n - 1, 1) != "）" || strSub(ln, n - 6, 1) != "（") { return 0; }
+    const t = strSub(ln, n - 5, 4);
+    if (!digitsOnly(t)) { return 0; }
+    return toIntJ(t);
+}
+
+// `模块:行:列` 前缀拆成 JSON 的 module/line/col 三段；格式不符时整段作模块、行列为 0。
+function located(sev: string, prefix: string, code: int, msg: string): string {
+    const c2 = lastColon(prefix);
+    if (c2 > 0) {
+        const colText = strSub(prefix, c2 + 1, cpCountJ(prefix) - c2 - 1);
+        const head = strSub(prefix, 0, c2);
+        const c1 = lastColon(head);
+        if (c1 > 0) {
+            const lineText = strSub(head, c1 + 1, cpCountJ(head) - c1 - 1);
+            if (digitsOnly(lineText) && digitsOnly(colText)) {
+                return diagJsonSev(sev, code, msg, strSub(head, 0, c1), toIntJ(lineText), toIntJ(colText));
+            }
+        }
+    }
+    return diagJsonSev(sev, code, msg, prefix, 0, 0);
+}
+
+// `前缀: <sev> 码: 消息` 形；不是该形返回 ""。
+function sevDiag(ln: string, sev: string): string {
+    const mark = ": " + sev + " ";
+    const at = strIndexOf(ln, mark);
+    if (at < 0) { return ""; }
+    const skip = cpCountJ(mark);
+    const rest = strSub(ln, at + skip, cpCountJ(ln) - at - skip);
+    const sep = strIndexOf(rest, ": ");
+    if (sep <= 0 || !digitsOnly(strSub(rest, 0, sep))) { return ""; }
+    return located(sev, strSub(ln, 0, at), toIntJ(strSub(rest, 0, sep)), strSub(rest, sep + 2, cpCountJ(rest) - sep - 2));
+}
+
+// 一行编译诊断或 trap 行转 JSON 对象；不是诊断行（提示行、空行）返回 ""。
+function lineDiag(raw: string): string {
+    const ln = trimCr(raw);
+    if (len(ln) == 0 || strIndexOf(ln, "  └─") == 0) { return ""; }
+    const n = cpCountJ(ln);
+    const rt = strIndexOf(ln, "[runtime:");
+    if (rt >= 0) {
+        const rest = strSub(ln, rt + 9, n - rt - 9);
+        const close = strIndexOf(rest, "]");
+        if (close > 0) {
+            const name = strSub(rest, 0, close);
+            let msg = strSub(rest, close + 1, cpCountJ(rest) - close - 1);
+            if (strIndexOf(msg, " ") == 0) { msg = strSub(msg, 1, cpCountJ(msg) - 1); }
+            let prefix = "";
+            if (rt >= 2) { prefix = strSub(ln, 0, rt - 2); }
+            return located("error", prefix, runtimeCodeOf(name), msg);
+        }
+    }
+    const er = sevDiag(ln, "error");
+    if (len(er) > 0) { return er; }
+    const wr = sevDiag(ln, "warning");
+    if (len(wr) > 0) { return wr; }
+    if (strIndexOf(ln, "error ") == 0) {
+        const rest = strSub(ln, 6, n - 6);
+        const sep = strIndexOf(rest, ": ");
+        if (sep > 0 && digitsOnly(strSub(rest, 0, sep))) {
+            return diagJson(toIntJ(strSub(rest, 0, sep)), strSub(rest, sep + 2, cpCountJ(rest) - sep - 2), "", 0, 0);
+        }
+    }
+    return diagJson(tailCode(ln), ln, "", 0, 0);
+}
+
+// 文本中全部诊断行组成的 JSON 数组。
+export function diagsArray(text: string): string {
+    let out = "[";
+    let first = true;
+    for (raw in strSplit(text, "\n")) {
+        const d = lineDiag(raw);
+        if (len(d) > 0) {
+            if (!first) { out = out + ","; }
+            out = out + d;
+            first = false;
+        }
+    }
+    return out + "]";
+}
+
+// 只取 trap 行（`[runtime:` 开头的诊断）组成的 JSON 数组。
+export function trapArray(text: string): string {
+    let out = "[";
+    let first = true;
+    for (raw in strSplit(text, "\n")) {
+        if (strIndexOf(raw, "[runtime:") >= 0) {
+            const d = lineDiag(raw);
+            if (len(d) > 0) {
+                if (!first) { out = out + ","; }
+                out = out + d;
+                first = false;
+            }
+        }
+    }
+    return out + "]";
+}
+
+export function diagsDoc(text: string): string {
+    return jsonStart("diag/1") + ",\"diags\":" + diagsArray(text) + "}";
+}
+
+export function testEntry(name: string, ok: bool, us: int, diags: string): string {
+    let okText = "false";
+    if (ok) { okText = "true"; }
+    return "{\"name\":" + jsonQuote(name) + ",\"ok\":" + okText + ",\"duration_us\":" + toStr(us) + ",\"diags\":" + diags + "}";
+}
+
+export function testsDoc(entries: List<string>, pass: int, fail: int): string {
+    return jsonStart("tests/1") + "," + testsBody(entries, pass, fail) + "}";
+}
+
+// tests/1 的 tests 与 summary 两个成员（不含括号与 schema），供已带 schema 的外层对象拼接（MCP test）。
+export function testsBody(entries: List<string>, pass: int, fail: int): string {
+    let out = "\"tests\":[";
+    let i = 0;
+    while (i < listLen(entries)) {
+        if (i > 0) { out = out + ","; }
+        out = out + (listGet(entries, i) catch "");
+        i = i + 1;
+    }
+    return out + "],\"summary\":{\"total\":" + toStr(pass + fail) + ",\"pass\":" + toStr(pass) + ",\"fail\":" + toStr(fail) + "}";
+}

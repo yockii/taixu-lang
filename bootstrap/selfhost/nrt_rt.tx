@@ -1,0 +1,578 @@
+// NRT 进程级运行时表（线程设计 §十六，2c）：__rt 内部内建——句柄表与环境变量。模块全局变量每线程一份，
+// 标准库里要跨线程共享的系统状态（套接字表、Linux 的环境变量表）因此放在内核里，经一把进程级的票据锁访问。
+// 表的内存直接向系统要页（Windows VirtualAlloc，Linux mmap），不经每线程的堆；满了按倍增重建。
+//
+// 句柄表：每项 16 字节——系统值@0（空闲时 −1）、代数@8（u32，≥1）、空闲链@12（u32，下一空闲槽号＋1）。
+// 句柄＝代数×2^24＋槽号，恒为正；取出（take）时代数加一，旧句柄随即失效；代数超过 2^31−1 的槽不再复用。
+// 槽数从 256 起倍增，上限 2^24。系统值须 ≥0（−1 留作无效）。
+//
+// 环境变量（Linux）：内核只在进程启动时给出初始环境（_start 存入 __tx_nrt_envp），getenv/setenv 是 libc 的
+// 概念。这里首次使用时把初始环境整份拷进一张进程级的表，此后读写都只经这张表（同 Go 的 syscall 环境表）。
+// 记录：长度@0（u32，含头、8 字节对齐）、存活@4（u32）、"NAME=VALUE\0"@8；同名取第一条存活记录（同 libc
+// getenv 的顺序扫描），设置时先作废全部同名记录再追加。空间不够时按存活字节的两倍重建并丢掉作废记录。子进程
+// （runProcess、工具链的 procSpawn）的环境取这张表的当前内容（__tx_rt_env_block，D3 v0.39）。
+// Windows 的环境变量本就是进程级的（kernel32 自带锁），直接调用 Get/SetEnvironmentVariableW。
+// 名字为空、含 `=` 或含 NUL 时：取值得 None，设置失败（−1）——同 Go 的 syscall.Getenv／Setenv。
+import { StructuredBuffer, asBufferLabel, asBufferZero } from "./assemble";
+import { RtFn, RtOp, L, I, A, G, GAcq } from "./rtfn_base";
+import { rtBegin, rtSet, rtSetGlobal, rtOp, rtShift, rtLoad, rtStore, rtLabel, rtJump, rtIf, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtCall5, rtCallList, rtSyscall, rtRet, rtRetVoid } from "./rtfn";
+import { check, text, arity, argTag, strSpan, trapText, trapAt, ARITY, memcpyName, nrtTarget } from "./nrt_base";
+import { tRawSyscall, tUnix } from "./target";
+import { uxSys, uxMapFlags } from "./unix_sys";
+import { RT_BI_BASE, RT_BI_COUNT, rtBiName } from "./builtin_names";
+
+const H_SLOT_BITS: int = 24;
+const H_SLOT_MASK: int = 16777215;
+const H_MAX_SLOTS: int = 16777216;
+const H_GEN_MAX: int = 2147483647;
+const H_INIT_SLOTS: int = 256;
+const ENV_MIN_BYTES: int = 4096;
+const TAG_INT: int = 1;
+const TAG_NONE: int = 4;
+const TAG_STR: int = 6;
+
+// __tx_rt_argv／__tx_rt_argc：入口保存的参数表（指针数组＋NUL 结尾的 UTF-8 串，整块）与项数（含程序名），D3 v0.41。
+const BSS: string = "__tx_rt_lock_next __tx_rt_lock_serve __tx_rt_h_tab __tx_rt_h_cap __tx_rt_h_used __tx_rt_h_free __tx_rt_env_buf __tx_rt_env_cap __tx_rt_env_len __tx_rt_env_live __tx_rt_env_ready __tx_rt_argv __tx_rt_argc";
+
+/// 进程级 .bss（须在内核唯一的 .bss 块里）。
+export function nrtRtBss(b: Ref<StructuredBuffer>): void {
+    const names = strSplit(BSS, " ");
+    let k = 0;
+    while (k < listLen(names)) { asBufferLabel(b, listGet(names, k) catch "", 1); asBufferZero(b, 8, 1); k = k + 1; }
+}
+
+/// __tx_callbi 的 "rt" 分支：按编号直接调用 __tx_bi_<rtBiName>，编号不在段内转 "unknown"。
+export function nrtRtDispatch(f: Ref<RtFn>, xs: List<Ref<RtOp>>): void {
+    let k = 0;
+    while (k < RT_BI_COUNT) {
+        const next = "rtnext" + toStr(k);
+        rtIf(f, L("id"), "ne", I(RT_BI_BASE + k), next);
+        rtCallList(f, "", "__tx_bi_" + rtBiName(RT_BI_BASE + k), xs);
+        rtRetVoid(f);
+        rtLabel(f, next);
+        k = k + 1;
+    }
+    rtJump(f, "unknown");
+}
+
+function emitPrims(b: Ref<StructuredBuffer>, t: int): void {
+    // __tx_rt_lock()／__tx_rt_unlock()：票据锁——lock xadd 取号，叫号等于自己的号即得锁，未轮到时让出处理器。
+    // 临界区里只做表操作与内核分配，不运行太虚代码，不会重入。
+    let f = rtBegin(b, "__tx_rt_lock", "", "t", 2, "bootstrap/selfhost/nrt_rt.tx");
+    rtCall2(f, "t", "__tx_atomic_add", A("__tx_rt_lock_next"), I(1));
+    rtLabel(f, "wait");
+    rtIf(f, GAcq("__tx_rt_lock_serve"), "eq", L("t"), "got");
+    const none: List<Ref<RtOp>> = listNew();
+    if (tUnix(t)) { uxSys(f, t, "", 24, none); } else { rtCall1(f, "", "Sleep", I(0)); }
+    rtJump(f, "wait");
+    rtLabel(f, "got");
+    rtRetVoid(f); check(f);
+    f = rtBegin(b, "__tx_rt_unlock", "", "", 2, "bootstrap/selfhost/nrt_rt.tx");
+    rtCall2(f, "", "__tx_atomic_add", A("__tx_rt_lock_serve"), I(1));
+    rtRetVoid(f); check(f);
+
+    // __tx_rt_pages(n) → n 字节全零的可读写页，失败为 0；__tx_rt_pages_free(p, n)。
+    f = rtBegin(b, "__tx_rt_pages", "n", "p", 6, "bootstrap/selfhost/nrt_rt.tx");
+    if (tUnix(t)) {
+        const xs: List<Ref<RtOp>> = listNew();
+        listPush(xs, I(0)); listPush(xs, L("n")); listPush(xs, I(3)); listPush(xs, I(uxMapFlags(t, 34))); listPush(xs, I(-1)); listPush(xs, I(0));
+        uxSys(f, t, "p", 9, xs);
+        rtIf(f, L("p"), "uge", I(-4095), "fail");
+    } else {
+        rtCall4(f, "p", "VirtualAlloc", I(0), L("n"), I(12288), I(4));
+    }
+    rtRet(f, L("p"));
+    rtLabel(f, "fail"); rtRet(f, I(0)); check(f);
+    f = rtBegin(b, "__tx_rt_pages_free", "p n", "", 3, "bootstrap/selfhost/nrt_rt.tx");
+    if (tUnix(t)) {
+        const ys: List<Ref<RtOp>> = listNew(); listPush(ys, L("p")); listPush(ys, L("n"));
+        uxSys(f, t, "", 11, ys);
+    } else {
+        rtCall3(f, "", "VirtualFree", L("p"), I(0), I(32768));
+    }
+    rtRetVoid(f); check(f);
+}
+
+function emitHandles(b: Ref<StructuredBuffer>): void {
+    // __tx_rt_h_entry(h) → 句柄 h 的表项地址（持锁调用）；句柄无效（越界、代数不符、已取出）为 0。
+    let f = rtBegin(b, "__tx_rt_h_entry", "h", "slot g e x", 0, "bootstrap/selfhost/nrt_rt.tx");
+    rtIf(f, L("h"), "lt", I(0), "bad");
+    rtOp(f, "slot", L("h"), "and", I(H_SLOT_MASK));
+    rtShift(f, "g", L("h"), "shr", H_SLOT_BITS);
+    rtIf(f, L("g"), "eq", I(0), "bad");
+    rtIf(f, L("g"), "gt", I(H_GEN_MAX), "bad");
+    rtIf(f, L("slot"), "ge", G("__tx_rt_h_used"), "bad");
+    rtShift(f, "e", L("slot"), "shl", 4); rtOp(f, "e", L("e"), "add", G("__tx_rt_h_tab"));
+    rtLoad(f, "x", L("e"), 8, 4);
+    rtIf(f, L("x"), "ne", L("g"), "bad");
+    rtLoad(f, "x", L("e"), 0, 8);
+    rtIf(f, L("x"), "lt", I(0), "bad");
+    rtRet(f, L("e"));
+    rtLabel(f, "bad"); rtRet(f, I(0)); check(f);
+
+    // __rtHandleAdd(raw): int — 登记系统值，返回新句柄；raw < 0、表已到 2^24 项或内存不足时为 −1。
+    f = rtBegin(b, "__tx_bi_rt_handle_add", "win fn pc a nargs", "s t raw slot e g cap nt old r", 5, "bootstrap/selfhost/nrt_rt.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", TAG_INT, "type");
+    rtLoad(f, "raw", L("s"), 8, 8);
+    rtSet(f, "r", I(-1));
+    rtIf(f, L("raw"), "lt", I(0), "out");
+    rtCall0(f, "", "__tx_rt_lock");
+    rtSet(f, "slot", G("__tx_rt_h_free"));
+    rtIf(f, L("slot"), "eq", I(0), "fresh");
+    rtOp(f, "slot", L("slot"), "sub", I(1));
+    rtShift(f, "e", L("slot"), "shl", 4); rtOp(f, "e", L("e"), "add", G("__tx_rt_h_tab"));
+    rtLoad(f, "g", L("e"), 12, 4);
+    rtSetGlobal(f, "__tx_rt_h_free", L("g"));
+    rtLoad(f, "g", L("e"), 8, 4);
+    rtJump(f, "fill");
+    rtLabel(f, "fresh");
+    rtSet(f, "slot", G("__tx_rt_h_used"));
+    rtIf(f, L("slot"), "lt", G("__tx_rt_h_cap"), "room");
+    // 表满：槽数倍增（首次 256），拷贝已用项后归还旧表。
+    rtSet(f, "cap", G("__tx_rt_h_cap"));
+    rtIf(f, L("cap"), "ge", I(H_MAX_SLOTS), "full");
+    rtOp(f, "nt", L("cap"), "add", L("cap"));
+    rtIf(f, L("nt"), "ne", I(0), "sized");
+    rtSet(f, "nt", I(H_INIT_SLOTS));
+    rtLabel(f, "sized");
+    rtShift(f, "t", L("nt"), "shl", 4);
+    rtCall1(f, "e", "__tx_rt_pages", L("t"));
+    rtIf(f, L("e"), "eq", I(0), "full");
+    rtSet(f, "old", G("__tx_rt_h_tab"));
+    rtIf(f, L("old"), "eq", I(0), "swap");
+    rtShift(f, "t", L("cap"), "shl", 4);
+    rtCall3(f, "", memcpyName(), L("e"), L("old"), L("t"));
+    rtCall2(f, "", "__tx_rt_pages_free", L("old"), L("t"));
+    rtLabel(f, "swap");
+    rtSetGlobal(f, "__tx_rt_h_tab", L("e"));
+    rtSetGlobal(f, "__tx_rt_h_cap", L("nt"));
+    rtLabel(f, "room");
+    rtOp(f, "t", L("slot"), "add", I(1));
+    rtSetGlobal(f, "__tx_rt_h_used", L("t"));
+    rtShift(f, "e", L("slot"), "shl", 4); rtOp(f, "e", L("e"), "add", G("__tx_rt_h_tab"));
+    rtSet(f, "g", I(1));
+    rtLabel(f, "fill");
+    rtStore(f, L("e"), 0, L("raw"), 8);
+    rtStore(f, L("e"), 8, L("g"), 4);
+    rtStore(f, L("e"), 12, I(0), 4);
+    rtShift(f, "r", L("g"), "shl", H_SLOT_BITS); rtOp(f, "r", L("r"), "or", L("slot"));
+    rtLabel(f, "full");
+    rtCall0(f, "", "__tx_rt_unlock");
+    rtLabel(f, "out");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_INT), L("r"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "__rtHandleAdd 的实参不是 int");
+    rtRetVoid(f); check(f);
+
+    // __rtHandlePeek(h): int — 句柄上的系统值；无效句柄为 −1。
+    f = rtBegin(b, "__tx_bi_rt_handle_peek", "win fn pc a nargs", "s t h e r", 5, "bootstrap/selfhost/nrt_rt.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", TAG_INT, "type");
+    rtLoad(f, "h", L("s"), 8, 8);
+    rtSet(f, "r", I(-1));
+    rtCall0(f, "", "__tx_rt_lock");
+    rtCall1(f, "e", "__tx_rt_h_entry", L("h"));
+    rtIf(f, L("e"), "eq", I(0), "done");
+    rtLoad(f, "r", L("e"), 0, 8);
+    rtLabel(f, "done");
+    rtCall0(f, "", "__tx_rt_unlock");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_INT), L("r"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "__rtHandlePeek 的实参不是 int");
+    rtRetVoid(f); check(f);
+
+    // __rtHandleTake(h): int — 取出系统值并作废句柄（槽位代数加一后进空闲链）；无效句柄为 −1。
+    f = rtBegin(b, "__tx_bi_rt_handle_take", "win fn pc a nargs", "s t h e r g", 5, "bootstrap/selfhost/nrt_rt.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", TAG_INT, "type");
+    rtLoad(f, "h", L("s"), 8, 8);
+    rtSet(f, "r", I(-1));
+    rtCall0(f, "", "__tx_rt_lock");
+    rtCall1(f, "e", "__tx_rt_h_entry", L("h"));
+    rtIf(f, L("e"), "eq", I(0), "done");
+    rtLoad(f, "r", L("e"), 0, 8);
+    rtStore(f, L("e"), 0, I(-1), 8);
+    rtLoad(f, "g", L("e"), 8, 4);
+    rtOp(f, "g", L("g"), "add", I(1));
+    rtStore(f, L("e"), 8, L("g"), 4);
+    // 代数用尽的槽不再复用（旧句柄永不复活）。
+    rtIf(f, L("g"), "gt", I(H_GEN_MAX), "done");
+    rtStore(f, L("e"), 12, G("__tx_rt_h_free"), 4);
+    rtOp(f, "g", L("h"), "and", I(H_SLOT_MASK)); rtOp(f, "g", L("g"), "add", I(1));
+    rtSetGlobal(f, "__tx_rt_h_free", L("g"));
+    rtLabel(f, "done");
+    rtCall0(f, "", "__tx_rt_unlock");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_INT), L("r"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "__rtHandleTake 的实参不是 int");
+    rtRetVoid(f); check(f);
+}
+
+function emitEnvCommon(b: Ref<StructuredBuffer>): void {
+    // __tx_rt_env_name_ok(p, n) → 1：非空、不含 '=' 与 NUL；否则 0。
+    let f = rtBegin(b, "__tx_rt_env_name_ok", "p n", "i c", 0, "bootstrap/selfhost/nrt_rt.tx");
+    rtIf(f, L("n"), "le", I(0), "bad");
+    rtSet(f, "i", I(0));
+    rtLabel(f, "loop");
+    rtIf(f, L("i"), "ge", L("n"), "ok");
+    rtOp(f, "c", L("p"), "add", L("i")); rtLoad(f, "c", L("c"), 0, 1);
+    rtIf(f, L("c"), "eq", I(61), "bad");
+    rtIf(f, L("c"), "eq", I(0), "bad");
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "loop");
+    rtLabel(f, "ok"); rtRet(f, I(1));
+    rtLabel(f, "bad"); rtRet(f, I(0)); check(f);
+
+    // __tx_rt_nul_free(p, n) → 1：不含 NUL；否则 0。
+    f = rtBegin(b, "__tx_rt_nul_free", "p n", "i c", 0, "bootstrap/selfhost/nrt_rt.tx");
+    rtSet(f, "i", I(0));
+    rtLabel(f, "loop");
+    rtIf(f, L("i"), "ge", L("n"), "ok");
+    rtOp(f, "c", L("p"), "add", L("i")); rtLoad(f, "c", L("c"), 0, 1);
+    rtIf(f, L("c"), "eq", I(0), "bad");
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "loop");
+    rtLabel(f, "ok"); rtRet(f, I(1));
+    rtLabel(f, "bad"); rtRet(f, I(0)); check(f);
+
+    // __rtEnvGet(name): string? — 未设置或名字不合法时为 None。工具链的 getEnv 也走这里。
+    f = rtBegin(b, "__tx_bi_rt_env_get", "win fn pc a nargs", "s t p n q", 5, "bootstrap/selfhost/nrt_rt.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", TAG_STR, "type");
+    strSpan(f, "s", "p", "n");
+    rtCall2(f, "q", "__tx_rt_env_get", L("p"), L("n"));
+    rtIf(f, L("q"), "eq", I(0), "none");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_STR), L("q")); rtRetVoid(f);
+    rtLabel(f, "none");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_NONE), I(0)); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "__rtEnvGet 的实参不是 string");
+    rtRetVoid(f); check(f);
+
+    // __rtEnvSet(name, value): int — 0 成功；名字不合法、值含 NUL 或系统拒绝时为 −1。
+    f = rtBegin(b, "__tx_bi_rt_env_set", "win fn pc a nargs", "s t p n q m r", 5, "bootstrap/selfhost/nrt_rt.tx");
+    arity(b, f, 2);
+    argTag(f, 0, "s", "t", TAG_STR, "type");
+    strSpan(f, "s", "p", "n");
+    argTag(f, 1, "s", "t", TAG_STR, "type");
+    strSpan(f, "s", "q", "m");
+    rtCall4(f, "r", "__tx_rt_env_set", L("p"), L("n"), L("q"), L("m"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_INT), L("r")); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "__rtEnvSet 的实参不是 string");
+    rtRetVoid(f); check(f);
+}
+
+function emitEnvLinux(b: Ref<StructuredBuffer>): void {
+    // __tx_rt_env_put(p, n, q, m, eq)（持锁）：追加一条记录 p[0..n)（eq＝1 时再接 '=' 与 q[0..m)）与 NUL；
+    // 空间不够先重建。成功 0，内存不足 1。
+    let f = rtBegin(b, "__tx_rt_env_put", "p n q m eq", "sz need cap nb o k x w y", 3, "bootstrap/selfhost/nrt_rt.tx");
+    rtOp(f, "sz", L("n"), "add", L("m")); rtOp(f, "sz", L("sz"), "add", L("eq"));
+    rtOp(f, "sz", L("sz"), "add", I(16)); rtOp(f, "sz", L("sz"), "and", I(-8));
+    rtOp(f, "need", G("__tx_rt_env_len"), "add", L("sz"));
+    rtIf(f, L("need"), "le", G("__tx_rt_env_cap"), "room");
+    rtOp(f, "cap", G("__tx_rt_env_live"), "add", L("sz")); rtOp(f, "cap", L("cap"), "add", L("cap"));
+    rtIf(f, L("cap"), "ge", I(ENV_MIN_BYTES), "big");
+    rtSet(f, "cap", I(ENV_MIN_BYTES));
+    rtLabel(f, "big");
+    rtCall1(f, "nb", "__tx_rt_pages", L("cap"));
+    rtIf(f, L("nb"), "eq", I(0), "oom");
+    rtSet(f, "o", I(0)); rtSet(f, "k", I(0));
+    rtLabel(f, "copy");
+    rtIf(f, L("k"), "ge", G("__tx_rt_env_len"), "copied");
+    rtOp(f, "x", G("__tx_rt_env_buf"), "add", L("k"));
+    rtLoad(f, "w", L("x"), 0, 4);
+    rtLoad(f, "y", L("x"), 4, 4);
+    rtIf(f, L("y"), "eq", I(0), "skip");
+    rtOp(f, "y", L("nb"), "add", L("o"));
+    rtCall3(f, "", memcpyName(), L("y"), L("x"), L("w"));
+    rtOp(f, "o", L("o"), "add", L("w"));
+    rtLabel(f, "skip");
+    rtOp(f, "k", L("k"), "add", L("w")); rtJump(f, "copy");
+    rtLabel(f, "copied");
+    rtSet(f, "x", G("__tx_rt_env_buf"));
+    rtIf(f, L("x"), "eq", I(0), "swap");
+    rtCall2(f, "", "__tx_rt_pages_free", L("x"), G("__tx_rt_env_cap"));
+    rtLabel(f, "swap");
+    rtSetGlobal(f, "__tx_rt_env_buf", L("nb"));
+    rtSetGlobal(f, "__tx_rt_env_cap", L("cap"));
+    rtSetGlobal(f, "__tx_rt_env_len", L("o"));
+    rtSetGlobal(f, "__tx_rt_env_live", L("o"));
+    rtLabel(f, "room");
+    rtOp(f, "x", G("__tx_rt_env_buf"), "add", G("__tx_rt_env_len"));
+    rtStore(f, L("x"), 0, L("sz"), 4);
+    rtStore(f, L("x"), 4, I(1), 4);
+    rtOp(f, "w", L("x"), "add", I(8));
+    rtCall3(f, "", memcpyName(), L("w"), L("p"), L("n"));
+    rtOp(f, "w", L("w"), "add", L("n"));
+    rtIf(f, L("eq"), "eq", I(0), "noeq");
+    rtStore(f, L("w"), 0, I(61), 1);
+    rtOp(f, "w", L("w"), "add", I(1));
+    rtCall3(f, "", memcpyName(), L("w"), L("q"), L("m"));
+    rtOp(f, "w", L("w"), "add", L("m"));
+    rtLabel(f, "noeq");
+    rtStore(f, L("w"), 0, I(0), 1);
+    rtOp(f, "w", G("__tx_rt_env_len"), "add", L("sz")); rtSetGlobal(f, "__tx_rt_env_len", L("w"));
+    rtOp(f, "w", G("__tx_rt_env_live"), "add", L("sz")); rtSetGlobal(f, "__tx_rt_env_live", L("w"));
+    rtRet(f, I(0));
+    rtLabel(f, "oom"); rtRet(f, I(1)); check(f);
+
+    // __tx_rt_env_enter()：取锁；首次使用时把初始环境（__tx_nrt_envp）整份拷进表。
+    f = rtBegin(b, "__tx_rt_env_enter", "", "e x n c", 5, "bootstrap/selfhost/nrt_rt.tx");
+    rtCall0(f, "", "__tx_rt_lock");
+    rtIf(f, G("__tx_rt_env_ready"), "ne", I(0), "done");
+    rtSetGlobal(f, "__tx_rt_env_ready", I(1));
+    rtSet(f, "e", G("__tx_nrt_envp"));
+    rtIf(f, L("e"), "eq", I(0), "done");
+    rtLabel(f, "next");
+    rtLoad(f, "x", L("e"), 0, 8);
+    rtIf(f, L("x"), "eq", I(0), "done");
+    rtSet(f, "n", I(0));
+    rtLabel(f, "len");
+    rtOp(f, "c", L("x"), "add", L("n")); rtLoad(f, "c", L("c"), 0, 1);
+    rtIf(f, L("c"), "eq", I(0), "put");
+    rtOp(f, "n", L("n"), "add", I(1)); rtJump(f, "len");
+    rtLabel(f, "put");
+    rtCall5(f, "c", "__tx_rt_env_put", L("x"), L("n"), I(0), I(0), I(0));
+    rtIf(f, L("c"), "ne", I(0), "oom");
+    rtOp(f, "e", L("e"), "add", I(8)); rtJump(f, "next");
+    rtLabel(f, "done"); rtRetVoid(f);
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRetVoid(f); check(f);
+
+    // __tx_rt_env_find(p, n)（持锁）→ 第一条存活的 "NAME=…" 记录地址，无则 0。名字须已校验（不含 NUL）。
+    f = rtBegin(b, "__tx_rt_env_find", "p n", "k x w c d i", 0, "bootstrap/selfhost/nrt_rt.tx");
+    rtSet(f, "k", I(0));
+    rtLabel(f, "rec");
+    rtIf(f, L("k"), "ge", G("__tx_rt_env_len"), "none");
+    rtOp(f, "x", G("__tx_rt_env_buf"), "add", L("k"));
+    rtLoad(f, "w", L("x"), 0, 4);
+    rtLoad(f, "c", L("x"), 4, 4);
+    rtIf(f, L("c"), "eq", I(0), "skip");
+    rtSet(f, "i", I(0));
+    rtLabel(f, "cmp");
+    rtIf(f, L("i"), "ge", L("n"), "sign");
+    rtOp(f, "c", L("x"), "add", L("i")); rtLoad(f, "c", L("c"), 8, 1);
+    rtOp(f, "d", L("p"), "add", L("i")); rtLoad(f, "d", L("d"), 0, 1);
+    rtIf(f, L("c"), "ne", L("d"), "skip");
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "cmp");
+    rtLabel(f, "sign");
+    rtOp(f, "c", L("x"), "add", L("n")); rtLoad(f, "c", L("c"), 8, 1);
+    rtIf(f, L("c"), "eq", I(61), "hit");
+    rtLabel(f, "skip");
+    rtOp(f, "k", L("k"), "add", L("w")); rtJump(f, "rec");
+    rtLabel(f, "hit"); rtRet(f, L("x"));
+    rtLabel(f, "none"); rtRet(f, I(0)); check(f);
+
+    // __tx_rt_env_get(p, n) → 新 string（非法 UTF-8 逐字节替换为 U+FFFD），未设置或名字不合法为 0。
+    f = rtBegin(b, "__tx_rt_env_get", "p n", "ok x q", 2, "bootstrap/selfhost/nrt_rt.tx");
+    rtCall2(f, "ok", "__tx_rt_env_name_ok", L("p"), L("n"));
+    rtIf(f, L("ok"), "eq", I(0), "none");
+    rtCall0(f, "", "__tx_rt_env_enter");
+    rtSet(f, "q", I(0));
+    rtCall2(f, "x", "__tx_rt_env_find", L("p"), L("n"));
+    rtIf(f, L("x"), "eq", I(0), "done");
+    rtOp(f, "x", L("x"), "add", L("n")); rtOp(f, "x", L("x"), "add", I(9));
+    rtCall1(f, "q", "__tx_ffi_cstr_to_str", L("x"));
+    rtLabel(f, "done");
+    rtCall0(f, "", "__tx_rt_unlock");
+    rtRet(f, L("q"));
+    rtLabel(f, "none"); rtRet(f, I(0)); check(f);
+
+    // __tx_rt_env_set(p, n, q, m) → 0／−1：作废全部同名记录后追加一条。
+    f = rtBegin(b, "__tx_rt_env_set", "p n q m", "ok x w", 5, "bootstrap/selfhost/nrt_rt.tx");
+    rtCall2(f, "ok", "__tx_rt_env_name_ok", L("p"), L("n"));
+    rtIf(f, L("ok"), "eq", I(0), "bad");
+    rtCall2(f, "ok", "__tx_rt_nul_free", L("q"), L("m"));
+    rtIf(f, L("ok"), "eq", I(0), "bad");
+    rtCall0(f, "", "__tx_rt_env_enter");
+    rtLabel(f, "kill");
+    rtCall2(f, "x", "__tx_rt_env_find", L("p"), L("n"));
+    rtIf(f, L("x"), "eq", I(0), "put");
+    rtStore(f, L("x"), 4, I(0), 4);
+    rtLoad(f, "w", L("x"), 0, 4);
+    rtOp(f, "w", G("__tx_rt_env_live"), "sub", L("w")); rtSetGlobal(f, "__tx_rt_env_live", L("w"));
+    rtJump(f, "kill");
+    rtLabel(f, "put");
+    rtCall5(f, "ok", "__tx_rt_env_put", L("p"), L("n"), L("q"), L("m"), I(1));
+    rtCall0(f, "", "__tx_rt_unlock");
+    rtIf(f, L("ok"), "ne", I(0), "oom");
+    rtRet(f, I(0));
+    rtLabel(f, "bad"); rtRet(f, I(-1));
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRet(f, I(-1)); check(f);
+
+    // __tx_rt_env_block() → 子进程的 envp：新分配的一块，先是各条目的指针与结尾的 NULL，其后依次放 "NAME=VALUE\0"，
+    // 调用方一次释放。内容取进程级环境表的当前存活记录（首次使用时先拷入初始环境），持锁拷贝——std/os 的 setenv 对之后
+    // 起的子进程可见（同 Go 的 syscall.Environ、Windows 继承当前环境块）。内存不足致命。
+    f = rtBegin(b, "__tx_rt_env_block", "", "k x w c n cnt s arr q i y", 5, "bootstrap/selfhost/nrt_rt.tx");
+    rtCall0(f, "", "__tx_rt_env_enter");
+    rtSet(f, "k", I(0)); rtSet(f, "n", I(0)); rtSet(f, "cnt", I(0));
+    rtLabel(f, "size");
+    rtIf(f, L("k"), "ge", G("__tx_rt_env_len"), "sized");
+    rtOp(f, "x", G("__tx_rt_env_buf"), "add", L("k"));
+    rtLoad(f, "w", L("x"), 0, 4);
+    rtLoad(f, "c", L("x"), 4, 4);
+    rtIf(f, L("c"), "eq", I(0), "snext");
+    rtSet(f, "s", I(0));
+    rtLabel(f, "slen");
+    rtOp(f, "c", L("x"), "add", L("s")); rtLoad(f, "c", L("c"), 8, 1);
+    rtIf(f, L("c"), "eq", I(0), "scount");
+    rtOp(f, "s", L("s"), "add", I(1)); rtJump(f, "slen");
+    rtLabel(f, "scount");
+    rtOp(f, "n", L("n"), "add", L("s")); rtOp(f, "n", L("n"), "add", I(1));
+    rtOp(f, "cnt", L("cnt"), "add", I(1));
+    rtLabel(f, "snext");
+    rtOp(f, "k", L("k"), "add", L("w")); rtJump(f, "size");
+    rtLabel(f, "sized");
+    rtOp(f, "q", L("cnt"), "add", I(1)); rtShift(f, "q", L("q"), "shl", 3);
+    rtOp(f, "x", L("q"), "add", L("n"));
+    rtCall2(f, "arr", "__tx_native_mem_alloc", L("x"), I(8));
+    rtIf(f, L("arr"), "eq", I(0), "oom");
+    rtOp(f, "q", L("arr"), "add", L("q"));
+    rtSet(f, "k", I(0)); rtSet(f, "i", I(0));
+    rtLabel(f, "copy");
+    rtIf(f, L("k"), "ge", G("__tx_rt_env_len"), "copied");
+    rtOp(f, "x", G("__tx_rt_env_buf"), "add", L("k"));
+    rtLoad(f, "w", L("x"), 0, 4);
+    rtLoad(f, "c", L("x"), 4, 4);
+    rtIf(f, L("c"), "eq", I(0), "cnext");
+    rtSet(f, "s", I(0));
+    rtLabel(f, "clen");
+    rtOp(f, "c", L("x"), "add", L("s")); rtLoad(f, "c", L("c"), 8, 1);
+    rtOp(f, "s", L("s"), "add", I(1));
+    rtIf(f, L("c"), "ne", I(0), "clen");
+    rtOp(f, "y", L("x"), "add", I(8));
+    rtCall3(f, "", memcpyName(), L("q"), L("y"), L("s"));
+    rtShift(f, "y", L("i"), "shl", 3); rtOp(f, "y", L("y"), "add", L("arr"));
+    rtStore(f, L("y"), 0, L("q"), 8);
+    rtOp(f, "q", L("q"), "add", L("s"));
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtLabel(f, "cnext");
+    rtOp(f, "k", L("k"), "add", L("w")); rtJump(f, "copy");
+    rtLabel(f, "copied");
+    rtShift(f, "y", L("i"), "shl", 3); rtOp(f, "y", L("y"), "add", L("arr"));
+    rtStore(f, L("y"), 0, I(0), 8);
+    rtCall0(f, "", "__tx_rt_unlock");
+    rtRet(f, L("arr"));
+    rtLabel(f, "oom");
+    rtCall0(f, "", "__tx_rt_unlock");
+    rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRet(f, I(0)); check(f);
+
+    // tempDir() 的 TMPDIR（非空才用）：持锁取值，无则 0。
+    f = rtBegin(b, "__tx_rt_env_tmpdir", "", "x c q", 2, "bootstrap/selfhost/nrt_rt.tx");
+    rtCall0(f, "", "__tx_rt_env_enter");
+    rtSet(f, "q", I(0));
+    rtCall2(f, "x", "__tx_rt_env_find", A(text(b, "TMPDIR")), I(6));
+    rtIf(f, L("x"), "eq", I(0), "done");
+    rtOp(f, "x", L("x"), "add", I(15));
+    rtLoad(f, "c", L("x"), 0, 1);
+    rtIf(f, L("c"), "eq", I(0), "done");
+    rtCall1(f, "q", "__tx_ffi_cstr_to_str", L("x"));
+    rtLabel(f, "done");
+    rtCall0(f, "", "__tx_rt_unlock");
+    rtRet(f, L("q")); check(f);
+}
+
+function emitEnvWindows(b: Ref<StructuredBuffer>): void {
+    // __tx_rt_env_get(p, n) → 新 string，未设置或名字不合法为 0。缓冲按所需长度重取，期间别的线程把值改长时
+    // 再取一次（原工具链 getEnv 在这种竞争下会越界读缓冲）。
+    let f = rtBegin(b, "__tx_rt_env_get", "p n", "ok w r t buf q", 3, "bootstrap/selfhost/nrt_rt.tx");
+    rtCall2(f, "ok", "__tx_rt_env_name_ok", L("p"), L("n"));
+    rtIf(f, L("ok"), "eq", I(0), "none");
+    rtCall2(f, "w", "__tx_file_wpath", L("p"), L("n"));
+    rtIf(f, L("w"), "eq", I(0), "oom");
+    rtCall3(f, "r", "GetEnvironmentVariableW", L("w"), I(0), I(0));
+    rtOp(f, "r", L("r"), "and", I(4294967295));
+    rtLabel(f, "again");
+    rtIf(f, L("r"), "eq", I(0), "nonefree");
+    rtOp(f, "t", L("r"), "add", L("r"));
+    rtCall2(f, "buf", "__tx_native_mem_alloc", L("t"), I(2));
+    rtIf(f, L("buf"), "eq", I(0), "oom");
+    rtCall3(f, "t", "GetEnvironmentVariableW", L("w"), L("buf"), L("r"));
+    rtOp(f, "t", L("t"), "and", I(4294967295));
+    rtIf(f, L("t"), "lt", L("r"), "fits");
+    rtCall1(f, "", "__tx_native_mem_free", L("buf"));
+    rtSet(f, "r", L("t"));
+    rtJump(f, "again");
+    rtLabel(f, "fits");
+    rtCall2(f, "q", "__tx_nrt_wide_to_str", L("buf"), L("t"));
+    rtCall1(f, "", "__tx_native_mem_free", L("buf"));
+    rtCall1(f, "", "__tx_native_mem_free", L("w"));
+    rtRet(f, L("q"));
+    rtLabel(f, "nonefree");
+    rtCall1(f, "", "__tx_native_mem_free", L("w"));
+    rtLabel(f, "none"); rtRet(f, I(0));
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRet(f, I(0)); check(f);
+
+    // __tx_rt_env_set(p, n, q, m) → 0／−1（空值给只含 NUL 的宽串：设为空串，不是删除）。
+    f = rtBegin(b, "__tx_rt_env_set", "p n q m", "ok w v r", 3, "bootstrap/selfhost/nrt_rt.tx");
+    rtCall2(f, "ok", "__tx_rt_env_name_ok", L("p"), L("n"));
+    rtIf(f, L("ok"), "eq", I(0), "bad");
+    rtCall2(f, "ok", "__tx_rt_nul_free", L("q"), L("m"));
+    rtIf(f, L("ok"), "eq", I(0), "bad");
+    rtCall2(f, "w", "__tx_file_wpath", L("p"), L("n"));
+    rtIf(f, L("w"), "eq", I(0), "oom");
+    rtIf(f, L("m"), "ne", I(0), "wide");
+    rtCall2(f, "v", "__tx_native_mem_alloc", I(4), I(1));
+    rtIf(f, L("v"), "eq", I(0), "oom");
+    rtStore(f, L("v"), 0, I(0), 4);
+    rtJump(f, "call");
+    rtLabel(f, "wide");
+    rtCall2(f, "v", "__tx_file_wpath", L("q"), L("m"));
+    rtIf(f, L("v"), "eq", I(0), "oom");
+    rtLabel(f, "call");
+    rtCall2(f, "r", "SetEnvironmentVariableW", L("w"), L("v"));
+    rtOp(f, "r", L("r"), "and", I(4294967295));
+    rtCall1(f, "", "__tx_native_mem_free", L("v"));
+    rtCall1(f, "", "__tx_native_mem_free", L("w"));
+    rtIf(f, L("r"), "eq", I(0), "bad");
+    rtRet(f, I(0));
+    rtLabel(f, "bad"); rtRet(f, I(-1));
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRet(f, I(-1)); check(f);
+}
+
+/// 代码段：锁、页、句柄表、环境变量与五个 __rt 内建。
+// 命令行参数（D3 v0.41，docs/design/v052-argv-entry-v0.1-20261025.md）：入口在任何太虚代码运行之前把参数表写进
+// __tx_rt_argv／__tx_rt_argc，此后只读，不需要锁。入口已校验每个参数是合法 UTF-8，这里照常经 __tx_ffi_cstr_to_str 构造。
+function emitArgs(b: Ref<StructuredBuffer>): void {
+    // __rtArgCount(): int — 参数个数，不含程序名（等于 main 的 len(args)）；入口没有保存参数表时为 0。
+    let f = rtBegin(b, "__tx_bi_rt_arg_count", "win fn pc a nargs", "n", 5, "bootstrap/selfhost/nrt_rt.tx");
+    arity(b, f, 0);
+    rtSet(f, "n", G("__tx_rt_argc"));
+    rtIf(f, L("n"), "eq", I(0), "set");
+    rtOp(f, "n", L("n"), "sub", I(1));
+    rtLabel(f, "set");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_INT), L("n")); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    rtRetVoid(f); check(f);
+
+    // __rtArgAt(i): string? — 第 i 个参数（0 起，不含程序名）的新字符串；越界为 None。
+    f = rtBegin(b, "__tx_bi_rt_arg_at", "win fn pc a nargs", "s t i p q", 5, "bootstrap/selfhost/nrt_rt.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", TAG_INT, "type");
+    rtLoad(f, "i", L("s"), 8, 8);
+    rtIf(f, L("i"), "lt", I(0), "none");
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtIf(f, L("i"), "uge", G("__tx_rt_argc"), "none");
+    rtShift(f, "p", L("i"), "shl", 3);
+    rtOp(f, "p", L("p"), "add", G("__tx_rt_argv"));
+    rtLoad(f, "p", L("p"), 0, 8);
+    rtCall1(f, "q", "__tx_ffi_cstr_to_str", L("p"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_STR), L("q")); rtRetVoid(f);
+    rtLabel(f, "none");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_NONE), I(0)); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "__rtArgAt 的实参不是 int");
+    rtRetVoid(f); check(f);
+}
+
+export function emitNrtRt(b: Ref<StructuredBuffer>): void {
+    const t = nrtTarget();
+    emitPrims(b, t);
+    emitHandles(b);
+    emitEnvCommon(b);
+    if (tUnix(t)) { emitEnvLinux(b); } else { emitEnvWindows(b); }
+    emitArgs(b);
+}

@@ -1,0 +1,900 @@
+// procSpawn 的程序对象例程（第 6 轮 6c-3，TOOL-103，docs/design/v052-round6-debug-v0.1-20261018.md §四-6）。
+// procSpawn(exe, args, cwd, opts): int | Error——不经 shell、不按 PATH 查找；stdout、stderr 恒走管道，opts 位 0＝stdin
+// 走管道（否则接空设备），位 1＝建控制通道（子进程读 cR、写 eW，环境变量 TAIXU_DEBUG_CHANNEL=<cR>,<eW>）。
+// 子进程环境＝本进程启动时的环境去掉 TAIXU_DEBUG_CHANNEL。启动失败得 Error，文案同 runProcess（__tx_store_file_err）。
+// 内存不足按 runProcess 先例致命（__tx_native_object_oom_v1）。
+import { StructuredBuffer, asBufferSection, asBufferAlign, asBufferLabel, asBufferByte } from "./assemble";
+import { RtFn, L, I, A } from "./rtfn_base";
+import { rtBegin, rtSet, rtOp, rtShift, rtDivMod, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtIf32, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtCall5, rtSyscall, rtRet, rtRetVoid, rtStoreRel, rtTag } from "./rtfn";
+import { callWinImport } from "./ffi_callbacks";
+import { TB_MASK } from "./thread_block_abi";
+import { emitMsvcQuote, linuxCloseRange } from "./nrt_proc";
+import { emitBudgetHelpers, budgetArguments, budgetArgumentTrap, budgetLinuxChild, budgetCloseWindows } from "./tool_budget";
+import { R_JOB, REC_COUNT, REC_SHIFT, REC_BYTES, R_GEN, R_STATE, R_OWNER, R_PROC, R_IN, R_OUT, R_ERR, R_CW, R_CR, R_DONE, R_CODE, TAG_INT, TAG_ERR, TAG_STR, TAG_LIST, CHANNEL_VAR, toolCheck, xs0, xs1, xs2, xs3, xs4, xs5, xs7, toolText, toolTrap, toolArity, toolArg, toolArgInt, toolArgSpan } from "./tool_base";
+import { tRawSyscall, tUnix, tMacos } from "./target";
+import { uxSys, uxMac, uxConst } from "./unix_sys";
+import { emitMacSpawnSupport, emitMacDevNull, macPosixSpawn, macForkSpawn } from "./tool_mac_spawn";
+
+const HANDLES: string = "inR inW outR outW errR errW cR cW eR eW";
+
+export function emitToolSpawn(b: Ref<StructuredBuffer>, t: int): void {
+    emitBudgetHelpers(b, t);
+    emitClaim(b);
+    emitHasNul(b);
+    emitDec(b);
+    if (tUnix(t)) {
+        emitUnixHelpers(b, t);
+        if (tMacos(t)) { emitMacSpawnSupport(b, t); emitMacDevNull(b, t); } else { emitEnviron(b); }
+        emitSpawnUnix(b, false, t);
+        emitSpawnUnix(b, true, t);
+    } else {
+        toolCheck(emitMsvcQuote(b, "__tx_tool_quote", "__tx_tool_copy"));
+        emitEnvBlock(b);
+        emitSpawnWindows(b, false);
+        emitSpawnWindows(b, true);
+    }
+}
+
+// __tx_tool_claim(win) → 领到的表项（状态 1、代数加一、记下本线程块，各端置 −1）；表满为 0。
+function emitClaim(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "__tx_tool_claim", "win", "k e r g o", 3, "bootstrap/selfhost/tool_spawn.tx");
+    rtSet(f, "k", I(0));
+    rtLabel(f, "loop");
+    rtIf(f, L("k"), "ge", I(REC_COUNT), "full");
+    rtOp(f, "e", L("k"), "imul", I(REC_BYTES));
+    rtOp(f, "e", L("e"), "add", A("__tx_tool_recs"));
+    rtOp(f, "r", L("e"), "add", I(R_STATE));
+    rtCall3(f, "r", "__tx_tool_cas", L("r"), I(0), I(1));
+    rtIf(f, L("r"), "ne", I(0), "got");
+    rtOp(f, "k", L("k"), "add", I(1));
+    rtJump(f, "loop");
+    rtLabel(f, "got");
+    rtLoad(f, "g", L("e"), R_GEN, 8);
+    rtOp(f, "g", L("g"), "add", I(1));
+    rtStore(f, L("e"), R_GEN, L("g"), 8);
+    rtOp(f, "o", L("win"), "and", I(TB_MASK));
+    rtStore(f, L("e"), R_OWNER, L("o"), 8);
+    rtStore(f, L("e"), R_PROC, I(0), 8);
+    rtStore(f, L("e"), R_IN, I(-1), 8);
+    rtStore(f, L("e"), R_OUT, I(-1), 8);
+    rtStore(f, L("e"), R_ERR, I(-1), 8);
+    rtStore(f, L("e"), R_CW, I(-1), 8);
+    rtStore(f, L("e"), R_CR, I(-1), 8);
+    rtStore(f, L("e"), R_DONE, I(0), 8);
+    rtStore(f, L("e"), R_CODE, I(0), 8);
+    rtStore(f, L("e"), R_JOB, I(0), 8);
+    rtRet(f, L("e"));
+    rtLabel(f, "full");
+    rtRet(f, I(0));
+    toolCheck(f);
+}
+
+// __tx_tool_hasnul(p, n) → 1 含 NUL 字节（路径与参数里的 NUL 会截断系统调用看到的串，按无效实参拒绝）。
+function emitHasNul(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "__tx_tool_hasnul", "p n", "c", 0, "bootstrap/selfhost/tool_spawn.tx");
+    rtLabel(f, "top");
+    rtIf(f, L("n"), "le", I(0), "no");
+    rtLoad(f, "c", L("p"), 0, 1);
+    rtIf(f, L("c"), "eq", I(0), "yes");
+    rtOp(f, "p", L("p"), "add", I(1));
+    rtOp(f, "n", L("n"), "sub", I(1));
+    rtJump(f, "top");
+    rtLabel(f, "yes");
+    rtRet(f, I(1));
+    rtLabel(f, "no");
+    rtRet(f, I(0));
+    toolCheck(f);
+}
+
+// __tx_tool_dec(d, v, wide) → 在 d 写 v（≥0）的十进制数字，返回新的末尾；wide 非 0 时按 UTF-16 写。
+function emitDec(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "__tx_tool_dec", "d v wide", "b0 b1 b2 bp k q r c", 0, "bootstrap/selfhost/tool_spawn.tx");
+    rtAddrOf(f, "bp", "b0");
+    rtSet(f, "k", I(0));
+    rtLabel(f, "digit");
+    rtDivMod(f, "q", "r", L("v"), I(10));
+    rtOp(f, "c", L("r"), "add", I(48));
+    rtOp(f, "r", L("bp"), "add", L("k"));
+    rtStore(f, L("r"), 0, L("c"), 1);
+    rtOp(f, "k", L("k"), "add", I(1));
+    rtSet(f, "v", L("q"));
+    rtIf(f, L("v"), "gt", I(0), "digit");
+    rtLabel(f, "emit");
+    rtIf(f, L("k"), "le", I(0), "done");
+    rtOp(f, "k", L("k"), "sub", I(1));
+    rtOp(f, "r", L("bp"), "add", L("k"));
+    rtLoad(f, "c", L("r"), 0, 1);
+    rtStore(f, L("d"), 0, L("c"), 1);
+    rtOp(f, "d", L("d"), "add", I(1));
+    rtIf(f, L("wide"), "eq", I(0), "emit");
+    rtStore(f, L("d"), 0, I(0), 1);
+    rtOp(f, "d", L("d"), "add", I(1));
+    rtJump(f, "emit");
+    rtLabel(f, "done");
+    rtRet(f, L("d"));
+    toolCheck(f);
+}
+
+// 两个目标共用的实参检查：exe 跨度 (ep, en) 与串下标 te，参数表 (base, cnt)，cwd 跨度 (cp, cn) 与串下标 tc，opts。
+// 空程序路径、任一串含 NUL：Error invalid argument。之后领表项，表满：Error io error。
+function spawnHead(f: Ref<RtFn>, limited: bool): void {
+    if (limited) { toolArity(f, 6); } else { toolArity(f, 4); }
+    toolArgSpan(f, 0, TAG_STR, "o", "ep", "en", "t0bad");
+    rtLoad(f, "te", L("s"), 8, 4);
+    toolArg(f, 1, TAG_LIST, "t1bad");
+    rtLoad(f, "lo", L("s"), 8, 4);
+    rtCall1(f, "lo", "__tx_native_object_address_v1", L("lo"));
+    rtLoad(f, "base", L("lo"), 32, 8);
+    rtLoad(f, "cnt", L("lo"), 40, 8);
+    toolArgSpan(f, 2, TAG_STR, "o", "cp", "cn", "t2bad");
+    rtLoad(f, "tc", L("s"), 8, 4);
+    toolArgInt(f, 3, "opts", "t3bad");
+    if (limited) { budgetArguments(f); }
+    rtIf(f, L("opts"), "lt", I(0), "badopts");
+    rtIf(f, L("opts"), "gt", I(3), "badopts");
+    rtOp(f, "ctl", L("opts"), "and", I(2));
+    // 参数表的元素都须是 string（通用形态，每个 16 字节槽：标签@0、对象下标@8）。
+    rtSet(f, "i", I(0));
+    rtLabel(f, "elems");
+    rtIf(f, L("i"), "ge", L("cnt"), "elemsok");
+    rtShift(f, "e", L("i"), "shl", 4);
+    rtOp(f, "e", L("e"), "add", L("base"));
+    rtLoad(f, "x", L("e"), 0, 1);
+    rtIf(f, L("x"), "ne", I(TAG_STR), "elembad");
+    elemSpan(f);
+    rtCall2(f, "x", "__tx_tool_hasnul", L("p"), L("n"));
+    rtIf(f, L("x"), "ne", I(0), "badarg");
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "elems");
+    rtLabel(f, "elemsok");
+    rtSet(f, "st", I(1));
+    rtSet(f, "et", L("te"));
+    rtIf(f, L("en"), "eq", I(0), "error");
+    rtCall2(f, "x", "__tx_tool_hasnul", L("ep"), L("en"));
+    rtIf(f, L("x"), "ne", I(0), "error");
+    rtSet(f, "et", L("tc"));
+    rtCall2(f, "x", "__tx_tool_hasnul", L("cp"), L("cn"));
+    rtIf(f, L("x"), "ne", I(0), "error");
+    rtSet(f, "st", I(5));
+    rtSet(f, "et", L("te"));
+    rtCall1(f, "rec", "__tx_tool_claim", L("win"));
+    rtIf(f, L("rec"), "eq", I(0), "error");
+    const hs = strSplit(HANDLES, " ");
+    let k = 0;
+    while (k < listLen(hs)) { rtSet(f, listGet(hs, k) catch "inR", I(-1)); k = k + 1; }
+}
+
+// 参数表第 i 个元素的数据区 (p, n)。
+function elemSpan(f: Ref<RtFn>): void {
+    rtShift(f, "e", L("i"), "shl", 4);
+    rtOp(f, "e", L("e"), "add", L("base"));
+    rtLoad(f, "o", L("e"), 8, 4);
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("o"));
+    rtLoad(f, "p", L("o"), 32, 8);
+    rtLoad(f, "n", L("o"), 40, 8);
+}
+
+// 成功：把父进程这端记进表项、关掉子进程那端，返回句柄＝代数×REC_COUNT＋槽号。
+function spawnDone(f: Ref<RtFn>): void {
+    rtStore(f, L("rec"), R_IN, L("inW"), 8);
+    rtStore(f, L("rec"), R_OUT, L("outR"), 8);
+    rtStore(f, L("rec"), R_ERR, L("errR"), 8);
+    rtStore(f, L("rec"), R_CW, L("cW"), 8);
+    rtStore(f, L("rec"), R_CR, L("eR"), 8);
+    closeAll(f, "inR outW errW cR eW");
+    rtStoreRel(f, L("rec"), R_STATE, I(2));
+    rtOp(f, "x", L("rec"), "sub", A("__tx_tool_recs"));
+    rtDivMod(f, "x", "", L("x"), I(REC_BYTES));
+    rtLoad(f, "g", L("rec"), R_GEN, 8);
+    rtShift(f, "g", L("g"), "shl", REC_SHIFT);
+    rtOp(f, "x", L("x"), "add", L("g"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_INT), L("x"));
+    rtRetVoid(f);
+}
+
+function closeAll(f: Ref<RtFn>, names: string): void {
+    const hs = strSplit(names, " ");
+    let k = 0;
+    while (k < listLen(hs)) {
+        const h = listGet(hs, k) catch "inR";
+        rtCall1(f, "", "__tx_tool_close", L(h));
+        rtSet(f, h, I(-1));
+        k = k + 1;
+    }
+}
+
+// 失败：关掉全部管道端、归还表项，再报 Error {st}: {et 所指的串}。
+function spawnFail(b: Ref<StructuredBuffer>, f: Ref<RtFn>): void {
+    rtLabel(f, "fail");
+    closeAll(f, HANDLES);
+    rtStoreRel(f, L("rec"), R_STATE, I(0));
+    rtLabel(f, "error");
+    rtCall4(f, "q", "__tx_store_file_err", L("st"), L("et"), L("fn"), L("pc"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_ERR), L("q"));
+    rtRetVoid(f);
+    rtLabel(f, "oom");
+    rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRetVoid(f);
+    toolTrap(b, f, "arity", 4010, "内建函数实参数目错误");
+    toolTrap(b, f, "t0bad", 4010, "procSpawn 第一实参（程序路径）不是 string");
+    toolTrap(b, f, "t1bad", 4010, "procSpawn 第二实参（参数）不是 List");
+    toolTrap(b, f, "elembad", 4010, "procSpawn 第二实参的元素不是 string");
+    toolTrap(b, f, "t2bad", 4010, "procSpawn 第三实参（工作目录）不是 string");
+    toolTrap(b, f, "t3bad", 4010, "procSpawn 第四实参（选项位）不是 int");
+    toolTrap(b, f, "badopts", 4010, "procSpawn 的选项位须在 0..3（位 0 stdin 走管道，位 1 建控制通道）");
+    rtRetVoid(f);
+    // 参数里含 NUL：Error invalid argument: {exe}。
+    rtLabel(f, "badarg");
+    rtSet(f, "st", I(1));
+    rtSet(f, "et", L("te"));
+    rtJump(f, "error");
+}
+
+const COMMON: string = "s t o ep en te lo base cnt i e x p n cp cn tc opts ctl st et rec g q r";
+
+// ---------------------------------------------------------------- Windows
+
+// __tx_tool_u16(p) → p 处的 UTF-16 单元（逐字节读，不越过块尾）。
+// __tx_tool_envmatch(p) → 1：p 处的条目以 TAIXU_DEBUG_CHANNEL= 开头（变量名不分大小写）。
+// __tx_tool_envblock(cr, ew, ctl) → 新的 UTF-16 环境块：本进程的环境去掉 TAIXU_DEBUG_CHANNEL，ctl 非 0 时追加本次的。
+function emitEnvBlock(b: Ref<StructuredBuffer>): void {
+    const prefix = toolText(b, CHANNEL_VAR + "=");
+    let f = rtBegin(b, "__tx_tool_u16", "p", "lo hi", 0, "bootstrap/selfhost/tool_spawn.tx");
+    rtLoad(f, "lo", L("p"), 0, 1);
+    rtLoad(f, "hi", L("p"), 1, 1);
+    rtShift(f, "hi", L("hi"), "shl", 8);
+    rtOp(f, "lo", L("lo"), "or", L("hi"));
+    rtRet(f, L("lo"));
+    toolCheck(f);
+
+    f = rtBegin(b, "__tx_tool_envmatch", "p", "k c w", 1, "bootstrap/selfhost/tool_spawn.tx");
+    rtSet(f, "k", I(0));
+    rtLabel(f, "loop");
+    rtIf(f, L("k"), "ge", I(len(CHANNEL_VAR) + 1), "yes");
+    rtCall1(f, "c", "__tx_tool_u16", L("p"));
+    rtIf(f, L("c"), "lt", I(97), "cased");
+    rtIf(f, L("c"), "gt", I(122), "cased");
+    rtOp(f, "c", L("c"), "sub", I(32));
+    rtLabel(f, "cased");
+    rtOp(f, "w", A(prefix), "add", L("k"));
+    rtLoad(f, "w", L("w"), 0, 1);
+    rtIf(f, L("c"), "ne", L("w"), "no");
+    rtOp(f, "p", L("p"), "add", I(2));
+    rtOp(f, "k", L("k"), "add", I(1));
+    rtJump(f, "loop");
+    rtLabel(f, "yes");
+    rtRet(f, I(1));
+    rtLabel(f, "no");
+    rtRet(f, I(0));
+    toolCheck(f);
+
+    f = rtBegin(b, "__tx_tool_envblock", "cr ew ctl", "blk p e c nb d k x gp ef", 3, "bootstrap/selfhost/tool_spawn.tx");
+    callWinImport(f, "blk", "GetEnvironmentStringsW", xs0());
+    // 量出原块的条目总长（不含末尾的空条目）。
+    rtSet(f, "p", L("blk"));
+    rtIf(f, L("blk"), "eq", I(0), "measured");
+    rtLabel(f, "m1");
+    rtCall1(f, "c", "__tx_tool_u16", L("p"));
+    rtIf(f, L("c"), "eq", I(0), "measured");
+    rtLabel(f, "m2");
+    rtCall1(f, "c", "__tx_tool_u16", L("p"));
+    rtOp(f, "p", L("p"), "add", I(2));
+    rtIf(f, L("c"), "ne", I(0), "m2");
+    rtJump(f, "m1");
+    rtLabel(f, "measured");
+    rtOp(f, "x", L("p"), "sub", L("blk"));
+    rtOp(f, "x", L("x"), "add", I(256));
+    rtCall2(f, "nb", "__tx_native_mem_alloc", L("x"), I(2));
+    rtIf(f, L("nb"), "eq", I(0), "oom");
+    rtSet(f, "d", L("nb"));
+    rtSet(f, "p", L("blk"));
+    rtIf(f, L("blk"), "eq", I(0), "copied");
+    rtLabel(f, "c1");
+    rtCall1(f, "c", "__tx_tool_u16", L("p"));
+    rtIf(f, L("c"), "eq", I(0), "copied");
+    rtSet(f, "e", L("p"));
+    rtLabel(f, "c2");
+    rtCall1(f, "c", "__tx_tool_u16", L("e"));
+    rtOp(f, "e", L("e"), "add", I(2));
+    rtIf(f, L("c"), "ne", I(0), "c2");
+    rtCall1(f, "k", "__tx_tool_envmatch", L("p"));
+    rtIf(f, L("k"), "ne", I(0), "skip");
+    rtOp(f, "x", L("e"), "sub", L("p"));
+    rtCall3(f, "", "__tx_tool_copy", L("d"), L("p"), L("x"));
+    rtOp(f, "d", L("d"), "add", L("x"));
+    rtLabel(f, "skip");
+    rtSet(f, "p", L("e"));
+    rtJump(f, "c1");
+    rtLabel(f, "copied");
+    rtIf(f, L("ctl"), "eq", I(0), "close");
+    rtSet(f, "k", I(0));
+    rtLabel(f, "pre");
+    rtIf(f, L("k"), "ge", I(len(CHANNEL_VAR) + 1), "num");
+    rtOp(f, "x", A(prefix), "add", L("k"));
+    rtLoad(f, "x", L("x"), 0, 1);
+    rtStore(f, L("d"), 0, L("x"), 1);
+    rtStore(f, L("d"), 1, I(0), 1);
+    rtOp(f, "d", L("d"), "add", I(2));
+    rtOp(f, "k", L("k"), "add", I(1));
+    rtJump(f, "pre");
+    rtLabel(f, "num");
+    rtCall3(f, "d", "__tx_tool_dec", L("d"), L("cr"), I(1));
+    rtStore(f, L("d"), 0, I(44), 1);
+    rtStore(f, L("d"), 1, I(0), 1);
+    rtOp(f, "d", L("d"), "add", I(2));
+    rtCall3(f, "d", "__tx_tool_dec", L("d"), L("ew"), I(1));
+    rtStore(f, L("d"), 0, I(0), 1);
+    rtStore(f, L("d"), 1, I(0), 1);
+    rtOp(f, "d", L("d"), "add", I(2));
+    rtLabel(f, "close");
+    // 块以一个空条目结束；没有任何条目时须是两个 NUL 单元。
+    rtIf(f, L("d"), "ne", L("nb"), "last");
+    rtStore(f, L("d"), 0, I(0), 4);
+    rtOp(f, "d", L("d"), "add", I(2));
+    rtLabel(f, "last");
+    rtStore(f, L("d"), 0, I(0), 1);
+    rtStore(f, L("d"), 1, I(0), 1);
+    rtIf(f, L("blk"), "eq", I(0), "done");
+    callWinImport(f, "", "FreeEnvironmentStringsW", xs1(L("blk")));
+    rtLabel(f, "done");
+    rtRet(f, L("nb"));
+    rtLabel(f, "oom");
+    rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRet(f, I(0));
+    toolCheck(f);
+}
+
+// 一个宽字符串常量（UTF-16，NUL 结尾）。
+function wideConst(b: Ref<StructuredBuffer>, label: string, text: string): void {
+    asBufferSection(b, 1, 1);
+    asBufferAlign(b, 1, 1);
+    asBufferLabel(b, label, 1);
+    let i = 0;
+    while (i < len(text)) { asBufferByte(b, byteAt(text, i) catch 0, 1); asBufferByte(b, 0, 1); i = i + 1; }
+    asBufferByte(b, 0, 1);
+    asBufferByte(b, 0, 1);
+    asBufferSection(b, 0, 1);
+}
+
+function emitSpawnWindows(b: Ref<StructuredBuffer>, limited: bool): void {
+    if (!limited) { wideConst(b, "__tx_tool_nul_w", "NUL"); }
+    const locals = COMMON + " budgetMem budgetCpu budgetError " + HANDLES + " k cap buf d cmdW exeW cwdW env attr ai asz ap hl0 hl1 hl2 hl3 hl4 hp" +
+    " si0 si1 si2 si3 si4 si5 si6 si7 si8 si9 si10 si11 si12 si13 sip pi0 pi1 pi2 pip gp ef";
+    let name = "__tx_tool_proc_spawn";
+    if (limited) { name = name + "_limited"; }
+    const f = rtBegin(b, name, "win fn pc a bi nargs", locals, 10, "bootstrap/selfhost/tool_spawn.tx");
+    spawnHead(f, limited);
+    rtSet(f, "cmdW", I(0)); rtSet(f, "exeW", I(0)); rtSet(f, "cwdW", I(0)); rtSet(f, "env", I(0));
+    rtSet(f, "attr", I(0)); rtSet(f, "ai", I(0));
+    // 命令行（UTF-8）：加引号的 exe 与各参数以空格分隔，再转 UTF-16。容量按最坏情形（每字节翻倍，外加引号与空格）。
+    rtOp(f, "cap", L("en"), "add", L("en"));
+    rtOp(f, "cap", L("cap"), "add", I(4));
+    rtSet(f, "i", I(0));
+    rtLabel(f, "size");
+    rtIf(f, L("i"), "ge", L("cnt"), "sized");
+    elemSpan(f);
+    rtOp(f, "cap", L("cap"), "add", L("n"));
+    rtOp(f, "cap", L("cap"), "add", L("n"));
+    rtOp(f, "cap", L("cap"), "add", I(4));
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "size");
+    rtLabel(f, "sized");
+    rtCall2(f, "buf", "__tx_native_mem_alloc", L("cap"), I(1));
+    rtIf(f, L("buf"), "eq", I(0), "oom");
+    rtCall3(f, "d", "__tx_tool_quote", L("buf"), L("ep"), L("en"));
+    rtSet(f, "i", I(0));
+    rtLabel(f, "build");
+    rtIf(f, L("i"), "ge", L("cnt"), "built");
+    elemSpan(f);
+    rtStore(f, L("d"), 0, I(32), 1);
+    rtOp(f, "d", L("d"), "add", I(1));
+    rtCall3(f, "d", "__tx_tool_quote", L("d"), L("p"), L("n"));
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "build");
+    rtLabel(f, "built");
+    rtOp(f, "n", L("d"), "sub", L("buf"));
+    rtCall2(f, "cmdW", "__tx_file_wpath", L("buf"), L("n"));
+    rtCall1(f, "", "__tx_native_mem_free", L("buf"));
+    rtIf(f, L("cmdW"), "eq", I(0), "oom");
+    rtCall2(f, "exeW", "__tx_file_wpath", L("ep"), L("en"));
+    rtIf(f, L("exeW"), "eq", I(0), "oom");
+    rtIf(f, L("cn"), "eq", I(0), "pipes");
+    rtCall2(f, "cwdW", "__tx_file_wpath", L("cp"), L("cn"));
+    rtIf(f, L("cwdW"), "eq", I(0), "oom");
+    // 管道：父进程这端不可继承，子进程那端随后标为可继承，并经句柄列表只交给这个子进程。
+    rtLabel(f, "pipes");
+    winPipe(f, "outR", "outW");
+    winPipe(f, "errR", "errW");
+    rtOp(f, "x", L("opts"), "and", I(1));
+    rtIf(f, L("x"), "eq", I(0), "nulin");
+    winPipe(f, "inR", "inW");
+    rtJump(f, "ctl");
+    rtLabel(f, "nulin");
+    callWinImport(f, "inR", "CreateFileW", xs7(A("__tx_tool_nul_w"), I(2147483648), I(3), I(0), I(3), I(0), I(0)));
+    rtIf(f, L("inR"), "eq", I(-1), "lasterr");
+    rtLabel(f, "ctl");
+    rtIf(f, L("ctl"), "eq", I(0), "inherit");
+    winPipe(f, "cR", "cW");
+    winPipe(f, "eR", "eW");
+    rtLabel(f, "inherit");
+    const kids = strSplit("inR outW errW cR eW", " ");
+    let k = 0;
+    while (k < listLen(kids)) {
+        const h = listGet(kids, k) catch "inR";
+        const next = "inh" + toStr(k);
+        rtIf(f, L(h), "eq", I(-1), next);
+        callWinImport(f, "r", "SetHandleInformation", xs3(L(h), I(1), I(1)));
+        rtIf32(f, L("r"), "eq", I(0), "lasterr");
+        rtLabel(f, next);
+        k = k + 1;
+    }
+    rtCall3(f, "env", "__tx_tool_envblock", L("cR"), L("eW"), L("ctl"));
+    // 属性列表：只继承列明的句柄（PROC_THREAD_ATTRIBUTE_HANDLE_LIST）。
+    rtSet(f, "asz", I(0));
+    rtAddrOf(f, "ap", "asz");
+    callWinImport(f, "", "InitializeProcThreadAttributeList", xs4(I(0), I(1), I(0), L("ap")));
+    rtIf(f, L("asz"), "eq", I(0), "lasterr");
+    rtCall2(f, "attr", "__tx_native_mem_alloc", L("asz"), I(16));
+    rtIf(f, L("attr"), "eq", I(0), "oom");
+    callWinImport(f, "r", "InitializeProcThreadAttributeList", xs4(L("attr"), I(1), I(0), L("ap")));
+    rtIf32(f, L("r"), "eq", I(0), "lasterr");
+    rtSet(f, "ai", I(1));
+    rtSet(f, "hl0", L("inR")); rtSet(f, "hl1", L("outW")); rtSet(f, "hl2", L("errW"));
+    rtSet(f, "hl3", L("cR")); rtSet(f, "hl4", L("eW"));
+    rtSet(f, "k", I(24));
+    rtIf(f, L("ctl"), "eq", I(0), "listed");
+    rtSet(f, "k", I(40));
+    rtLabel(f, "listed");
+    rtAddrOf(f, "hp", "hl0");
+    callWinImport(f, "r", "UpdateProcThreadAttribute", xs7(L("attr"), I(0), I(131074), L("hp"), L("k"), I(0), I(0)));
+    rtIf32(f, L("r"), "eq", I(0), "lasterr");
+    // STARTUPINFOEXW（112 字节）：cb、dwFlags@60＝STARTF_USESTDHANDLES、标准句柄@80/88/96、属性列表@104。
+    let z = 0;
+    while (z < 14) { rtSet(f, "si" + toStr(z), I(0)); z = z + 1; }
+    rtSet(f, "pi0", I(0)); rtSet(f, "pi1", I(0)); rtSet(f, "pi2", I(0));
+    rtAddrOf(f, "sip", "si0");
+    rtStore(f, L("sip"), 0, I(112), 4);
+    rtStore(f, L("sip"), 60, I(256), 4);
+    rtStore(f, L("sip"), 80, L("inR"), 8);
+    rtStore(f, L("sip"), 88, L("outW"), 8);
+    rtStore(f, L("sip"), 96, L("errW"), 8);
+    rtStore(f, L("sip"), 104, L("attr"), 8);
+    rtAddrOf(f, "pip", "pi0");
+    // EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW。
+    const cp = xs5(L("exeW"), L("cmdW"), I(0), I(0), I(1));
+    if (limited) {
+        rtCall2(f, "x", "__tx_tool_budget_new", L("budgetMem"), L("budgetCpu"));
+        rtIf(f, L("x"), "eq", I(0), "lasterr");
+        rtStore(f, L("rec"), R_JOB, L("x"), 8);
+        listPush(cp, I(134743044));
+    } else { listPush(cp, I(134743040)); }
+    listPush(cp, L("env")); listPush(cp, L("cwdW")); listPush(cp, L("sip")); listPush(cp, L("pip"));
+    callWinImport(f, "r", "CreateProcessW", cp);
+    rtIf32(f, L("r"), "eq", I(0), "lasterr");
+    if (limited) {
+        rtLoad(f, "x", L("rec"), R_JOB, 8);
+        callWinImport(f, "r", "AssignProcessToJobObject", xs2(L("x"), L("pi0")));
+        rtIf32(f, L("r"), "eq", I(0), "budget_attach_fail");
+        callWinImport(f, "r", "ResumeThread", xs1(L("pi1")));
+        rtIf32(f, L("r"), "ne", I(4294967295), "budget_attached");
+        rtLabel(f, "budget_attach_fail");
+        callWinImport(f, "budgetError", "GetLastError", xs0());
+        callWinImport(f, "", "TerminateProcess", xs2(L("pi0"), I(1)));
+        callWinImport(f, "", "WaitForSingleObject", xs2(L("pi0"), I(4294967295)));
+        callWinImport(f, "", "CloseHandle", xs1(L("pi0")));
+        callWinImport(f, "", "CloseHandle", xs1(L("pi1")));
+        callWinImport(f, "", "SetLastError", xs1(L("budgetError")));
+        rtJump(f, "lasterr");
+        rtLabel(f, "budget_attached");
+    }
+    callWinImport(f, "", "CloseHandle", xs1(L("pi1")));
+    rtStore(f, L("rec"), R_PROC, L("pi0"), 8);
+    winRelease(f);
+    spawnDone(f);
+    // 系统错误码 → 状态：2/3 找不到、5 拒绝访问、123/193/216 不是有效的程序、267 工作目录无效（报该目录）。
+    rtLabel(f, "lasterr");
+    callWinImport(f, "r", "GetLastError", xs0());
+    rtOp(f, "r", L("r"), "and", I(4294967295));
+    rtSet(f, "et", L("te"));
+    rtSet(f, "st", I(3));
+    rtIf(f, L("r"), "eq", I(2), "mapped");
+    rtIf(f, L("r"), "eq", I(3), "mapped");
+    rtSet(f, "st", I(4));
+    rtIf(f, L("r"), "eq", I(5), "mapped");
+    rtSet(f, "st", I(1));
+    rtIf(f, L("r"), "eq", I(123), "mapped");
+    rtIf(f, L("r"), "eq", I(193), "mapped");
+    rtIf(f, L("r"), "eq", I(216), "mapped");
+    rtSet(f, "st", I(5));
+    rtIf(f, L("r"), "ne", I(267), "mapped");
+    rtSet(f, "st", I(3));
+    rtSet(f, "et", L("tc"));
+    rtLabel(f, "mapped");
+    if (limited) { budgetCloseWindows(f); }
+    winRelease(f);
+    rtJump(f, "fail");
+    spawnFail(b, f);
+    if (limited) { budgetArgumentTrap(b, f); }
+    toolCheck(f);
+}
+
+// CreatePipe(&r, &w, NULL, 64 KiB)；失败转 lasterr。
+function winPipe(f: Ref<RtFn>, r: string, w: string): void {
+    rtAddrOf(f, "p", r);
+    rtAddrOf(f, "q", w);
+    callWinImport(f, "x", "CreatePipe", xs4(L("p"), L("q"), I(0), I(65536)));
+    rtIf32(f, L("x"), "eq", I(0), "lasterr");
+}
+
+// 释放启动用的缓冲与属性列表（成功、失败两条路都走）。
+function winRelease(f: Ref<RtFn>): void {
+    const tag = rtTag(f);
+    const bufs = strSplit("cmdW exeW cwdW env", " ");
+    let k = 0;
+    while (k < listLen(bufs)) {
+        const v = listGet(bufs, k) catch "cmdW";
+        const next = "rel" + v + tag;
+        rtIf(f, L(v), "eq", I(0), next);
+        rtCall1(f, "", "__tx_native_mem_free", L(v));
+        rtSet(f, v, I(0));
+        rtLabel(f, next);
+        k = k + 1;
+    }
+    const tail = "relattr" + tag;
+    rtIf(f, L("attr"), "eq", I(0), tail);
+    rtIf(f, L("ai"), "eq", I(0), tail + "f");
+    callWinImport(f, "", "DeleteProcThreadAttributeList", xs1(L("attr")));
+    rtSet(f, "ai", I(0));
+    rtLabel(f, tail + "f");
+    rtCall1(f, "", "__tx_native_mem_free", L("attr"));
+    rtSet(f, "attr", I(0));
+    rtLabel(f, tail);
+}
+
+// ---------------------------------------------------------------- Unix（Linux、macOS）
+
+// __tx_tool_lift(fd) → 编号 ≥3 的同一文件（小于 3 时 F_DUPFD_CLOEXEC 挪上去并关掉原号）；失败 −1。
+// __tx_tool_pipe(rp, wp) → 0 成功；pipe2(O_CLOEXEC) 两端各经 lift 写到 *rp、*wp（失败的一端写 −1）。macOS 没有 pipe2：
+// 在内核的 fork 锁内 pipe 后逐端置 FD_CLOEXEC（nrt_proc.tx 的 __tx_nrt_fork_lock）。
+// __tx_tool_nonblock(fd)：设 O_NONBLOCK（只在父进程的读端上）。
+// __tx_tool_cstr(p, n) → 新分配的 NUL 结尾副本。
+function emitUnixHelpers(b: Ref<StructuredBuffer>, t: int): void {
+    let f = rtBegin(b, "__tx_tool_lift", "fd", "n", 0, "bootstrap/selfhost/tool_spawn.tx");
+    rtIf(f, L("fd"), "lt", I(0), "bad");
+    rtIf(f, L("fd"), "ge", I(3), "ok");
+    uxSys(f, t, "n", 72, xs3(L("fd"), I(uxConst(t, "F_DUPFD_CLOEXEC")), I(3)));
+    uxSys(f, t, "", 3, xs1(L("fd")));
+    rtIf(f, L("n"), "lt", I(0), "bad");
+    rtRet(f, L("n"));
+    rtLabel(f, "ok");
+    rtRet(f, L("fd"));
+    rtLabel(f, "bad");
+    rtRet(f, I(-1));
+    toolCheck(f);
+
+    f = rtBegin(b, "__tx_tool_pipe", "rp wp", "fds fp r x y", 2, "bootstrap/selfhost/tool_spawn.tx");
+    rtSet(f, "fds", I(0));
+    rtAddrOf(f, "fp", "fds");
+    if (tMacos(t)) {
+        rtCall0(f, "", "__tx_nrt_fork_lock");
+        uxMac(f, "r", "pipe", xs1(L("fp")));
+        rtIf(f, L("r"), "lt", I(0), "unlocked");
+        rtLoad(f, "x", L("fp"), 0, 4);
+        uxSys(f, t, "", 72, xs3(L("x"), I(uxConst(t, "F_SETFD")), I(1)));
+        rtLoad(f, "x", L("fp"), 4, 4);
+        uxSys(f, t, "", 72, xs3(L("x"), I(uxConst(t, "F_SETFD")), I(1)));
+        rtLabel(f, "unlocked");
+        rtCall0(f, "", "__tx_nrt_fork_unlock");
+    } else {
+        rtSyscall(f, "r", 293, xs2(L("fp"), I(524288)));
+    }
+    rtIf(f, L("r"), "lt", I(0), "bad");
+    rtLoad(f, "x", L("fp"), 0, 4);
+    rtCall1(f, "x", "__tx_tool_lift", L("x"));
+    rtLoad(f, "y", L("fp"), 4, 4);
+    rtCall1(f, "y", "__tx_tool_lift", L("y"));
+    rtStore(f, L("rp"), 0, L("x"), 8);
+    rtStore(f, L("wp"), 0, L("y"), 8);
+    rtIf(f, L("x"), "lt", I(0), "bad");
+    rtIf(f, L("y"), "lt", I(0), "bad");
+    rtRet(f, I(0));
+    rtLabel(f, "bad");
+    rtRet(f, I(-1));
+    toolCheck(f);
+
+    f = rtBegin(b, "__tx_tool_nonblock", "fd", "fl", 0, "bootstrap/selfhost/tool_spawn.tx");
+    uxSys(f, t, "fl", 72, xs3(L("fd"), I(uxConst(t, "F_GETFL")), I(0)));
+    rtIf(f, L("fl"), "lt", I(0), "done");
+    rtOp(f, "fl", L("fl"), "or", I(uxConst(t, "O_NONBLOCK")));
+    uxSys(f, t, "", 72, xs3(L("fd"), I(uxConst(t, "F_SETFL")), L("fl")));
+    rtLabel(f, "done");
+    rtRetVoid(f);
+    toolCheck(f);
+
+    f = rtBegin(b, "__tx_tool_cstr", "p n", "q x", 3, "bootstrap/selfhost/tool_spawn.tx");
+    rtOp(f, "x", L("n"), "add", I(1));
+    rtCall2(f, "q", "__tx_native_mem_alloc", L("x"), I(1));
+    rtIf(f, L("q"), "eq", I(0), "oom");
+    rtCall3(f, "", "__tx_tool_copy", L("q"), L("p"), L("n"));
+    rtOp(f, "x", L("q"), "add", L("n"));
+    rtStore(f, L("x"), 0, I(0), 1);
+    rtRet(f, L("q"));
+    rtLabel(f, "oom");
+    rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRet(f, I(0));
+    toolCheck(f);
+}
+
+// __tx_tool_environ(cr, ew, ctl, bufp, ev) → 子进程的 envp（新分配，调用方释放）。条目指向 ev——调用方经 __tx_rt_env_block
+// 取得的本进程当前环境（进程级环境表，含 std/os 的 setenv；D3 v0.39），起完子进程后由调用方释放——去掉
+// TAIXU_DEBUG_CHANNEL=…，ctl 非 0 时在数组尾部的空间里写本次的并追加。*bufp 记 0（没有另外的缓冲）。
+function emitEnviron(b: Ref<StructuredBuffer>): void {
+    const nullPath = "/dev/null";
+    const nulPath = toolText(b, nullPath);
+    const prefix = toolText(b, CHANNEL_VAR + "=");
+    let f = rtBegin(b, "__tx_tool_environ", "cr ew ctl bufp ev", "cnt arr k p m c x v d i", 3, "bootstrap/selfhost/tool_spawn.tx");
+    rtSet(f, "cnt", I(0));
+    rtLabel(f, "count");
+    rtShift(f, "x", L("cnt"), "shl", 3);
+    rtOp(f, "x", L("x"), "add", L("ev"));
+    rtLoad(f, "x", L("x"), 0, 8);
+    rtIf(f, L("x"), "eq", I(0), "counted");
+    rtOp(f, "cnt", L("cnt"), "add", I(1));
+    rtJump(f, "count");
+    rtLabel(f, "counted");
+    rtOp(f, "x", L("cnt"), "add", I(2));
+    rtShift(f, "x", L("x"), "shl", 3);
+    rtOp(f, "x", L("x"), "add", I(96));
+    rtCall2(f, "arr", "__tx_native_mem_alloc", L("x"), I(8));
+    rtIf(f, L("arr"), "eq", I(0), "oom");
+    rtSet(f, "k", I(0));
+    rtSet(f, "i", I(0));
+    rtLabel(f, "entry");
+    rtIf(f, L("i"), "ge", L("cnt"), "entries");
+    rtShift(f, "p", L("i"), "shl", 3);
+    rtOp(f, "p", L("p"), "add", L("ev"));
+    rtLoad(f, "p", L("p"), 0, 8);
+    rtOp(f, "i", L("i"), "add", I(1));
+    // 前缀比较：条目短于前缀时在它的 NUL 处就不相等。
+    rtSet(f, "m", I(0));
+    rtLabel(f, "cmp");
+    rtIf(f, L("m"), "ge", I(len(CHANNEL_VAR) + 1), "entry");
+    rtOp(f, "x", L("p"), "add", L("m"));
+    rtLoad(f, "c", L("x"), 0, 1);
+    rtOp(f, "x", A(prefix), "add", L("m"));
+    rtLoad(f, "x", L("x"), 0, 1);
+    rtIf(f, L("c"), "ne", L("x"), "keep");
+    rtOp(f, "m", L("m"), "add", I(1));
+    rtJump(f, "cmp");
+    rtLabel(f, "keep");
+    rtShift(f, "x", L("k"), "shl", 3);
+    rtOp(f, "x", L("x"), "add", L("arr"));
+    rtStore(f, L("x"), 0, L("p"), 8);
+    rtOp(f, "k", L("k"), "add", I(1));
+    rtJump(f, "entry");
+    rtLabel(f, "entries");
+    rtIf(f, L("ctl"), "eq", I(0), "terminate");
+    rtOp(f, "v", L("cnt"), "add", I(2));
+    rtShift(f, "v", L("v"), "shl", 3);
+    rtOp(f, "v", L("v"), "add", L("arr"));
+    rtCall3(f, "", "__tx_tool_copy", L("v"), A(prefix), I(len(CHANNEL_VAR) + 1));
+    rtOp(f, "d", L("v"), "add", I(len(CHANNEL_VAR) + 1));
+    rtCall3(f, "d", "__tx_tool_dec", L("d"), L("cr"), I(0));
+    rtStore(f, L("d"), 0, I(44), 1);
+    rtOp(f, "d", L("d"), "add", I(1));
+    rtCall3(f, "d", "__tx_tool_dec", L("d"), L("ew"), I(0));
+    rtStore(f, L("d"), 0, I(0), 1);
+    rtShift(f, "x", L("k"), "shl", 3);
+    rtOp(f, "x", L("x"), "add", L("arr"));
+    rtStore(f, L("x"), 0, L("v"), 8);
+    rtOp(f, "k", L("k"), "add", I(1));
+    rtLabel(f, "terminate");
+    rtShift(f, "x", L("k"), "shl", 3);
+    rtOp(f, "x", L("x"), "add", L("arr"));
+    rtStore(f, L("x"), 0, I(0), 8);
+    rtStore(f, L("bufp"), 0, I(0), 8);
+    rtRet(f, L("arr"));
+    rtLabel(f, "oom");
+    rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRet(f, I(0));
+    toolCheck(f);
+
+    f = rtBegin(b, "__tx_tool_devnull", "", "pz fd", 3, "bootstrap/selfhost/tool_spawn.tx");
+    rtCall2(f, "pz", "__tx_tool_cstr", A(nulPath), I(len(nullPath)));
+    rtSyscall(f, "fd", 2, xs3(L("pz"), I(524288), I(0)));
+    rtCall1(f, "", "__tx_native_mem_free", L("pz"));
+    rtCall1(f, "fd", "__tx_tool_lift", L("fd"));
+    rtRet(f, L("fd"));
+    toolCheck(f);
+}
+
+function emitSpawnUnix(b: Ref<StructuredBuffer>, limited: bool, t: int): void {
+    let locals = COMMON + " budgetMem budgetCpu rl0 rl1 lim ka kb " + HANDLES + " env envbuf envblk ebp ce cw av pid cerr w";
+    // macOS：posix_spawn 的 file actions 与属性对象、fork 的回传管道（M3 设计 G3）；posix_spawn 有 6 个实参。
+    let maxArgs = 5;
+    if (tMacos(t)) { locals = locals + " fa at fap atp pr pw got"; maxArgs = 6; }
+    let name = "__tx_tool_proc_spawn";
+    if (limited) { name = name + "_limited"; }
+    const f = rtBegin(b, name, "win fn pc a bi nargs", locals, maxArgs, "bootstrap/selfhost/tool_spawn.tx");
+    spawnHead(f, limited);
+    rtSet(f, "env", I(0)); rtSet(f, "envbuf", I(0)); rtSet(f, "envblk", I(0)); rtSet(f, "ce", I(0)); rtSet(f, "cw", I(0)); rtSet(f, "av", I(0));
+    linuxPipe(f, "outR", "outW");
+    rtCall1(f, "", "__tx_tool_nonblock", L("outR"));
+    linuxPipe(f, "errR", "errW");
+    rtCall1(f, "", "__tx_tool_nonblock", L("errR"));
+    rtOp(f, "x", L("opts"), "and", I(1));
+    rtIf(f, L("x"), "eq", I(0), "nulin");
+    linuxPipe(f, "inR", "inW");
+    rtJump(f, "ctl");
+    rtLabel(f, "nulin");
+    rtCall1(f, "inR", "__tx_tool_devnull", I(0));
+    rtIf(f, L("inR"), "lt", I(0), "io");
+    rtLabel(f, "ctl");
+    rtIf(f, L("ctl"), "eq", I(0), "environ");
+    linuxPipe(f, "cR", "cW");
+    linuxPipe(f, "eR", "eW");
+    rtCall1(f, "", "__tx_tool_nonblock", L("eR"));
+    rtLabel(f, "environ");
+    rtAddrOf(f, "ebp", "envbuf");
+    // 子进程环境取本进程当前的环境（进程级环境表，含 std/os 的 setenv；D3 v0.39），起完子进程后释放。
+    rtCall0(f, "envblk", "__tx_rt_env_block");
+    if (tMacos(t) && limited) {
+        // 受限子进程另带回收 cookie（ctl 位 4，M3 设计 G9）。
+        rtOp(f, "x", L("ctl"), "or", I(4));
+        rtCall5(f, "env", "__tx_tool_environ", L("cR"), L("eW"), L("x"), L("ebp"), L("envblk"));
+    } else {
+        rtCall5(f, "env", "__tx_tool_environ", L("cR"), L("eW"), L("ctl"), L("ebp"), L("envblk"));
+    }
+    rtIf(f, L("env"), "eq", I(0), "io");
+    // argv＝[exe, 参数…, NULL]，各为 NUL 结尾的副本；工作目录同。
+    rtCall2(f, "ce", "__tx_tool_cstr", L("ep"), L("en"));
+    rtOp(f, "x", L("cnt"), "add", I(2));
+    rtShift(f, "x", L("x"), "shl", 3);
+    rtCall2(f, "av", "__tx_native_mem_alloc", L("x"), I(8));
+    rtIf(f, L("av"), "eq", I(0), "oom");
+    rtStore(f, L("av"), 0, L("ce"), 8);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "argv");
+    rtIf(f, L("i"), "ge", L("cnt"), "argvdone");
+    elemSpan(f);
+    rtCall2(f, "x", "__tx_tool_cstr", L("p"), L("n"));
+    rtOp(f, "e", L("i"), "add", I(1));
+    rtShift(f, "e", L("e"), "shl", 3);
+    rtOp(f, "e", L("e"), "add", L("av"));
+    rtStore(f, L("e"), 0, L("x"), 8);
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "argv");
+    rtLabel(f, "argvdone");
+    rtOp(f, "e", L("cnt"), "add", I(1));
+    rtShift(f, "e", L("e"), "shl", 3);
+    rtOp(f, "e", L("e"), "add", L("av"));
+    rtStore(f, L("e"), 0, I(0), 8);
+    rtIf(f, L("cn"), "eq", I(0), "fork");
+    rtCall2(f, "cw", "__tx_tool_cstr", L("cp"), L("cn"));
+    // vfork：子进程与本帧共用栈，execve 之前只发系统调用、只写局部变量（cerr 把失败的 errno 交回父进程：
+    // execve 失败为 errno，chdir 失败为 4096＋errno）。父进程在子进程 execve 或退出之后才继续。
+    rtLabel(f, "fork");
+    if (tMacos(t)) {
+        if (limited) { macForkSpawn(f, t); } else { macPosixSpawn(f, t); }
+    } else {
+        rtSet(f, "cerr", I(0));
+        rtSyscall(f, "pid", 58, xs0());
+        rtIf(f, L("pid"), "ne", I(0), "parent");
+        if (limited) { budgetLinuxChild(f); }
+        rtSyscall(f, "", 33, xs2(L("inR"), I(0)));
+        rtSyscall(f, "", 33, xs2(L("outW"), I(1)));
+        rtSyscall(f, "", 33, xs2(L("errW"), I(2)));
+        // 子进程只拿到标准三件与控制通道的两端（D3 v0.40）：其余 3 以上的描述符一律关掉，不论是否带 CLOEXEC。
+        rtIf(f, L("cR"), "eq", I(-1), "closeall");
+        rtSyscall(f, "", 72, xs3(L("cR"), I(2), I(0)));
+        rtSyscall(f, "", 72, xs3(L("eW"), I(2), I(0)));
+        // 跳开控制通道：ka ≤ kb 为两端的号，分三段关。
+        rtSet(f, "ka", L("cR")); rtSet(f, "kb", L("eW"));
+        rtIf(f, L("ka"), "le", L("kb"), "ordered");
+        rtSet(f, "ka", L("eW")); rtSet(f, "kb", L("cR"));
+        rtLabel(f, "ordered");
+        rtOp(f, "x", L("ka"), "sub", I(1));
+        linuxCloseRange(f, I(3), L("x"), "c1");
+        rtOp(f, "x", L("ka"), "add", I(1));
+        rtOp(f, "e", L("kb"), "sub", I(1));
+        linuxCloseRange(f, L("x"), L("e"), "c2");
+        rtOp(f, "x", L("kb"), "add", I(1));
+        linuxCloseRange(f, L("x"), I(4294967295), "c3");
+        rtJump(f, "chdir");
+        rtLabel(f, "closeall");
+        linuxCloseRange(f, I(3), I(4294967295), "c0");
+        rtLabel(f, "chdir");
+        rtIf(f, L("cw"), "eq", I(0), "exec");
+        rtSyscall(f, "w", 80, xs1(L("cw")));
+        rtIf(f, L("w"), "ge", I(0), "exec");
+        rtOp(f, "cerr", I(4096), "sub", L("w"));
+        rtSyscall(f, "", 231, xs1(I(127)));
+        rtLabel(f, "exec");
+        rtSyscall(f, "w", 59, xs3(L("ce"), L("av"), L("env")));
+        rtOp(f, "cerr", I(0), "sub", L("w"));
+        rtSyscall(f, "", 231, xs1(I(127)));
+        rtLabel(f, "parent");
+        rtIf(f, L("pid"), "lt", I(0), "io");
+        rtIf(f, L("cerr"), "eq", I(0), "started");
+    }
+    // 子进程没能执行：回收它，按 errno 报错（ENOENT/ENOTDIR 找不到、EACCES/EPERM 拒绝访问、ENOEXEC 不是可执行文件）。
+    rtLabel(f, "reap");
+    uxSys(f, t, "w", 61, xs4(L("pid"), I(0), I(0), I(0)));
+    rtIf(f, L("w"), "eq", I(-4), "reap");
+    // macOS 的 posix_spawn 失败不产生子进程，带着 cerr 直接到这里。
+    rtLabel(f, "mapped");
+    rtSet(f, "et", L("te"));
+    if (limited) {
+        rtIf(f, L("cerr"), "lt", I(8192), "budget_errno");
+        rtSet(f, "st", I(5));
+        rtJump(f, "linfail");
+        rtLabel(f, "budget_errno");
+    }
+    rtIf(f, L("cerr"), "lt", I(4096), "errno");
+    rtOp(f, "cerr", L("cerr"), "sub", I(4096));
+    rtSet(f, "et", L("tc"));
+    rtLabel(f, "errno");
+    rtSet(f, "st", I(3));
+    rtIf(f, L("cerr"), "eq", I(2), "linfail");
+    rtIf(f, L("cerr"), "eq", I(20), "linfail");
+    rtSet(f, "st", I(4));
+    rtIf(f, L("cerr"), "eq", I(13), "linfail");
+    rtIf(f, L("cerr"), "eq", I(1), "linfail");
+    rtSet(f, "st", I(1));
+    rtIf(f, L("cerr"), "eq", I(8), "linfail");
+    rtSet(f, "st", I(5));
+    rtJump(f, "linfail");
+    rtLabel(f, "started");
+    rtStore(f, L("rec"), R_PROC, L("pid"), 8);
+    if (limited) { rtStore(f, L("rec"), R_JOB, I(1), 8); }
+    linuxRelease(f);
+    spawnDone(f);
+    rtLabel(f, "io");
+    rtSet(f, "st", I(5));
+    rtSet(f, "et", L("te"));
+    rtLabel(f, "linfail");
+    linuxRelease(f);
+    rtJump(f, "fail");
+    spawnFail(b, f);
+    if (limited) { budgetArgumentTrap(b, f); }
+    toolCheck(f);
+}
+
+// pipe2 到 (r, w)；失败转 io。
+function linuxPipe(f: Ref<RtFn>, r: string, w: string): void {
+    rtAddrOf(f, "p", r);
+    rtAddrOf(f, "q", w);
+    rtCall2(f, "x", "__tx_tool_pipe", L("p"), L("q"));
+    rtIf(f, L("x"), "ne", I(0), "io");
+}
+
+// 释放 argv、工作目录与环境的副本（成功、失败两条路都走；argv 只在建全之后才非 0）。
+function linuxRelease(f: Ref<RtFn>): void {
+    const tag = rtTag(f);
+    rtIf(f, L("av"), "eq", I(0), "noav" + tag);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "freeav" + tag);
+    rtIf(f, L("i"), "gt", L("cnt"), "avdone" + tag);
+    rtShift(f, "e", L("i"), "shl", 3);
+    rtOp(f, "e", L("e"), "add", L("av"));
+    rtLoad(f, "x", L("e"), 0, 8);
+    rtCall1(f, "", "__tx_native_mem_free", L("x"));
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "freeav" + tag);
+    rtLabel(f, "avdone" + tag);
+    rtCall1(f, "", "__tx_native_mem_free", L("av"));
+    rtSet(f, "av", I(0));
+    rtSet(f, "ce", I(0));
+    rtLabel(f, "noav" + tag);
+    const bufs = strSplit("ce cw env envbuf envblk", " ");
+    let k = 0;
+    while (k < listLen(bufs)) {
+        const v = listGet(bufs, k) catch "cw";
+        const next = "rel" + v + tag;
+        rtIf(f, L(v), "eq", I(0), next);
+        rtCall1(f, "", "__tx_native_mem_free", L(v));
+        rtSet(f, v, I(0));
+        rtLabel(f, next);
+        k = k + 1;
+    }
+}

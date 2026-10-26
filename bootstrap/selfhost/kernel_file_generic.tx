@@ -1,0 +1,394 @@
+// 文件读写的可移植版（rtfn 写，macOS 适配 M4 设计 A8）：语义与导出名同 file_linux.tx 的 linuxFileEmit（Unix 目标的
+// __tx_native_file_read／__tx_native_file_write／__tx_native_file_write_exec 及其内部的 __tx_linux_file_status）与
+// runtime_memory_gen.tx 的 fileReadBi、fileWriteBi、fileWriteBytesBi（readFile／writeFile／writeFileBytes 内建的外壳
+// __tx_bi_read_file、__tx_bi_write_file、__tx_bi_write_file_bytes）。
+// 系统调用经 unix_sys.tx 的 uxSys：Linux 发裸系统调用，macOS 调 libSystem 的蹦床 __tx_mac_<名>，结果同为“非负成功、负值为 −errno”；
+// 打开标志、AT_FDCWD 与 ENAMETOOLONG 按目标取值（同手写版）。Windows 目标只发外壳：它的文件原语是 Win32 平台代码，由生成器
+// 照旧发手写版（arm64 只有 macOS，不需要）。
+// 原语 (路径指针, 路径长, 出参指针或数据, 出参指针或数据长) → 状态（0 成功、1 无效实参、2 内存不足、3 无此文件、4 拒绝访问、
+// 5 读写错误、6 过大，即 nrt_sys.tx 的 STATUS_NAMES）。路径长须在 1..4095、不含 NUL，复制成 NUL 结尾的临时串再打开；
+// 打开与读写遇 EINTR 重试；读按 4096 起倍增扩缓冲（不设上限），读完的空内容不留分配，成功的非空缓冲在关闭成功后才交给出参；
+// 写遇 0 字节写出报读写错误；writeExecutable 先 unlinkat 旧文件再以 0777 创建（同 ld）；关闭一律只做一次，先前无错时关闭的
+// 错误也换成状态。
+// 外壳（win, fn, pc, a, nargs）：结果槽为窗口槽 a，实参在 a+1、a+2；实参数或类型不符时转宿主全量路径 __tx_bi_*_host。
+// fn、pc、a、nargs 按 u32 读（生成代码只写 dword 栈参，经 __tx_callbi 原样转来，高 32 位不定）。
+// 与手写版的差别：
+// - __tx_linux_file_status 的实参在第一个参数位（手写版在 rax 里入参，只供本模块的三个原语调用）。
+// - 读打开不带 O_CREAT，mode 实参恒为 0（手写版留着扫描路径时的 r10，内核不读）。
+// - 外壳转宿主路径是调用后返回，不是尾跳；传过去的值相同（win、fn、pc、a 的低 32 位，nargs 原样）。
+// - writeFileBytes 的装填缓冲分配失败：手写版尾跳 __tx_str_oom（Windows 上按跳入写成，不能经 call 调用，rtfn 也没有尾跳），
+//   这里改调 NRT 的内存不足终局 __tx_native_object_oom_v1（同一诊断文本、退出码 3、同一进程级致命锁），都不返回。
+// - 手写的 Linux 原语保存 rbx rsi rdi；这里在 Linux 上发裸系统调用会写 rdi rsi（同 nrt_sys.tx 等经 uxSys 的 rtfn 例程）。调用方
+//   只有本模块的外壳与 nrt_sys.tx 的宿主回退、writeExecutable，都是 rtfn（跨调用不在寄存器里保值）。
+import { StructuredBuffer, asBufferSection } from "./assemble";
+import { RtFn, RtOp, L, I } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtShift, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtCall5, rtRet, rtRetVoid } from "./rtfn";
+import { uxSys, uxOpenFlags, uxAtFdcwd, uxErrno } from "./unix_sys";
+import { tSysV, tUnix } from "./target";
+import { TAG_INT } from "./value_abi";
+import { TAG_ERR, TAG_STR, TAG_LIST } from "./store_abi";
+
+const MODULE: string = "bootstrap/selfhost/kernel_file_generic.tx";
+const M32: int = 4294967295;
+const TAG_NONE: int = 4;
+const READ: int = 1;
+const WRITE: int = 0;
+const EXEC: int = 2;
+// 路径长上限（字节，不含结尾 NUL）。
+const PATH_MAX_BYTES: int = 4095;
+const READ_CHUNK: int = 4096;
+// Linux 的 O_RDONLY|O_CLOEXEC 与 O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC（uxOpenFlags 换成目标的位）；新建文件的权限位。
+const OPEN_READ: int = 524288;
+const OPEN_WRITE: int = 524865;
+const MODE_FILE: int = 438;
+const MODE_EXEC: int = 511;
+// Linux 系统调用号（uxSys 在 macOS 上按号对应同语义的 libSystem 函数）。
+const NR_READ: int = 0;
+const NR_WRITE: int = 1;
+const NR_CLOSE: int = 3;
+const NR_OPENAT: int = 257;
+const NR_UNLINKAT: int = 263;
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+function ops(a: Ref<RtOp>, b: Ref<RtOp>, c: Ref<RtOp>): List<Ref<RtOp>> {
+    const xs: List<Ref<RtOp>> = listNew();
+    listPush(xs, a); listPush(xs, b); listPush(xs, c);
+    return xs;
+}
+
+// __tx_linux_file_status(e)：负的 errno → 状态（表同手写版；ENAMETOOLONG 按目标取值，其余各号两个目标相同），不在表里的为 5。
+function statusFn(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    const f = rtBegin(b, "__tx_linux_file_status", "e", "", 0, MODULE);
+    const names: List<string> = strSplit("ENOENT ENOTDIR EACCES EPERM EROFS ENOMEM EINVAL ENAMETOOLONG EISDIR EFBIG", " ");
+    const values: List<int> = listNew();
+    listPush(values, 3); listPush(values, 3); listPush(values, 4); listPush(values, 4); listPush(values, 4);
+    listPush(values, 2); listPush(values, 1); listPush(values, 1); listPush(values, 1); listPush(values, 6);
+    let k = 0;
+    while (k < listLen(names)) {
+        rtIf(f, L("e"), "eq", I(0 - uxErrno(t, listGet(names, k) catch "")), "s" + toStr(k));
+        k = k + 1;
+    }
+    rtRet(f, I(5));
+    k = 0;
+    while (k < listLen(names)) {
+        rtLabel(f, "s" + toStr(k));
+        rtRet(f, I(listGet(values, k) catch 5));
+        k = k + 1;
+    }
+    done(f, failures);
+}
+
+// 读：(路径, 路径长, 出参 *ptr, 出参 *len)；写：(路径, 路径长, 数据, 数据长)。局部：fd 描述符（−1 未打开）、buf 读缓冲、cnt 已读写
+// 字节数、st 状态、cp NUL 结尾的路径副本、cap 读缓冲容量。
+function fileFn(b: Ref<StructuredBuffer>, failures: List<string>, t: int, mode: int): void {
+    let entry = "__tx_native_file_write";
+    if (mode == READ) { entry = "__tx_native_file_read"; }
+    if (mode == EXEC) { entry = "__tx_native_file_write_exec"; }
+    let copy = "memcpy";
+    if (tSysV(t)) { copy = "__tx_linux_memcpy"; }
+    const eintr = 0 - uxErrno(t, "EINTR");
+    const f = rtBegin(b, entry, "pp pn d dn", "fd buf cnt st cp cap r x c", 4, MODULE);
+    rtSet(f, "fd", I(-1));
+    rtSet(f, "buf", I(0));
+    rtSet(f, "cnt", I(0));
+    rtSet(f, "st", I(1));
+    rtSet(f, "cp", I(0));
+    rtIf(f, L("pp"), "eq", I(0), "clean");
+    rtIf(f, L("pn"), "le", I(0), "clean");
+    rtIf(f, L("pn"), "ugt", I(PATH_MAX_BYTES), "clean");
+    if (mode == READ) {
+        rtIf(f, L("d"), "eq", I(0), "clean");
+        rtIf(f, L("dn"), "eq", I(0), "clean");
+    } else {
+        rtIf(f, L("dn"), "lt", I(0), "clean");
+        rtIf(f, L("dn"), "eq", I(0), "path");
+        rtIf(f, L("d"), "eq", I(0), "clean");
+    }
+    // 路径里有 NUL 即无效实参；否则复制成 NUL 结尾的副本。
+    rtLabel(f, "path");
+    rtSet(f, "x", L("pp"));
+    rtSet(f, "r", L("pn"));
+    rtLabel(f, "scan");
+    rtLoad(f, "c", L("x"), 0, 1);
+    rtIf(f, L("c"), "eq", I(0), "clean");
+    rtOp(f, "x", L("x"), "add", I(1));
+    rtOp(f, "r", L("r"), "sub", I(1));
+    rtIf(f, L("r"), "ne", I(0), "scan");
+    rtOp(f, "x", L("pn"), "add", I(1));
+    rtCall2(f, "cp", "__tx_native_mem_alloc", L("x"), I(1));
+    rtIf(f, L("cp"), "eq", I(0), "oom");
+    rtCall3(f, "", copy, L("cp"), L("pp"), L("pn"));
+    rtOp(f, "x", L("cp"), "add", L("pn"));
+    rtStore(f, L("x"), 0, I(0), 1);
+    // writeExecutable：先删旧文件（结果不看），新文件按 0777 & ~umask 创建。
+    if (mode == EXEC) { uxSys(f, t, "", NR_UNLINKAT, ops(I(uxAtFdcwd(t)), L("cp"), I(0))); }
+    rtLabel(f, "open");
+    let flags = OPEN_WRITE;
+    let perm = MODE_FILE;
+    if (mode == READ) {
+        flags = OPEN_READ;
+        perm = 0;
+    }
+    if (mode == EXEC) { perm = MODE_EXEC; }
+    const oargs = ops(I(uxAtFdcwd(t)), L("cp"), I(uxOpenFlags(t, flags)));
+    listPush(oargs, I(perm));
+    uxSys(f, t, "r", NR_OPENAT, oargs);
+    rtIf(f, L("r"), "eq", I(eintr), "open");
+    rtIf(f, L("r"), "lt", I(0), "errno");
+    rtSet(f, "fd", L("r"));
+    rtSet(f, "st", I(0));
+    if (mode == READ) {
+        rtSet(f, "cap", I(READ_CHUNK));
+        rtCall2(f, "buf", "__tx_native_mem_alloc", I(READ_CHUNK), I(1));
+        rtIf(f, L("buf"), "eq", I(0), "oom");
+    }
+    // 读写循环：短读短写接着做，EINTR 重试。
+    rtLabel(f, "io");
+    if (mode == READ) {
+        rtIf(f, L("cnt"), "eq", L("cap"), "grow");
+        rtOp(f, "x", L("buf"), "add", L("cnt"));
+        rtOp(f, "c", L("cap"), "sub", L("cnt"));
+        uxSys(f, t, "r", NR_READ, ops(L("fd"), L("x"), L("c")));
+    } else {
+        rtIf(f, L("cnt"), "eq", L("dn"), "clean");
+        rtOp(f, "x", L("d"), "add", L("cnt"));
+        rtOp(f, "c", L("dn"), "sub", L("cnt"));
+        uxSys(f, t, "r", NR_WRITE, ops(L("fd"), L("x"), L("c")));
+    }
+    rtIf(f, L("r"), "eq", I(eintr), "io");
+    rtIf(f, L("r"), "lt", I(0), "errno");
+    if (mode == READ) { rtIf(f, L("r"), "eq", I(0), "success"); } else { rtIf(f, L("r"), "eq", I(0), "ioerr"); }
+    rtOp(f, "cnt", L("cnt"), "add", L("r"));
+    rtJump(f, "io");
+    if (mode == READ) {
+        // 缓冲按倍增扩张，不设尺寸上限（容量批 C4b），分配失败即内存不足（原缓冲仍在 buf，收尾释放）。
+        rtLabel(f, "grow");
+        rtShift(f, "x", L("cap"), "shl", 1);
+        rtCall4(f, "r", "__tx_native_mem_realloc", L("buf"), L("cap"), L("x"), I(1));
+        rtIf(f, L("r"), "eq", I(0), "oom");
+        rtSet(f, "buf", L("r"));
+        rtShift(f, "cap", L("cap"), "shl", 1);
+        rtJump(f, "io");
+        // 读完：空内容不留分配；非空缓冲等关闭成功后再交出（出错时出参不动）。
+        rtLabel(f, "success");
+        rtIf(f, L("cnt"), "ne", I(0), "clean");
+        rtCall1(f, "", "__tx_native_mem_free", L("buf"));
+        rtSet(f, "buf", I(0));
+        rtJump(f, "clean");
+    }
+    rtLabel(f, "errno");
+    rtCall1(f, "st", "__tx_linux_file_status", L("r"));
+    rtJump(f, "clean");
+    rtLabel(f, "oom");
+    rtSet(f, "st", I(2));
+    rtJump(f, "clean");
+    if (mode != READ) {
+        rtLabel(f, "ioerr");
+        rtSet(f, "st", I(5));
+    }
+    // 收尾：只关一次（Linux 的 close 遇 EINTR 也已释放描述符）；先前无错时关闭的错误换成状态。
+    rtLabel(f, "clean");
+    rtIf(f, L("fd"), "lt", I(0), "closed");
+    const cargs: List<Ref<RtOp>> = listNew();
+    listPush(cargs, L("fd"));
+    uxSys(f, t, "r", NR_CLOSE, cargs);
+    rtIf(f, L("st"), "ne", I(0), "closed");
+    rtIf(f, L("r"), "ge", I(0), "closed");
+    rtCall1(f, "st", "__tx_linux_file_status", L("r"));
+    rtLabel(f, "closed");
+    if (mode == READ) {
+        rtIf(f, L("st"), "ne", I(0), "free");
+        rtStore(f, L("d"), 0, L("buf"), 8);
+        rtStore(f, L("dn"), 0, L("cnt"), 8);
+        rtSet(f, "buf", I(0));
+    }
+    rtLabel(f, "free");
+    rtCall1(f, "", "__tx_native_mem_free", L("buf"));
+    rtCall1(f, "", "__tx_native_mem_free", L("cp"));
+    rtRet(f, L("st"));
+    done(f, failures);
+}
+
+// ---------------------------------------------------------------------------
+// 内建外壳
+// ---------------------------------------------------------------------------
+
+// 入口：fn、pc、a 取低 32 位；n = nargs 的低 32 位（nargs 本身原样留给宿主路径）。
+function shellEntry(f: Ref<RtFn>): void {
+    rtOp(f, "fn", L("fn"), "and", I(M32));
+    rtOp(f, "pc", L("pc"), "and", I(M32));
+    rtOp(f, "a", L("a"), "and", I(M32));
+    rtOp(f, "n", L("nargs"), "and", I(M32));
+}
+
+// 实参 k（窗口槽 a + k，按 u32 相加）的标签字节不是 tag 即转宿主路径；是则 idx = 载荷的低 32 位（对象号）。
+function argIdx(f: Ref<RtFn>, k: int, tag: int, idx: string): void {
+    rtOp(f, "s", L("a"), "add", I(k));
+    rtOp(f, "s", L("s"), "and", I(M32));
+    rtShift(f, "s", L("s"), "shl", 4);
+    rtOp(f, "s", L("win"), "add", L("s"));
+    rtLoad(f, "x", L("s"), 0, 1);
+    rtIf(f, L("x"), "ne", I(tag), "host");
+    rtLoad(f, idx, L("s"), 8, 4);
+}
+
+// 结果槽 a：先放掉旧值，再写 {tag, pay}（同手写版的次序）。
+function setResult(f: Ref<RtFn>, tag: int, pay: Ref<RtOp>): void {
+    rtShift(f, "s", L("a"), "shl", 4);
+    rtOp(f, "s", L("win"), "add", L("s"));
+    rtCall1(f, "", "__tx_release", L("s"));
+    rtStore(f, L("s"), 0, I(tag), 8);
+    rtStore(f, L("s"), 8, pay, 8);
+}
+
+// 原语的状态 st（已取低 32 位）非 0：结果为文件错误对象 "{状态名}: {路径}"。
+function fileError(f: Ref<RtFn>): void {
+    rtCall4(f, "e", "__tx_store_file_err", L("st"), L("pi"), L("fn"), L("pc"));
+    rtOp(f, "e", L("e"), "and", I(M32));
+    setResult(f, TAG_ERR, L("e"));
+    rtRetVoid(f);
+}
+
+// 实参数或类型不符：转宿主全量路径（由它报 4010 等）。
+function hostPath(f: Ref<RtFn>, host: string): void {
+    rtLabel(f, "host");
+    rtCall5(f, "", host, L("win"), L("fn"), L("pc"), L("a"), L("nargs"));
+    rtRetVoid(f);
+}
+
+// readFile(path) → string | Error：成功时缓冲移交给新字符串（分配点按 fn、pc 记）。
+function readShell(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_bi_read_file", "win fn pc a nargs", "n s x pi pp pn op on opa ona st e site idx", 5, MODULE);
+    shellEntry(f);
+    rtIf(f, L("n"), "ne", I(1), "host");
+    argIdx(f, 1, TAG_STR, "pi");
+    rtCall1(f, "pp", "__tx_store_str_ptr", L("pi"));
+    rtCall1(f, "pn", "__tx_store_str_len", L("pi"));
+    rtAddrOf(f, "opa", "op");
+    rtAddrOf(f, "ona", "on");
+    rtCall4(f, "st", "__tx_native_file_read", L("pp"), L("pn"), L("opa"), L("ona"));
+    rtOp(f, "st", L("st"), "and", I(M32));
+    rtIf(f, L("st"), "eq", I(0), "ok");
+    fileError(f);
+    rtLabel(f, "ok");
+    rtCall2(f, "site", "__tx_site_of", L("fn"), L("pc"));
+    rtOp(f, "site", L("site"), "and", I(M32));
+    rtCall3(f, "idx", "__tx_store_new_str_take", L("op"), L("on"), L("site"));
+    rtOp(f, "idx", L("idx"), "and", I(M32));
+    setResult(f, TAG_STR, L("idx"));
+    rtRetVoid(f);
+    hostPath(f, "__tx_bi_read_file_host");
+    done(f, failures);
+}
+
+// writeFile(path, content) → void | Error。
+function writeShell(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_bi_write_file", "win fn pc a nargs", "n s x pi ci pp pn cp cn st e", 5, MODULE);
+    shellEntry(f);
+    rtIf(f, L("n"), "ne", I(2), "host");
+    argIdx(f, 1, TAG_STR, "pi");
+    argIdx(f, 2, TAG_STR, "ci");
+    rtCall1(f, "pp", "__tx_store_str_ptr", L("pi"));
+    rtCall1(f, "pn", "__tx_store_str_len", L("pi"));
+    rtCall1(f, "cp", "__tx_store_str_ptr", L("ci"));
+    rtCall1(f, "cn", "__tx_store_str_len", L("ci"));
+    rtCall4(f, "st", "__tx_native_file_write", L("pp"), L("pn"), L("cp"), L("cn"));
+    rtOp(f, "st", L("st"), "and", I(M32));
+    rtIf(f, L("st"), "eq", I(0), "ok");
+    fileError(f);
+    rtLabel(f, "ok");
+    setResult(f, TAG_NONE, I(0));
+    rtRetVoid(f);
+    hostPath(f, "__tx_bi_write_file_host");
+    done(f, failures);
+}
+
+// writeFileBytes(path, List<int>) → void | Error：通用列表（16 字节槽，元素须为 int）与原始 int 列表（8 字节槽）在这里逐个校验
+// 0..255 并装填成字节；其他形态（紧凑列表、元素不是 int 的原始列表）与 Bytes 转宿主路径。v0 v1 v2 是 __tx_list_view 写的视图
+// {指针@0, 长度@8, 元素种类 u32@16}（三个连续的局部槽）。
+function writeBytesShell(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_bi_write_file_bytes", "win fn pc a nargs", "n s x pi li v0 v1 v2 vp form buf cur val kind pp pn st e", 5, MODULE);
+    shellEntry(f);
+    rtIf(f, L("n"), "ne", I(2), "host");
+    argIdx(f, 1, TAG_STR, "pi");
+    argIdx(f, 2, TAG_LIST, "li");
+    rtAddrOf(f, "vp", "v0");
+    rtCall2(f, "form", "__tx_list_view", L("li"), L("vp"));
+    rtOp(f, "form", L("form"), "and", I(M32));
+    rtIf(f, L("form"), "eq", I(1), "allocate");
+    rtIf(f, L("form"), "ne", I(2), "host");
+    rtLoad(f, "x", L("vp"), 16, 4);
+    rtIf(f, L("x"), "ne", I(TAG_INT), "host");
+    rtLabel(f, "allocate");
+    rtCall2(f, "buf", "__tx_native_mem_alloc", L("v1"), I(1));
+    rtIf(f, L("buf"), "eq", I(0), "oom");
+    rtSet(f, "cur", I(0));
+    rtLabel(f, "loop");
+    rtIf(f, L("cur"), "uge", L("v1"), "packed");
+    rtIf(f, L("form"), "eq", I(2), "raw");
+    rtShift(f, "x", L("cur"), "shl", 4);
+    rtOp(f, "x", L("v0"), "add", L("x"));
+    rtLoad(f, "val", L("x"), 0, 1);
+    rtIf(f, L("val"), "ne", I(TAG_INT), "badtype");
+    rtLoad(f, "val", L("x"), 8, 8);
+    rtJump(f, "value");
+    rtLabel(f, "raw");
+    rtShift(f, "x", L("cur"), "shl", 3);
+    rtOp(f, "x", L("v0"), "add", L("x"));
+    rtLoad(f, "val", L("x"), 0, 8);
+    rtLabel(f, "value");
+    rtIf(f, L("val"), "lt", I(0), "badrange");
+    rtIf(f, L("val"), "gt", I(255), "badrange");
+    rtOp(f, "x", L("buf"), "add", L("cur"));
+    rtStore(f, L("x"), 0, L("val"), 1);
+    rtOp(f, "cur", L("cur"), "add", I(1));
+    rtJump(f, "loop");
+    // 元素错误：种类 0 不是 int（值按手写版传 0xFFFFFFFF——它以 32 位写入 −1），种类 1 越界（值为元素）。
+    rtLabel(f, "badtype");
+    rtSet(f, "kind", I(0));
+    rtSet(f, "val", I(M32));
+    rtJump(f, "elemerr");
+    rtLabel(f, "badrange");
+    rtSet(f, "kind", I(1));
+    rtLabel(f, "elemerr");
+    rtCall4(f, "e", "__tx_store_wfb_elem_err", L("kind"), L("val"), L("fn"), L("pc"));
+    rtOp(f, "e", L("e"), "and", I(M32));
+    rtCall1(f, "", "__tx_native_mem_free", L("buf"));
+    setResult(f, TAG_ERR, L("e"));
+    rtRetVoid(f);
+    // 装填完：写文件，先放掉装填缓冲再看状态。
+    rtLabel(f, "packed");
+    rtCall1(f, "pp", "__tx_store_str_ptr", L("pi"));
+    rtCall1(f, "pn", "__tx_store_str_len", L("pi"));
+    rtCall4(f, "st", "__tx_native_file_write", L("pp"), L("pn"), L("buf"), L("cur"));
+    rtCall1(f, "", "__tx_native_mem_free", L("buf"));
+    rtOp(f, "st", L("st"), "and", I(M32));
+    rtIf(f, L("st"), "eq", I(0), "ok");
+    fileError(f);
+    rtLabel(f, "ok");
+    setResult(f, TAG_NONE, I(0));
+    rtRetVoid(f);
+    rtLabel(f, "oom");
+    rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRetVoid(f);
+    hostPath(f, "__tx_bi_write_file_bytes_host");
+    done(f, failures);
+}
+
+/// 发出文件读写的函数；rtfn 的失败记进 failures。t 为目标编号：Unix 目标发原语与外壳，Windows 只发外壳（原语由生成器发手写版）。
+export function fileGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    asBufferSection(b, 0, 1);
+    if (tUnix(t)) {
+        statusFn(b, failures, t);
+        fileFn(b, failures, t, READ);
+        fileFn(b, failures, t, WRITE);
+        fileFn(b, failures, t, EXEC);
+    }
+    readShell(b, failures);
+    writeShell(b, failures);
+    writeBytesShell(b, failures);
+}

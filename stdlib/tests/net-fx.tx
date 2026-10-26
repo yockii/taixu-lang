@@ -1,0 +1,116 @@
+// ============================================================================
+// stdlib 用例：std/net（V0.39-N1；STD-10；D86 §四确定性断言面）。
+// 纯函数段＝固定向量（零 I/O）；集成段＝loopback 127.0.0.1 自建自连＋固定
+// 响应（禁外网依赖；端口占用步进重试 ≤8 次后结构化报错）。
+// 运行：taixu test tests/net-fx.tx
+// ============================================================================
+
+import { parseUrl, buildHttpRequest, parseHttpResponse,
+    tcpListen, tcpAccept, tcpConnect, tcpSend, tcpRecv, tcpClose } from "std/net";
+import { Url, HttpResp } from "std/net";
+import { repeat } from "std/text";
+
+// —— 纯函数段：URL 解析 ——
+
+test "net：URL 解析固定向量" {
+    const r1: Url | Error = parseUrl("http://127.0.0.1:47110/ping");
+    const u1: Url = r1 catch panic("url1 解析失败");
+    assert(u1.host == "127.0.0.1", "host");
+    assert(u1.port == 47110, "port");
+    assert(u1.path == "/ping", "path");
+    const r2: Url | Error = parseUrl("http://example.org");
+    const u2: Url = r2 catch panic("url2 解析失败");
+    assert(u2.host == "example.org", "缺省 host");
+    assert(u2.port == 80, "缺省端口 80");
+    assert(u2.path == "/", "缺省 path");
+    // https 结构化拒绝：catch 缺省判别（空 host）。
+    const bad: Url | Error = parseUrl("https://example.org/x");
+    const badUrl: Url = bad catch Url { host: "", port: 0, path: "" };
+    assert(badUrl.host == "", "https 拒绝（空 host 占位）");
+}
+
+// —— 纯函数段：请求构造 ——
+
+test "net：HTTP 请求构造固定向量" {
+    const get: string = buildHttpRequest("GET", "/ping", "127.0.0.1", "");
+    assert(get == "GET /ping HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", "GET 请求行逐字节");
+    const post: string = buildHttpRequest("POST", "/echo", "h", "hi");
+    assert(post == "POST /echo HTTP/1.0\r\nHost: h\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi", "POST 带 Content-Length");
+}
+
+// —— 纯函数段：响应解析 ——
+
+test "net：HTTP 响应解析固定向量" {
+    const r: HttpResp | Error = parseHttpResponse("HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nhello net");
+    const resp: HttpResp = r catch panic("响应解析失败");
+    assert(resp.status == 200, "状态 200");
+    assert(resp.body == "hello net", "体分割");
+    const r2: HttpResp | Error = parseHttpResponse("HTTP/1.0 404 Not Found\r\n\r\n");
+    const resp2: HttpResp = r2 catch panic("404 解析失败");
+    assert(resp2.status == 404, "状态 404");
+    assert(resp2.body == "", "无体形态");
+}
+
+// —— loopback 集成段：自建自连＋固定响应（同进程 listen/accept/connect）——
+
+test "net：loopback 固定响应回路（D86 §四）" {
+    let listener: int = -1;
+    let port: int = 47110;
+    let attempt: int = 0;
+    while (attempt < 8) {
+        const l: int | Error = tcpListen(port);
+        listener = l catch -1;
+        if (listener >= 0) { break; }
+        port = port + 1;
+        attempt = attempt + 1;
+    }
+    assert(listener >= 0, "loopback 监听建立");
+    // 单线程确定性回路：connect 先行（内核 backlog 完成握手挂起）→ 客户端
+    // 发送 → accept 出队（立即返回）→ 服务端回读/回发 → 客户端回读。
+    // 真纤程/线程不在面（S1 异步为协程面——阻塞宿主调用不挂起切换）。
+    const cli: int | Error = tcpConnect("127.0.0.1", port);
+    const c: int = cli catch panic("loopback connect 失败");
+    const sent: int | Error = tcpSend(c, "ping");
+    assert((sent catch 0) == 4, "发送 4 字节");
+    const conn: int | Error = tcpAccept(listener);
+    const cc: int = conn catch panic("loopback accept 失败");
+    const got: string = tcpRecv(cc, 64) catch "ERR";
+    assert(got == "ping", "固定响应回读");
+    const back: int | Error = tcpSend(cc, "pong");
+    assert((back catch 0) == 4, "回发 4 字节");
+    assert((tcpRecv(c, 64) catch "ERR") == "pong", "客户端回读");
+    assert((tcpRecv(c, 0) catch "ERR") == "ERR", "max ≤ 0 为 Error");
+    tcpClose(c);
+    tcpClose(cc);
+    tcpClose(listener);
+}
+
+test "net：对端关闭后发送得 Error，进程不被 SIGPIPE 结束" {
+    let listener: int = -1;
+    let port: int = 47130;
+    let attempt: int = 0;
+    while (attempt < 8) {
+        const l: int | Error = tcpListen(port);
+        listener = l catch -1;
+        if (listener >= 0) { break; }
+        port = port + 1;
+        attempt = attempt + 1;
+    }
+    assert(listener >= 0, "监听建立");
+    const c: int = tcpConnect("127.0.0.1", port) catch panic("connect 失败");
+    const cc: int = tcpAccept(listener) catch panic("accept 失败");
+    tcpClose(cc);
+    // 对端已关闭：头一两次发送可能仍进内核缓冲，收到 RST 之后发送失败（Linux 带 MSG_NOSIGNAL、macOS 设 SO_NOSIGPIPE，
+    // 得 EPIPE 而不是 SIGPIPE）。
+    const chunk = repeat("x", 1024);
+    let failed: bool = false;
+    let i: int = 0;
+    while (i < 200 && !failed) {
+        const r: int | Error = tcpSend(c, chunk);
+        if ((r catch -1) < 0) { failed = true; }
+        i = i + 1;
+    }
+    assert(failed, "对端关闭后发送失败");
+    tcpClose(c);
+    tcpClose(listener);
+}

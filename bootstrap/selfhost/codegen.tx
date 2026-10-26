@@ -1,0 +1,5280 @@
+import { ProgramContext } from "./program_context";
+import { compileProfileActive, compileProfileClock, compileProfileCodegenDetail } from "./compile_profile_data";
+// codegen.tx —— typed→字节码生成的 .tx 承接（V0.50-S5-① 批 B2；BOOT-47；
+// D102 §一——src/compiler/codegen/codegen.zig 六步管线＋FnEmitter 的同构移植）。
+//
+// 输入＝SEB1+FAB1 文本（semamirror 产出；单行空白分隔 token 流——str 域
+// 空格转义为 \x20 故整流可安全按空格分词）。输出＝PROGDUMP v2 文本（指令字为 TXC v6）
+//（bytecode.tx serializeDump 消费——.txc 字节恒等锚）。
+//
+// 架构：SEB1 侧表条目键升序（sebin §6.2）→ 平行数组＋二分查；FAB1 记录束
+// → id 索引（排序＋二分）。codegen 六步＝generate :57-244 同构；FnEmitter
+// 全语句/表达式面＝:578-1339 同构（node-id 键沿 semamirror/SEB1 形态）。
+//
+// 锚：hello .txc 的原生金哈希（TXC v6，tests/golden/hello.native.txc.sha256）逐字节恒等
+//（bytecode.serialize 确定性纪律——发射序即字节面）；与 Zig 链 v4 产物经 scripts/txc_decode.py 结构比对。
+import { strtodBits, strtodF32Bits } from "./strtod";
+import { filePath } from "./file_path";
+import { serviceRestricted, serviceSize, serviceReadBytes } from "./service_files";
+import { serializeDump, serializeProgramContext, programBytesOut, ffiPayloadHex } from "./bytecode";
+import { fwOpCode, isFwOp, FW_NEG, FW_BNOT, FW_SHL, FW_SHR, FW_USHR, FW_WADD } from "./fw_ops";
+import { DBG_ENTER, DBG_STMT, DBG_LEAVE, DBG_RESUME, isToolBi } from "./builtin_names";
+import { dvReset, dvFnBegin, dvScopeOpen, dvScopeClose, dvLocal, dvRange, dvWhole, dvFnFinish, dvSetTypes, dvTake, dvDecl, dvSebDecl } from "./dbg_info";
+import { pathIsSep, pathOnWindows } from "./path_sep";
+
+// ============================================================================
+// §0 token 流读取器（SEB1/FAB1 共用；str 域空格已转义故按空格分词安全）
+// ============================================================================
+
+const CG_BAD: int = -9223372036854775807 - 1;
+
+struct TokRdr {
+    toks: List<string>,
+    pos: int,
+}
+
+function emptyStrList(): List<string> {
+    return listNew();
+}
+
+function emptyIntList(): List<int> {
+    return listNew();
+}
+
+function cgOpen(data: string): Ref<TokRdr> {
+    return new TokRdr { toks: strSplit(data, " "), pos: 0 };
+}
+
+function cgNext(r: Ref<TokRdr>): string {
+    if (r.pos >= listLen(r.toks)) { return ""; }
+    const t = listGet(r.toks, r.pos) catch "";
+    r.pos = r.pos + 1;
+    return t;
+}
+
+function cgU(r: Ref<TokRdr>): int {
+    // u32v/u64v＝十进制＋空格（fab1 W 同构）。
+    const t = cgNext(r);
+    if (len(t) == 0) { return CG_BAD; }
+    let v: int = 0;
+    let i = 0;
+    while (i < len(t)) {
+        const c = byteAt(t, i) catch 48;
+        if (c < 48 || c > 57) { return CG_BAD; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+function cgBool(r: Ref<TokRdr>): int {
+    // boolv＝"1 "/"0 "（fab1 W 同构）。
+    const t = cgNext(r);
+    if (t == "1") { return 1; }
+    return 0;
+}
+
+// unescape（render.escape 逆——\xNN 十六进制字节、\\、\"；其余直通）。
+// 非 ASCII 直通＝解码码点原样重组（utf8Encode 单字节通道对 ≥0x80 会双编码）。
+function cgUnescape(e: string): string {
+    if (len(e) > 256) { return cgUnescapeLarge(e); }
+    let out = "";
+    let i = 0;
+    while (i < len(e)) {
+        const c = byteAt(e, i) catch 0;
+        if (c == 92) { // '\\'
+            i = i + 1;
+            if (i >= len(e)) { break; }
+            const c2 = byteAt(e, i) catch 0;
+            if (c2 == 110) { out = out + "\n"; i = i + 1; continue; }
+            if (c2 == 116) { out = out + "\t"; i = i + 1; continue; }
+            if (c2 == 48) { out = out + (utf8Encode(0) catch ""); i = i + 1; continue; }
+            if (c2 == 117) { // \u{XXXXX} 码点转义（lexer 'u' 臂同构）
+                let cp: int = 0;
+                let j2 = i + 1;
+                if ((byteAt(e, j2) catch 0) == 123) {
+                    j2 = j2 + 1;
+                    while (j2 < len(e)) {
+                        const hx = byteAt(e, j2) catch 125;
+                        if (hx >= 48 && hx <= 57) { cp = cp * 16 + (hx - 48); }
+                        else if (hx >= 97 && hx <= 102) { cp = cp * 16 + (hx - 87); }
+                        else if (hx >= 65 && hx <= 70) { cp = cp * 16 + (hx - 55); }
+                        else { break; }
+                        j2 = j2 + 1;
+                    }
+                    if ((byteAt(e, j2) catch 0) == 125) { j2 = j2 + 1; }
+                }
+                out = out + (utf8Encode(cp) catch "");
+                i = j2;
+                continue;
+            }
+            if (c2 == 114) { out = out + "\r"; i = i + 1; continue; }
+            if (c2 == 92) { out = out + "\\"; i = i + 1; continue; }
+            if (c2 == 34) { out = out + "\""; i = i + 1; continue; }
+            if (c2 == 120) { // \xNN
+                const h1 = hexValCg(byteAt(e, i + 1) catch 48);
+                const h2 = hexValCg(byteAt(e, i + 2) catch 48);
+                if (h1 >= 0 && h2 >= 0) {
+                    // 域内 \xNN 恒 <0x80（空格/控制）；≥0x80 面仅源转义码点域。
+                    const b = h1 * 16 + h2;
+                    out = out + (utf8Encode(b) catch "");
+                    i = i + 3;
+                    continue;
+                }
+                out = out + "\\x";
+                i = i + 2;
+                continue;
+            }
+            out = out + (utf8Encode(c2) catch "");
+            i = i + 1;
+            continue;
+        }
+        if (c < 0x80) {
+            out = out + (utf8Encode(c) catch "");
+            i = i + 1;
+            continue;
+        }
+        // 多字节 UTF-8 直通：解码码点→原样重组（字节面恒等）。
+        let blen = 1;
+        let cpv = 0;
+        if (c >= 0xF0) { blen = 4; cpv = c & 7; }
+        else if (c >= 0xE0) { blen = 3; cpv = c & 15; }
+        else if (c >= 0xC0) { blen = 2; cpv = c & 31; }
+        let k = 1;
+        while (k < blen) {
+            cpv = (cpv << 6) | ((byteAt(e, i + k) catch 0) & 0x3F);
+            k = k + 1;
+        }
+        out = out + (utf8Encode(cpv) catch "");
+        i = i + blen;
+    }
+    return out;
+}
+
+// 仅在完整转义/码点处理之后分块，语义沿用短串路径。
+function cgJoinStringChunks(parts: List<string>, lo: int, hi: int): string {
+    if (hi - lo == 1) { return listGet(parts, lo) catch ""; }
+    const mid = lo + (hi - lo) / 2;
+    return cgJoinStringChunks(parts, lo, mid) + cgJoinStringChunks(parts, mid, hi);
+}
+
+function cgUnescapeLarge(e: string): string {
+    const parts: List<string> = listNew();
+    let out = "";
+    let i = 0;
+    while (i < len(e)) {
+        if (len(out) >= 256) { listPush(parts, out); out = ""; }
+        const c = byteAt(e, i) catch 0;
+        if (c == 92) { // '\\'
+            i = i + 1;
+            if (i >= len(e)) { break; }
+            const c2 = byteAt(e, i) catch 0;
+            if (c2 == 110) { out = out + "\n"; i = i + 1; continue; }
+            if (c2 == 116) { out = out + "\t"; i = i + 1; continue; }
+            if (c2 == 48) { out = out + (utf8Encode(0) catch ""); i = i + 1; continue; }
+            if (c2 == 117) { // \u{XXXXX} 码点转义（lexer 'u' 臂同构）
+                let cp: int = 0;
+                let j2 = i + 1;
+                if ((byteAt(e, j2) catch 0) == 123) {
+                    j2 = j2 + 1;
+                    while (j2 < len(e)) {
+                        const hx = byteAt(e, j2) catch 125;
+                        if (hx >= 48 && hx <= 57) { cp = cp * 16 + (hx - 48); }
+                        else if (hx >= 97 && hx <= 102) { cp = cp * 16 + (hx - 87); }
+                        else if (hx >= 65 && hx <= 70) { cp = cp * 16 + (hx - 55); }
+                        else { break; }
+                        j2 = j2 + 1;
+                    }
+                    if ((byteAt(e, j2) catch 0) == 125) { j2 = j2 + 1; }
+                }
+                out = out + (utf8Encode(cp) catch "");
+                i = j2;
+                continue;
+            }
+            if (c2 == 114) { out = out + "\r"; i = i + 1; continue; }
+            if (c2 == 92) { out = out + "\\"; i = i + 1; continue; }
+            if (c2 == 34) { out = out + "\""; i = i + 1; continue; }
+            if (c2 == 120) { // \xNN
+                const h1 = hexValCg(byteAt(e, i + 1) catch 48);
+                const h2 = hexValCg(byteAt(e, i + 2) catch 48);
+                if (h1 >= 0 && h2 >= 0) {
+                    // 域内 \xNN 恒 <0x80（空格/控制）；≥0x80 面仅源转义码点域。
+                    const b = h1 * 16 + h2;
+                    out = out + (utf8Encode(b) catch "");
+                    i = i + 3;
+                    continue;
+                }
+                out = out + "\\x";
+                i = i + 2;
+                continue;
+            }
+            out = out + (utf8Encode(c2) catch "");
+            i = i + 1;
+            continue;
+        }
+        if (c < 0x80) {
+            out = out + (utf8Encode(c) catch "");
+            i = i + 1;
+            continue;
+        }
+        // 多字节 UTF-8 直通：解码码点→原样重组（字节面恒等）。
+        let blen = 1;
+        let cpv = 0;
+        if (c >= 0xF0) { blen = 4; cpv = c & 7; }
+        else if (c >= 0xE0) { blen = 3; cpv = c & 15; }
+        else if (c >= 0xC0) { blen = 2; cpv = c & 31; }
+        let k = 1;
+        while (k < blen) {
+            cpv = (cpv << 6) | ((byteAt(e, i + k) catch 0) & 0x3F);
+            k = k + 1;
+        }
+        out = out + (utf8Encode(cpv) catch "");
+        i = i + blen;
+    }
+    listPush(parts, out);
+    return cgJoinStringChunks(parts, 0, listLen(parts));
+}
+
+// 源字面量值（fab1 string 存带引号源文本——剥引号＋源转义处理）。
+// strSub 为码点域——长度按码点数（引号两侧恒 ASCII 各 1 码点）。
+function cgCpLen(s: string): int {
+    let n = 0;
+    let i = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) catch 0;
+        n = n + 1;
+        if (c >= 0xF0) { i = i + 4; }
+        else if (c >= 0xE0) { i = i + 3; }
+        else if (c >= 0xC0) { i = i + 2; }
+        else { i = i + 1; }
+    }
+    return n;
+}
+
+function cgStrLitValue(raw: string): string {
+    const n = len(raw);
+    if (n >= 2 && (byteAt(raw, 0) catch 0) == 34 && (byteAt(raw, n - 1) catch 0) == 34) {
+        return cgUnescape(strSub(raw, 1, cgCpLen(raw) - 2));
+    }
+    return cgUnescape(raw);
+}
+
+function hexValCg(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return -1;
+}
+
+function cgStr(r: Ref<TokRdr>): string {
+    // str＝u64v 长前缀＋转义字节＋空格（长度为转义后字节长）。
+    const n = cgU(r);
+    if (n < 0) { return ""; }
+    // 长度按转义后字节计——token 即完整转义串（无空格）。
+    const esc = cgNext(r);
+    if (len(esc) != n) {
+        // 防御：长度不符按实际 token（分词不产空 token）。
+    }
+    return cgUnescape(esc);
+}
+
+function decCg(v: int): string {
+    return toStr(v);
+}
+
+// ============================================================================
+// §1 SEB1 数据模型（sebin §6.2 节序；平行数组＋二分查）
+// ============================================================================
+
+struct CgTy {
+    kind: int, // sebin 0..16
+    a: int,
+    b: int,
+}
+
+struct CgField {
+    name: string,
+    ty: int,
+}
+
+struct CgStruct {
+    moduleIdx: int,
+    name: string,
+    fields: List<Ref<CgField>>,
+}
+
+struct CgVariant {
+    name: string,
+    fields: List<Ref<CgField>>,
+    // 错误 enum 变体（D3 v0.19，SEB1 ERR1 节）：种类名、原因字段序（-1 无）、
+    // 消息片段（segF -1＝字面量原文 segS，否则字段序）。
+    kname: string,
+    cause: int,
+    segF: List<int>,
+    segS: List<string>,
+}
+
+struct CgEnum {
+    isErr: int,
+    moduleIdx: int,
+    name: string,
+    variants: List<Ref<CgVariant>>,
+}
+
+struct CgSig {
+    isAsync: int,
+    params: List<int>,
+    ret: int,
+}
+
+struct CgExtern {
+    name: string,
+    params: List<int>,
+    ret: int,
+}
+
+struct CgGlobal {
+    name: string,
+    ty: int,
+    slot: int,
+}
+
+struct CgModule {
+    display: string,
+    globals: List<Ref<CgGlobal>>,
+    initSlotCap: int,
+    symNames: List<string>,
+    symKinds: List<int>,
+    symA: List<int>,
+    symB: List<int>,
+}
+
+struct CgFn {
+    moduleIdx: int,
+    declKey: int,
+    name: string,
+    sigIdx: int,
+    paramTys: List<int>,
+    ret: int,
+    isAsync: int,
+}
+
+struct CgTest {
+    name: string,
+    moduleIdx: int,
+}
+
+// 侧表（键升序平行数组＋二分）。
+struct SideTab {
+    keys: List<int>, // u64 位型
+    vals: List<List<int>>, // 每条目定长载荷展开
+}
+
+function sideLen(t: Ref<SideTab>): int {
+    return listLen(t.keys);
+}
+
+function sideFind(t: Ref<SideTab>, key: int): int {
+    let lo = 0;
+    let hi = listLen(t.keys) - 1;
+    while (lo <= hi) {
+        const mid = (lo + hi) / 2;
+        const k = listGet(t.keys, mid) catch 0;
+        if (k == key) { return mid; }
+        if (k < key) { lo = mid + 1; } else { hi = mid - 1; }
+    }
+    return -1;
+}
+
+function sideGet1(t: Ref<SideTab>, key: int): int {
+    const m = sideFind(t, key);
+    if (m < 0) { return 0; }
+    const row = listGet(t.vals, m) catch emptyIntList();
+    return listGet(row, 0) catch 0;
+}
+
+export struct SemaView {
+    moduleCount: int,
+    moduleNodeCounts: List<int>,
+    tys: List<Ref<CgTy>>,
+    structs: List<Ref<CgStruct>>,
+    enums: List<Ref<CgEnum>>,
+    sigs: List<Ref<CgSig>>,
+    externs: List<Ref<CgExtern>>,
+    modules: List<Ref<CgModule>>,
+    fnTable: List<Ref<CgFn>>,
+    tests: List<Ref<CgTest>>,
+    stExprTypes: Ref<SideTab>,
+    stExprRes: Ref<SideTab>,
+    stMethodArgs: Ref<SideTab>,
+    stFieldRes: Ref<SideTab>,
+    stBindingSlots: Ref<SideTab>,
+    stArmRes: Ref<SideTab>,
+    stStructLit: Ref<SideTab>,
+    stArrayLit: Ref<SideTab>,
+    stVariantRes: Ref<SideTab>,
+    stBodySlots: Ref<SideTab>,
+    stCatchBinds: Ref<SideTab>,
+    stSwitchEnum: Ref<SideTab>,
+    stClosureRes: Ref<SideTab>,
+    stClosureMeta: Ref<SideTab>,
+    stIfaceCall: Ref<SideTab>, // D3 v0.20 接口方法调用（SEB1 IFC1 节）：[方法函数值字段序, 接收者经 Ref]
+    closureFnIndices: List<int>,
+    genFns: List<int>, // D3 v0.22 生成器函数的 fn 表序（SEB1 GEN1 节）
+    // D3 v0.23 FFI（SEB1 FFI1 节；行形见 program_context.tx）。
+    ffiLibs: List<string>,
+    ffiExt: List<List<int>>,
+    ffiLay: List<List<int>>,
+    ffiCb: List<List<int>>,
+    ffiCbFn: List<int>,
+    // 线程第 3b 步（SEB1 SND1 节）：不可发送的 struct 池序、enum 池序与闭包键；第 4c 步起另有一套不可共享的。
+    sndS: List<int>,
+    sndE: List<int>,
+    sndC: List<int>,
+    shrS: List<int>,
+    shrE: List<int>,
+    shrC: List<int>,
+    // 第 6 轮 6c-4a（SEB1 DBG1 节，仅调试构建）：绑定键 → 类型池号＋1（0 为未知）；类型池各项的源码拼写。
+    stDbgTy: Ref<SideTab>,
+    dbgTyNames: List<string>,
+    // 第 6 轮 6d-3a（SEB1 ANA1 节，仅 SEIN 标志位 16 置位时）：每行 10 个整数（模块、行、列、锚类、着色类、标志、键模块、
+    // 键行、键列、键锚类＋1）与名字，见 semamirror 的 AnaRow（LSP 与 MCP 实施设计 §四-2）。codegen 不用它。
+    anaInts: List<int>,
+    anaNames: List<string>,
+    // 6d-3b（ANT1 节，同受标志位 16 控制）：声明的说明，每行 5 个整数（模块、行、列、锚类、标志）与名字、文本两个串，见
+    // semamirror 的 AnaDet（§四-5）。codegen 不用它。
+    anaDetInts: List<int>,
+    anaDetStrs: List<string>,
+    entryModule: int,
+    hasMain: int,
+    mainFnIdx: int,
+    diagCount: int,
+    diagCodes: List<int>,
+    diagMods: List<int>,
+    diagLines: List<int>,
+    diagCols: List<int>,
+    diagMsgs: List<string>,
+}
+
+function newSideTab(): Ref<SideTab> {
+    return new SideTab { keys: listNew(), vals: listNew() };
+}
+
+function dummyCgTy(): Ref<CgTy> { return new CgTy { kind: 0, a: -1, b: 0 }; }
+function dummyCgField(): Ref<CgField> { return new CgField { name: "", ty: 0 }; }
+
+function dummyCgStruct(): Ref<CgStruct> { return new CgStruct { moduleIdx: 0, name: "", fields: listNew() }; }
+function dummyCgEnum(): Ref<CgEnum> { return new CgEnum { isErr: 0, moduleIdx: 0, name: "", variants: listNew() }; }
+function dummyCgSig(): Ref<CgSig> { return new CgSig { isAsync: 0, params: listNew(), ret: 0 }; }
+function dummyCgExtern(): Ref<CgExtern> { return new CgExtern { name: "", params: listNew(), ret: 0 }; }
+function dummyCgModule(): Ref<CgModule> {
+    return new CgModule { display: "", globals: listNew(), initSlotCap: 0, symNames: listNew(), symKinds: listNew(), symA: listNew(), symB: listNew() };
+}
+function dummyCgFn(): Ref<CgFn> { return new CgFn { moduleIdx: 0, declKey: 0, name: "", sigIdx: 0, paramTys: listNew(), ret: 0, isAsync: 0 }; }
+
+export function sebParseOk(): int {
+    return cgSebOk;
+}
+
+export function sideLenPub(t: Ref<SideTab>): int {
+    return sideLen(t);
+}
+
+// ============================================================================
+// §2 SEB1 解析（sebin.dump :254-580 节序同构的逆）
+// ============================================================================
+
+function newSide(): Ref<SideTab> { return newSideTab(); }
+
+function sideAdd(t: Ref<SideTab>, key: int, row: List<int>): void {
+    listPush(t.keys, key);
+    listPush(t.vals, row);
+}
+
+// parseSeb1：token 流 → SemaView（失败＝cgSebOk==0）。
+let cgSebOk: int = 1;
+
+export function parseSeb1(data: string): Ref<SemaView> {
+    cgSebOk = 1;
+    const r = cgOpen(data);
+    if (cgNext(r) != "SEB1") { cgSebOk = 0; return newSemaView(); }
+    const ver = cgU(r);
+    if (ver != 1) { cgSebOk = 0; return newSemaView(); }
+    const sv = newSemaView();
+
+    sv.moduleCount = cgU(r);
+    let i = 0;
+    while (i < sv.moduleCount) { listPush(sv.moduleNodeCounts, cgU(r)); i = i + 1; }
+
+    // 类型图池。
+    const nty = cgU(r);
+    i = 0;
+    while (i < nty) {
+        const kind = cgU(r);
+        if (kind == 11) { // array: a=elem b=len(u64v)
+            const a = cgU(r);
+            const b = cgU(r);
+            listPush(sv.tys, new CgTy { kind: kind, a: a, b: b });
+        } else if (kind <= 5 || (kind >= 12 && kind <= 14) || kind == 16 || kind == 17) {
+            if (kind == 12 || kind == 13 || kind == 14 || kind == 16) {
+                const a = cgU(r);
+                listPush(sv.tys, new CgTy { kind: kind, a: a, b: 0 });
+            } else {
+                listPush(sv.tys, new CgTy { kind: kind, a: -1, b: 0 });
+            }
+        } else if (kind == 21) { // 定宽数值（O4）：运行期即 int/float，b 载种类码 1..10（10＝f32）
+            const fk = cgU(r);
+            if (fk == 10) { listPush(sv.tys, new CgTy { kind: 1, a: -1, b: fk }); } else { listPush(sv.tys, new CgTy { kind: 0, a: -1, b: fk }); }
+        } else if (kind == 22) { // D3 v0.23 FFI 句柄：运行期即指针宽整数（句柄序不入 codegen）
+            cgU(r);
+            listPush(sv.tys, new CgTy { kind: 0, a: -1, b: 0 });
+        } else { // 6..10 optional/errunion/ref/weak/list
+            const a = cgU(r);
+            listPush(sv.tys, new CgTy { kind: kind, a: a, b: 0 });
+        }
+        i = i + 1;
+    }
+
+    // structs。
+    const nst = cgU(r);
+    i = 0;
+    while (i < nst) {
+        const mi = cgU(r);
+        const name = cgStr(r);
+        const st = new CgStruct { moduleIdx: mi, name: name, fields: listNew() };
+        const nf = cgU(r);
+        let j = 0;
+        while (j < nf) {
+            const fname = cgStr(r);
+            const fty = cgU(r);
+            listPush(st.fields, new CgField { name: fname, ty: fty });
+            j = j + 1;
+        }
+        listPush(sv.structs, st);
+        i = i + 1;
+    }
+
+    // enums。
+    const nen = cgU(r);
+    i = 0;
+    while (i < nen) {
+        const mi = cgU(r);
+        const name = cgStr(r);
+        const en = new CgEnum { isErr: 0, moduleIdx: mi, name: name, variants: listNew() };
+        const nv = cgU(r);
+        let j = 0;
+        while (j < nv) {
+            const vname = cgStr(r);
+            const v = new CgVariant { kname: "", cause: -1, segF: listNew(), segS: listNew(), name: vname, fields: listNew() };
+            const nff = cgU(r);
+            let k = 0;
+            while (k < nff) {
+                const fname = cgStr(r);
+                const fty = cgU(r);
+                listPush(v.fields, new CgField { name: fname, ty: fty });
+                k = k + 1;
+            }
+            listPush(en.variants, v);
+            j = j + 1;
+        }
+        listPush(sv.enums, en);
+        i = i + 1;
+    }
+
+    // sigs。
+    const nsg = cgU(r);
+    i = 0;
+    while (i < nsg) {
+        const isAsync = cgBool(r);
+        const np = cgU(r);
+        const sg = new CgSig { isAsync: isAsync, params: listNew(), ret: 0 };
+        let j = 0;
+        while (j < np) { listPush(sg.params, cgU(r)); j = j + 1; }
+        sg.ret = cgU(r);
+        listPush(sv.sigs, sg);
+        i = i + 1;
+    }
+
+    // externs。
+    const nex = cgU(r);
+    i = 0;
+    while (i < nex) {
+        const name = cgStr(r);
+        const np = cgU(r);
+        const ex = new CgExtern { name: name, params: listNew(), ret: 0 };
+        let j = 0;
+        while (j < np) { listPush(ex.params, cgU(r)); j = j + 1; }
+        ex.ret = cgU(r);
+        listPush(sv.externs, ex);
+        i = i + 1;
+    }
+
+    // modules。
+    const nmod = cgU(r);
+    i = 0;
+    while (i < nmod) {
+        const display = cgStr(r);
+        const m = new CgModule { display: display, globals: listNew(), initSlotCap: 0, symNames: listNew(), symKinds: listNew(), symA: listNew(), symB: listNew() };
+        const ng = cgU(r);
+        let j = 0;
+        while (j < ng) {
+            const gname = cgStr(r);
+            const gty = cgU(r);
+            const gslot = cgU(r);
+            listPush(m.globals, new CgGlobal { name: gname, ty: gty, slot: gslot });
+            j = j + 1;
+        }
+        m.initSlotCap = cgU(r);
+        const nsym = cgU(r);
+        j = 0;
+        while (j < nsym) {
+            listPush(m.symNames, cgStr(r));
+            listPush(m.symKinds, cgU(r));
+            listPush(m.symA, cgU(r));
+            listPush(m.symB, cgU(r));
+            j = j + 1;
+        }
+        listPush(sv.modules, m);
+        i = i + 1;
+    }
+
+    // fn_table。
+    const nfn = cgU(r);
+    i = 0;
+    while (i < nfn) {
+        const mi = cgU(r);
+        const dkey = cgU(r);
+        const name = cgStr(r);
+        const sigIdx = cgU(r);
+        const np = cgU(r);
+        const f = new CgFn { moduleIdx: mi, declKey: dkey, name: name, sigIdx: sigIdx, paramTys: listNew(), ret: 0, isAsync: 0 };
+        let j = 0;
+        while (j < np) { listPush(f.paramTys, cgU(r)); j = j + 1; }
+        f.ret = cgU(r);
+        f.isAsync = cgBool(r);
+        listPush(sv.fnTable, f);
+        i = i + 1;
+    }
+
+    // tests。
+    const ntest = cgU(r);
+    i = 0;
+    while (i < ntest) {
+        const name = cgStr(r);
+        const mi = cgU(r);
+        listPush(sv.tests, new CgTest { name: name, moduleIdx: mi });
+        i = i + 1;
+    }
+
+    // 14 张侧表（条目键升序）＋15 closure_fn_indices。
+    i = 0;
+    while (i < 14) {
+        const cnt = cgU(r);
+        const t = newSide();
+        let j = 0;
+        while (j < cnt) {
+            const key = cgU(r);
+            let row: List<int> = listNew();
+            if (i == 0) { // expr_types: ty
+                listPush(row, cgU(r));
+            } else if (i == 1) { // expr_res: tag+payload
+                const tag = cgU(r);
+                listPush(row, tag);
+                if (tag == 0) { listPush(row, cgU(r)); }
+                else if (tag == 1) { listPush(row, cgU(r)); listPush(row, cgU(r)); }
+                else if (tag == 2 || tag == 3 || tag == 4) { listPush(row, cgU(r)); }
+            } else if (i == 2) { // method_args: n + n keys
+                const n = cgU(r);
+                listPush(row, n);
+                let k = 0;
+                while (k < n) { listPush(row, cgU(r)); k = k + 1; }
+            } else if (i == 3) { // field_res: tag + payload
+                const tag = cgU(r);
+                listPush(row, tag);
+                if (tag == 0) { listPush(row, cgU(r)); listPush(row, cgU(r)); listPush(row, cgBool(r)); }
+                else if (tag == 1) { listPush(row, cgU(r)); listPush(row, cgU(r)); }
+                // tag 2 零载荷
+            } else if (i == 4 || i == 9 || i == 10) { // binding_slots/body_slots/catch_binds: u32
+                listPush(row, cgU(r));
+            } else if (i == 5) { // arm_res: enum + has_vi [+vi] + n + (name slot)*
+                listPush(row, cgU(r));
+                const hasVi = cgBool(r);
+                listPush(row, hasVi);
+                if (hasVi == 1) { listPush(row, cgU(r)); }
+                const nb = cgU(r);
+                listPush(row, nb);
+                let k = 0;
+                while (k < nb) { cgStr(r); listPush(row, cgU(r)); k = k + 1; }
+            } else if (i == 6) { // struct_lit: struct + n + n×u32
+                listPush(row, cgU(r));
+                const n = cgU(r);
+                listPush(row, n);
+                let k = 0;
+                while (k < n) { listPush(row, cgU(r)); k = k + 1; }
+            } else if (i == 7) { // array_lit: is_slice + elem + len(u64v)
+                listPush(row, cgBool(r));
+                listPush(row, cgU(r));
+                listPush(row, cgU(r));
+            } else if (i == 8) { // variant_res: enum + idx
+                listPush(row, cgU(r));
+                listPush(row, cgU(r));
+            } else if (i == 11) { // switch_enum: enum
+                listPush(row, cgU(r));
+            } else if (i == 12) { // closure_res: fn_idx + sig + n + (name ty slot src[+payload])*
+                listPush(row, cgU(r));
+                listPush(row, cgU(r));
+                const n = cgU(r);
+                listPush(row, n);
+                const capNs: List<string> = listNew();
+                let k = 0;
+                while (k < n) {
+                    listPush(capNs, cgStr(r));
+                    listPush(row, cgU(r));
+                    listPush(row, cgU(r));
+                    const src = cgU(r);
+                    listPush(row, src);
+                    if (src == 0) { listPush(row, cgU(r)); }
+                    else if (src == 1) { listPush(row, cgU(r)); listPush(row, cgU(r)); }
+                    k = k + 1;
+                }
+                listPush(closureCapNames, capNs);
+            } else if (i == 13) { // closure_meta: fndecl_key → arrow_key
+                listPush(row, cgU(r));
+            }
+            sideAdd(t, key, row);
+            j = j + 1;
+        }
+        if (i == 0) { sv.stExprTypes = t; }
+        else if (i == 1) { sv.stExprRes = t; }
+        else if (i == 2) { sv.stMethodArgs = t; }
+        else if (i == 3) { sv.stFieldRes = t; }
+        else if (i == 4) { sv.stBindingSlots = t; }
+        else if (i == 5) { sv.stArmRes = t; }
+        else if (i == 6) { sv.stStructLit = t; }
+        else if (i == 7) { sv.stArrayLit = t; }
+        else if (i == 8) { sv.stVariantRes = t; }
+        else if (i == 9) { sv.stBodySlots = t; }
+        else if (i == 10) { sv.stCatchBinds = t; }
+        else if (i == 11) { sv.stSwitchEnum = t; }
+        else if (i == 12) { sv.stClosureRes = t; }
+        else if (i == 13) { sv.stClosureMeta = t; }
+        i = i + 1;
+    }
+    const ncfi = cgU(r);
+    i = 0;
+    while (i < ncfi) { listPush(sv.closureFnIndices, cgU(r)); i = i + 1; }
+
+    // entry。
+    sv.entryModule = cgU(r);
+    sv.hasMain = cgBool(r);
+    sv.mainFnIdx = cgU(r);
+
+    // diags（第 26 节——干净程序 0）。记录全量消费（sebin.zig §26 同构：
+    // u32 code/u32 module_idx/u32 line/u32 col/str msg——sema_loader :1755
+    // 消费面对偶；drvCompile/drvNative 产物前阻断依据）。
+    sv.diagCount = cgU(r);
+    let dci = 0;
+    while (dci < sv.diagCount) {
+        listPush(sv.diagCodes, cgU(r));
+        listPush(sv.diagMods, cgU(r));
+        listPush(sv.diagLines, cgU(r));
+        listPush(sv.diagCols, cgU(r));
+        listPush(sv.diagMsgs, cgStr(r));
+        dci = dci + 1;
+    }
+    // ERR1（D3 v0.19 错误 enum；仅程序含错误 enum 时出现）。
+    let secTok = cgNext(r);
+    if (secTok == "ERR1") {
+        const nerr = cgU(r);
+        let ei2 = 0;
+        while (ei2 < nerr) {
+            const en = listGet(sv.enums, cgU(r)) catch dummyCgEnum();
+            en.isErr = 1;
+            const nv2 = cgU(r);
+            let vj = 0;
+            while (vj < nv2) {
+                const v = listGet(en.variants, vj) catch dummyCgVariant();
+                v.kname = cgStr(r);
+                v.cause = cgU(r) - 1;
+                const ns = cgU(r);
+                let sk = 0;
+                while (sk < ns) {
+                    const fsel = cgU(r);
+                    listPush(v.segF, fsel - 1);
+                    if (fsel == 0) { listPush(v.segS, cgStr(r)); } else { listPush(v.segS, ""); }
+                    sk = sk + 1;
+                }
+                vj = vj + 1;
+            }
+            ei2 = ei2 + 1;
+        }
+        secTok = cgNext(r);
+    }
+    // IFC1（D3 v0.20 接口方法调用；仅程序含此类调用时出现，键升序）。其后可能还有无载荷的
+    // LVE1 标记节（List 值类型元素，见 semamirror），这里无需读取。
+    if (secTok == "IFC1") {
+        const nic = cgU(r);
+        let ici = 0;
+        while (ici < nic) {
+            const key = cgU(r);
+            const row: List<int> = listNew();
+            listPush(row, cgU(r));
+            listPush(row, cgU(r));
+            sideAdd(sv.stIfaceCall, key, row);
+            ici = ici + 1;
+        }
+        secTok = cgNext(r);
+    }
+    // GEN1（D3 v0.22；仅程序用到生成器时出现）：生成器函数的 fn 表序。
+    if (secTok == "GEN1") {
+        const ngen = cgU(r);
+        let gni = 0;
+        while (gni < ngen) {
+            listPush(sv.genFns, cgU(r));
+            gni = gni + 1;
+        }
+        secTok = cgNext(r);
+    }
+    // FFI1（D3 v0.23；仅程序含带 from 的外部函数时出现）：节形见 semamirror 发射处，行形见 program_context.tx。
+    if (secTok == "FFI1") {
+        parseFfi1(r, sv);
+        secTok = cgNext(r);
+    }
+    // DBG1（第 6 轮 6c-4a；仅调试构建时出现）：n 行（键, 类型池号＋1）按键升序，再是类型池各项的源码拼写。
+    // 键：let/const 为绑定号，catch 绑定为 2^58＋catch 表达式号，switch 臂绑定为 2^59＋臂号×2^16＋绑定序。
+    if (secTok == "DBG1") {
+        const ndb = cgU(r);
+        let dbi = 0;
+        while (dbi < ndb) {
+            const key = cgU(r);
+            const row: List<int> = listNew();
+            listPush(row, cgU(r));
+            sideAdd(sv.stDbgTy, key, row);
+            dbi = dbi + 1;
+        }
+        const ntn = cgU(r);
+        dbi = 0;
+        while (dbi < ntn) {
+            listPush(sv.dbgTyNames, cgStr(r));
+            dbi = dbi + 1;
+        }
+        secTok = cgNext(r);
+    }
+    // SND1（线程第 3b 步；仅程序用到 threadSpawn 或 sharedNew 时出现）：不可发送的 struct 池序、enum 池序与闭包键，
+    // 再是不可共享的同样三组（第 4c 步）。其后可能还有 LVE1 标记节。
+    if (secTok == "SND1") {
+        cgReadInts(r, sv.sndS, cgU(r));
+        cgReadInts(r, sv.sndE, cgU(r));
+        cgReadInts(r, sv.sndC, cgU(r));
+        cgReadInts(r, sv.shrS, cgU(r));
+        cgReadInts(r, sv.shrE, cgU(r));
+        cgReadInts(r, sv.shrC, cgU(r));
+        secTok = cgNext(r);
+    }
+    // LVE1 是无载荷的标记节，codegen 不读。
+    if (secTok == "LVE1") { secTok = cgNext(r); }
+    // ANA1（第 6 轮 6d-3a；仅 SEIN 标志位 16 置位时出现，不挂“无诊断”）：n 行，每行 10 个整数与名字。
+    if (secTok == "ANA1") {
+        const nana = cgU(r);
+        let ai = 0;
+        while (ai < nana) {
+            cgReadInts(r, sv.anaInts, 10);
+            listPush(sv.anaNames, cgStr(r));
+            ai = ai + 1;
+        }
+        secTok = cgNext(r);
+    }
+    if (secTok == "ANT1") {
+        const ndet = cgU(r);
+        let di = 0;
+        while (di < ndet) {
+            cgReadInts(r, sv.anaDetInts, 5);
+            listPush(sv.anaDetStrs, cgStr(r));
+            listPush(sv.anaDetStrs, cgStr(r));
+            di = di + 1;
+        }
+    }
+    return sv;
+}
+
+function cgFfiLib(sv: Ref<SemaView>, name: string): int {
+    let i = 0;
+    while (i < listLen(sv.ffiLibs)) {
+        if ((listGet(sv.ffiLibs, i) catch "") == name) { return i; }
+        i = i + 1;
+    }
+    listPush(sv.ffiLibs, name);
+    return listLen(sv.ffiLibs) - 1;
+}
+
+function cgReadInts(r: Ref<TokRdr>, row: List<int>, n: int): void {
+    let i = 0;
+    while (i < n) { listPush(row, cgU(r)); i = i + 1; }
+}
+
+function parseFfi1(r: Ref<TokRdr>, sv: Ref<SemaView>): void {
+    const nfx = cgU(r);
+    let i = 0;
+    while (i < nfx) {
+        const row: List<int> = listNew();
+        const mode = cgU(r);
+        let lib = 0;
+        let nr = 0;
+        if (mode == 1) { lib = cgFfiLib(sv, cgStr(r)) + 1; } else if (mode == 2) { nr = cgU(r); }
+        listPush(row, mode);
+        listPush(row, lib);
+        listPush(row, nr);
+        if (mode == 0) {
+            let z = 0;
+            while (z < 7) { listPush(row, 0); z = z + 1; }
+        } else {
+            const pos: List<int> = listNew();
+            cgReadInts(r, pos, 3);
+            const np = cgU(r);
+            const pks: List<int> = listNew();
+            cgReadInts(r, pks, np * 2);
+            listPush(row, cgU(r));
+            listPush(row, cgU(r));
+            let z = 0;
+            while (z < 3) { listPush(row, listGet(pos, z) catch 0); z = z + 1; }
+            listPush(row, np);
+            let j = 0;
+            while (j < listLen(pks)) { listPush(row, listGet(pks, j) catch 0); j = j + 1; }
+            listPush(row, cgU(r)); // D3 v0.36：定参个数（其后的参数按 C 变参约定传）
+        }
+        listPush(sv.ffiExt, row);
+        i = i + 1;
+    }
+    const nlay = cgU(r);
+    i = 0;
+    while (i < nlay) {
+        const row: List<int> = listNew();
+        cgReadInts(r, row, 3);
+        const nf = cgU(r);
+        listPush(row, nf);
+        cgReadInts(r, row, nf * 4);
+        listPush(sv.ffiLay, row);
+        i = i + 1;
+    }
+    const ncb = cgU(r);
+    i = 0;
+    while (i < ncb) {
+        const row: List<int> = listNew();
+        listPush(row, cgU(r));
+        const np = cgU(r);
+        listPush(row, np);
+        cgReadInts(r, row, np);
+        listPush(sv.ffiCb, row);
+        i = i + 1;
+    }
+    const ncf = cgU(r);
+    cgReadInts(r, sv.ffiCbFn, ncf * 2);
+}
+
+// 语义诊断消费（运行校验交接 §4 首要根因修复）：SEB1 diags 节全量转
+// stderr 行（seed main_cmds.zig printDiagJsonOrHuman human 面同构——
+// module:line:col: error code: msg；3000..4000 域附 explain 对照行）。
+// 返回诊断数；调用面（driver 两出口）>0 即在产物前阻断（seed sema_loader
+// 红线 5 同位）。module 域＝CgModule.display（相对归一形——seed 生产链为
+// abs_path，路径域差异属门 L2 独立核验面）。
+// 第 i 条语义诊断所在模块、第 midx 个模块的显示名（同 diagRenderSv；LSP 检查用，第 6 轮 6d-1）。
+export function svDiagDisplay(sv: Ref<SemaView>, i: int): string {
+    return svModuleDisplay(sv, listGet(sv.diagMods, i) catch 0);
+}
+
+export function svModuleDisplay(sv: Ref<SemaView>, midx: int): string {
+    return (listGet(sv.modules, midx) catch dummyCgModule()).display;
+}
+
+export function diagRenderSv(sv: Ref<SemaView>): string {
+    const n = sv.diagCount;
+    let out = "";
+    let i = 0;
+    while (i < n) {
+        const midx = listGet(sv.diagMods, i) catch 0;
+        const m = listGet(sv.modules, midx) catch dummyCgModule();
+        const line = listGet(sv.diagLines, i) catch 0;
+        const col = listGet(sv.diagCols, i) catch 0;
+        const code = listGet(sv.diagCodes, i) catch 0;
+        const msg = listGet(sv.diagMsgs, i) catch "";
+        out = out + m.display + ":" + toStr(line) + ":" + toStr(col) + ": error " + toStr(code) + ": " + msg + "\n";
+        if (code >= 3000 && code < 4000) {
+            out = out + "  └─ 处置详见: taixu explain " + toStr(code) + "\n";
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+function newSemaView(): Ref<SemaView> {
+    return new SemaView {
+        moduleCount: 0, moduleNodeCounts: listNew(),
+        tys: listNew(), structs: listNew(), enums: listNew(), sigs: listNew(),
+        externs: listNew(), modules: listNew(), fnTable: listNew(), tests: listNew(),
+        stExprTypes: newSide(), stExprRes: newSide(), stMethodArgs: newSide(), stFieldRes: newSide(),
+        stBindingSlots: newSide(), stArmRes: newSide(), stStructLit: newSide(), stArrayLit: newSide(),
+        stVariantRes: newSide(), stBodySlots: newSide(), stCatchBinds: newSide(), stSwitchEnum: newSide(),
+        stClosureRes: newSide(), stClosureMeta: newSide(), stIfaceCall: newSide(),
+        closureFnIndices: listNew(),
+        genFns: listNew(),
+        ffiLibs: listNew(), ffiExt: listNew(), ffiLay: listNew(), ffiCb: listNew(), ffiCbFn: listNew(),
+        sndS: listNew(), sndE: listNew(), sndC: listNew(), shrS: listNew(), shrE: listNew(), shrC: listNew(),
+        stDbgTy: newSide(), dbgTyNames: listNew(),
+        anaInts: listNew(), anaNames: listNew(), anaDetInts: listNew(), anaDetStrs: listNew(),
+        entryModule: 0, hasMain: 0, mainFnIdx: 0, diagCount: 0,
+        diagCodes: listNew(), diagMods: listNew(), diagLines: listNew(), diagCols: listNew(), diagMsgs: listNew(),
+    };
+}
+
+const closureCapNames: List<List<string>> = listNew();
+
+// ============================================================================
+// §3 FAB1 解析（fab1.dump :119-156 模块段＋记录束的逆；记录＝id/kind/atoms/子）
+// ============================================================================
+
+struct FabRec {
+    id: int,
+    kind: int,
+    atoms: string, // 原样转义域（按 kind 惰性解码）
+    childIds: List<int>,
+    atomsToks: List<string>, // atoms 按空格分词后的 token 游标域（str 长前缀已含）
+}
+
+struct FabModule {
+    mi: int,
+    roots: List<int>,
+    recIdx: List<int>, // 记录束序的记录下标
+}
+
+struct FabView {
+    modules: List<Ref<FabModule>>,
+    recs: List<Ref<CgNode>>,
+}
+
+function newFabRec(id: int, kind: int, atoms: string): Ref<FabRec> {
+    return new FabRec { id: id, kind: kind, atoms: atoms, childIds: listNew(), atomsToks: strSplit(atoms, " ") };
+}
+
+function fabRecByd(v: Ref<FabView>, id: int): int {
+    // id→记录下标（线性；调用面低频——root/子解析期）。
+    let i = 0;
+    while (i < listLen(v.recs)) {
+        if ((listGet(v.recs, i) catch newNode(0, 0)).id == id) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// atoms 游标（惰性解码域——u32v/u64v/i64v/str 同 fab1 W 编码）。
+struct AtomRdr {
+    toks: List<string>,
+    pos: int,
+}
+
+function atomOpen(rec: Ref<FabRec>): Ref<AtomRdr> {
+    return new AtomRdr { toks: rec.atomsToks, pos: 0 };
+}
+
+function atomNext(r: Ref<AtomRdr>): string {
+    if (r.pos >= listLen(r.toks)) { return ""; }
+    const t = listGet(r.toks, r.pos) catch "";
+    r.pos = r.pos + 1;
+    return t;
+}
+
+function atomU(r: Ref<AtomRdr>): int {
+    const t = atomNext(r);
+    if (len(t) == 0) { return CG_BAD; }
+    let v: int = 0;
+    let i = 0;
+    while (i < len(t)) {
+        const c = byteAt(t, i) catch 48;
+        if (c < 48 || c > 57) { return CG_BAD; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+function atomI(r: Ref<AtomRdr>): int {
+    // i64v 十进制（可负）。
+    const t = atomNext(r);
+    if (len(t) == 0) { return CG_BAD; }
+    let neg = false;
+    let i = 0;
+    if ((byteAt(t, 0) catch 48) == 45) { neg = true; i = 1; }
+    let v: int = 0;
+    while (i < len(t)) {
+        const c = byteAt(t, i) catch 48;
+        if (c < 48 || c > 57) { return CG_BAD; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    if (neg) { return -v; }
+    return v;
+}
+
+function atomStr(r: Ref<AtomRdr>): string {
+    // str＝u64 长前缀＋转义字节（空格已转义故 token 完整）。
+    const n = atomU(r);
+    if (n < 0) { return ""; }
+    const esc = atomNext(r);
+    return cgUnescape(esc);
+}
+
+function parseFab1(data: string): Ref<FabView> {
+    const v = new FabView { modules: listNew(), recs: listNew() };
+    const r = cgOpen(data);
+    if (cgNext(r) != "FAB1") { cgSebOk = 0; return v; }
+    const ver = cgU(r);
+    if (ver != 1) { cgSebOk = 0; return v; }
+    const nmod = cgU(r);
+    let mi = 0;
+    while (mi < nmod) {
+        const midx = cgU(r);
+        const nroots = cgU(r);
+        const roots: List<int> = listNew();
+        let j = 0;
+        while (j < nroots) { listPush(roots, cgU(r)); j = j + 1; }
+        const nrecs = cgU(r);
+        const fm = new FabModule { mi: midx, roots: roots, recIdx: listNew() };
+        j = 0;
+        while (j < nrecs) {
+            const id = cgU(r);
+            const kind = cgU(r);
+            // atoms＝直到 child_count 前的原始字节——按空格分词流中，原子域
+            // 的空格已转义，故 child_count token 即下一个纯数字 token。逐
+            // token 前瞻：child_count＝首个其后跟合法记录形态的 u32？不可靠
+            // ——改按 zig 同构：无原子长度前缀，解析器按 kind 定原子域数
+            //（semamirror 双侧同构表）。此处取 token 游标快照，按 kind 的
+            // 原子域数在消费面跳读。
+            const rec = newNode(id, kind);
+            listPush(v.recs, rec);
+            listPush(fm.recIdx, listLen(v.recs) - 1);
+            j = j + 1;
+        }
+        listPush(v.modules, fm);
+        mi = mi + 1;
+    }
+    return v;
+}
+
+// ============================================================================
+// §4 FAB1 树物化（按 kind 原子域解析——arity 表见 orders 批 B2 注记；str 恒
+// 2 token〔长前缀＋转义体〕；变长 kind 按域首 u32 展开）
+// ============================================================================
+
+struct CgNode {
+    id: int,
+    kind: int,
+    name: string, // str 原子（fn/param/field/variant/test/binding/ident/field 名/finit/patf/tnamed/tgeneric/variant 双名归 strVal2）
+    strVal: string, // 第二 str（int/float/string 的 raw；variant 的 enum 名）
+    strVal2: string, // 第三 str（variant 的 variant 名；catch 的 binding；struct_lit 的 hint）
+    intVal: int, // u32 原子（bool 值/binary·unary op/fn reserved/tyargs n/tfn n/tparams n/array_lit 无）
+    i64Val: int, // i64 原子（tarray len；finit 无）
+    exported: int,
+    isAsync: int,
+    line: int,
+    col: int,
+    nameLine: int,
+    nameCol: int,
+    childIds: List<int>,
+    // codegen memo 面（decl/sig/env 首触序＝zig 指针 memo 同构）。
+    declIdx: int, // 0＝未发射哨兵（zig 同款 +1 形）
+    tyIdxMemo: int,
+    sigIdxMemo: int,
+}
+
+function newNode(id: int, kind: int): Ref<CgNode> {
+    return new CgNode {
+        id: id, kind: kind, name: "", strVal: "", strVal2: "",
+        intVal: 0, i64Val: 0, exported: 0, isAsync: 0,
+        line: 1, col: 1, nameLine: 0, nameCol: 0,
+        childIds: listNew(), declIdx: 0, tyIdxMemo: -1, sigIdxMemo: -1,
+    };
+}
+
+// per-kind 原子域解析（fab1 walk* 原子写序的逆；str 恒 2 token；变长 kind
+// 按域首 u32 展开）。返回该记录的子 id 数（child_count 域）。
+function cgParseAtoms(rec: Ref<CgNode>, r: Ref<TokRdr>): int {
+    const k = rec.kind;
+    if (k == 1) { // fn_
+        rec.name = cgStr(r);
+        rec.exported = cgU(r);
+        rec.isAsync = cgU(r);
+        rec.intVal = cgU(r); // 保留域（恒 0）
+        rec.line = cgU(r);
+        rec.col = cgU(r);
+    } else if (k == 2) { // param
+        rec.name = cgStr(r);
+        rec.col = cgU(r);
+    } else if (k == 5) { // struct_
+        rec.name = cgStr(r);
+        rec.exported = cgU(r);
+        rec.line = cgU(r);
+        rec.col = cgU(r);
+    } else if (k == 6) { // field_d
+        rec.name = cgStr(r);
+    } else if (k == 7) { // enum_
+        rec.name = cgStr(r);
+        rec.exported = cgU(r);
+        rec.line = cgU(r);
+        rec.col = cgU(r);
+    } else if (k == 8) { // variant_d
+        rec.name = cgStr(r);
+    } else if (k == 9) { // test_
+        rec.name = cgStr(r);
+        rec.line = cgU(r);
+        rec.col = cgU(r);
+    } else if (k == 10) { // import_（names＝str 域×n——fab1 walkImport 同序）
+        const n = cgU(r);
+        let j = 0;
+        let inames = "";
+        while (j < n) { inames = inames + cgStr(r) + " "; j = j + 1; }
+        rec.name = inames;
+        rec.strVal = cgStr(r); // path
+        rec.line = cgU(r);
+        rec.col = cgU(r);
+    } else if (k == 11 || k == 12) { // let/const_
+        rec.name = cgStr(r);
+        rec.exported = cgU(r);
+        rec.line = cgU(r);
+        rec.col = cgU(r);
+    } else if (k == 14 || k == 15 || k == 17 || k == 18 || k == 23 || k == 24 || k == 25 || k == 65 || k == 71 || k == 30 || k == 34 || k == 35 || k == 37 || k == 38 || k == 43 || k == 44 || k == 46 || k == 51) {
+        rec.line = cgU(r);
+        rec.col = cgU(r);
+    } else if (k == 26 || k == 27 || k == 28) { // int/float/string 字面量
+        rec.strVal = cgStr(r);
+        rec.line = cgU(r);
+        rec.col = cgU(r);
+    } else if (k == 29) { // bool_
+        rec.intVal = cgU(r);
+        rec.line = cgU(r);
+        rec.col = cgU(r);
+    } else if (k == 31) { // ident
+        rec.name = cgStr(r);
+        rec.line = cgU(r);
+        rec.col = cgU(r);
+    } else if (k == 32 || k == 33) { // binary/unary
+        rec.intVal = cgU(r);
+        rec.line = cgU(r);
+        rec.col = cgU(r);
+    } else if (k == 36) { // field
+        rec.name = cgStr(r);
+        rec.line = cgU(r);
+        rec.col = cgU(r);
+        rec.nameLine = cgU(r);
+        rec.nameCol = cgU(r);
+    } else if (k == 39) { // catch_
+        rec.intVal = cgU(r); // has_binding
+        if (rec.intVal == 1) { rec.name = cgStr(r); }
+        rec.line = cgU(r);
+        rec.col = cgU(r);
+    } else if (k == 41) { // struct_lit
+        rec.intVal = cgU(r); // has_hint
+        if (rec.intVal == 1) { rec.name = cgStr(r); }
+        rec.line = cgU(r);
+        rec.col = cgU(r);
+    } else if (k == 42) { // finit
+        rec.name = cgStr(r);
+    } else if (k == 45) { // variant
+        rec.strVal = cgStr(r); // enum 名
+        rec.name = cgStr(r); // variant 名
+        rec.line = cgU(r);
+        rec.col = cgU(r);
+    } else if (k == 47) { // arm（tag 0=variant 1=else——两形皆写 str 域，else 为空串）
+        rec.intVal = cgU(r);
+        rec.name = cgStr(r);
+        rec.line = cgU(r);
+        rec.col = cgU(r);
+    } else if (k == 48) { // patf
+        rec.name = cgStr(r);
+    } else if (k == 49) { // arrow
+        rec.isAsync = cgU(r);
+        rec.line = cgU(r);
+        rec.col = cgU(r);
+    } else if (k == 52) { // tnamed
+        rec.name = cgStr(r);
+    } else if (k == 58) { // tarray
+        rec.i64Val = atomI2(r);
+    } else if (k == 60) { // tfn
+        rec.intVal = cgU(r); // param 数
+    } else if (k == 62) { // tgeneric（str base＋u32 args 数——fab1 walkType 同序）
+        rec.name = cgStr(r);
+        rec.intVal = cgU(r);
+    } else if (k == 63) { // tyargs（u32 n；子＝n 类型）
+        rec.intVal = cgU(r); // n
+    } else if (k == 64) { // tparams（u32 n＋n 个名字原子；零子——名字在原子域）
+        rec.intVal = cgU(r); // n
+        let j2 = 0;
+        let tps = "";
+        while (j2 < rec.intVal) { tps = tps + cgStr(r) + " "; j2 = j2 + 1; }
+        rec.name = tps;
+    }
+    // 53/54/55/56/57/61（tref/tweak/tlist/topt/terrunion/tslice/tfuture）与
+    // 3/4/13/16/19/20/21/40/50：零原子。
+    return cgU(r); // child_count
+}
+
+function atomI2(r: Ref<TokRdr>): int {
+    // i64v decimal (tarray len null form).
+    const t = cgNext(r);
+    if (len(t) == 0) { return CG_BAD; }
+    let neg = false;
+    let i = 0;
+    if ((byteAt(t, 0) catch 48) == 45) { neg = true; i = 1; }
+    let v: int = 0;
+    while (i < len(t)) {
+        const c = byteAt(t, i) catch 48;
+        if (c < 48 || c > 57) { return CG_BAD; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    if (neg) { return -v; }
+    return v;
+}
+
+// parseFabRecords：记录束全量解析（atoms 按 kind 定域；child_count 后逐子 id）。
+export function parseFabRecords(data: string, v: Ref<FabView>): int {
+    const r = cgOpen(data);
+    if (cgNext(r) != "FAB1") { cgSebOk = 0; return -1; }
+    if (cgU(r) != 1) { cgSebOk = 0; return -1; }
+    const nmod = cgU(r);
+    let mi = 0;
+    while (mi < nmod) {
+        const midx = cgU(r);
+        const nroots = cgU(r);
+        const roots: List<int> = listNew();
+        let j = 0;
+        while (j < nroots) { listPush(roots, cgU(r)); j = j + 1; }
+        const fm = new FabModule { mi: midx, roots: roots, recIdx: listNew() };
+        const nrecs = cgU(r);
+        j = 0;
+        while (j < nrecs) {
+            const id = cgU(r);
+            const kind = cgU(r);
+            const rec = newNode(id, kind);
+            const nch = cgParseAtoms(rec, r);
+            let k = 0;
+            while (k < nch) { listPush(rec.childIds, cgU(r)); k = k + 1; }
+            listPush(v.recs, rec);
+            listPush(fm.recIdx, listLen(v.recs) - 1);
+            j = j + 1;
+        }
+        listPush(v.modules, fm);
+        mi = mi + 1;
+    }
+    return 0;
+}
+
+// id→记录（每模块排序索引＋按模块序首中——zig Join.expr 同构：合成 id
+// 2^40+ 每模块各自起算，跨模块碰撞只能按模块序消歧；模块内记录束＝
+// parse 段与 synth 段分别升序；通用归并排序避免大型模块的平方成本）。
+const modSortIds: List<List<int>> = listNew();
+const modSortIdx: List<List<int>> = listNew();
+let nodeSorted: int = 0;
+
+function sortOnePairList(ids: List<int>, idxs: List<int>): void {
+    const n = listLen(ids);
+    let ordered = 1;
+    let i = 1;
+    while (i < n) {
+        if ((listGet(ids, i - 1) catch 0) > (listGet(ids, i) catch 0)) { ordered = 0; break; }
+        i = i + 1;
+    }
+    if (ordered == 1) { return; }
+    // 原表保留到验明无重复键；异常重复键仍走原选择排序，保持旧消歧规则。
+    let workIds: List<int> = listNew();
+    let workIdxs: List<int> = listNew();
+    let nextIds: List<int> = listNew();
+    let nextIdxs: List<int> = listNew();
+    i = 0;
+    while (i < n) {
+        listPush(workIds, listGet(ids, i) catch 0);
+        listPush(workIdxs, listGet(idxs, i) catch 0);
+        listPush(nextIds, 0);
+        listPush(nextIdxs, 0);
+        i = i + 1;
+    }
+    let width = 1;
+    while (width < n) {
+        let lo = 0;
+        while (lo < n) {
+            let mid = lo + width;
+            if (mid > n) { mid = n; }
+            let hi = mid + width;
+            if (hi > n) { hi = n; }
+            let left = lo;
+            let right = mid;
+            let out = lo;
+            while (out < hi) {
+                let take = right;
+                if (left < mid && (right >= hi || (listGet(workIds, left) catch 0) <= (listGet(workIds, right) catch 0))) {
+                    take = left;
+                    left = left + 1;
+                } else { right = right + 1; }
+                listSet(nextIds, out, listGet(workIds, take) catch 0);
+                listSet(nextIdxs, out, listGet(workIdxs, take) catch 0);
+                out = out + 1;
+            }
+            lo = hi;
+        }
+        const oldIds = workIds;
+        const oldIdxs = workIdxs;
+        workIds = nextIds;
+        workIdxs = nextIdxs;
+        nextIds = oldIds;
+        nextIdxs = oldIdxs;
+        width = width * 2;
+    }
+    i = 1;
+    while (i < n) {
+        if ((listGet(workIds, i - 1) catch 0) == (listGet(workIds, i) catch 0)) {
+            sortDuplicatePairList(ids, idxs);
+            return;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n) {
+        listSet(ids, i, listGet(workIds, i) catch 0);
+        listSet(idxs, i, listGet(workIdxs, i) catch 0);
+        i = i + 1;
+    }
+}
+
+// 重复节点 ID 不属于正常 FAB；保留原算法处理它，避免改变历史行为。
+function sortDuplicatePairList(ids: List<int>, idxs: List<int>): void {
+    let i = 0;
+    while (i < listLen(ids)) {
+        let mi = i;
+        let j = i + 1;
+        while (j < listLen(ids)) {
+            if ((listGet(ids, j) catch 0) < (listGet(ids, mi) catch 0)) { mi = j; }
+            j = j + 1;
+        }
+        if (mi != i) {
+            const ta = listGet(ids, i) catch 0;
+            listSet(ids, i, listGet(ids, mi) catch 0);
+            listSet(ids, mi, ta);
+            const tb = listGet(idxs, i) catch 0;
+            listSet(idxs, i, listGet(idxs, mi) catch 0);
+            listSet(idxs, mi, tb);
+        }
+        i = i + 1;
+    }
+}
+
+function buildNodeIndex(v: Ref<FabView>): void {
+    listClearLL(modSortIds);
+    listClearLL(modSortIdx);
+    nodeSorted = 1;
+    let mi = 0;
+    while (mi < listLen(v.modules)) {
+        const fm = listGet(v.modules, mi) catch new FabModule { mi: 0, roots: emptyIntList(), recIdx: emptyIntList() };
+        const ids: List<int> = listNew();
+        const idxs: List<int> = listNew();
+        let k = 0;
+        while (k < listLen(fm.recIdx)) {
+            const gi = listGet(fm.recIdx, k) catch 0;
+            listPush(ids, (listGet(v.recs, gi) catch newNode(0, 0)).id);
+            listPush(idxs, gi);
+            k = k + 1;
+        }
+        sortOnePairList(ids, idxs);
+        listPush(modSortIds, ids);
+        listPush(modSortIdx, idxs);
+        mi = mi + 1;
+    }
+}
+
+// 节点解析＝先 ndModule 内二分，未中再按模块序首中（zig Join 同构）。
+// 非键记录 id（finit/slot/type/import＝2^40+ 每模块各自起算）跨模块碰撞——
+// 体/声明子树查找必须落在当前发射模块（fmtmirror 扩测发现）。
+let ndModule: int = 0;
+
+function nodeByIdIn(mi: int, id: int): int {
+    if (mi < 0 || mi >= listLen(modSortIds)) { return -1; }
+    const ids = listGet(modSortIds, mi) catch emptyIntList();
+    let lo = 0;
+    let hi = listLen(ids) - 1;
+    while (lo <= hi) {
+        const mid = (lo + hi) / 2;
+        const k = listGet(ids, mid) catch -1;
+        if (k == id) {
+            const idxs = listGet(modSortIdx, mi) catch emptyIntList();
+            return listGet(idxs, mid) catch -1;
+        }
+        if (k < id) { lo = mid + 1; } else { hi = mid - 1; }
+    }
+    return -1;
+}
+
+function nodeById(v: Ref<FabView>, id: int): int {
+    const m = nodeByIdIn(ndModule, id);
+    if (m >= 0) { return m; }
+    let mi = 0;
+    while (mi < listLen(modSortIds)) {
+        if (mi == ndModule) { mi = mi + 1; continue; }
+        const r = nodeByIdIn(mi, id);
+        if (r >= 0) { return r; }
+        mi = mi + 1;
+    }
+    return -1;
+}
+
+function listClear(l: List<int>): void {
+    while (listLen(l) > 0) { listRemoveAt(l, listLen(l) - 1); }
+}
+
+// ============================================================================
+// §5 CG 状态与六步管线（codegen.zig Codegen :28-444 同构）
+// ============================================================================
+
+// —— CG 状态（平行表；字符串与类型去重经散列链，见 cgIntern）——
+let cgStrings: List<string> = listNew();
+let cgRawStrings: List<Bytes> = listNew();
+const cgEmptyRaw: Bytes = bytesNew(0);
+let cgTysK: List<int> = listNew();
+let cgTysA: List<int> = listNew();
+let cgTysB: List<int> = listNew();
+let cgStrHead: List<int> = listNew();
+let cgStrNext: List<int> = listNew();
+let cgTyHead: List<int> = listNew();
+let cgTyNext: List<int> = listNew();
+let declMods: List<int> = listNew();
+let declNameIdx: List<int> = listNew();
+let declIsEnum: List<int> = listNew(); // 0=struct 1=enum
+let declFieldNames: List<List<int>> = listNew(); // 每字段名字符串索引
+let declFieldTys: List<List<int>> = listNew();
+let declVariantNames: List<List<int>> = listNew();
+// 枚举变体字段表（PROGDUMP v/f 行——declVariantNames 同序平行）。
+let declVarFNames: List<List<int>> = listNew();
+let declVarFTys: List<List<int>> = listNew();
+let declVarFCnt: List<int> = listNew();
+let fnNameIdx: List<int> = listNew();
+let fnModule: List<int> = listNew();
+let fnReg: List<int> = listNew();
+let fnNparams: List<int> = listNew();
+let fnCode: List<List<int>> = listNew();
+let fnConstsK: List<List<int>> = listNew(); // const tag
+let fnConstsI: List<List<int>> = listNew(); // const.i / fbits
+let fnConstsTbl: List<List<int>> = listNew(); // 每函数 jump_table 扁平拼接
+let fnConstsTblLen: List<List<int>> = listNew(); // 每函数每 const 的表长
+let fnLinesL: List<List<int>> = listNew();
+let fnLinesC: List<List<int>> = listNew();
+let fnPtys: List<List<int>> = listNew();
+let fnRet: List<int> = listNew();
+// 每函数的取消落点表（原生异步，扁平对：挂起点 pc、落点 pc；见 emCancelLanding）。
+let fnLandings: List<List<int>> = listNew();
+let modOutPath: List<int> = listNew();
+let modOutState: List<int> = listNew();
+let modOutInit: List<int> = listNew();
+let testOutName: List<int> = listNew();
+let testOutFunc: List<int> = listNew();
+let extNames: List<string> = listNew();
+let extTags: List<List<int>> = listNew();
+let extRets: List<int> = listNew();
+let fnSigDescs: List<List<int>> = listNew();
+// D3 v0.23 FFI（SemaView 的 FFI1 节原样转入 ProgramContext／.txc TXFFI）。
+let cgFfiLibs: List<string> = listNew();
+let cgFfiExt: List<List<int>> = listNew();
+let cgFfiLay: List<List<int>> = listNew();
+let cgFfiCb: List<List<int>> = listNew();
+let cgFfiCbFn: List<int> = listNew();
+// 线程第 3b 步：不可发送的运行期类型号（TXC 类型表序），原生镜像据此发可发送表；第 4c 步：其中连共享也不可的。
+let cgSendBad: List<int> = listNew();
+let cgShareBad: List<int> = listNew();
+
+const accMemoK: List<int> = listNew(); // module*65536+slot
+const accMemoV: List<int> = listNew();
+const envMemoK: List<int> = listNew();
+const envMemoV: List<int> = listNew();
+const sigMemoK: List<int> = listNew();
+const sigMemoV: List<int> = listNew();
+const stateMemoK: List<int> = listNew();
+const stateMemoV: List<int> = listNew();
+const structDeclMemo: List<int> = listNew(); // seb struct idx → decl_idx+1
+const enumDeclMemo: List<int> = listNew();
+const closureSites: List<int> = listNew(); // caller,a 交错
+
+let cgEntry: int = -1;
+
+// 去重索引（容量批 C3c）：FNV-1a 散列链，按条目数增量补链、负载过半时桶数翻倍重建。
+// 原为逐项线性比较，字符串常量、名字与类型多时平方级（4 万个字符串常量 34 秒）。
+// 链按下标升序头插；查找取最小的匹配下标，与原线性查找结果相同。
+function cgHashStr(s: string): int {
+    let h: int = 2166136261;
+    let i = 0;
+    while (i < len(s)) {
+        h = imul(h, 16777619) ^ (byteAt(s, i) catch 0);
+        i = i + 1;
+    }
+    return h;
+}
+
+function cgHashTy(kind: int, a: int, b: int): int {
+    return imul(imul(imul(2166136261, 16777619) ^ kind, 16777619) ^ a, 16777619) ^ b;
+}
+
+// 桶数不足（含刚重置）时重建桶表并清空链，链随后由调用方从头补。
+function cgIndexGrow(head: List<int>, next: List<int>, n: int): void {
+    if (listLen(head) >= n * 2 + 2 && listLen(next) <= n) { return; }
+    let nb = 64;
+    while (nb < n * 4 + 4) { nb = nb * 2; }
+    listClear(head);
+    listClear(next);
+    while (listLen(head) < nb) { listPush(head, -1); }
+}
+
+function cgIndexLink(head: List<int>, next: List<int>, i: int, h: int): void {
+    const bk = h & (listLen(head) - 1);
+    listPush(next, listGet(head, bk) catch -1);
+    listSet(head, bk, i);
+}
+
+function cgRawAt(i: int): Bytes { return listGet(cgRawStrings, i) catch cgEmptyRaw; }
+function cgHashBytes(b: Bytes): int {
+    let h = 2166136261; let i = 0;
+    while (i < bytesLen(b)) { h = imul(h, 16777619) ^ (bytesGet(b, i) catch 0); i = i + 1; } return h;
+}
+function cgStringHash(i: int): int {
+    const b = cgRawAt(i); if (bytesLen(b) > 0) { return cgHashBytes(b); }
+    return cgHashStr(listGet(cgStrings, i) catch "");
+}
+function cgInternBytes(data: Bytes): int {
+    const decoded: string? = bytesToStr(data) catch None;
+    if (decoded != None) { return cgIntern(decoded catch ""); }
+    const n = listLen(cgStrings); cgIndexGrow(cgStrHead, cgStrNext, n);
+    while (listLen(cgStrNext) < n) { const k = listLen(cgStrNext); cgIndexLink(cgStrHead, cgStrNext, k, cgStringHash(k)); }
+    let i = listGet(cgStrHead, cgHashBytes(data) & (listLen(cgStrHead) - 1)) catch -1;
+    let best = -1;
+    while (i >= 0) { const raw = cgRawAt(i); if (bytesLen(raw) > 0 && bytesEqual(raw, data)) { best = i; } i = listGet(cgStrNext, i) catch -1; }
+    if (best >= 0) { return best; }
+    listPush(cgStrings, ""); while (listLen(cgRawStrings) < n) { listPush(cgRawStrings, cgEmptyRaw); } listPush(cgRawStrings, data); return n;
+}
+
+function cgIntern(s: string): int {
+    const n = listLen(cgStrings);
+    cgIndexGrow(cgStrHead, cgStrNext, n);
+    while (listLen(cgStrNext) < n) {
+        const k = listLen(cgStrNext);
+        cgIndexLink(cgStrHead, cgStrNext, k, cgStringHash(k));
+    }
+    let i = listGet(cgStrHead, cgHashStr(s) & (listLen(cgStrHead) - 1)) catch -1;
+    let best = -1;
+    while (i >= 0) {
+        if (bytesLen(cgRawAt(i)) == 0 && (listGet(cgStrings, i) catch "") == s) { best = i; }
+        i = listGet(cgStrNext, i) catch -1;
+    }
+    if (best >= 0) { return best; }
+    listPush(cgStrings, s);
+    return n;
+}
+
+function tyIndex(kind: int, a: int, b: int): int {
+    const n = listLen(cgTysK);
+    cgIndexGrow(cgTyHead, cgTyNext, n);
+    while (listLen(cgTyNext) < n) {
+        const k = listLen(cgTyNext);
+        cgIndexLink(cgTyHead, cgTyNext, k, cgHashTy(listGet(cgTysK, k) catch 0, listGet(cgTysA, k) catch 0, listGet(cgTysB, k) catch 0));
+    }
+    let i = listGet(cgTyHead, cgHashTy(kind, a, b) & (listLen(cgTyHead) - 1)) catch -1;
+    let best = -1;
+    while (i >= 0) {
+        if ((listGet(cgTysK, i) catch 0) == kind && (listGet(cgTysA, i) catch 0) == a && (listGet(cgTysB, i) catch 0) == b) { best = i; }
+        i = listGet(cgTyNext, i) catch -1;
+    }
+    if (best >= 0) { return best; }
+    listPush(cgTysK, kind);
+    listPush(cgTysA, a);
+    listPush(cgTysB, b);
+    return n;
+}
+
+// flattenTy 的 SEB1 视图版：SEB1 类型池 idx → TXC 类型表 idx（递归；named
+// 经 declIndex；fn 经 fnSigDescIdx）。memo 表防环+保序。
+const flatMemoK: List<int> = listNew();
+const flatMemoV: List<int> = listNew();
+
+function flattenTy(sv: Ref<SemaView>, sebIdx: int): int {
+    const m = sideFind2(flatMemoK, sebIdx);
+    if (m >= 0) { return listGet(flatMemoV, m) catch 0; }
+    const t = listGet(sv.tys, sebIdx) catch dummyCgTy();
+    let out = 0;
+    if (t.kind == 0) { out = tyIndex(1, 0, 0); }
+    else if (t.kind == 1) { out = tyIndex(2, 0, 0); }
+    else if (t.kind == 2) { out = tyIndex(3, 0, 0); }
+    else if (t.kind == 3) { out = tyIndex(4, 0, 0); }
+    else if (t.kind == 4) { out = tyIndex(5, 0, 0); }
+    else if (t.kind == 5) { out = tyIndex(6, 0, 0); }
+    else if (t.kind == 6) { out = tyIndex(7, flattenTy(sv, t.a), 0); }
+    else if (t.kind == 7) { out = tyIndex(8, flattenTy(sv, t.a), 0); }
+    else if (t.kind == 8) { out = tyIndex(9, flattenTy(sv, t.a), 0); }
+    else if (t.kind == 9) { out = tyIndex(14, flattenTy(sv, t.a), 0); } // weak（SEB1 9→TXC14）
+    else if (t.kind == 10) { out = tyIndex(15, flattenTy(sv, t.a), 0); } // list（SEB1 10→TXC15）
+    else if (t.kind == 11) { out = tyIndex(10, flattenTy(sv, t.a), t.b); } // array（SEB1 11→TXC10，b=len）
+    else if (t.kind == 12) { out = tyIndex(11, flattenTy(sv, t.a), 0); } // slice（SEB1 12→TXC11）
+    else if (t.kind == 13) { out = tyIndex(12, declIndexStruct(sv, t.a), 0); } // named_struct（SEB1 13→TXC12）
+    else if (t.kind == 14) { out = tyIndex(13, declIndexEnum(sv, t.a), 0); } // named_enum（SEB1 14→TXC13）
+    else if (t.kind == 15) { out = tyIndex(16, fnSigDescIdx(sv, t.a), 0); }
+    else if (t.kind == 16) { out = tyIndex(17, flattenTy(sv, t.a), 0); }
+    else if (t.kind == 17) { out = tyIndex(18, 0, 0); } // Bytes（SEB1 17→TXC18，D3 v0.18）
+    else if (t.kind == 19) { out = tyIndex(6, 0, 0); } // 错误 enum（D3 v0.19）：运行期即 Error 对象
+    else if (t.kind == 20) { out = tyIndex(19, flattenTy(sv, t.a), 0); } // Gen<T>（SEB1 20→TXC19，D3 v0.22）
+    else if (t.kind == 23) { out = tyIndex(20, flattenTy(sv, t.a), 0); } // Thread<T>（SEB1 23→TXC20，线程第 2 步）
+    else if (t.kind == 24) { out = tyIndex(21, flattenTy(sv, t.a), 0); } // Shared<T>（SEB1 24→TXC21，线程第 4c 步）
+    else if (t.kind == 25) { out = tyIndex(22, 0, 0); } // Atomic<int>（SEB1 25→TXC22，线程第 4c 步）
+    listPush(flatMemoK, sebIdx);
+    listPush(flatMemoV, out);
+    return out;
+}
+
+function sideFind2(keys: List<int>, key: int): int {
+    let i = 0;
+    while (i < listLen(keys)) {
+        if ((listGet(keys, i) catch 0) == key) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+function fnSigDescIdx(sv: Ref<SemaView>, sebSigIdx: int): int {
+    const m = sideFind2(sigMemoK, sebSigIdx);
+    if (m >= 0) { return listGet(sigMemoV, m) catch 0; }
+    const sg = listGet(sv.sigs, sebSigIdx) catch dummyCgSig();
+    const desc: List<int> = listNew();
+    let j = 0;
+    while (j < listLen(sg.params)) { listPush(desc, flattenTy(sv, listGet(sg.params, j) catch 0)); j = j + 1; }
+    listPush(desc, flattenTy(sv, sg.ret));
+    listPush(fnSigDescs, desc);
+    const idx = listLen(fnSigDescs) - 1;
+    listPush(sigMemoK, sebSigIdx);
+    listPush(sigMemoV, idx);
+    return idx;
+}
+
+// 成对 [key,val]  memo 查找——只扫偶数位 key（sideFind2 会撞值槽：
+// key 恰等前条 val 时假命中——fmtmirror 扩测发现的 decl 错位根因）。
+function memoFindP(l: List<int>, key: int): int {
+    let i = 0;
+    while (i < listLen(l)) {
+        if ((listGet(l, i) catch 0) == key) { return i; }
+        i = i + 2;
+    }
+    return -1;
+}
+
+function declIndexStruct(sv: Ref<SemaView>, sebIdx: int): int {
+    // 先占位（递归类型终止——zig decl_idx+1 哨兵同构）；memo 成对 [key,val]。
+    const m = memoFindP(structDeclMemo, sebIdx);
+    if (m >= 0) { return (listGet(structDeclMemo, m + 1) catch 1) - 1; }
+    const st = listGet(sv.structs, sebIdx) catch dummyCgStruct();
+    listPush(declMods, st.moduleIdx);
+    listPush(declNameIdx, cgIntern(st.name));
+    listPush(declIsEnum, 0);
+    const fns: List<int> = listNew();
+    const fts: List<int> = listNew();
+    listPush(declFieldNames, fns);
+    listPush(declFieldTys, fts);
+    listPush(declVariantNames, listNew());
+    // 变体字段表与 decl 平行（struct 占空位——PROGDUMP 按 decl 序号索引；
+    // json 族 struct 夹前错位＝f 行全零活捉）。
+    listPush(declVarFNames, listNew());
+    listPush(declVarFTys, listNew());
+    const declIdx = listLen(declMods) - 1;
+    listPush(structDeclMemo, sebIdx);
+    listPush(structDeclMemo, declIdx + 1);
+    const seb: List<int> = listNew();
+    if (cgDebug) {
+        dvDecl(seb, listNew(), listNew());
+        dvSebDecl(false, sebIdx, declIdx);
+    }
+    let j = 0;
+    while (j < listLen(st.fields)) {
+        const f = listGet(st.fields, j) catch dummyCgField();
+        listPush(fns, cgIntern(f.name));
+        listPush(fts, flattenTy(sv, f.ty));
+        listPush(seb, f.ty);
+        j = j + 1;
+    }
+    return declIdx;
+}
+
+function declIndexEnum(sv: Ref<SemaView>, sebIdx: int): int {
+    // memo 成对 [key,val]——同 structDeclMemo 纪律（偶数位扫描）。
+    const m = memoFindP(enumDeclMemo, sebIdx);
+    if (m >= 0) { return (listGet(enumDeclMemo, m + 1) catch 1) - 1; }
+    if (sebIdx < 0 || sebIdx >= listLen(sv.enums)) { return -1; }
+    const en = listGet(sv.enums, sebIdx) catch dummyCgEnum();
+    listPush(declMods, en.moduleIdx);
+    listPush(declNameIdx, cgIntern(en.name));
+    listPush(declIsEnum, 1);
+    listPush(declFieldNames, listNew());
+    listPush(declFieldTys, listNew());
+    const vns: List<int> = listNew();
+    const vfn: List<int> = listNew();
+    const vft: List<int> = listNew();
+    const vfc: List<int> = listNew();
+    listPush(declVariantNames, vns);
+    listPush(declVarFNames, vfn);
+    listPush(declVarFTys, vft);
+    const declIdx = listLen(declMods) - 1;
+    listPush(enumDeclMemo, sebIdx);
+    listPush(enumDeclMemo, declIdx + 1);
+    const vseb: List<int> = listNew();
+    if (cgDebug) {
+        dvDecl(listNew(), vseb, vfc);
+        dvSebDecl(true, sebIdx, declIdx);
+    }
+    let j = 0;
+    while (j < listLen(en.variants)) {
+        const v = listGet(en.variants, j) catch dummyCgVariant();
+        // intern 序＝zig 同构：field 名先于 variant 名（strtab 序对齐——
+        // 10-switch 活捉：序反转致 47 字节差异）。
+        let k = 0;
+        while (k < listLen(v.fields)) {
+            const f = listGet(v.fields, k) catch dummyCgField();
+            listPush(vfn, cgIntern(f.name));
+            listPush(vft, flattenTy(sv, f.ty));
+            listPush(vseb, f.ty);
+            k = k + 1;
+        }
+        listPush(vns, cgIntern(v.name));
+        listPush(vfc, listLen(v.fields));
+        j = j + 1;
+    }
+    // 变体计数入扁平表（P8/闭包门 10-switch 活捉——vfc 从未入 declVarFCnt
+    // ＝全域恒空，变体域 0 字段渲染）。
+    let ci = 0;
+    while (ci < listLen(vfc)) {
+        listPush(declVarFCnt, listGet(vfc, ci) catch 0);
+        ci = ci + 1;
+    }
+    return declIdx;
+}
+
+function dummyCgVariant(): Ref<CgVariant> {
+    return new CgVariant { kname: "", cause: -1, segF: listNew(), segS: listNew(), name: "", fields: listNew() };
+}
+
+function stateTyIdx(sv: Ref<SemaView>, moduleIdx: int): int {
+    const m = sideFind2(stateMemoK, moduleIdx);
+    if (m >= 0) { return listGet(stateMemoV, m) catch 0; }
+    const mod = listGet(sv.modules, moduleIdx) catch dummyCgModule();
+    const fns: List<int> = listNew();
+    const fts: List<int> = listNew();
+    const seb: List<int> = listNew();
+    let j = 0;
+    while (j < listLen(mod.globals)) {
+        const g = listGet(mod.globals, j) catch new CgGlobal { name: "", ty: 0, slot: 0 };
+        listPush(fns, cgIntern(g.name));
+        listPush(fts, flattenTy(sv, g.ty));
+        listPush(seb, g.ty);
+        j = j + 1;
+    }
+    if (cgDebug) { dvDecl(seb, listNew(), listNew()); }
+    listPush(declMods, moduleIdx);
+    listPush(declNameIdx, cgIntern("__state"));
+    listPush(declIsEnum, 0);
+    listPush(declFieldNames, fns);
+    listPush(declFieldTys, fts);
+    listPush(declVariantNames, listNew());
+    listPush(declVarFNames, listNew());
+    listPush(declVarFTys, listNew());
+    const declIdx = listLen(declMods) - 1;
+    const tyIdx = tyIndex(12, declIdx, 0);
+    listPush(stateMemoK, moduleIdx);
+    listPush(stateMemoV, tyIdx);
+    return tyIdx;
+}
+
+function envTyIdx(sv: Ref<SemaView>, arrowKey: int, moduleIdx: int): int {
+    const m = sideFind2(envMemoK, arrowKey);
+    if (m >= 0) { return listGet(envMemoV, m) catch 0; }
+    const sm = sideFind(sv.stClosureRes, arrowKey);
+    const row = listGet(sv.stClosureRes.vals, sm) catch emptyIntList();
+    const fnIdx = listGet(row, 0) catch 0;
+    const sigIdx = listGet(row, 1) catch 0;
+    const ncaps = listGet(row, 2) catch 0;
+    const capNames = listGet(closureCapNames, sm) catch emptyStrList();
+    const sig = listGet(sv.sigs, sigIdx) catch dummyCgSig();
+    const fnTy = tyIndex(16, fnSigDescIdx(sv, sigIdx), 0);
+    const fns: List<int> = listNew();
+    const fts: List<int> = listNew();
+    const seb: List<int> = listNew();
+    listPush(seb, -1);
+    listPush(seb, -1);
+    listPush(fns, cgIntern("__fn"));
+    listPush(fts, fnTy);
+    listPush(fns, cgIntern("__base"));
+    listPush(fts, stateTyIdx(sv, moduleIdx));
+    let k = 0;
+    let base = 3;
+    while (k < ncaps) {
+        const cname = cgIntern(listGet(capNames, k) catch "");
+        const cty = listGet(row, base) catch 0;
+        listPush(fns, cname);
+        listPush(fts, flattenTy(sv, cty));
+        listPush(seb, cty);
+        base = base + 1;
+        const slotv = listGet(row, base) catch 0;
+        base = base + 1;
+        const src = listGet(row, base) catch 0;
+        base = base + 1;
+        if (src == 0) { base = base + 1; }
+        else if (src == 1) { base = base + 2; }
+        k = k + 1;
+    }
+    if (cgDebug) { dvDecl(seb, listNew(), listNew()); }
+    listPush(declMods, moduleIdx);
+    listPush(declNameIdx, cgIntern("#closureenv"));
+    listPush(declIsEnum, 0);
+    listPush(declFieldNames, fns);
+    listPush(declFieldTys, fts);
+    listPush(declVariantNames, listNew());
+    listPush(declVarFNames, listNew());
+    listPush(declVarFTys, listNew());
+    const declIdx = listLen(declMods) - 1;
+    const tyIdx = tyIndex(12, declIdx, 0);
+    listPush(envMemoK, arrowKey);
+    listPush(envMemoV, tyIdx);
+    return tyIdx;
+}
+
+function accessorFn(moduleIdx: int, slot: int): int {
+    const key = moduleIdx * 65536 + slot;
+    let i = 0;
+    while (i < listLen(accMemoK)) {
+        if ((listGet(accMemoK, i) catch 0) == key) { return listGet(accMemoV, i) catch 0; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+function accMemoPut(moduleIdx: int, slot: int, fnIdx: int): void {
+    listPush(accMemoK, moduleIdx * 65536 + slot);
+    listPush(accMemoV, fnIdx);
+}
+
+// ============================================================================
+// §6 FnEmitter（codegen.zig FnEmitter :428-1339 同构；模块级状态＝单函数
+// 发射期生命周期——emInit 重置）
+// ============================================================================
+
+function listClearLL(l: List<List<int>>): void {
+    while (listLen(l) > 0) { listRemoveAt(l, listLen(l) - 1); }
+}
+function listClearS(l: List<string>): void {
+    while (listLen(l) > 0) { listRemoveAt(l, listLen(l) - 1); }
+}
+function listClearLLS(l: List<List<string>>): void {
+    while (listLen(l) > 0) { listRemoveAt(l, listLen(l) - 1); }
+}
+
+const emCode: List<int> = listNew();
+const emConstsK: List<int> = listNew();
+const emConstsI: List<int> = listNew();
+const emConstsTbl: List<List<int>> = listNew();
+const emLinesL: List<int> = listNew();
+const emLinesC: List<int> = listNew();
+let emPosLine: int = 1;
+let emPosCol: int = 1;
+let emSlotCap: int = 1;
+let emNextTemp: int = 1;
+let emMaxReg: int = 1;
+let emGlobalBase: int = 0;
+let emNparams: int = 0;
+let emFnSelf: int = 0;
+// 当前函数是否 async（取消落点只在 async 函数发射）与本函数的落点对。
+let emFnAsync: bool = false;
+const emLandings: List<int> = listNew();
+let emFnModuleSelf: int = 0;
+let emModuleName: string = "";
+// 循环栈（breaks/continues/cond_pc 三平行栈）。
+const loopBreaks: List<List<int>> = listNew();
+const loopConts: List<List<int>> = listNew();
+const loopConds: List<int> = listNew();
+// defer（D3 v0.19）：每个正在编译的块一层，元素＝该块已登记的 defer 节点（后进先出）。
+const deferScopes: List<List<int>> = listNew();
+// 每层循环体块的 defer 层底（break/continue 只执行本层及以内的 defer）。
+const loopDeferBase: List<int> = listNew();
+// 字符串拼接链叶游标（emitStrLeaves 显式序——.tx int 传值无 ref 形参）。
+let strChainIdx: int = 0;
+
+// —— FabView/SemaView 模块态（codegen 会话生命周期）——
+let cgFab: Ref<FabView> = new FabView { modules: listNew(), recs: listNew() };
+let cgSv: Ref<SemaView> = newSemaView();
+
+function ndById(id: int): int {
+    return nodeById(cgFab, id);
+}
+
+function ndKind(id: int): int {
+    const m = ndById(id);
+    if (m < 0) { return 0; }
+    return (listGet(cgFab.recs, m) catch newNode(0, 0)).kind;
+}
+
+function ndName(id: int): string {
+    const m = ndById(id);
+    if (m < 0) { return ""; }
+    return (listGet(cgFab.recs, m) catch newNode(0, 0)).name;
+}
+
+function ndRaw(id: int): string {
+    const m = ndById(id);
+    if (m < 0) { return ""; }
+    return (listGet(cgFab.recs, m) catch newNode(0, 0)).strVal;
+}
+
+function ndLine(id: int): int {
+    const m = ndById(id);
+    if (m < 0) { return 1; }
+    return (listGet(cgFab.recs, m) catch newNode(0, 0)).line;
+}
+
+function ndCol(id: int): int {
+    const m = ndById(id);
+    if (m < 0) { return 1; }
+    return (listGet(cgFab.recs, m) catch newNode(0, 0)).col;
+}
+
+function ndChild(id: int, i: int): int {
+    const m = ndById(id);
+    if (m < 0) { return -1; }
+    const cids = (listGet(cgFab.recs, m) catch newNode(0, 0)).childIds;
+    if (i < 0 || i >= listLen(cids)) { return -1; }
+    return listGet(cids, i) catch -1;
+}
+
+function ndChildCount(id: int): int {
+    const m = ndById(id);
+    if (m < 0) { return 0; }
+    return listLen((listGet(cgFab.recs, m) catch newNode(0, 0)).childIds);
+}
+
+function ndChildLast(id: int): int {
+    const n = ndChildCount(id);
+    if (n == 0) { return -1; }
+    return ndChild(id, n - 1);
+}
+
+function ndIntVal(id: int): int {
+    const m = ndById(id);
+    if (m < 0) { return 0; }
+    return (listGet(cgFab.recs, m) catch newNode(0, 0)).intVal;
+}
+
+// —— sema 侧表视图（node id 键；行布局见 parseSeb1 各分支注记）——
+function sExprType(id: int): int {
+    return sideGet1(cgSv.stExprTypes, id);
+}
+
+function sResTag(id: int): int {
+    return sideGet1(cgSv.stExprRes, id);
+}
+
+function sResField(id: int, f: int): int {
+    const m = sideFind(cgSv.stExprRes, id);
+    if (m < 0) { return 0; }
+    const row = listGet(cgSv.stExprRes.vals, m) catch emptyIntList();
+    return listGet(row, f) catch 0;
+}
+
+function sCatchBind(id: int): int {
+    return sideGet1(cgSv.stCatchBinds, id);
+}
+
+function sSwitchEnum(id: int): int {
+    return sideGet1(cgSv.stSwitchEnum, id);
+}
+
+// arm_res 行：[0]=enum [1]=has_vi [2]=vi（has_vi 时）[3]=nb [4..]=bind slot 序。
+function sArmHasVi(id: int): int {
+    const m = sideFind(cgSv.stArmRes, id);
+    if (m < 0) { return 0; }
+    const row = listGet(cgSv.stArmRes.vals, m) catch emptyIntList();
+    return listGet(row, 1) catch 0;
+}
+
+function sArmVi(id: int): int {
+    const m = sideFind(cgSv.stArmRes, id);
+    if (m < 0) { return -1; }
+    const row = listGet(cgSv.stArmRes.vals, m) catch emptyIntList();
+    return listGet(row, 2) catch -1;
+}
+
+function sArmNb(id: int): int {
+    const m = sideFind(cgSv.stArmRes, id);
+    if (m < 0) { return 0; }
+    const row = listGet(cgSv.stArmRes.vals, m) catch emptyIntList();
+    return listGet(row, 3) catch 0;
+}
+
+function sArmBindSlot(id: int, i: int): int {
+    const m = sideFind(cgSv.stArmRes, id);
+    if (m < 0) { return 0; }
+    const row = listGet(cgSv.stArmRes.vals, m) catch emptyIntList();
+    return listGet(row, 4 + i) catch 0;
+}
+
+// struct_lit 行：[0]=struct [1]=n [2..]=field_idx 序。
+function sStructLitN(id: int): int {
+    const m = sideFind(cgSv.stStructLit, id);
+    if (m < 0) { return 0; }
+    const row = listGet(cgSv.stStructLit.vals, m) catch emptyIntList();
+    return listGet(row, 1) catch 0;
+}
+
+function sStructLitField(id: int, i: int): int {
+    const m = sideFind(cgSv.stStructLit, id);
+    if (m < 0) { return 0; }
+    const row = listGet(cgSv.stStructLit.vals, m) catch emptyIntList();
+    return listGet(row, 2 + i) catch 0;
+}
+
+// array_lit 行：[0]=is_slice [1]=elem [2]=len。
+function sArrSlice(id: int): int {
+    const m = sideFind(cgSv.stArrayLit, id);
+    if (m < 0) { return 0; }
+    const row = listGet(cgSv.stArrayLit.vals, m) catch emptyIntList();
+    return listGet(row, 0) catch 0;
+}
+
+function sArrElem(id: int): int {
+    const m = sideFind(cgSv.stArrayLit, id);
+    if (m < 0) { return 0; }
+    const row = listGet(cgSv.stArrayLit.vals, m) catch emptyIntList();
+    return listGet(row, 1) catch 0;
+}
+
+function sArrLen(id: int): int {
+    const m = sideFind(cgSv.stArrayLit, id);
+    if (m < 0) { return 0; }
+    const row = listGet(cgSv.stArrayLit.vals, m) catch emptyIntList();
+    return listGet(row, 2) catch 0;
+}
+
+// closure_res 行：[0]=fn_idx [1]=sig [2]=n [3..] 每 cap＝ty slot src (+1/2 载荷)。
+function sClosureFn(id: int): int {
+    return sideGet1(cgSv.stClosureRes, id);
+}
+
+function sClosureSig(id: int): int {
+    const m = sideFind(cgSv.stClosureRes, id);
+    if (m < 0) { return 0; }
+    const row = listGet(cgSv.stClosureRes.vals, m) catch emptyIntList();
+    return listGet(row, 1) catch 0;
+}
+
+function sClosureN(id: int): int {
+    const m = sideFind(cgSv.stClosureRes, id);
+    if (m < 0) { return 0; }
+    const row = listGet(cgSv.stClosureRes.vals, m) catch emptyIntList();
+    return listGet(row, 2) catch 0;
+}
+
+function sClosureRow(id: int): List<int> {
+    const m = sideFind(cgSv.stClosureRes, id);
+    if (m < 0) { return listNew(); }
+    return listGet(cgSv.stClosureRes.vals, m) catch emptyIntList();
+}
+
+// field_res 行：tag=0 时 [1]=struct [2]=idx [3]=autoderef。
+function sFieldTag(id: int): int {
+    return sideGet1(cgSv.stFieldRes, id);
+}
+
+function sFieldIdx(id: int): int {
+    const m = sideFind(cgSv.stFieldRes, id);
+    if (m < 0) { return 0; }
+    const row = listGet(cgSv.stFieldRes.vals, m) catch emptyIntList();
+    return listGet(row, 2) catch 0;
+}
+
+function sFieldAuto(id: int): int {
+    const m = sideFind(cgSv.stFieldRes, id);
+    if (m < 0) { return 0; }
+    const row = listGet(cgSv.stFieldRes.vals, m) catch emptyIntList();
+    return listGet(row, 3) catch 0;
+}
+
+// method_args 行：[0]=n [1..]=实参键序。
+function sMethodArgsN(id: int): int {
+    const m = sideFind(cgSv.stMethodArgs, id);
+    if (m < 0) { return -1; }
+    const row = listGet(cgSv.stMethodArgs.vals, m) catch emptyIntList();
+    return listGet(row, 0) catch -1;
+}
+
+function sMethodArg(id: int, i: int): int {
+    const m = sideFind(cgSv.stMethodArgs, id);
+    if (m < 0) { return -1; }
+    const row = listGet(cgSv.stMethodArgs.vals, m) catch emptyIntList();
+    return listGet(row, 1 + i) catch -1;
+}
+
+// variant_res 行：[0]=enum [1]=idx。
+function sVariantTag(e: int): int {
+    // 存在性面（zig variant_res.get(e) 同构）：命中＝enum 池 idx（可任意值），
+    // 未命中＝-1。旧 sideGet1 直返把池索引当布尔——==1 门只放行首枚举。
+    const m = sideFind(cgSv.stVariantRes, e);
+    if (m < 0) { return -1; }
+    const row = listGet(cgSv.stVariantRes.vals, m) catch emptyIntList();
+    return listGet(row, 0) catch -1;
+}
+
+function sVariantEnum(e: int): int {
+    const m = sideFind(cgSv.stVariantRes, e);
+    if (m < 0) { return -1; }
+    const row = listGet(cgSv.stVariantRes.vals, m) catch emptyIntList();
+    return listGet(row, 0) catch -1;
+}
+
+function sVariantIdx(e: int): int {
+    const m = sideFind(cgSv.stVariantRes, e);
+    if (m < 0) { return 0; }
+    const row = listGet(cgSv.stVariantRes.vals, m) catch emptyIntList();
+    return listGet(row, 1) catch 0;
+}
+
+// ============================================================================
+// §6.1 发射基元（bc 编码常量直嵌——opcode 值＝vm/bytecode.zig §1 单一出处）
+// ============================================================================
+
+let cgOperandError: string = "";
+
+export function cgLastError(): string { return cgOperandError; }
+
+// TXC v6 指令字（容量与编码上限评估 §八）：iABC＝op16|A16<<16|B16<<32|C16<<48；
+// iABx＝op16|A16<<16|Bx32<<32；sBx＝Bx−2^31。C 用到第 15 位时整字为负（读取一律逻辑右移）。
+const SBX_BIAS: int = 2147483648;
+// 单函数寄存器上限（容量批 C3b）：编号 0–65534，65535 是后端的“无槽”哨兵（原为 255，与真实的 R255 相撞）。
+const CG_MAX_OPERAND_REG: int = 65534;
+// callbi 编号：内建 0..4095，外部函数从 4096 起（v4 为 64）。
+const EXTERN_ID_BASE: int = 4096;
+// GETFLD/SETFLD 字段选择子：第 15 位为自动解引用或模块状态标志，0..14 位为字段号。
+const FLD_FLAG: int = 0x8000;
+
+function cgCheckOperand(value: int): void {
+    if ((value < 0 || value > 65535) && len(cgOperandError) == 0) {
+        cgOperandError = emModuleName + ":" + toStr(emPosLine) + ":" + toStr(emPosCol) + ": error 3101: 字节码操作数超出16位编码范围：单函数局部槽、临时槽、调用参数或外部函数过多，请拆分函数或表达式";
+    }
+}
+
+function encABC(op: int, a: int, b: int, c: int): int {
+    const bits = a | b | c;
+    if (bits < 0 || bits > 65535) { cgCheckOperand(bits); }
+    return op | (a << 16) | (b << 32) | (c << 48);
+}
+
+function encABx(op: int, a: int, bx: int): int {
+    if (a < 0 || a > 65535) { cgCheckOperand(a); }
+    // Bx 是 32 位：常量池下标超出时拒绝（不按位截断）。
+    if ((bx < 0 || bx > 4294967295) && len(cgOperandError) == 0) {
+        cgOperandError = emModuleName + ":" + toStr(emPosLine) + ":" + toStr(emPosCol) + ": error 3101: 字节码操作数超出32位编码范围：单函数常量过多（超过 4294967296 个），请拆分函数或把大字面量移到数据文件";
+    }
+    return op | (a << 16) | (bx << 32);
+}
+
+function encAsBx(op: int, a: int, sbx: int): int {
+    return encABx(op, a, sbx + SBX_BIAS);
+}
+
+// 字段选择子：字段号超出 15 位即诊断（不截断，免得与标志位相撞）。
+function fieldSel(flag: int, idx: int): int {
+    if ((idx < 0 || idx > 32767) && len(cgOperandError) == 0) {
+        cgOperandError = emModuleName + ":" + toStr(emPosLine) + ":" + toStr(emPosCol) + ": error 3101: 字段号超出15位编码范围（超过 32767），请拆分结构或模块";
+    }
+    return flag | (idx & 0x7FFF);
+}
+
+function emInit(moduleIdx: int, name: string, nparams: int, line: int, col: int, cap: int): void {
+    listClear(emCode);
+    listClear(emConstsK);
+    listClear(emConstsI);
+    listClearLL(emConstsTbl);
+    listClear(emLinesL);
+    listClear(emLinesC);
+    listClearLL(loopBreaks);
+    listClearLL(loopConts);
+    listClear(loopConds);
+    listClearLL(deferScopes);
+    listClear(loopDeferBase);
+    listClear(emLandings);
+    emFnAsync = false;
+    emDbgOn = false;
+    let base = cap;
+    if (base < 1 + nparams) { base = 1 + nparams; }
+    emSlotCap = base;
+    emNextTemp = base;
+    emMaxReg = base;
+    emPosLine = line;
+    emPosCol = col;
+    emGlobalBase = 0;
+    emNparams = nparams;
+    emFnModuleSelf = moduleIdx;
+    ndModule = moduleIdx;
+    emModuleName = name;
+    // 缺省＝下一个追加位：访问器、模块 init、test 块按追加序 emFinishAt，其闭包值调用点须登记在
+    // 自身名下（原先沿用上一个函数的值——多为 fn_table 尾段的闭包体，窗口校正随之正反馈膨胀到轮次封顶）；
+    // fn_table 函数与生成器创建函数由调用方改为各自的序号。
+    emFnSelf = listLen(fnNameIdx);
+    if (cgDebug) { dvFnBegin(); }
+}
+
+function emUseReg(r: int): void {
+    if (r + 1 > emMaxReg) { emMaxReg = r + 1; }
+}
+
+function emTempBase(): int {
+    return emNextTemp;
+}
+
+function emEmit(ins: int): void {
+    listPush(emCode, ins);
+    listPush(emLinesL, emPosLine);
+    listPush(emLinesC, emPosCol);
+}
+
+function emHere(): int {
+    return listLen(emCode);
+}
+
+function emPatchJump(at: int, target: int): void {
+    const dist = target - at - 1;
+    // AsBx 是 ±2^31：超出时拒绝（不跳过回填——那会让跳转落到下一条指令，静默改变控制流）。
+    if (dist < -2147483648 || dist > 2147483647) {
+        if (len(cgOperandError) == 0) {
+            cgOperandError = emModuleName + ":" + toStr(emPosLine) + ":" + toStr(emPosCol) + ": error 3100: 跳转偏移超界（" + toStr(dist) + "）：单函数指令数超出 AsBx ±2^31 编码域（超大循环体/函数体）——拆分函数或缩小循环体";
+        }
+        return;
+    }
+    const old = listGet(emCode, at) catch 0;
+    listSet(emCode, at, encAsBx(old & 0xFFFF, (old >>> 16) & 0xFFFF, dist));
+}
+
+function emPatchJumpToHere(ats: List<int>): void {
+    let i = 0;
+    while (i < listLen(ats)) {
+        emPatchJump(listGet(ats, i) catch 0, emHere());
+        i = i + 1;
+    }
+}
+
+// 常量池追加（tag 表＝bc.Const 同构：1 int 2 float(fbits) 3 str 4 fn_ref
+// 5 jump_table 6 ty 7 variant(ty,idx) 8 arr_desc(elem,len)）。
+function emK(c: int, v: int, tbl: List<int>): int {
+    listPush(emConstsK, c);
+    listPush(emConstsI, v);
+    listPush(emConstsTbl, tbl);
+    return listLen(emConstsK) - 1;
+}
+
+function emKInt(v: int): int { return emK(1, v, listNew()); }
+function emKFloatBits(bits: int): int { return emK(2, bits, listNew()); }
+function emKStr(idx: int): int { return emK(3, idx, listNew()); }
+function emKFnRef(idx: int): int { return emK(4, idx, listNew()); }
+function emKTy(idx: int): int { return emK(6, idx, listNew()); }
+function emKVariant(ty: int, idx: int): int {
+    const t: List<int> = listNew();
+    listPush(t, ty);
+    listPush(t, idx);
+    return emK(7, ty, t);
+}
+function emKArrDesc(elem: int, len: int): int {
+    const t: List<int> = listNew();
+    listPush(t, elem);
+    listPush(t, len);
+    return emK(8, elem, t);
+}
+function emKJumpTable(pcs: List<int>): int {
+    return emK(5, listLen(pcs), pcs);
+}
+
+// finishAt 寄存器自愈重扫（codegen.zig :520-576 同构——bit 运算族 40..47
+// 与 zig 同款不进扫描臂；.jt/.jf 只计 A）。
+function emFinishScanMax(): int {
+    let scanMax = 0;
+    let pc = 0;
+    while (pc < listLen(emCode)) {
+        const ins = listGet(emCode, pc) catch 0;
+        const op = ins & 0xFFFF;
+        const a = (ins >>> 16) & 0xFFFF;
+        const b = (ins >>> 32) & 0xFFFF;
+        const c = (ins >>> 48) & 0xFFFF;
+        if (a > scanMax) { scanMax = a; }
+        if ((op >= 5 && op <= 9) || (op >= 12 && op <= 14) || op == 22 || op == 23 || isFwOp(op)) {
+            if (b > scanMax) { scanMax = b; }
+            if (c > scanMax) { scanMax = c; }
+        } else if (op == 20 || op == 21 || op == 4 || op == 10 || op == 11 || op == 18 || op == 19 || op == 24 || op == 36 || op == 37 || op == 52) {
+            if (b > scanMax) { scanMax = b; }
+        } else if (op == 30 || op == 32 || op == 38) {
+            const t = a + b - 1;
+            if (t > scanMax) { scanMax = t; }
+        } else if (op == 31) {
+            const t = a + c;
+            if (t > scanMax) { scanMax = t; }
+        }
+        pc = pc + 1;
+    }
+    return scanMax;
+}
+
+// ============================================================================
+// §6.2 语句发射（emitStmts :588-731 同构）
+// ============================================================================
+
+// SEB1 类型池索引 → kind（wantTy 检查面统一 kind 语义——池索引直比是
+// 类型错位源，fmtmirror 扩测发现）。
+function kindOfSeb(tyIdx: int): int {
+    if (tyIdx < 0 || tyIdx >= listLen(cgSv.tys)) { return -1; }
+    return (listGet(cgSv.tys, tyIdx) catch dummyCgTy()).kind;
+}
+
+// 定宽数值种类码（O4）：1 i8、2 i16、3 i32、4 u8、5 u16、6 u32、7 u64、8 isize、9 usize、10 f32；
+// 普通 int 记 11、float 记 12；非数值 0。
+function fwCodeOf(tyIdx: int): int {
+    if (tyIdx < 0 || tyIdx >= listLen(cgSv.tys)) { return 0; }
+    const t = listGet(cgSv.tys, tyIdx) catch dummyCgTy();
+    if (t.kind == 0) { if (t.b == 0) { return 11; } return t.b; }
+    if (t.kind == 1) { if (t.b == 0) { return 12; } return t.b; }
+    return 0;
+}
+
+function fwIsFloat(c: int): bool { return c == 10 || c == 12; }
+// Bytes 定宽读写的种类码（D3 v0.37）：低 4 位宽度，16 有符号，32 浮点；大端另加 64。
+function bytesNumKind(c: int): int {
+    if (c == 1) { return 17; }
+    if (c == 2) { return 18; }
+    if (c == 3) { return 20; }
+    if (c == 4) { return 1; }
+    if (c == 5) { return 2; }
+    if (c == 6) { return 4; }
+    if (c == 7) { return 8; }
+    if (c == 10) { return 36; }
+    if (c == 12) { return 40; }
+    return 24;
+}
+function fwIsU64(c: int): bool { return c == 7 || c == 9; }
+function fwBits(c: int): int {
+    if (c == 1 || c == 4) { return 8; }
+    if (c == 2 || c == 5) { return 16; }
+    if (c == 3 || c == 6) { return 32; }
+    return 64;
+}
+function fwSigned(c: int): bool { return c == 1 || c == 2 || c == 3 || c == 8 || c == 11; }
+
+// 整数种类 sc 的取值范围是否落在 tc 之内（无需检查的转换）。
+function fwContains(tc: int, sc: int): bool {
+    if (fwSigned(tc)) {
+        if (fwSigned(sc)) { return fwBits(sc) <= fwBits(tc); }
+        return fwBits(sc) < fwBits(tc);
+    }
+    return !fwSigned(sc) && fwBits(sc) <= fwBits(tc);
+}
+
+// toStr(u64/usize)（O4）：非负按 int 转；最高位置位时 x＝2h＋b（h＝x>>>1，b＝x&1），
+// 商 q＝h/5、余 r＝2·(h%5)＋b，结果为 toStr(q)＋toStr(r)——全程无有符号溢出。
+function compileToStrU64(a0: int, dst: int): void {
+    const bi = builtinBcId(4);
+    const x = dst + 1;
+    emUseReg(dst + 9);
+    compileExpr(a0, x, sExprType(a0));
+    emEmit(encABx(1, dst + 2, emKInt(0)));
+    emEmit(encABC(13, dst + 2, x, dst + 2));
+    const jpos = emHere();
+    emEmit(encAsBx(17, dst + 2, 0));
+    emEmit(encABx(1, dst + 5, emKInt(1)));
+    emEmit(encABC(45, dst + 2, x, dst + 5));
+    emEmit(encABx(1, dst + 5, emKInt(5)));
+    emEmit(encABC(8, dst + 3, dst + 2, dst + 5));
+    emEmit(encABC(9, dst + 4, dst + 2, dst + 5));
+    emEmit(encABx(1, dst + 5, emKInt(1)));
+    emEmit(encABC(40, dst + 5, x, dst + 5));
+    emEmit(encABC(5, dst + 4, dst + 4, dst + 4));
+    emEmit(encABC(5, dst + 4, dst + 4, dst + 5));
+    emEmit(encABC(4, dst + 7, dst + 3, 0));
+    emEmit(encABC(31, dst + 6, bi, 1));
+    emEmit(encABC(4, dst + 9, dst + 4, 0));
+    emEmit(encABC(31, dst + 8, bi, 1));
+    emEmit(encABC(5, dst, dst + 6, dst + 8));
+    const jend = emHere();
+    emEmit(encAsBx(15, 0, 0));
+    emPatchJump(jpos, emHere());
+    emEmit(encABC(31, dst, bi, 1));
+    emPatchJump(jend, emHere());
+}
+
+// R[dst] 原地定宽转换（字节码 cvt＝52，C＝种类；种类表见 scalar_ops cvtOpsEmit）。
+function emCvt(dst: int, kind: int): void { emEmit(encABC(52, dst, dst, kind)); }
+
+// as 降级（定宽数值参与时）：操作数已在 R[dst]。
+function emAsFixed(dst: int, sc: int, tc: int): void {
+    if (sc == tc) { return; }
+    if (fwIsFloat(sc)) {
+        if (tc == 12) { return; } // f32→float 无损
+        if (tc == 10) { emCvt(dst, 17); return; } // float→f32 舍入
+        if (tc == 11 || tc == 8) { emEmit(encABC(37, dst, dst, 0)); return; }
+        if (fwIsU64(tc)) { emCvt(dst, 24); return; }
+        emEmit(encABC(37, dst, dst, 0));
+        emCvt(dst, tc + 17);
+        return;
+    }
+    if (tc == 12) { if (fwIsU64(sc)) { emCvt(dst, 15); } else { emEmit(encABC(36, dst, dst, 0)); } return; }
+    if (tc == 10) { if (fwIsU64(sc)) { emCvt(dst, 16); } else { emCvt(dst, 14); } return; }
+    if (fwContains(tc, sc)) { return; }
+    if (tc >= 1 && tc <= 6) { emCvt(dst, tc); return; }
+    emCvt(dst, 7); // 64 位有符号与无符号互转：只需非负检查
+}
+
+// SEB1 值语义类型（isValueTy 同构——struct 13/enum 14/array 11；入参池索引）。
+function isValueTySeb(tyIdx: int): int {
+    const k = kindOfSeb(tyIdx);
+    if (k == 13 || k == 14 || k == 11) { return 1; }
+    return 0;
+}
+
+// 表达式语句域白名单（README 必修④：字面量..await；排除 arm/patf/body/finit）。
+function isExprStmtKind(k: int): int {
+    if (k >= 26 && k <= 39) { return 1; }
+    if (k == 41 || k == 43 || k == 44 || k == 45 || k == 46 || k == 49 || k == 51) { return 1; }
+    return 0;
+}
+
+// block 节点的 stmts 子 id 列（block 记录 children＝stmts）。
+function blockStmts(blockId: int): List<int> {
+    const m = ndById(blockId);
+    if (m < 0) { return emptyIntList(); }
+    return (listGet(cgFab.recs, m) catch newNode(0, 0)).childIds;
+}
+
+// 编译一个块：开一层 defer 作用域，块尾（未以 return/break/continue 结束时）按后进先出执行本层 defer。
+function emBlock(blockId: int): void {
+    listPush(deferScopes, emptyIntList());
+    if (cgDebug) { dvScopeOpen(); }
+    const stmts = blockStmts(blockId);
+    emStmts(stmts);
+    const n = listLen(stmts);
+    let jumps = false;
+    if (n > 0) {
+        const lk = ndKind(listGet(stmts, n - 1) catch -1);
+        jumps = lk == 23 || lk == 24 || lk == 25;
+    }
+    if (!jumps) {
+        emDeferScope(listGet(deferScopes, listLen(deferScopes) - 1) catch emptyIntList());
+    }
+    if (cgDebug) { dvScopeClose(emHere()); }
+    listRemoveAt(deferScopes, listLen(deferScopes) - 1);
+}
+
+// 发射一层已登记的 defer（逆序）；每个 defer 体本身是块，有自己的 defer 层。
+function emDeferScope(scope: List<int>): void {
+    let i = listLen(scope) - 1;
+    while (i >= 0) {
+        const d = listGet(scope, i) catch -1;
+        emBlock(ndChild(d, 0));
+        i = i - 1;
+    }
+}
+
+// 从最内层到第 floor 层（含）依次执行已登记的 defer。
+function emDefersDownTo(floor: int): void {
+    let k = listLen(deferScopes) - 1;
+    while (k >= floor) {
+        emDeferScope(listGet(deferScopes, k) catch emptyIntList());
+        k = k - 1;
+    }
+}
+
+function deferPending(floor: int): bool {
+    let k = listLen(deferScopes) - 1;
+    while (k >= floor) {
+        if (listLen(listGet(deferScopes, k) catch emptyIntList()) > 0) { return true; }
+        k = k - 1;
+    }
+    return false;
+}
+
+// 取消落点（原生异步，D3 v0.21）：async 函数的挂起点（await、taskAwaitAny）已登记
+// defer 时，挂起中的任务被取消要按后进先出执行这些 defer。落点紧跟挂起点：
+// `ldbool t,false; jt t,落点; jmp 续行`——jt 永不成立，只为让各分析看到挂起点到
+// 落点这条边；内核取消时由函数入口分派直接跳到落点，执行 defer 后 ldnone/ret 正常
+// 返回（帧释放归还全部值槽）。落点对（挂起点 pc、落点 pc）随函数登记进上下文。
+function emCancelLanding(dst: int): void {
+    if (!emFnAsync || !deferPending(0)) { return; }
+    const at = emHere() - 1;
+    const t = dst + 1;
+    emUseReg(t);
+    emEmit(encABC(2, t, 0, 0));
+    const jt = emHere();
+    emEmit(encAsBx(16, t, 0));
+    const jm = emHere();
+    emEmit(encAsBx(15, 0, 0));
+    emPatchJump(jt, emHere());
+    listPush(emLandings, at);
+    listPush(emLandings, emHere());
+    emDefersKeeping(dst);
+    emEmit(encABC(3, dst, 0, 0));
+    emDbg(DBG_LEAVE, dst + 1);
+    emEmit(encABC(33, dst, 0, 0));
+    emPatchJump(jm, emHere());
+}
+
+// 带值离开（return 值、? 的错误值在 keep 槽）时执行全部 defer：临时槽抬到 keep 之上，defer 不会覆盖它。
+function emDefersKeeping(keep: int): void {
+    if (!deferPending(0)) { return; }
+    const saved = emNextTemp;
+    if (emNextTemp < keep + 1) { emNextTemp = keep + 1; }
+    emUseReg(emNextTemp);
+    emDefersDownTo(0);
+    emNextTemp = saved;
+}
+
+function emStmts(stmts: List<int>): void {
+    let i = 0;
+    while (i < listLen(stmts)) {
+        emStmt(listGet(stmts, i) catch -1);
+        i = i + 1;
+    }
+}
+
+function emStmt(s: int): void {
+    if (s < 0) { return; }
+    const k = ndKind(s);
+    if (k == 11 || k == 12) { // let/const binding
+        emPosLine = ndLine(s);
+        emPosCol = ndCol(s);
+        emDbg(DBG_STMT, emTempBase());
+        const slot = sideGet1(cgSv.stBindingSlots, s);
+        emUseReg(slot);
+        const t = emTempBase();
+        emUseReg(t);
+        const init = ndChildLast(s);
+        const ity = sExprType(init);
+        compileExpr(init, t, ity);
+        if (isValueTySeb(ity) == 1) { emEmit(encABC(24, t, t, 0)); } // clone
+        emEmit(encABC(4, slot, t, 0)); // move
+        if (cgDebug) { dvLocal(slot, ndName(s), dbgTyOf(s), emHere()); }
+    } else if (k == 14) { // assign
+        emPosLine = ndLine(s);
+        emPosCol = ndCol(s);
+        emDbg(DBG_STMT, emTempBase());
+        emitAssign(s);
+    } else if (isExprStmtKind(k) == 1) { // expr 语句
+        emPosLine = ndLine(s);
+        emPosCol = ndCol(s);
+        emDbg(DBG_STMT, emTempBase());
+        const dst = emTempBase();
+        emUseReg(dst);
+        const ety = sExprType(s);
+        compileExpr(s, dst, ety);
+    } else if (k == 15) { // if_
+        const cond = ndChild(s, 0);
+        emPosLine = ndLine(cond);
+        emPosCol = ndCol(cond);
+        emDbg(DBG_STMT, emTempBase());
+        const t = emTempBase();
+        emUseReg(t);
+        compileExpr(cond, t, sExprType(cond)); // sema 保证 bool
+        const jf = emHere();
+        emEmit(encAsBx(17, t, 0)); // jf
+        const thenB = ndChild(s, 1);
+        emBlock(thenB);
+        const elseSlot = ndChild(s, 2);
+        if (ndChildCount(elseSlot) == 0) {
+            emPatchJump(jf, emHere());
+        } else {
+            const jend = emHere();
+            emEmit(encAsBx(15, 0, 0)); // jmp
+            emPatchJump(jf, emHere());
+            const inner = ndChild(elseSlot, 0);
+            if (ndKind(inner) == 4) {
+                emBlock(inner);
+            } else {
+                emStmt(inner); // else-if 链
+            }
+            emPatchJump(jend, emHere());
+        }
+    } else if (k == 17) { // while_
+        const cond = ndChild(s, 0);
+        emPosLine = ndLine(cond);
+        emPosCol = ndCol(cond);
+        const condPc = emHere(); // 回边目标＝cond 起点（zig cond_pc 同构——先记后编译）
+        emDbg(DBG_STMT, emTempBase()); // 调试检查点在回边目标上，每轮都经过
+        const t = emTempBase();
+        emUseReg(t);
+        compileExpr(cond, t, sExprType(cond));
+        const jf = emHere();
+        emEmit(encAsBx(17, t, 0));
+        const brks: List<int> = listNew();
+        const cnts: List<int> = listNew();
+        listPush(loopBreaks, brks);
+        listPush(loopConts, cnts);
+        listPush(loopConds, condPc);
+        const body = ndChild(s, 1);
+        listPush(loopDeferBase, listLen(deferScopes));
+        emBlock(body);
+        listRemoveAt(loopDeferBase, listLen(loopDeferBase) - 1);
+        emPatchJumpToHere(listGet(loopConts, listLen(loopConts) - 1) catch emptyIntList());
+        emEmit(encAsBx(15, 0, 0));
+        emPatchJump(emHere() - 1, listGet(loopConds, listLen(loopConds) - 1) catch 0);
+        emPatchJump(jf, emHere());
+        emPatchJumpToHere(listGet(loopBreaks, listLen(loopBreaks) - 1) catch emptyIntList());
+        listRemoveAt(loopBreaks, listLen(loopBreaks) - 1);
+        listRemoveAt(loopConts, listLen(loopConts) - 1);
+        listRemoveAt(loopConds, listLen(loopConds) - 1);
+    } else if (k == 18) { // for_
+        emPosLine = ndLine(s);
+        emPosCol = ndCol(s);
+        if (cgDebug) { dvScopeOpen(); } // init 里的绑定止于整条 for 语句的结尾
+        const initSlot = ndChild(s, 0);
+        if (ndChildCount(initSlot) > 0) {
+            emStmt(ndChild(initSlot, 0));
+        }
+        const condSlot = ndChild(s, 1);
+        const updSlot = ndChild(s, 2);
+        const bodyB = ndChild(s, 3);
+        const condPc = emHere();
+        let jf = -1;
+        if (ndChildCount(condSlot) > 0) {
+            const cond = ndChild(condSlot, 0);
+            emPosLine = ndLine(cond);
+            emPosCol = ndCol(cond);
+            emDbg(DBG_STMT, emTempBase()); // 调试检查点在回边目标上，每轮都经过
+            const t = emTempBase();
+            emUseReg(t);
+            compileExpr(cond, t, sExprType(cond));
+            jf = emHere();
+            emEmit(encAsBx(17, t, 0));
+        } else {
+            emPosLine = ndLine(s);
+            emPosCol = ndCol(s);
+            emDbg(DBG_STMT, emTempBase());
+        }
+        const brks: List<int> = listNew();
+        const cnts: List<int> = listNew();
+        listPush(loopBreaks, brks);
+        listPush(loopConts, cnts);
+        listPush(loopConds, condPc);
+        listPush(loopDeferBase, listLen(deferScopes));
+        emBlock(bodyB);
+        listRemoveAt(loopDeferBase, listLen(loopDeferBase) - 1);
+        emPatchJumpToHere(listGet(loopConts, listLen(loopConts) - 1) catch emptyIntList());
+        if (ndChildCount(updSlot) > 0) {
+            const upd = ndChild(updSlot, 0);
+            if (ndKind(upd) == 14) {
+                emPosLine = ndLine(upd);
+                emPosCol = ndCol(upd);
+                emitAssign(upd);
+            } else {
+                emPosLine = ndLine(upd);
+                emPosCol = ndCol(upd);
+                const t = emTempBase();
+                emUseReg(t);
+                compileExpr(upd, t, sExprType(upd));
+            }
+        }
+        emEmit(encAsBx(15, 0, 0));
+        emPatchJump(emHere() - 1, condPc);
+        if (jf >= 0) { emPatchJump(jf, emHere()); }
+        emPatchJumpToHere(listGet(loopBreaks, listLen(loopBreaks) - 1) catch emptyIntList());
+        listRemoveAt(loopBreaks, listLen(loopBreaks) - 1);
+        listRemoveAt(loopConts, listLen(loopConts) - 1);
+        listRemoveAt(loopConds, listLen(loopConds) - 1);
+        if (cgDebug) { dvScopeClose(emHere()); }
+    } else if (k == 23) { // return
+        emPosLine = ndLine(s);
+        emPosCol = ndCol(s);
+        emDbg(DBG_STMT, emTempBase());
+        if (ndChildCount(s) > 0) {
+            const v = ndChild(s, 0);
+            emPosLine = ndLine(v);
+            emPosCol = ndCol(v);
+            const t = emTempBase();
+            emUseReg(t);
+            const vty = sExprType(v);
+            compileExpr(v, t, vty);
+            if (isValueTySeb(vty) == 1) { emEmit(encABC(24, t, t, 0)); }
+            emDefersKeeping(t); // D3 v0.19：返回值先求值，再执行 defer
+            emPosLine = ndLine(s);
+            emPosCol = ndCol(s);
+            emDbg(DBG_LEAVE, t + 1);
+            emEmit(encABC(33, t, 0, 0)); // ret
+        } else {
+            emDefersDownTo(0);
+            emPosLine = ndLine(s);
+            emPosCol = ndCol(s);
+            const t = emTempBase();
+            emEmit(encABC(3, t, 0, 0)); // ldnone
+            emDbg(DBG_LEAVE, t + 1);
+            emEmit(encABC(33, t, 0, 0)); // ret
+        }
+    } else if (k == 71) { // yield（D3 v0.22）：值算入临时槽（值类型先拷贝），yield A——挂起点，恢复后重执行本条即继续
+        emPosLine = ndLine(s);
+        emPosCol = ndCol(s);
+        emDbg(DBG_STMT, emTempBase());
+        const t = emTempBase();
+        emUseReg(t);
+        const v = ndChild(s, 0);
+        const vty = sExprType(v);
+        compileExpr(v, t, vty);
+        if (isValueTySeb(vty) == 1) { emEmit(encABC(24, t, t, 0)); }
+        emEmit(encABC(49, t, 0, 0));
+        emDbg(DBG_RESUME, t + 1);
+    } else if (k == 65) { // defer（D3 v0.19）：登记到当前块，离开块时执行
+        if (listLen(deferScopes) > 0) { listPush(listGet(deferScopes, listLen(deferScopes) - 1) catch emptyIntList(), s); }
+    } else if (k == 24) { // break
+        emPosLine = ndLine(s);
+        emPosCol = ndCol(s);
+        emDbg(DBG_STMT, emTempBase());
+        if (listLen(loopDeferBase) > 0) { emDefersDownTo(listGet(loopDeferBase, listLen(loopDeferBase) - 1) catch 0); }
+        emPosLine = ndLine(s);
+        emPosCol = ndCol(s);
+        const j = emHere();
+        emEmit(encAsBx(15, 0, 0));
+        if (listLen(loopBreaks) > 0) {
+            listPush(listGet(loopBreaks, listLen(loopBreaks) - 1) catch emptyIntList(), j);
+        }
+    } else if (k == 25) { // continue
+        emPosLine = ndLine(s);
+        emPosCol = ndCol(s);
+        emDbg(DBG_STMT, emTempBase());
+        if (listLen(loopDeferBase) > 0) { emDefersDownTo(listGet(loopDeferBase, listLen(loopDeferBase) - 1) catch 0); }
+        emPosLine = ndLine(s);
+        emPosCol = ndCol(s);
+        const j = emHere();
+        emEmit(encAsBx(15, 0, 0));
+        if (listLen(loopConts) > 0) {
+            listPush(listGet(loopConts, listLen(loopConts) - 1) catch emptyIntList(), j);
+        }
+    }
+}
+
+// ============================================================================
+// §6.3 表达式发射（compileExpr :833-987 全臂同构；入口置 pos＝zig self.pos = e.at）
+// ============================================================================
+
+// binary op id → bc opcode（GT/GE 反转操作数；NEQ=EQ+NOT）。
+function binOpBc(id: int): int {
+    if (id == 0) { return 5; } // add
+    if (id == 1) { return 6; } // sub
+    if (id == 2) { return 7; } // mul
+    if (id == 3) { return 8; } // div
+    if (id == 4) { return 9; } // mod
+    if (id == 5) { return 12; } // eq
+    if (id == 6) { return 12; } // neq→eq+not
+    if (id == 7) { return 13; } // lt
+    if (id == 8) { return 14; } // le
+    if (id == 9) { return 13; } // gt→反转 lt
+    if (id == 10) { return 14; } // ge→反转 le
+    if (id == 13) { return 40; } // band
+    if (id == 14) { return 41; } // bor
+    if (id == 15) { return 42; } // bxor
+    if (id == 16) { return 44; } // shl
+    if (id == 17) { return 46; } // sar
+    if (id == 18) { return 45; } // shr
+    return 0;
+}
+
+// 二元运算的字节码（O4 第二步）：结果为定宽类型（种类 1..10）的算术与移位走定宽运算族，带类型的溢出与计数检查；
+// 与、或、异或不会越出公共类型的范围，比较按第一步的规则，二者沿用 int/float 的操作码。
+function fwBinOpBc(id: int, rt: int): int {
+    if (rt >= 1 && rt <= 10) {
+        if (id >= 0 && id <= 4) { return fwOpCode(rt, id); }
+        if (id == 16) { return fwOpCode(rt, FW_SHL); }
+        if (id == 17) { return fwOpCode(rt, FW_SHR); }
+        if (id == 18) { return fwOpCode(rt, FW_USHR); }
+    }
+    return binOpBc(id);
+}
+
+// 定宽负字面量（O4 第二步）：-128 之类直接载入取负后的常量（sema 已按期望型检查范围）；f32 按 float 载入后舍入。
+function compileNegFwLit(lit: int, dst: int, ut: int): void {
+    const raw = ndRaw(lit);
+    if (ut == 10 && ndKind(lit) == 27) {
+        // 浮点常量的位型在记录流里按 u64 十进制转录（D96 §二-6），不放符号位置位的常量：载入正值后取负（精确）。
+        emEmit(encABx(1, dst, emKFloatBits(strtodF32Bits(raw))));
+        emEmit(encABC(10, dst, dst, 0));
+        return;
+    }
+    emEmit(encABx(1, dst, emKInt(0 - cgParseIntLit(raw))));
+    if (ut == 10) { emCvt(dst, 14); } // f32 的负整数字面量：一次舍入到 f32
+}
+
+// sema builtin 序数 → bytecode BuiltinId（imul=29 调用臂早退直发 IMUL）。
+function builtinBcId(ord: int): int {
+    // 36..46＝Bytes 内建 37..47（D3 v0.18）；embedBytes(47) 不走此表（compileCall 降为常量＋bytesFromStr）。
+    // 序数 47 embedBytes 占位 0（不走此表）；48/49＝errAs/errWrap（D3 v0.19）；50..52 为 codegen 内部发射的 errRich/errPayload/errCause。
+    // 序数 50..56＝D3 v0.21 工具链系统内建 → BuiltinId 53..59。
+    // 序数 57..61 codegen 直发（占位 0）；62＝ffiLastError（D3 v0.23）→ BuiltinId 60；63/64 直发；
+    // 65/66＝threadSpawn/threadJoin（线程第 2 步）→ BuiltinId 61/62；67..73＝sharedNew..atomicCas（第 4c 步）→ 63..69。
+    // 74..76＝wrapAdd/wrapSub/wrapMul（codegen 直发，占位 0）；77/78＝bytesAsList/listAsBytes（O4 第二步 2c2）→ 74/75；
+    // 79＝hostArch（macOS 适配 M0b）→ 76；80..85＝bytesCopy、bytesFill、bytesGetLE/BE、bytesSetLE/BE（D3 v0.37）→ 77、78、79、79、80、80；
+    // 86＝setEnv（D3 v0.42）→ 81。
+    // 序数 2048 起＝__rt 内部内建（线程设计 §十六），序数即运行期编号。
+    if (ord >= 2048) { return ord; }
+    const map = "1 2 3 4 5 6 9 10 11 12 13 14 15 16 17 18 7 8 20 21 22 23 24 25 26 27 28 29 30 0 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 0 48 49 53 54 55 56 57 58 59 0 0 0 0 0 60 0 0 61 62 63 64 65 66 67 68 69 0 0 0 74 75 76 77 78 79 79 80 80 81";
+    let pos = 0;
+    let idx = 0;
+    const n = len(map);
+    while (pos <= n) {
+        let end = pos;
+        while (end < n && (byteAt(map, end) catch 32) != 32) { end = end + 1; }
+        if (end > pos && idx == ord) { return cgParseIntLit(strSub(map, pos, end - pos)); }
+        if (end > pos) { idx = idx + 1; }
+        pos = end + 1;
+    }
+    return 0;
+}
+
+// 整数字面量解析（0x/0b/0o 前缀＋'_' 分位符容错；可负——lexer 同形）。
+function cgCharValue(raw: string): int {
+    // 引号间 content 解码（zig charValue 同表：单字节直取；转义集 n/t/r/反斜杠/单引号/零）。
+    const n = len(raw);
+    if (n < 3) { return 0; }
+    if (n == 3) { return byteAt(raw, 1) catch 0; }
+    const c2 = byteAt(raw, 2) catch 0;
+    if (c2 == 110) { return 10; }
+    if (c2 == 116) { return 9; }
+    if (c2 == 114) { return 13; }
+    if (c2 == 92) { return 92; }
+    if (c2 == 39) { return 39; }
+    if (c2 == 48) { return 0; }
+    return 0;
+}
+
+// (v·base + d) mod 2^64，v 按无符号位看待：u64/usize 的大字面量（O4 第二步，2^63..2^64−1）以二补码位载入；
+// 结果在 int 范围内时与 v·base + d 相同。
+function cgAccDigit(v: int, base: int, d: int): int {
+    const m = imul(v, base);
+    if (m > 9223372036854775807 - d) { return (m - 9223372036854775807 - 1 + d) + (-9223372036854775807 - 1); }
+    return m + d;
+}
+
+function cgParseIntLit(raw: string): int {
+    // 字符字面量（LANG-16 同表）：char_lit 解析期即 int 节点但 FAB1 只留
+    // 原文 `'a'`——值由消费侧回算（zig t.int_val 面的 .tx 对偶）。
+    if ((byteAt(raw, 0) catch 0) == 39) { return cgCharValue(raw); }
+    let neg = false;
+    let i = 0;
+    if ((byteAt(raw, 0) catch 48) == 45) { neg = true; i = 1; }
+    let base = 10;
+    if ((byteAt(raw, i) catch 0) == 48) {
+        const c2 = byteAt(raw, i + 1) catch 0;
+        if (c2 == 120 || c2 == 88) { base = 16; i = i + 2; }
+        else if (c2 == 98 || c2 == 66) { base = 2; i = i + 2; }
+        else if (c2 == 111 || c2 == 79) { base = 8; i = i + 2; }
+    }
+    let v: int = 0;
+    while (i < len(raw)) {
+        const c = byteAt(raw, i) catch 48;
+        let d = -1;
+        if (c >= 48 && c <= 57) { d = c - 48; }
+        else if (c >= 97 && c <= 102) { d = c - 87; }
+        else if (c >= 65 && c <= 70) { d = c - 55; }
+        if (d >= 0 && d < base) { v = cgAccDigit(v, base, d); }
+        i = i + 1;
+    }
+    if (neg) { return -v; }
+    return v;
+}
+
+// i64 值 → IEEE754 位型（zig @floatFromInt 对拍——round-to-nearest-even）。
+function intToF64Bits(v: int): int {
+    if (v == 0) { return 0; }
+    let neg = false;
+    let m = v;
+    if (m == -9223372036854775807 - 1) {
+        // i64 min＝2^63 恰 2 的幂——无舍入面。
+        neg = true;
+        m = 1 << 62;
+    } else if (m < 0) {
+        neg = true;
+        m = -m;
+    }
+    let e2 = bitLenU2(m) - 1;
+    let mant: int = 0;
+    if (e2 >= 52) {
+        const d = e2 - 52;
+        const low = m & ((1 << d) - 1);
+        const half = 1 << (d - 1);
+        mant = m >>> d;
+        if (low > half || (low == half && (mant & 1) == 1)) { mant = mant + 1; }
+    } else {
+        mant = m << (52 - e2);
+    }
+    if (mant >= (1 << 53)) { mant = mant >>> 1; e2 = e2 + 1; }
+    const biased = e2 + 1023;
+    let bits: int = ((biased << 52) & 0x7FFFFFFFFFFFFFFF) | (mant - (1 << 52));
+    if (neg) { bits = bits | (-9223372036854775807 - 1); }
+    return bits;
+}
+
+function bitLenU2(v: int): int {
+    if (v <= 0) { return 0; }
+    let n = 0;
+    let x = v;
+    while (x > 0) { n = n + 1; x = x >>> 1; }
+    return n;
+}
+
+function compileExpr(e: int, dst: int, wantTy: int): int {
+    if (e < 0) { return dst; }
+    emPosLine = ndLine(e);
+    emPosCol = ndCol(e);
+    emUseReg(dst);
+    const k = ndKind(e);
+    if (k == 26) { // int 字面量
+        const raw = ndRaw(e);
+        if (fwCodeOf(wantTy) == 10) { // f32 的整数字面量（O4）：载入整数后一次舍入到 f32（cvt 14，不经 float）
+            emEmit(encABx(1, dst, emKInt(cgParseIntLit(raw))));
+            emCvt(dst, 14);
+        } else if (kindOfSeb(wantTy) == 1) { // want float→float(int 值)（zig @floatFromInt）
+            emEmit(encABx(1, dst, emKFloatBits(intToF64Bits(cgParseIntLit(raw)))));
+        } else {
+            emEmit(encABx(1, dst, emKInt(cgParseIntLit(raw))));
+        }
+    } else if (k == 27) { // float 字面量
+        if (fwCodeOf(wantTy) == 10) { // f32 字面量（O4）：十进制文本直接正确舍入到 f32
+            emEmit(encABx(1, dst, emKFloatBits(strtodF32Bits(ndRaw(e)))));
+        } else {
+            emEmit(encABx(1, dst, emKFloatBits(strtodBits(ndRaw(e)))));
+        }
+    } else if (k == 28) { // string 字面量（fab1 存带引号源文本——剥引号＋源转义）
+        emEmit(encABx(1, dst, emKStr(cgIntern(cgStrLitValue(ndRaw(e))))));
+    } else if (k == 29) { // bool 字面量
+        emEmit(encABC(2, dst, ndIntVal(e), 0));
+    } else if (k == 30) { // none 字面量
+        emEmit(encABC(3, dst, 0, 0));
+    } else if (k == 31) { // ident
+        const tag = sResTag(e);
+        if (tag == 0) { // local
+            emEmit(encABC(4, dst, sResField(e, 1), 0));
+        } else if (tag == 1) { // global
+            const gm = sResField(e, 1);
+            const gs = sResField(e, 2);
+            if (gm == emFnModuleSelf) {
+                emEmit(encABC(20, dst, emGlobalBase, fieldSel(FLD_FLAG, gs)));
+            } else {
+                emEmit(encABx(1, dst, emKFnRef(accessorFn(gm, gs))));
+                emEmit(encABC(30, dst, 1, 1));
+            }
+        } else if (tag == 2) { // func 值
+            emEmit(encABx(1, dst, emKFnRef(sResField(e, 1))));
+        } else {
+            emEmit(encABC(3, dst, 0, 0)); // extern/builtin 作值——sema 已拒，兜底
+        }
+    } else if (k == 32) { // binary
+        const opId = ndIntVal(e);
+        const myTy = sExprType(e);
+        if (opId == 0 && kindOfSeb(myTy) == 3) { // add + string → 拼接链合并（≥3≤8 叶）
+            const n = strChainLen(e);
+            if (n >= 3 && n <= 8) {
+                compileStrConcat(e, dst, n);
+                return dst;
+            }
+        }
+        if (opId == 11 || opId == 12) { // logic_and(jf) / logic_or(jt)
+            const lhs = ndChild(e, 0);
+            const rhs = ndChild(e, 1);
+            compileExpr(lhs, dst, sExprType(lhs));
+            if (opId == 11) {
+                const jf = emHere();
+                emEmit(encAsBx(17, dst, 0));
+                compileExpr(rhs, dst, sExprType(rhs));
+                emPatchJump(jf, emHere());
+            } else {
+                const jt = emHere();
+                emEmit(encAsBx(16, dst, 0));
+                compileExpr(rhs, dst, sExprType(rhs));
+                emPatchJump(jt, emHere());
+            }
+            return dst;
+        }
+        let lhsE = ndChild(e, 0);
+        let rhsE = ndChild(e, 1);
+        if ((opId == 5 || opId == 6) && compileErrEq(opId, lhsE, rhsE, dst)) { return dst; }
+        if (opId == 9 || opId == 10) { // gt/ge 反转操作数
+            lhsE = ndChild(e, 1);
+            rhsE = ndChild(e, 0);
+        }
+        compileExpr(lhsE, dst, sExprType(lhsE));
+        const r = dst + 1;
+        emUseReg(r);
+        compileExpr(rhsE, r, sExprType(rhsE));
+        if (opId >= 7 && opId <= 10 && (fwIsU64(fwCodeOf(sExprType(lhsE))) || fwIsU64(fwCodeOf(sExprType(rhsE))))) {
+            // u64/usize 大小比较（O4）：x ^ MIN 把无符号序映到有符号序。
+            const km = dst + 2;
+            emUseReg(km);
+            emEmit(encABx(1, km, emKInt(-9223372036854775807 - 1)));
+            emEmit(encABC(42, dst, dst, km));
+            emEmit(encABC(42, r, r, km));
+        }
+        emEmit(encABC(fwBinOpBc(opId, fwCodeOf(myTy)), dst, dst, r));
+        if (opId == 6) { emEmit(encABC(11, dst, dst, 0)); } // neq→not
+    } else if (k == 33) { // unary
+        const operand = ndChild(e, 0);
+        const opId = ndIntVal(e);
+        const ut = fwCodeOf(sExprType(e));
+        if (opId == 0 && ut >= 1 && ut <= 10 && (ndKind(operand) == 26 || ndKind(operand) == 27)) {
+            compileNegFwLit(operand, dst, ut); // 定宽负字面量（O4 第二步）：直接载入常量
+            return dst;
+        }
+        compileExpr(operand, dst, sExprType(operand));
+        if (opId == 0) {
+            if (ut >= 1 && ut <= 9) { emEmit(encABC(fwOpCode(ut, FW_NEG), dst, dst, dst)); } // 定宽有符号取负（检查溢出）
+            else { emEmit(encABC(10, dst, dst, 0)); } // neg（int/float/f32）
+        }
+        else if (opId == 1) { emEmit(encABC(11, dst, dst, 0)); } // not
+        else if (ut >= 1 && ut <= 9) { emEmit(encABC(fwOpCode(ut, FW_BNOT), dst, dst, dst)); } // 定宽按位取反（类型宽度内）
+        else { emEmit(encABC(43, dst, dst, 0)); } // bnot
+    } else if (k == 34) { // call
+        compileCall(e, dst);
+    } else if (k == 36) { // field
+        const tag = sFieldTag(e);
+        const base = ndChild(e, 0);
+        if (tag == 0) { // 字段读
+            compileExpr(base, dst, sExprType(base));
+            const c = fieldSel(sFieldAuto(e) * FLD_FLAG, sFieldIdx(e));
+            emEmit(encABC(20, dst, dst, c));
+        } else if (tag == 1) { // variant_ctor（零参变体）
+            const varEi = sFieldP1(e);
+            if (varEi < 0) { return dst; }
+            const vty = emKVariant(declIndexEnum(cgSv, varEi), sFieldIdx(e));
+            emEmit(encABx(26, dst, vty));
+            emErrWrapIf(e, sFieldIdx(e), dst);
+        } else if (tag == 3) { // cause（D3 v0.19）：errCause → Error?
+            compileErrUnary(base, 52, dst);
+        } else { // err_message（interp 对 .err tag 特判）
+            compileExpr(base, dst, sExprType(base));
+            emEmit(encABC(20, dst, dst, 0));
+        }
+    } else if (k == 35) { // index
+        const base = ndChild(e, 0);
+        const idx = ndChild(e, 1);
+        compileExpr(base, dst, sExprType(base));
+        const idxR = dst + 1;
+        emUseReg(idxR);
+        compileExpr(idx, idxR, sExprType(idx));
+        emEmit(encABC(22, dst, dst, idxR));
+    } else if (k == 37) { // propagate（? 传播）
+        const inner = ndChild(e, 0);
+        const ity = sExprType(inner);
+        compileExpr(inner, dst, ity);
+        const t = dst + 1;
+        emUseReg(t);
+        if (kindOfSeb(ity) == 7) { emEmit(encABC(18, t, dst, 0)); } else { emEmit(encABC(19, t, dst, 0)); } // errunion→iserr
+        const jfail = emHere();
+        emEmit(encAsBx(16, t, 0)); // jt 失败→reterr
+        const jend = emHere();
+        emEmit(encAsBx(15, 0, 0)); // 成功→直落
+        emPatchJump(jfail, emHere());
+        emDefersKeeping(t); // D3 v0.19：错误值在 dst（t＝dst+1 之下），defer 用更高的临时槽
+        emDbg(DBG_LEAVE, t);
+        emEmit(encABC(34, dst, 0, 0)); // reterr
+        emPatchJump(jend, emHere());
+    } else if (k == 38) { // as_cast（int→float / float→int）
+        const operand = ndChild(e, 0);
+        const oty = sExprType(operand);
+        compileExpr(operand, dst, oty);
+        const sc = fwCodeOf(oty);
+        const tc = fwCodeOf(sExprType(e));
+        if ((sc != 11 && sc != 12) || (tc != 11 && tc != 12)) { emAsFixed(dst, sc, tc); }
+        else if (kindOfSeb(oty) == 0) { emEmit(encABC(36, dst, dst, 0)); } else { emEmit(encABC(37, dst, dst, 0)); }
+    } else if (k == 39) { // catch
+        compileCatch(e, dst);
+    } else if (k == 41) { // struct_lit
+        compileStructLit(e, dst, 0);
+    } else if (k == 43) { // array_lit
+        const kd = emKArrDesc(flattenTy(cgSv, sArrElem(e)), sArrLen(e));
+        if (sArrSlice(e) == 1) { emEmit(encABx(29, dst, kd)); } else { emEmit(encABx(28, dst, kd)); }
+        const idxR = dst + 1;
+        const v = dst + 2;
+        emUseReg(v);
+        let i = 0;
+        while (i < ndChildCount(e)) {
+            const el = ndChild(e, i);
+            compileExpr(el, v, sExprType(el));
+            if (isValueTySeb(sExprType(el)) == 1) { emEmit(encABC(24, v, v, 0)); }
+            emEmit(encABx(1, idxR, emKInt(i)));
+            emEmit(encABC(23, v, dst, idxR));
+            i = i + 1;
+        }
+    } else if (k == 44) { // new（struct_lit→newref；variant→newref 逐字段）
+        const inner = ndChild(e, 0);
+        if (ndKind(inner) == 41) {
+            compileStructLit(inner, dst, 1);
+        } else { // variant 槽——variant_res 键＝外层 new_expr 节点 e（zig 同构）
+            const ei = declIndexEnum(cgSv, sVariantEnum(e));
+            const vty = emKVariant(ei, sVariantIdx(e));
+            emEmit(encABx(27, dst, vty));
+            const arg = dst + 1;
+            emUseReg(arg);
+            // variant_res 键＝外层 new_expr e（inner 槽节点无登记——vi 恒
+            // 0 落 Null 槽＝字段表空 break 吞实参，json Bool(true) 族活捉）。
+            const fields = variantOf(ei, sVariantIdx(e));
+            let i = 0;
+            while (i < ndChildCount(inner)) {
+                if (i >= listLen(fields)) { break; }
+                const a = ndChild(inner, i);
+                const fty = listGet(fields, i) catch 0;
+                compileExpr(a, arg, fty);
+                if (isValueTySeb(fty) == 1) { emEmit(encABC(24, arg, arg, 0)); }
+                emEmit(encABC(21, arg, dst, fieldSel(0, i)));
+                i = i + 1;
+            }
+        }
+    } else if (k == 46) { // switch
+        compileSwitch(e, dst);
+    } else if (k == 49) { // arrow（闭包创建点）
+        compileClosure(e, dst);
+    } else if (k == 51) { // await
+        const operand = ndChild(e, 0);
+        compileExpr(operand, dst, sExprType(operand));
+        emEmit(encABC(39, dst, 0, 0)); // await_fut
+        emCancelLanding(dst);
+        emDbg(DBG_RESUME, dst + 1);
+    }
+    return dst;
+}
+
+// field_res 行[1]（tag0＝struct；tag1＝enum——variant_ctor 消费面）。
+function sFieldP1(id: int): int {
+    const m = sideFind(cgSv.stFieldRes, id);
+    if (m < 0) { return -1; }
+    const row = listGet(cgSv.stFieldRes.vals, m) catch emptyIntList();
+    if ((listGet(row, 0) catch 0) != 1) { return -1; } // 非 variant_ctor 行
+    return listGet(row, 1) catch -1;
+}
+
+// 字符串加法链叶计数（左结合树、全节点 string）。
+function strChainLen(e: int): int {
+    if (ndKind(e) == 32 && ndIntVal(e) == 0 && kindOfSeb(sExprType(e)) == 3) {
+        return strChainLen(ndChild(e, 0)) + strChainLen(ndChild(e, 1));
+    }
+    return 1;
+}
+
+// 链整体编译：叶按左→右装入 dst+1.. 连续寄存器，尾接 callbi str_concat。
+function compileStrConcat(e: int, dst: int, n: int): void {
+    emPosLine = ndLine(e);
+    emPosCol = ndCol(e);
+    // 保存/恢复——叶实参内可嵌套更深 concat（zig 局部 idx: *usize 同构；
+    // 全局计数被内层复位＝parser fn114 叶寄存器错位根因）。
+    const saved = strChainIdx;
+    strChainIdx = 0;
+    emitStrLeaves(e, dst);
+    strChainIdx = saved;
+    emEmit(encABC(31, dst, 19, n));
+}
+
+function emitStrLeaves(e: int, dst: int): void {
+    if (ndKind(e) == 32 && ndIntVal(e) == 0 && kindOfSeb(sExprType(e)) == 3) {
+        emitStrLeaves(ndChild(e, 0), dst);
+        emitStrLeaves(ndChild(e, 1), dst);
+        return;
+    }
+    strChainIdx = strChainIdx + 1;
+    const r = dst + strChainIdx;
+    emUseReg(r);
+    compileExpr(e, r, sExprType(e));
+}
+
+// ============================================================================
+// §6.4 call/assign/lvalue/闭包/catch/struct_lit/switch（:1101-1339 同构）
+// ============================================================================
+
+// call 节点的实参表（方法语法糖形实参前插接收者——stMethodArgs；否则
+// children＝[tyargs?, callee, args...] 跳过 tyargs/callee）。
+function callArgs(e: int): List<int> {
+    const out: List<int> = listNew();
+    const nMA = sMethodArgsN(e);
+    if (nMA >= 0) {
+        let i = 0;
+        while (i < nMA) { listPush(out, sMethodArg(e, i)); i = i + 1; }
+        return out;
+    }
+    const nch = ndChildCount(e);
+    let start = 0;
+    if (nch > 0 && ndKind(ndChild(e, 0)) == 63) { start = 1; }
+    let i = start + 1;
+    while (i < nch) { listPush(out, ndChild(e, i)); i = i + 1; }
+    return out;
+}
+
+function callCalleeExpr(e: int): int {
+    const nch = ndChildCount(e);
+    let start = 0;
+    if (nch > 0 && ndKind(ndChild(e, 0)) == 63) { start = 1; }
+    return ndChild(e, start);
+}
+
+// embedBytes("路径")（D3 v0.18）：编译期按调用所在源文件的目录解析并读取文件，
+// 内容作为字符串常量入池（任意字节），运行期经 bytesFromStr（BuiltinId 45）拷贝
+// 成新的 Bytes。读不到或超过 64MB 即编译错误 3102，不生成产物。
+let cgModulePaths: List<string> = listNew();
+export function cgSetModulePaths(paths: List<string>): void { cgModulePaths = paths; }
+
+// 调试构建（第 6 轮 6c-1，调试实施设计 §四-2）：函数入口、语句起点、ret/reterr 之前与挂起点恢复处插检查点
+// callbi a, DBG_*, 0。检查点不写目标槽、不带实参（emit_record 登记为 void），a 取发射处已死的临时槽。
+// prelude 与编译器合成的函数（跨模块访问器、生成器创建函数）不插桩；正常构建不插，指令流不变。
+let cgDebug: bool = false;
+let emDbgOn: bool = false;
+export function cgSetDebug(on: bool): void { cgDebug = on; }
+
+// 程序用到了工具链进程与标准输入内建（TOOL-103）：原生构建据此把 __tx_tool_* 例程生成进程序对象，
+// 字节码构建据此报错（VM 不认识这组号）。每次生成从 false 起。
+let cgToolUsed: bool = false;
+export function cgUsesToolBuiltins(): bool { return cgToolUsed; }
+
+// 本函数开始插桩（调试构建且不在 prelude 里）并发出入口检查点；在 emInit 与闭包序言之后调用。
+function emDbgBegin(): void {
+    emDbgOn = cgDebug && (listGet(cgModulePaths, emFnModuleSelf) catch "") != "<prelude>";
+    emDbg(DBG_ENTER, emTempBase());
+}
+
+function emDbg(id: int, a: int): void {
+    if (!emDbgOn) { return; }
+    emUseReg(a);
+    emEmit(encABC(31, a, id, 0));
+}
+
+function embedPath(lit: string): string {
+    return embedPathFrom(lit, listGet(cgModulePaths, emFnModuleSelf) catch "");
+}
+
+function embedPathFrom(lit: string, base: string): string {
+    const c0 = byteAt(lit, 0) catch 0;
+    const c1 = byteAt(lit, 1) catch 0;
+    // 绝对路径：/ 开头；Windows 宿主上另有 \ 开头与盘符（类 Unix 上 \ 与冒号是名字里的普通字符，与运行期 readFile 一致）。
+    if (c0 == 47 || (pathOnWindows() && (c0 == 92 || c1 == 58))) { return lit; }
+    // strSub counts code points, so the separator position is a code point index.
+    let cut = -1;
+    let cps = 0;
+    let i = 0;
+    while (i < len(base)) {
+        const c = byteAt(base, i) catch 0;
+        if ((c & 192) != 128) {
+            if (pathIsSep(c)) { cut = cps; }
+            cps = cps + 1;
+        }
+        i = i + 1;
+    }
+    if (cut < 0) { return lit; }
+    return strSub(base, 0, cut + 1) + lit;
+}
+
+// embedBytes 的文件有没有问题（空串为没有；LSP 与 MCP 实施设计 §三-4、§三-6 补定）：经 fileSize 只取元数据、不读内容。
+// 取不到大小时带上它的错误文案；其中 invalid argument 在路径不含 NUL 时就是“不是普通文件”（目录、设备、管道），改写成
+// not a regular file（同 Go 嵌入的专门文案）。超过 64 MiB 得上限文案。代码生成读入之前先过它，LSP 检查只过它。
+export function embedProblem(path: string, lit: string): string {
+    const fp = filePath(path);
+    const size = serviceSize(fp) catch (e) {
+        return "embedBytes 无法读取 " + lit + "（" + embedReason(fp, e.message) + "）";
+    };
+    if (size > 67108864) { return "embedBytes 文件超过 64MB：" + lit; }
+    return "";
+}
+
+function embedReason(fp: string, msg: string): string {
+    if (msg != "invalid argument: " + fp) { return msg; }
+    let i = 0;
+    while (i < len(fp)) {
+        if ((byteAt(fp, i) catch 1) == 0) { return msg; }
+        i = i + 1;
+    }
+    return "not a regular file: " + fp;
+}
+
+function compileEmbedBytes(cargs: List<int>, dst: int): void {
+    const a = listGet(cargs, 0) catch -1;
+    const lit = cgStrLitValue(ndRaw(a));
+    const path = embedPath(lit);
+    const mod = listGet(cgSv.modules, emFnModuleSelf) catch dummyCgModule();
+    const where = mod.display + ":" + toStr(emPosLine) + ":" + toStr(emPosCol) + ": error 3102: ";
+    const why = embedProblem(path, lit);
+    if (len(why) > 0) {
+        if (len(cgOperandError) == 0) { cgOperandError = where + why; }
+        return;
+    }
+    let dataIndex = 0;
+    if (serviceRestricted()) {
+        const data = serviceReadBytes(path, 67108864) catch (e) {
+            if (len(cgOperandError) == 0) { cgOperandError = where + "embedBytes 无法读取 " + lit + "（" + e.message + "）"; } return;
+        };
+        dataIndex = cgInternBytes(data);
+    } else {
+        const data: string = readFile(filePath(path)) catch (e) {
+            if (len(cgOperandError) == 0) { cgOperandError = where + "embedBytes 无法读取 " + lit + "（" + e.message + "）"; } return;
+        };
+        if (len(data) > 67108864) {
+            if (len(cgOperandError) == 0) { cgOperandError = where + "embedBytes 文件超过 64MB：" + lit; } return;
+        }
+        dataIndex = cgIntern(data);
+    }
+    const ar = dst + 1;
+    emUseReg(ar);
+    emEmit(encABx(1, ar, emKStr(dataIndex)));
+    emEmit(encABC(31, dst, 45, 1));
+}
+
+// LSP 检查（第 6 轮 6d-1，LSP 与 MCP 实施设计 §三-6）：不生成代码时找出 embedBytes 调用——名字解析为内建 47
+// 的调用节点，取其字面量与位置，路径按调用所在模块的目录解析（同 compileEmbedBytes）。module 为语义模块序。
+export struct CgEmbedSite {
+    module: int,
+    line: int,
+    col: int,
+    lit: string,
+    path: string,
+}
+
+export function cgEmbedSiteFromRaw(module: int, line: int, col: int, raw: string, modPaths: List<string>): Ref<CgEmbedSite> {
+    const lit = cgStrLitValue(raw);
+    return new CgEmbedSite { module: module, line: line, col: col, lit: lit,
+        path: embedPathFrom(lit, listGet(modPaths, module) catch "") };
+}
+
+export function cgEmbedSites(sv: Ref<SemaView>, fabData: string, modPaths: List<string>): List<Ref<CgEmbedSite>> {
+    const out: List<Ref<CgEmbedSite>> = listNew();
+    const fab = new FabView { modules: listNew(), recs: listNew() };
+    if (parseFabRecords(fabData, fab) < 0) { return out; }
+    cgSv = sv;
+    cgFab = fab;
+    buildNodeIndex(fab);
+    cgModulePaths = modPaths;
+    const t = sv.stExprRes;
+    let k = 0;
+    while (k < listLen(t.keys)) {
+        const row = listGet(t.vals, k) catch emptyIntList();
+        if ((listGet(row, 0) catch 0) == 3 && (listGet(row, 1) catch 0) == 47) {
+            const e = listGet(t.keys, k) catch -1;
+            let mi = 0;
+            while (mi < listLen(modSortIds) && nodeByIdIn(mi, e) < 0) { mi = mi + 1; }
+            if (mi < listLen(modSortIds)) {
+                ndModule = mi;
+                emFnModuleSelf = mi;
+                const a = listGet(callArgs(e), 0) catch -1;
+                // 实参不是字符串字面量时语义分析已报 3002，代码生成走不到读文件这一步。
+                if (ndKind(a) == 28) {
+                    const lit = cgStrLitValue(ndRaw(a));
+                    listPush(out, new CgEmbedSite { module: mi, line: ndLine(e), col: ndCol(e), lit: lit, path: embedPath(lit) });
+                }
+            }
+        }
+        k = k + 1;
+    }
+    return out;
+}
+
+// List<T> 的紧凑存放种类（O4 第二步，设计 §三-4）：T 为 i8..u32 或 f32 时返回其定宽种类码，否则 0。
+function listCompactKind(t0: int): int {
+    let t = t0;
+    if (kindOfSeb(t) == 8) { t = (listGet(cgSv.tys, t) catch dummyCgTy()).a; }
+    if (kindOfSeb(t) != 10) { return 0; }
+    const c = fwCodeOf((listGet(cgSv.tys, t) catch dummyCgTy()).a);
+    if ((c >= 1 && c <= 6) || c == 10) { return c; }
+    return 0;
+}
+
+// List 实参的元素是否值类型（struct/enum/定长数组；接收者可经 Ref）。
+function listElemIsValue(a: int): int {
+    let t = sExprType(a);
+    if (kindOfSeb(t) == 8) { t = (listGet(cgSv.tys, t) catch dummyCgTy()).a; }
+    if (kindOfSeb(t) != 10) { return 0; }
+    return isValueTySeb((listGet(cgSv.tys, t) catch dummyCgTy()).a);
+}
+
+// D3 v0.20 接口方法调用：接口值是 Ref<隐藏 struct>（字段 0＝self，其后为各方法的函数值）。
+// 接收者先放 dst+1，取出方法函数值到 dst、self 覆盖 dst+1，实参自 dst+2 起，按闭包值调用。
+// 被调帧尺寸静态未知，同闭包调用登记调用点供帧窗口校正。
+function compileIfaceCall(e: int, dst: int, m: int): void {
+    const row = listGet(cgSv.stIfaceCall.vals, m) catch emptyIntList();
+    const fieldIdx = listGet(row, 0) catch 1;
+    let flag = 0;
+    if ((listGet(row, 1) catch 0) == 1) { flag = FLD_FLAG; }
+    const callee = callCalleeExpr(e);
+    const recv = ndChild(callee, 0);
+    const cargs = callArgs(e);
+    const n = listLen(cargs);
+    emUseReg(dst + 1);
+    compileExpr(recv, dst + 1, sExprType(recv));
+    emEmit(encABC(20, dst, dst + 1, fieldSel(flag, fieldIdx)));
+    emEmit(encABC(20, dst + 1, dst + 1, flag));
+    // 方法形参类型（值类型实参要 clone）：接收者类型 → 隐藏 struct → 字段函数类型 → 签名。
+    let rty = sExprType(recv);
+    if (kindOfSeb(rty) == 8) { rty = (listGet(cgSv.tys, rty) catch dummyCgTy()).a; }
+    const st = listGet(cgSv.structs, (listGet(cgSv.tys, rty) catch dummyCgTy()).a) catch dummyCgStruct();
+    const fty = (listGet(st.fields, fieldIdx) catch dummyCgField()).ty;
+    const sg = listGet(cgSv.sigs, (listGet(cgSv.tys, fty) catch dummyCgTy()).a) catch dummyCgSig();
+    let i = 0;
+    while (i < n) {
+        const a = listGet(cargs, i) catch -1;
+        const ar = dst + 2 + i;
+        emUseReg(ar);
+        const pty = listGet(sg.params, i + 1) catch sExprType(a);
+        compileExpr(a, ar, pty);
+        if (isValueTySeb(pty) == 1) { emEmit(encABC(24, ar, ar, 0)); }
+        i = i + 1;
+    }
+    emEmit(encABC(30, dst, n + 2, 1));
+    listPush(closureSites, emFnSelf);
+    listPush(closureSites, dst);
+}
+
+function compileCall(e: int, dst: int): void {
+    if (listLen(cgSv.stIfaceCall.keys) > 0) {
+        const icm = sideFind(cgSv.stIfaceCall, e);
+        if (icm >= 0) {
+            compileIfaceCall(e, dst, icm);
+            return;
+        }
+    }
+    const tag = sResTag(e);
+    const cargs = callArgs(e);
+    const ncargs = listLen(cargs);
+    if (tag == 4) { // extern_fn → callbi 宿主段（64+声明序；string 借用封送不 clone）
+        const xi = sResField(e, 1);
+        let i = 0;
+        while (i < ncargs) {
+            const a = listGet(cargs, i) catch -1;
+            const ar = dst + 1 + i;
+            emUseReg(ar);
+            compileExpr(a, ar, sExprType(a));
+            i = i + 1;
+        }
+        emEmit(encABC(31, dst, EXTERN_ID_BASE + xi, ncargs));
+        return;
+    }
+    if (tag == 3) { // builtin
+        const ord = sResField(e, 1);
+        if (ord == 29) { // imul 直发 IMUL opcode（64 位环绕）
+            const a0 = listGet(cargs, 0) catch -1;
+            const a1 = listGet(cargs, 1) catch -1;
+            const argBase = dst + 1;
+            emUseReg(argBase);
+            compileExpr(a0, argBase, sExprType(a0));
+            emUseReg(argBase + 1);
+            compileExpr(a1, argBase + 1, sExprType(a1));
+            emEmit(encABC(47, dst, argBase, argBase + 1));
+            return;
+        }
+        if (ord == 47) { compileEmbedBytes(cargs, dst); return; }
+        if (ord == 57 || ord == 58) {
+            // D3 v0.22 生成器：genNext 直发 gen_next（R[A] = genNext(R[B])）；#genClose（for-in 解糖的关闭动作）直发 gen_close。
+            const g0 = listGet(cargs, 0) catch -1;
+            const gb = dst + 1;
+            emUseReg(gb);
+            compileExpr(g0, gb, sExprType(g0));
+            if (ord == 57) {
+                emEmit(encABC(50, dst, gb, 0));
+            } else {
+                emEmit(encABC(51, gb, 0, 0));
+                emEmit(encABC(3, dst, 0, 0));
+            }
+            return;
+        }
+        if (ord == 63 || ord == 64) { // floatToBits / floatFromBits（D3 v0.23）：换标签、载荷不变（cvt 25/26）
+            const f0 = listGet(cargs, 0) catch -1;
+            compileExpr(f0, dst, sExprType(f0));
+            emCvt(dst, ord - 38);
+            return;
+        }
+        if (ord == 60 || ord == 61) { // handleBits / handleFromBits（D3 v0.23 FFI）：句柄即整数，恒等
+            const h0 = listGet(cargs, 0) catch -1;
+            compileExpr(h0, dst, sExprType(h0));
+            return;
+        }
+        if (ord == 59) { // wrapTo<T>(x)（O4）：截断到 T 的宽度；T 为 64 位时位不变
+            const w0 = listGet(cargs, 0) catch -1;
+            compileExpr(w0, dst, sExprType(w0));
+            const wc = fwCodeOf(sExprType(e));
+            if (wc >= 1 && wc <= 6) { emCvt(dst, wc + 7); }
+            return;
+        }
+        if (ord == 4 && ncargs == 1 && fwIsU64(fwCodeOf(sExprType(listGet(cargs, 0) catch -1)))) {
+            compileToStrU64(listGet(cargs, 0) catch -1, dst);
+            return;
+        }
+        if (ord == 4 && ncargs == 1 && fwCodeOf(sExprType(listGet(cargs, 0) catch -1)) == 10) {
+            // toStr(f32)（O4 第二步）：按 f32 的最短往返表示，内核例程 BuiltinId 70。
+            const f0 = listGet(cargs, 0) catch -1;
+            emUseReg(dst + 1);
+            compileExpr(f0, dst + 1, sExprType(f0));
+            emEmit(encABC(31, dst, 70, 1));
+            return;
+        }
+        if (ord >= 74 && ord <= 76) {
+            // wrapAdd/wrapSub/wrapMul<T>（O4 第二步）：按 T 的宽度环绕；wrapMul<int> 即 imul。
+            const w0 = listGet(cargs, 0) catch -1;
+            const w1 = listGet(cargs, 1) catch -1;
+            compileExpr(w0, dst, sExprType(w0));
+            emUseReg(dst + 1);
+            compileExpr(w1, dst + 1, sExprType(w1));
+            const wt = fwCodeOf(sExprType(e));
+            if (wt == 11 && ord == 76) { emEmit(encABC(47, dst, dst, dst + 1)); return; }
+            emEmit(encABC(fwOpCode(wt, FW_WADD + ord - 74), dst, dst, dst + 1));
+            return;
+        }
+        if (ord == 48) { compileErrAs(e, cargs, dst); return; }
+        if (ord == 10) {
+            // O4 第二步：List<i8..u32/f32> 建紧凑列表——种类码作 listNew 的实参（运行期 form 3）。
+            const lk = listCompactKind(sExprType(e));
+            if (lk > 0) {
+                emUseReg(dst + 1);
+                emEmit(encABx(1, dst + 1, emKInt(lk)));
+                emEmit(encABC(31, dst, 13, 1));
+                return;
+            }
+        }
+        if (ord >= 82 && ord <= 85) {
+            // D3 v0.37 bytesGetLE/BE、bytesSetLE/BE<T>（LANG-32）：T 的种类码作末个实参（编码见 nrt_bytes.tx 的 emitBytesBulk）。
+            // 读的 T 取自结果类型 T?，写的 T 取自值（语义检查保证值的类型正是 T）。
+            let nty = sExprType(listGet(cargs, 2) catch -1);
+            if (ord <= 83) { nty = (listGet(cgSv.tys, sExprType(e)) catch dummyCgTy()).a; }
+            let nk = bytesNumKind(fwCodeOf(nty));
+            if (ord == 83 || ord == 85) { nk = nk + 64; }
+            let ni = 0;
+            while (ni < ncargs) {
+                const a = listGet(cargs, ni) catch -1;
+                emUseReg(dst + 1 + ni);
+                compileExpr(a, dst + 1 + ni, sExprType(a));
+                ni = ni + 1;
+            }
+            emUseReg(dst + 1 + ncargs);
+            emEmit(encABx(1, dst + 1 + ncargs, emKInt(nk)));
+            emEmit(encABC(31, dst, builtinBcId(ord), ncargs + 1));
+            return;
+        }
+        let biId = builtinBcId(ord);
+        // O4 第二步 2c1b：紧凑列表的 listGet/listSet/listLen 发 71..73（运行期同 16..18，发射器单设内联臂）。
+        if ((ord == 13 || ord == 14 || ord == 15) && ncargs > 0 && listCompactKind(sExprType(listGet(cargs, 0) catch -1)) > 0) { biId = 71 + ord - 13; }
+        // D3 v0.20 List 值类型元素：listPush/listSet/listInsert 存入拷贝，listGet 取出拷贝。
+        let cloneArg = -1;
+        if (ord == 11) { cloneArg = 1; } else if (ord == 14 || ord == 25) { cloneArg = 2; }
+        let i = 0;
+        while (i < ncargs) {
+            const a = listGet(cargs, i) catch -1;
+            const ar = dst + 1 + i;
+            emUseReg(ar);
+            compileExpr(a, ar, sExprType(a));
+            if (i == cloneArg && isValueTySeb(sExprType(a)) == 1) { emEmit(encABC(24, ar, ar, 0)); }
+            i = i + 1;
+        }
+        emEmit(encABC(31, dst, biId, ncargs));
+        if (isToolBi(biId)) { cgToolUsed = true; }
+        if (biId == 22) { emCancelLanding(dst); emDbg(DBG_RESUME, dst + 1); } // taskAwaitAny：挂起点
+        if (ord == 13 && ncargs > 0 && listElemIsValue(listGet(cargs, 0) catch -1) == 1) { emEmit(encABC(24, dst, dst, 0)); }
+        return;
+    }
+    if (sVariantTag(e) >= 0) { // 变体构造（值语义——newenum＋逐字段 clone/setfld）
+        const ei = declIndexEnum(cgSv, sVariantEnum(e));
+        const vi = sVariantIdx(e);
+        const vty = emKVariant(ei, vi);
+        emEmit(encABx(26, dst, vty));
+        const arg = dst + 1;
+        emUseReg(arg);
+        const fields = variantOf(ei, vi);
+        let i = 0;
+        while (i < ncargs) {
+            if (i >= listLen(fields)) { break; }
+            const a = listGet(cargs, i) catch -1;
+            const fty = listGet(fields, i) catch 0;
+            compileExpr(a, arg, fty);
+            if (isValueTySeb(fty) == 1) { emEmit(encABC(24, arg, arg, 0)); }
+            emEmit(encABC(21, arg, dst, fieldSel(0, i)));
+            i = i + 1;
+        }
+        emErrWrapIf(e, vi, dst);
+        return;
+    }
+    if (tag == 2) { // 具名函数调用（实参型按签名表＋值类型 clone）
+        const fidx = sResField(e, 1);
+        emEmit(encABx(1, dst, emKFnRef(fidx)));
+        const callee = listGet(cgSv.fnTable, fidx) catch dummyCgFn();
+        const nparams = listLen(callee.paramTys);
+        let i = 0;
+        while (i < ncargs) {
+            const a = listGet(cargs, i) catch -1;
+            const ar = dst + 1 + i;
+            emUseReg(ar);
+            if (i < nparams) {
+                const pty = listGet(callee.paramTys, i) catch 0;
+                compileExpr(a, ar, pty);
+                if (isValueTySeb(pty) == 1) { emEmit(encABC(24, ar, ar, 0)); }
+            } else {
+                compileExpr(a, ar, sExprType(a));
+            }
+            i = i + 1;
+        }
+        if (callee.isAsync == 1) {
+            emEmit(encABC(38, dst, ncargs + 1, 1)); // async_start
+        } else {
+            emEmit(encABC(30, dst, ncargs + 1, 1)); // call
+        }
+        return;
+    }
+    // 闭包直调（callee 表达式类型为 fn——SEB1 kind 15；调用点登记供 4.5 窗口校正）。
+    const calleeExpr = callCalleeExpr(e);
+    const calleeTy = sExprType(calleeExpr);
+    if (kindOfSeb(calleeTy) == 15) {
+        compileExpr(calleeExpr, dst, calleeTy);
+        const ct = listGet(cgSv.tys, calleeTy) catch dummyCgTy();
+        const sg = listGet(cgSv.sigs, ct.a) catch dummyCgSig();
+        let i = 0;
+        while (i < ncargs) {
+            const a = listGet(cargs, i) catch -1;
+            const ar = dst + 1 + i;
+            emUseReg(ar);
+            // 实参 clone 按被调签参数面（zig :1225 同构——值形参须 clone；
+            // gui/events 族 CLONE 缺失活捉）。
+            if (i < listLen(sg.params)) {
+                const pty = listGet(sg.params, i) catch 0;
+                compileExpr(a, ar, pty);
+                if (isValueTySeb(pty) == 1) { emEmit(encABC(24, ar, ar, 0)); }
+            } else {
+                compileExpr(a, ar, sExprType(a));
+            }
+            i = i + 1;
+        }
+        if (sg.isAsync == 1) {
+            emEmit(encABC(38, dst, ncargs + 1, 1));
+        } else {
+            emEmit(encABC(30, dst, ncargs + 1, 1));
+        }
+        listPush(closureSites, emFnSelf);
+        listPush(closureSites, dst);
+        return;
+    }
+    emEmit(encABC(3, dst, 0, 0)); // 兜底（sema 已拒面）
+}
+
+// D3 v0.19 错误 enum：SEB1 类型池 kind 19 → enum 池号；否则 -1。
+function errEnumPoolOf(tyIdx: int): int {
+    if (kindOfSeb(tyIdx) != 19) { return -1; }
+    return (listGet(cgSv.tys, tyIdx) catch dummyCgTy()).a;
+}
+
+// 以下 D3 v0.19 发射点独立成函数：compileExpr/compileCall 已很大，原地展开会把
+// 原生发射推过既有的大函数性能悬崖（见第 2 轮设计稿 §十）。
+
+// 表达式 e 为错误 enum 时，把 dst 中刚构造的变体值包成富 Error 对象。
+function emErrWrapIf(e: int, vi: int, dst: int): void {
+    const pool = errEnumPoolOf(sExprType(e));
+    if (pool >= 0) { emErrWrap(pool, vi, dst); }
+}
+
+// dst ← 内建 id(x)（x 编译到 dst+1）：errPayload 51／errCause 52。
+function compileErrUnary(x: int, id: int, dst: int): void {
+    emUseReg(dst + 1);
+    compileExpr(x, dst + 1, sExprType(x));
+    emEmit(encABC(31, dst, id, 1));
+}
+
+// 错误 enum 的 ==/!=：按变体载荷比较（Error 仍按 message）。非错误 enum 返回 false 交回原路径。
+function compileErrEq(opId: int, lhsE: int, rhsE: int, dst: int): bool {
+    if (errEnumPoolOf(sExprType(lhsE)) < 0) { return false; }
+    emUseReg(dst + 2);
+    compileErrUnary(lhsE, 51, dst);
+    compileErrUnary(rhsE, 51, dst + 1);
+    emEmit(encABC(binOpBc(opId), dst, dst, dst + 1));
+    if (opId == 6) { emEmit(encABC(11, dst, dst, 0)); }
+    return true;
+}
+
+// errAs<E>(e)：第二实参＝E 的类型号（SEB1 enum 池号）。
+function compileErrAs(e: int, cargs: List<int>, dst: int): void {
+    const a0 = listGet(cargs, 0) catch -1;
+    emUseReg(dst + 2);
+    compileExpr(a0, dst + 1, sExprType(a0));
+    const optTy = listGet(cgSv.tys, sExprType(e)) catch dummyCgTy();
+    emEmit(encABx(1, dst + 2, emKInt(errEnumPoolOf(optTy.a))));
+    emEmit(encABC(31, dst, 48, 2));
+}
+
+// dst 中刚构造的错误 enum 变体值包成富 Error 对象：errRich(消息, 种类名, 类型号, 载荷, 原因)。
+// 消息按片段求出（字面量／字段经 toStr），多片段经 strConcat 合并；实参窗 dst+1..dst+5。
+function emErrWrap(pool: int, vi: int, dst: int): void {
+    const en = listGet(cgSv.enums, pool) catch dummyCgEnum();
+    const v = listGet(en.variants, vi) catch dummyCgVariant();
+    const base = dst + 1;
+    const nseg = listLen(v.segF);
+    let top = base + 4;
+    if (base + nseg + 1 > top) { top = base + nseg + 1; }
+    emUseReg(top);
+    if (nseg == 0) {
+        emEmit(encABx(1, base, emKStr(cgIntern(""))));
+    } else {
+        let i = 0;
+        while (i < nseg) {
+            const r = base + 1 + i;
+            const fsel = listGet(v.segF, i) catch -1;
+            if (fsel < 0) {
+                emEmit(encABx(1, r, emKStr(cgIntern(cgStrLitValue(listGet(v.segS, i) catch "\"\"")))));
+            } else {
+                emEmit(encABC(20, r + 1, dst, fieldSel(0, fsel))); // 字段
+                emEmit(encABC(31, r, 5, 1)); // toStr
+            }
+            i = i + 1;
+        }
+        emEmit(encABC(31, base, 19, nseg)); // strConcat
+    }
+    emEmit(encABx(1, base + 1, emKStr(cgIntern(v.kname))));
+    emEmit(encABx(1, base + 2, emKInt(pool)));
+    emEmit(encABC(4, base + 3, dst, 0)); // 载荷（move＝复制引用）
+    if (v.cause >= 0) {
+        emEmit(encABC(20, base + 4, dst, fieldSel(0, v.cause)));
+    } else {
+        emEmit(encABC(3, base + 4, 0, 0));
+    }
+    emEmit(encABC(31, dst, 50, 5)); // errRich
+}
+
+// enum 变体的字段类型列（SEB1 enums 反查——declIdx+1 → seb idx 线性回扫）。
+function variantOf(declIdx: int, vi: int): List<int> {
+    const out: List<int> = listNew();
+    const isEnum = listGet(declIsEnum, declIdx) catch 0;
+    if (isEnum != 1) { return out; }
+    const vnames = listGet(declVariantNames, declIdx) catch emptyIntList();
+    if (vi >= listLen(vnames)) { return out; }
+    const vnameIdx = listGet(vnames, vi) catch 0;
+    const vname = listGet(cgStrings, vnameIdx) catch "";
+    let si = 0;
+    while (si + 1 < listLen(enumDeclMemo)) {
+        if ((listGet(enumDeclMemo, si + 1) catch 0) == declIdx + 1) {
+            const en = listGet(cgSv.enums, listGet(enumDeclMemo, si) catch 0) catch dummyCgEnum();
+            let k = 0;
+            while (k < listLen(en.variants)) {
+                const v = listGet(en.variants, k) catch dummyCgVariant();
+                if (v.name == vname) {
+                    let f = 0;
+                    while (f < listLen(v.fields)) {
+                        listPush(out, (listGet(v.fields, f) catch dummyCgField()).ty);
+                        f = f + 1;
+                    }
+                    return out;
+                }
+                k = k + 1;
+            }
+            return out;
+        }
+        si = si + 2;
+    }
+    return out;
+}
+
+function emitAssign(s: int): void {
+    const target = ndChild(s, 0);
+    const value = ndChild(s, 1);
+    const valTy = sExprType(value);
+    const tk = ndKind(target);
+    if (tk == 31) { // ident——local move / global setfld
+        const tag = sResTag(target);
+        const t = emTempBase();
+        emUseReg(t);
+        compileExpr(value, t, valTy);
+        if (isValueTySeb(valTy) == 1) { emEmit(encABC(24, t, t, 0)); }
+        if (tag == 0) {
+            emEmit(encABC(4, sResField(target, 1), t, 0));
+        } else if (tag == 1) {
+            const gs = sResField(target, 2);
+            emEmit(encABC(21, t, emGlobalBase, fieldSel(FLD_FLAG, gs)));
+        }
+    } else if (tk == 36) { // field——基座＝目标 .base 子（zig loadLvalueBase(field.base)）
+        const base = emTempBase();
+        emUseReg(base);
+        const baseReg = loadLvalueBase(ndChild(target, 0), base);
+        const v = base + 1;
+        emUseReg(v);
+        compileExpr(value, v, valTy);
+        if (isValueTySeb(valTy) == 1) { emEmit(encABC(24, v, v, 0)); }
+        const c = fieldSel(sFieldAuto(target) * FLD_FLAG, sFieldIdx(target));
+        emEmit(encABC(21, v, baseReg, c));
+    } else if (tk == 35) { // index——基座＝目标 .base 子；idxR/v 依次 +1/+2
+        const base = emTempBase();
+        emUseReg(base);
+        const baseReg = loadLvalueBase(ndChild(target, 0), base);
+        const idxR = base + 1;
+        const v = base + 2;
+        emUseReg(v);
+        compileExpr(ndChild(target, 1), idxR, sExprType(ndChild(target, 1)));
+        compileExpr(value, v, valTy);
+        if (isValueTySeb(valTy) == 1) { emEmit(encABC(24, v, v, 0)); }
+        emEmit(encABC(23, v, baseReg, idxR));
+    }
+}
+
+// 装载左值基座链；返回持有目标容器的寄存器（ident/field/index 链）。
+function loadLvalueBase(e: int, dst: int): int {
+    const k = ndKind(e);
+    if (k == 31) {
+        const tag = sResTag(e);
+        if (tag == 0) {
+            const slot = sResField(e, 1);
+            emUseReg(slot);
+            return slot;
+        }
+        if (tag == 1) {
+            const gm = sResField(e, 1);
+            const gs = sResField(e, 2);
+            if (gm == emFnModuleSelf) {
+                emEmit(encABC(20, dst, emGlobalBase, fieldSel(FLD_FLAG, gs)));
+                return dst;
+            }
+            emEmit(encABx(1, dst, emKFnRef(accessorFn(gm, gs))));
+            emEmit(encABC(30, dst, 1, 1));
+            return dst;
+        }
+        return dst;
+    }
+    if (k == 36) {
+        const base = dst + 1;
+        emUseReg(base);
+        const baseReg = loadLvalueBase(ndChild(e, 0), base);
+        const c = fieldSel(sFieldAuto(e) * FLD_FLAG, sFieldIdx(e));
+        emEmit(encABC(20, dst, baseReg, c));
+        return dst;
+    }
+    if (k == 35) {
+        const base = dst + 1;
+        const idxR = dst + 2;
+        emUseReg(idxR);
+        const baseReg = loadLvalueBase(ndChild(e, 0), base);
+        compileExpr(ndChild(e, 1), idxR, sExprType(ndChild(e, 1)));
+        emEmit(encABC(22, dst, baseReg, idxR));
+        return dst;
+    }
+    return dst;
+}
+
+function compileCatch(e: int, dst: int): void {
+    const operand = ndChild(e, 0);
+    const handlerSlot = ndChildLast(e);
+    const ity = sExprType(operand);
+    compileExpr(operand, dst, ity);
+    const t = dst + 1;
+    emUseReg(t);
+    let testOp = 19; // isnone
+    if (kindOfSeb(ity) == 7) { testOp = 18; } // errunion→iserr
+    const hasBinding = ndIntVal(e);
+    const handlerInner = ndChild(handlerSlot, 0);
+    if (ndKind(handlerInner) != 4) { // default expr
+        emEmit(encABC(testOp, t, dst, 0));
+        const jfail = emHere();
+        emEmit(encAsBx(16, t, 0)); // jt 失败→处理支
+        const jend = emHere();
+        emEmit(encAsBx(15, 0, 0)); // 成功→直落保成功值
+        emPatchJump(jfail, emHere());
+        compileExpr(handlerInner, dst, sExprType(handlerInner));
+        emPatchJump(jend, emHere());
+    } else { // block 处理支（发散）
+        emEmit(encABC(testOp, t, dst, 0));
+        const jhandler = emHere();
+        emEmit(encAsBx(16, t, 0));
+        const jok = emHere();
+        emEmit(encAsBx(15, 0, 0));
+        emPatchJump(jhandler, emHere());
+        if (hasBinding == 1) {
+            emEmit(encABC(4, sCatchBind(e), dst, 0)); // 绑定持有 Error 值本身
+        }
+        const hstart = emHere();
+        emBlock(handlerInner);
+        if (cgDebug && hasBinding == 1) { dvRange(sCatchBind(e), ndName(e), dbgTyOf(DBG_KEY_CATCH + e), hstart, emHere()); }
+        emEmit(encABC(3, dst, 0, 0)); // 块未发散→None 占位
+        emPatchJump(jok, emHere());
+    }
+}
+
+// struct_lit 的 TXC 类型索引（stStructLit row[0]＝SEB1 struct → declIndex→
+// tyIndex(12, decl)——zig flattenTy(.struct_t) 同构）。
+function compileStructTy(e: int): int {
+    const m = sideFind(cgSv.stStructLit, e);
+    if (m >= 0) {
+        const row = listGet(cgSv.stStructLit.vals, m) catch emptyIntList();
+        const sebStructIdx = listGet(row, 0) catch 0;
+        return tyIndex(12, declIndexStruct(cgSv, sebStructIdx), 0);
+    }
+    return 0;
+}
+
+function compileStructLit(e: int, dst: int, asRef: int): void {
+    const tyIdx = compileStructTy(e);
+    const kc = emKTy(tyIdx);
+    if (asRef == 1) { emEmit(encABx(27, dst, kc)); } else { emEmit(encABx(25, dst, kc)); }
+    const v = dst + 1;
+    emUseReg(v);
+    const start = countTyargs(e);
+    const nf = sStructLitN(e);
+    let fi = 0;
+    while (fi < nf) {
+        const finit = ndChild(e, start + fi);
+        const valExpr = ndChild(finit, 0);
+        const fieldIdx = sStructLitField(e, fi);
+        compileExpr(valExpr, v, sExprType(valExpr));
+        if (isValueTySeb(sExprType(valExpr)) == 1) { emEmit(encABC(24, v, v, 0)); }
+        emEmit(encABC(21, v, dst, fieldSel(0, fieldIdx)));
+        fi = fi + 1;
+    }
+}
+
+function countTyargs(e: int): int {
+    if (ndChildCount(e) > 0 && ndKind(ndChild(e, 0)) == 63) { return 1; }
+    return 0;
+}
+
+// 调试构建（第 6 轮 6c-4a）：DBG1 的键（与 semamirror 相同）与变量表的登记。
+const DBG_KEY_CATCH: int = 288230376151711744;
+const DBG_KEY_ARM: int = 576460752303423488;
+
+// 绑定键在 DBG1 里的类型池号（−1 为未知）。
+function dbgTyOf(key: int): int {
+    return sideGet1(cgSv.stDbgTy, key) - 1;
+}
+
+// switch 臂的绑定：名字取臂的 patf 子节点（与 arm_res 的绑定同序），覆盖该臂。
+function dbgArmVars(arm: int, nb: int, start: int, end: int): void {
+    let k = 0;
+    let ci = 0;
+    const nc = ndChildCount(arm);
+    while (ci < nc && k < nb) {
+        const c = ndChild(arm, ci);
+        if (ndKind(c) == 48) {
+            dvRange(sArmBindSlot(arm, k), ndName(c), dbgTyOf(DBG_KEY_ARM + arm * 65536 + k), start, end);
+            k = k + 1;
+        }
+        ci = ci + 1;
+    }
+}
+
+// 参数（槽 1..n，名字取函数声明的 param 子节点）与闭包捕获（closure_res 的槽、类型与名字）覆盖整个函数。
+function dbgParamVars(f: Ref<CgFn>, arrowM: int): void {
+    let j = 0;
+    let ci = 0;
+    const nc = ndChildCount(f.declKey);
+    while (ci < nc && j < listLen(f.paramTys)) {
+        const c = ndChild(f.declKey, ci);
+        if (ndKind(c) == 2) {
+            dvWhole(1 + j, ndName(c), listGet(f.paramTys, j) catch -1);
+            j = j + 1;
+        }
+        ci = ci + 1;
+    }
+    if (arrowM < 0) { return; }
+    const arrowKey = listGet(listGet(cgSv.stClosureMeta.vals, arrowM) catch emptyIntList(), 0) catch 0;
+    const sm = sideFind(cgSv.stClosureRes, arrowKey);
+    if (sm < 0) { return; }
+    const row = listGet(cgSv.stClosureRes.vals, sm) catch emptyIntList();
+    const names = listGet(closureCapNames, sm) catch emptyStrList();
+    const ncaps = listGet(row, 2) catch 0;
+    let tok = 3;
+    let i = 0;
+    while (i < ncaps) {
+        dvWhole(listGet(row, tok + 1) catch 0, listGet(names, i) catch "", listGet(row, tok) catch -1);
+        const src = listGet(row, tok + 2) catch 0;
+        tok = tok + 3;
+        if (src == 0) { tok = tok + 1; }
+        else if (src == 1) { tok = tok + 2; }
+        i = i + 1;
+    }
+}
+
+// SEB1 类型池与 sema 的拼写交给变量表（类型号即池号）。
+function dbgTypes(sv: Ref<SemaView>): void {
+    const tk: List<int> = listNew();
+    const ta: List<int> = listNew();
+    const tb: List<int> = listNew();
+    let i = 0;
+    while (i < listLen(sv.tys)) {
+        const t = listGet(sv.tys, i) catch dummyCgTy();
+        listPush(tk, t.kind);
+        listPush(ta, t.a);
+        listPush(tb, t.b);
+        i = i + 1;
+    }
+    dvSetTypes(tk, ta, tb, sv.dbgTyNames);
+}
+
+function compileSwitch(e: int, dst: int): void {
+    const scrutinee = ndChild(e, 0);
+    const scrutTy = sExprType(scrutinee);
+    if (errEnumPoolOf(scrutTy) >= 0) { // D3 v0.19：错误 enum 先取出变体载荷再分派
+        compileErrUnary(scrutinee, 51, dst);
+    } else {
+        compileExpr(scrutinee, dst, scrutTy);
+    }
+    const scrutIsRef = kindOfSeb(scrutTy) == 8; // SEB1 ref
+    const eiSeb = sSwitchEnum(e);
+    const en = listGet(cgSv.enums, eiSeb) catch dummyCgEnum();
+    const nVariants = listLen(en.variants);
+    const tblConst = emKJumpTable(emptyIntList()); // 占位——臂发射后回填
+    emEmit(encABx(35, dst, tblConst));
+    const armPcs: List<int> = listNew();
+    let i = 0;
+    while (i <= nVariants) { listPush(armPcs, 0); i = i + 1; }
+    const jends: List<int> = listNew();
+    const narms = ndChildCount(e) - 1;
+    let ai = 0;
+    while (ai < narms) {
+        const arm = ndChild(e, 1 + ai);
+        emPosLine = ndLine(arm);
+        emPosCol = ndCol(arm);
+        const armPc = emHere();
+        const hasVi = sArmHasVi(arm);
+        if (hasVi == 1) {
+            listSet(armPcs, sArmVi(arm), armPc);
+        } else {
+            listSet(armPcs, nVariants, armPc);
+        }
+        // 绑定装载：flag＝scrut ref 时置 0x8000 自动解引用位；字段序＝变体字段。
+        const nb = sArmNb(arm);
+        let bi = 0;
+        while (bi < nb) {
+            let c = 0;
+            if (scrutIsRef) { c = FLD_FLAG; }
+            if (hasVi == 1) { c = fieldSel(c, bi); }
+            emEmit(encABC(20, sArmBindSlot(arm, bi), dst, c));
+            bi = bi + 1;
+        }
+        const astart = emHere();
+        const bodyExpr = ndChildLast(arm);
+        compileExpr(bodyExpr, dst, sExprType(bodyExpr));
+        if (cgDebug) { dbgArmVars(arm, nb, astart, emHere()); }
+        listPush(jends, emHere());
+        emEmit(encAsBx(15, 0, 0));
+        ai = ai + 1;
+    }
+    const endPc = emHere();
+    emPatchJumpToHere(jends);
+    // 未显式列出变体 → else 臂/末尾防御位；穷尽性由 sema 保证。
+    if ((listGet(armPcs, nVariants) catch 0) == 0) { listSet(armPcs, nVariants, endPc); }
+    let vi = 0;
+    while (vi < nVariants) {
+        if ((listGet(armPcs, vi) catch 0) == 0) { listSet(armPcs, vi, listGet(armPcs, nVariants) catch endPc); }
+        vi = vi + 1;
+    }
+    listSet(emConstsTbl, tblConst, armPcs);
+}
+
+// 闭包创建点（D25 §四）：newref env→loadk fn_ref→setfld f0→全局基座 setfld f1
+// →逐捕获取值（值类型 clone）＋setfld。
+function compileClosure(e: int, dst: int): void {
+    const fnIdx = sClosureFn(e);
+    const tyIdx = envTyIdx(cgSv, e, emFnModuleSelf);
+    const kc = emKTy(tyIdx);
+    emEmit(encABx(27, dst, kc)); // newref env
+    const tmp = dst + 1;
+    emUseReg(tmp);
+    emEmit(encABx(1, tmp, emKFnRef(fnIdx))); // f0＝闭包体函数
+    emEmit(encABC(21, tmp, dst, 0));
+    emEmit(encABC(4, tmp, emGlobalBase, 0)); // f1＝定义模块状态引用
+    emEmit(encABC(21, tmp, dst, 1));
+    const row = sClosureRow(e);
+    const ncaps = sClosureN(e);
+    let tok = 3;
+    let i = 0;
+    while (i < ncaps) {
+        const cty = listGet(row, tok) catch 0;
+        const slot = listGet(row, tok + 1) catch 0;
+        const src = listGet(row, tok + 2) catch 0;
+        tok = tok + 3;
+        if (src == 0) { // local——句柄复制/值 clone（源＝src 载荷定义帧槽；
+            // cap.slot 是闭包体侧序言槽——两槽在 sema 分配序中不同）。
+            const ls = listGet(row, tok) catch 0;
+            emEmit(encABC(4, tmp, ls, 0));
+        } else if (src == 1) { // global
+            const gs = listGet(row, tok + 1) catch 0;
+            emEmit(encABC(20, tmp, emGlobalBase, fieldSel(FLD_FLAG, gs)));
+        }
+        if (src == 0) { tok = tok + 1; }
+        else if (src == 1) { tok = tok + 2; }
+        if (isValueTySeb(cty) == 1) { emEmit(encABC(24, tmp, tmp, 0)); }
+        emEmit(encABC(21, tmp, dst, fieldSel(0, 2 + i)));
+        i = i + 1;
+    }
+}
+
+// ============================================================================
+// §7 generate 六步（codegen.zig generate :57-244 同构；输出写 §5 表）
+// ============================================================================
+
+// codegen 会话重置（多次编译隔离）。
+function cgSessionReset(): void {
+    cgToolUsed = false;
+    dvReset();
+    cgStrings = listNew();
+    cgRawStrings = listNew();
+    cgTysK = listNew();
+    cgTysA = listNew();
+    cgTysB = listNew();
+    cgStrHead = listNew();
+    cgStrNext = listNew();
+    cgTyHead = listNew();
+    cgTyNext = listNew();
+    declMods = listNew();
+    declNameIdx = listNew();
+    declIsEnum = listNew();
+    declFieldNames = listNew();
+    declFieldTys = listNew();
+    declVariantNames = listNew();
+    declVarFNames = listNew();
+    declVarFTys = listNew();
+    declVarFCnt = listNew();
+    fnSigDescs = listNew();
+    listClear(accMemoK);
+    listClear(accMemoV);
+    listClear(envMemoK);
+    listClear(envMemoV);
+    listClear(sigMemoK);
+    listClear(sigMemoV);
+    listClear(stateMemoK);
+    listClear(stateMemoV);
+    listClear(structDeclMemo);
+    listClear(enumDeclMemo);
+    listClear(flatMemoK);
+    listClear(flatMemoV);
+    listClear(closureSites);
+    listClearLLS(closureCapNames);
+    fnNameIdx = listNew();
+    fnModule = listNew();
+    fnReg = listNew();
+    fnNparams = listNew();
+    fnCode = listNew();
+    fnConstsK = listNew();
+    fnConstsI = listNew();
+    fnConstsTbl = listNew();
+    fnConstsTblLen = listNew();
+    fnLinesL = listNew();
+    fnLinesC = listNew();
+    fnPtys = listNew();
+    fnRet = listNew();
+    fnLandings = listNew();
+    modOutPath = listNew();
+    modOutState = listNew();
+    modOutInit = listNew();
+    testOutName = listNew();
+    testOutFunc = listNew();
+    extNames = listNew();
+    extTags = listNew();
+    extRets = listNew();
+    cgFfiLibs = listNew();
+    cgFfiExt = listNew();
+    cgFfiLay = listNew();
+    cgFfiCb = listNew();
+    cgFfiCbFn = listNew();
+    cgSendBad = listNew();
+    cgShareBad = listNew();
+    listClearLL(modSortIds);
+    listClearLL(modSortIdx);
+    nodeSorted = 0;
+    cgEntry = -1;
+}
+
+// SEB1 kind → extern 封送 tag（sema externTagOf 同构——void 亦映射 5）。
+function externTagOfSeb(tySeb: int): int {
+    // 池索引先解 kind（gui 族活捉：池序非恒等——string 池 idx 9 误落 float
+    // tag 2；zig externTagOf＝kind 面 int1/float2/bool3/str4/void5）。
+    const k = kindOfSeb(tySeb);
+    if (k == 0) { return 1; }
+    if (k == 1) { return 2; }
+    if (k == 2) { return 3; }
+    if (k == 3) { return 4; }
+    return 5;
+}
+
+// finishAt：发射状态写回 §5 fn 表＋寄存器自愈（:520-576 同构）。
+function emFinishAt(idx: int): void {
+    const scanMax = emFinishScanMax();
+    // 单函数寄存器上限：指令里引用到的寄存器号不得超过 65534（C3b）。
+    if (scanMax > CG_MAX_OPERAND_REG && len(cgOperandError) == 0) {
+        cgOperandError = emModuleName + ":" + toStr(emPosLine) + ":" + toStr(emPosCol) + ": error 3101: 单函数寄存器超过 65535 个（局部槽、临时槽或调用参数过多），请拆分函数或表达式";
+    }
+    let regCount = emMaxReg;
+    if (scanMax + 1 > regCount) { regCount = scanMax + 1; }
+    const codeCopy: List<int> = listNew();
+    let i = 0;
+    while (i < listLen(emCode)) { listPush(codeCopy, listGet(emCode, i) catch 0); i = i + 1; }
+    const ck: List<int> = listNew();
+    const cii: List<int> = listNew();
+    const ctflat: List<int> = listNew();
+    const ctlens: List<int> = listNew();
+    i = 0;
+    while (i < listLen(emConstsK)) {
+        listPush(ck, listGet(emConstsK, i) catch 0);
+        listPush(cii, listGet(emConstsI, i) catch 0);
+        const srcTbl = listGet(emConstsTbl, i) catch emptyIntList();
+        listPush(ctlens, listLen(srcTbl));
+        let j = 0;
+        while (j < listLen(srcTbl)) { listPush(ctflat, listGet(srcTbl, j) catch 0); j = j + 1; }
+        i = i + 1;
+    }
+    const ll: List<int> = listNew();
+    const lc: List<int> = listNew();
+    i = 0;
+    while (i < listLen(emLinesL)) { listPush(ll, listGet(emLinesL, i) catch 0); listPush(lc, listGet(emLinesC, i) catch 0); i = i + 1; }
+    const lands: List<int> = listNew();
+    i = 0;
+    while (i < listLen(emLandings)) { listPush(lands, listGet(emLandings, i) catch 0); i = i + 1; }
+    if (idx == listLen(fnNameIdx)) {
+        listPush(fnNameIdx, cgIntern(emModuleName));
+        listPush(fnModule, emFnModuleSelf);
+        listPush(fnReg, regCount);
+        listPush(fnNparams, emNparams);
+        listPush(fnCode, codeCopy);
+        listPush(fnConstsK, ck);
+        listPush(fnConstsI, cii);
+        listPush(fnConstsTbl, ctflat);
+        listPush(fnConstsTblLen, ctlens);
+        listPush(fnLinesL, ll);
+        listPush(fnLinesC, lc);
+        listPush(fnPtys, emptyIntList());
+        listPush(fnRet, 4294967295);
+        listPush(fnLandings, lands);
+    } else {
+        listSet(fnCode, idx, codeCopy);
+        listSet(fnConstsK, idx, ck);
+        listSet(fnConstsI, idx, cii);
+        listSet(fnConstsTbl, idx, ctflat);
+        listSet(fnConstsTblLen, idx, ctlens);
+        listSet(fnLinesL, idx, ll);
+        listSet(fnLinesC, idx, lc);
+        listSet(fnReg, idx, regCount);
+        listSet(fnLandings, idx, lands);
+    }
+    if (cgDebug) { dvFnFinish(idx, listLen(emCode)); }
+}
+
+// 帧尺寸上界：闭包值调用链校正后若有函数帧超过 65535 槽，按 3101 拒绝，
+// 不把异常帧交给原生发射（其分析按“指令数×帧槽数”分配，会耗尽内存而不是报错）。
+const CG_MAX_FRAME: int = 65535;
+
+function checkFrameSizes(): void {
+    let i = 0;
+    while (i < listLen(fnReg)) {
+        if ((listGet(fnReg, i) catch 0) > CG_MAX_FRAME && len(cgOperandError) == 0) {
+            const fname = listGet(cgStrings, listGet(fnNameIdx, i) catch 0) catch "?";
+            cgOperandError = "error 3101: 函数 " + fname + " 的帧超过 " + toStr(CG_MAX_FRAME) + " 槽（闭包值调用链过深），请拆分函数";
+        }
+        i = i + 1;
+    }
+}
+
+// 闭包体序言（D25 §3.3）：捕获槽←R0.f(2+i)（k 条）＋全局基座槽←R0.f1。
+// SEB1 closure_res 无 base_slot 域——基座槽＝捕获槽后下一个持久槽（sema
+// 分配序：捕获/基座先于体绑定）。
+function emitClosurePrologue(arrowKey: int): void {
+    const sm = sideFind(cgSv.stClosureRes, arrowKey);
+    if (sm < 0) { return; }
+    const row = listGet(cgSv.stClosureRes.vals, sm) catch emptyIntList();
+    const ncaps = listGet(row, 2) catch 0;
+    let tok = 3;
+    let lastCap = 0;
+    let i = 0;
+    while (i < ncaps) {
+        const capSlot = listGet(row, tok + 1) catch 0;
+        emUseReg(capSlot);
+        emEmit(encABC(20, capSlot, 0, fieldSel(FLD_FLAG, 2 + i)));
+        if (capSlot > lastCap) { lastCap = capSlot; }
+        const src = listGet(row, tok + 2) catch 0;
+        tok = tok + 3;
+        if (src == 0) { tok = tok + 1; }
+        else if (src == 1) { tok = tok + 2; }
+        i = i + 1;
+    }
+    // 基座槽＝sig 参数数＋1（sema_loader :2025 重构同构——非 lastCap＋1：
+    // 捕获槽与基座槽同为 sema allocSlot 序，捕获可达参数区之后任意槽，
+    // lastCap＋1 在多捕获面错位——closure-basic 活捉 base 4≠oracle 2）。
+    const baseSlot = emNparams + 1;
+    emUseReg(baseSlot);
+    emEmit(encABC(20, baseSlot, 0, fieldSel(FLD_FLAG, 1)));
+    emGlobalBase = baseSlot;
+}
+
+function cgIsGenFn(sv: Ref<SemaView>, fi: int): bool {
+    let k = 0;
+    while (k < listLen(sv.genFns)) {
+        if ((listGet(sv.genFns, k) catch -1) == fi) { return true; }
+        k = k + 1;
+    }
+    return false;
+}
+
+// 生成器的创建函数（D3 v0.22，原 fn 表序）：被调值＝体函数，实参移入其后，gen_new 建生成器对象
+// （实参快照由内核 retain，同 async_start），返回生成器。函数体一行都不执行。
+function emitGenCreator(f: Ref<CgFn>, fi: int, body: int): void {
+    const np = listLen(f.paramTys);
+    emInit(f.moduleIdx, f.name, np, ndLine(f.declKey), ndCol(f.declKey), 1 + np);
+    emFnSelf = fi;
+    const t = emTempBase();
+    emUseReg(t + np);
+    emEmit(encABx(1, t, emKFnRef(body)));
+    let j = 0;
+    while (j < np) {
+        emEmit(encABC(4, t + 1 + j, 1 + j, 0));
+        j = j + 1;
+    }
+    emEmit(encABC(48, t, np + 1, 0));
+    emEmit(encABC(33, t, 0, 0));
+    emFinishAt(fi);
+}
+
+// 模块 init 函数（:396-412 同构）：全局按声明序 compileExpr→clone→setfld。
+// init fn idx 按 mi 序推 modOutInit（步 5 直读——无自引用回灌）。
+function emitModuleInit(sv: Ref<SemaView>, mi: int): void {
+    const mod = listGet(sv.modules, mi) catch dummyCgModule();
+    emInit(mi, "__init", 0, 1, 1, mod.initSlotCap);
+    emDbgBegin();
+    const fabM = listGet(cgFab.modules, mi) catch new FabModule { mi: 0, roots: emptyIntList(), recIdx: emptyIntList() };
+    const bix = bindIndexBuild(fabM);
+    let gi = 0;
+    while (gi < listLen(mod.globals)) {
+        const g = listGet(mod.globals, gi) catch new CgGlobal { name: "", ty: 0, slot: 0 };
+        const bindId = bindIndexFind(bix, g.name);
+        if (bindId >= 0) {
+            emPosLine = ndLine(bindId);
+            emPosCol = ndCol(bindId);
+            emDbg(DBG_STMT, emTempBase());
+            const initExpr = ndChildLast(bindId);
+            const dst = emTempBase();
+            compileExpr(initExpr, dst, sExprType(initExpr));
+            if (isValueTySeb(g.ty) == 1) { emEmit(encABC(24, dst, dst, 0)); }
+            emEmit(encABC(21, dst, 0, fieldSel(FLD_FLAG, g.slot)));
+        }
+        gi = gi + 1;
+    }
+    const t = emTempBase();
+    emEmit(encABC(3, t, 0, 0));
+    emDbg(DBG_LEAVE, t + 1);
+    emEmit(encABC(33, t, 0, 0));
+    const idx = listLen(fnNameIdx);
+    emFinishAt(idx);
+    listPush(modOutInit, idx);
+}
+
+// 模块根上的 let/const 绑定按名索引（容量批 C3c）：原为每个全局线性扫全部根并逐个取名，
+// 顶层绑定多时平方级（8 千个 25 秒）。同名取最靠前的根，与原线性查找相同。
+struct BindIndex {
+    head: List<int>,
+    next: List<int>,
+    names: List<string>,
+    ids: List<int>,
+}
+
+function bindIndexBuild(fabM: Ref<FabModule>): Ref<BindIndex> {
+    const ix = new BindIndex { head: listNew(), next: listNew(), names: listNew(), ids: listNew() };
+    let n = 0;
+    let ri = 0;
+    while (ri < listLen(fabM.roots)) {
+        const k = ndKind(listGet(fabM.roots, ri) catch -1);
+        if (k == 11 || k == 12) { n = n + 1; }
+        ri = ri + 1;
+    }
+    cgIndexGrow(ix.head, ix.next, n);
+    ri = 0;
+    while (ri < listLen(fabM.roots)) {
+        const rootId = listGet(fabM.roots, ri) catch -1;
+        const k = ndKind(rootId);
+        if (k == 11 || k == 12) {
+            const name = ndName(rootId);
+            listPush(ix.names, name);
+            listPush(ix.ids, rootId);
+            cgIndexLink(ix.head, ix.next, listLen(ix.ids) - 1, cgHashStr(name));
+        }
+        ri = ri + 1;
+    }
+    return ix;
+}
+
+function bindIndexFind(ix: Ref<BindIndex>, name: string): int {
+    let i = listGet(ix.head, cgHashStr(name) & (listLen(ix.head) - 1)) catch -1;
+    let best = -1;
+    while (i >= 0) {
+        if ((listGet(ix.names, i) catch "") == name) { best = i; }
+        i = listGet(ix.next, i) catch -1;
+    }
+    if (best < 0) { return -1; }
+    return listGet(ix.ids, best) catch -1;
+}
+
+// 访问器合成门控：任一模块符号表存在跨模块符号（symA≠本模块＝导入面）。
+// SEB1 symbols 直判——FAB1 import_ 根扫描不可靠（键/根序面）。
+function hasImportsAnywhere(): int {
+    let mi = 0;
+    while (mi < listLen(cgSv.modules)) {
+        const m = listGet(cgSv.modules, mi) catch dummyCgModule();
+        let si = 0;
+        while (si < listLen(m.symNames)) {
+            if ((listGet(m.symA, si) catch -1) != mi && (listGet(m.symKinds, si) catch -1) == 0) { return 1; }
+            si = si + 1;
+        }
+        mi = mi + 1;
+    }
+    return 0;
+}
+
+// 该顶层绑定是否被任一模块导入（zig importedAnywhere 同构——SEB1 面）：
+// 任一他模块符号表存在该名 symbol（kind 0=global，a=tm，b=slot）即真；
+// 本模块自有 global 的 a==tm==mi 不误触。
+function importedAnywhere(sv: Ref<SemaView>, gname: string, tm: int, slot: int): int {
+    let mi = 0;
+    while (mi < listLen(sv.modules)) {
+        if (mi == tm) { mi = mi + 1; continue; }
+        const im = listGet(sv.modules, mi) catch dummyCgModule();
+        let si = 0;
+        while (si < listLen(im.symNames)) {
+            if ((listGet(im.symNames, si) catch "") == gname && (listGet(im.symKinds, si) catch -1) == 0) {
+                if ((listGet(im.symA, si) catch -1) == tm && (listGet(im.symB, si) catch -1) == slot) {
+                    return 1;
+                }
+            }
+            si = si + 1;
+        }
+        mi = mi + 1;
+    }
+    return 0;
+}
+
+// generate：SEB1+FAB1 → CG 状态全量（六步）。返回 0＝成。
+export function generate(sv: Ref<SemaView>, fab: Ref<FabView>): int {
+    cgSv = sv;
+    cgFab = fab;
+    buildNodeIndex(fab);
+    // 基础类型预置（索引稳定：0=int…5=err）。
+    tyIndex(1, 0, 0);
+    tyIndex(2, 0, 0);
+    tyIndex(3, 0, 0);
+    tyIndex(4, 0, 0);
+    tyIndex(5, 0, 0);
+    tyIndex(6, 0, 0);
+    // 0) fn_table 预建（索引与 fn_table 严格对齐；ptys/ret 压平入类型表）。
+    let i = 0;
+    while (i < listLen(sv.fnTable)) {
+        const f = listGet(sv.fnTable, i) catch dummyCgFn();
+        const nameIdx = cgIntern(f.name);
+        const ptys: List<int> = listNew();
+        let j = 0;
+        while (j < listLen(f.paramTys)) {
+            listPush(ptys, flattenTy(sv, listGet(f.paramTys, j) catch 0));
+            j = j + 1;
+        }
+        const ret = flattenTy(sv, f.ret);
+        listPush(fnNameIdx, nameIdx);
+        listPush(fnModule, f.moduleIdx);
+        listPush(fnReg, 0);
+        listPush(fnNparams, listLen(f.paramTys));
+        listPush(fnCode, emptyIntList());
+        listPush(fnConstsK, emptyIntList());
+        listPush(fnConstsI, emptyIntList());
+        listPush(fnConstsTbl, emptyIntList());
+        listPush(fnConstsTblLen, emptyIntList());
+        listPush(fnLinesL, emptyIntList());
+        listPush(fnLinesC, emptyIntList());
+        listPush(fnPtys, ptys);
+        listPush(fnRet, ret);
+        listPush(fnLandings, emptyIntList());
+        i = i + 1;
+    }
+    // 1) 访问器合成（跨模块导入的顶层绑定；确定性序＝目标模块序 × 字段序
+    // ——zig 步 1 同构；有 import 才扫——单模块零访零字节扰动）。
+    if (hasImportsAnywhere() == 1) {
+        let tm = 0;
+        while (tm < listLen(sv.modules)) {
+            const tmod = listGet(sv.modules, tm) catch dummyCgModule();
+            let slot = 0;
+            while (slot < listLen(tmod.globals)) {
+                const g = listGet(tmod.globals, slot) catch new CgGlobal { name: "", ty: 0, slot: 0 };
+                if (importedAnywhere(sv, g.name, tm, g.slot) == 1) {
+                    emInit(tm, "__access", 0, 1, 1, 1);
+                    const dst = emTempBase();
+                    emUseReg(dst);
+                    emEmit(encABC(20, dst, 0, fieldSel(FLD_FLAG, g.slot)));
+                    emEmit(encABC(33, dst, 0, 0));
+                    const aidx = listLen(fnNameIdx);
+                    emFinishAt(aidx);
+                    accMemoPut(tm, g.slot, aidx);
+                }
+                slot = slot + 1;
+            }
+            tm = tm + 1;
+        }
+    }
+    // 2) 函数体发射（含闭包体——fn_table 尾段；闭包先注入捕获/基座序言）。
+    i = 0;
+    while (i < listLen(sv.fnTable)) {
+        const f = listGet(sv.fnTable, i) catch dummyCgFn();
+        ndModule = f.moduleIdx; // declKey/体子树按本 fn 模块解析（非键 id 碰撞面）
+        let bodyBlock = -1;
+        if (ndById(f.declKey) >= 0) {
+            bodyBlock = ndChildLast(f.declKey);
+        }
+        let cap = 1 + listLen(f.paramTys);
+        if (bodyBlock >= 0) {
+            const bs = sideGet1(sv.stBodySlots, bodyBlock);
+            if (bs > 0) { cap = bs; }
+        }
+        const isGen = cgIsGenFn(sv, i);
+        let genBody = -1;
+        if (isGen) {
+            // D3 v0.22：生成器体编译成追加的内部函数（只经 gen_next 进入），原序号留给创建函数。
+            genBody = listLen(fnNameIdx);
+            emInit(f.moduleIdx, f.name + "#gen", listLen(f.paramTys), ndLine(f.declKey), ndCol(f.declKey), cap);
+            emFnSelf = genBody;
+        } else {
+            emInit(f.moduleIdx, f.name, listLen(f.paramTys), ndLine(f.declKey), ndCol(f.declKey), cap);
+            emFnSelf = i;
+        }
+        emFnAsync = f.isAsync == 1;
+        const arrowM = sideFind(sv.stClosureMeta, f.declKey);
+        if (arrowM >= 0) {
+            const arrowKey = listGet(listGet(sv.stClosureMeta.vals, arrowM) catch emptyIntList(), 0) catch 0;
+            emitClosurePrologue(arrowKey);
+        }
+        if (cgDebug) { dbgParamVars(f, arrowM); }
+        emDbgBegin();
+        if (bodyBlock >= 0) {
+            emBlock(bodyBlock);
+        }
+        // void fn 尾：ldnone+ret（pos＝(0,0)——zig 同形；sig.ret 为池 id——kind 解析）。生成器体走到末尾即结束迭代，同此。
+        const sig = listGet(sv.sigs, f.sigIdx) catch dummyCgSig();
+        if (kindOfSeb(sig.ret) == 4 || isGen) {
+            emPosLine = 0;
+            emPosCol = 0;
+            const t = emTempBase();
+            emEmit(encABC(3, t, 0, 0));
+            emDbg(DBG_LEAVE, t + 1);
+            emEmit(encABC(33, t, 0, 0));
+        }
+        if (isGen) {
+            emFinishAt(genBody);
+            emitGenCreator(f, i, genBody);
+        } else {
+            emFinishAt(i);
+        }
+        i = i + 1;
+    }
+    // 3) 模块 init（idx 按 mi 序推 modOutInit）。
+    i = 0;
+    while (i < listLen(sv.modules)) {
+        emitModuleInit(sv, i);
+        i = i + 1;
+    }
+    // 4) test 块（body＋void 尾）。
+    i = 0;
+    while (i < listLen(sv.tests)) {
+        const t = listGet(sv.tests, i) catch new CgTest { name: "", moduleIdx: 0 };
+        const tdecl = findTestDecl(fab, t.name);
+        ndModule = t.moduleIdx;
+        let tbody = -1;
+        if (tdecl >= 0) { tbody = ndChildLast(tdecl); }
+        let tcap = 1;
+        if (tbody >= 0) {
+            const bs = sideGet1(sv.stBodySlots, tbody);
+            if (bs > 0) { tcap = bs; }
+        }
+        emInit(t.moduleIdx, t.name, 0, ndLine(tdecl), ndCol(tdecl), tcap);
+        emDbgBegin();
+        if (tbody >= 0) {
+            emBlock(tbody);
+        }
+        emPosLine = 0;
+        emPosCol = 0;
+        const tr = emTempBase();
+        emEmit(encABC(3, tr, 0, 0));
+        emDbg(DBG_LEAVE, tr + 1);
+        emEmit(encABC(33, tr, 0, 0));
+        const idx = listLen(fnNameIdx);
+        emFinishAt(idx);
+        listPush(testOutName, cgIntern(t.name));
+        listPush(testOutFunc, idx);
+        i = i + 1;
+    }
+    // 4.5) 帧窗口不侵入校正（不动点；闭包链以闭包数+2 轮截断）。
+    // 只校正闭包值调用点。直接调用（CALL A B C，被调函数值在寄存器 A）不在此校正：
+    // 旧形（zig codegen 同）把 B|C 当常量下标解读，常量池超过约 257 项的函数会把
+    // 某个 fn_ref 常量误认成被调，递归时帧尺寸逐轮累加（compileExpr 曾被算成约 196 万
+    // 槽，原生发射随之卡死）；正常形态下它从不命中，删除后既有产物不变。
+    let fixChanged = true;
+    let fixRound = 0;
+    const fixCap = listLen(fnNameIdx) + 2;
+    while (fixChanged) {
+        fixChanged = false;
+        fixRound = fixRound + 1;
+        if (fixRound > fixCap) { break; }
+        // 闭包调用点同纪律（被调 reg_count 静态未知——全程序闭包体上界）。
+        let maxClosure = 0;
+        let ci = 0;
+        while (ci < listLen(sv.closureFnIndices)) {
+            const cfn = listGet(sv.closureFnIndices, ci) catch 0;
+            if (cfn >= 0 && cfn < listLen(fnReg)) {
+                if ((listGet(fnReg, cfn) catch 0) > maxClosure) { maxClosure = listGet(fnReg, cfn) catch 0; }
+            }
+            ci = ci + 1;
+        }
+        ci = 0;
+        while (ci < listLen(closureSites)) {
+            const caller = listGet(closureSites, ci) catch 0;
+            const a = listGet(closureSites, ci + 1) catch 0;
+            if (caller >= 0 && caller < listLen(fnReg)) {
+                const need = a + maxClosure;
+                if (need > (listGet(fnReg, caller) catch 0)) {
+                    listSet(fnReg, caller, need);
+                    fixChanged = true;
+                }
+            }
+            ci = ci + 2;
+        }
+    }
+    checkFrameSizes();
+    // 5) 模块信息（状态类型＋init 索引——modOutInit 步 3 已按序）。
+    i = 0;
+    while (i < listLen(sv.modules)) {
+        const stateTy = stateTyIdx(sv, i);
+        const mod = listGet(sv.modules, i) catch dummyCgModule();
+        listPush(modOutPath, cgIntern(mod.display));
+        listPush(modOutState, stateTy);
+        i = i + 1;
+    }
+    // extern 声明面（声明序＝callbi 宿主 id 序）。
+    i = 0;
+    while (i < listLen(sv.externs)) {
+        const ex = listGet(sv.externs, i) catch dummyCgExtern();
+        const tags: List<int> = listNew();
+        let j = 0;
+        while (j < listLen(ex.params)) {
+            listPush(tags, externTagOfSeb(listGet(ex.params, j) catch 0));
+            j = j + 1;
+        }
+        listPush(extNames, ex.name);
+        listPush(extTags, tags);
+        listPush(extRets, externTagOfSeb(ex.ret));
+        i = i + 1;
+    }
+    cgFfiLibs = sv.ffiLibs;
+    cgFfiExt = sv.ffiExt;
+    cgFfiLay = sv.ffiLay;
+    cgFfiCb = sv.ffiCb;
+    cgFfiCbFn = sv.ffiCbFn;
+    cgSendBad = sendBadTys(sv, sv.sndS, sv.sndE, sv.sndC);
+    cgShareBad = sendBadTys(sv, sv.shrS, sv.shrE, sv.shrC);
+    // entry（main 缺席＝invalid_entry——0xFFFFFFFF）。
+    if (sv.hasMain == 1) { cgEntry = sv.mainFnIdx; } else { cgEntry = 4294967295; }
+    if (cgDebug) { dbgTypes(sv); }
+    return 0;
+}
+
+// 线程第 3b 步：SND1 的不可发送 struct、enum（SEB1 池序）与闭包（键）换成运行期类型号（第 4c 步起不可共享的一套
+// 同样换）。只有建过 decl 的类型才会有运行期对象；enum 对象的类型号是该 decl 的首个类型序（nrt_image
+// typeIndexOfDecl），这里标记该 decl 的全部类型序。
+function sendBadTys(sv: Ref<SemaView>, bs: List<int>, be: List<int>, bc: List<int>): List<int> {
+    const out: List<int> = listNew();
+    if (listLen(bs) + listLen(be) + listLen(bc) == 0) { return out; }
+    const badDecl: List<int> = listNew();
+    let i = 0;
+    while (i < listLen(declMods)) { listPush(badDecl, 0); i = i + 1; }
+    i = 0;
+    while (i < listLen(bs)) {
+        const m = memoFindP(structDeclMemo, listGet(bs, i) catch -1);
+        if (m >= 0) { listSet(badDecl, (listGet(structDeclMemo, m + 1) catch 0) - 1, 1); }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < listLen(be)) {
+        const m = memoFindP(enumDeclMemo, listGet(be, i) catch -1);
+        if (m >= 0) { listSet(badDecl, (listGet(enumDeclMemo, m + 1) catch 0) - 1, 1); }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < listLen(cgTysK)) {
+        const k = listGet(cgTysK, i) catch 0;
+        if ((k == 12 || k == 13) && (listGet(badDecl, listGet(cgTysA, i) catch -1) catch 0) == 1) { listPush(out, i); }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < listLen(bc)) {
+        const m = sideFind2(envMemoK, listGet(bc, i) catch -1);
+        if (m >= 0) { listPush(out, listGet(envMemoV, m) catch 0); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// test 名→FAB1 test_ 记录 id（名匹配；逐模块 scoping——非键 id 碰撞面）。
+function findTestDecl(fab: Ref<FabView>, name: string): int {
+    let mi = 0;
+    while (mi < listLen(fab.modules)) {
+        ndModule = mi;
+        const fm = listGet(fab.modules, mi) catch new FabModule { mi: 0, roots: emptyIntList(), recIdx: emptyIntList() };
+        let ri = 0;
+        while (ri < listLen(fm.roots)) {
+            const rootId = listGet(fm.roots, ri) catch -1;
+            if (ndKind(rootId) == 9 && ndName(rootId) == name) { return rootId; }
+            ri = ri + 1;
+        }
+        mi = mi + 1;
+    }
+    return -1;
+}
+
+// ============================================================================
+// §8 PROGDUMP v2 发射（bytecode.tx serializeDump 消费域——decodeToDump
+// 同协议同字段序同分隔；字节内容 hex 编码）
+// ============================================================================
+
+function cgHexDigit(b: int): string {
+    const digits = "0123456789abcdef";
+    return strSub(digits, b & 15, 1);
+}
+
+function cgHexEncodeBytes(data: Bytes): string {
+    const hex = "0123456789abcdef"; const out = bytesNew(0); let i = 0;
+    while (i < bytesLen(data)) {
+        const c = bytesGet(data, i) catch 0; bytesPush(out, byteAt(hex, c / 16) catch 0); bytesPush(out, byteAt(hex, c % 16) catch 0); i = i + 1;
+    }
+    return bytesToStr(out) catch "";
+}
+function cgHexEncodeStr(s: string): string {
+    return cgHexEncodeRange(s, 0, len(s));
+}
+
+function cgHexEncodeRange(s: string, lo: int, hi: int): string {
+    if (hi - lo > 256) {
+        const mid = lo + (hi - lo) / 2;
+        return cgHexEncodeRange(s, lo, mid) + cgHexEncodeRange(s, mid, hi);
+    }
+    let out = "";
+    let i = lo;
+    while (i < hi) {
+        const b = byteAt(s, i) catch 0;
+        out = out + cgHexDigit((b >>> 4) & 15) + cgHexDigit(b & 15);
+        i = i + 1;
+    }
+    return out;
+}
+
+// —— 分块拼接底座（parser.tx joinParts 同构；emitProgDump 的逐段
+// `out = out + 片` 全量拷贝为 O(n²)——AOT 剂量下 commit 爆，批 E 执行发现）——
+const dumpParts: List<string> = listNew();
+
+function dp(piece: string): void {
+    listPush(dumpParts, piece);
+}
+
+function dpJoinRange(lo: int, hi: int): string {
+    if (hi - lo == 1) {
+        return listGet(dumpParts, lo) catch "";
+    }
+    const mid = lo + (hi - lo) / 2;
+    return dpJoinRange(lo, mid) + dpJoinRange(mid, hi);
+}
+
+function dpJoin(): string {
+    const n = listLen(dumpParts);
+    if (n == 0) { return ""; }
+    return dpJoinRange(0, n);
+}
+
+// 顶层 ' + ' 切分（括号感知——嵌套调用内 "+" 不切）。
+function splitTop(expr: string): List<string> {
+    const out: List<string> = listNew();
+    let depth = 0;
+    let start = 0;
+    let i = 0;
+    while (i < len(expr)) {
+        const c = byteAt(expr, i) catch 32;
+        if (c == 40) { depth = depth + 1; } else if (c == 41) { depth = depth - 1; } else if (c == 43 && depth == 0) {
+            listPush(out, strSub(expr, start, i - start));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    listPush(out, strSub(expr, start, len(expr) - start));
+    return out;
+}
+
+// 按格式段拆分；共享dumpParts只在入口清零，段顺序与旧实现相同。
+function dumpTypes(): void {
+    // tys。
+    dp("tys ");
+    dp(decCg(listLen(cgTysK)));
+    dp("\n");
+    let i = 0;
+    while (i < listLen(cgTysK)) {
+        dp("t ");
+        dp(decCg(listGet(cgTysK, i) catch 0));
+        dp(" ");
+        dp(decCg(listGet(cgTysA, i) catch 0));
+        dp(" ");
+        dp(decCg(listGet(cgTysB, i) catch 0));
+        dp("\n");
+        i = i + 1;
+    }
+}
+
+function dumpDecls(): void {
+    // decls。
+    dp("decls ");
+    dp(decCg(listLen(declMods)));
+    dp("\n");
+    let i = 0;
+    while (i < listLen(declMods)) {
+        const isEnum = listGet(declIsEnum, i) catch 0;
+        if (isEnum == 0) {
+            const fields = listGet(declFieldNames, i) catch emptyIntList();
+            const fts = listGet(declFieldTys, i) catch emptyIntList();
+            dp("d ");
+            dp(decCg(listGet(declMods, i) catch 0));
+            dp(" ");
+            dp(decCg(listGet(declNameIdx, i) catch 0));
+            dp(" struct ");
+            dp(decCg(listLen(fields)));
+            dp("\n");
+            let j = 0;
+            while (j < listLen(fields)) {
+                dp("f ");
+                dp(decCg(listGet(fields, j) catch 0));
+                dp(" ");
+                dp(decCg(listGet(fts, j) catch 0));
+                dp("\n");
+                j = j + 1;
+            }
+        } else {
+            const vns = listGet(declVariantNames, i) catch emptyIntList();
+            const vfn = listGet(declVarFNames, i) catch emptyIntList();
+            const vft = listGet(declVarFTys, i) catch emptyIntList();
+            dp("d ");
+            dp(decCg(listGet(declMods, i) catch 0));
+            dp(" ");
+            dp(decCg(listGet(declNameIdx, i) catch 0));
+            dp(" enum ");
+            dp(decCg(listLen(vns)));
+            dp("\n");
+            // declVarFCnt 跨 decl 扁平——本 decl 的变体计数切片自前置变体数起。
+            let vstart = 0;
+            let pi = 0;
+            while (pi < i) {
+                if ((listGet(declIsEnum, pi) catch 0) == 1) {
+                    vstart = vstart + listLen(listGet(declVariantNames, pi) catch emptyIntList());
+                }
+                pi = pi + 1;
+            }
+            let fo = 0;
+            let j = 0;
+            while (j < listLen(vns)) {
+                const nf = listGet(declVarFCnt, vstart + j) catch 0;
+                dp("v ");
+                dp(decCg(listGet(vns, j) catch 0));
+                dp(" ");
+                dp(decCg(nf));
+                dp("\n");
+                let k = 0;
+                while (k < nf) {
+                    dp("f ");
+                    dp(decCg(listGet(vfn, fo) catch 0));
+                    dp(" ");
+                    dp(decCg(listGet(vft, fo) catch 0));
+                    dp("\n");
+                    fo = fo + 1;
+                    k = k + 1;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+function dumpFunctions(): void {
+    // funcs（consts 表长对齐 fnConstsTblLen——扁平拼接切片）。
+    dp("funcs ");
+    dp(decCg(listLen(fnNameIdx)));
+    dp("\n");
+    let i = 0;
+    while (i < listLen(fnNameIdx)) {
+        const code = listGet(fnCode, i) catch emptyIntList();
+        const ck = listGet(fnConstsK, i) catch emptyIntList();
+        const cii = listGet(fnConstsI, i) catch emptyIntList();
+        const ctflat = listGet(fnConstsTbl, i) catch emptyIntList();
+        const ctlens = listGet(fnConstsTblLen, i) catch emptyIntList();
+        const ll = listGet(fnLinesL, i) catch emptyIntList();
+        const lc = listGet(fnLinesC, i) catch emptyIntList();
+        const ptys = listGet(fnPtys, i) catch emptyIntList();
+        dp("fn ");
+        dp(decCg(listGet(fnNameIdx, i) catch 0));
+        dp(" ");
+        dp(decCg(listGet(fnModule, i) catch 0));
+        dp(" ");
+        dp(decCg(listGet(fnReg, i) catch 0));
+        dp(" ");
+        dp(decCg(listGet(fnNparams, i) catch 0));
+        dp(" ");
+        dp(decCg(listLen(code)));
+        dp(" ");
+        dp(decCg(listLen(ck)));
+        dp(" ");
+        dp(decCg(listLen(ll)));
+        dp(" ");
+        dp(decCg(listLen(ptys)));
+        dp(" ");
+        dp(decCg(listGet(fnRet, i) catch 0));
+        dp("\n");
+        let j = 0;
+        while (j < listLen(code)) { dp("i "); dp(decCg(listGet(code, j) catch 0)); dp("\n"); j = j + 1; }
+        let toff = 0;
+        j = 0;
+        while (j < listLen(ck)) {
+            const tag = listGet(ck, j) catch 0;
+            const tlen = listGet(ctlens, j) catch 0;
+            if (tag == 5) {
+                dp("c 5 ");
+                dp(decCg(tlen));
+                dp("\n");
+                let k = 0;
+                while (k < tlen) { dp("j "); dp(decCg(listGet(ctflat, toff + k) catch 0)); dp("\n"); k = k + 1; }
+            } else if (tag == 7) {
+                dp("c 7 ");
+                dp(decCg(listGet(cii, j) catch 0));
+                dp(" ");
+                dp(decCg(listGet(ctflat, toff + 1) catch 0));
+                dp("\n");
+            } else if (tag == 8) {
+                dp("c 8 ");
+                dp(decCg(listGet(cii, j) catch 0));
+                dp(" ");
+                dp(decCg(listGet(ctflat, toff + 1) catch 0));
+                dp("\n");
+            } else {
+                dp("c ");
+                dp(decCg(tag));
+                dp(" ");
+                dp(decCg(listGet(cii, j) catch 0));
+                dp("\n");
+            }
+            toff = toff + tlen;
+            j = j + 1;
+        }
+        j = 0;
+        while (j < listLen(ll)) { dp("l "); dp(decCg(listGet(ll, j) catch 0)); dp(" "); dp(decCg(listGet(lc, j) catch 0)); dp("\n"); j = j + 1; }
+        j = 0;
+        while (j < listLen(ptys)) { dp("p "); dp(decCg(listGet(ptys, j) catch 0)); dp("\n"); j = j + 1; }
+        i = i + 1;
+    }
+}
+
+function dumpModules(): void {
+    // modules。
+    dp("modules ");
+    dp(decCg(listLen(modOutPath)));
+    dp("\n");
+    let i = 0;
+    while (i < listLen(modOutPath)) {
+        dp("m ");
+        dp(decCg(listGet(modOutPath, i) catch 0));
+        dp(" ");
+        dp(decCg(listGet(modOutState, i) catch 0));
+        dp(" ");
+        dp(decCg(listGet(modOutInit, i) catch 0));
+        dp("\n");
+        i = i + 1;
+    }
+}
+
+function dumpTests(): void {
+    // tests。
+    dp("tests ");
+    dp(decCg(listLen(testOutName)));
+    dp("\n");
+    let i = 0;
+    while (i < listLen(testOutName)) {
+        dp("tt ");
+        dp(decCg(listGet(testOutName, i) catch 0));
+        dp(" ");
+        dp(decCg(listGet(testOutFunc, i) catch 0));
+        dp("\n");
+        i = i + 1;
+    }
+}
+
+function dumpExterns(): void {
+    // externs。
+    dp("externs ");
+    dp(decCg(listLen(extNames)));
+    dp("\n");
+    let i = 0;
+    while (i < listLen(extNames)) {
+        const tags = listGet(extTags, i) catch emptyIntList();
+        dp("e ");
+        dp(cgHexEncodeStr(listGet(extNames, i) catch ""));
+        dp(" ");
+        dp(decCg(listLen(tags)));
+        let j = 0;
+        while (j < listLen(tags)) { dp(" "); dp(decCg(listGet(tags, j) catch 0)); j = j + 1; }
+        dp(" ");
+        dp(decCg(listGet(extRets, i) catch 0));
+        dp("\n");
+        i = i + 1;
+    }
+}
+
+function dumpSignatures(): void {
+    // sigs（fnSigDescs 行＝params…＋ret 尾位）。
+    dp("sigs ");
+    dp(decCg(listLen(fnSigDescs)));
+    dp("\n");
+    let i = 0;
+    while (i < listLen(fnSigDescs)) {
+        const sg = listGet(fnSigDescs, i) catch emptyIntList();
+        const np = listLen(sg) - 1;
+        dp("s ");
+        dp(decCg(listGet(sg, np) catch 0));
+        dp(" ");
+        dp(decCg(np));
+        let j = 0;
+        while (j < np) { dp(" "); dp(decCg(listGet(sg, j) catch 0)); j = j + 1; }
+        dp("\n");
+        i = i + 1;
+    }
+}
+
+function dumpStrings(): void {
+    // strtab。
+    const nstr = listLen(cgStrings);
+    dp("strtab ");
+    dp(decCg(nstr));
+    dp("\n");
+    let i = 0;
+    while (i < nstr) {
+        let hx = "";
+        const raw = cgRawAt(i);
+        if (bytesLen(raw) > 0) { hx = cgHexEncodeBytes(raw); } else { hx = cgHexEncodeStr(listGet(cgStrings, i) catch ""); }
+        if (len(hx) == 0) { dp("h\n"); } else { dp("h "); dp(hx); dp("\n"); }
+        i = i + 1;
+    }
+}
+
+function emitProgDump(): string {
+    listClearS(dumpParts);
+    dp("PROGDUMP v2\n");
+    dp("entry ");
+    dp(decCg(cgEntry));
+    dp("\n");
+    dumpTypes();
+    dumpDecls();
+    dumpFunctions();
+    dumpModules();
+    dumpTests();
+    dumpExterns();
+    dumpSignatures();
+    dumpStrings();
+    // D3 v0.23 FFI：可选 ffi 行（TXFFI 载荷 hex，与 bytecode.tx decodeToDump 同形）。
+    if (listLen(cgFfiExt) > 0) {
+        dp("ffi ");
+        dp(ffiPayloadHex(cgFfiLibs, cgFfiExt, cgFfiLay, cgFfiCb, cgFfiCbFn));
+        dp("\n");
+    }
+    return dpJoin();
+}
+// ============================================================================
+// §9 顶层入口：SEB1+FAB1 → PROGDUMP → .txc 字节
+// ============================================================================
+
+// 会话已备视图（探针复用已解析 sv/fab）→ PROGDUMP 文本。
+export function dumpFromViews(sv: Ref<SemaView>, fab: Ref<FabView>): string {
+    cgOperandError = "";
+    const gr = generate(sv, fab);
+    if (len(cgOperandError) > 0) { return ""; }
+    if (gr != 0) { return ""; }
+    return emitProgDump();
+}
+
+export function cgFailed(): int {
+    return cgSebOk;
+}
+
+// 全管线：SEB1+FAB1 文本 → PROGDUMP 文本。
+export function progDumpText(sebData: string, fabData: string): string {
+    cgSessionReset();
+    cgSebOk = 1;
+    const sv = parseSeb1(sebData);
+    if (cgSebOk == 0) { return ""; }
+    const fab = new FabView { modules: listNew(), recs: listNew() };
+    const pn = parseFabRecords(fabData, fab);
+    if (pn < 0) { return ""; }
+    return dumpFromViews(sv, fab);
+}
+
+// 全管线：SEB1+FAB1 文本 → .txc v4 字节（失败返回空表）。
+export function codegenTxc(sebData: string, fabData: string): List<int> {
+    const context = generateProgramContext(sebData, fabData);
+    const result = serializeProgramContext(context);
+    return programBytesOut(result);
+}
+
+export function cgSnapshotCurrent(): Ref<ProgramContext> {
+    return new ProgramContext { version: 2, ok: cgSebOk, error: cgOperandError, entry: cgEntry,
+        cgStrings: cgStrings,
+        cgRawStrings: cgRawStrings,
+        cgTysK: cgTysK,
+        cgTysA: cgTysA,
+        cgTysB: cgTysB,
+        declMods: declMods,
+        declNameIdx: declNameIdx,
+        declIsEnum: declIsEnum,
+        declFieldNames: declFieldNames,
+        declFieldTys: declFieldTys,
+        declVariantNames: declVariantNames,
+        declVarFNames: declVarFNames,
+        declVarFTys: declVarFTys,
+        declVarFCnt: declVarFCnt,
+        fnNameIdx: fnNameIdx,
+        fnModule: fnModule,
+        fnReg: fnReg,
+        fnNparams: fnNparams,
+        fnCode: fnCode,
+        fnConstsK: fnConstsK,
+        fnConstsI: fnConstsI,
+        fnConstsTbl: fnConstsTbl,
+        fnConstsTblLen: fnConstsTblLen,
+        fnLinesL: fnLinesL,
+        fnLinesC: fnLinesC,
+        fnPtys: fnPtys,
+        fnRet: fnRet,
+        fnLandings: fnLandings,
+        modOutPath: modOutPath,
+        modOutState: modOutState,
+        modOutInit: modOutInit,
+        testOutName: testOutName,
+        testOutFunc: testOutFunc,
+        extNames: extNames,
+        extTags: extTags,
+        extRets: extRets,
+        fnSigDescs: fnSigDescs,
+        ffiLibs: cgFfiLibs,
+        ffiExt: cgFfiExt,
+        ffiLay: cgFfiLay,
+        ffiCb: cgFfiCb,
+        ffiCbFn: cgFfiCbFn,
+        sendBad: cgSendBad,
+        shareBad: cgShareBad,
+        dbg: dvTake(),
+    };
+}
+
+export function cgCurrentDump(): string { return emitProgDump(); }
+
+export function generateProgramContext(sebData: string, fabData: string): Ref<ProgramContext> {
+    cgSessionReset();
+    cgSebOk = 1;
+    cgOperandError = "";
+    // 编译画像：SEB1、FAB1 两段文本中转的解析与生成分开计时（BOOT-50′ 的度量）。
+    const profiling = compileProfileActive();
+    let t0 = 0; if (profiling) { t0 = compileProfileClock(); }
+    const sv = parseSeb1(sebData);
+    if (profiling) { const t1 = compileProfileClock(); compileProfileCodegenDetail("seb1-parse", t1 - t0); t0 = t1; }
+    if (cgSebOk == 0) { return cgSnapshotCurrent(); }
+    const fab = new FabView { modules: listNew(), recs: listNew() };
+    if (parseFabRecords(fabData, fab) < 0) { cgSebOk = 0; return cgSnapshotCurrent(); }
+    if (profiling) { const t1 = compileProfileClock(); compileProfileCodegenDetail("fab1-parse", t1 - t0); t0 = t1; }
+    if (generate(sv, fab) != 0 || len(cgOperandError) > 0) { cgSebOk = 0; }
+    if (profiling) { compileProfileCodegenDetail("generate", compileProfileClock() - t0); }
+    return cgSnapshotCurrent();
+}

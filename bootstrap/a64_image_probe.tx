@@ -1,0 +1,121 @@
+// A64 写出链路的端到端探针（macOS 适配 M4a，设计 A2、A3）：用 a64_asm 手写两个目标文件，经 ELF aarch64 对象与链接器写成
+// Mach-O arm64 可执行文件。在 Apple Silicon 上运行应依次打印三行：
+//   a64 image: write ok          ← 经 __got 调 libSystem 的 write（PAGE21＋LDST64）、符号地址（PAGE21＋ADD_LO12）
+//   a64 image: relax ok          ← 越过 1 MiB 的 cbz 与越过 32 KiB 的向后 tbnz 换成长形式
+//   a64 image: call/data ok      ← 跨对象 bl（CALL26）、.data 里的绝对地址（ABS64，加载期 rebase）、读 .data（LDST64）
+// 然后 exit(0)。用法：a64_image_probe <输出文件>；构建成功打印 PASS_A64_IMAGE 与字节数。
+import { StructuredBuffer, asBufferNewA64, asBufferLabel, asStructuredBegin, asStructuredSection, asStructuredLabel, asStructuredByte, asStructuredAddress, asFailedAs, asLastErrAs } from "./selfhost/assemble";
+import { a64BufferSubmit, a64Emit, a64B, a64Cbz, a64Tbz, a64AddrOf, a64SymAccess, a64MovImm } from "./selfhost/a64_asm";
+import { a64LdStPair, a64AddSubImm, a64BranchReg, a64Brk, A64_NOP } from "./selfhost/a64_encode";
+import { elfWriteObject, elfObjectOk, elfObjectBytes, elfObjectError } from "./selfhost/emit_elf_object";
+import { linkMachO, machoBytes, machoError, machoImportReset, machoIdentifierFor } from "./selfhost/link_macho";
+
+function text(label: string, s: string): void {
+    asStructuredSection(1);
+    asStructuredLabel(label);
+    let i = 0;
+    while (i < len(s)) { asStructuredByte(byteAt(s, i) catch 0); i = i + 1; }
+    asStructuredSection(0);
+}
+
+// 帧记录：stp x29, x30, [sp, #-16]!; add x29, sp, #0。
+function prologue(b: Ref<StructuredBuffer>): void {
+    a64Emit(b, a64LdStPair(2, 0, 0, 29, 30, 31, -16, 3), "stp");
+    a64Emit(b, a64AddSubImm(1, 0, 0, 29, 31, 0, 0), "mov x29, sp");
+}
+
+// write(1, 符号, n)：参数 x0..x2，经导入槽 __imp_write 间接调用（x16）。
+function write(b: Ref<StructuredBuffer>, symbol: string, n: int): void {
+    a64MovImm(b, 0, 1);
+    a64AddrOf(b, 1, symbol, 0);
+    a64MovImm(b, 2, n);
+    a64SymAccess(b, 3, 0, 1, 16, 16, "__imp_write", 0);
+    a64Emit(b, a64BranchReg(1, 16), "blr");
+}
+
+function object(exports: List<string>): Bytes {
+    const r = elfWriteObject(exports);
+    if (elfObjectOk(r) != 1) { eprint("elf: " + elfObjectError(r)); return bytesNew(0); }
+    return elfObjectBytes(r);
+}
+
+const MSG_WRITE: string = "a64 image: write ok\n";
+const MSG_RELAX: string = "a64 image: relax ok\n";
+const MSG_CALL: string = "a64 image: call/data ok\n";
+
+function first(): Bytes {
+    const b = asBufferNewA64();
+    asBufferLabel(b, "a64_main", 1);
+    prologue(b);
+    write(b, "msg_write", len(MSG_WRITE));
+    // 向前越过 1 MiB 的 cbz（x9＝0，必跳）：短形式够不着，换成 cbnz +8; b .Lfar。
+    a64MovImm(b, 9, 0);
+    a64Cbz(b, 1, 0, 9, ".Lfar");
+    asBufferLabel(b, ".Lback", 1);
+    write(b, "msg_relax", len(MSG_RELAX));
+    a64B(b, 0, ".Lafter");
+    let k = 0;
+    while (k < 300000) { a64Emit(b, A64_NOP, "nop"); k = k + 1; }
+    a64Emit(b, a64Brk(1), "brk");
+    asBufferLabel(b, ".Lfar", 1);
+    // 向后越过 32 KiB 的 tbnz（x10 的第 0 位为 1，必跳）。
+    a64MovImm(b, 10, 1);
+    a64Tbz(b, 1, 10, 0, ".Lback");
+    a64Emit(b, a64Brk(2), "brk");
+    asBufferLabel(b, ".Lafter", 1);
+    a64B(b, 1, "a64_helper");
+    a64MovImm(b, 0, 0);
+    a64SymAccess(b, 3, 0, 1, 16, 16, "__imp_exit", 0);
+    a64Emit(b, a64BranchReg(1, 16), "blr");
+    a64Emit(b, a64Brk(3), "brk");
+    asStructuredBegin();
+    a64BufferSubmit(b);
+    if (asFailedAs() != 0) { eprint("a64: " + asLastErrAs()); return bytesNew(0); }
+    text("msg_write", MSG_WRITE);
+    text("msg_relax", MSG_RELAX);
+    const exports: List<string> = listNew(); listPush(exports, "a64_main");
+    return object(exports);
+}
+
+function second(): Bytes {
+    const b = asBufferNewA64();
+    asBufferLabel(b, "a64_helper", 1);
+    prologue(b);
+    // x1 ＝ [cell]：.data 里存着 msg_call 的绝对地址。
+    a64SymAccess(b, 3, 0, 1, 1, 16, "a64_cell", 0);
+    a64MovImm(b, 0, 1);
+    a64MovImm(b, 2, len(MSG_CALL));
+    a64SymAccess(b, 3, 0, 1, 16, 16, "__imp_write", 0);
+    a64Emit(b, a64BranchReg(1, 16), "blr");
+    a64Emit(b, a64LdStPair(2, 0, 1, 29, 30, 31, 16, 1), "ldp");
+    a64Emit(b, a64BranchReg(2, 30), "ret");
+    asStructuredBegin();
+    a64BufferSubmit(b);
+    if (asFailedAs() != 0) { eprint("a64: " + asLastErrAs()); return bytesNew(0); }
+    text("msg_call", MSG_CALL);
+    asStructuredSection(2);
+    asStructuredLabel("a64_cell");
+    asStructuredAddress("msg_call");
+    asStructuredSection(0);
+    const exports: List<string> = listNew(); listPush(exports, "a64_helper");
+    return object(exports);
+}
+
+function main(args: []string): int {
+    if (len(args) < 1) { eprint("usage: a64_image_probe <out>"); return 64; }
+    const a = first();
+    if (asFailedAs() != 0) { eprint("asm: " + asLastErrAs()); return 65; }
+    const c = second();
+    if (asFailedAs() != 0) { eprint("asm: " + asLastErrAs()); return 65; }
+    if (bytesLen(a) == 0 || bytesLen(c) == 0) { return 66; }
+    const objects: List<Bytes> = listNew();
+    listPush(objects, a);
+    listPush(objects, c);
+    machoImportReset();
+    machoIdentifierFor("a64_image");
+    if (linkMachO(objects, "a64_main") != 0) { eprint("link: " + machoError()); return 67; }
+    const image = machoBytes();
+    writeFileBytes(args[0], image) catch (e) { eprint(e.message); return 68; };
+    print("PASS_A64_IMAGE " + toStr(bytesLen(image)));
+    return 0;
+}

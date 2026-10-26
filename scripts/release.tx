@@ -1,0 +1,387 @@
+// 发布包（docs/design/v052-public-release-v0.1-20261026.md §四）：在导出的公开仓树里，用一个编译器交叉编出四个目标的 taixu，
+// 每个目标一个目录 taixu-<版本>-<三元组>/（taixu 或 taixu.exe、stdlib/、examples/、docs/、skill/、README.md、许可证），Windows 打
+// zip，其余打 tar.gz，另写 SHA256SUMS。tar 由这里按 ustar 写出（可执行位、属主、时间戳由我们写定，结果可复现）；压缩交给系统
+// 工具：bsdtar（Windows 与 macOS 自带）把现成的 tar 重新打成 tar.gz（条目原样保留）并写 zip，没有 bsdtar 时用 gzip 与 zip。
+// 用法（在导出树根、先跑过 scripts/build.tx 之后运行）：taixu run --toolchain scripts/release.tx --compiler work/bin/taixu --out <目录>
+//   [--version <版本>]
+import { absolute, baseOf, deleteTree, dirOf, findInPath, join, kindOf, list1, mkdirs, nat, nothing, plus, readBytes, runIn, safeRel, startsWith,
+    trimLine } from "./build_lib";
+import { osRealPath, osWriteFile } from "./build_os";
+import { sha256Hex } from "../bootstrap/selfhost/sha256";
+
+const TARGETS: string = "x86_64-windows x86_64-linux x86_64-macos aarch64-macos";
+// 包里带的内容（导出树里的路径）；标准库只带源码与说明。
+const CONTENT: string = "README.md LICENSE-APACHE LICENSE-MIT docs examples skill stdlib/src stdlib/README.md";
+// 归档条目的修改时间（2026-10-26 00:00:00 UTC）：固定值，同一输入得同一归档。
+const MTIME: int = 1792972800;
+
+struct Opts {
+    root: string,
+    compiler: string,
+    out: string,
+    version: string,
+}
+
+struct Entry {
+    path: string,
+    data: Bytes,
+    exec: bool,
+}
+
+function usage(): int {
+    eprint("用法：taixu run --toolchain scripts/release.tx --compiler <taixu> --out <目录> [--version <版本>]");
+    return 64;
+}
+
+function parseOpts(args: []string): Ref<Opts> | Error {
+    const o = new Opts { root: osRealPath(currentDir() catch "."), compiler: "", out: "", version: "" };
+    let i = 0;
+    while (i < len(args)) {
+        if (i + 1 >= len(args)) {
+            return err("选项缺少值：" + args[i]);
+        }
+        const a = args[i];
+        const v = args[i + 1];
+        if (a == "--compiler") {
+            o.compiler = osRealPath(absolute(v));
+        } else if (a == "--out") {
+            o.out = absolute(v);
+        } else if (a == "--version") {
+            o.version = v;
+        } else {
+            return err("不认识的选项：" + a);
+        }
+        i = i + 2;
+    }
+    if (len(o.compiler) == 0 || len(o.out) == 0) {
+        return err("请给出 --compiler 与 --out");
+    }
+    if (kindOf(join(o.root, "scripts/release.tx")) != 1 || kindOf(join(o.root, "stdlib/src")) != 2) {
+        return err("请在导出的公开仓树根运行（要有 scripts/release.tx 与 stdlib/src）");
+    }
+    if (kindOf(join(o.root, "bootstrap/nrt-kernel/kernel.obj")) != 1) {
+        return err("树里还没有运行时内核：先运行 taixu run --toolchain scripts/build.tx --compiler <种子> --out work/bin，"
+            + "它生成内核并自举出发布用的编译器（再以 --compiler work/bin/taixu 打包）");
+    }
+    return o;
+}
+
+// 产品版本取自源码（bootstrap/selfhost/toolchain.tx 的 TOOLCHAIN_VERSION），与编译器打印的一致。
+function sourceVersion(root: string): string | Error {
+    const b = readBytes(join(root, "bootstrap/selfhost/toolchain.tx")) catch (e) {
+        return e;
+    };
+    const text = bytesToStr(b) catch "";
+    const key = "export const TOOLCHAIN_VERSION: string = \"";
+    for (line in strSplit(text, "\n")) {
+        if (startsWith(line, key)) {
+            // 这一行全是 ASCII，码点下标与字节下标相同。
+            const rest = strSub(line, len(key), len(line) - len(key));
+            const q = strIndexOf(rest, "\"");
+            if (q > 0) {
+                return strSub(rest, 0, q);
+            }
+        }
+    }
+    return err("toolchain.tx 里找不到 TOOLCHAIN_VERSION");
+}
+
+// 递归收集 rel 之下的文件（正斜杠相对路径）。
+function collect(root: string, rel: string, out: List<string>): void {
+    const k = kindOf(join(root, rel));
+    if (k == 1) {
+        listPush(out, rel);
+        return;
+    }
+    if (k != 2) {
+        return;
+    }
+    const names = localListDir(nat(join(root, rel)), "") catch (e) {
+        return;
+    };
+    for (n in names) {
+        collect(root, rel + "/" + n, out);
+    }
+}
+
+// ---- ustar ----
+
+function putField(h: Bytes, at: int, n: int, s: string): void {
+    const b = bytesFromStr(s);
+    let k = 0;
+    while (k < n && k < bytesLen(b)) {
+        bytesSet(h, at + k, bytesGet(b, k) ?? 0);
+        k = k + 1;
+    }
+}
+
+// 定长八进制字段：n−1 位数字补零，末尾 NUL。
+function putOctal(h: Bytes, at: int, n: int, v: int): void {
+    let digits = "";
+    let x = v;
+    while (x > 0) {
+        digits = toStr(x % 8) + digits;
+        x = x / 8;
+    }
+    while (len(digits) < n - 1) {
+        digits = "0" + digits;
+    }
+    putField(h, at, n - 1, digits);
+}
+
+function header(path: string, size: int, mode: int, dir: bool): Bytes | Error {
+    const h = bytesNew(512);
+    const b = bytesFromStr(path);
+    if (bytesLen(b) <= 100) {
+        putField(h, 0, 100, path);
+    } else {
+        // 超过 100 字节：在某个 / 处拆成 prefix（≤155）与 name（≤100）。
+        let cut = -1;
+        let k = 0;
+        while (k < bytesLen(b)) {
+            if ((bytesGet(b, k) ?? 0) == 47 && k <= 155 && bytesLen(b) - k - 1 <= 100) {
+                cut = k;
+                break;
+            }
+            k = k + 1;
+        }
+        if (cut < 0) {
+            return err("路径太长，ustar 放不下：" + path);
+        }
+        putField(h, 345, 155, bytesToStr(bytesSlice(b, 0, cut)) catch "");
+        putField(h, 0, 100, bytesToStr(bytesSlice(b, cut + 1, bytesLen(b) - cut - 1)) catch "");
+    }
+    putOctal(h, 100, 8, mode);
+    putOctal(h, 108, 8, 0);
+    putOctal(h, 116, 8, 0);
+    putOctal(h, 124, 12, size);
+    putOctal(h, 136, 12, MTIME);
+    if (dir) {
+        bytesSet(h, 156, 53);
+    } else {
+        bytesSet(h, 156, 48);
+    }
+    putField(h, 257, 6, "ustar");
+    putField(h, 263, 2, "00");
+    // 校验和：先按 8 个空格算，再写回（6 位八进制、NUL、空格）。
+    putField(h, 148, 8, "        ");
+    let sum = 0;
+    let i = 0;
+    while (i < 512) {
+        sum = sum + (bytesGet(h, i) ?? 0);
+        i = i + 1;
+    }
+    putOctal(h, 148, 7, sum);
+    bytesSet(h, 155, 32);
+    return h;
+}
+
+function tarOf(entries: List<Ref<Entry>>, dirs: List<string>): Bytes | Error {
+    const t = bytesNew(0);
+    for (d in dirs) {
+        const h = header(d + "/", 0, 493, true) catch (e) {
+            return e;
+        };
+        bytesAppend(t, h);
+    }
+    for (e in entries) {
+        let mode = 420;
+        if (e.exec) {
+            mode = 493;
+        }
+        const h = header(e.path, bytesLen(e.data), mode, false) catch (x) {
+            return x;
+        };
+        bytesAppend(t, h);
+        bytesAppend(t, e.data);
+        const pad = (512 - bytesLen(e.data) % 512) % 512;
+        bytesAppend(t, bytesNew(pad));
+    }
+    bytesAppend(t, bytesNew(1024));
+    return t;
+}
+
+// 条目里出现的全部上级目录（去重、按出现先后），归档里先列目录。
+function dirsOf(entries: List<Ref<Entry>>): List<string> {
+    const out: List<string> = listNew();
+    const seen: Map<string, bool> = mapNew();
+    for (e in entries) {
+        let p = dirOf(e.path);
+        const chain: List<string> = listNew();
+        while (len(p) > 0 && p != "." && !(mapHas(seen, p))) {
+            mapSet(seen, p, true);
+            listPush(chain, p);
+            p = dirOf(p);
+        }
+        let k = listLen(chain) - 1;
+        while (k >= 0) {
+            listPush(out, listGet(chain, k) catch "");
+            k = k - 1;
+        }
+    }
+    return out;
+}
+
+// ---- 系统工具 ----
+
+function bsdtar(): string {
+    let cands: List<string> = listNew();
+    listPush(cands, findInPath("bsdtar"));
+    listPush(cands, "C:/Windows/System32/tar.exe");
+    listPush(cands, findInPath("tar"));
+    for (c in cands) {
+        if (len(c) > 0 && kindOf(c) == 1 && isBsdtar(c)) {
+            return c;
+        }
+    }
+    return "";
+}
+
+function isBsdtar(exe: string): bool {
+    const r = runIn(exe, list1("--version"), ".", true, false) catch (e) {
+        return false;
+    };
+    return r.code == 0 && strIndexOf(bytesToStr(r.out) catch "", "bsdtar") >= 0;
+}
+
+function tool(exe: string, args: List<string>, cwd: string): void | Error {
+    const r = runIn(exe, args, cwd, false, true) catch (e) {
+        return e;
+    };
+    if (r.code != 0) {
+        return err(baseOf(exe) + " 失败：" + (bytesToStr(r.tail) catch "?"));
+    }
+    return nothing();
+}
+
+function pack(o: Ref<Opts>, triple: string, bsd: string, stage: string): string | Error {
+    const name = "taixu-" + o.version + "-" + triple;
+    const windows = triple == "x86_64-windows";
+    let exe = "taixu";
+    if (windows) {
+        exe = "taixu.exe";
+    }
+    // 编译器：用给定编译器为该目标编译导出树里的源码（三端交叉一致由门逐次核对）。
+    const binDir = join(stage, "bin-" + triple);
+    tool(o.compiler, plus(plus(list1("build"), list1("bootstrap/taixu.tx")), plus(plus(list1("--toolchain"), list1("--target=" + triple)), plus(list1("--out"), list1(binDir)))), o.root) catch (e) {
+        return e;
+    };
+    const entries: List<Ref<Entry>> = listNew();
+    const bin = readBytes(join(binDir, exe)) catch (e) {
+        return err("没编出 " + exe + "（" + triple + "）");
+    };
+    listPush(entries, new Entry { path: name + "/" + exe, data: bin, exec: true });
+    const files: List<string> = listNew();
+    for (c in strSplit(CONTENT, " ")) {
+        if (kindOf(join(o.root, c)) == 0) {
+            return err("导出树里没有 " + c);
+        }
+        collect(o.root, c, files);
+    }
+    for (f in files) {
+        if (!safeRel(f)) {
+            return err("不安全的路径：" + f);
+        }
+        const data = readBytes(join(o.root, f)) catch (e) {
+            return e;
+        };
+        listPush(entries, new Entry { path: name + "/" + f, data: data, exec: false });
+    }
+    if (windows) {
+        // zip 不带 Unix 权限位：解到 stage 下的目录再整体打包。
+        const dir = join(stage, "zip-" + triple);
+        for (e in entries) {
+            const p = join(dir, e.path);
+            if (!mkdirs(dirOf(p)) || !osWriteFile(p, e.data, e.exec)) {
+                return err("写不了：" + p);
+            }
+        }
+        const zip = join(o.out, name + ".zip");
+        if (len(bsd) > 0) {
+            tool(bsd, plus(plus(list1("-a"), list1("-cf")), plus(list1(nat(zip)), plus(plus(list1("-C"), list1(nat(dir))), list1(name)))), stage) catch (e) {
+                return e;
+            };
+        } else {
+            tool(findInPath("zip"), plus(plus(list1("-r"), list1("-X")), plus(list1(nat(zip)), list1(name))), dir) catch (e) {
+                return e;
+            };
+        }
+        return zip;
+    }
+    const t = tarOf(entries, dirsOf(entries)) catch (e) {
+        return e;
+    };
+    const tar = join(stage, name + ".tar");
+    if (!osWriteFile(tar, t, false)) {
+        return err("写不了：" + tar);
+    }
+    const gz = join(o.out, name + ".tar.gz");
+    if (len(bsd) > 0) {
+        tool(bsd, plus(plus(list1("-czf"), list1(nat(gz))), list1("@" + nat(tar))), stage) catch (e) {
+            return e;
+        };
+    } else {
+        tool(findInPath("gzip"), plus(plus(list1("-9"), list1("-n")), plus(list1("-f"), list1(nat(tar)))), stage) catch (e) {
+            return e;
+        };
+        const b = readBytes(tar + ".gz") catch (e) {
+            return e;
+        };
+        if (!osWriteFile(gz, b, false)) {
+            return err("写不了：" + gz);
+        }
+    }
+    return gz;
+}
+
+function run(args: []string): int | Error {
+    const o = parseOpts(args) catch (e) {
+        return e;
+    };
+    if (len(o.version) == 0) {
+        o.version = sourceVersion(o.root) catch (e) {
+            return e;
+        };
+    }
+    if (!mkdirs(o.out)) {
+        return err("建不了：" + o.out);
+    }
+    const stage = join(o.out, ".stage");
+    if (!mkdirs(stage)) {
+        return err("建不了：" + stage);
+    }
+    const bsd = bsdtar();
+    if (len(bsd) == 0 && (len(findInPath("gzip")) == 0 || len(findInPath("zip")) == 0)) {
+        return err("需要 bsdtar，或 gzip 与 zip");
+    }
+    let sums = "";
+    for (triple in strSplit(TARGETS, " ")) {
+        const archive = pack(o, triple, bsd, stage) catch (e) {
+            return e;
+        };
+        const b = readBytes(archive) catch (e) {
+            return e;
+        };
+        sums = sums + sha256Hex(b) + "  " + baseOf(archive) + "\n";
+        print("包：" + baseOf(archive) + "（" + toStr(bytesLen(b)) + " 字节）");
+    }
+    if (!osWriteFile(join(o.out, "SHA256SUMS"), bytesFromStr(sums), false)) {
+        return err("写不了 SHA256SUMS");
+    }
+    // 中间产物（各目标的编译器、未压缩的 tar、zip 的展开目录）不随发布：输出目录里只留归档与 SHA256SUMS。
+    if (!deleteTree(stage)) {
+        return err("删不掉：" + stage);
+    }
+    print(sums);
+    return 0;
+}
+
+function main(args: []string): int {
+    if (len(args) == 0) {
+        return usage();
+    }
+    return run(args) catch (e) {
+        eprint("release: " + e.message);
+        return 1;
+    };
+}

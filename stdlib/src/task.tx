@@ -1,0 +1,207 @@
+// ============================================================================
+// std/task —— TaskGroup：显式并发上限的批处理组（V0.9-A2；D26 §四；RT-07 库层）。
+//
+// **纯 .tx 库对象**（编译器/VM 不感知；async 面＝V0.9-A1 语言内建之上）。
+// add 入组＋drain 批环——未收割槽位按插入序补位至 limit → taskAwaitAny 裁决
+// → await 收割 → 补位，直到全部任务终结。完成序＝裁决序＝确定性（FIFO＋
+// 观察集插入序）。
+//
+// **着色面注意（S1 函数类型无 async 位——D3 v0.8 §8）**：spawn 发生在用户侧
+// 的 async 调用表达式（`five()`／`async (): int => ...`——被调表达式自带着色，
+// 调用即 spawn 惰性入队），本模块只收其 Future 入组。经普通 fn 类型形参转发
+// 调用会擦除着色（同步执行、内含 await 即结构化 trap），故 API 以 Future 直收。
+//
+// 任务面＝`Future<int>`（体级 err / 被取消的槽位计入 failed 计数，不入结果
+// 列表——结果列表＝成功槽按完成序）。SKIP＝收割 catch 默认值形态的内部
+// 哨兵（int 近最小值），模块外无意义。
+//
+// **异步深化（V0.10-A1；D29）**：timeout 包装（单态 Future<int>——S1 无用户
+// 泛型函数，评审定档；竞速走"包装 runner 同构化"——两 runner 各自 async 包装
+// 为同型 Future<int | Error> 标记值后 taskAwaitAny 裁决下标）＋
+// taskGroupCancel 组级取消传播（登记序遍历；cancel 后 drain 必达零 pending
+// ——结构化闭环）。
+//
+// **异构选择菜谱（D29 §二定档：无新语法/新内建——用例驱动后置）**：不同
+// T 的 Future 不可直入同一 List<Future<T>>（taskAwaitAny 同构约束）——
+// 包装统一为同型标记值（下标携带来源），载荷经捕获 Ref 共享：
+//   struct Pick { v: int }
+//   async function runA(f: Future< string >, cell: Ref< Pick >): int {
+//       const s = await f catch ""; cell.v = len(s); return 0;  // 下标 0＝A 源
+//   }
+//   // timer/他源 runner 同型返回 int 标记（下标 1…）；taskAwaitAny 裁决后
+//   // 经 cell 取载荷。timeout 即本菜谱的微缩应用（int 单态直透）。
+//
+// 用法（main 同步体只 spawn/入组；结果观察经 async 任务内 print）：
+//   const tg = taskGroupNew();
+//   taskGroupAdd(tg, five());                      // 直接调用即 spawn
+//   taskGroupAdd(tg, (async (): int => k * 10)()); // 直接调用，得 Future；捕获携参
+//   const rs = taskGroupDrain(tg, 2);              // async：调用处得 Future
+// ============================================================================
+
+// 收割哨兵（任务体级失败/取消槽位的 catch 默认值；与结果比对后不入列）。
+const SKIP: int = -9223372036854775807;
+
+export struct TaskGroup {
+    futures: List<Future<int>>,
+    failed: int,
+}
+
+// 建组（Ref 句柄语义：赋值/传参共享）。
+export function taskGroupNew(): Ref<TaskGroup> {
+    return new TaskGroup {
+        futures: listNew(),
+        failed: 0,
+    };
+}
+
+// 入组：future 入队尾（任务已在用户侧 spawn——惰性 FIFO）；返回槽位下标。
+export function taskGroupAdd(tg: Ref<TaskGroup>, fut: Future<int>): int {
+    listPush(tg.futures, fut);
+    return listLen(tg.futures) - 1;
+}
+
+// 批环收割（async——未决时挂起，调用处得 Future<List<int>>）：就绪补位至
+// limit → taskAwaitAny（插入序裁决）→ await 收割 → 补位，直至全部终结。
+// 返回＝成功槽结果按完成序；失败/取消槽入 failed 计数（taskGroupFailed 查询）。
+export async function taskGroupDrain(tg: Ref<TaskGroup>, limit: int): List<int> {
+    const results: List<int> = listNew();
+    const n = listLen(tg.futures);
+    const taken: List<bool> = listNew();
+    let i: int = 0;
+    while (i < n) {
+        listPush(taken, false);
+        i = i + 1;
+    }
+    let doneCount: int = 0;
+    let width: int = limit;
+    if (width < 1) { width = 1; } // limit 下限归一（显式上限非 0 批）
+    while (doneCount < n) {
+        // 批窗口＝未收割槽位的插入序前 width 个（确定性补位）。
+        const batch: List<Future<int>> = listNew();
+        const idxs: List<int> = listNew();
+        i = 0;
+        while (i < n && listLen(batch) < width) {
+            const isTaken: bool = listGet(taken, i) catch true;
+            if (!isTaken) {
+                const f = (listGet(tg.futures, i) catch err("taskGroup: 槽位索引越界（不可达）"))?;
+                listPush(batch, f);
+                listPush(idxs, i);
+            }
+            i = i + 1;
+        }
+        if (listLen(batch) == 0) {
+            break; // 不可达（doneCount < n 蕴含存在未收割槽）；防御死循环
+        }
+        const w = taskAwaitAny(batch); // 挂起裁决：任一终结即唤醒重扫
+        const wi: int = w catch 0; // 非空批裁决恒成功；空批已防御
+        const slot: int = listGet(idxs, wi) catch 0;
+        listSet(taken, slot, true);
+        doneCount = doneCount + 1;
+        const fut = (listGet(tg.futures, slot) catch err("taskGroup: 槽位索引越界（不可达）"))?;
+        const v: int = await fut catch failBump(tg); // 任务体级 err/取消 → 计数不入列
+        if (v != SKIP) {
+            listPush(results, v); // 成功槽按完成序收割
+        }
+    }
+    return results;
+}
+
+// 失败计数自增（收割 catch 默认值面；返回 SKIP 哨兵供比对）。
+function failBump(tg: Ref<TaskGroup>): int {
+    tg.failed = tg.failed + 1;
+    return SKIP;
+}
+
+// 失败/取消槽位计数（drain 后查询）。
+export function taskGroupFailed(tg: Ref<TaskGroup>): int {
+    return tg.failed;
+}
+
+// 组级取消传播（V0.10-A1；D29 §三）：遍历组内未决 future 逐 taskCancel——
+// 遍历序＝组内登记序（确定性）；已完成/已取消成员为空操作（既有语义）。
+// 取消后 drain 收割 err("task cancelled")——**cancel 后 drain 必达零 pending**
+// （结构化闭环：组级取消是清空未决任务的正规通道）。返回 void | Error：
+// 槽位越界防御通道（listGet None 经 catch err 桥接后 ? 传播——不可达）。
+export function taskGroupCancel(tg: Ref<TaskGroup>): void | Error {
+    let i: int = 0;
+    while (i < listLen(tg.futures)) {
+        const f = (listGet(tg.futures, i) catch err("taskGroup: 槽位索引越界（不可达）"))?;
+        taskCancel(f);
+        i = i + 1;
+    }
+    return assert(true, "taskGroupCancel: 正常出口"); // void 值出口（恒真无副作用）
+}
+
+// —— 超时包装（V0.10-A1；D29 §二）——
+//
+// **单态定档（评审）**：timeout 以 Future<int> 单态落地（stdlib 任务返回值
+// 主面）；他类型按用例逐型增包装，泛型函数维持排除（D3 v0.9 §九注记）。
+//
+// 实现＝spawn 包装任务，竞速走"包装 runner 同构化"：taskAwaitAny 只收同构
+// List<Future<T>>，f 与 sleepMs 的 Future 异构不可直竞——两 runner 各自 async
+// 包装为同型 Future<int | Error>（await_any 裁决下标携带来源）：
+//   下标 0＝f 先完成 → 透传结果（含 f 的体级 err 原样穿透），失败者
+//     runnerTimer taskCancel——sleepMs 定时器事后收割为空操作（D29 §一-3）；
+//   下标 1＝定时器先到期 → taskCancel(f)（失败者取消，V0.9 取消即清理
+//     语义复用）→ err("timeout")。
+// ms 负值：sleepMs 即 err future（D29 §一确定边界）→ err("sleep ms < 0")
+// 即刻胜出（确定性错误通道）。**着色约束（V0.9 裁决）**：f 必须是 Future
+// 直收——与 TaskGroup.spawn 同形态。
+//
+// **实现注记（评审定档的菜谱本体化）**：S1 类型文法不支持泛型实参内联
+// errunion（`List<Future<int | Error>>` 2002）——两 runner 以同型 Future<int>
+// 标记值入列（await_any 同构约束），结果经捕获 Ref cell 携带（done=1 值／
+// done=0 err）。裁决确定性：await_any 插入序扫描——同刻双胜出恒透传侧。
+// 败者时序：wrapper 读 cell 先于败者 runner 恢复（await 胜者已 done 不挂起
+// ——同段泵内完成），败者后到写不复读（确定性不受扰动）。
+//
+// timeout(f, ms) 为 async——调用即 spawn，调用处得 Future<int | Error>。
+export struct TimeoutCell {
+    done: int,
+    value: int,
+    message: string,
+}
+
+export async function timeout(f: Future<int>, ms: int): int | Error {
+    const cell = new TimeoutCell { done: 0, value: 0, message: "" };
+    const runners: List<Future<int>> = listNew();
+    listPush(runners, runnerPassthrough(f, cell));
+    listPush(runners, runnerTimer(ms, cell));
+    const i = taskAwaitAny(runners) catch -1;
+    if (i == 0) {
+        const rf = (listGet(runners, 1) catch err("timeout: runner 索引越界（不可达）"))?;
+        taskCancel(rf); // 失败者取消：定时器 runner（收割空操作路径）
+    } else if (i == 1) {
+        taskCancel(f); // 定时器先到期：失败者＝原任务（取消即清理）
+    } else {
+        return err("timeout: awaitAny 裁决失败"); // awaitAny 自身失败（空列不可达）
+    }
+    if (cell.done == 1) {
+        return cell.value;
+    }
+    return err(cell.message);
+}
+
+// 透传 runner：await f 值入 cell（int）；f 的体级 err 原样上抛（不丢失）。
+async function runnerPassthrough(f: Future<int>, cell: Ref<TimeoutCell>): int {
+    const v = await f catch (e) {
+        cell.done = 0;
+        cell.message = e.message;
+        return 0;
+    };
+    cell.done = 1;
+    cell.value = v;
+    return 0;
+}
+
+// 定时器 runner：ms 到期 → err("timeout")；sleepMs 负值 err 原样上抛。
+async function runnerTimer(ms: int, cell: Ref<TimeoutCell>): int {
+    await sleepMs(ms) catch (e) {
+        cell.done = 0;
+        cell.message = e.message;
+        return 0;
+    };
+    cell.done = 0;
+    cell.message = "timeout";
+    return 0;
+}

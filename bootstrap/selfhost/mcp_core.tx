@@ -1,0 +1,159 @@
+// MCP 核心工具（第 6 轮 6d-4；LSP 与 MCP 实施设计 §四-6、四-7）。compile 保留兼容的内部编码摘要，
+// run/test 共用 CLI 的宿主编译与逐测试核心；请求预算含编译，输出按字符边界保留头尾。
+import { mcpRequestMs } from "./mcp_request_budget";
+import { scratchProduct, scratchErrorJson } from "./mcp_scratch";
+import { jsonStart } from "./toolchain";
+import { JsonValue, jsonGet, jsonNew, JSON_STR, JSON_INT, JSON_ARR, JSON_NULL } from "./json_parse";
+import { disasmList } from "./disasm";
+import { McpOut } from "./mcp_debug";
+import { drvCompile, drvDiagOut, drvBytesOut, drvSetDebug, drvSetTestMode, drvTestNames } from "./driver";
+import { diagsArray, diagsDoc, testsBody } from "./cli_json";
+import { sha256Hex } from "./sha256";
+import { dbgStr } from "./dbg_out";
+import { filePath } from "./file_path";
+import { runBuildHost, runChild, runTests, runStderrJson, runCapNew, runCapAddText, runCapText, runCapTruncated } from "./run_core";
+import { hostTargetId } from "./target_host";
+
+function item(xs: List<Ref<JsonValue>>, at: int): Ref<JsonValue> { return listGet(xs, at) catch jsonNew(JSON_NULL); }
+
+export function mcpCoreTool(name: string, args: Ref<JsonValue>): Ref<McpOut> {
+    const start = monoNs();
+    const pv = jsonGet(args, "path") catch None;
+    if (pv == None) { return badParams("Invalid params: 缺少 path"); }
+    const p = pv catch args;
+    if (p.kind != JSON_STR) { return badParams("Invalid params: path 须为字符串"); }
+    if (len(p.s) == 0) { return badParams("Invalid params: path 为空"); }
+    let ms = mcpRequestMs();
+    const tv = jsonGet(args, "timeout_ms") catch None;
+    if (tv != None) {
+        const t = tv catch args;
+        if (t.kind != JSON_INT || t.i <= 0) { return badParams("Invalid params: timeout_ms 需要正整数（毫秒）"); }
+        if (t.i < ms) { ms = t.i; }
+    }
+    if (name == "compile") { return toolCompile(p.s); }
+    if (name == "disasm") { return toolDisasm(p.s, args, start, start + ms * 1000000); }
+    const av: List<string> = listNew();
+    if (name == "run") {
+        const vv = jsonGet(args, "args") catch None;
+        if (vv != None) {
+            const v = vv catch args;
+            if (v.kind != JSON_ARR) { return badParams("Invalid params: args 须为字符串数组"); }
+            let i = 0;
+            while (i < listLen(v.items)) {
+                const a = item(v.items, i);
+                if (a.kind != JSON_STR) { return badParams("Invalid params: args 须为字符串数组"); }
+                listPush(av, a.s);
+                i = i + 1;
+            }
+        }
+    }
+    return toolExecute(name, p.s, av, start, start + ms * 1000000);
+}
+
+function badParams(text: string): Ref<McpOut> {
+    return new McpOut { code: -32602, text: text, isErr: false };
+}
+
+function toolCompile(path: string): Ref<McpOut> {
+    const start = monoNs();
+    // debug_start 与 compile 共用常驻驱动；前者会留下调试开关，内部编码摘要须保持普通编译形态。
+    drvSetDebug(false);
+    drvSetTestMode(false);
+    const ok = drvCompile(path, 0) == 0;
+    let result = jsonStart("compile/1") + ",\"ok\":" + toStr(ok) + ",\"diags\":" + diagsArray(drvDiagOut());
+    if (ok) {
+        const b = drvBytesOut();
+        result = result + ",\"txc_sha256\":\"" + sha256Hex(b) + "\",\"txc_bytes\":" + toStr(bytesLen(b));
+    }
+    result = result + ",\"duration_us\":" + toStr((monoNs() - start) / 1000) + "}";
+    return new McpOut { code: 0, text: result, isErr: !ok };
+}
+
+function toolExecute(name: string, path: string, av: List<string>, start: int, deadline: int): Ref<McpOut> {
+    drvSetDebug(false);
+    drvSetTestMode(name == "test");
+    const exe = scratchProduct() catch (e) { return new McpOut { code: 0, isErr: true, text: scratchErrorJson(name, e.message) }; };
+    let needMain = 1;
+    if (name == "test") { needMain = 0; }
+    const built = runBuildHost(path, needMain, exe);
+    const out = runCapNew();
+    const err = runCapNew();
+    let code = 1;
+    let timedOut = monoNs() >= deadline;
+    let failed = !built.ok;
+    let truncated = false;
+    let signal = 0;
+    let extra = "";
+    // 子进程的输出已在 runChild／runTests 里按上限截过一次；直接采用，不再进第二个上限（否则标记重复、字数不实）。
+    let outDirect = false; let outText = "";
+    let errDirect = false; let errText = "";
+    if (name == "test") { extra = ",\"tests\":[],\"summary\":{\"total\":0,\"pass\":0,\"fail\":0}"; }
+    if (!built.ok) {
+        if (len(built.diags) > 0) { runCapAddText(err, diagsDoc(built.diags) + "\n"); }
+        else { runCapAddText(err, built.error + "\n"); }
+    } else if (!timedOut && name == "run") {
+        const r = runChild(exe, av, deadline, true, true, out);
+        code = r.code;
+        timedOut = r.timedOut;
+        truncated = r.truncated;
+        if (len(r.startError) > 0) {
+            code = 3;
+            failed = true;
+            runCapAddText(err, "taixu: 无法启动程序: " + r.startError + "\n");
+        } else {
+            errDirect = true; errText = runStderrJson(r.err);
+            if (code < 0 && !timedOut) { signal = 0 - code; code = -2; }
+        }
+    } else if (!timedOut) {
+        const r = runTests(exe, drvTestNames(), deadline, true);
+        code = 0;
+        if (r.failed > 0) { code = 2; }
+        if (len(r.startError) > 0) { code = 3; failed = true; }
+        timedOut = r.timedOut;
+        truncated = r.truncated;
+        outDirect = true; outText = r.stdout;
+        errDirect = true; errText = r.stderr;
+        extra = "," + testsBody(r.entries, r.passed, r.failed);
+        if (len(r.timeoutTest) > 0) { extra = extra + ",\"timeout_test\":" + dbgStr(r.timeoutTest); }
+    }
+    removeFile(filePath(exe)) catch (e) {};
+    if (timedOut) { code = -1; failed = true; }
+    let stdout = outText;
+    if (!outDirect) { stdout = runCapText(out); }
+    let stderr = errText;
+    if (!errDirect) { stderr = runCapText(err); }
+    truncated = truncated || runCapTruncated(out) || runCapTruncated(err);
+    let schema = "run/1";
+    if (name == "test") { schema = "tests/1"; }
+    let result = jsonStart(schema) + ",\"exit_code\":" + toStr(code) + ",\"timed_out\":" + toStr(timedOut) + ",\"truncated\":" + toStr(truncated)
+    + ",\"duration_us\":" + toStr((monoNs() - start) / 1000) + ",\"stdout\":" + dbgStr(stdout) + ",\"stderr\":" + dbgStr(stderr) + extra;
+    if (signal > 0) { result = result + ",\"signal\":" + toStr(signal); }
+    return new McpOut { code: 0, text: result + "}", isErr: failed };
+}
+
+function toolDisasm(path: string, args: Ref<JsonValue>, start: int, deadline: int): Ref<McpOut> {
+    let format = "text";
+    const fv = jsonGet(args, "format") catch None;
+    if (fv != None) {
+        const f = fv catch args;
+        if (f.kind != JSON_STR || (f.s != "text" && f.s != "json")) { return badParams("Invalid params: format 须为 text 或 json"); }
+        format = f.s;
+    }
+    // MCP 的 disasm 不带 target 参数，按宿主目标。
+    const r = disasmList(path, hostTargetId(), 16384, 1048400);
+    const timedOut = monoNs() >= deadline;
+    const out = runCapNew(); const errors = runCapNew();
+    let functions = "[]"; let code = 1; let cut = false;
+    if (timedOut) { code = -1; }
+    else if (r.ok) {
+        code = 0; functions = r.functions; cut = r.truncated;
+        if (format == "json") { runCapAddText(out, r.json + "\n"); }
+        else { runCapAddText(out, r.text); }
+    } else { runCapAddText(errors, diagsDoc(r.diags) + "\n"); }
+    const stdout = runCapText(out); const stderr = runCapText(errors);
+    cut = cut || runCapTruncated(out) || runCapTruncated(errors);
+    const result = jsonStart("mcp-disasm/1") + ",\"exit_code\":" + toStr(code) + ",\"timed_out\":" + toStr(timedOut) + ",\"truncated\":" + toStr(cut)
+    + ",\"duration_us\":" + toStr((monoNs() - start) / 1000) + ",\"stdout\":" + dbgStr(stdout) + ",\"stderr\":" + dbgStr(stderr)
+    + ",\"functions\":" + functions + ",\"format\":" + dbgStr(format) + "}";
+    return new McpOut { code: 0, text: result, isErr: code != 0 };
+}

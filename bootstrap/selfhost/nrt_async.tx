@@ -1,0 +1,852 @@
+// NRT 原生异步运行时（去 Zig 第 4 轮第 3 步；docs/design/v052-native-run-test-async-v0.1-20261014.md §四）：
+// 任务表、FIFO 就绪队、Future（Obj72 future 类，布局与 Zig FuturePayload 相同）、
+// 定时器、调度泵与四个任务内建。语义逐项对照 src/vm/interp/interp.zig 的任务运行时：
+// 惰性入队、同步栈排空后进入泵、单帧挂起（值槽整块移入快照，恢复后重新执行挂起点）、
+// 取消即清理、taskAwaitAny 插入序裁决、定时器 deadline 升序且同刻按登记序、死锁与
+// “退出时仍有未决任务”两种 trap。行为变化：2026-10-14 裁决的“只剩定时器时等待到期”（VM 同修）；
+// D3 v0.38 起 await 与 future 共享结果（VM 把结果移给第一个 await，再 await 得 None，违背 T | Error 的类型）。
+//
+// 只有任务的基帧能挂起：生成代码把 rbx（窗口基址）传进来，与任务窗口不符时按
+// “await 执行于无任务上下文”报错（async 着色经函数值擦除后在任务内同步调用）。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, RtOp, L, I, A, G } from "./rtfn_base";
+import { rtBegin, rtSet, rtSetGlobal, rtOp, rtShift, rtDivMod, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtIf32, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtCall5, rtCallList, rtSyscall, rtRet, rtRetVoid } from "./rtfn";
+import { ARITY, check, text, memcpyName, fatal, trapText, trapAt, arity, argTag, nrtTarget } from "./nrt_base";
+import { tRawSyscall, tUnix } from "./target";
+import { uxSys, uxClock } from "./unix_sys";
+
+export const NRT_ASYNC_EXPORTS: string = "__tx_task_spawn __tx_task_await __tx_task_bad_resume __tx_task_pump __tx_task_discard_tests __tx_task_pending __tx_bi_task_cancel __tx_bi_task_cancelled __tx_bi_task_await_any __tx_bi_sleep_ms";
+
+// 任务记录（96 字节，按任务号索引；表增长会搬动，跨调用一律按号重取）：
+// state@0（0 排队 1 运行 2 挂起 3 完成 4 已取消）cancel@8 fn@16 future@24
+// r0@32/40（首启时的 R0：闭包 env 或 {ref, 模块状态}）args@48 nargs@56
+// saved@64（挂起快照，挂起函数 reg_count 个值）savedPc@72 savedFn@80（同 VM
+// saved_fn：挂起帧所属函数，恢复与取消都按它取入口与槽数）gen@88（记录代数）。
+//
+// 记录回收（容量批 C4d）：任务完成或取消后记录挂上退役链（@8 改作链接，任务号＋1），下一调度轮开始时整条并入
+// 空闲链，spawn 优先复用并把代数加一——本轮就绪快照里的旧任务号不会指向复用后的新任务。Future 的观察者
+// 条目带代数（gen<<32｜任务号），裁决时代数不符即跳过，旧条目不会唤醒复用该记录的新任务；代数到 2^32−1 的
+// 记录不再回收（同 2c 句柄表），代数因此不会回绕。排队＋挂起的任务数
+// 在状态迁移处增减（__tx_task_npend），不再扫全表。原先记录只增不减、每次计数扫全表，长期运行的程序记录数
+// 与计数开销随总任务数增长。
+const TASK_BYTES: int = 96;
+const TASK_GEN: int = 88;
+const ST_QUEUED: int = 0;
+const ST_RUNNING: int = 1;
+const ST_SUSPENDED: int = 2;
+const ST_DONE: int = 3;
+const ST_CANCELLED: int = 4;
+// Future 对象（Obj72）：owner u32@24、state u32@28（0 未决 1 完成 2 取消）、
+// 观察者 {ptr@32 len@40 cap@48}（u32 任务号，插入序＝唤醒序）、result 值@56/64。
+const FUT_OWNER: int = 24;
+const FUT_STATE: int = 28;
+const FUT_OBS: int = 32;
+const FUT_OBS_LEN: int = 40;
+const FUT_OBS_CAP: int = 48;
+const FUT_RESULT: int = 56;
+const NO_OWNER: int = 4294967295;
+
+const NO_TASK: string = "await 执行于无任务上下文（async 着色经 fn 类型转发被擦除——须直接调用 async 函数/箭头，D3 v0.8 §8）";
+const DEADLOCK: string = "调度泵无进展轮且存在未决任务（await 死锁——检查任务间等待环，或补 TaskGroup/显式取消）";
+
+// 运行时状态在线程块里（thread_block_abi.tx）：四个向量 __tx_task_tab/rq/round/tm 各 {ptr, len, cap}，
+// 字 __tx_task_tseq/cur/resume/susp/win/main。
+
+function emitVectors(b: Ref<StructuredBuffer>): void {
+    // __tx_task_vgrow(vec, esz): 保证 len < cap（容量翻倍，起步 8）。
+    let f = rtBegin(b, "__tx_task_vgrow", "vec esz", "n cap p sz", 3, "bootstrap/selfhost/nrt_async.tx");
+    rtLoad(f, "n", L("vec"), 8, 8); rtLoad(f, "cap", L("vec"), 16, 8);
+    rtIf(f, L("n"), "lt", L("cap"), "done");
+    rtOp(f, "cap", L("cap"), "add", L("cap"));
+    rtIf(f, L("cap"), "ne", I(0), "sized");
+    rtSet(f, "cap", I(8));
+    rtLabel(f, "sized");
+    rtOp(f, "sz", L("cap"), "imul", L("esz"));
+    rtCall2(f, "p", "__tx_native_mem_alloc", L("sz"), I(8));
+    rtIf(f, L("p"), "eq", I(0), "oom");
+    rtIf(f, L("n"), "eq", I(0), "store");
+    rtOp(f, "sz", L("n"), "imul", L("esz"));
+    rtLoad(f, "n", L("vec"), 0, 8);
+    rtCall3(f, "", memcpyName(), L("p"), L("n"), L("sz"));
+    rtCall1(f, "", "__tx_native_mem_free", L("n"));
+    rtLabel(f, "store");
+    rtStore(f, L("vec"), 0, L("p"), 8); rtStore(f, L("vec"), 16, L("cap"), 8);
+    rtLabel(f, "done"); rtRetVoid(f);
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRetVoid(f); check(f);
+
+    // __tx_task_vpush(vec, value): 8 字节元素入队尾。
+    f = rtBegin(b, "__tx_task_vpush", "vec v", "n p", 2, "bootstrap/selfhost/nrt_async.tx");
+    rtCall2(f, "", "__tx_task_vgrow", L("vec"), I(8));
+    rtLoad(f, "n", L("vec"), 8, 8); rtLoad(f, "p", L("vec"), 0, 8);
+    rtShift(f, "p", L("n"), "shl", 3); rtLoad(f, "n", L("vec"), 0, 8); rtOp(f, "p", L("p"), "add", L("n"));
+    rtStore(f, L("p"), 0, L("v"), 8);
+    rtLoad(f, "n", L("vec"), 8, 8); rtOp(f, "n", L("n"), "add", I(1)); rtStore(f, L("vec"), 8, L("n"), 8);
+    rtRetVoid(f); check(f);
+
+    // __tx_task_vremove(vec, i): 8 字节元素按序摘除（后继前移）。
+    f = rtBegin(b, "__tx_task_vremove", "vec i", "n p q x", 0, "bootstrap/selfhost/nrt_async.tx");
+    rtLoad(f, "n", L("vec"), 8, 8); rtOp(f, "n", L("n"), "sub", I(1));
+    rtLabel(f, "loop");
+    rtIf(f, L("i"), "ge", L("n"), "done");
+    rtLoad(f, "p", L("vec"), 0, 8); rtShift(f, "q", L("i"), "shl", 3); rtOp(f, "p", L("p"), "add", L("q"));
+    rtLoad(f, "x", L("p"), 8, 8); rtStore(f, L("p"), 0, L("x"), 8);
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "loop");
+    rtLabel(f, "done"); rtStore(f, L("vec"), 8, L("n"), 8);
+    rtRetVoid(f); check(f);
+
+    // __tx_task_at(tid) → 任务记录地址。
+    f = rtBegin(b, "__tx_task_at", "tid", "p", 0, "bootstrap/selfhost/nrt_async.tx");
+    rtOp(f, "p", L("tid"), "imul", I(TASK_BYTES));
+    rtSet(f, "tid", A("__tx_task_tab")); rtLoad(f, "tid", L("tid"), 0, 8);
+    rtOp(f, "p", L("p"), "add", L("tid"));
+    rtRet(f, L("p")); check(f);
+}
+
+function emitClock(b: Ref<StructuredBuffer>): void {
+    // __tx_task_now() → 单调钟纳秒（与 monoNs 同源）。
+    let f = rtBegin(b, "__tx_task_now", "", "c fq hi lo r", 4, "bootstrap/selfhost/nrt_async.tx");
+    if (tUnix(nrtTarget())) {
+        rtAddrOf(f, "r", "c");
+        const xs: List<Ref<RtOp>> = listNew(); listPush(xs, I(uxClock(nrtTarget(), 1))); listPush(xs, L("r"));
+        uxSys(f, nrtTarget(), "", 228, xs);
+        rtOp(f, "r", L("c"), "imul", I(1000000000));
+        rtOp(f, "r", L("r"), "add", L("fq"));
+    } else {
+        rtAddrOf(f, "r", "c"); rtCall1(f, "", "QueryPerformanceCounter", L("r"));
+        rtAddrOf(f, "r", "fq"); rtCall1(f, "", "QueryPerformanceFrequency", L("r"));
+        rtDivMod(f, "hi", "lo", L("c"), L("fq"));
+        rtOp(f, "hi", L("hi"), "imul", I(1000000000));
+        rtOp(f, "lo", L("lo"), "imul", I(1000000000));
+        rtDivMod(f, "lo", "", L("lo"), L("fq"));
+        rtOp(f, "r", L("hi"), "add", L("lo"));
+    }
+    rtRet(f, L("r")); check(f);
+
+    // __tx_task_wait(): 睡到最早定时器到期（就绪队空、仍有未决任务时调用）。
+    f = rtBegin(b, "__tx_task_wait", "", "now d sec nsec r", 4, "bootstrap/selfhost/nrt_async.tx");
+    rtCall0(f, "now", "__tx_task_now");
+    rtSet(f, "d", A("__tx_task_tm")); rtLoad(f, "d", L("d"), 0, 8); rtLoad(f, "d", L("d"), 0, 8);
+    rtOp(f, "d", L("d"), "sub", L("now"));
+    rtIf(f, L("d"), "le", I(0), "done");
+    if (tUnix(nrtTarget())) {
+        // nanosleep(&{sec, nsec}, NULL)
+        rtDivMod(f, "sec", "nsec", L("d"), I(1000000000));
+        rtAddrOf(f, "r", "sec");
+        const xs: List<Ref<RtOp>> = listNew(); listPush(xs, L("r")); listPush(xs, I(0));
+        uxSys(f, nrtTarget(), "", 35, xs);
+    } else {
+        // 毫秒向上取整，上限 2^31-1（同 VM）。
+        rtDivMod(f, "d", "r", L("d"), I(1000000));
+        rtIf(f, L("r"), "eq", I(0), "whole");
+        rtOp(f, "d", L("d"), "add", I(1));
+        rtLabel(f, "whole");
+        rtIf(f, L("d"), "le", I(2147483647), "sleep");
+        rtSet(f, "d", I(2147483647));
+        rtLabel(f, "sleep");
+        rtCall1(f, "", "Sleep", L("d"));
+    }
+    rtLabel(f, "done"); rtRetVoid(f); check(f);
+}
+
+function emitFutures(b: Ref<StructuredBuffer>): void {
+    // __tx_task_new_future(owner, state) → idx（Obj72：kind 11 future、payload 8，rc 1）。
+    let f = rtBegin(b, "__tx_task_new_future", "owner st", "s0 s1 s2 s3 s4 s5 s6 s7 sp", 1, "bootstrap/selfhost/nrt_async.tx");
+    rtSet(f, "s0", I(11)); rtSet(f, "s1", I(34359738368));
+    rtSet(f, "s2", I(0)); rtSet(f, "s3", I(0)); rtSet(f, "s4", I(0));
+    rtOp(f, "s5", L("owner"), "and", I(4294967295)); rtShift(f, "st", L("st"), "shl", 32); rtOp(f, "s5", L("s5"), "or", L("st"));
+    rtSet(f, "s6", I(4)); rtSet(f, "s7", I(0));
+    rtAddrOf(f, "sp", "s0");
+    rtCall1(f, "s0", "__tx_native_object_create_v1", L("sp"));
+    rtRet(f, L("s0")); check(f);
+
+    // __tx_task_unref(idx): 释放一个 Future 引用（任务/定时器自持的那一份）。
+    f = rtBegin(b, "__tx_task_unref", "idx", "vt vp va", 1, "bootstrap/selfhost/nrt_async.tx");
+    rtSet(f, "vt", I(16)); rtOp(f, "vp", L("idx"), "and", I(4294967295));
+    rtAddrOf(f, "va", "vt"); rtCall1(f, "", "__tx_release", L("va"));
+    rtRetVoid(f); check(f);
+
+    // __tx_task_ref(idx): 增加一个 Future 引用。
+    f = rtBegin(b, "__tx_task_ref", "idx", "vt vp va", 1, "bootstrap/selfhost/nrt_async.tx");
+    rtSet(f, "vt", I(16)); rtOp(f, "vp", L("idx"), "and", I(4294967295));
+    rtAddrOf(f, "va", "vt"); rtCall1(f, "", "__tx_retain", L("va"));
+    rtRetVoid(f); check(f);
+
+    // __tx_task_observe(fut, tid): 观察者入列（插入序，允许重复——与 VM 相同）；条目 8 字节＝记录代数<<32｜任务号。
+    f = rtBegin(b, "__tx_task_observe", "fut tid", "o n cap p sz q g", 3, "bootstrap/selfhost/nrt_async.tx");
+    rtCall1(f, "g", "__tx_task_at", L("tid")); rtLoad(f, "g", L("g"), TASK_GEN, 8);
+    rtShift(f, "g", L("g"), "shl", 32); rtOp(f, "g", L("g"), "or", L("tid"));
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("fut"));
+    rtLoad(f, "n", L("o"), FUT_OBS_LEN, 8); rtLoad(f, "cap", L("o"), FUT_OBS_CAP, 8);
+    rtIf(f, L("n"), "lt", L("cap"), "put");
+    rtOp(f, "sz", L("cap"), "add", L("cap"));
+    rtIf(f, L("sz"), "ne", I(0), "sized");
+    rtSet(f, "sz", I(4));
+    rtLabel(f, "sized");
+    rtSet(f, "cap", L("sz"));
+    rtShift(f, "sz", L("cap"), "shl", 3);
+    rtCall2(f, "p", "__tx_native_mem_alloc", L("sz"), I(8));
+    rtIf(f, L("p"), "eq", I(0), "oom");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("fut"));
+    rtIf(f, L("n"), "eq", I(0), "fresh");
+    rtLoad(f, "q", L("o"), FUT_OBS, 8);
+    rtShift(f, "sz", L("n"), "shl", 3);
+    rtCall3(f, "", memcpyName(), L("p"), L("q"), L("sz"));
+    rtCall1(f, "", "__tx_native_mem_free", L("q"));
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("fut"));
+    rtLabel(f, "fresh");
+    rtStore(f, L("o"), FUT_OBS, L("p"), 8); rtStore(f, L("o"), FUT_OBS_CAP, L("cap"), 8);
+    rtLabel(f, "put");
+    rtLoad(f, "p", L("o"), FUT_OBS, 8); rtShift(f, "q", L("n"), "shl", 3); rtOp(f, "p", L("p"), "add", L("q"));
+    rtStore(f, L("p"), 0, L("g"), 8);
+    rtOp(f, "n", L("n"), "add", I(1)); rtStore(f, L("o"), FUT_OBS_LEN, L("n"), 8);
+    rtRetVoid(f);
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRetVoid(f); check(f);
+
+    // __tx_task_resolve(fut, state, rtag, rpay): 裁决（1 完成带结果／2 取消），按观察
+    // 集插入序唤醒挂起中的观察者入就绪队尾，再清空观察集（保留容量）。
+    f = rtBegin(b, "__tx_task_resolve", "fut st rt rp", "o n i p tid t s g", 2, "bootstrap/selfhost/nrt_async.tx");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("fut"));
+    rtStore(f, L("o"), FUT_STATE, L("st"), 4);
+    rtIf(f, L("st"), "ne", I(1), "wake");
+    rtStore(f, L("o"), FUT_RESULT, L("rt"), 8); rtStore(f, L("o"), FUT_RESULT + 8, L("rp"), 8);
+    rtLabel(f, "wake");
+    rtLoad(f, "n", L("o"), FUT_OBS_LEN, 8);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "loop");
+    rtIf(f, L("i"), "ge", L("n"), "done");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("fut"));
+    rtLoad(f, "p", L("o"), FUT_OBS, 8); rtShift(f, "tid", L("i"), "shl", 3); rtOp(f, "p", L("p"), "add", L("tid"));
+    rtLoad(f, "tid", L("p"), 0, 8);
+    rtShift(f, "g", L("tid"), "shr", 32); rtOp(f, "tid", L("tid"), "and", I(4294967295));
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtLoad(f, "s", L("t"), TASK_GEN, 8);
+    rtIf(f, L("s"), "ne", L("g"), "next");
+    rtLoad(f, "s", L("t"), 0, 8);
+    rtIf(f, L("s"), "ne", I(ST_SUSPENDED), "next");
+    rtStore(f, L("t"), 0, I(ST_QUEUED), 8);
+    rtCall2(f, "", "__tx_task_vpush", A("__tx_task_rq"), L("tid"));
+    rtLabel(f, "next");
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "loop");
+    rtLabel(f, "done");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("fut"));
+    rtStore(f, L("o"), FUT_OBS_LEN, I(0), 8);
+    rtRetVoid(f); check(f);
+}
+
+function emitTaskCore(b: Ref<StructuredBuffer>): void {
+    // __tx_task_pending() → 排队＋挂起的任务数（结构化出口守护的计数面）；状态迁移处增减（容量批 C4d）。
+    let f = rtBegin(b, "__tx_task_pending", "", "", 0, "bootstrap/selfhost/nrt_async.tx");
+    rtRet(f, G("__tx_task_npend")); check(f);
+
+    // __tx_task_npend_add(d)：排队＋挂起计数加 d。
+    f = rtBegin(b, "__tx_task_npend_add", "d", "x", 0, "bootstrap/selfhost/nrt_async.tx");
+    rtOp(f, "x", G("__tx_task_npend"), "add", L("d"));
+    rtSetGlobal(f, "__tx_task_npend", L("x"));
+    rtRetVoid(f); check(f);
+
+    // __tx_task_retire(tid)：已终结的任务记录挂上退役链尾（@8 改作链接）；代数到顶的记录留在原处不再复用。
+    f = rtBegin(b, "__tx_task_retire", "tid", "t x", 1, "bootstrap/selfhost/nrt_async.tx");
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtLoad(f, "x", L("t"), TASK_GEN, 8);
+    rtIf(f, L("x"), "uge", I(4294967295), "keep");
+    rtStore(f, L("t"), 8, I(0), 8);
+    rtOp(f, "x", L("tid"), "add", I(1));
+    rtIf(f, G("__tx_task_retired"), "ne", I(0), "append");
+    rtSetGlobal(f, "__tx_task_retired", L("x"));
+    rtSetGlobal(f, "__tx_task_rtail", L("x"));
+    rtRetVoid(f);
+    rtLabel(f, "append");
+    rtSet(f, "t", G("__tx_task_rtail")); rtOp(f, "t", L("t"), "sub", I(1));
+    rtCall1(f, "t", "__tx_task_at", L("t"));
+    rtStore(f, L("t"), 8, L("x"), 8);
+    rtSetGlobal(f, "__tx_task_rtail", L("x"));
+    rtLabel(f, "keep"); rtRetVoid(f); check(f);
+
+    // __tx_task_recycle()：调度轮开始时退役链整条并入空闲链。
+    f = rtBegin(b, "__tx_task_recycle", "", "t", 1, "bootstrap/selfhost/nrt_async.tx");
+    rtIf(f, G("__tx_task_retired"), "eq", I(0), "done");
+    rtSet(f, "t", G("__tx_task_rtail")); rtOp(f, "t", L("t"), "sub", I(1));
+    rtCall1(f, "t", "__tx_task_at", L("t"));
+    rtStore(f, L("t"), 8, G("__tx_task_free"), 8);
+    rtSetGlobal(f, "__tx_task_free", G("__tx_task_retired"));
+    rtSetGlobal(f, "__tx_task_retired", I(0));
+    rtSetGlobal(f, "__tx_task_rtail", I(0));
+    rtLabel(f, "done"); rtRetVoid(f); check(f);
+
+    // __tx_task_spawn(win, a, nargs, fn, pc)：调用即 spawn（惰性入 FIFO）。R[A] 为
+    // fnv 或闭包（ref，字段 0 为 fnv）；实参快照逐个 retain（源槽仍归调用方），
+    // 闭包 env 另 retain 一份交任务；Future rc 2（R[A] 一份、任务自持一份）。
+    const notFn = "async 启动目标不是函数";
+    f = rtBegin(b, "__tx_task_spawn", "win a nargs fn pc", "p tag h o x target r0t r0p tid fut args i sz t vt vp va reuse", 5, "bootstrap/selfhost/nrt_async.tx");
+    rtOp(f, "p", L("a"), "and", I(4294967295)); rtShift(f, "p", L("p"), "shl", 4); rtOp(f, "p", L("p"), "add", L("win"));
+    rtOp(f, "nargs", L("nargs"), "and", I(4294967295));
+    rtLoad(f, "tag", L("p"), 0, 1);
+    rtIf(f, L("tag"), "eq", I(12), "fnv");
+    rtIf(f, L("tag"), "ne", I(9), "bad");
+    rtLoad(f, "h", L("p"), 8, 4);
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("h"));
+    rtLoad(f, "x", L("o"), 16, 4); rtIf(f, L("x"), "ne", I(1), "bad");
+    rtLoad(f, "x", L("o"), 40, 8); rtIf(f, L("x"), "lt", I(2), "bad");
+    rtLoad(f, "x", L("o"), 32, 8);
+    rtLoad(f, "tag", L("x"), 0, 1); rtIf(f, L("tag"), "ne", I(12), "bad");
+    rtLoad(f, "target", L("x"), 8, 4);
+    rtSet(f, "r0t", I(9)); rtSet(f, "r0p", L("h"));
+    rtSet(f, "vt", I(9)); rtSet(f, "vp", L("h")); rtAddrOf(f, "va", "vt"); rtCall1(f, "", "__tx_retain", L("va"));
+    rtJump(f, "have");
+    rtLabel(f, "fnv");
+    rtLoad(f, "target", L("p"), 8, 4);
+    rtIf(f, L("target"), "uge", G("__tx_rt_table_len"), "bad");
+    rtShift(f, "x", L("target"), "shl", 4); rtOp(f, "x", L("x"), "add", G("__tx_rt_table_ptr"));
+    rtSet(f, "r0t", I(9)); rtLoad(f, "r0p", L("x"), 12, 4);
+    rtLabel(f, "have");
+    // 任务号：空闲链有记录就复用（代数加一），否则表尾新增。
+    rtSet(f, "reuse", G("__tx_task_free"));
+    rtIf(f, L("reuse"), "eq", I(0), "fresh");
+    rtOp(f, "tid", L("reuse"), "sub", I(1));
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtLoad(f, "x", L("t"), 8, 8); rtSetGlobal(f, "__tx_task_free", L("x"));
+    rtLoad(f, "x", L("t"), TASK_GEN, 8); rtOp(f, "x", L("x"), "add", I(1));
+    rtStore(f, L("t"), TASK_GEN, L("x"), 8);
+    rtJump(f, "haveid");
+    rtLabel(f, "fresh");
+    rtSet(f, "tid", A("__tx_task_tab")); rtLoad(f, "tid", L("tid"), 8, 8);
+    rtLabel(f, "haveid");
+    rtCall2(f, "fut", "__tx_task_new_future", L("tid"), I(0));
+    rtSet(f, "vt", I(16)); rtSet(f, "vp", L("fut")); rtAddrOf(f, "va", "vt"); rtCall1(f, "", "__tx_retain", L("va"));
+    rtSet(f, "args", I(0));
+    rtIf(f, L("nargs"), "eq", I(0), "noargs");
+    rtShift(f, "sz", L("nargs"), "shl", 4);
+    rtCall2(f, "args", "__tx_native_mem_alloc", L("sz"), I(8));
+    rtIf(f, L("args"), "eq", I(0), "oom");
+    rtOp(f, "p", L("a"), "and", I(4294967295)); rtShift(f, "p", L("p"), "shl", 4); rtOp(f, "p", L("p"), "add", L("win")); rtOp(f, "p", L("p"), "add", I(16));
+    rtCall3(f, "", memcpyName(), L("args"), L("p"), L("sz"));
+    rtSet(f, "i", I(0));
+    rtLabel(f, "retain");
+    rtIf(f, L("i"), "ge", L("nargs"), "noargs");
+    rtShift(f, "x", L("i"), "shl", 4); rtOp(f, "x", L("x"), "add", L("args"));
+    rtCall1(f, "", "__tx_retain", L("x"));
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "retain");
+    rtLabel(f, "noargs");
+    rtIf(f, L("reuse"), "ne", I(0), "init");
+    rtCall2(f, "", "__tx_task_vgrow", A("__tx_task_tab"), I(TASK_BYTES));
+    rtSet(f, "x", A("__tx_task_tab")); rtOp(f, "i", L("tid"), "add", I(1)); rtStore(f, L("x"), 8, L("i"), 8);
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtStore(f, L("t"), TASK_GEN, I(0), 8);
+    rtLabel(f, "init");
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtStore(f, L("t"), 0, I(ST_QUEUED), 8); rtStore(f, L("t"), 8, I(0), 8);
+    rtStore(f, L("t"), 16, L("target"), 8); rtStore(f, L("t"), 24, L("fut"), 8);
+    rtStore(f, L("t"), 32, L("r0t"), 8); rtStore(f, L("t"), 40, L("r0p"), 8);
+    rtStore(f, L("t"), 48, L("args"), 8); rtStore(f, L("t"), 56, L("nargs"), 8);
+    rtStore(f, L("t"), 64, I(0), 8); rtStore(f, L("t"), 72, I(0), 8); rtStore(f, L("t"), 80, L("target"), 8);
+    rtCall1(f, "", "__tx_task_npend_add", I(1));
+    rtCall2(f, "", "__tx_task_vpush", A("__tx_task_rq"), L("tid"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(16), L("fut"));
+    rtRetVoid(f);
+    trapAt(b, f, "bad", 4010, notFn);
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRetVoid(f); check(f);
+
+    // __tx_task_suspend(win, fn, pc): 当前任务挂起——窗口 reg_count 个值零释放移入
+    // 快照（窗口置 None），记下恢复 pc（挂起点本身，恢复后重新执行）。
+    f = rtBegin(b, "__tx_task_suspend", "win fn pc", "tid reg sz snap t", 3, "bootstrap/selfhost/nrt_async.tx");
+    rtSet(f, "tid", G("__tx_task_cur")); rtOp(f, "tid", L("tid"), "sub", I(1));
+    rtOp(f, "reg", L("fn"), "and", I(4294967295)); rtShift(f, "reg", L("reg"), "shl", 4); rtOp(f, "reg", L("reg"), "add", G("__tx_rt_table_ptr"));
+    rtLoad(f, "reg", L("reg"), 8, 4);
+    rtShift(f, "sz", L("reg"), "shl", 4);
+    rtIf(f, L("sz"), "ne", I(0), "sized");
+    rtSet(f, "sz", I(16));
+    rtLabel(f, "sized");
+    rtCall2(f, "snap", "__tx_native_mem_alloc", L("sz"), I(8));
+    rtIf(f, L("snap"), "eq", I(0), "oom");
+    rtShift(f, "sz", L("reg"), "shl", 4);
+    rtCall3(f, "", memcpyName(), L("snap"), L("win"), L("sz"));
+    rtCall2(f, "", "__tx_nrt_window", L("win"), L("reg"));
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtStore(f, L("t"), 64, L("snap"), 8);
+    rtOp(f, "pc", L("pc"), "and", I(4294967295)); rtStore(f, L("t"), 72, L("pc"), 8);
+    rtOp(f, "fn", L("fn"), "and", I(4294967295)); rtStore(f, L("t"), 80, L("fn"), 8);
+    rtStore(f, L("t"), 0, I(ST_SUSPENDED), 8);
+    rtCall1(f, "", "__tx_task_npend_add", I(1));
+    rtRetVoid(f);
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRetVoid(f); check(f);
+
+    // __tx_task_await(win, a, fn, pc) → 0 结果已入 R[A]／1 已挂起（函数须立即返回）。
+    f = rtBegin(b, "__tx_task_await", "win a fn pc", "p tag h o st rt rp e", 5, "bootstrap/selfhost/nrt_async.tx");
+    rtOp(f, "p", L("a"), "and", I(4294967295)); rtShift(f, "p", L("p"), "shl", 4); rtOp(f, "p", L("p"), "add", L("win"));
+    rtLoad(f, "tag", L("p"), 0, 1);
+    rtIf(f, L("tag"), "ne", I(16), "notfut");
+    rtLoad(f, "h", L("p"), 8, 4);
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("h"));
+    rtLoad(f, "st", L("o"), FUT_STATE, 4);
+    rtIf(f, L("st"), "eq", I(1), "done");
+    rtIf(f, L("st"), "eq", I(2), "cancelled");
+    rtIf(f, G("__tx_task_cur"), "eq", I(0), "notask");
+    rtIf(f, L("win"), "ne", G("__tx_task_win"), "notask");
+    rtSet(f, "e", G("__tx_task_cur")); rtOp(f, "e", L("e"), "sub", I(1));
+    rtCall2(f, "", "__tx_task_observe", L("h"), L("e"));
+    rtCall3(f, "", "__tx_task_suspend", L("win"), L("fn"), L("pc"));
+    rtRet(f, I(1));
+    rtLabel(f, "done");
+    // 结果与 future 共享（D3 v0.38 §6.12-2）：槽得一份引用，future 留着自己那份，再 await 得同一结果；future 释放时
+    // 经载荷视图连带释放结果。先 retain 再写槽：槽 A 原来放的正是这个 future，写槽可能放掉它的最后一个引用。
+    rtLoad(f, "rt", L("o"), FUT_RESULT, 8); rtLoad(f, "rp", L("o"), FUT_RESULT + 8, 8);
+    rtOp(f, "e", L("o"), "add", I(FUT_RESULT));
+    rtCall1(f, "", "__tx_retain", L("e"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), L("rt"), L("rp"));
+    rtRet(f, I(0));
+    rtLabel(f, "cancelled");
+    const cancelled = "task cancelled";
+    rtCall3(f, "e", "__tx_nrt_str_copy", A(text(b, cancelled)), I(len(cancelled)), I(2));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(5), L("e"));
+    rtRet(f, I(0));
+    trapAt(b, f, "notfut", 4010, "await 的操作数不是 Future");
+    trapAt(b, f, "notask", 4010, NO_TASK);
+    rtRetVoid(f); check(f);
+
+    // __tx_task_cancel(tid, cwin, cfn, cpc)：排队/挂起中——摘队、释放未移交的输入、
+    // 处理挂起快照（见下）、裁决 cancelled、释放任务自持的 Future 引用；运行中——只置
+    // 协作旗标；已终结——空操作。有挂起快照时（D3 v0.21 async 中的 defer）：在取消者
+    // 帧（cwin，函数 cfn）之上开窗，快照移入，以“取消模式”（__tx_task_resume 置位
+    // 2^30）调用挂起函数——挂起点有已登记 defer 的跳到取消落点，按后进先出执行后正常
+    // 返回；没有的直接返回。随后释放窗口剩余值（与 VM 释放快照同序）。落点运行时
+    // 当前任务是被取消者，taskCancelled() 为真。
+    f = rtBegin(b, "__tx_task_cancel", "tid cwin cfn cpc", "t s n i p x reg fut fp lw prev", 5, "bootstrap/selfhost/nrt_async.tx");
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtLoad(f, "s", L("t"), 0, 8);
+    rtIf(f, L("s"), "eq", I(ST_DONE), "done");
+    rtIf(f, L("s"), "eq", I(ST_CANCELLED), "done");
+    rtIf(f, L("s"), "ne", I(ST_RUNNING), "pending");
+    rtStore(f, L("t"), 8, I(1), 8);
+    rtLabel(f, "done"); rtRetVoid(f);
+    rtLabel(f, "pending");
+    rtStore(f, L("t"), 0, I(ST_CANCELLED), 8);
+    rtCall1(f, "", "__tx_task_npend_add", I(-1));
+    rtSet(f, "p", A("__tx_task_rq")); rtLoad(f, "n", L("p"), 8, 8);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "find");
+    rtIf(f, L("i"), "ge", L("n"), "inputs");
+    rtSet(f, "p", A("__tx_task_rq")); rtLoad(f, "p", L("p"), 0, 8); rtShift(f, "x", L("i"), "shl", 3); rtOp(f, "p", L("p"), "add", L("x"));
+    rtLoad(f, "x", L("p"), 0, 8);
+    rtIf(f, L("x"), "eq", L("tid"), "unqueue");
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "find");
+    rtLabel(f, "unqueue");
+    rtCall2(f, "", "__tx_task_vremove", A("__tx_task_rq"), L("i"));
+    rtLabel(f, "inputs");
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtLoad(f, "n", L("t"), 56, 8); rtSet(f, "i", I(0));
+    rtLabel(f, "args");
+    rtIf(f, L("i"), "ge", L("n"), "argsdone");
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtLoad(f, "p", L("t"), 48, 8); rtShift(f, "x", L("i"), "shl", 4); rtOp(f, "p", L("p"), "add", L("x"));
+    rtCall1(f, "", "__tx_release", L("p"));
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "args");
+    rtLabel(f, "argsdone");
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtLoad(f, "p", L("t"), 48, 8);
+    rtIf(f, L("p"), "eq", I(0), "env");
+    rtCall1(f, "", "__tx_native_mem_free", L("p"));
+    rtLabel(f, "env");
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtStore(f, L("t"), 48, I(0), 8); rtStore(f, L("t"), 56, I(0), 8);
+    rtOp(f, "p", L("t"), "add", I(32));
+    rtCall1(f, "", "__tx_release", L("p"));
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtStore(f, L("t"), 32, I(4), 8); rtStore(f, L("t"), 40, I(0), 8);
+    rtLoad(f, "p", L("t"), 64, 8);
+    rtIf(f, L("p"), "eq", I(0), "resolve");
+    rtLoad(f, "x", L("t"), 80, 8); rtShift(f, "x", L("x"), "shl", 4); rtOp(f, "x", L("x"), "add", G("__tx_rt_table_ptr"));
+    rtLoad(f, "fp", L("x"), 0, 8); rtLoad(f, "reg", L("x"), 8, 4);
+    rtOp(f, "x", L("cfn"), "and", I(4294967295)); rtShift(f, "x", L("x"), "shl", 4); rtOp(f, "x", L("x"), "add", G("__tx_rt_table_ptr"));
+    rtLoad(f, "x", L("x"), 8, 4); rtShift(f, "x", L("x"), "shl", 4);
+    rtOp(f, "lw", L("cwin"), "add", L("x"));
+    rtShift(f, "x", L("reg"), "shl", 4); rtOp(f, "x", L("x"), "add", L("lw"));
+    rtIf(f, L("x"), "ule", G("__tx_stack_limit"), "room");
+    rtCall1(f, "x", "__tx_stack_more", L("x"));
+    rtIf(f, L("x"), "eq", I(0), "overflow");
+    rtLabel(f, "room");
+    rtShift(f, "x", L("reg"), "shl", 4);
+    rtCall3(f, "", memcpyName(), L("lw"), L("p"), L("x"));
+    rtCall1(f, "", "__tx_native_mem_free", L("p"));
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtStore(f, L("t"), 64, I(0), 8); rtStore(f, L("t"), 8, I(1), 8);
+    rtLoad(f, "x", L("t"), 72, 8); rtOp(f, "x", L("x"), "add", I(1)); rtOp(f, "x", L("x"), "or", I(1073741824));
+    rtSetGlobal(f, "__tx_task_resume", L("x"));
+    rtSet(f, "prev", G("__tx_task_cur"));
+    rtOp(f, "x", L("tid"), "add", I(1)); rtSetGlobal(f, "__tx_task_cur", L("x"));
+    rtCall1(f, "", "*fp", L("lw"));
+    rtSetGlobal(f, "__tx_task_cur", L("prev"));
+    rtSet(f, "i", I(0));
+    rtLabel(f, "saved");
+    rtIf(f, L("i"), "ge", L("reg"), "cleared");
+    rtShift(f, "x", L("i"), "shl", 4); rtOp(f, "x", L("x"), "add", L("lw"));
+    rtCall1(f, "", "__tx_release", L("x"));
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "saved");
+    rtLabel(f, "cleared");
+    rtCall2(f, "", "__tx_nrt_window", L("lw"), L("reg"));
+    rtLabel(f, "resolve");
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtLoad(f, "fut", L("t"), 24, 8);
+    rtCall4(f, "", "__tx_task_resolve", L("fut"), I(2), I(4), I(0));
+    rtCall1(f, "", "__tx_task_unref", L("fut"));
+    rtCall1(f, "", "__tx_task_retire", L("tid"));
+    rtRetVoid(f);
+    rtLabel(f, "overflow");
+    const deep = "调用栈深度超限";
+    rtCall5(f, "", "__tx_trap", L("cfn"), L("cpc"), I(4003), A(text(b, deep)), I(len(deep)));
+    rtRetVoid(f); check(f);
+
+    // __tx_task_run(tid)：首启（R0、实参所有权移交窗口）或恢复（快照移回、经
+    // __tx_task_resume 跳回挂起点），运行至完成或再次挂起；完成即裁决 Future。
+    f = rtBegin(b, "__tx_task_run", "tid", "t e fp reg win snap sz n p rt rp fut", 3, "bootstrap/selfhost/nrt_async.tx");
+    rtOp(f, "e", L("tid"), "add", I(1)); rtSetGlobal(f, "__tx_task_cur", L("e"));
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtLoad(f, "e", L("t"), 80, 8); rtShift(f, "e", L("e"), "shl", 4); rtOp(f, "e", L("e"), "add", G("__tx_rt_table_ptr"));
+    rtLoad(f, "fp", L("e"), 0, 8); rtLoad(f, "reg", L("e"), 8, 4);
+    rtSet(f, "win", G("__tx_task_win"));
+    // 快照移回之前先确保窗口所在的值槽栈已提交（2d，线程设计 §十七）。
+    rtShift(f, "sz", L("reg"), "shl", 4); rtOp(f, "sz", L("sz"), "add", L("win"));
+    rtCall1(f, "", "__tx_stack_ensure", L("sz"));
+    rtLoad(f, "snap", L("t"), 64, 8);
+    rtIf(f, L("snap"), "eq", I(0), "first");
+    rtShift(f, "sz", L("reg"), "shl", 4);
+    rtCall3(f, "", memcpyName(), L("win"), L("snap"), L("sz"));
+    rtCall1(f, "", "__tx_native_mem_free", L("snap"));
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtStore(f, L("t"), 64, I(0), 8);
+    rtLoad(f, "e", L("t"), 72, 8); rtOp(f, "e", L("e"), "add", I(1)); rtSetGlobal(f, "__tx_task_resume", L("e"));
+    rtJump(f, "go");
+    rtLabel(f, "first");
+    rtCall2(f, "", "__tx_nrt_window", L("win"), L("reg"));
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtLoad(f, "e", L("t"), 32, 8); rtStore(f, L("win"), 0, L("e"), 8);
+    rtLoad(f, "e", L("t"), 40, 8); rtStore(f, L("win"), 8, L("e"), 8);
+    rtStore(f, L("t"), 32, I(4), 8); rtStore(f, L("t"), 40, I(0), 8);
+    rtLoad(f, "p", L("t"), 48, 8); rtLoad(f, "n", L("t"), 56, 8);
+    rtIf(f, L("n"), "eq", I(0), "noargs");
+    rtShift(f, "sz", L("n"), "shl", 4); rtOp(f, "e", L("win"), "add", I(16));
+    rtCall3(f, "", memcpyName(), L("e"), L("p"), L("sz"));
+    rtLabel(f, "noargs");
+    rtIf(f, L("p"), "eq", I(0), "go");
+    rtCall1(f, "", "__tx_native_mem_free", L("p"));
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtStore(f, L("t"), 48, I(0), 8); rtStore(f, L("t"), 56, I(0), 8);
+    rtLabel(f, "go");
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtStore(f, L("t"), 0, I(ST_RUNNING), 8);
+    rtCall1(f, "", "__tx_task_npend_add", I(-1));
+    rtCall1(f, "", "*fp", L("win"));
+    rtSetGlobal(f, "__tx_task_cur", I(0)); rtSetGlobal(f, "__tx_task_susp", I(0));
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtLoad(f, "e", L("t"), 0, 8);
+    rtIf(f, L("e"), "ne", I(ST_RUNNING), "out");
+    rtStore(f, L("t"), 0, I(ST_DONE), 8);
+    rtLoad(f, "fut", L("t"), 24, 8);
+    rtLoad(f, "rt", L("win"), 0, 8); rtLoad(f, "rp", L("win"), 8, 8);
+    rtStore(f, L("win"), 0, I(4), 8); rtStore(f, L("win"), 8, I(0), 8);
+    rtCall4(f, "", "__tx_task_resolve", L("fut"), I(1), L("rt"), L("rp"));
+    rtCall1(f, "", "__tx_task_unref", L("fut"));
+    rtCall1(f, "", "__tx_task_retire", L("tid"));
+    rtLabel(f, "out"); rtRetVoid(f); check(f);
+}
+
+function emitTimers(b: Ref<StructuredBuffer>): void {
+    // __tx_task_timer_add(deadline, fut)：按 deadline 升序插入；严格大于才前移
+    // ＝同刻新条目排在既有等刻之后（同刻登记序）。条目 24 字节 {deadline, fut, seq}。
+    let f = rtBegin(b, "__tx_task_timer_add", "dl fut", "seq n p pos e x j", 2, "bootstrap/selfhost/nrt_async.tx");
+    rtSet(f, "seq", G("__tx_task_tseq")); rtOp(f, "x", L("seq"), "add", I(1)); rtSetGlobal(f, "__tx_task_tseq", L("x"));
+    rtCall2(f, "", "__tx_task_vgrow", A("__tx_task_tm"), I(24));
+    rtSet(f, "p", A("__tx_task_tm")); rtLoad(f, "n", L("p"), 8, 8); rtLoad(f, "p", L("p"), 0, 8);
+    rtSet(f, "pos", L("n"));
+    rtLabel(f, "scan");
+    rtIf(f, L("pos"), "eq", I(0), "place");
+    rtOp(f, "e", L("pos"), "sub", I(1)); rtOp(f, "e", L("e"), "imul", I(24)); rtOp(f, "e", L("e"), "add", L("p"));
+    rtLoad(f, "x", L("e"), 0, 8);
+    rtIf(f, L("x"), "le", L("dl"), "place");
+    rtOp(f, "pos", L("pos"), "sub", I(1)); rtJump(f, "scan");
+    rtLabel(f, "place");
+    rtSet(f, "j", L("n"));
+    rtLabel(f, "shift");
+    rtIf(f, L("j"), "le", L("pos"), "put");
+    rtOp(f, "e", L("j"), "imul", I(24)); rtOp(f, "e", L("e"), "add", L("p"));
+    rtLoad(f, "x", L("e"), -24, 8); rtStore(f, L("e"), 0, L("x"), 8);
+    rtLoad(f, "x", L("e"), -16, 8); rtStore(f, L("e"), 8, L("x"), 8);
+    rtLoad(f, "x", L("e"), -8, 8); rtStore(f, L("e"), 16, L("x"), 8);
+    rtOp(f, "j", L("j"), "sub", I(1)); rtJump(f, "shift");
+    rtLabel(f, "put");
+    rtOp(f, "e", L("pos"), "imul", I(24)); rtOp(f, "e", L("e"), "add", L("p"));
+    rtStore(f, L("e"), 0, L("dl"), 8); rtStore(f, L("e"), 8, L("fut"), 8); rtStore(f, L("e"), 16, L("seq"), 8);
+    rtSet(f, "p", A("__tx_task_tm")); rtOp(f, "n", L("n"), "add", I(1)); rtStore(f, L("p"), 8, L("n"), 8);
+    rtRetVoid(f); check(f);
+
+    // __tx_task_harvest()：到期条目按队列序裁决 done（结果 None），已裁决者跳过；
+    // 定时器自持引用逐条释放，到期段整体前移出队。
+    f = rtBegin(b, "__tx_task_harvest", "", "n now due e x o p k", 4, "bootstrap/selfhost/nrt_async.tx");
+    rtSet(f, "p", A("__tx_task_tm")); rtLoad(f, "n", L("p"), 8, 8);
+    rtIf(f, L("n"), "eq", I(0), "out");
+    rtCall0(f, "now", "__tx_task_now");
+    rtSet(f, "due", I(0));
+    rtLabel(f, "loop");
+    rtIf(f, L("due"), "ge", L("n"), "compact");
+    rtSet(f, "p", A("__tx_task_tm")); rtLoad(f, "p", L("p"), 0, 8);
+    rtOp(f, "e", L("due"), "imul", I(24)); rtOp(f, "e", L("e"), "add", L("p"));
+    rtLoad(f, "x", L("e"), 0, 8);
+    rtIf(f, L("x"), "gt", L("now"), "compact");
+    rtLoad(f, "x", L("e"), 8, 8);
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("x"));
+    rtLoad(f, "o", L("o"), FUT_STATE, 4);
+    rtIf(f, L("o"), "ne", I(0), "drop");
+    rtCall4(f, "", "__tx_task_resolve", L("x"), I(1), I(4), I(0));
+    rtLabel(f, "drop");
+    rtCall1(f, "", "__tx_task_unref", L("x"));
+    rtOp(f, "due", L("due"), "add", I(1)); rtJump(f, "loop");
+    rtLabel(f, "compact");
+    rtIf(f, L("due"), "eq", I(0), "out");
+    rtSet(f, "p", A("__tx_task_tm")); rtLoad(f, "p", L("p"), 0, 8);
+    rtOp(f, "n", L("n"), "sub", L("due"));
+    rtOp(f, "n", L("n"), "imul", I(3));
+    rtOp(f, "due", L("due"), "imul", I(24));
+    rtSet(f, "k", I(0));
+    rtLabel(f, "move");
+    rtIf(f, L("k"), "ge", L("n"), "moved");
+    rtShift(f, "e", L("k"), "shl", 3); rtOp(f, "e", L("e"), "add", L("p"));
+    rtOp(f, "o", L("e"), "add", L("due")); rtLoad(f, "x", L("o"), 0, 8); rtStore(f, L("e"), 0, L("x"), 8);
+    rtOp(f, "k", L("k"), "add", I(1)); rtJump(f, "move");
+    rtLabel(f, "moved");
+    rtDivMod(f, "n", "", L("n"), I(3));
+    rtSet(f, "p", A("__tx_task_tm")); rtStore(f, L("p"), 8, L("n"), 8);
+    rtLabel(f, "out"); rtRetVoid(f); check(f);
+
+    // __tx_task_drain()：泵出口——未到期定时器收割为空操作，只释放自持引用。
+    f = rtBegin(b, "__tx_task_drain", "", "n i p x", 1, "bootstrap/selfhost/nrt_async.tx");
+    rtSet(f, "p", A("__tx_task_tm")); rtLoad(f, "n", L("p"), 8, 8);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "loop");
+    rtIf(f, L("i"), "ge", L("n"), "done");
+    rtSet(f, "p", A("__tx_task_tm")); rtLoad(f, "p", L("p"), 0, 8);
+    rtOp(f, "x", L("i"), "imul", I(24)); rtOp(f, "x", L("x"), "add", L("p")); rtLoad(f, "x", L("x"), 8, 8);
+    rtCall1(f, "", "__tx_task_unref", L("x"));
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "loop");
+    rtLabel(f, "done");
+    rtSet(f, "p", A("__tx_task_tm")); rtStore(f, L("p"), 8, I(0), 8);
+    rtRetVoid(f); check(f);
+}
+
+function emitPump(b: Ref<StructuredBuffer>): void {
+    // 同步 test 不启动泵：没有已运行/挂起帧，只取消未启动的任务并放开定时器。
+    // 就绪队只有任务号，先清空再逐记录取消，避免逐个摘队造成二次方清理。
+    let f = rtBegin(b, "__tx_task_discard_tests", "", "p n i t s", 4, "bootstrap/selfhost/nrt_async.tx");
+    rtSet(f, "p", A("__tx_task_rq")); rtStore(f, L("p"), 8, I(0), 8);
+    rtSet(f, "p", A("__tx_task_tab")); rtLoad(f, "n", L("p"), 8, 8);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "each");
+    rtIf(f, L("i"), "ge", L("n"), "timers");
+    rtCall1(f, "t", "__tx_task_at", L("i")); rtLoad(f, "s", L("t"), 0, 8);
+    rtIf(f, L("s"), "ne", I(ST_QUEUED), "next");
+    // 首启前 saved 必为零；取消只释放输入，不读取调用方函数或运行 defer。
+    rtCall4(f, "", "__tx_task_cancel", L("i"), I(0), I(0), I(0));
+    rtLabel(f, "next");
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "each");
+    rtLabel(f, "timers");
+    rtCall0(f, "", "__tx_task_drain");
+    rtRetVoid(f); check(f);
+
+    // __tx_task_pump()：main 返回后的调度泵。每轮先收割到期定时器，再按开队时的
+    // 就绪队快照依次运行（轮内被取消摘队者跳过）；就绪队空而仍有未决任务时，有
+    // 定时器就睡到最早到期再继续，没有就是死锁（trap 4014）。无任务程序零迭代。
+    f = rtBegin(b, "__tx_task_pump", "", "p n i tid t x idx k", 5, "bootstrap/selfhost/nrt_async.tx");
+    rtSet(f, "p", A("__tx_task_tab")); rtLoad(f, "n", L("p"), 8, 8);
+    rtSet(f, "p", A("__tx_task_tm")); rtLoad(f, "x", L("p"), 8, 8);
+    rtOp(f, "x", L("x"), "or", L("n"));
+    rtIf(f, L("x"), "eq", I(0), "out");
+    rtSet(f, "x", G("__tx_nrt_entry_win")); rtOp(f, "x", L("x"), "add", I(16)); rtSetGlobal(f, "__tx_task_win", L("x"));
+    rtLabel(f, "round");
+    rtCall0(f, "", "__tx_task_recycle");
+    rtCall0(f, "", "__tx_task_harvest");
+    rtSet(f, "p", A("__tx_task_rq")); rtLoad(f, "n", L("p"), 8, 8);
+    rtIf(f, L("n"), "ne", I(0), "snapshot");
+    rtSet(f, "p", A("__tx_task_tm")); rtLoad(f, "x", L("p"), 8, 8);
+    rtIf(f, L("x"), "eq", I(0), "finish");
+    rtCall0(f, "x", "__tx_task_pending");
+    rtIf(f, L("x"), "eq", I(0), "finish");
+    rtCall0(f, "", "__tx_task_wait");
+    rtJump(f, "round");
+    rtLabel(f, "snapshot");
+    rtSet(f, "p", A("__tx_task_round")); rtStore(f, L("p"), 8, I(0), 8);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "copy");
+    rtIf(f, L("i"), "ge", L("n"), "run");
+    rtSet(f, "p", A("__tx_task_rq")); rtLoad(f, "p", L("p"), 0, 8); rtShift(f, "x", L("i"), "shl", 3); rtOp(f, "p", L("p"), "add", L("x"));
+    rtLoad(f, "x", L("p"), 0, 8);
+    rtCall2(f, "", "__tx_task_vpush", A("__tx_task_round"), L("x"));
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "copy");
+    rtLabel(f, "run");
+    rtSet(f, "i", I(0));
+    rtLabel(f, "each");
+    rtIf(f, L("i"), "ge", L("n"), "round");
+    rtSet(f, "p", A("__tx_task_round")); rtLoad(f, "p", L("p"), 0, 8); rtShift(f, "x", L("i"), "shl", 3); rtOp(f, "p", L("p"), "add", L("x"));
+    rtLoad(f, "tid", L("p"), 0, 8);
+    rtCall1(f, "t", "__tx_task_at", L("tid"));
+    rtLoad(f, "x", L("t"), 0, 8);
+    rtIf(f, L("x"), "ne", I(ST_QUEUED), "next");
+    rtSet(f, "p", A("__tx_task_rq")); rtLoad(f, "k", L("p"), 8, 8);
+    rtSet(f, "idx", I(0));
+    rtLabel(f, "find");
+    rtIf(f, L("idx"), "ge", L("k"), "next");
+    rtSet(f, "p", A("__tx_task_rq")); rtLoad(f, "p", L("p"), 0, 8); rtShift(f, "x", L("idx"), "shl", 3); rtOp(f, "p", L("p"), "add", L("x"));
+    rtLoad(f, "x", L("p"), 0, 8);
+    rtIf(f, L("x"), "eq", L("tid"), "take");
+    rtOp(f, "idx", L("idx"), "add", I(1)); rtJump(f, "find");
+    rtLabel(f, "take");
+    rtCall2(f, "", "__tx_task_vremove", A("__tx_task_rq"), L("idx"));
+    rtCall1(f, "", "__tx_task_run", L("tid"));
+    rtLabel(f, "next");
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "each");
+    rtLabel(f, "finish");
+    rtCall0(f, "", "__tx_task_harvest");
+    rtCall0(f, "", "__tx_task_drain");
+    rtCall0(f, "x", "__tx_task_pending");
+    rtIf(f, L("x"), "ne", I(0), "deadlock");
+    rtLabel(f, "out"); rtRetVoid(f);
+    rtLabel(f, "deadlock");
+    rtCallList(f, "", "__tx_trap", trapArgs(A(text(b, DEADLOCK)), len(DEADLOCK)));
+    rtRetVoid(f); check(f);
+
+    // 恢复分派找不到挂起点：内核与生成代码不一致。
+    f = rtBegin(b, "__tx_task_bad_resume", "", "", 3, "bootstrap/selfhost/nrt_async.tx");
+    fatal(b, f, "taixu NRT: 任务恢复点不存在\n", 70);
+    rtRetVoid(f); check(f);
+}
+
+function trapArgs(msg: Ref<RtOp>, n: int): List<Ref<RtOp>> {
+    const xs: List<Ref<RtOp>> = listNew();
+    listPush(xs, I(0)); listPush(xs, I(0)); listPush(xs, I(4014)); listPush(xs, msg); listPush(xs, I(n));
+    return xs;
+}
+
+function emitBuiltins(b: Ref<StructuredBuffer>): void {
+    // taskCancel(Future<T>): void——未决者按属主任务取消；已终结为空操作。
+    let f = rtBegin(b, "__tx_bi_task_cancel", "win fn pc a nargs", "s t o st owner", 5, "bootstrap/selfhost/nrt_async.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", 16, "type");
+    rtLoad(f, "o", L("s"), 8, 4);
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("o"));
+    rtLoad(f, "st", L("o"), FUT_STATE, 4);
+    rtIf(f, L("st"), "ne", I(0), "done");
+    rtLoad(f, "owner", L("o"), FUT_OWNER, 4);
+    rtSet(f, "t", A("__tx_task_tab")); rtLoad(f, "t", L("t"), 8, 8);
+    rtIf(f, L("owner"), "uge", L("t"), "noowner");
+    rtCall4(f, "", "__tx_task_cancel", L("owner"), L("win"), L("fn"), L("pc"));
+    rtLabel(f, "done"); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "taskCancel 的实参不是 Future");
+    trapAt(b, f, "noowner", 4012, "future 无属主任务");
+    rtRetVoid(f); check(f);
+
+    // taskCancelled(): bool——当前任务的协作取消旗标（任务外恒 false）。
+    f = rtBegin(b, "__tx_bi_task_cancelled", "win fn pc a nargs", "r t", 5, "bootstrap/selfhost/nrt_async.tx");
+    arity(b, f, 0);
+    rtSet(f, "r", I(0));
+    rtIf(f, G("__tx_task_cur"), "eq", I(0), "set");
+    rtSet(f, "t", G("__tx_task_cur")); rtOp(f, "t", L("t"), "sub", I(1));
+    rtCall1(f, "t", "__tx_task_at", L("t"));
+    rtLoad(f, "r", L("t"), 8, 8);
+    rtLabel(f, "set");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(3), L("r")); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    rtRetVoid(f); check(f);
+
+    // taskAwaitAny(List<Future<T>>): int | Error——插入序扫描取第一个已终结者下标；
+    // 空列表得 err；全未决则在每个 Future 上登记观察并挂起，恢复后重新执行本内建。
+    const emptyMsg = "taskAwaitAny: 空列表";
+    f = rtBegin(b, "__tx_bi_task_await_any", "win fn pc a nargs", "s t h o n p i e st c", 5, "bootstrap/selfhost/nrt_async.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", 15, "notlist");
+    rtLoad(f, "h", L("s"), 8, 4);
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("h"));
+    rtLoad(f, "n", L("o"), 40, 8);
+    rtIf(f, L("n"), "eq", I(0), "empty");
+    rtLoad(f, "t", L("o"), 28, 4); rtIf(f, L("t"), "ne", I(1), "notfut");
+    rtSet(f, "i", I(0));
+    rtLabel(f, "scan");
+    rtIf(f, L("i"), "ge", L("n"), "pending");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("h"));
+    rtLoad(f, "p", L("o"), 32, 8); rtShift(f, "e", L("i"), "shl", 4); rtOp(f, "e", L("e"), "add", L("p"));
+    rtLoad(f, "t", L("e"), 0, 1); rtIf(f, L("t"), "ne", I(16), "notfut");
+    rtLoad(f, "t", L("e"), 8, 4);
+    rtCall1(f, "t", "__tx_native_object_address_v1", L("t"));
+    rtLoad(f, "st", L("t"), FUT_STATE, 4);
+    rtIf(f, L("st"), "ne", I(0), "verdict");
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "scan");
+    rtLabel(f, "verdict");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(1), L("i")); rtRetVoid(f);
+    rtLabel(f, "empty");
+    rtCall3(f, "e", "__tx_nrt_str_copy", A(text(b, emptyMsg)), I(len(emptyMsg)), I(2));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(5), L("e")); rtRetVoid(f);
+    rtLabel(f, "pending");
+    rtIf(f, G("__tx_task_cur"), "eq", I(0), "notask");
+    rtIf(f, L("win"), "ne", G("__tx_task_win"), "notask");
+    rtSet(f, "c", G("__tx_task_cur")); rtOp(f, "c", L("c"), "sub", I(1));
+    rtSet(f, "i", I(0));
+    rtLabel(f, "observe");
+    rtIf(f, L("i"), "ge", L("n"), "suspend");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("h"));
+    rtLoad(f, "p", L("o"), 32, 8); rtShift(f, "e", L("i"), "shl", 4); rtOp(f, "e", L("e"), "add", L("p"));
+    rtLoad(f, "t", L("e"), 8, 4);
+    rtCall2(f, "", "__tx_task_observe", L("t"), L("c"));
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "observe");
+    rtLabel(f, "suspend");
+    rtCall3(f, "", "__tx_task_suspend", L("win"), L("fn"), L("pc"));
+    rtSetGlobal(f, "__tx_task_susp", I(1));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "notlist", 4010, "taskAwaitAny 的实参不是 List");
+    trapAt(b, f, "notfut", 4010, "taskAwaitAny 元素须为 Future");
+    trapAt(b, f, "notask", 4010, "taskAwaitAny 挂起等待只能在 async 任务内（同步上下文无暂停点）");
+    rtRetVoid(f); check(f);
+
+    // sleepMs(ms): Future<void>——登记定时器（deadline＝单调钟＋ms，饱和不回绕；
+    // 0 ms 为下一调度轮到期）；负值即得已完成的 err Future（不登记定时器）。
+    const negMsg = "sleep ms < 0";
+    f = rtBegin(b, "__tx_bi_sleep_ms", "win fn pc a nargs", "s t ms fut o e dl now", 5, "bootstrap/selfhost/nrt_async.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", 1, "type");
+    rtLoad(f, "ms", L("s"), 8, 8);
+    rtCall2(f, "fut", "__tx_task_new_future", I(NO_OWNER), I(0));
+    rtIf(f, L("ms"), "ge", I(0), "timer");
+    rtCall3(f, "e", "__tx_nrt_str_copy", A(text(b, negMsg)), I(len(negMsg)), I(2));
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("fut"));
+    rtStore(f, L("o"), FUT_STATE, I(1), 4);
+    rtStore(f, L("o"), FUT_RESULT, I(5), 8); rtStore(f, L("o"), FUT_RESULT + 8, L("e"), 8);
+    rtJump(f, "set");
+    rtLabel(f, "timer");
+    rtCall1(f, "", "__tx_task_ref", L("fut"));
+    rtCall0(f, "now", "__tx_task_now");
+    rtSet(f, "dl", I(9223372036854775807));
+    rtIf(f, L("ms"), "gt", I(9223372036854), "add");
+    rtOp(f, "e", L("ms"), "imul", I(1000000));
+    rtOp(f, "e", L("e"), "add", L("now"));
+    rtIf(f, L("e"), "lt", L("now"), "add");
+    rtSet(f, "dl", L("e"));
+    rtLabel(f, "add");
+    rtCall2(f, "", "__tx_task_timer_add", L("dl"), L("fut"));
+    rtLabel(f, "set");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(16), L("fut")); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "sleepMs 的实参不是 int");
+    rtRetVoid(f); check(f);
+}
+
+/// 原生异步运行时（代码段）。
+export function emitNrtAsync(b: Ref<StructuredBuffer>): void {
+    emitVectors(b);
+    emitClock(b);
+    emitFutures(b);
+    emitTaskCore(b);
+    emitTimers(b);
+    emitPump(b);
+    emitBuiltins(b);
+}

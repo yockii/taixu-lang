@@ -1,0 +1,108 @@
+// NRT 外部函数支持（D3 v0.23 FFI，去 Zig 第 5 轮第 2 步）：外部函数调用桩（由编译器按程序
+// 生成，见 selfhost/ffi_stubs.tx）用到的内核例程与状态——系统错误码槽、ffiLastError 内建、
+// C 字符串返回值的拷贝（非法 UTF-8 逐字节替换为 U+FFFD）。
+import { StructuredBuffer, asBufferLabel, asBufferZero } from "./assemble";
+import { L, I, A, G } from "./rtfn_base";
+import { rtBegin, rtLabel, rtJump, rtIf, rtSet, rtOp, rtLoad, rtStore, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtRet, rtRetVoid } from "./rtfn";
+import { check, arity, trapText, ARITY, memcpyName, nrtTarget } from "./nrt_base";
+import { tSysV, tKernel32, tRawSyscall, tWindows } from "./target";
+
+/// 内核导出：本模块的例程与状态，外加程序映像里的外部函数调用桩要用的内部例程（取实参槽、写结果槽；
+/// Windows 另有 UTF-8→UTF-16 的路径转换与宽串转 string；Linux 另有私有约定的 memcpy——导出的
+/// memcpy 是给 C 用的 SysV 包装）。
+export function nrtFfiExports(): string {
+    const t = nrtTarget();
+    let out = "__tx_bi_ffi_last_error __tx_ffi_cstr_to_str __tx_nrt_arg __tx_nrt_set_new __tx_nrt_window";
+    // 各随定义处的判断：私有约定的 memcpy（SysV 目标导出的 memcpy 是给 C 的包装）；libc exit 钩子槽（不经 kernel32、
+    // 可无 libc 的目标）；UTF-8→UTF-16 路径（经 kernel32 的文件原语，runtime_memory_gen 的 fileEmit）；宽串转 string（Windows，nrt_proc）。
+    if (tSysV(t)) { out = out + " __tx_linux_memcpy"; }
+    if (tRawSyscall(t)) { out = out + " __tx_libc_exit"; }
+    if (tKernel32(t)) { out = out + " __tx_file_wpath"; }
+    if (tWindows(t)) { out = out + " __tx_nrt_wide_to_str"; }
+    return out;
+}
+
+// 错误码槽 __tx_ffi_last_error 与回调窗口 __tx_ffi_cb_win 在线程块里（thread_block_abi.tx，线程设计 §四-7）。
+export function nrtFfiBss(b: Ref<StructuredBuffer>): void {
+    // Linux 动态产物：动态加载器把 libc 的 exit 填进这里（GLOB_DAT），进程经它退出以刷新 C 侧缓冲；
+    // 静态产物保持 0，照旧 exit_group。
+    if (tRawSyscall(nrtTarget())) { asBufferLabel(b, "__tx_libc_exit", 1); asBufferZero(b, 8, 1); }
+}
+
+export function nrtFfiEmit(b: Ref<StructuredBuffer>): void {
+    // ffiLastError(): int — 最近一次外部函数调用后保存的系统错误码（Windows GetLastError，
+    // Linux libc errno；from syscall 的返回值本身就是 -errno，不经此槽）。
+    let f = rtBegin(b, "__tx_bi_ffi_last_error", "win fn pc a nargs", "v", 5, "bootstrap/selfhost/nrt_ffi.tx");
+    arity(b, f, 0);
+    rtSet(f, "v", G("__tx_ffi_last_error"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(1), L("v"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    rtRetVoid(f); check(f);
+
+    // __tx_ffi_cstr_to_str(p) → 新 string：NUL 结尾的字节串（空指针得空串）；合法 UTF-8 原样，
+    // 每个不能开始或完成合法序列的字节替换为 U+FFFD（EF BF BD）。
+    f = rtBegin(b, "__tx_ffi_cstr_to_str", "p", "n e q o c d k lo hi s j", 4, "bootstrap/selfhost/nrt_ffi.tx");
+    rtSet(f, "n", I(0));
+    rtIf(f, L("p"), "eq", I(0), "empty");
+    rtLabel(f, "len");
+    rtOp(f, "c", L("p"), "add", L("n")); rtLoad(f, "c", L("c"), 0, 1);
+    rtIf(f, L("c"), "eq", I(0), "sized");
+    rtOp(f, "n", L("n"), "add", I(1)); rtJump(f, "len");
+    rtLabel(f, "sized");
+    rtIf(f, L("n"), "eq", I(0), "empty");
+    rtOp(f, "c", L("n"), "imul", I(3));
+    rtCall2(f, "q", "__tx_native_mem_alloc", L("c"), I(1));
+    rtIf(f, L("q"), "eq", I(0), "oom");
+    rtSet(f, "o", L("q"));
+    rtOp(f, "e", L("p"), "add", L("n"));
+    rtLabel(f, "lead");
+    rtIf(f, L("p"), "uge", L("e"), "done");
+    rtSet(f, "s", L("p"));
+    rtLoad(f, "c", L("p"), 0, 1); rtOp(f, "p", L("p"), "add", I(1));
+    rtIf(f, L("c"), "lt", I(128), "copy");
+    rtSet(f, "lo", I(128)); rtSet(f, "hi", I(191));
+    rtIf(f, L("c"), "lt", I(194), "bad");
+    rtSet(f, "k", I(1)); rtIf(f, L("c"), "le", I(223), "first");
+    rtSet(f, "k", I(2));
+    rtIf(f, L("c"), "ne", I(224), "e1"); rtSet(f, "lo", I(160)); rtJump(f, "first");
+    rtLabel(f, "e1"); rtIf(f, L("c"), "ne", I(237), "e2"); rtSet(f, "hi", I(159)); rtJump(f, "first");
+    rtLabel(f, "e2"); rtIf(f, L("c"), "le", I(239), "first");
+    rtSet(f, "k", I(3)); rtIf(f, L("c"), "gt", I(244), "bad");
+    rtIf(f, L("c"), "ne", I(240), "f4"); rtSet(f, "lo", I(144)); rtJump(f, "first");
+    rtLabel(f, "f4"); rtIf(f, L("c"), "ne", I(244), "first"); rtSet(f, "hi", I(143));
+    rtLabel(f, "first");
+    rtIf(f, L("p"), "uge", L("e"), "bad");
+    rtLoad(f, "d", L("p"), 0, 1);
+    rtIf(f, L("d"), "lt", L("lo"), "bad"); rtIf(f, L("d"), "gt", L("hi"), "bad");
+    rtOp(f, "p", L("p"), "add", I(1));
+    rtOp(f, "k", L("k"), "sub", I(1));
+    rtLabel(f, "cont");
+    rtIf(f, L("k"), "eq", I(0), "copy");
+    rtIf(f, L("p"), "uge", L("e"), "bad");
+    rtLoad(f, "d", L("p"), 0, 1);
+    rtIf(f, L("d"), "lt", I(128), "bad"); rtIf(f, L("d"), "gt", I(191), "bad");
+    rtOp(f, "p", L("p"), "add", I(1));
+    rtOp(f, "k", L("k"), "sub", I(1)); rtJump(f, "cont");
+    // 合法序列 [s, p) 原样拷入。
+    rtLabel(f, "copy");
+    rtOp(f, "j", L("p"), "sub", L("s"));
+    rtCall3(f, "", memcpyName(), L("o"), L("s"), L("j"));
+    rtOp(f, "o", L("o"), "add", L("j"));
+    rtJump(f, "lead");
+    // 不合法：只消耗起始字节，写 U+FFFD，从下一字节重新开始。
+    rtLabel(f, "bad");
+    rtOp(f, "p", L("s"), "add", I(1));
+    rtStore(f, L("o"), 0, I(239), 1); rtStore(f, L("o"), 1, I(191), 1); rtStore(f, L("o"), 2, I(189), 1);
+    rtOp(f, "o", L("o"), "add", I(3));
+    rtJump(f, "lead");
+    rtLabel(f, "done");
+    rtOp(f, "j", L("o"), "sub", L("q"));
+    rtCall3(f, "s", "__tx_nrt_str_copy", L("q"), L("j"), I(1));
+    rtCall1(f, "", "__tx_native_mem_free", L("q"));
+    rtRet(f, L("s"));
+    rtLabel(f, "empty");
+    rtCall3(f, "s", "__tx_nrt_str_copy", L("p"), I(0), I(1));
+    rtRet(f, L("s"));
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRet(f, I(0)); check(f);
+}

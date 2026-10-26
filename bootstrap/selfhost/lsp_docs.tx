@@ -1,0 +1,274 @@
+// lsp_docs.tx —— 原生 LSP 的文档表、URI 与路径、位置换算（第 6 轮 6d-2，LSP 与 MCP 实施设计 §四-1）。
+//
+// 文档的键是驱动归一后的路径（drvNormPath，盘符大写），覆盖层、入口与诊断的模块路径都按键比对。位置：编译器的列
+// 是 1 起的 UTF-8 字节列；协议的列按协商的编码（utf-8 字节、utf-16 码元、utf-32 码点）计。行以 LF 分隔。
+import { drvNormPath } from "./driver";
+import { filePath } from "./file_path";
+
+export const ENC_UTF8: int = 8;
+export const ENC_UTF16: int = 16;
+export const ENC_UTF32: int = 32;
+
+export struct LspDoc {
+    uri: string,
+    key: string,
+    path: string, // 交给驱动的路径（入口与覆盖层）
+    text: string,
+    version: int,
+    seq: int, // 打开的先后
+    starts: List<int>, // 各行起始的字节偏移；空表即待重算
+}
+
+export function newDoc(uri: string, path: string, text: string, version: int, seq: int): Ref<LspDoc> {
+    return new LspDoc { uri: uri, key: docKey(path), path: path, text: text, version: version, seq: seq, starts: listNew() };
+}
+
+// 文档或模块路径的键：驱动的归一形，盘符大写（VS Code 发小写盘符）。
+export function docKey(path: string): string {
+    const k = drvNormPath(path);
+    if (len(k) >= 2 && (byteAt(k, 1) catch 0) == 58) {
+        const c = byteAt(k, 0) catch 0;
+        if (c >= 97 && c <= 122) {
+            const b = bytesFromStr(k);
+            bytesSet(b, 0, c - 32);
+            return bytesToStr(b) catch k;
+        }
+    }
+    return k;
+}
+
+// 键对应的磁盘路径（键以 / 分隔，与驱动的规范形相同）。
+export function keyPath(key: string, windows: bool): string {
+    if (windows) { return key; }
+    return filePath(key);
+}
+
+// —— 字节串小工具（串的 strSub 按码点，这里按字节切）——
+
+function bytesOf(s: string): Bytes { return bytesFromStr(s); }
+
+function sliceStr(s: string, from: int, n: int): string {
+    return bytesToStr(bytesSlice(bytesOf(s), from, n)) catch "";
+}
+
+function startsWithBytes(s: string, p: string): bool {
+    if (len(s) < len(p)) { return false; }
+    let i = 0;
+    while (i < len(p)) {
+        if ((byteAt(s, i) catch 0) != (byteAt(p, i) catch 1)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+function hexVal(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    return -1;
+}
+
+const HEX: string = "0123456789ABCDEF";
+
+// 百分号解码（按字节）；不合形的 % 照原样保留。
+function pctDecode(s: string): string {
+    const b = bytesOf(s);
+    const out = bytesNew(0);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) catch 0;
+        if (c == 37 && i + 2 < bytesLen(b) + 0 && hexVal(bytesGet(b, i + 1) catch 0) >= 0 && hexVal(bytesGet(b, i + 2) catch 0) >= 0) {
+            bytesPush(out, hexVal(bytesGet(b, i + 1) catch 0) * 16 + hexVal(bytesGet(b, i + 2) catch 0));
+            i = i + 3;
+        } else {
+            bytesPush(out, c);
+            i = i + 1;
+        }
+    }
+    return bytesToStr(out) catch s;
+}
+
+// RFC 3986 路径编码：字母数字与 - . _ ~ / : 原样，其余字节写成 %XX。
+function pctEncode(s: string): string {
+    const b = bytesOf(s);
+    const out = bytesNew(0);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) catch 0;
+        const plain = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 46 || c == 95 || c == 126 || c == 47 || c == 58;
+        if (plain) {
+            bytesPush(out, c);
+        } else {
+            bytesPush(out, 37);
+            bytesPush(out, byteAt(HEX, c / 16) catch 48);
+            bytesPush(out, byteAt(HEX, c % 16) catch 48);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(out) catch s;
+}
+
+function replaceByte(s: string, from: int, to: int): string {
+    const b = bytesOf(s);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        if ((bytesGet(b, i) catch 0) == from) { bytesSet(b, i, to); }
+        i = i + 1;
+    }
+    return bytesToStr(b) catch s;
+}
+
+// file: URI 转本机路径；不是 file: 或无法转换时得空串。先解码再判盘符形（改正 Zig 版 `%3A` 形解析错，§二-2 第 9 条）。
+export function uriToPath(uri: string, windows: bool): string {
+    if (!startsWithBytes(uri, "file://")) { return ""; }
+    let rest = sliceStr(uri, 7, len(uri) - 7);
+    let host = "";
+    if (len(rest) > 0 && (byteAt(rest, 0) catch 0) != 47) {
+        let slash = 0;
+        while (slash < len(rest) && (byteAt(rest, slash) catch 0) != 47) { slash = slash + 1; }
+        host = sliceStr(rest, 0, slash);
+        rest = sliceStr(rest, slash, len(rest) - slash);
+    }
+    if (host == "localhost") { host = ""; }
+    if (len(host) > 0) { return ""; }
+    const dec = pctDecode(rest);
+    if (!windows) {
+        if (len(host) > 0 || len(dec) == 0) { return ""; }
+        return dec;
+    }
+    if (startsWithBytes(filePath(dec), "//")) { return ""; }
+    let p = dec;
+    if (len(p) >= 3 && (byteAt(p, 0) catch 0) == 47 && (byteAt(p, 2) catch 0) == 58) {
+        const d = byteAt(p, 1) catch 0;
+        if ((d >= 65 && d <= 90) || (d >= 97 && d <= 122)) { p = sliceStr(p, 1, len(p) - 1); }
+    }
+    if (len(p) == 0) { return ""; }
+    return docKey(p);
+}
+
+// 本机路径（或键）转 file: URI，按 RFC 3986 编码（改正 Zig 版不编码，§二-2 第 9 条）。
+export function pathToUri(path: string, windows: bool): string {
+    if (!windows) { return "file://" + pctEncode(filePath(path)); }
+    const p = replaceByte(path, 92, 47);
+    if (startsWithBytes(p, "//")) { return "file:" + pctEncode(p); }
+    return "file:///" + pctEncode(p);
+}
+
+// —— 行与位置 ——
+
+function lineStarts(d: Ref<LspDoc>): List<int> {
+    if (listLen(d.starts) > 0) { return d.starts; }
+    const s: List<int> = listNew();
+    listPush(s, 0);
+    let i = 0;
+    const n = len(d.text);
+    while (i < n) {
+        if ((byteAt(d.text, i) catch 0) == 10) { listPush(s, i + 1); }
+        i = i + 1;
+    }
+    d.starts = s;
+    return s;
+}
+
+export function lineCount(d: Ref<LspDoc>): int { return listLen(lineStarts(d)); }
+
+export function lineStart(d: Ref<LspDoc>, line: int): int {
+    return listGet(lineStarts(d), line) catch len(d.text);
+}
+
+// 第 line 行（0 起）内容的结束字节偏移（不含 LF 与其前的 CR）。
+export function lineEnd(d: Ref<LspDoc>, line: int): int {
+    const st = lineStarts(d);
+    if (line + 1 >= listLen(st)) { return len(d.text); }
+    let e = (listGet(st, line + 1) catch len(d.text)) - 1;
+    if (e > 0 && (byteAt(d.text, e - 1) catch 0) == 13 && e - 1 >= (listGet(st, line) catch 0)) { e = e - 1; }
+    return e;
+}
+
+// 字节 c 起头的 UTF-8 序列的字节数（不合法的按一个字节）。
+function seqLen(c: int): int {
+    if (c >= 240 && c < 248) { return 4; }
+    if (c >= 224 && c < 240) { return 3; }
+    if (c >= 192 && c < 224) { return 2; }
+    return 1;
+}
+
+// 该序列按 enc 计的单位数。
+function seqUnits(n: int, enc: int): int {
+    if (enc == ENC_UTF8) { return n; }
+    if (enc == ENC_UTF16 && n == 4) { return 2; }
+    return 1;
+}
+
+// 逗号连接（对半拼接，避免逐个追加的平方代价）。
+export function joinComma(xs: List<string>): string { return joinRange(xs, 0, listLen(xs)); }
+
+function joinRange(xs: List<string>, lo: int, hi: int): string {
+    if (hi <= lo) { return ""; }
+    if (hi - lo == 1) { return listGet(xs, lo) catch ""; }
+    const mid = lo + (hi - lo) / 2;
+    return joinRange(xs, lo, mid) + "," + joinRange(xs, mid, hi);
+}
+
+// 文本 text 中从字节 from 到 to 之间按 enc 计的长度。
+export function unitsBetween(text: string, from: int, to: int, enc: int): int {
+    let i = from;
+    let u = 0;
+    while (i < to) {
+        const n = seqLen(byteAt(text, i) catch 0);
+        u = u + seqUnits(n, enc);
+        i = i + n;
+    }
+    return u;
+}
+
+// 协议位置（行、按 enc 的列）转字节偏移；越界的行、列夹到文末、行末。
+export function posToOffset(d: Ref<LspDoc>, line: int, ch: int, enc: int): int {
+    if (line < 0) { return 0; }
+    if (line >= lineCount(d)) { return len(d.text); }
+    const st = lineStart(d, line);
+    const end = lineEnd(d, line);
+    let i = st;
+    let u = 0;
+    while (i < end && u < ch) {
+        const n = seqLen(byteAt(d.text, i) catch 0);
+        u = u + seqUnits(n, enc);
+        i = i + n;
+    }
+    if (i > end) { return end; }
+    return i;
+}
+
+// 文本 text 里第 line 行（0 起）、行内字节偏移 byteCol（0 起）处按 enc 的列；lineStartByte 为该行起点。
+export function colUnits(text: string, lineStartByte: int, byteCol: int, enc: int): int {
+    return unitsBetween(text, lineStartByte, lineStartByte + byteCol, enc);
+}
+
+// 文末的协议位置（行数为 LF 个数，列为最后一行按 enc 的长度）。
+export function endLine(d: Ref<LspDoc>): int { return lineCount(d) - 1; }
+
+export function endChar(d: Ref<LspDoc>, enc: int): int {
+    const last = lineCount(d) - 1;
+    return unitsBetween(d.text, lineStart(d, last), len(d.text), enc);
+}
+
+// 应用一个带 range 的变更（位置按 enc）；返回新文本。
+export function applyRange(d: Ref<LspDoc>, sl: int, sc: int, el: int, ec: int, newText: string, enc: int): string {
+    let a = posToOffset(d, sl, sc, enc);
+    let z = posToOffset(d, el, ec, enc);
+    if (z < a) {
+        const t = a;
+        a = z;
+        z = t;
+    }
+    const b = bytesOf(d.text);
+    const head = bytesToStr(bytesSlice(b, 0, a)) catch "";
+    const tail = bytesToStr(bytesSlice(b, z, bytesLen(b) - z)) catch "";
+    return head + newText + tail;
+}
+
+export function setText(d: Ref<LspDoc>, text: string, version: int): void {
+    d.text = text;
+    d.version = version;
+    d.starts = listNew();
+}

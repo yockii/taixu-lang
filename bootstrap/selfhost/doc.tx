@@ -1,0 +1,462 @@
+// `taixu doc [--format=json] [--out-dir=目录] <file.tx|目录>`（去 Zig 第 6 轮 6a；Zig 版在
+// src/tools/devtools.zig）：声明上方紧邻的连续 `///` 行是该声明的文档，输出 Markdown API 参考，
+// `--format=json` 为机读形态 {"module","decls":[{kind,name,signature,exported,line,doc}]}。
+// 默认全部写 stdout（每个模块之后一个空行）；--out-dir 时每个模块写 <目录>/<主名>.md|.json。
+//
+// 声明取自 parser.tx 的 AST 文本（parseSource；有语法错误时用恢复出的部分，同 Zig 版）。
+// 与 Zig 版的有意差别：签名带型参（`<T extends 约束>`）、`async`、`function*` 与外部函数的
+// `from` 子句；覆盖 v0.18 之后的声明（interface、declare type、declare struct、错误 enum）；
+// 多行 `///` 按行以一个换行连接（Zig 版每行多出一个换行，属缺陷）。
+
+import { jsonStart } from "./toolchain";
+import { parseSource } from "../parser";
+import { jsonQuote } from "./json_text";
+import { filePath } from "./file_path";
+import { pathOnWindows } from "./path_sep";
+
+// AST 文本按行：缩进层与内容两个平行列表。
+struct Ast {
+    depth: List<int>,
+    text: List<string>,
+}
+
+struct DeclDoc {
+    kind: string,
+    name: string,
+    signature: string,
+    exported: bool,
+    line: int,
+    doc: string,
+}
+
+// 错误行（`! `）与 notimpl 行略去。
+function astNodes(ast: string): Ref<Ast> {
+    const out: Ref<Ast> = new Ast { depth: listNew(), text: listNew() };
+    for (ln in strSplit(ast, "\n")) {
+        if (len(ln) == 0 || strIndexOf(ln, "! ") == 0 || strIndexOf(ln, "# ") == 0) { continue; }
+        let sp = 0;
+        while (sp < len(ln) && (byteAt(ln, sp) catch 0) == 32) { sp = sp + 1; }
+        listPush(out.depth, sp / 4);
+        listPush(out.text, strSub(ln, sp, cpCount(ln) - sp));
+    }
+    return out;
+}
+
+function cpCount(s: string): int {
+    let pos = 0;
+    let count = 0;
+    while (pos < len(s)) {
+        const c = byteAt(s, pos) catch 0;
+        if (c >= 240) { pos = pos + 4; }
+        else if (c >= 224) { pos = pos + 3; }
+        else if (c >= 192) { pos = pos + 2; }
+        else { pos = pos + 1; }
+        count = count + 1;
+    }
+    return count;
+}
+
+function words(s: string): List<string> {
+    return strSplit(s, " ");
+}
+
+function word(ws: List<string>, i: int): string {
+    return listGet(ws, i) catch "";
+}
+
+function hasWord(ws: List<string>, w: string): bool {
+    for (x in ws) {
+        if (x == w) { return true; }
+    }
+    return false;
+}
+
+// AST 文本的规范转义（`\\` `\"` `\xHH`）还原。
+function unescape(s: string): string {
+    if (strIndexOf(s, "\\") < 0) { return s; }
+    const hex = "0123456789abcdef";
+    let out = "";
+    const n = cpCount(s);
+    let i = 0;
+    while (i < n) {
+        const ch = strSub(s, i, 1);
+        if (ch == "\\" && i + 1 < n) {
+            const nx = strSub(s, i + 1, 1);
+            if (nx == "x" && i + 3 < n) {
+                const v = strIndexOf(hex, strSub(s, i + 2, 1)) * 16 + strIndexOf(hex, strSub(s, i + 3, 1));
+                out = out + (utf8Encode(v) catch "");
+                i = i + 4;
+                continue;
+            }
+            out = out + nx;
+            i = i + 2;
+            continue;
+        }
+        out = out + ch;
+        i = i + 1;
+    }
+    return out;
+}
+
+// 节点 at 的直接子节点下标（深度恰为 at 的深度 + 1，止于回到 at 的深度）。
+function children(ns: Ref<Ast>, at: int): List<int> {
+    const out: List<int> = listNew();
+    const d = listGet(ns.depth, at) catch 0;
+    let i = at + 1;
+    while (i < listLen(ns.depth)) {
+        const di = listGet(ns.depth, i) catch 0;
+        if (di <= d) { break; }
+        if (di == d + 1) { listPush(out, i); }
+        i = i + 1;
+    }
+    return out;
+}
+
+function nodeText(ns: Ref<Ast>, i: int): string {
+    return listGet(ns.text, i) catch "";
+}
+
+function firstChild(ns: Ref<Ast>, at: int): int {
+    const cs = children(ns, at);
+    if (listLen(cs) == 0) { return -1; }
+    return listGet(cs, 0) catch -1;
+}
+
+// 类型子树渲染成源码写法。
+function renderType(ns: Ref<Ast>, at: int): string {
+    if (at < 0) { return "?"; }
+    const ws = words(nodeText(ns, at));
+    const k = word(ws, 0);
+    const c = firstChild(ns, at);
+    if (k == "tnamed") { return unescape(word(ws, 1)); }
+    if (k == "tref") { return "Ref<" + renderType(ns, c) + ">"; }
+    if (k == "tweak") { return "Weak<" + renderType(ns, c) + ">"; }
+    if (k == "tlist") { return "List<" + renderType(ns, c) + ">"; }
+    if (k == "tfuture") { return "Future<" + renderType(ns, c) + ">"; }
+    if (k == "topt") { return renderType(ns, c) + "?"; }
+    if (k == "terrunion") { return renderType(ns, c) + " | Error"; }
+    if (k == "terrtyped") { return renderType(ns, c) + " | " + unescape(word(ws, 1)); }
+    if (k == "tslice") { return "[]" + renderType(ns, c); }
+    if (k == "tarray") { return "[" + word(ws, 1) + "]" + renderType(ns, c); }
+    if (k == "tgeneric") {
+        let out = unescape(word(ws, 1)) + "<";
+        let first = true;
+        for (g in children(ns, at)) {
+            if (!first) { out = out + ", "; }
+            out = out + renderType(ns, g);
+            first = false;
+        }
+        return out + ">";
+    }
+    if (k == "tfn") {
+        const cs = children(ns, at);
+        const n = listLen(cs);
+        let out = "(";
+        let i = 0;
+        while (i + 1 < n) {
+            if (i > 0) { out = out + ", "; }
+            out = out + renderType(ns, listGet(cs, i) catch -1);
+            i = i + 1;
+        }
+        return out + ") => " + renderType(ns, listGet(cs, n - 1) catch -1);
+    }
+    return k;
+}
+
+// `tparams A B` 子节点：其后的 extends 子树按出现顺序。AST 文本不记哪个型参带约束，
+// 全部带约束或只有一个型参时逐个配对，否则只列型参名。
+function renderTparams(ns: Ref<Ast>, at: int): string {
+    const ws = words(nodeText(ns, at));
+    const names: List<string> = listNew();
+    let i = 1;
+    while (i < listLen(ws)) { listPush(names, unescape(word(ws, i))); i = i + 1; }
+    const cons: List<string> = listNew();
+    for (c in children(ns, at)) {
+        if (nodeText(ns, c) == "extends") { listPush(cons, renderType(ns, firstChild(ns, c))); }
+    }
+    let out = "<";
+    let j = 0;
+    while (j < listLen(names)) {
+        if (j > 0) { out = out + ", "; }
+        out = out + (listGet(names, j) catch "");
+        if (listLen(cons) == listLen(names)) { out = out + " extends " + (listGet(cons, j) catch ""); }
+        j = j + 1;
+    }
+    return out + ">";
+}
+
+// 函数头之后的 `<型参>(参数: 类型, …): 返回`（以及外部函数的 from 子句）。
+function renderFnTail(ns: Ref<Ast>, at: int): string {
+    let tp = "";
+    let ret = "";
+    let from = "";
+    let nfix = -1;
+    const ps: List<string> = listNew();
+    for (c in children(ns, at)) {
+        const ws = words(nodeText(ns, c));
+        const k = word(ws, 0);
+        if (k == "tparams") { tp = renderTparams(ns, c); }
+        else if (k == "param") { listPush(ps, unescape(word(ws, 1)) + ": " + renderType(ns, firstChild(ns, c))); }
+        else if (k == "varargs") { nfix = intOf(word(ws, 1)); }
+        else if (k == "ret") { ret = renderType(ns, firstChild(ns, c)); }
+        else if (k == "from" && word(ws, 1) == "lib") { from = " from \"" + unescape(word(ws, 2)) + "\""; }
+        else if (k == "from" && word(ws, 1) == "syscall") { from = " from syscall " + word(ws, 2); }
+    }
+    // 外部函数的 C 变参参数（D3 v0.36）：第 nfix 个起写 `...`。
+    let params = "";
+    let i = 0;
+    while (i < listLen(ps)) {
+        if (i > 0) { params = params + ", "; }
+        if (nfix >= 0 && i >= nfix) { params = params + "..."; }
+        params = params + (listGet(ps, i) catch "");
+        i = i + 1;
+    }
+    return tp + "(" + params + "): " + ret + from;
+}
+
+function countKids(ns: Ref<Ast>, at: int, kind: string): int {
+    let n = 0;
+    for (c in children(ns, at)) {
+        if (word(words(nodeText(ns, c)), 0) == kind) { n = n + 1; }
+    }
+    return n;
+}
+
+// 头行末两个数为声明名的行、列。
+function headLine(ws: List<string>): int { return intOf(word(ws, listLen(ws) - 2)); }
+// 非负十进制文本的值。
+function intOf(t: string): int {
+    let v = 0;
+    let i = 0;
+    while (i < len(t)) { v = v * 10 + ((byteAt(t, i) catch 48) - 48); i = i + 1; }
+    return v;
+}
+
+// 声明行（1 起）上方紧邻的连续 `///` 行，去前缀与两端空白，以换行连接。
+function docAbove(lines: List<string>, declLine: int): string {
+    const got: List<string> = listNew();
+    let i = declLine - 2;
+    while (i >= 0) {
+        const t = trimWs(listGet(lines, i) catch "");
+        if (strIndexOf(t, "///") != 0) { break; }
+        listPush(got, trimWs(strSub(t, 3, cpCount(t) - 3)));
+        i = i - 1;
+    }
+    let out = "";
+    let k = listLen(got) - 1;
+    while (k >= 0) {
+        out = out + (listGet(got, k) catch "");
+        if (k > 0) { out = out + "\n"; }
+        k = k - 1;
+    }
+    return out;
+}
+
+function trimWs(s: string): string {
+    let n = cpCount(s);
+    let a = 0;
+    while (a < n && isWs(strSub(s, a, 1))) { a = a + 1; }
+    while (n > a && isWs(strSub(s, n - 1, 1))) { n = n - 1; }
+    return strSub(s, a, n - a);
+}
+
+function isWs(ch: string): bool {
+    return ch == " " || ch == "\t" || ch == "\r";
+}
+
+function moduleDocs(src: string): List<Ref<DeclDoc>> {
+    const ns = astNodes(parseSource(src));
+    const lines = strSplit(src, "\n");
+    const out: List<Ref<DeclDoc>> = listNew();
+    let i = 0;
+    while (i < listLen(ns.depth)) {
+        if ((listGet(ns.depth, i) catch 1) != 0) { i = i + 1; continue; }
+        const ws = words(nodeText(ns, i));
+        const k = word(ws, 0);
+        const name = unescape(word(ws, 1));
+        const exported = hasWord(ws, "export");
+        const line = headLine(ws);
+        let kind = "";
+        let sig = "";
+        if (k == "fn" && hasWord(ws, "extern")) {
+            kind = "extern";
+            sig = "declare function " + name + renderFnTail(ns, i);
+        } else if (k == "fn") {
+            kind = "function";
+            if (exported) { sig = "export "; }
+            if (hasWord(ws, "async")) { sig = sig + "async "; }
+            sig = sig + "function";
+            if (hasWord(ws, "gen")) { sig = sig + "*"; }
+            sig = sig + " " + name + renderFnTail(ns, i);
+        } else if (k == "struct" || k == "xstruct") {
+            kind = "struct";
+            if (k == "xstruct") { sig = "declare "; }
+            sig = sig + "struct " + name + structTparams(ns, i) + "（" + toStr(countKids(ns, i, "field")) + " 个字段）";
+        } else if (k == "enum") {
+            kind = "enum";
+            sig = "enum " + name;
+            if (hasWord(ws, "extends-error")) { sig = sig + " extends Error"; }
+            sig = sig + "（" + toStr(countKids(ns, i, "variant")) + " 个变体）";
+        } else if (k == "interface") {
+            kind = "interface";
+            sig = "interface " + name + structTparams(ns, i) + "（" + toStr(countKids(ns, i, "fn")) + " 个方法）";
+        } else if (k == "dtype") {
+            kind = "type";
+            sig = "declare type " + name;
+        } else if (k == "const" || k == "let") {
+            kind = "binding";
+            sig = k + " " + name;
+            for (c in children(ns, i)) {
+                // 无类型标注时 ty 节点没有子树（同 Zig 版只写名字）。
+                if (nodeText(ns, c) == "ty" && firstChild(ns, c) >= 0) { sig = sig + ": " + renderType(ns, firstChild(ns, c)); }
+            }
+        }
+        if (len(kind) > 0) {
+            listPush(out, new DeclDoc { kind: kind, name: name, signature: sig, exported: exported, line: line, doc: docAbove(lines, line) });
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+function structTparams(ns: Ref<Ast>, at: int): string {
+    for (c in children(ns, at)) {
+        if (strIndexOf(nodeText(ns, c), "tparams") == 0) { return renderTparams(ns, c); }
+    }
+    return "";
+}
+
+function renderMd(module: string, docs: List<Ref<DeclDoc>>): string {
+    let out = "# `" + module + "` API 参考\n\n";
+    for (d in docs) {
+        out = out + "## " + d.kind + " `" + d.name + "`\n\n";
+        if (d.exported) { out = out + "（导出）\n\n"; }
+        out = out + "```text\n" + d.signature + "\n```\n\n";
+        if (len(d.doc) > 0) { out = out + d.doc + "\n\n"; }
+    }
+    return out;
+}
+
+function renderJson(module: string, docs: List<Ref<DeclDoc>>): string {
+    let out = jsonStart("doc/1") + ",\"module\":" + jsonQuote(module) + ",\"decls\":[";
+    let first = true;
+    for (d in docs) {
+        if (!first) { out = out + ","; }
+        let ex = "false";
+        if (d.exported) { ex = "true"; }
+        out = out + "{\"kind\":" + jsonQuote(d.kind) + ",\"name\":" + jsonQuote(d.name) + ",\"signature\":" + jsonQuote(d.signature) + ",\"exported\":" + ex + ",\"line\":" + toStr(d.line) + ",\"doc\":" + jsonQuote(d.doc) + "}";
+        first = false;
+    }
+    return out + "]}";
+}
+
+function endsWithTx(s: string): bool {
+    const n = len(s);
+    return n >= 3 && (byteAt(s, n - 3) catch 0) == 46 && (byteAt(s, n - 2) catch 0) == 116 && (byteAt(s, n - 1) catch 0) == 120;
+}
+
+// 目录递归（同 Zig 版：每层先下钻子目录，再按名字序收该层的 .tx）。
+function collectTx(root: string, out: List<string>): void {
+    const names: List<string> = listDir(filePath(root)) catch (e) { return; };
+    const files: List<string> = listNew();
+    for (nm in names) {
+        const p = root + "/" + nm;
+        const ek = entryKind(filePath(p));
+        if (ek == 2) { collectTx(p, out); }
+        else if (ek == 1 && endsWithTx(nm)) { listPush(files, p); }
+    }
+    for (f in files) { listPush(out, f); }
+}
+
+// 主名：最后一段去掉最后一个扩展名。
+function stemOf(path: string): string {
+    const n = cpCount(path);
+    let start = 0;
+    let dot = -1;
+    let i = 0;
+    while (i < n) {
+        const ch = strSub(path, i, 1);
+        if (ch == "/" || (ch == "\\" && pathOnWindows())) { start = i + 1; dot = -1; }
+        else if (ch == ".") { dot = i; }
+        i = i + 1;
+    }
+    if (dot <= start) { return strSub(path, start, n - start); }
+    return strSub(path, start, dot - start);
+}
+
+// `taixu doc` 的参数（args[0] 为子命令名）。返回退出码；-64 为用法错误（调用方打印用法）。
+export function docCommand(args: []string): int {
+    let target = "";
+    let json = false;
+    let outDir = "";
+    let i = 1;
+    while (i < len(args)) {
+        const a = args[i];
+        if (a == "--format=json") { json = true; }
+        else if (strIndexOf(a, "--out-dir=") == 0) { outDir = strSub(a, 10, cpCount(a) - 10); }
+        else if (len(target) == 0) { target = a; }
+        else { return -64; }
+        i = i + 1;
+    }
+    if (len(target) == 0) { return -64; }
+    const ek = entryKind(filePath(target));
+    const paths: List<string> = listNew();
+    if (ek == 2) { collectTx(target, paths); }
+    else if (ek == 0) {
+        eprint("taixu doc: 无法读取目标路径");
+        return 64;
+    } else { listPush(paths, target); }
+    if (listLen(paths) == 0) {
+        eprint("taixu doc: 目标下无 .tx 文件");
+        return 64;
+    }
+    let all = "";
+    for (p in paths) {
+        // 读不到的文件跳过（同 Zig 版）；catch 块须发散，先按 entryKind 判。
+        if (entryKind(filePath(p)) != 1) { continue; }
+        const src = readFile(filePath(p)) catch "";
+        const stem = stemOf(p);
+        const docs = moduleDocs(src);
+        let content = "";
+        if (json) { content = renderJson(stem, docs); }
+        else { content = renderMd(stem, docs); }
+        if (len(outDir) > 0) {
+            makeDirs(outDir);
+            let ext = ".md";
+            if (json) { ext = ".json"; }
+            writeFile(filePath(outDir + "/" + stem + ext), content) catch (e) {};
+        } else {
+            all = all + content + "\n";
+        }
+    }
+    if (len(outDir) == 0) { printRaw(all); }
+    return 0;
+}
+
+// 逐级建目录（已存在不算错）。
+function makeDirs(dir: string): void {
+    const n = cpCount(dir);
+    let i = 1;
+    while (i <= n) {
+        let cut = i == n;
+        if (!cut) {
+            const ch = strSub(dir, i, 1);
+            cut = ch == "/" || (ch == "\\" && pathOnWindows());
+        }
+        if (cut) {
+            const part = strSub(dir, 0, i);
+            if (entryKind(filePath(part)) != 2) {
+                makeDir(filePath(part)) catch (e) {};
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// print 会补一个换行：去掉末尾的一个换行再交给它（空串时不输出）。
+function printRaw(text: string): void {
+    const n = cpCount(text);
+    if (n == 0) { return; }
+    if (strSub(text, n - 1, 1) == "\n") { print(strSub(text, 0, n - 1)); }
+    else { print(text); }
+}

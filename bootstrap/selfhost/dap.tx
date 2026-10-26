@@ -1,0 +1,861 @@
+// dap.tx —— 原生 `taixu dap`（第 6 轮 6c-5b，调试实施设计 §四-8；对照 Zig 版 src/tools/dap.zig，有意差别见 §五）。
+//
+// stdin/stdout 上的 Debug Adapter Protocol（Content-Length 分帧）。进程内编译调试构建、直接起产物（dbg_core.tx）；
+// 单线程：产物运行中用 corePump 同时等客户端 stdin 与产物，引擎事件（NDJSON 文本）收进队列后翻成 DAP 事件。
+// 引用号只在本次停下内有效：1..999,999 为动态子节点，1,000,000＋帧号为局部变量，2,000,000＋帧号为槽位。
+import { JsonValue, jsonNew, jsonParse, jsonGet, JSON_INT, JSON_STR, JSON_ARR, JSON_OBJ } from "./json_parse";
+import { dbgStr, dbgAbsPath, dbgBase, dbgQueueOn, dbgTakeEvents } from "./dbg_out";
+import { DbgSlot, DbgHead, DbgKid, viewSlots, viewBrief, viewHead, viewKids } from "./dbg_view";
+import { Sess, DbgFrame, ST_LOADING, ST_RUNNING, ST_ENDED, coreLaunch, coreClose, corePoints, coreFnPoint, coreArm, coreRun, corePause, corePump, coreKill, framesOf, regCount, varIdx, varTy, varName, varTyText, lineAt, colAt, fnText, intField, strField, hasInt } from "./dbg_core";
+import { filePath } from "./file_path";
+import { fioRead, fioTake, fioAtEof, fioError, fioSend } from "./frame_io";
+import { pathHostJoin } from "./path_sep";
+import { realPath } from "./real_path";
+
+const MSG_MAX: int = 1048576;
+const ERR_CAP: int = 1048576;
+const REF_LOCALS: int = 1000000;
+const REF_SLOTS: int = 2000000;
+const REF_END: int = 3000000;
+const FRAME_BASE: int = 1000;
+// DAP InitializeResponse.body is Capabilities itself (not an LSP-style wrapper).
+const CAPS: string = "{\"supportsConfigurationDoneRequest\":true,\"supportsFunctionBreakpoints\":true,\"supportsSetVariable\":false,\"supportsRestartRequest\":false,\"supportsTerminateRequest\":true,\"supportTerminateDebuggee\":true,\"supportsStepBack\":false,\"supportsEvaluateForHovers\":true,\"supportsCompletionsRequest\":false,\"supportsLoadedSourcesRequest\":true,\"supportsConditionalBreakpoints\":false,\"supportsHitConditionalBreakpoints\":false,\"supportsDelayedStackTraceLoading\":false,\"exceptionBreakpointFilters\":[]}";
+
+// 一个断点：行断点有源文件键（规范化的绝对路径，Windows 小写）与行，函数断点有名字；points 为解析出的语句检查点。
+struct Bp {
+    id: int,
+    key: string,
+    line: int,
+    fn: string,
+    points: List<int>,
+    verified: bool,
+    message: string,
+}
+
+// —— 状态（一个适配器进程同一时刻至多一个会话；sessions 只有 0 或 1 项，用 for-in 取出）——
+let outSeq: int = 1;
+let sessions: List<Ref<Sess>> = listNew();
+let configDone: bool = false;
+let terminatedSent: bool = false;
+let quit: bool = false;
+let errSent: int = 0;
+let windows: bool = false;
+let adapterCwd: string = ".";
+let bps: List<Ref<Bp>> = listNew();
+let armed: List<int> = listNew();
+let nextId: int = 1;
+// 本次停下的栈（栈顶在前）与动态引用。
+let frameCache: List<Ref<DbgFrame>> = listNew();
+let frameValid: bool = false;
+let refs: List<Ref<DbgKid>> = listNew();
+
+function noInts(): List<int> { return listNew(); }
+
+export function dapServe(): int {
+    dbgQueueOn();
+    windows = hostTarget() == "windows";
+    adapterCwd = currentDir() catch ".";
+    while (!quit) {
+        const msg = fioTake(MSG_MAX);
+        if (bytesLen(msg) > 0) {
+            handle(msg);
+            flushEngine();
+        } else if (len(fioError()) > 0) {
+            eprint("taixu dap: " + fioError());
+            endSession();
+            return 3;
+        } else if (fioAtEof()) {
+            endSession();
+            return 0;
+        } else if (!pumpOnce()) {
+            fioRead(-1);
+        }
+    }
+    endSession();
+    return 0;
+}
+
+// 产物运行中时推进一次（同时等客户端 stdin）；没有在运行的产物时得 false。
+function pumpOnce(): bool {
+    for (s in sessions) {
+        if (s.state != ST_RUNNING) { return false; }
+        corePump(s, 100, true);
+        flushEngine();
+        if (s.stdinReady) { fioRead(0); }
+        return true;
+    }
+    return false;
+}
+
+// —— 传输（分帧在 frame_io.tx）与文本小工具 ——
+
+function lowerAscii(s: string): string {
+    const b = bytesFromStr(s);
+    let k = 0;
+    while (k < bytesLen(b)) {
+        const c = bytesGet(b, k) catch 0;
+        if (c >= 65 && c <= 90) { bytesSet(b, k, c + 32); }
+        k = k + 1;
+    }
+    return bytesToStr(b) catch s;
+}
+
+function trimText(s: string): string {
+    const b = bytesFromStr(s);
+    let a = 0;
+    let z = bytesLen(b);
+    while (a < z && ((bytesGet(b, a) catch 0) == 32 || (bytesGet(b, a) catch 0) == 9)) { a = a + 1; }
+    while (z > a && ((bytesGet(b, z - 1) catch 0) == 32 || (bytesGet(b, z - 1) catch 0) == 9)) { z = z - 1; }
+    return bytesToStr(bytesSlice(b, a, z - a)) catch "";
+}
+
+function send(rest: string): void {
+    const body = "{\"seq\":" + toStr(outSeq) + "," + rest + "}";
+    outSeq = outSeq + 1;
+    fioSend(body);
+}
+
+function respond(seq: int, cmd: string, body: string): void {
+    let rest = "\"type\":\"response\",\"request_seq\":" + toStr(seq) + ",\"success\":true,\"command\":" + dbgStr(cmd);
+    if (len(body) > 0) { rest = rest + ",\"body\":" + body; }
+    send(rest);
+}
+
+function fail(seq: int, cmd: string, message: string): void {
+    send("\"type\":\"response\",\"request_seq\":" + toStr(seq) + ",\"success\":false,\"command\":" + dbgStr(cmd) + ",\"message\":" + dbgStr(message));
+}
+
+function event(name: string, body: string): void {
+    let rest = "\"type\":\"event\",\"event\":" + dbgStr(name);
+    if (len(body) > 0) { rest = rest + ",\"body\":" + body; }
+    send(rest);
+}
+
+function output(category: string, text: string): void {
+    event("output", "{\"category\":" + dbgStr(category) + ",\"output\":" + dbgStr(text) + "}");
+}
+
+function terminated(): void {
+    if (terminatedSent) { return; }
+    terminatedSent = true;
+    event("terminated", "");
+}
+
+// 产物 stderr：合计 1 MiB 后截断并提示（同 Zig 版）。
+function forwardErr(text: string): void {
+    if (errSent >= ERR_CAP) { return; }
+    const n = len(text);
+    if (errSent + n > ERR_CAP) {
+        errSent = ERR_CAP;
+        output("stderr", "\n（stderr 超过 1MiB 上限——截断）\n");
+        return;
+    }
+    errSent = errSent + n;
+    output("stderr", text);
+}
+
+// —— 引擎事件 → DAP ——
+
+function flushEngine(): void {
+    const evs = dbgTakeEvents();
+    let k = 0;
+    while (k < listLen(evs)) {
+        translate(listGet(evs, k) catch "{}");
+        k = k + 1;
+    }
+}
+
+function translate(line: string): void {
+    const e = jsonParse(bytesFromStr(line)) catch (x) { return; };
+    const ev = strField(e, "event");
+    if (ev == "ready") {
+        output("console", "调试目标已装载（ready——装填态，可先断后跑）\n");
+    } else if (ev == "stdout") {
+        output("stdout", strField(e, "text") + "\n");
+    } else if (ev == "stderr") {
+        forwardErr(strField(e, "text") + "\n");
+    } else if (ev == "stopped") {
+        resetStop();
+        const desc = strField(e, "fn") + "@" + toStr(intField(e, "line")) + ":" + toStr(intField(e, "col"));
+        event("stopped", "{\"reason\":" + dbgStr(strField(e, "reason")) + ",\"description\":" + dbgStr(desc) + ",\"threadId\":1,\"allThreadsStopped\":true}");
+    } else if (ev == "exited") {
+        const reason = strField(e, "reason");
+        if (reason == "timeout") { output("stderr", "执行墙钟到点——调试目标被强制收尾\n"); }
+        if (reason == "session_limit") { output("stderr", "会话硬顶到点——调试目标被强制收尾\n"); }
+        resetStop();
+        event("exited", "{\"exitCode\":" + toStr(intField(e, "code")) + "}");
+        terminated();
+    } else if (ev == "trapped") {
+        output("stderr", "trap " + strField(e, "code_name") + ": " + strField(e, "msg") + "（" + strField(e, "module") + ":" + toStr(intField(e, "line")) + ":" + toStr(intField(e, "col")) + "）\n");
+        resetStop();
+        event("exited", "{\"exitCode\":3}");
+        terminated();
+    } else if (ev == "compile_failed") {
+        let text = "编译失败（调试目标未启动）：\n";
+        const dv = jsonGet(e, "diags") catch None;
+        if (dv != None) {
+            const ds = dv catch e;
+            let i = 0;
+            while (i < listLen(ds.items)) {
+                const d = listGet(ds.items, i) catch e;
+                text = text + "  - " + strField(d, "module") + ":" + toStr(intField(d, "line")) + ":" + toStr(intField(d, "col")) + ": " + strField(d, "msg") + "\n";
+                i = i + 1;
+            }
+        }
+        output("stderr", text);
+    } else if (ev == "error") {
+        output("stderr", "调试引擎错误：" + strField(e, "message") + "\n");
+    }
+}
+
+// 停下或继续时作废本次停下的栈与引用（DAP：引用只在本次停下内有效）。
+function resetStop(): void {
+    frameCache = listNew();
+    frameValid = false;
+    refs = listNew();
+}
+
+// —— 请求 ——
+
+function handle(body: Bytes): void {
+    const m = jsonParse(body) catch (e) { return; };
+    if (m.kind != JSON_OBJ || strField(m, "type") != "request") { return; }
+    const cv = jsonGet(m, "command") catch None;
+    if (cv == None) { return; }
+    const c = cv catch m;
+    if (c.kind != JSON_STR) { return; }
+    const cmd = c.s;
+    let seq = 0;
+    const sv = jsonGet(m, "seq") catch None;
+    if (sv != None) {
+        const sq = sv catch m;
+        if (sq.kind == JSON_INT) { seq = sq.i; }
+    }
+    let args = jsonNew(JSON_OBJ);
+    const av = jsonGet(m, "arguments") catch None;
+    if (av != None) {
+        const a = av catch m;
+        if (a.kind == JSON_OBJ) { args = a; }
+    }
+    if (cmd == "initialize") {
+        respond(seq, cmd, CAPS);
+        event("initialized", "");
+    } else if (cmd == "launch") {
+        onLaunch(seq, cmd, args);
+    } else if (cmd == "setBreakpoints") {
+        onSetBreakpoints(seq, cmd, args);
+    } else if (cmd == "setFunctionBreakpoints") {
+        onSetFunctionBreakpoints(seq, cmd, args);
+    } else if (cmd == "setExceptionBreakpoints") {
+        respond(seq, cmd, "");
+    } else if (cmd == "configurationDone") {
+        configDone = true;
+        respond(seq, cmd, "");
+        startIfLoading();
+    } else if (cmd == "threads") {
+        respond(seq, cmd, "{\"threads\":[{\"id\":1,\"name\":\"taixu\"}]}");
+    } else if (cmd == "continue") {
+        onRun(seq, cmd, 0);
+    } else if (cmd == "next") {
+        onRun(seq, cmd, 2);
+    } else if (cmd == "stepIn") {
+        onRun(seq, cmd, 1);
+    } else if (cmd == "stepOut") {
+        onRun(seq, cmd, 3);
+    } else if (cmd == "pause") {
+        onPause(seq, cmd);
+    } else if (cmd == "stackTrace") {
+        onStackTrace(seq, cmd, args);
+    } else if (cmd == "scopes") {
+        onScopes(seq, cmd, args);
+    } else if (cmd == "variables") {
+        onVariables(seq, cmd, args);
+    } else if (cmd == "evaluate") {
+        onEvaluate(seq, cmd, args);
+    } else if (cmd == "loadedSources") {
+        onLoadedSources(seq, cmd);
+    } else if (cmd == "disconnect") {
+        endSession();
+        respond(seq, cmd, "");
+        terminated();
+        quit = true;
+    } else if (cmd == "terminate") {
+        endSession();
+        respond(seq, cmd, "");
+        terminated();
+        configDone = false;
+    } else if (cmd == "attach") {
+        fail(seq, cmd, "不支持 attach（只支持 launch）");
+    } else {
+        fail(seq, cmd, "command not supported");
+    }
+}
+
+// 结束并清理当前会话（产物仍在运行时杀掉，删除临时产物）。
+function endSession(): void {
+    for (s in sessions) {
+        coreKill(s);
+        coreClose(s);
+    }
+    sessions = listNew();
+    armed = listNew();
+    resetStop();
+}
+
+function getStr(args: Ref<JsonValue>, key: string): string {
+    const v = jsonGet(args, key) catch None;
+    if (v == None) { return ""; }
+    const x = v catch args;
+    if (x.kind != JSON_STR) { return ""; }
+    return x.s;
+}
+
+function stemOf(path: string): string {
+    let base = dbgBase(path);
+    if (len(base) > 3 && strIndexOf(base, ".tx") == len(base) - 3) { base = strSub(base, 0, len(base) - 3); }
+    return base;
+}
+
+function onLaunch(seq: int, cmd: string, args: Ref<JsonValue>): void {
+    for (old in sessions) {
+        if (old.state != ST_ENDED) {
+            fail(seq, cmd, "已 launch（单会话制——重启请 disconnect 后新会话）");
+            return;
+        }
+    }
+    endSession();
+    launchNew(seq, cmd, args);
+}
+
+function launchNew(seq: int, cmd: string, args: Ref<JsonValue>): void {
+    const pv = jsonGet(args, "program") catch None;
+    if (pv == None) {
+        fail(seq, cmd, "缺少 program（.tx 源文件路径）");
+        return;
+    }
+    const pp = pv catch args;
+    if (pp.kind != JSON_STR) {
+        fail(seq, cmd, "program 须为字符串");
+        return;
+    }
+    let runDir = adapterCwd;
+    const cwdArg = getStr(args, "cwd");
+    if (len(cwdArg) > 0) { runDir = dbgAbsPath(adapterCwd, filePath(cwdArg), windows); }
+    const program = dbgAbsPath(runDir, filePath(pp.s), windows);
+    const progArgs: List<string> = listNew();
+    const lv = jsonGet(args, "args") catch None;
+    if (lv != None) {
+        const la = lv catch args;
+        if (la.kind == JSON_ARR) {
+            let i = 0;
+            while (i < listLen(la.items)) {
+                const x = listGet(la.items, i) catch args;
+                if (x.kind == JSON_STR) { listPush(progArgs, x.s); }
+                i = i + 1;
+            }
+        }
+    }
+    let exe = pathHostJoin(tempDir(), "taixu-dap-" + stemOf(program) + "-" + toStr(monoNs()));
+    let exeHost = exe;
+    if (windows) {
+        exe = exe + ".exe";
+        exeHost = exe;
+    } else {
+        exeHost = filePath(exe);
+    }
+    terminatedSent = false;
+    errSent = 0;
+    const s = coreLaunch(program, adapterCwd, progArgs, exe, exeHost, runDir) catch (e) {
+        flushEngine();
+        fail(seq, cmd, "调试目标启动即退出（编译失败或早退——详见调试控制台）");
+        terminated();
+        return;
+    };
+    listPush(sessions, s);
+    respond(seq, cmd, "");
+    flushEngine();
+    if (s.state == ST_ENDED) { return; }
+    let k = 0;
+    while (k < listLen(bps)) {
+        const b = listGet(bps, k) catch new Bp { id: 0, key: "", line: 0, fn: "", points: noInts(), verified: false, message: "" };
+        resolve(s, b);
+        event("breakpoint", "{\"reason\":\"changed\",\"breakpoint\":" + bpJson(b) + "}");
+        k = k + 1;
+    }
+    rearm();
+    startIfLoading();
+}
+
+// configurationDone 与 launch 都到了、产物还在装填态时放行（两者先后不限）。
+function startIfLoading(): void {
+    for (s in sessions) {
+        if (configDone && s.state == ST_LOADING) {
+            resetStop();
+            coreRun(s, 0, 0, 0);
+            flushEngine();
+        }
+    }
+}
+
+function onRun(seq: int, cmd: string, mode: int): void {
+    for (s in sessions) {
+        runOn(s, seq, cmd, mode);
+        return;
+    }
+    fail(seq, cmd, "尚未 launch");
+}
+
+function runOn(s: Ref<Sess>, seq: int, cmd: string, mode: int): void {
+    if (s.state == ST_ENDED) {
+        fail(seq, cmd, "调试目标已结束");
+        return;
+    }
+    if (cmd == "continue") { respond(seq, cmd, "{\"allThreadsContinued\":true}"); } else { respond(seq, cmd, ""); }
+    if (s.state == ST_RUNNING) { return; }
+    let m = mode;
+    // 装填态的 over、out 相当于 continue（同 NDJSON 引擎）。
+    if (s.state == ST_LOADING && m != 1) { m = 0; }
+    resetStop();
+    coreRun(s, m, 0, 0);
+    flushEngine();
+}
+
+function onPause(seq: int, cmd: string): void {
+    for (s in sessions) {
+        respond(seq, cmd, "");
+        if (s.state == ST_RUNNING) { corePause(s); }
+        return;
+    }
+    fail(seq, cmd, "尚未 launch");
+}
+
+// —— 断点 ——
+
+// 源文件路径 → 比较键：规范化的绝对路径再解析为真实路径，Windows 不分大小写。模块路径按（物理的）当前目录解析，客户端给的
+// 是它看到的路径，经符号链接（macOS 的 /tmp、/var，链接进来的工作区）时字面不同；按真实路径比，同一文件才对得上（跟进第 4 条）。
+// 断点请求逐个模块求键，按路径缓存。
+let keyCache: Map<string, string> = mapNew();
+function pathKey(path: string): string {
+    const abs = dbgAbsPath(adapterCwd, filePath(path), windows);
+    const hit = mapGet(keyCache, abs);
+    if (hit != None) { return hit ?? ""; }
+    let key = dbgAbsPath(adapterCwd, filePath(realPath(abs)), windows);
+    if (windows) { key = lowerAscii(key); }
+    mapSet(keyCache, abs, key);
+    return key;
+}
+
+function modulesOfKey(s: Ref<Sess>, key: string): List<int> {
+    const out: List<int> = listNew();
+    let m = 0;
+    while (m < listLen(s.absMods)) {
+        const p = listGet(s.absMods, m) catch "";
+        if (p != "<prelude>" && pathKey(p) == key) { listPush(out, m); }
+        m = m + 1;
+    }
+    return out;
+}
+
+function resolve(s: Ref<Sess>, b: Ref<Bp>): void {
+    b.points = listNew();
+    b.message = "";
+    if (len(b.fn) > 0) {
+        const p = coreFnPoint(s, b.fn);
+        if (p >= 0) { listPush(b.points, p); } else { b.message = "没有这个函数（或函数体没有语句）"; }
+    } else {
+        const mods = modulesOfKey(s, b.key);
+        if (listLen(mods) == 0) {
+            b.message = "该文件不在本程序中";
+        } else {
+            b.points = corePoints(s, mods, b.line);
+            if (listLen(b.points) == 0) { b.message = "该行没有可停的语句"; }
+        }
+    }
+    b.verified = listLen(b.points) > 0;
+}
+
+// 产物里装着的断点与全部断点的并集对齐：多出的清除，缺的置位（运行中也立即生效）。
+function rearm(): void {
+    for (s in sessions) {
+        if (s.state != ST_ENDED) { rearmOn(s); }
+    }
+}
+
+function rearmOn(s: Ref<Sess>): void {
+    const want: List<int> = listNew();
+    let k = 0;
+    while (k < listLen(bps)) {
+        const b = listGet(bps, k) catch new Bp { id: 0, key: "", line: 0, fn: "", points: noInts(), verified: false, message: "" };
+        let j = 0;
+        while (j < listLen(b.points)) {
+            const p = listGet(b.points, j) catch 0;
+            if (!hasInt(want, p)) { listPush(want, p); }
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    k = 0;
+    while (k < listLen(armed)) {
+        const p = listGet(armed, k) catch 0;
+        if (!hasInt(want, p)) { coreArm(s, p, 0); }
+        k = k + 1;
+    }
+    k = 0;
+    while (k < listLen(want)) {
+        const p = listGet(want, k) catch 0;
+        if (!hasInt(armed, p)) { coreArm(s, p, 1); }
+        k = k + 1;
+    }
+    armed = want;
+}
+
+function bpJson(b: Ref<Bp>): string {
+    let out = "{\"id\":" + toStr(b.id) + ",\"verified\":";
+    if (b.verified) { out = out + "true"; } else { out = out + "false"; }
+    if (b.line > 0) { out = out + ",\"line\":" + toStr(b.line); }
+    if (len(b.message) > 0) { out = out + ",\"message\":" + dbgStr(b.message); }
+    return out + "}";
+}
+
+// 去掉 keep 为假的旧断点（同一文件的行断点，或全部函数断点）。
+function dropBps(key: string, fns: bool): void {
+    const kept: List<Ref<Bp>> = listNew();
+    let k = 0;
+    while (k < listLen(bps)) {
+        const b = listGet(bps, k) catch new Bp { id: 0, key: "", line: 0, fn: "", points: noInts(), verified: false, message: "" };
+        let drop = false;
+        if (fns) { drop = len(b.fn) > 0; } else { drop = len(b.fn) == 0 && b.key == key; }
+        if (!drop) { listPush(kept, b); }
+        k = k + 1;
+    }
+    bps = kept;
+}
+
+function addBp(key: string, line: int, fn: string): Ref<Bp> {
+    const b = new Bp { id: nextId, key: key, line: line, fn: fn, points: noInts(), verified: false, message: "" };
+    nextId = nextId + 1;
+    for (s in sessions) {
+        if (s.state != ST_ENDED) { resolve(s, b); }
+    }
+    listPush(bps, b);
+    return b;
+}
+
+// setBreakpoints：替换该文件的全部断点（DAP 规范）；回执与请求一一对应。
+function onSetBreakpoints(seq: int, cmd: string, args: Ref<JsonValue>): void {
+    const sv = jsonGet(args, "source") catch None;
+    let path = "";
+    if (sv != None) { path = getStr(sv catch args, "path"); }
+    if (len(path) == 0) {
+        fail(seq, cmd, "缺少 source.path（pathless source 不支持）");
+        return;
+    }
+    const key = pathKey(path);
+    dropBps(key, false);
+    const lines: List<int> = listNew();
+    const bv = jsonGet(args, "breakpoints") catch None;
+    if (bv != None) {
+        const ba = bv catch args;
+        let i = 0;
+        while (i < listLen(ba.items)) {
+            const one = listGet(ba.items, i) catch args;
+            listPush(lines, intOf(one, "line"));
+            i = i + 1;
+        }
+    } else {
+        const lv = jsonGet(args, "lines") catch None;
+        if (lv != None) {
+            const la = lv catch args;
+            let i = 0;
+            while (i < listLen(la.items)) {
+                const x = listGet(la.items, i) catch args;
+                if (x.kind == JSON_INT) { listPush(lines, x.i); } else { listPush(lines, 0); }
+                i = i + 1;
+            }
+        }
+    }
+    let out = "";
+    let k = 0;
+    while (k < listLen(lines)) {
+        const b = addBp(key, listGet(lines, k) catch 0, "");
+        if (k > 0) { out = out + ","; }
+        out = out + bpJson(b);
+        k = k + 1;
+    }
+    respond(seq, cmd, "{\"breakpoints\":[" + out + "]}");
+    rearm();
+}
+
+function intOf(obj: Ref<JsonValue>, key: string): int {
+    const v = jsonGet(obj, key) catch None;
+    if (v == None) { return 0; }
+    const x = v catch obj;
+    if (x.kind != JSON_INT) { return 0; }
+    return x.i;
+}
+
+function onSetFunctionBreakpoints(seq: int, cmd: string, args: Ref<JsonValue>): void {
+    dropBps("", true);
+    let out = "";
+    const bv = jsonGet(args, "breakpoints") catch None;
+    if (bv != None) {
+        const ba = bv catch args;
+        let i = 0;
+        while (i < listLen(ba.items)) {
+            const one = listGet(ba.items, i) catch args;
+            let name = getStr(one, "name");
+            if (len(name) == 0) { name = "?"; }
+            const b = addBp("", 0, name);
+            if (i > 0) { out = out + ","; }
+            out = out + bpJson(b);
+            i = i + 1;
+        }
+    }
+    respond(seq, cmd, "{\"breakpoints\":[" + out + "]}");
+    rearm();
+}
+
+// —— 栈、作用域与变量 ——
+
+// 停止态的会话；不是时回执失败并得 Error。what 为“栈”或“变量”。
+function stoppedSess(seq: int, cmd: string, what: string): Ref<Sess> | Error {
+    for (s in sessions) {
+        if (s.state == ST_ENDED) {
+            fail(seq, cmd, "调试目标已退出");
+            return err("ended");
+        }
+        if (s.state == ST_RUNNING) {
+            fail(seq, cmd, "目标运行中（" + what + "仅停止态可用）");
+            return err("running");
+        }
+        return s;
+    }
+    fail(seq, cmd, "尚未 launch");
+    return err("no session");
+}
+
+// 本次停下的栈，栈顶在前（引擎的 FRAMES 以最外层在前）。
+function stack(s: Ref<Sess>): List<Ref<DbgFrame>> {
+    if (frameValid) { return frameCache; }
+    const outer = framesOf(s);
+    const out: List<Ref<DbgFrame>> = listNew();
+    let k = listLen(outer) - 1;
+    while (k >= 0) {
+        listPush(out, listGet(outer, k) catch new DbgFrame { win: 0, fn: 0, pc: 0 });
+        k = k - 1;
+    }
+    frameCache = out;
+    frameValid = true;
+    return out;
+}
+
+function onStackTrace(seq: int, cmd: string, args: Ref<JsonValue>): void {
+    const s = stoppedSess(seq, cmd, "栈") catch (e) { return; };
+    const frames = stack(s);
+    let start = intOf(args, "startFrame");
+    if (start < 0) { start = 0; }
+    let levels = intOf(args, "levels");
+    if (levels <= 0) { levels = listLen(frames); }
+    let out = "";
+    let k = start;
+    while (k < listLen(frames) && k < start + levels) {
+        const fr = listGet(frames, k) catch new DbgFrame { win: 0, fn: 0, pc: 0 };
+        const mi = listGet(s.ctx.fnModule, fr.fn) catch -1;
+        let mod = "";
+        if (mi >= 0 && mi < listLen(s.absMods)) { mod = listGet(s.absMods, mi) catch ""; }
+        let src = "";
+        if (len(mod) > 0 && mod != "<prelude>") { src = ",\"source\":{\"name\":" + dbgStr(dbgBase(mod)) + ",\"path\":" + dbgStr(mod) + "}"; }
+        if (len(out) > 0) { out = out + ","; }
+        out = out + "{\"id\":" + toStr(FRAME_BASE + k) + ",\"name\":" + dbgStr(fnText(s, fr.fn)) + src + ",\"line\":" + toStr(lineAt(s, fr.fn, fr.pc)) + ",\"column\":" + toStr(colAt(s, fr.fn, fr.pc)) + "}";
+        k = k + 1;
+    }
+    respond(seq, cmd, "{\"stackFrames\":[" + out + "],\"totalFrames\":" + toStr(listLen(frames)) + "}");
+}
+
+function onScopes(seq: int, cmd: string, args: Ref<JsonValue>): void {
+    const fv = jsonGet(args, "frameId") catch None;
+    if (fv == None) {
+        fail(seq, cmd, "缺少 frameId");
+        return;
+    }
+    const f = fv catch args;
+    if (f.kind != JSON_INT) {
+        fail(seq, cmd, "frameId 须为整数");
+        return;
+    }
+    const s = stoppedSess(seq, cmd, "变量") catch (e) { return; };
+    const k = f.i - FRAME_BASE;
+    if (k < 0 || k >= listLen(stack(s))) {
+        fail(seq, cmd, "frameId 越界（见 stackTrace）");
+        return;
+    }
+    respond(seq, cmd, "{\"scopes\":[{\"name\":\"局部变量\",\"variablesReference\":" + toStr(REF_LOCALS + k) + ",\"expensive\":false,\"presentationHint\":\"locals\"},{\"name\":\"槽位\",\"variablesReference\":" + toStr(REF_SLOTS + k) + ",\"expensive\":false}]}");
+}
+
+// 变量面板里值的写法（调试实施设计 §四-8）。
+function valueText(h: Ref<DbgHead>): string {
+    if (h.tag == "string") {
+        let q = "\"" + h.text;
+        if ((h.tr & 4) != 0) { q = q + "…"; }
+        return q + "\"";
+    }
+    if ((h.tag == "struct" || h.tag == "ref") && len(h.ty) > 0) { return h.ty + "（" + h.text + "）"; }
+    if (h.tag == "enum" && len(h.ty) > 0) { return h.ty + "." + h.text; }
+    if (h.tag == "list" || h.tag == "array" || h.tag == "slice" || h.tag == "bytes") { return h.tag + "（" + h.text + "）"; }
+    return h.text;
+}
+
+// 值可展开时登记一个动态引用并返回其号，否则为 0。
+function refOf(s: Ref<Sess>, kid: Ref<DbgKid>): int {
+    if (listLen(viewKids(s.v, kid.slot, kid.ty, kid.hint)) == 0) { return 0; }
+    if (listLen(refs) >= REF_LOCALS - 1) { return 0; }
+    listPush(refs, kid);
+    return listLen(refs);
+}
+
+function varJson(name: string, value: string, ty: string, ref: int): string {
+    return "{\"name\":" + dbgStr(name) + ",\"value\":" + dbgStr(value) + ",\"type\":" + dbgStr(ty) + ",\"variablesReference\":" + toStr(ref) + "}";
+}
+
+function onVariables(seq: int, cmd: string, args: Ref<JsonValue>): void {
+    const rv = jsonGet(args, "variablesReference") catch None;
+    if (rv == None) {
+        fail(seq, cmd, "缺少 variablesReference");
+        return;
+    }
+    const r = rv catch args;
+    if (r.kind != JSON_INT) {
+        fail(seq, cmd, "variablesReference 须为整数");
+        return;
+    }
+    const s = stoppedSess(seq, cmd, "变量") catch (e) { return; };
+    const ref = r.i;
+    let out = "";
+    if (ref >= REF_LOCALS && ref < REF_END) {
+        let k = ref - REF_LOCALS;
+        let named = true;
+        if (ref >= REF_SLOTS) {
+            k = ref - REF_SLOTS;
+            named = false;
+        }
+        const frames = stack(s);
+        if (k >= listLen(frames)) {
+            fail(seq, cmd, "variablesReference 越界");
+            return;
+        }
+        out = frameVars(s, listGet(frames, k) catch new DbgFrame { win: 0, fn: 0, pc: 0 }, named);
+    } else if (ref >= 1 && ref <= listLen(refs)) {
+        const parent = listGet(refs, ref - 1) catch new DbgKid { name: "", slot: new DbgSlot { tag: 0, pay: 0 }, ty: -1, fw: 0, hint: -1 };
+        const kids = viewKids(s.v, parent.slot, parent.ty, parent.hint);
+        let i = 0;
+        while (i < listLen(kids)) {
+            const c = listGet(kids, i) catch parent;
+            const h = viewHead(s.v, c.slot, c.ty, c.fw, c.hint);
+            let name = c.name;
+            if (len(name) == 0) { name = "[" + toStr(i) + "]"; }
+            let ty = h.ty;
+            if (len(ty) == 0) { ty = h.tag; }
+            if (len(out) > 0) { out = out + ","; }
+            out = out + varJson(name, valueText(h), ty, refOf(s, c));
+            i = i + 1;
+        }
+    } else {
+        fail(seq, cmd, "variablesReference 越界");
+        return;
+    }
+    respond(seq, cmd, "{\"variables\":[" + out + "]}");
+}
+
+// 一帧的局部变量（具名，按槽序）或槽位（s{N}，值为 brief、类型为 tag，同 Zig 版）。
+function frameVars(s: Ref<Sess>, fr: Ref<DbgFrame>, named: bool): string {
+    const slots = viewSlots(s.v, fr.win, regCount(s, fr.fn));
+    let out = "";
+    let i = 0;
+    while (i < listLen(slots)) {
+        const slot = listGet(slots, i) catch new DbgSlot { tag: 0, pay: 0 };
+        const vk = varIdx(s, fr.fn, fr.pc, i);
+        const ty = varTy(s, fr.fn, vk);
+        const kid = new DbgKid { name: "", slot: slot, ty: ty, fw: 0, hint: -1 };
+        if (named && vk >= 0) {
+            const h = viewHead(s.v, slot, ty, 0, -1);
+            if (len(out) > 0) { out = out + ","; }
+            out = out + varJson(varName(s, fr.fn, vk), valueText(h), varTyText(s, fr.fn, vk), refOf(s, kid));
+        } else if (!named) {
+            const h = viewHead(s.v, slot, ty, 0, -1);
+            if (len(out) > 0) { out = out + ","; }
+            out = out + varJson("s" + toStr(i), viewBrief(s.v, slot, ty), h.tag, refOf(s, kid));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+function isIdent(s: string): bool {
+    if (len(s) == 0) { return false; }
+    let k = 0;
+    while (k < len(s)) {
+        const c = byteAt(s, k) catch 0;
+        const letter = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+        const digit = c >= 48 && c <= 57;
+        if (!letter && !(digit && k > 0)) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+// evaluate：只支持变量名（悬停与监视），按 frameId（缺省栈顶）找可见的具名变量。
+function onEvaluate(seq: int, cmd: string, args: Ref<JsonValue>): void {
+    const expr = trimText(getStr(args, "expression"));
+    if (!isIdent(expr)) {
+        fail(seq, cmd, "只支持变量名（表达式求值另排）");
+        return;
+    }
+    const s = stoppedSess(seq, cmd, "变量") catch (e) { return; };
+    const frames = stack(s);
+    let k = 0;
+    const fv = jsonGet(args, "frameId") catch None;
+    if (fv != None) {
+        const f = fv catch args;
+        if (f.kind == JSON_INT) { k = f.i - FRAME_BASE; }
+    }
+    if (k < 0 || k >= listLen(frames)) {
+        fail(seq, cmd, "frameId 越界（见 stackTrace）");
+        return;
+    }
+    const fr = listGet(frames, k) catch new DbgFrame { win: 0, fn: 0, pc: 0 };
+    const slots = viewSlots(s.v, fr.win, regCount(s, fr.fn));
+    let i = 0;
+    while (i < listLen(slots)) {
+        const vk = varIdx(s, fr.fn, fr.pc, i);
+        if (vk >= 0 && varName(s, fr.fn, vk) == expr) {
+            const slot = listGet(slots, i) catch new DbgSlot { tag: 0, pay: 0 };
+            const ty = varTy(s, fr.fn, vk);
+            const h = viewHead(s.v, slot, ty, 0, -1);
+            const ref = refOf(s, new DbgKid { name: expr, slot: slot, ty: ty, fw: 0, hint: -1 });
+            respond(seq, cmd, "{\"result\":" + dbgStr(valueText(h)) + ",\"type\":" + dbgStr(varTyText(s, fr.fn, vk)) + ",\"variablesReference\":" + toStr(ref) + "}");
+            return;
+        }
+        i = i + 1;
+    }
+    fail(seq, cmd, "当前帧没有名为 " + expr + " 的变量");
+}
+
+function onLoadedSources(seq: int, cmd: string): void {
+    let out = "";
+    for (s in sessions) { out = sourcesOf(s); }
+    respond(seq, cmd, "{\"sources\":[" + out + "]}");
+}
+
+function sourcesOf(s: Ref<Sess>): string {
+    let out = "";
+    let m = 0;
+    while (m < listLen(s.absMods)) {
+        const p = listGet(s.absMods, m) catch "";
+        if (p != "<prelude>") {
+            if (len(out) > 0) { out = out + ","; }
+            out = out + "{\"name\":" + dbgStr(dbgBase(p)) + ",\"path\":" + dbgStr(p) + "}";
+        }
+        m = m + 1;
+    }
+    return out;
+}

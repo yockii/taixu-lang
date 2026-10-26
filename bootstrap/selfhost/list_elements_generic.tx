@@ -1,0 +1,203 @@
+// 列表元素的可移植版（rtfn 写，macOS 适配 M4 设计 A8）：语义与导出名同 list_elements.tx。描述符见 list_backing_generic.tx；
+// 所有权与陷阱留在调用方。紧凑列表（form 3）转 list_compact 的对应例程（实参原样传过去）。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, L, I } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtLoad, rtStore, rtLabel, rtJump, rtIf, rtCall1, rtCall3, rtCall4, rtRet } from "./rtfn";
+import { LIST_FORM_COMPACT } from "./list_compact";
+
+const MODULE: string = "bootstrap/selfhost/list_elements_generic.tx";
+const LEN_LIMIT: int = 1152921504606846975;
+const MASK32: int = 4294967295;
+// 各函数共用的局部：addr 元素地址、form 形态、elem 原始形态的标签、stride 元素宽度。
+const LOCALS: string = "addr form elem stride t p x y r";
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// 紧凑列表（视图非空且 form 3）调 target 并返回它的结果；否则落到 full。
+function compactJump(f: Ref<RtFn>, target: string, nargs: int): void {
+    rtIf(f, L("v"), "eq", I(0), "full");
+    rtLoad(f, "x", L("v"), 24, 4);
+    rtIf(f, L("x"), "ne", I(LIST_FORM_COMPACT), "full");
+    if (nargs == 4) { rtCall4(f, "r", target, L("v"), L("idx"), L("val"), L("allow")); }
+    else { rtCall3(f, "r", target, L("v"), L("idx"), L("val")); }
+    rtRet(f, L("r"));
+    rtLabel(f, "full");
+}
+
+// 定址（视图 v、下标 idx、值指针 val）：核对描述符（val 非空、idx < 长度 ≤ 容量 ≤ 2^60 − 1、指针非空、form 1 或 elem 1..3 的
+// form 2），不符跳 bad；得 addr、form、elem（只 form 2 有）、stride（通用 16、原始 8）。地址计算进位也跳 bad。
+function access(f: Ref<RtFn>): void {
+    rtIf(f, L("v"), "eq", I(0), "bad");
+    rtIf(f, L("val"), "eq", I(0), "bad");
+    rtLoad(f, "x", L("v"), 8, 8);
+    rtIf(f, L("idx"), "uge", L("x"), "bad");
+    rtLoad(f, "y", L("v"), 16, 8);
+    rtIf(f, L("x"), "ugt", L("y"), "bad");
+    rtIf(f, L("y"), "ugt", I(LEN_LIMIT), "bad");
+    rtLoad(f, "x", L("v"), 0, 8);
+    rtIf(f, L("x"), "eq", I(0), "bad");
+    rtLoad(f, "form", L("v"), 24, 4);
+    rtSet(f, "stride", I(16));
+    rtIf(f, L("form"), "eq", I(1), "addr");
+    rtIf(f, L("form"), "ne", I(2), "bad");
+    rtLoad(f, "elem", L("v"), 28, 4);
+    rtIf(f, L("elem"), "ult", I(1), "bad");
+    rtIf(f, L("elem"), "ugt", I(3), "bad");
+    rtSet(f, "stride", I(8));
+    rtLabel(f, "addr");
+    rtOp(f, "addr", L("idx"), "imul", L("stride"));
+    rtLoad(f, "x", L("v"), 0, 8);
+    rtOp(f, "addr", L("addr"), "add", L("x"));
+    rtIf(f, L("addr"), "ult", L("x"), "bad");
+}
+
+// 读出元素写到 *val：通用形态拷贝 16 字节；原始形态写 {elem, 载荷}（布尔规范为 0/1）。
+function output(f: Ref<RtFn>): void {
+    rtIf(f, L("form"), "eq", I(1), "generic");
+    rtSet(f, "t", L("elem"));
+    rtLoad(f, "p", L("addr"), 0, 8);
+    rtIf(f, L("elem"), "ne", I(3), "write");
+    rtIf(f, L("p"), "eq", I(0), "write");
+    rtSet(f, "p", I(1));
+    rtJump(f, "write");
+    rtLabel(f, "generic");
+    rtLoad(f, "t", L("addr"), 0, 8);
+    rtLoad(f, "p", L("addr"), 8, 8);
+    rtLabel(f, "write");
+    rtStore(f, L("val"), 0, L("t"), 8);
+    rtStore(f, L("val"), 8, L("p"), 8);
+}
+
+// get(view, idx, out*) → form（1 通用、2 原始），或 0（描述符损坏、越界、out 为空）。
+function getFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_list_get_v2", "v idx val", LOCALS, 3, MODULE);
+    compactJump(f, "__tx_native_list_cget_v1", 3);
+    access(f);
+    output(f);
+    rtRet(f, L("form"));
+    rtLabel(f, "bad");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// remove(view, idx, out*) → form：取出元素写到 *out，其后的元素前移一位，长度减一；失败为 0（描述符不变）。
+function removeFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_list_remove_v2", "v idx val", LOCALS + " last", 3, MODULE);
+    compactJump(f, "__tx_native_list_cremove_v1", 3);
+    access(f);
+    output(f);
+    rtLoad(f, "x", L("v"), 8, 8);
+    rtOp(f, "x", L("x"), "sub", I(1));
+    rtOp(f, "x", L("x"), "imul", L("stride"));
+    rtLoad(f, "y", L("v"), 0, 8);
+    rtOp(f, "last", L("x"), "add", L("y"));
+    rtLabel(f, "loop");
+    rtIf(f, L("addr"), "uge", L("last"), "shifted");
+    rtOp(f, "p", L("addr"), "add", L("stride"));
+    rtLoad(f, "x", L("p"), 0, 8);
+    rtStore(f, L("addr"), 0, L("x"), 8);
+    rtIf(f, L("form"), "eq", I(2), "next");
+    rtLoad(f, "x", L("p"), 8, 8);
+    rtStore(f, L("addr"), 8, L("x"), 8);
+    rtLabel(f, "next");
+    rtSet(f, "addr", L("p"));
+    rtJump(f, "loop");
+    rtLabel(f, "shifted");
+    rtLoad(f, "x", L("v"), 8, 8);
+    rtOp(f, "x", L("x"), "sub", I(1));
+    rtStore(f, L("v"), 8, L("x"), 8);
+    rtRet(f, L("form"));
+    rtLabel(f, "bad");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// prepareSet(view, idx, 值*) → 2（原始形态、标签与 elem 相同，已原地写入载荷）、1（通用形态，或已转为通用形态，调用方写通用槽）、
+// 0（描述符损坏、越界、值为空、转换失败）。标签不同时经 __tx_native_list_generic_v1 转为通用形态并返回它的结果。
+function prepareSetFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_list_prepare_set_v2", "v idx val", LOCALS, 3, MODULE);
+    compactJump(f, "__tx_native_list_cset_v1", 3);
+    access(f);
+    rtIf(f, L("form"), "eq", I(1), "generic_done");
+    rtLoad(f, "x", L("val"), 0, 8);
+    rtOp(f, "x", L("x"), "and", I(255));
+    rtIf(f, L("x"), "ne", L("elem"), "convert");
+    rtLoad(f, "p", L("val"), 8, 8);
+    rtIf(f, L("elem"), "ne", I(3), "write");
+    rtIf(f, L("p"), "eq", I(0), "write");
+    rtSet(f, "p", I(1));
+    rtLabel(f, "write");
+    rtStore(f, L("addr"), 0, L("p"), 8);
+    rtRet(f, I(2));
+    rtLabel(f, "convert");
+    rtCall1(f, "r", "__tx_native_list_generic_v1", L("v"));
+    rtRet(f, L("r"));
+    rtLabel(f, "generic_done");
+    rtRet(f, I(1));
+    rtLabel(f, "bad");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// insert(view, idx, 值*, allowRaw) → __tx_native_list_append_v1 的结果形态，或 0（视图为空、idx > 长度、追加失败）：
+// 先追加到末尾，再把 [idx, 末尾) 的元素后移一位，新元素放到 idx。
+function insertFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_list_insert_v2", "v idx val allow", LOCALS + " res at tw bits", 4, MODULE);
+    compactJump(f, "__tx_native_list_cinsert_v1", 4);
+    rtIf(f, L("v"), "eq", I(0), "bad");
+    rtLoad(f, "x", L("v"), 8, 8);
+    rtIf(f, L("idx"), "ugt", L("x"), "bad");
+    rtOp(f, "x", L("allow"), "and", I(MASK32));
+    rtCall3(f, "res", "__tx_native_list_append_v1", L("v"), L("val"), L("x"));
+    rtIf(f, L("res"), "eq", I(0), "out");
+    rtSet(f, "stride", I(8));
+    rtLoad(f, "x", L("v"), 24, 4);
+    rtIf(f, L("x"), "eq", I(2), "addr");
+    rtSet(f, "stride", I(16));
+    rtLabel(f, "addr");
+    rtLoad(f, "y", L("v"), 0, 8);
+    rtLoad(f, "x", L("v"), 8, 8);
+    rtOp(f, "x", L("x"), "sub", I(1));
+    rtOp(f, "x", L("x"), "imul", L("stride"));
+    rtOp(f, "addr", L("x"), "add", L("y"));
+    rtOp(f, "at", L("idx"), "imul", L("stride"));
+    rtOp(f, "at", L("at"), "add", L("y"));
+    // 刚追加的元素：原始形态只有 8 字节位；通用形态为 {标签字, 载荷}。
+    rtLoad(f, "bits", L("addr"), 0, 8);
+    rtIf(f, L("stride"), "eq", I(8), "loop");
+    rtSet(f, "tw", L("bits"));
+    rtLoad(f, "bits", L("addr"), 8, 8);
+    rtLabel(f, "loop");
+    rtIf(f, L("addr"), "eq", L("at"), "store");
+    rtOp(f, "p", L("addr"), "sub", L("stride"));
+    rtLoad(f, "x", L("p"), 0, 8);
+    rtStore(f, L("addr"), 0, L("x"), 8);
+    rtIf(f, L("stride"), "eq", I(8), "next");
+    rtLoad(f, "x", L("p"), 8, 8);
+    rtStore(f, L("addr"), 8, L("x"), 8);
+    rtLabel(f, "next");
+    rtSet(f, "addr", L("p"));
+    rtJump(f, "loop");
+    rtLabel(f, "store");
+    rtIf(f, L("stride"), "eq", I(8), "store_bits");
+    rtStore(f, L("addr"), 0, L("tw"), 8);
+    rtOp(f, "addr", L("addr"), "add", I(8));
+    rtLabel(f, "store_bits");
+    rtStore(f, L("addr"), 0, L("bits"), 8);
+    rtLabel(f, "out");
+    rtRet(f, L("res"));
+    rtLabel(f, "bad");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+/// 发出列表元素的函数；rtfn 的失败记进 failures。t 为目标编号（只在语义随目标不同时用）。
+export function listElementsGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    getFn(b, failures);
+    removeFn(b, failures);
+    prepareSetFn(b, failures);
+    insertFn(b, failures);
+}

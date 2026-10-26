@@ -1,0 +1,824 @@
+// 生成代码的指令宏（macOS 适配 M4 设计 A9 修订，docs/design/v052-macos-m4-arm64-v0.1-20261024.md）。可移植渲染器
+// （emit_portable*.tx）只经这里出指令，x86_64 与 A64 各有一种落地，渲染逻辑因此只写一份，并能在 x86 宿主上随语料对照验证。
+// 逻辑寄存器：W 值槽窗口、K0 K1 跨调用保存、T0–T3 临时（调用后失效）、SP 只作帧基址：
+//   x86  W rbx、K r14 r15、T rax r10 r11 r9；落地自用 rcx、rdx（移位计数、除法、setcc、立即数）与 xmm0、xmm1。
+//   A64  W x19、K x20 x21、T x9–x12；落地自用 x16 与 d16、d17（x17 留给 a64_asm 的偏移合法化）。
+// 整数一律 64 位，读按宽度零扩展；浮点值以双精度位型放在通用寄存器里。调用按私有约定：实参 x86 rcx rdx r8 r9、[rsp+32] 起，
+// A64 x0..x7；结果 rax／x0，第二结果 r8／x1。出错只记在 Gen.failed（第一条），由渲染器报出。
+import { StructuredBuffer, asBufferNew, asBufferNewA64, asBufferInstruction, asBufferLabel, asBufferFrame, asBufferFunctionPrologueEnd, asBufferFunctionEpilogueStart, asBufferFunctionEnd, asBufferGeneratedBegin, asBufferAppend, asBufferSubmit, asStructuredSection, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem, Operand } from "./assemble";
+import { a64Emit, a64B, a64BCond, a64Cbz, a64AddrOf, a64SymAccess, a64MovImm, a64AddImm, a64Mem, a64BufferSubmit, a64Frame, a64FrameAlloc } from "./a64_asm";
+import { a64AddSubImm, a64AddSubShifted, a64AddSubExt, a64LogicalImm, a64LogicalShifted, a64DataProc2, a64DataProc3, a64Bitfield, a64LdStReg, a64LdStPair, a64LdStImm9, a64BranchReg, a64CondSelect, a64InvertCond, a64FpInt, a64FpUnary, a64FpBinary, a64Fcmp, A64_SDIV, A64_UDIV, A64_LSLV, A64_LSRV, A64_ASRV } from "./a64_encode";
+
+export const G_W: int = 0;
+export const G_K0: int = 1;
+export const G_K1: int = 2;
+export const G_T0: int = 3;
+export const G_T1: int = 4;
+export const G_T2: int = 5;
+export const G_T3: int = 6;
+export const G_SP: int = 7;
+
+export struct Gen {
+    b: Ref<StructuredBuffer>,
+    a64: bool,
+    failed: string,
+    frame: int,
+    seq: int,
+}
+
+export function genNew(a64: bool): Ref<Gen> {
+    let b = asBufferNew();
+    if (a64) { b = asBufferNewA64(); }
+    return new Gen { b: b, a64: a64, failed: "", frame: 0, seq: 0 };
+}
+export function genFail(g: Ref<Gen>, why: string): void { if (len(g.failed) == 0) { g.failed = why; } }
+export function genAppend(g: Ref<Gen>, body: Ref<Gen>): void {
+    if (len(body.failed) > 0) { genFail(g, body.failed); }
+    asBufferAppend(g.b, body.b);
+}
+/// 把缓冲交给当前映像（代码节）。之前有失败则不提交，返回原因；成功返回空串。
+export function genSubmit(g: Ref<Gen>): string {
+    if (len(g.failed) > 0) { return g.failed; }
+    if (g.a64) { a64BufferSubmit(g.b); return ""; }
+    asStructuredSection(0);
+    asBufferSubmit(g.b);
+    return "";
+}
+
+// ---------------------------------------------------------------------------
+// 物理寄存器
+// ---------------------------------------------------------------------------
+function xr(r: int): int {
+    if (r == G_W) { return 3; }
+    if (r == G_K0) { return 14; }
+    if (r == G_K1) { return 15; }
+    if (r == G_T0) { return 0; }
+    if (r == G_T1) { return 10; }
+    if (r == G_T2) { return 11; }
+    if (r == G_T3) { return 9; }
+    if (r == G_SP) { return 4; }
+    return -1;
+}
+function ar(r: int): int {
+    if (r == G_W) { return 19; }
+    if (r == G_K0) { return 20; }
+    if (r == G_K1) { return 21; }
+    if (r == G_T0) { return 9; }
+    if (r == G_T1) { return 10; }
+    if (r == G_T2) { return 11; }
+    if (r == G_T3) { return 12; }
+    if (r == G_SP) { return 31; }
+    return -1;
+}
+// 运算的目的与源：只许 W K T（SP 只作基址）。
+function okReg(g: Ref<Gen>, r: int): bool {
+    if (r >= G_W && r <= G_T3) { return true; }
+    genFail(g, "GenBadRegister"); return false;
+}
+function okBase(g: Ref<Gen>, r: int): bool {
+    if (r >= G_W && r <= G_SP) { return true; }
+    genFail(g, "GenBadBase"); return false;
+}
+const AX: int = 0;
+const CX: int = 1;
+const DX: int = 2;
+const X16: int = 16;
+
+// x86 结构化指令
+function q(n: int): Ref<Operand> { return asStructuredReg(0, n); }
+function d32(n: int): Ref<Operand> { return asStructuredReg(1, n); }
+function b8(n: int): Ref<Operand> { return asStructuredReg(2, n); }
+function xmm(n: int): Ref<Operand> { return asStructuredReg(3, n); }
+function im(v: int): Ref<Operand> { return asStructuredImm(v); }
+function memSize(width: int): int {
+    if (width == 1) { return 0; }
+    if (width == 2) { return 3; }
+    if (width == 4) { return 1; }
+    return 2;
+}
+function xm(width: int, base: int, off: int): Ref<Operand> { return asStructuredMem(memSize(width), base, -1, 0, off, 0, ""); }
+function xmi(width: int, base: int, index: int, scaled: bool): Ref<Operand> {
+    let sc = 0;
+    if (scaled) { sc = aSize(width); }
+    return asStructuredMem(memSize(width), base, index, sc, 0, 0, "");
+}
+function xrip(width: int, sym: string): Ref<Operand> { return asStructuredMem(memSize(width), -1, -1, 0, 0, 1, sym); }
+function x2(g: Ref<Gen>, mn: string, a: Ref<Operand>, b: Ref<Operand>): void { asBufferInstruction(g.b, mn, 2, a, b, asStructuredMissing(), 1); }
+function x1(g: Ref<Gen>, mn: string, a: Ref<Operand>): void { asBufferInstruction(g.b, mn, 1, a, asStructuredMissing(), asStructuredMissing(), 1); }
+function x0(g: Ref<Gen>, mn: string): void { asBufferInstruction(g.b, mn, 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1); }
+function xj(g: Ref<Gen>, mn: string, label: string): void { asBufferInstruction(g.b, mn, 1, asStructuredTarget(label), asStructuredMissing(), asStructuredMissing(), 1); }
+function fitsI32(v: int): bool { return v >= -2147483648 && v <= 2147483647; }
+function xMovI(g: Ref<Gen>, p: int, v: int): void {
+    if (fitsI32(v)) { x2(g, "mov", q(p), im(v)); } else { x2(g, "movabs", q(p), im(v)); }
+}
+function xMov(g: Ref<Gen>, pd: int, ps: int): void { if (pd != ps) { x2(g, "mov", q(pd), q(ps)); } }
+
+// A64
+function aw(g: Ref<Gen>, word: int, what: string): void {
+    if (word < 0) { genFail(g, "GenA64Encode:" + what); return; }
+    a64Emit(g.b, word, what);
+}
+function aMov(g: Ref<Gen>, rd: int, rn: int): void {
+    if (rd == rn) { return; }
+    if (rd == 31 || rn == 31) { aw(g, a64AddSubImm(1, 0, 0, rd, rn, 0, 0), "mov sp"); return; }
+    aw(g, a64LogicalShifted(1, 1, 0, rd, 31, rn, 0, 0), "mov");
+}
+function aCond(cc: string): int {
+    if (cc == "eq") { return 0; }
+    if (cc == "ne") { return 1; }
+    if (cc == "lt") { return 11; }
+    if (cc == "le") { return 13; }
+    if (cc == "gt") { return 12; }
+    if (cc == "ge") { return 10; }
+    if (cc == "ult") { return 3; }
+    if (cc == "ule") { return 9; }
+    if (cc == "ugt") { return 8; }
+    if (cc == "uge") { return 2; }
+    return -1;
+}
+function xCond(cc: string): string {
+    if (cc == "eq") { return "je"; }
+    if (cc == "ne") { return "jne"; }
+    if (cc == "lt") { return "jl"; }
+    if (cc == "le") { return "jle"; }
+    if (cc == "gt") { return "jg"; }
+    if (cc == "ge") { return "jge"; }
+    if (cc == "ult") { return "jb"; }
+    if (cc == "ule") { return "jbe"; }
+    if (cc == "ugt") { return "ja"; }
+    if (cc == "uge") { return "jae"; }
+    return "";
+}
+function xSetCond(cc: string): string {
+    const j = xCond(cc);
+    if (len(j) == 0) { return ""; }
+    return "set" + strSub(j, 1, len(j) - 1);
+}
+function aSize(width: int): int {
+    if (width == 1) { return 0; }
+    if (width == 2) { return 1; }
+    if (width == 4) { return 2; }
+    return 3;
+}
+function okWidth(g: Ref<Gen>, width: int): bool {
+    if (width == 1 || width == 2 || width == 4 || width == 8) { return true; }
+    genFail(g, "GenBadWidth"); return false;
+}
+
+// ---------------------------------------------------------------------------
+// 标号、转移、搬运、读写
+// ---------------------------------------------------------------------------
+export function genLabel(g: Ref<Gen>, name: string): void { asBufferLabel(g.b, name, g.b.line); }
+/// 此后的指令记在字节码 pc 名下（A64 函数清单按它对源码行；行号＝pc＋2，同 asProducer*）。
+export function genAt(g: Ref<Gen>, pc: int): void { g.b.line = pc + 2; }
+export function genJmp(g: Ref<Gen>, label: string): void {
+    if (g.a64) { a64B(g.b, 0, label); return; }
+    xj(g, "jmp", label);
+}
+export function genMov(g: Ref<Gen>, rd: int, rs: int): void {
+    if (!okReg(g, rd) || !okReg(g, rs)) { return; }
+    if (g.a64) { aMov(g, ar(rd), ar(rs)); return; }
+    xMov(g, xr(rd), xr(rs));
+}
+export function genMovI(g: Ref<Gen>, rd: int, v: int): void {
+    if (!okReg(g, rd)) { return; }
+    if (g.a64) { a64MovImm(g.b, ar(rd), v); return; }
+    xMovI(g, xr(rd), v);
+}
+/// rd = *(width*)(base + off)，零扩展。
+export function genLd(g: Ref<Gen>, width: int, rd: int, base: int, off: int): void {
+    if (!okReg(g, rd) || !okBase(g, base) || !okWidth(g, width)) { return; }
+    if (g.a64) { a64Mem(g.b, aSize(width), 1, ar(rd), ar(base), off); return; }
+    if (width == 8) { x2(g, "mov", q(xr(rd)), xm(8, xr(base), off)); }
+    else if (width == 4) { x2(g, "mov", d32(xr(rd)), xm(4, xr(base), off)); }
+    else { x2(g, "movzx", d32(xr(rd)), xm(width, xr(base), off)); }
+}
+/// *(width*)(base + off) = rs 的低位。
+export function genSt(g: Ref<Gen>, width: int, base: int, off: int, rs: int): void {
+    if (!okReg(g, rs) || !okBase(g, base) || !okWidth(g, width)) { return; }
+    if (g.a64) { a64Mem(g.b, aSize(width), 0, ar(rs), ar(base), off); return; }
+    if (width == 8) { x2(g, "mov", xm(8, xr(base), off), q(xr(rs))); }
+    else if (width == 1) { x2(g, "mov", xm(1, xr(base), off), b8(xr(rs))); }
+    else { x2(g, "mov", xm(width, xr(base), off), d32(xr(rs))); }
+}
+/// *(width*)(base + off) = v。
+export function genStI(g: Ref<Gen>, width: int, base: int, off: int, v: int): void {
+    if (!okBase(g, base) || !okWidth(g, width)) { return; }
+    if (g.a64) {
+        let rt = 31;
+        if (v != 0) { a64MovImm(g.b, X16, v); rt = X16; }
+        a64Mem(g.b, aSize(width), 0, rt, ar(base), off);
+        return;
+    }
+    if ((width == 8 || width == 4) && fitsI32(v)) { x2(g, "mov", xm(width, xr(base), off), im(v)); return; }
+    xMovI(g, CX, v);
+    if (width == 8) { x2(g, "mov", xm(8, xr(base), off), q(CX)); }
+    else if (width == 1) { x2(g, "mov", xm(1, xr(base), off), b8(CX)); }
+    else { x2(g, "mov", xm(width, xr(base), off), d32(CX)); }
+}
+/// rd = *(width*)(base + index)，scaled 时 index 按 width 放大，否则以字节计。
+export function genLdX(g: Ref<Gen>, width: int, rd: int, base: int, index: int, scaled: bool): void {
+    if (!okReg(g, rd) || !okBase(g, base) || !okReg(g, index) || !okWidth(g, width)) { return; }
+    if (g.a64) {
+        let sc = 0;
+        if (scaled && width > 1) { sc = 1; }
+        aw(g, a64LdStReg(aSize(width), 0, 1, ar(rd), ar(base), ar(index), 3, sc), "ldr reg");
+        return;
+    }
+    if (width == 8) { x2(g, "mov", q(xr(rd)), xmi(8, xr(base), xr(index), scaled)); }
+    else if (width == 4) { x2(g, "mov", d32(xr(rd)), xmi(4, xr(base), xr(index), scaled)); }
+    else { x2(g, "movzx", d32(xr(rd)), xmi(width, xr(base), xr(index), scaled)); }
+}
+/// *(width*)(base + index) = rs 的低位；index 同 genLdX。
+export function genStX(g: Ref<Gen>, width: int, base: int, index: int, rs: int, scaled: bool): void {
+    if (!okReg(g, rs) || !okBase(g, base) || !okReg(g, index) || !okWidth(g, width)) { return; }
+    if (g.a64) {
+        let sc = 0;
+        if (scaled && width > 1) { sc = 1; }
+        aw(g, a64LdStReg(aSize(width), 0, 0, ar(rs), ar(base), ar(index), 3, sc), "str reg");
+        return;
+    }
+    if (width == 8) { x2(g, "mov", xmi(8, xr(base), xr(index), scaled), q(xr(rs))); }
+    else if (width == 1) { x2(g, "mov", xmi(1, xr(base), xr(index), scaled), b8(xr(rs))); }
+    else { x2(g, "mov", xmi(width, xr(base), xr(index), scaled), d32(xr(rs))); }
+}
+/// rd = base + off。
+export function genLea(g: Ref<Gen>, rd: int, base: int, off: int): void {
+    if (!okReg(g, rd) || !okBase(g, base)) { return; }
+    if (g.a64) { a64AddImm(g.b, ar(rd), ar(base), off); return; }
+    x2(g, "lea", q(xr(rd)), xm(8, xr(base), off));
+}
+/// rd = &symbol。
+export function genLeaSym(g: Ref<Gen>, rd: int, sym: string): void {
+    if (!okReg(g, rd)) { return; }
+    if (g.a64) { a64AddrOf(g.b, ar(rd), sym, 0); return; }
+    x2(g, "lea", q(xr(rd)), xrip(8, sym));
+}
+/// rd = *(width*)&symbol（width 4 或 8）。
+export function genLdSym(g: Ref<Gen>, width: int, rd: int, sym: string): void {
+    if (!okReg(g, rd)) { return; }
+    if (width != 4 && width != 8) { genFail(g, "GenBadWidth"); return; }
+    if (g.a64) { a64SymAccess(g.b, aSize(width), 0, 1, ar(rd), ar(rd), sym, 0); return; }
+    if (width == 8) { x2(g, "mov", q(xr(rd)), xrip(8, sym)); } else { x2(g, "mov", d32(xr(rd)), xrip(4, sym)); }
+}
+/// if (SP <cc> rb) goto label（只用无符号条件）。
+export function genBrSp(g: Ref<Gen>, cc: string, rb: int, label: string): void {
+    if (!okReg(g, rb)) { return; }
+    if (aCond(cc) < 0) { genFail(g, "GenBadCond:" + cc); return; }
+    if (g.a64) {
+        aw(g, a64AddSubExt(1, 1, 1, 31, 31, ar(rb), 3, 0), "cmp sp");
+        a64BCond(g.b, aCond(cc), label);
+        return;
+    }
+    x2(g, "cmp", q(4), q(xr(rb)));
+    xj(g, xCond(cc), label);
+}
+/// rd = 栈指针。
+export function genSp(g: Ref<Gen>, rd: int): void {
+    if (!okReg(g, rd)) { return; }
+    if (g.a64) { aMov(g, ar(rd), 31); return; }
+    x2(g, "mov", q(xr(rd)), q(4));
+}
+
+// ---------------------------------------------------------------------------
+// 整数运算
+// ---------------------------------------------------------------------------
+function isShift(op: string): bool { return op == "shl" || op == "shr" || op == "sar"; }
+/// rd = ra <op> rb：add sub and or xor mul（环绕）、shl shr sar（计数按 64 取模）。
+export function genOp(g: Ref<Gen>, op: string, rd: int, ra: int, rb: int): void {
+    if (!okReg(g, rd) || !okReg(g, ra) || !okReg(g, rb)) { return; }
+    if (g.a64) {
+        const d = ar(rd);
+        const a = ar(ra);
+        const b = ar(rb);
+        let w = -1;
+        if (op == "add") { w = a64AddSubShifted(1, 0, 0, d, a, b, 0, 0); }
+        if (op == "sub") { w = a64AddSubShifted(1, 1, 0, d, a, b, 0, 0); }
+        if (op == "and") { w = a64LogicalShifted(1, 0, 0, d, a, b, 0, 0); }
+        if (op == "or") { w = a64LogicalShifted(1, 1, 0, d, a, b, 0, 0); }
+        if (op == "xor") { w = a64LogicalShifted(1, 2, 0, d, a, b, 0, 0); }
+        if (op == "mul") { w = a64DataProc3(1, 0, 0, d, a, b, 31); }
+        if (op == "shl") { w = a64DataProc2(1, A64_LSLV, d, a, b); }
+        if (op == "shr") { w = a64DataProc2(1, A64_LSRV, d, a, b); }
+        if (op == "sar") { w = a64DataProc2(1, A64_ASRV, d, a, b); }
+        aw(g, w, "op " + op);
+        return;
+    }
+    let mn = op;
+    if (op == "mul") { mn = "imul"; }
+    if (mn != "add" && mn != "sub" && mn != "and" && mn != "or" && mn != "xor" && mn != "imul" && !isShift(op)) { genFail(g, "GenBadOp:" + op); return; }
+    if (isShift(op)) {
+        xMov(g, CX, xr(rb));
+        xMov(g, xr(rd), xr(ra));
+        x2(g, mn, q(xr(rd)), b8(CX));
+        return;
+    }
+    if (rd == rb && rd != ra) {
+        x2(g, "mov", q(CX), q(xr(ra)));
+        x2(g, mn, q(CX), q(xr(rb)));
+        x2(g, "mov", q(xr(rd)), q(CX));
+        return;
+    }
+    xMov(g, xr(rd), xr(ra));
+    x2(g, mn, q(xr(rd)), q(xr(rb)));
+}
+/// rd = ra <op> imm：add sub and or xor，及按常数移位 shl shr sar（0..63）。
+export function genOpI(g: Ref<Gen>, op: string, rd: int, ra: int, v: int): void {
+    if (!okReg(g, rd) || !okReg(g, ra)) { return; }
+    if (isShift(op) && (v < 0 || v > 63)) { genFail(g, "GenBadShift"); return; }
+    if (g.a64) {
+        const d = ar(rd);
+        const a = ar(ra);
+        if (op == "add") { a64AddImm(g.b, d, a, v); return; }
+        if (op == "sub") { a64AddImm(g.b, d, a, -v); return; }
+        if (op == "shl") { aw(g, a64Bitfield(1, 2, d, a, (64 - v) % 64, 63 - v), "lsl"); return; }
+        if (op == "shr") { aw(g, a64Bitfield(1, 2, d, a, v, 63), "lsr"); return; }
+        if (op == "sar") { aw(g, a64Bitfield(1, 0, d, a, v, 63), "asr"); return; }
+        let opc = -1;
+        if (op == "and") { opc = 0; }
+        if (op == "or") { opc = 1; }
+        if (op == "xor") { opc = 2; }
+        if (opc < 0) { genFail(g, "GenBadOp:" + op); return; }
+        const w = a64LogicalImm(1, opc, d, a, v);
+        if (w >= 0) { aw(g, w, "logical imm"); return; }
+        a64MovImm(g.b, X16, v);
+        aw(g, a64LogicalShifted(1, opc, 0, d, a, X16, 0, 0), "logical");
+        return;
+    }
+    if (op != "add" && op != "sub" && op != "and" && op != "or" && op != "xor" && !isShift(op)) { genFail(g, "GenBadOp:" + op); return; }
+    xMov(g, xr(rd), xr(ra));
+    if (isShift(op) || fitsI32(v)) { x2(g, op, q(xr(rd)), im(v)); return; }
+    x2(g, "movabs", q(CX), im(v));
+    x2(g, op, q(xr(rd)), q(CX));
+}
+export function genNeg(g: Ref<Gen>, rd: int, ra: int): void {
+    if (!okReg(g, rd) || !okReg(g, ra)) { return; }
+    if (g.a64) { aw(g, a64AddSubShifted(1, 1, 0, ar(rd), 31, ar(ra), 0, 0), "neg"); return; }
+    xMov(g, xr(rd), xr(ra));
+    x1(g, "neg", q(xr(rd)));
+}
+export function genNot(g: Ref<Gen>, rd: int, ra: int): void {
+    if (!okReg(g, rd) || !okReg(g, ra)) { return; }
+    if (g.a64) { aw(g, a64LogicalShifted(1, 1, 1, ar(rd), 31, ar(ra), 0, 0), "mvn"); return; }
+    xMov(g, xr(rd), xr(ra));
+    x1(g, "not", q(xr(rd)));
+}
+/// rd = ra <op> rb，溢出时转到 label 且不写 rd：add sub mul 按有符号，addu subu mulu 按无符号。
+export function genOpO(g: Ref<Gen>, op: string, rd: int, ra: int, rb: int, label: string): void {
+    if (!okReg(g, rd) || !okReg(g, ra) || !okReg(g, rb)) { return; }
+    if (g.a64) {
+        const a = ar(ra);
+        const b = ar(rb);
+        if (op == "add" || op == "addu") {
+            aw(g, a64AddSubShifted(1, 0, 1, X16, a, b, 0, 0), "adds");
+            if (op == "add") { a64BCond(g.b, 6, label); } else { a64BCond(g.b, 2, label); }
+        } else if (op == "sub" || op == "subu") {
+            aw(g, a64AddSubShifted(1, 1, 1, X16, a, b, 0, 0), "subs");
+            if (op == "sub") { a64BCond(g.b, 6, label); } else { a64BCond(g.b, 3, label); }
+        } else if (op == "mul") {
+            aw(g, a64DataProc3(1, 0, 0, X16, a, b, 31), "mul");
+            aw(g, a64DataProc3(1, 2, 0, 17, a, b, 31), "smulh");
+            aw(g, a64AddSubShifted(1, 1, 1, 31, 17, X16, 2, 63), "cmp asr");
+            a64BCond(g.b, 1, label);
+        } else if (op == "mulu") {
+            aw(g, a64DataProc3(1, 0, 0, X16, a, b, 31), "mul");
+            aw(g, a64DataProc3(1, 6, 0, 17, a, b, 31), "umulh");
+            a64Cbz(g.b, 1, 1, 17, label);
+        } else { genFail(g, "GenBadOp:" + op); return; }
+        aMov(g, ar(rd), X16);
+        return;
+    }
+    if (op == "mulu") {
+        x2(g, "mov", q(AX), q(xr(ra)));
+        x2(g, "mov", q(CX), q(xr(rb)));
+        x1(g, "mul", q(CX));
+        xj(g, "jo", label);
+        xMov(g, xr(rd), AX);
+        return;
+    }
+    let mn = "";
+    let j = "jo";
+    if (op == "add" || op == "addu") { mn = "add"; }
+    if (op == "sub" || op == "subu") { mn = "sub"; }
+    if (op == "mul") { mn = "imul"; }
+    if (op == "addu" || op == "subu") { j = "jb"; }
+    if (len(mn) == 0) { genFail(g, "GenBadOp:" + op); return; }
+    x2(g, "mov", q(CX), q(xr(ra)));
+    x2(g, mn, q(CX), q(xr(rb)));
+    xj(g, j, label);
+    x2(g, "mov", q(xr(rd)), q(CX));
+}
+/// rd = −ra，有符号溢出（最小值取负）时转到 label 且不写 rd。
+export function genNegO(g: Ref<Gen>, rd: int, ra: int, label: string): void {
+    if (!okReg(g, rd) || !okReg(g, ra)) { return; }
+    if (g.a64) {
+        aw(g, a64AddSubShifted(1, 1, 1, X16, 31, ar(ra), 0, 0), "negs");
+        a64BCond(g.b, 6, label);
+        aMov(g, ar(rd), X16);
+        return;
+    }
+    x2(g, "mov", q(CX), q(xr(ra)));
+    x1(g, "neg", q(CX));
+    xj(g, "jo", label);
+    x2(g, "mov", q(xr(rd)), q(CX));
+}
+/// 商与余数（qd、rd 为 −1 表示不要）。调用方已排除除数为零与有符号的“最小值 ÷ −1”。x86 上改写 T0。
+export function genDivRem(g: Ref<Gen>, signed: bool, qd: int, rd: int, ra: int, rb: int): void {
+    if (!okReg(g, ra) || !okReg(g, rb)) { return; }
+    if ((qd >= 0 && !okReg(g, qd)) || (rd >= 0 && !okReg(g, rd)) || (qd >= 0 && qd == rd)) { genFail(g, "GenBadDivRem"); return; }
+    if (g.a64) {
+        let op = A64_UDIV;
+        if (signed) { op = A64_SDIV; }
+        aw(g, a64DataProc2(1, op, X16, ar(ra), ar(rb)), "div");
+        if (rd >= 0) { aw(g, a64DataProc3(1, 0, 1, ar(rd), X16, ar(rb), ar(ra)), "msub"); }
+        if (qd >= 0) { aMov(g, ar(qd), X16); }
+        return;
+    }
+    x2(g, "mov", q(CX), q(xr(rb)));
+    xMov(g, AX, xr(ra));
+    if (signed) { x0(g, "cqo"); x1(g, "idiv", q(CX)); }
+    else { x2(g, "xor", d32(DX), d32(DX)); x1(g, "div", q(CX)); }
+    if (qd >= 0) { xMov(g, xr(qd), AX); }
+    if (rd >= 0) { x2(g, "mov", q(xr(rd)), q(DX)); }
+}
+
+// ---------------------------------------------------------------------------
+// 比较与转移（cc：eq ne lt le gt ge 有符号，ult ule ugt uge 无符号）
+// ---------------------------------------------------------------------------
+function aCmpI(g: Ref<Gen>, a: int, v: int): void {
+    if (v >= 0 && v < 4096) { aw(g, a64AddSubImm(1, 1, 1, 31, a, v, 0), "cmp"); return; }
+    if (v < 0 && v > -4096) { aw(g, a64AddSubImm(1, 0, 1, 31, a, -v, 0), "cmn"); return; }
+    a64MovImm(g.b, X16, v);
+    aw(g, a64AddSubShifted(1, 1, 1, 31, a, X16, 0, 0), "cmp");
+}
+function xCmpI(g: Ref<Gen>, p: int, v: int): void {
+    if (fitsI32(v)) { x2(g, "cmp", q(p), im(v)); return; }
+    x2(g, "movabs", q(CX), im(v));
+    x2(g, "cmp", q(p), q(CX));
+}
+export function genBr(g: Ref<Gen>, cc: string, ra: int, rb: int, label: string): void {
+    if (!okReg(g, ra) || !okReg(g, rb)) { return; }
+    if (aCond(cc) < 0) { genFail(g, "GenBadCond:" + cc); return; }
+    if (g.a64) {
+        aw(g, a64AddSubShifted(1, 1, 1, 31, ar(ra), ar(rb), 0, 0), "cmp");
+        a64BCond(g.b, aCond(cc), label);
+        return;
+    }
+    x2(g, "cmp", q(xr(ra)), q(xr(rb)));
+    xj(g, xCond(cc), label);
+}
+export function genBrI(g: Ref<Gen>, cc: string, ra: int, v: int, label: string): void {
+    if (!okReg(g, ra)) { return; }
+    if (aCond(cc) < 0) { genFail(g, "GenBadCond:" + cc); return; }
+    if (g.a64) {
+        if (v == 0 && (cc == "eq" || cc == "ne")) {
+            let nz = 0;
+            if (cc == "ne") { nz = 1; }
+            a64Cbz(g.b, 1, nz, ar(ra), label);
+            return;
+        }
+        aCmpI(g, ar(ra), v);
+        a64BCond(g.b, aCond(cc), label);
+        return;
+    }
+    if (v == 0 && (cc == "eq" || cc == "ne")) { x2(g, "test", q(xr(ra)), q(xr(ra))); }
+    else { xCmpI(g, xr(ra), v); }
+    xj(g, xCond(cc), label);
+}
+/// rd = (ra <cc> rb) ? 1 : 0。
+export function genSet(g: Ref<Gen>, cc: string, rd: int, ra: int, rb: int): void {
+    if (!okReg(g, rd) || !okReg(g, ra) || !okReg(g, rb)) { return; }
+    if (aCond(cc) < 0) { genFail(g, "GenBadCond:" + cc); return; }
+    if (g.a64) {
+        aw(g, a64AddSubShifted(1, 1, 1, 31, ar(ra), ar(rb), 0, 0), "cmp");
+        aw(g, a64CondSelect(1, 0, 1, ar(rd), 31, 31, a64InvertCond(aCond(cc))), "cset");
+        return;
+    }
+    x2(g, "cmp", q(xr(ra)), q(xr(rb)));
+    x1(g, xSetCond(cc), b8(CX));
+    x2(g, "movzx", d32(xr(rd)), b8(CX));
+}
+export function genSetI(g: Ref<Gen>, cc: string, rd: int, ra: int, v: int): void {
+    if (!okReg(g, rd) || !okReg(g, ra)) { return; }
+    if (aCond(cc) < 0) { genFail(g, "GenBadCond:" + cc); return; }
+    if (g.a64) {
+        aCmpI(g, ar(ra), v);
+        aw(g, a64CondSelect(1, 0, 1, ar(rd), 31, 31, a64InvertCond(aCond(cc))), "cset");
+        return;
+    }
+    xCmpI(g, xr(ra), v);
+    x1(g, xSetCond(cc), b8(CX));
+    x2(g, "movzx", d32(xr(rd)), b8(CX));
+}
+
+// ---------------------------------------------------------------------------
+// 浮点（IEEE 双精度，就近舍入；不生成乘加融合）
+// ---------------------------------------------------------------------------
+function aToD(g: Ref<Gen>, d: int, r: int): void { aw(g, a64FpInt(1, 1, 0, 7, d, ar(r)), "fmov"); }
+function aFromD(g: Ref<Gen>, r: int, d: int): void { aw(g, a64FpInt(1, 1, 0, 6, ar(r), d), "fmov"); }
+function xToX(g: Ref<Gen>, x: int, r: int): void { x2(g, "movq", xmm(x), q(xr(r))); }
+function xFromX(g: Ref<Gen>, r: int, x: int): void { x2(g, "movq", q(xr(r)), xmm(x)); }
+/// rd = ra <op> rb：fadd fsub fmul fdiv。
+export function genFop(g: Ref<Gen>, op: string, rd: int, ra: int, rb: int): void {
+    if (!okReg(g, rd) || !okReg(g, ra) || !okReg(g, rb)) { return; }
+    let opcode = -1;
+    let mn = "";
+    if (op == "fmul") { opcode = 0; mn = "mulsd"; }
+    if (op == "fdiv") { opcode = 1; mn = "divsd"; }
+    if (op == "fadd") { opcode = 2; mn = "addsd"; }
+    if (op == "fsub") { opcode = 3; mn = "subsd"; }
+    if (opcode < 0) { genFail(g, "GenBadFloatOp:" + op); return; }
+    if (g.a64) {
+        aToD(g, 16, ra); aToD(g, 17, rb);
+        aw(g, a64FpBinary(1, opcode, 16, 16, 17), op);
+        aFromD(g, rd, 16);
+        return;
+    }
+    xToX(g, 0, ra); xToX(g, 1, rb);
+    x2(g, mn, xmm(0), xmm(1));
+    xFromX(g, rd, 0);
+}
+/// if (ra <cc> rb) goto label，按 IEEE：cc 为 lt le gt ge eq ne，有 NaN 时只有 ne 成立；nlt、nle 是 lt、le 的否定（有 NaN 时成立）。
+export function genFBr(g: Ref<Gen>, cc: string, ra: int, rb: int, label: string): void {
+    if (!okReg(g, ra) || !okReg(g, rb)) { return; }
+    if (g.a64) {
+        let cond = -1;
+        if (cc == "lt") { cond = 4; }
+        if (cc == "le") { cond = 9; }
+        if (cc == "gt") { cond = 12; }
+        if (cc == "ge") { cond = 10; }
+        if (cc == "eq") { cond = 0; }
+        if (cc == "ne") { cond = 1; }
+        if (cc == "nlt") { cond = 5; }
+        if (cc == "nle") { cond = 8; }
+        if (cond < 0) { genFail(g, "GenBadFloatCond:" + cc); return; }
+        aToD(g, 16, ra); aToD(g, 17, rb);
+        aw(g, a64Fcmp(1, 16, 17, 0), "fcmp");
+        a64BCond(g.b, cond, label);
+        return;
+    }
+    xToX(g, 0, ra); xToX(g, 1, rb);
+    // ucomisd 无序时 ZF=PF=CF=1：a < b 写成 b > a（ja 要 CF=0、ZF=0，无序时不成立），其余同理。
+    if (cc == "lt" || cc == "le") {
+        x2(g, "ucomisd", xmm(1), xmm(0));
+        if (cc == "lt") { xj(g, "ja", label); } else { xj(g, "jae", label); }
+    } else if (cc == "gt" || cc == "ge") {
+        x2(g, "ucomisd", xmm(0), xmm(1));
+        if (cc == "gt") { xj(g, "ja", label); } else { xj(g, "jae", label); }
+    } else if (cc == "eq") {
+        g.seq = g.seq + 1;
+        const skip = label + "_fnan" + toStr(g.seq);
+        x2(g, "ucomisd", xmm(0), xmm(1));
+        xj(g, "jp", skip);
+        xj(g, "je", label);
+        genLabel(g, skip);
+    } else if (cc == "ne") {
+        x2(g, "ucomisd", xmm(0), xmm(1));
+        xj(g, "jp", label);
+        xj(g, "jne", label);
+    } else if (cc == "nlt" || cc == "nle") {
+        // 否定式（含无序）：!(a < b) 即 无序或 a ≥ b；!(a <= b) 即 无序或 a > b。
+        x2(g, "ucomisd", xmm(0), xmm(1));
+        xj(g, "jp", label);
+        if (cc == "nlt") { xj(g, "jae", label); } else { xj(g, "ja", label); }
+    } else { genFail(g, "GenBadFloatCond:" + cc); }
+}
+/// rd = (ra <cc> rb) ? 1 : 0，按 IEEE：cc 为 lt le eq；有 NaN 时为 0。
+export function genFSet(g: Ref<Gen>, cc: string, rd: int, ra: int, rb: int): void {
+    if (!okReg(g, rd) || !okReg(g, ra) || !okReg(g, rb)) { return; }
+    let cond = -1;
+    let mn = "";
+    if (cc == "lt") { cond = 4; mn = "setb"; }
+    if (cc == "le") { cond = 9; mn = "setbe"; }
+    if (cc == "eq") { cond = 0; mn = "sete"; }
+    if (cond < 0) { genFail(g, "GenBadFloatCond:" + cc); return; }
+    if (g.a64) {
+        aToD(g, 16, ra); aToD(g, 17, rb);
+        aw(g, a64Fcmp(1, 16, 17, 0), "fcmp");
+        aw(g, a64CondSelect(1, 0, 1, ar(rd), 31, 31, a64InvertCond(cond)), "cset");
+        return;
+    }
+    xToX(g, 0, ra); xToX(g, 1, rb);
+    x2(g, "ucomisd", xmm(0), xmm(1));
+    x1(g, mn, b8(CX));
+    x1(g, "setnp", b8(DX));
+    x2(g, "and", b8(CX), b8(DX));
+    x2(g, "movzx", d32(xr(rd)), b8(CX));
+}
+/// rd = (double) ra（有符号 64 位整数）。
+export function genI2F(g: Ref<Gen>, rd: int, ra: int): void {
+    if (!okReg(g, rd) || !okReg(g, ra)) { return; }
+    if (g.a64) { aw(g, a64FpInt(1, 1, 0, 2, 16, ar(ra)), "scvtf"); aFromD(g, rd, 16); return; }
+    x2(g, "cvtsi2sd", xmm(0), q(xr(ra)));
+    xFromX(g, rd, 0);
+}
+/// rd = 把 ra 舍入到单精度再回到双精度（f32 运算按 D3 以双精度算后舍入）。
+export function genF32Round(g: Ref<Gen>, rd: int, ra: int): void {
+    if (!okReg(g, rd) || !okReg(g, ra)) { return; }
+    if (g.a64) {
+        aToD(g, 16, ra);
+        aw(g, a64FpUnary(1, 4, 16, 16), "fcvt s");
+        aw(g, a64FpUnary(0, 5, 16, 16), "fcvt d");
+        aFromD(g, rd, 16);
+        return;
+    }
+    xToX(g, 0, ra);
+    x2(g, "cvtsd2ss", xmm(0), xmm(0));
+    x2(g, "cvtss2sd", xmm(0), xmm(0));
+    xFromX(g, rd, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 调用
+// ---------------------------------------------------------------------------
+export struct GArg { kind: int, width: int, reg: int, off: int, sym: string }
+const GA_IMM: int = 0;
+const GA_REG: int = 1;
+const GA_LOAD: int = 2;
+const GA_LEA: int = 3;
+const GA_SYM: int = 4;
+export function gaI(v: int): Ref<GArg> { return new GArg { kind: GA_IMM, width: 8, reg: -1, off: v, sym: "" }; }
+export function gaR(r: int): Ref<GArg> { return new GArg { kind: GA_REG, width: 8, reg: r, off: 0, sym: "" }; }
+/// 实参＝*(width*)(base + off)，零扩展。
+export function gaLd(width: int, base: int, off: int): Ref<GArg> { return new GArg { kind: GA_LOAD, width: width, reg: base, off: off, sym: "" }; }
+/// 实参＝base + off。
+export function gaLea(base: int, off: int): Ref<GArg> { return new GArg { kind: GA_LEA, width: 8, reg: base, off: off, sym: "" }; }
+export function gaSym(sym: string): Ref<GArg> { return new GArg { kind: GA_SYM, width: 8, reg: -1, off: 0, sym: sym }; }
+
+function aArgInto(g: Ref<Gen>, p: int, a: Ref<GArg>): void {
+    if (a.kind == GA_IMM) { a64MovImm(g.b, p, a.off); }
+    else if (a.kind == GA_REG) { if (okReg(g, a.reg)) { aMov(g, p, ar(a.reg)); } }
+    else if (a.kind == GA_LOAD) { if (okBase(g, a.reg) && okWidth(g, a.width)) { a64Mem(g.b, aSize(a.width), 1, p, ar(a.reg), a.off); } }
+    else if (a.kind == GA_LEA) { if (okBase(g, a.reg)) { a64AddImm(g.b, p, ar(a.reg), a.off); } }
+    else { a64AddrOf(g.b, p, a.sym, 0); }
+}
+function xArgInto(g: Ref<Gen>, p: int, a: Ref<GArg>): void {
+    if (a.kind == GA_IMM) { xMovI(g, p, a.off); }
+    else if (a.kind == GA_REG) { if (okReg(g, a.reg)) { xMov(g, p, xr(a.reg)); } }
+    else if (a.kind == GA_LOAD) {
+        if (!okBase(g, a.reg) || !okWidth(g, a.width)) { return; }
+        if (a.width == 8) { x2(g, "mov", q(p), xm(8, xr(a.reg), a.off)); }
+        else if (a.width == 4) { x2(g, "mov", d32(p), xm(4, xr(a.reg), a.off)); }
+        else { x2(g, "movzx", d32(p), xm(a.width, xr(a.reg), a.off)); }
+    }
+    else if (a.kind == GA_LEA) { if (okBase(g, a.reg)) { x2(g, "lea", q(p), xm(8, xr(a.reg), a.off)); } }
+    else { x2(g, "lea", q(p), xrip(8, a.sym)); }
+}
+// 实参的源寄存器（物理号；没有为 −1）。
+function xArgSrc(a: Ref<GArg>): int {
+    if (a.kind == GA_REG || a.kind == GA_LOAD || a.kind == GA_LEA) { return xr(a.reg); }
+    return -1;
+}
+function xArgReg(k: int): int {
+    if (k == 0) { return CX; }
+    if (k == 1) { return DX; }
+    if (k == 2) { return 8; }
+    return 9;
+}
+function genArgs(g: Ref<Gen>, args: List<Ref<GArg>>): void {
+    const n = listLen(args);
+    if (g.a64) {
+        if (n > 8) { genFail(g, "GenTooManyArguments"); return; }
+        let k = 0;
+        while (k < n) { aArgInto(g, k, listGet(args, k) catch gaI(0)); k = k + 1; }
+        return;
+    }
+    // 栈上实参（第 5 个起）先放：只用 rax 中转，所以之后的寄存器实参不得再读 T0。
+    let usedAx = false;
+    let k = 4;
+    while (k < n) {
+        const a = listGet(args, k) catch gaI(0);
+        const at = xm(8, 4, 32 + (k - 4) * 8);
+        if (a.kind == GA_IMM && fitsI32(a.off)) { x2(g, "mov", at, im(a.off)); }
+        else if (a.kind == GA_REG) { if (okReg(g, a.reg)) { x2(g, "mov", at, q(xr(a.reg))); } }
+        else { xArgInto(g, AX, a); x2(g, "mov", at, q(AX)); usedAx = true; }
+        k = k + 1;
+    }
+    k = 0;
+    while (k < n && k < 4) {
+        const a = listGet(args, k) catch gaI(0);
+        const src = xArgSrc(a);
+        if (usedAx && src == AX) { genFail(g, "GenArgumentClobbered"); return; }
+        let j = 0;
+        while (j < k) { if (src == xArgReg(j)) { genFail(g, "GenArgumentClobbered"); return; } j = j + 1; }
+        xArgInto(g, xArgReg(k), a);
+        k = k + 1;
+    }
+}
+/// 按私有约定调用 target；调用后 T0–T3 失效，结果用 genRes／genRes2 取。
+export function genCall(g: Ref<Gen>, target: string, args: List<Ref<GArg>>): void {
+    genArgs(g, args);
+    if (g.a64) { a64B(g.b, 1, target); return; }
+    xj(g, "call", target);
+}
+/// 间接调用 r 里的地址（r 不得是 T3：x86 上它也是第 4 个实参）。
+export function genCallR(g: Ref<Gen>, r: int, args: List<Ref<GArg>>): void {
+    if (!okReg(g, r)) { return; }
+    if (r == G_T3) { genFail(g, "GenCallThroughArgumentRegister"); return; }
+    genArgs(g, args);
+    if (g.a64) { aw(g, a64BranchReg(1, ar(r)), "blr"); return; }
+    x1(g, "call", q(xr(r)));
+}
+export function genRes(g: Ref<Gen>, rd: int): void {
+    if (!okReg(g, rd)) { return; }
+    if (g.a64) { aMov(g, ar(rd), 0); return; }
+    xMov(g, xr(rd), AX);
+}
+/// 结果的低 32 位（内核以 32 位寄存器返回的状态与种类码）。
+export function genRes32(g: Ref<Gen>, rd: int): void {
+    genRes(g, rd);
+    genOpI(g, "and", rd, rd, 4294967295);
+}
+export function genRes2(g: Ref<Gen>, rd: int): void {
+    if (!okReg(g, rd)) { return; }
+    if (g.a64) { aMov(g, ar(rd), 1); return; }
+    x2(g, "mov", q(xr(rd)), q(8));
+}
+/// 返回前放结果（x86 rax／A64 x0）与第二结果（r8／x1）：探针与按私有约定返回值的例程用。
+export function genSetRes(g: Ref<Gen>, rs: int): void {
+    if (!okReg(g, rs)) { return; }
+    if (g.a64) { aMov(g, 0, ar(rs)); return; }
+    xMov(g, AX, xr(rs));
+}
+export function genSetRes2(g: Ref<Gen>, rs: int): void {
+    if (!okReg(g, rs)) { return; }
+    if (g.a64) { aMov(g, 1, ar(rs)); return; }
+    x2(g, "mov", q(8), q(xr(rs)));
+}
+export function args0(): List<Ref<GArg>> { return listNew(); }
+
+// ---------------------------------------------------------------------------
+// 函数框架：f_<id> 的开头保存 W K0 K1 并留出 frame 字节的帧（[SP + 0, frame)），W 取自第一个实参。
+// x86 与 emitmirror 同形（push rbp／mov rbp, rsp／push rbx r14 r15／sub rsp, frame；frame ≡ 8 mod 16 由记录保证）；
+// A64：stp x29, x30／mov x29, sp／stp x19, x20／str x21／sub sp（帧按 16 向上取整）。
+// ---------------------------------------------------------------------------
+export function genFnBegin(g: Ref<Gen>, id: int, frame: int): void {
+    asBufferGeneratedBegin(g.b, id);
+    genLabel(g, "f_" + toStr(id));
+    if (g.a64) {
+        // 帧事件（M4 设计 §A5）：stp 记两次压入（先第二个寄存器），str x21 的写回 16 字节（含 8 字节对齐填充）记一次压入 16。
+        g.frame = (frame + 15) / 16 * 16;
+        let first = listLen(g.b.entries);
+        aw(g, a64LdStPair(2, 0, 0, 29, 30, 31, -16, 3), "stp fp");
+        a64Frame(g.b, first, "push-nonvolatile", 30, 8); a64Frame(g.b, first, "push-nonvolatile", 29, 8);
+        first = listLen(g.b.entries);
+        aMov(g, 29, 31);
+        a64Frame(g.b, first, "set-frame-pointer", 29, 0);
+        first = listLen(g.b.entries);
+        aw(g, a64LdStPair(2, 0, 0, 19, 20, 31, -16, 3), "stp x19");
+        a64Frame(g.b, first, "push-nonvolatile", 20, 8); a64Frame(g.b, first, "push-nonvolatile", 19, 8);
+        first = listLen(g.b.entries);
+        aw(g, a64LdStImm9(3, 0, 0, 21, 31, -16, 3), "str x21");
+        a64Frame(g.b, first, "push-nonvolatile", 21, 16);
+        if (g.frame > 0) { a64FrameAlloc(g.b, g.frame); }
+        asBufferFunctionPrologueEnd(g.b);
+        return;
+    }
+    g.frame = frame;
+    asBufferFrame(g.b, "push-nonvolatile", 5, 8);
+    asBufferFrame(g.b, "set-frame-pointer", 5, 0);
+    asBufferFrame(g.b, "push-nonvolatile", 3, 8);
+    asBufferFrame(g.b, "push-nonvolatile", 14, 8);
+    asBufferFrame(g.b, "push-nonvolatile", 15, 8);
+    asBufferFrame(g.b, "allocate-stack", 4, frame);
+    asBufferFunctionPrologueEnd(g.b);
+}
+/// W = 第一个实参（被调窗口）。
+export function genWinFromArg(g: Ref<Gen>): void {
+    if (g.a64) { aMov(g, 19, 0); return; }
+    x2(g, "mov", q(3), q(CX));
+}
+export function genFnEpilogue(g: Ref<Gen>): void {
+    if (g.a64) {
+        // 帧为 0 时 sub sp, x29, #32 不动 sp，留在尾声之前。
+        if (g.frame == 0) { aw(g, a64AddSubImm(1, 1, 0, 31, 29, 32, 0), "sub sp, x29, #32"); }
+        asBufferFunctionEpilogueStart(g.b);
+        let first = listLen(g.b.entries);
+        if (g.frame > 0) {
+            aw(g, a64AddSubImm(1, 1, 0, 31, 29, 32, 0), "sub sp, x29, #32");
+            a64Frame(g.b, first, "release-stack", 31, g.frame);
+            first = listLen(g.b.entries);
+        }
+        aw(g, a64LdStImm9(3, 0, 1, 21, 31, 16, 1), "ldr x21");
+        a64Frame(g.b, first, "pop-nonvolatile", 21, 16);
+        first = listLen(g.b.entries);
+        aw(g, a64LdStPair(2, 0, 1, 19, 20, 31, 16, 1), "ldp x19");
+        a64Frame(g.b, first, "pop-nonvolatile", 19, 8); a64Frame(g.b, first, "pop-nonvolatile", 20, 8);
+        first = listLen(g.b.entries);
+        aw(g, a64LdStPair(2, 0, 1, 29, 30, 31, 16, 1), "ldp fp");
+        a64Frame(g.b, first, "pop-nonvolatile", 29, 8); a64Frame(g.b, first, "pop-nonvolatile", 30, 8);
+        first = listLen(g.b.entries);
+        aw(g, a64BranchReg(2, 30), "ret");
+        a64Frame(g.b, first, "return", -1, 0);
+        asBufferFunctionEnd(g.b);
+        return;
+    }
+    asBufferFunctionEpilogueStart(g.b);
+    asBufferFrame(g.b, "release-stack", 4, g.frame);
+    asBufferFrame(g.b, "pop-nonvolatile", 15, 8);
+    asBufferFrame(g.b, "pop-nonvolatile", 14, 8);
+    asBufferFrame(g.b, "pop-nonvolatile", 3, 8);
+    asBufferFrame(g.b, "pop-nonvolatile", 5, 8);
+    asBufferFrame(g.b, "return", -1, 8);
+    asBufferFunctionEnd(g.b);
+}

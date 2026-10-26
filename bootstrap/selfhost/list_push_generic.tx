@@ -1,0 +1,112 @@
+// 列表追加（NRT）的可移植版（rtfn 写，macOS 适配 M4 设计 A8）：语义与导出名同 runtime_memory_gen.tx 的 listPushNrt。
+// __tx_list_push(idx, vp) → 0（已追加，或交 __tx_store_list_append 处理），或 1（List 已冻结或正被外部调用借用，什么也不做；
+// 调用方转通用内建报 4022／4024）。idx 只取低 32 位；vp 指向 16 字节的值 {tag@0, 载荷@8}。
+// 对象 Obj72 在槽表状态（线程块字段 __tx_nrt_slots）+48 处的指针 + idx·72：flags u32@0、elem u32@24、form u32@28、ptr@32、len@40、cap@48。
+// 先查冻结（flags 位 16）与借用（位 64），再 retain 值；容量足够时就地写入：通用形态（form 1）写 16 字节值（空表遇到 tag 1..3
+// 的标量要转原始形态，走慢路径）；原始形态（form 2）在值的 tag 等于 elem 时写 8 字节载荷（bool 归一为 0／1）；紧凑形态（form 3）
+// 按种类码 elem 的宽度写载荷的低位（f32 为 10，值须为 float，舍入为单精度位；1、4 一字节，2、5 两字节，3、6 四字节，值须为 int）。
+// 其余（扩容、形态转换、种类或 tag 不符）走 __tx_store_list_append。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, L, I, G } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtShift, rtLoad, rtStore, rtLabel, rtJump, rtIf, rtCall1, rtCall2, rtF64ToF32Bits, rtRet } from "./rtfn";
+
+const MODULE: string = "bootstrap/selfhost/list_push_generic.tx";
+const OBJ_BYTES: int = 72;
+// flags：冻结（来自 Shared，线程第 4b 步）16、外部调用借用中（D3 v0.34 §6.8-16）64。
+const GUARD_FLAGS: int = 80;
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// 以 shift 位缩放的第 len 个元素的地址：k = ptr + (len << shift)。
+function elemAddr(f: Ref<RtFn>, shift: int): void {
+    if (shift == 0) { rtSet(f, "k", L("len")); } else { rtShift(f, "k", L("len"), "shl", shift); }
+    rtLoad(f, "x", L("o"), 32, 8);
+    rtOp(f, "k", L("k"), "add", L("x"));
+}
+
+function listPushFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_list_push", "idx vp", "o x t len form e v k", 2, MODULE);
+    rtOp(f, "idx", L("idx"), "and", I(4294967295));
+    rtSet(f, "o", G("__tx_nrt_slots"));
+    rtLoad(f, "o", L("o"), 48, 8);
+    rtOp(f, "x", L("idx"), "imul", I(OBJ_BYTES));
+    rtOp(f, "o", L("o"), "add", L("x"));
+    rtLoad(f, "x", L("o"), 0, 4);
+    rtOp(f, "x", L("x"), "and", I(GUARD_FLAGS));
+    rtIf(f, L("x"), "ne", I(0), "guarded");
+    // retain 不建对象、槽表不搬：对象地址跨过它仍有效。
+    rtCall1(f, "", "__tx_retain", L("vp"));
+    rtLoad(f, "t", L("vp"), 0, 1);
+    rtLoad(f, "len", L("o"), 40, 8);
+    rtLoad(f, "x", L("o"), 48, 8);
+    rtIf(f, L("len"), "uge", L("x"), "slow");
+    rtLoad(f, "form", L("o"), 28, 4);
+    rtIf(f, L("form"), "ne", I(1), "raw");
+    rtIf(f, L("len"), "ne", I(0), "generic");
+    rtIf(f, L("t"), "ult", I(1), "generic");
+    rtIf(f, L("t"), "ule", I(3), "slow");
+    rtLabel(f, "generic");
+    elemAddr(f, 4);
+    rtLoad(f, "v", L("vp"), 0, 8);
+    rtStore(f, L("k"), 0, L("v"), 8);
+    rtLoad(f, "v", L("vp"), 8, 8);
+    rtStore(f, L("k"), 8, L("v"), 8);
+    rtJump(f, "bump");
+    rtLabel(f, "raw");
+    rtIf(f, L("form"), "ne", I(2), "compact");
+    rtLoad(f, "e", L("o"), 24, 4);
+    rtIf(f, L("t"), "ne", L("e"), "slow");
+    rtLoad(f, "v", L("vp"), 8, 8);
+    rtIf(f, L("t"), "ne", I(3), "raw_store");
+    rtIf(f, L("v"), "eq", I(0), "raw_store");
+    rtSet(f, "v", I(1));
+    rtLabel(f, "raw_store");
+    elemAddr(f, 3);
+    rtStore(f, L("k"), 0, L("v"), 8);
+    rtLabel(f, "bump");
+    rtOp(f, "len", L("len"), "add", I(1));
+    rtStore(f, L("o"), 40, L("len"), 8);
+    rtRet(f, I(0));
+    rtLabel(f, "compact");
+    rtIf(f, L("form"), "ne", I(3), "slow");
+    rtLoad(f, "e", L("o"), 24, 4);
+    rtLoad(f, "v", L("vp"), 8, 8);
+    rtIf(f, L("e"), "ne", I(10), "c_int");
+    rtIf(f, L("t"), "ne", I(2), "slow");
+    rtF64ToF32Bits(f, "v", L("v"));
+    rtJump(f, "c4");
+    rtLabel(f, "c_int");
+    rtIf(f, L("t"), "ne", I(1), "slow");
+    rtIf(f, L("e"), "eq", I(1), "c1");
+    rtIf(f, L("e"), "eq", I(4), "c1");
+    rtIf(f, L("e"), "eq", I(2), "c2");
+    rtIf(f, L("e"), "eq", I(5), "c2");
+    rtIf(f, L("e"), "eq", I(3), "c4");
+    rtIf(f, L("e"), "ne", I(6), "slow");
+    rtLabel(f, "c4");
+    elemAddr(f, 2);
+    rtStore(f, L("k"), 0, L("v"), 4);
+    rtJump(f, "bump");
+    rtLabel(f, "c2");
+    elemAddr(f, 1);
+    rtStore(f, L("k"), 0, L("v"), 2);
+    rtJump(f, "bump");
+    rtLabel(f, "c1");
+    elemAddr(f, 0);
+    rtStore(f, L("k"), 0, L("v"), 1);
+    rtJump(f, "bump");
+    rtLabel(f, "slow");
+    rtCall2(f, "", "__tx_store_list_append", L("idx"), L("vp"));
+    rtRet(f, I(0));
+    rtLabel(f, "guarded");
+    rtRet(f, I(1));
+    done(f, failures);
+}
+
+/// 发出列表追加（NRT）的函数；rtfn 的失败记进 failures。t 为目标编号（本模块的语义不随目标变）。
+export function listPushGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    listPushFn(b, failures);
+}

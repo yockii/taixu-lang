@@ -1,0 +1,777 @@
+// bootstrap/parser —— S1 自举语法分析器（BOOT-05；D13 §3/§4/§6）。
+//
+// 与引导版（src/compiler/parser/parser.zig）行为同构：输出规范化 AST 文本
+// （文法基准＝src/compiler/ast/render.zig 头部文法表），语法错误输出
+// `! line col code`（码位硬编码对齐 diag.Code）并退出 1；词法错误经预扫描
+// 透传词法器错误行（D13 §4-5 定序镜像：先词法全程、后语法）。
+// 差异测试（build_tools/diff_parser.zig，B2-P6）对全部仓库 .tx 比对本实现
+// 与 `taixu parse` 的输出（TEST-06）。
+//
+// 流式设计：每个解析函数返回"子树文本块"（string，各行以 \n 收尾、相对
+// 缩进 0），父层以 indent4 拼接自己的节点行；前瞻为重复词法（快照/恢复，
+// 性能不对齐是预期）。分段合入：P1 骨架与类型层 → P2 声明 → P3 语句
+// → P4 表达式 → P5 消歧与收口；分段期未实现构造经 NOTIMPL 干净退场
+// （stdout 单行 `# notimpl <构造名>`、退出码 0、丢弃部分渲染输出）。
+//
+// 【B2-P1 实现注记（调查结论已定案，见 docs/work/VM-RC-fix.md）】
+// 1. sema 导入可见性（引导侧缺陷，已确认）：导入结构类型（lexer 的
+//    Cur/Tok/Out）不可用于函数签名与 struct 字段位置——registerModules
+//    次序为签名/字段类型消解（阶段 1/2）先于导入解析（阶段 4），仅函数
+//    体内可见。绕开：游标与词法错误状态在 P 内值化（pos/line/col ＋
+//    lexErrs/lexFailed），逐次经局部 Cur/Out 包装驱动 lexer 的 nextToken
+//    （D13 §3 骨架的 `P { cur: Ref<Cur>, err: Ref<Out> }` 形态留待修订
+//    后复原）。
+// 2. codegen __access 桩寄存器少报（引导侧缺陷，已修复）：跨模块常量
+//    访问桩合成时漏 useReg，GETFLD 越出 1 槽窗口写调用方相邻槽位并
+//    释放旧值——本件每次 K_* 常量读取都触发，先期观察到的段错误/值槽
+//    载荷混淆/错误分支皆其连带表现；修复＝合成器补一行 useReg（无导入
+//    模块的 .txc 与金哈希不变）。解析函数返回 string 文本块的流式形态
+//    保留（较 struct Result 简省且已全绿）。
+// 3. 自测抓得并已修复的本件逻辑缺陷两处：advance 曾双重消费 token
+//    （走查行数对账定案）；indent4 曾漏首行缩进（18 vs 14 字节定案）。
+//    修复后类型层 11 例全绿。
+// 4. 遗留观察（不阻塞 P1 验收面，随 VM-RC-fix 工单跟进）：同一程序内
+//    "token 全量走查段＋类型段"顺序执行仍可在退出清理期触发段错误
+//    （两段各自独立程序均全绿）——疑似帧窗口释放账目的更深问题；
+//    P1 验收面（分段比对＋zig build test）不经过该组合。
+
+import {
+    Cur, Tok, Out, nextToken, sliceText,
+    K_EOF, K_IDENT, K_INT, K_FLOAT, K_STR,
+    K_EXPORT, K_FUNCTION, K_STRUCT, K_ENUM, K_LET, K_CONST,
+    K_IF, K_ELSE, K_WHILE, K_FOR, K_BREAK, K_CONTINUE, K_RETURN,
+    K_SWITCH, K_CASE, K_TEST, K_IMPORT, K_TRUE, K_FALSE,
+    K_NEW, K_CATCH, K_AS,
+    K_PLUS, K_MINUS, K_STAR, K_SLASH, K_PERCENT,
+    K_EQEQ, K_BANGEQ, K_LT, K_LTEQ, K_GT, K_GTEQ,
+    K_ANDAND, K_OROR, K_BANG, K_QUESTION, K_ASSIGN, K_FATARROW,
+    K_DOT, K_COMMA, K_SEMI, K_COLON, K_LPAREN, K_RPAREN,
+    K_LBRACE, K_RBRACE, K_LBRACKET, K_RBRACKET, K_PIPE, K_COMMENT,
+} from "./lexer";
+
+// —— 解析器状态：游标值化（恒停当前 token 之前，D13 §3）＋当前 token
+// 缓存（curValid）＋首错承载（只记首个）＋输出缓冲 buf 与 expr 元数据槽——
+struct P {
+    src: string,
+    pos: int,
+    line: int,
+    col: int,
+    lexErrs: string,
+    lexFailed: bool,
+    curValid: bool,
+    curKind: int,
+    curText: string,
+    curLine: int,
+    curCol: int,
+    lastKind: int,
+    buf: string,
+    impl: bool,
+    implWhat: string,
+    failed: bool,
+    errLine: int,
+    errCol: int,
+    errCode: int,
+    exprLine: int,
+    exprCol: int,
+    exprLval: bool,
+}
+
+// —— lexer 驱动核心：值化游标 → 局部 Cur/Out → nextToken → 写回。
+// 从游标词法一个 token：游标前进过它，其 text/line/col 写入 cur 缓存字段，
+// kind 为返回值。预扫描已保证词法干净（lexFailed 恒 false），assert 为
+// 不变量绊线。唯一跨函数边界的 struct 值是瞬态 Tok（单个存活，lexer.tx
+// 同款形态）。——
+function lexStep(p: Ref<P>): int {
+    assert(!p.lexFailed, "lexer failed after preScan");
+    const c: Ref<Cur> = new Cur { pos: p.pos, line: p.line, col: p.col };
+    const o: Ref<Out> = new Out { lines: "", errors: p.lexErrs, failed: p.lexFailed, coded: false };
+    let t: Tok = nextToken(p.src, c, o);
+    // 跳过注释（镜像 compile 管线：parser 消费无注释的 token 流）。
+    p.curText = t.text;
+    p.curLine = t.line;
+    p.curCol = t.col;
+    p.pos = c.pos;
+    p.line = c.line;
+    p.col = c.col;
+    p.lexErrs = o.errors;
+    p.lexFailed = o.failed;
+    while (t.kind == K_COMMENT) {
+        const t2: Tok = nextToken(p.src, c, o);
+        t = t2;
+        p.curText = t.text;
+        p.curLine = t.line;
+        p.curCol = t.col;
+        p.pos = c.pos;
+        p.line = c.line;
+        p.col = c.col;
+        p.lexErrs = o.errors;
+        p.lexFailed = o.failed;
+    }
+    return t.kind;
+}
+
+/// 确保当前 token 已缓存（惰性填充）。
+function fillTok(p: Ref<P>): void {
+    if (!p.curValid) {
+        p.curKind = lexStep(p);
+        p.curValid = true;
+    }
+}
+
+/// 当前 token 的 kind（不消费）。
+function tokKind(p: Ref<P>): int {
+    fillTok(p);
+    return p.curKind;
+}
+
+/// 当前 token 的词法原文切片（不消费）。
+function tokText(p: Ref<P>): string {
+    fillTok(p);
+    return p.curText;
+}
+
+/// 当前 token 的行（不消费）。
+function tokLine(p: Ref<P>): int {
+    fillTok(p);
+    return p.curLine;
+}
+
+/// 当前 token 的列（不消费）。
+function tokCol(p: Ref<P>): int {
+    fillTok(p);
+    return p.curCol;
+}
+
+/// 消费当前 token（EOF 处幂等，与引导版 advance 钳位同构）。
+/// 不变量：curValid=false 时游标在"下一个未读 token"之前；fillTok 的
+/// lexStep 已越过当前 token，故此处只失效缓存、不得再 lexStep——多消费
+/// 一次即跳 token（B2-P1 自测抓得的原始缺陷，走查 12 行 vs taixu lex
+/// 24 行定案）。调用点所需的名字/位置字段在调用前经 tokText 等取走。
+function advance(p: Ref<P>): void {
+    fillTok(p);
+    p.lastKind = p.curKind;
+    p.curValid = false;
+}
+
+/// 前瞻第 off 个 token 的 kind（off=0 即当前；EOF 之后 nextToken 恒产 EOF，
+/// 与引导版 peekKind 的 `@min(pos+off, len-1)` 钳位同构）。
+/// 快照 → lexStep×(off+1) → 恢复（D13 §3 语义；游标与缓存失效待重填）。
+function peekKind(p: Ref<P>, off: int): int {
+    const savePos: int = p.pos;
+    const saveLine: int = p.line;
+    const saveCol: int = p.col;
+    p.lastKind = lexStep(p);
+    let i: int = 1;
+    while (i < off + 1) {
+        p.lastKind = lexStep(p);
+        i = i + 1;
+    }
+    p.pos = savePos;
+    p.line = saveLine;
+    p.col = saveCol;
+    p.curValid = false;
+    return p.lastKind;
+}
+
+/// 全文词法预检（丢弃 token、仅查 failed）：词法错误即首错，不进入解析。
+/// 返回词法器错误缓冲（""＝干净）。
+function preScan(src: string): string {
+    const c: Ref<Cur> = new Cur { pos: 0, line: 1, col: 1 };
+    const o: Ref<Out> = new Out { lines: "", errors: "", failed: false, coded: false };
+    while (true) {
+        const t = nextToken(src, c, o);
+        if (t.kind == K_EOF) {
+            break;
+        }
+    }
+    return o.errors;
+}
+
+// —— 首错记录（只记首个；码位硬编码对齐 diag.Code：2002 expected_token、
+// 2001 unexpected_token、2003 bare_literal_stmt、3016 bad_lvalue、3020 bad_type_expr）——
+function recordErrAt(p: Ref<P>, code: int, line: int, col: int): void {
+    if (!p.failed) {
+        p.failed = true;
+        p.errLine = line;
+        p.errCol = col;
+        p.errCode = code;
+    }
+}
+
+/// 位置取当前 token（镜像引导版 err()）；expect 失败等均经此。
+function recordErrCur(p: Ref<P>, code: int): void {
+    const el = tokLine(p);
+    const ec = tokCol(p);
+    recordErrAt(p, code, el, ec);
+}
+
+/// expect 镜像：命中即消费；否则记 expected_token（2002）于当前 token。
+function expectKind(p: Ref<P>, k: int): bool {
+    if (tokKind(p) == k) {
+        advance(p);
+        return true;
+    }
+    recordErrCur(p, 2002);
+    return false;
+}
+
+// —— NOTIMPL 分段退场：置标记（首个构造名获胜）后经 Error 通道快速上抛——
+function markNotimpl(p: Ref<P>, what: string): void {
+    if (!p.impl) {
+        p.impl = true;
+        p.implWhat = what;
+    }
+}
+
+// —— 规范转义（D13 §4-3，逐条镜像 render.zig escape）：`\`→`\\`、`"`→`\"`、
+// 空格与控制字符（0x00–0x1F、0x7F）→`\xHH` 两位小写、非 ASCII 直通——
+function escape(text: string): string {
+    let out: string = "";
+    let i: int = 0;
+    const n = len(text);
+    while (i < n) {
+        const b = byteAt(text, i) catch 0;
+        if (b == 92) {
+            out = out + "\\\\";
+            i = i + 1;
+            continue;
+        }
+        if (b == 34) {
+            out = out + "\\\"";
+            i = i + 1;
+            continue;
+        }
+        if (b == 32) {
+            out = out + "\\x20";
+            i = i + 1;
+            continue;
+        }
+        if (b < 32 || b == 127) {
+            out = out + "\\x" + hexByte(b);
+            i = i + 1;
+            continue;
+        }
+        if (b < 128) {
+            out = out + (utf8Encode(b) catch "");
+            i = i + 1;
+            continue;
+        }
+        // 非 ASCII：按完整 UTF-8 序列直通（复用 sliceText 的码点重组）。
+        const seq = utf8SeqLen(b);
+        const piece = sliceText(text, i, i + seq);
+        out = out + piece;
+        i = i + seq;
+    }
+    return out;
+}
+
+/// 两位小写十六进制（仅用于转义的 0x00–0x7F 字节）。
+function hexByte(v: int): string {
+    const digits = "0123456789abcdef";
+    const hi = v / 16;
+    const lo = v - hi * 16;
+    const h = sliceText(digits, hi, hi + 1);
+    const l = sliceText(digits, lo, lo + 1);
+    return h + l;
+}
+
+/// UTF-8 序列长度（首字节判定；与 sliceText 的重组规则一致）。
+function utf8SeqLen(b: int): int {
+    if (b >= 240) {
+        return 4;
+    }
+    if (b >= 224) {
+        return 3;
+    }
+    return 2;
+}
+
+/// 子树文本块整体右移一层：块内每一行（含首行）前补 4 空格；
+/// 各行以 \n 收尾，故效果为每行相对缩进 +4（父层无再缩进）。
+function indent4(text: string): string {
+    let out: string = "    ";
+    let i: int = 0;
+    const n = len(text);
+    while (i < n) {
+        const b = byteAt(text, i) catch 0;
+        if (b < 128) {
+            out = out + (utf8Encode(b) catch "");
+            if (b == 10 && i + 1 < n) {
+                out = out + "    ";
+            }
+            i = i + 1;
+            continue;
+        }
+        const seq = utf8SeqLen(b);
+        const piece = sliceText(text, i, i + seq);
+        out = out + piece;
+        i = i + seq;
+    }
+    return out;
+}
+
+/// 数组类型长度：词法原文 → 值（进制与 `_` 分隔；镜像引导版 @max(0, int_val)）。
+/// 越界字面量已被预扫描拦截（词法诊断→不进解析），此处不遇溢出。
+function intTextToLen(text: string): int {
+    let v: int = 0;
+    let i: int = 0;
+    let base: int = 10;
+    const n = len(text);
+    if (n > 2 && (byteAt(text, 0) catch 0) == 48) {
+        const k = byteAt(text, 1) catch 0;
+        if (k == 120 || k == 88) {
+            base = 16;
+            i = 2;
+        } else if (k == 111 || k == 79) {
+            base = 8;
+            i = 2;
+        } else if (k == 98 || k == 66) {
+            base = 2;
+            i = 2;
+        }
+    }
+    while (i < n) {
+        const b = byteAt(text, i) catch 0;
+        i = i + 1;
+        if (b == 95) {
+            continue;
+        }
+        let d: int = 0;
+        if (b >= 48 && b <= 57) {
+            d = b - 48;
+        } else if (b >= 97 && b <= 102) {
+            d = b - 97 + 10;
+        } else {
+            d = b - 65 + 10;
+        }
+        v = v * base + d;
+    }
+    if (v < 0) {
+        return 0;
+    }
+    return v;
+}
+
+// —— 类型解析（与引导版 parseType/parseTypeUnion/parseTypeAtom 一一对应；
+// 返回子树文本块，各行以 \n 收尾、相对缩进 0）——
+function parseType(p: Ref<P>): string | Error {
+    return parseTypeUnion(p);
+}
+
+/// T | Error 归一（两侧两种写法同树）：errunion 子为非 Error 侧。
+function parseTypeUnion(p: Ref<P>): string | Error {
+    const first = parseTypeAtom(p)?;
+    if (tokKind(p) != K_PIPE) {
+        return first;
+    }
+    advance(p); // |
+    const second = parseTypeAtom(p)?;
+    // 联合唯一化为 errunion：Error 在右侧取 first，Error 在左侧取 second。
+    // tnamed Error 的块形态恒为 "tnamed Error\n"（无位置无子），据此识别。
+    const errFirst: bool = first == "tnamed Error\n";
+    const errSecond: bool = second == "tnamed Error\n";
+    if (errFirst && errSecond) {
+        recordErrCur(p, 3020); // 联合类型两侧不能都是 Error（bad_type_expr）
+        return err("parse");
+    }
+    let inner: string = first;
+    if (errFirst) {
+        inner = second;
+    }
+    if (tokKind(p) == K_PIPE) {
+        recordErrCur(p, 3020); // 类型联合只支持二元（bad_type_expr）
+        return err("parse");
+    }
+    const ind = indent4(inner);
+    return "terrunion\n" + ind;
+}
+
+/// 类型原子：具名 / Ref<> / Weak<> / [] / [N]，后随至多一个 `?`（镜像单 if）。
+function parseTypeAtom(p: Ref<P>): string | Error {
+    let acc: string = "";
+    const tK = tokKind(p);
+    if (tK == K_IDENT) {
+        const name = tokText(p);
+        advance(p);
+        if (name == "Ref") {
+            if (!expectKind(p, K_LT)) { return err("parse"); }
+            const inner = parseTypeAtom(p)?;
+            if (!expectKind(p, K_GT)) { return err("parse"); }
+            const ind = indent4(inner);
+            acc = "tref\n" + ind;
+        } else if (name == "Weak") {
+            if (!expectKind(p, K_LT)) { return err("parse"); }
+            const inner = parseTypeAtom(p)?;
+            if (!expectKind(p, K_GT)) { return err("parse"); }
+            const ind = indent4(inner);
+            acc = "tweak\n" + ind;
+        } else {
+            const esc = escape(name);
+            acc = "tnamed " + esc + "\n";
+        }
+    } else if (tK == K_LBRACKET) {
+        advance(p);
+        let hasLen: bool = false;
+        let lenVal: int = 0;
+        if (tokKind(p) == K_INT) {
+            const raw = tokText(p);
+            advance(p);
+            hasLen = true;
+            lenVal = intTextToLen(raw);
+        }
+        if (!expectKind(p, K_RBRACKET)) { return err("parse"); }
+        const elem = parseTypeAtom(p)?;
+        const ind = indent4(elem);
+        if (hasLen) {
+            const lenStr = toStr(lenVal);
+            acc = "tarray " + lenStr + "\n" + ind;
+        } else {
+            acc = "tslice\n" + ind;
+        }
+    } else {
+        recordErrCur(p, 2002); // 期望类型（expected_token）
+        return err("parse");
+    }
+    if (tokKind(p) == K_QUESTION) {
+        advance(p);
+        const ind = indent4(acc);
+        acc = "topt\n" + ind;
+    }
+    return acc;
+}
+
+/// 字符串词法原文切片（含首尾引号）→ 解码文本（镜像 lexer 转义集：
+/// \n \t \r \\ \" \0 \u{…}；非 ASCII 直通）。供 test 名与 import 路径。
+function decodeStringLiteral(raw: string): string {
+    let out: string = "";
+    let i: int = 1;
+    const n = len(raw);
+    while (i < n - 1) {
+        const b = byteAt(raw, i) catch 0;
+        if (b != 92) {
+            if (b < 128) {
+                out = out + (utf8Encode(b) catch "");
+            } else {
+                const seq = utf8SeqLen(b);
+                const piece = sliceText(raw, i, i + seq);
+                out = out + piece;
+                i = i + seq - 1;
+            }
+            i = i + 1;
+            continue;
+        }
+        i = i + 1;
+        const e = byteAt(raw, i) catch 0;
+        i = i + 1;
+        if (e == 110) {
+            out = out + "\n";
+        } else if (e == 116) {
+            out = out + "\t";
+        } else if (e == 114) {
+            out = out + "\r";
+        } else if (e == 34) {
+            out = out + "\"";
+        } else if (e == 92) {
+            out = out + "\\";
+        } else if (e == 48) {
+            out = out + (utf8Encode(0) catch "");
+        } else if (e == 117) {
+            // \u{…}：十六进制码点（1-6 位）。
+            if ((byteAt(raw, i) catch 0) == 123) {
+                i = i + 1;
+                let cp: int = 0;
+                let any: bool = false;
+                while (i < n) {
+                    const h = byteAt(raw, i) catch 0;
+                    if (h == 125) {
+                        i = i + 1;
+                        break;
+                    }
+                    let d: int = 0;
+                    if (h >= 48 && h <= 57) {
+                        d = h - 48;
+                    } else if (h >= 97 && h <= 102) {
+                        d = h - 97 + 10;
+                    } else if (h >= 65 && h <= 70) {
+                        d = h - 65 + 10;
+                    } else {
+                        i = i + 1;
+                        continue;
+                    }
+                    cp = cp * 16 + d;
+                    any = true;
+                    i = i + 1;
+                }
+                if (any) {
+                    out = out + (utf8Encode(cp) catch "");
+                }
+            }
+        } else {
+            out = out + (utf8Encode(e) catch "");
+        }
+    }
+    return out;
+}
+
+// —— 顶层声明（P2 段：镜像 parseTopDecl 的分支序与软/硬错误位）——
+function parseModule(p: Ref<P>): string | Error {
+    let out: string = "";
+    while (tokKind(p) != K_EOF) {
+        const part = parseTopDecl(p)?;
+        out = out + part;
+    }
+    p.buf = out;
+    return out;
+}
+
+function parseTopDecl(p: Ref<P>): string | Error {
+    let exported: bool = false;
+    if (tokKind(p) == K_EXPORT) {
+        advance(p);
+        exported = true;
+    }
+    const tK = tokKind(p);
+    if (tK == K_FUNCTION) {
+        return parseFn(p, exported);
+    }
+    if (tK == K_STRUCT) {
+        return parseStruct(p, exported);
+    }
+    if (tK == K_ENUM) {
+        return parseEnum(p, exported);
+    }
+    if (tK == K_TEST) {
+        return parseTest(p);
+    }
+    if (tK == K_LET || tK == K_CONST) {
+        return parseBinding(p, exported);
+    }
+    if (tK == K_IMPORT) {
+        if (exported) {
+            print("[DBG] fallthrough kind=" + toStr(tokKind(p)) + " text=" + tokText(p)); recordErrCur(p, 2001); // export 不能修饰 import
+            return err("parse");
+        }
+        return parseImport(p);
+    }
+    recordErrCur(p, 2001); // 期望顶层声明（unexpected_token）
+    return err("parse");
+}
+
+/// import { 名, … } from "路径"; —— from 按标识符形态匹配（D3 §3）。
+function parseImport(p: Ref<P>): string | Error {
+    const iLine = tokLine(p);
+    const iCol = tokCol(p);
+    advance(p); // import
+    if (!expectKind(p, K_LBRACE)) { return err("parse"); }
+    let names: string = "";
+    while (tokKind(p) != K_RBRACE) {
+        if (tokKind(p) != K_IDENT) { recordErrCur(p, 2002); return err("parse"); }
+        const nm = tokText(p);
+        advance(p);
+        names = names + " " + escape(nm);
+        if (tokKind(p) != K_COMMA) { break; }
+        advance(p);
+    }
+    if (!expectKind(p, K_RBRACE)) { return err("parse"); }
+    if (tokKind(p) != K_IDENT) { recordErrCur(p, 2002); return err("parse"); }
+    const fromW = tokText(p);
+    const fLine = tokLine(p);
+    const fCol = tokCol(p);
+    advance(p);
+    if (fromW != "from") {
+        recordErrAt(p, 2002, fLine, fCol); // 期望 'from'
+        return err("parse");
+    }
+    if (!expectKind(p, K_STR)) { return err("parse"); }
+    const rawPath = tokText(p);
+    advance(p);
+    if (!expectKind(p, K_SEMI)) { return err("parse"); }
+    const path = decodeStringLiteral(rawPath);
+    return "import" + names + " " + escape(path) + " " + toStr(iLine) + " " + toStr(iCol) + "\n";
+}
+
+/// function 名(参数: 类型, …): 类型 { 体 } —— 体为 P3 段（遇之 NOTIMPL）。
+function parseFn(p: Ref<P>, exported: bool): string | Error {
+    advance(p); // function
+    if (tokKind(p) != K_IDENT) { recordErrCur(p, 2002); return err("parse"); }
+    const name = tokText(p);
+    const nLine = tokLine(p);
+    const nCol = tokCol(p);
+    advance(p);
+    if (!expectKind(p, K_LPAREN)) { return err("parse"); }
+    let head: string = "fn " + escape(name);
+    if (exported) {
+        head = head + " export";
+    }
+    head = head + " " + toStr(nLine) + " " + toStr(nCol) + "\n";
+    let params: string = "";
+    if (tokKind(p) != K_RPAREN) {
+        while (true) {
+            if (tokKind(p) != K_IDENT) { recordErrCur(p, 2002); return err("parse"); }
+            const pn = tokText(p);
+            const pc = tokCol(p);
+            advance(p);
+            if (!expectKind(p, K_COLON)) { return err("parse"); }
+            const ty = parseType(p)?;
+            params = params + "param " + escape(pn) + " " + toStr(pc) + "\n" + indent4(ty);
+            if (tokKind(p) != K_COMMA) { break; }
+            advance(p);
+            if (tokKind(p) == K_RPAREN) { break; }
+        }
+    }
+    if (!expectKind(p, K_RPAREN)) { return err("parse"); }
+    if (!expectKind(p, K_COLON)) { return err("parse"); }
+    const ret = parseType(p)?;
+    let acc: string = head + params;
+    acc = acc + "ret\n" + indent4(ret);
+    // 体 → P3 段（NOTIMPL 退场）。
+    if (tokKind(p) != K_LBRACE) { recordErrCur(p, 2002); return err("parse"); }
+    markNotimpl(p, "stmt");
+    return err("notimpl");
+}
+
+/// struct 名 { 字段: 类型, … } —— 字段行无位置。
+function parseStruct(p: Ref<P>, exported: bool): string | Error {
+    advance(p); // struct
+    if (tokKind(p) != K_IDENT) { recordErrCur(p, 2002); return err("parse"); }
+    const name = tokText(p);
+    const nLine = tokLine(p);
+    const nCol = tokCol(p);
+    advance(p);
+    if (!expectKind(p, K_LBRACE)) { return err("parse"); }
+    let acc: string = "struct " + escape(name);
+    if (exported) {
+        acc = acc + " export";
+    }
+    acc = acc + " " + toStr(nLine) + " " + toStr(nCol) + "\n";
+    while (tokKind(p) != K_RBRACE && tokKind(p) != K_EOF) {
+        if (tokKind(p) != K_IDENT) { recordErrCur(p, 2002); return err("parse"); }
+        const fname = tokText(p);
+        advance(p);
+        if (!expectKind(p, K_COLON)) { return err("parse"); }
+        const ty = parseType(p)?;
+        acc = acc + "field " + escape(fname) + "\n" + indent4(ty);
+        if (tokKind(p) != K_COMMA) { break; }
+        advance(p);
+    }
+    if (!expectKind(p, K_RBRACE)) { return err("parse"); }
+    return acc;
+}
+
+/// enum 名 { 变体, 变体(字段: 类型, …) } —— 变体行无位置。
+function parseEnum(p: Ref<P>, exported: bool): string | Error {
+    advance(p); // enum
+    if (tokKind(p) != K_IDENT) { recordErrCur(p, 2002); return err("parse"); }
+    const name = tokText(p);
+    const nLine = tokLine(p);
+    const nCol = tokCol(p);
+    advance(p);
+    if (!expectKind(p, K_LBRACE)) { return err("parse"); }
+    let acc: string = "enum " + escape(name);
+    if (exported) {
+        acc = acc + " export";
+    }
+    acc = acc + " " + toStr(nLine) + " " + toStr(nCol) + "\n";
+    while (tokKind(p) != K_RBRACE && tokKind(p) != K_EOF) {
+        if (tokKind(p) != K_IDENT) { recordErrCur(p, 2002); return err("parse"); }
+        const vname = tokText(p);
+        advance(p);
+        acc = acc + "variant " + escape(vname) + "\n";
+        if (tokKind(p) == K_LPAREN) {
+            advance(p);
+            while (tokKind(p) != K_RPAREN && tokKind(p) != K_EOF) {
+                if (tokKind(p) != K_IDENT) { recordErrCur(p, 2002); return err("parse"); }
+                const fname = tokText(p);
+                advance(p);
+                if (!expectKind(p, K_COLON)) { return err("parse"); }
+                const ty = parseType(p)?;
+                acc = acc + "field " + escape(fname) + "\n" + indent4(ty);
+                if (tokKind(p) != K_COMMA) { break; }
+                advance(p);
+            }
+            if (!expectKind(p, K_RPAREN)) { return err("parse"); }
+        }
+        if (tokKind(p) != K_COMMA) { break; }
+        advance(p);
+    }
+    if (!expectKind(p, K_RBRACE)) { return err("parse"); }
+    return acc;
+}
+
+/// test "名" { … } —— 名为解码后文本（转义呈现）；体为 P3 段。
+function parseTest(p: Ref<P>): string | Error {
+    advance(p); // test
+    if (tokKind(p) != K_STR) { recordErrCur(p, 2002); return err("parse"); }
+    advance(p);
+    if (tokKind(p) != K_LBRACE) { recordErrCur(p, 2002); return err("parse"); }
+    markNotimpl(p, "stmt");
+    return err("notimpl");
+}
+
+/// let/const 名 [: 类型] = 初值 ; —— export 位随导出修饰；初值为 P4 段。
+function parseBinding(p: Ref<P>, exported: bool): string | Error {
+    const kw = tokKind(p);
+    const kwLine = tokLine(p);
+    const kwCol = tokCol(p);
+    advance(p); // let/const
+    if (tokKind(p) != K_IDENT) { recordErrCur(p, 2002); return err("parse"); }
+    const name = tokText(p);
+    advance(p);
+    let head: string = "let ";
+    if (kw == K_CONST) {
+        head = "const ";
+    }
+    head = head + escape(name);
+    if (exported) {
+        head = head + " export";
+    }
+    head = head + " " + toStr(kwLine) + " " + toStr(kwCol) + "\n";
+    if (tokKind(p) == K_COLON) {
+        advance(p);
+        const ty = parseType(p)?;
+        head = head + "ty\n" + indent4(ty);
+    } else {
+        head = head + "ty\n";
+    }
+    if (!expectKind(p, K_ASSIGN)) { return err("parse"); }
+    // 初值 → P4 段（NOTIMPL 退场）。
+    markNotimpl(p, "expr");
+    return err("notimpl");
+}
+
+// —— 入口：读被测源 → 预扫描 → 解析 → 输出（协议镜像 tools/main.zig cmdParse）——
+
+function newP(src: string): Ref<P> {
+    return new P {
+        src: src, pos: 0, line: 1, col: 1,
+        lexErrs: "", lexFailed: false,
+        curValid: false, curKind: 0, curText: "", curLine: 0, curCol: 0, lastKind: 0,
+        buf: "", impl: false, implWhat: "",
+        failed: false, errLine: 0, errCol: 0, errCode: 0,
+        exprLine: 0, exprCol: 0, exprLval: false,
+    };
+}
+
+function expectDecl(p: Ref<P>, want: string, label: string): int {
+    const blk = parseModule(p) catch (e) {
+        print("DECLFAIL " + label + ": " + e.message);
+        return 1;
+    };
+    if (blk != want) {
+        print("DECLMISMATCH " + label);
+        return 1;
+    }
+    return 0;
+}
+export function main(args: []string): int {
+    const q0 = newP("struct P { x: int }");
+    if (expectDecl(q0, "struct P 1 8\n    field x\n        tnamed int\n", "case0") != 0) { return 101; }
+    const q1 = newP("struct P { x: int, y: int }");
+    if (expectDecl(q1, "struct P 1 8\n    field x\n    field y\n        tnamed int\n", "case1") != 0) { return 102; }
+    const q2 = newP("export struct P { x: int }");
+    if (expectDecl(q2, "struct P export 1 8\n    field x\n        tnamed int\n", "case2") != 0) { return 103; }
+    const q3 = newP("struct P { x: int, y: int, z: int }");
+    if (expectDecl(q3, "struct P 1 8\n    field x\n    field y\n    field z\n        tnamed int\n", "case3") != 0) { return 104; }
+    print("STRUCT OK");
+    return 0;
+}

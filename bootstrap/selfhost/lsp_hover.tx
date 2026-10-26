@@ -1,0 +1,122 @@
+// lsp_hover.tx —— 原生 LSP 的 hover（第 6 轮 6d-3b1，LSP 与 MCP 实施设计 §四-5）。
+//
+// 光标处的出现（命中同 definition：名字之内优先，其次名字末尾）→ 其身份的声明说明（semamirror 的 ANT1，lsp_diag 的
+// Root.dets）；markdown 时放进 taixu 代码块。没有出现而光标处是后随 `(` 的标识符、名字在内建表里时为内建（用户声明的
+// 同名符号会在该处留下出现）。无身份的出现、关键字、注释与串里为 null。
+import { hitsAt, startsOf, rangeJson } from "./lsp_refs";
+import { AnaDetail, anaDetailOf } from "./ana_index";
+import { LspDoc, posToOffset, lineStart } from "./lsp_docs";
+import { Builtin, builtinNamed } from "./lsp_builtins";
+import { nextToken, Cur, Tok, Out, K_EOF, K_IDENT, K_COMMENT, K_LPAREN } from "../lexer";
+import { dbgStr } from "./dbg_out";
+
+const VARIES_NOTE: string = "类型随泛型实例而定";
+
+// 随泛型实例不同的说明只写到名字为止（`const y: …` → `const y`）。
+function headOf(d: Ref<AnaDetail>): string {
+    const at = strIndexOf(d.text, ": ");
+    if (at < 0) { return d.text; }
+    return strSub(d.text, 0, at);
+}
+
+function hasText(xs: List<string>, s: string): bool {
+    for (x in xs) {
+        if (x == s) { return true; }
+    }
+    return false;
+}
+
+function hoverJson(markdown: bool, code: string, note: string, range: string): string {
+    let value = code;
+    let kind = "plaintext";
+    if (markdown) {
+        kind = "markdown";
+        value = "```taixu\n" + code + "\n```";
+    }
+    if (len(note) > 0) { value = value + "\n\n" + note; }
+    return "{\"contents\":{\"kind\":\"" + kind + "\",\"value\":" + dbgStr(value) + "},\"range\":" + range + "}";
+}
+
+// 光标处的标识符记号（名字之内优先，其次名字末尾）：返回记号下标，没有为 -1。kinds、texts、lines、cols 为文档的记号
+// （不含注释）。
+function identTokenAt(kinds: List<int>, lines: List<int>, cols: List<int>, texts: List<string>, line: int, bc: int): int {
+    let atEnd = -1;
+    let i = 0;
+    while (i < listLen(kinds)) {
+        if ((listGet(kinds, i) catch -1) == K_IDENT && (listGet(lines, i) catch 0) == line + 1) {
+            const s = (listGet(cols, i) catch 0) - 1;
+            const n = len(listGet(texts, i) catch "");
+            if (bc >= s && bc < s + n) { return i; }
+            if (bc == s + n) { atEnd = i; }
+        }
+        i = i + 1;
+    }
+    return atEnd;
+}
+
+function builtinHover(d: Ref<LspDoc>, line: int, ch: int, enc: int, markdown: bool): string {
+    const kinds: List<int> = listNew();
+    const texts: List<string> = listNew();
+    const lines: List<int> = listNew();
+    const cols: List<int> = listNew();
+    const out: Ref<Out> = new Out { lines: "", errors: "", failed: false, coded: true };
+    const c: Ref<Cur> = new Cur { pos: 0, line: 1, col: 1 };
+    while (true) {
+        const k: Tok = nextToken(d.text, c, out);
+        if (k.kind == K_EOF) { break; }
+        if (k.kind != K_COMMENT) {
+            listPush(kinds, k.kind);
+            listPush(texts, k.text);
+            listPush(lines, k.line);
+            listPush(cols, k.col);
+        }
+    }
+    const bc = posToOffset(d, line, ch, enc) - lineStart(d, line);
+    const i = identTokenAt(kinds, lines, cols, texts, line, bc);
+    if (i < 0 || (listGet(kinds, i + 1) catch -1) != K_LPAREN) { return "null"; }
+    const name = listGet(texts, i) catch "";
+    const bv = builtinNamed(name);
+    if (bv == None) { return "null"; }
+    const b = bv catch new Builtin { name: "", sig: "", doc: "", toolchain: false };
+    let note = b.doc;
+    if (b.toolchain) { note = note + "（仅 --toolchain 构建可用）"; }
+    return hoverJson(markdown, b.sig, note, rangeJson(d.text, startsOf(d.text), line + 1, listGet(cols, i) catch 1, len(name), enc));
+}
+
+// textDocument/hover 的结果（JSON 文本，没有为 null）。调用前该文档的入口已同步分析。
+export function hoverAt(d: Ref<LspDoc>, line: int, ch: int, enc: int, markdown: bool): string {
+    const hits = hitsAt(d, line, ch, enc);
+    if (listLen(hits) == 0) { return builtinHover(d, line, ch, enc, markdown); }
+    const code: List<string> = listNew();
+    let note = "";
+    // range 取第一个命中的出现（同一位置的几个身份范围相同）。
+    let rl = 0;
+    let rc = 0;
+    let rn = 0;
+    for (h in hits) {
+        if (rl == 0) {
+            rl = h.occ.line;
+            rc = h.occ.col;
+            rn = h.occ.len;
+        }
+        const dv = anaDetailOf(h.root.dets, h.occ.key);
+        if (dv != None) {
+            const det = dv catch new AnaDetail { key: "", mod: -1, how: 0, name: "", text: "", exported: false, varies: false };
+            let text = det.text;
+            if (det.varies) {
+                text = headOf(det);
+                note = VARIES_NOTE;
+            }
+            if (!hasText(code, text)) { listPush(code, text); }
+        }
+    }
+    if (listLen(code) == 0) { return "null"; }
+    let joined = "";
+    let k = 0;
+    while (k < listLen(code)) {
+        if (k > 0) { joined = joined + "\n"; }
+        joined = joined + (listGet(code, k) catch "");
+        k = k + 1;
+    }
+    return hoverJson(markdown, joined, note, rangeJson(d.text, startsOf(d.text), rl, rc, rn, enc));
+}

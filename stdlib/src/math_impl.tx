@@ -1,0 +1,481 @@
+// ============================================================================
+// std/math 的纯太虚实现（D3 v0.23；FFI 与平台层设计 §九-11）。
+//
+// 逐句移植 taixu-project src/gui/math_host.zig（Zig CLI 经宿主 extern 调用的同一套算法），
+// 两条路径结果逐位一致：浮点运算顺序与原文相同（太虚的 float 即 IEEE 双精度，加减乘除逐次舍入、
+// 不合并为 FMA）；位操作经 floatToBits/floatFromBits（codegen 直发，不经运行时库）。原文唯一的
+// 硬件指令 @sqrt（sqrtsd，IEEE 正确舍入）在这里用逐位开方实现：平方根不会恰好落在两个可表示数
+// 的正中间，多求一位再进位即为正确舍入，结果与 sqrtsd 相同。精度口径同原文：常规域约 1–2ulp，
+// pow/cbrt 为组合或迭代形约 2ulp，三角大参数（|x| 超过 2^20·π/2 的块域）归约精度随 |x| 衰减。
+// 由公共包装 math.tx 引用，两个目标共用；原 Zig 宿主实现已随第 6 轮 6e 退役。
+// ============================================================================
+
+const PI_V: float = 3.14159265358979323846264338327950288;
+const E_V: float = 2.71828182845904523536028747135266250;
+const HALF_PI: float = 1.57079632679489661923132169163975144;
+
+const SIGN_BIT: int = -9223372036854775807 - 1;
+const ABS_MASK: int = 9223372036854775807;
+const MANT_MASK: int = 4503599627370495;
+const EXP_ONE: int = 4607182418800017408;
+const NAN_BITS: int = 9221120237041090560;
+const INF_BITS: int = 9218868437227405312;
+
+export function mPi(): float { return PI_V; }
+export function mE(): float { return E_V; }
+
+function nan(): float { return floatFromBits(NAN_BITS); }
+function inf(): float { return floatFromBits(INF_BITS); }
+function isNan(x: float): bool { return x != x; }
+function isInf(x: float): bool { return (floatToBits(x) & ABS_MASK) == INF_BITS; }
+function expField(x: float): int { return (floatToBits(x) >>> 52) & 2047; }
+
+// ============ 位操作族 ============
+
+export function mTrunc(x: float): float {
+    const b = floatToBits(x);
+    const ex = (b >>> 52) & 2047;
+    if (ex >= 1075) { return x; }
+    if (ex < 1023) { return floatFromBits(b & SIGN_BIT); }
+    const sh = 52 - (ex - 1023);
+    const m = (1 << sh) - 1;
+    return floatFromBits(b & (m ^ -1));
+}
+
+export function mFloor(x: float): float {
+    if (expField(x) >= 1075) { return x; }
+    const t = mTrunc(x);
+    if (x >= 0.0 || t == x) { return t; }
+    return t - 1.0;
+}
+
+export function mCeil(x: float): float {
+    return -mFloor(-x);
+}
+
+export function mRound(x: float): float {
+    const t = mTrunc(x);
+    if (x >= 0.0) {
+        if (x - t >= 0.5) { return t + 1.0; }
+        return t;
+    }
+    if (t - x >= 0.5) { return t - 1.0; }
+    return t;
+}
+
+export function mAbs(x: float): float {
+    return floatFromBits(floatToBits(x) & ABS_MASK);
+}
+
+export function mMin(x: float, y: float): float {
+    if (isNan(x)) { return y; }
+    if (isNan(y)) { return x; }
+    if (x == 0.0 && y == 0.0) {
+        if (floatToBits(x) < 0) { return x; }
+        return y;
+    }
+    if (x < y) { return x; }
+    return y;
+}
+
+export function mMax(x: float, y: float): float {
+    if (isNan(x)) { return y; }
+    if (isNan(y)) { return x; }
+    if (x == 0.0 && y == 0.0) {
+        if (floatToBits(y) < 0) { return x; }
+        return y;
+    }
+    if (x > y) { return x; }
+    return y;
+}
+
+/// 正确舍入的平方根（同 sqrtsd）：负数得 NaN；±0、+inf、NaN 原样。
+export function mSqrt(x: float): float {
+    if (x < 0.0) { return nan(); }
+    if (x == 0.0 || isNan(x) || isInf(x)) { return x; }
+    const b = floatToBits(x);
+    let e = (b >>> 52) & 2047;
+    let m = b & MANT_MASK;
+    if (e == 0) {
+        // 亚正规：归一化到隐含位在第 52 位。
+        while ((m & 4503599627370496) == 0) {
+            m = m << 1;
+            e = e - 1;
+        }
+        e = e + 1;
+    } else {
+        m = m | 4503599627370496;
+    }
+    // x = m·2^(e−1075)，m ∈ [2^52, 2^53)。令指数部分为偶数：x = m'·2^(2k)。
+    let ex = e - 1075;
+    if ((ex & 1) != 0) {
+        m = m << 1;
+        ex = ex - 1;
+    }
+    // 求 q = ⌊√(m·2^54)⌋（54 位：53 位结果＋1 位保护），再按保护位进位。
+    // 被开方数 m·2^54 共 108 位，从高位起每次取两位；余数始终 < 2q＋1 < 2^56。
+    let q = 0;
+    let r = 0;
+    let i = 53;
+    while (i >= 0) {
+        // 第 i 对位（自高位起）：m·2^54 的第 2i＋1、2i 位。
+        const at = 2 * i - 54;
+        let two = 0;
+        if (at >= 0) { two = (m >>> at) & 3; }
+        r = (r << 2) | two;
+        const t = (q << 2) | 1;
+        if (r >= t) {
+            r = r - t;
+            q = (q << 1) | 1;
+        } else {
+            q = q << 1;
+        }
+        i = i - 1;
+    }
+    // q ∈ [2^53, 2^54)：最低位为保护位；恰在正中间不可能出现，进位即正确舍入。
+    // √x ≈ q·2^((ex−54)/2) = mant·2^(ex/2−26)，指数字段 = ex/2 − 26 + 1075。
+    let mant = (q + 1) >>> 1;
+    let field = ex / 2 + 1049;
+    if (mant >= 9007199254740992) {
+        mant = mant >>> 1;
+        field = field + 1;
+    }
+    return floatFromBits((field << 52) | (mant & MANT_MASK));
+}
+
+export function mHypot(x: float, y: float): float {
+    const ax = mAbs(x);
+    const ay = mAbs(y);
+    const hi = mMax(ax, ay);
+    const lo = mMin(ax, ay);
+    if (hi == 0.0) { return 0.0; }
+    if (isInf(hi)) { return inf(); }
+    const r = lo / hi;
+    return hi * mSqrt(1.0 + r * r);
+}
+
+// ============ 三角族（fdlibm sin/cos 内核＋四分之一象限两字归约） ============
+
+const S1: float = -1.66666666666666324348e-01;
+const S2: float = 8.33333333332248946124e-03;
+const S3: float = -1.98412698298579493134e-04;
+const S4: float = 2.75573137070700676789e-06;
+const S5: float = -2.50507602534068634195e-08;
+const S6: float = 1.58969099521155010221e-10;
+
+function sinKernel(x: float): float {
+    const z = x * x;
+    const r = S2 + z * (S3 + z * (S4 + z * (S5 + z * S6)));
+    return x + x * z * (S1 + z * r);
+}
+
+function cosKernel(x: float): float {
+    const z = x * x;
+    let p = 1.0 - z / 240.0;
+    p = 1.0 - (z / 182.0) * p;
+    p = 1.0 - (z / 132.0) * p;
+    p = 1.0 - (z / 90.0) * p;
+    p = 1.0 - (z / 56.0) * p;
+    p = 1.0 - (z / 30.0) * p;
+    p = 1.0 - (z / 12.0) * p;
+    return 1.0 - 0.5 * z * p;
+}
+
+const PIO2_1: float = 1.57079632673412561417e+00;
+const PIO2_1T: float = 6.07710050650619224932e-11;
+const INV_PIO2: float = 6.36619772367581382433e-01;
+const PIO2_BIG: float = 1647099.3291652855; // 1.57079632679489661923 × 2^20（乘 2 的幂精确）
+
+struct Reduced {
+    y: float,
+    n: int,
+}
+
+function reduce(x: float): Reduced {
+    let ax = mAbs(x);
+    if (ax > PIO2_BIG) {
+        const kb = mFloor(ax / PIO2_BIG);
+        ax = ax - kb * PIO2_BIG;
+    }
+    const kf = mFloor(ax * INV_PIO2 + 0.5);
+    const k = kf as int;
+    const r = ax - kf * PIO2_1;
+    const w = kf * PIO2_1T;
+    const y = r - w;
+    if (x < 0.0) { return Reduced { y: -y, n: -k }; }
+    return Reduced { y: y, n: k };
+}
+
+function qmod4(n: int): int {
+    let m = n % 4;
+    if (m < 0) { m = m + 4; }
+    return m;
+}
+
+export function mSin(x: float): float {
+    if (isNan(x) || isInf(x)) { return nan(); }
+    const rd = reduce(x);
+    const q = qmod4(rd.n);
+    if (q == 0) { return sinKernel(rd.y); }
+    if (q == 1) { return cosKernel(rd.y); }
+    if (q == 2) { return -sinKernel(rd.y); }
+    return -cosKernel(rd.y);
+}
+
+export function mCos(x: float): float {
+    if (isNan(x) || isInf(x)) { return nan(); }
+    const rd = reduce(x);
+    const q = qmod4(rd.n);
+    if (q == 0) { return cosKernel(rd.y); }
+    if (q == 1) { return -sinKernel(rd.y); }
+    if (q == 2) { return -cosKernel(rd.y); }
+    return sinKernel(rd.y);
+}
+
+export function mTan(x: float): float {
+    if (isNan(x) || isInf(x)) { return nan(); }
+    const c = mCos(x);
+    if (c == 0.0) { return inf(); }
+    return mSin(x) / c;
+}
+
+// ============ 反三角族 ============
+
+const A1: float = 3.33333333333329318027e-01;
+const A2: float = -1.99999999998766034827e-01;
+const A3: float = 1.42857142725034663711e-01;
+const A4: float = -1.11111104054623557880e-01;
+const A5: float = 9.09088713343650656196e-02;
+const A6: float = -7.69187620504482999495e-02;
+const A7: float = 6.66107313738753120635e-02;
+const A8: float = -5.83581299105672924911e-02;
+const A9: float = 4.98564661517546538172e-02;
+const A10: float = -3.67007886132492919261e-02;
+const A11: float = 2.58966584510949442043e-02;
+const A12: float = -1.58829467774974191533e-02;
+const A13: float = 8.53005396829382459359e-03;
+const A14: float = -3.65828373075331078979e-03;
+const A15: float = 1.07321254225702235069e-03;
+const A16: float = -1.45445654313582952665e-04;
+
+function atanPoly(t: float): float {
+    const z = t * t;
+    const p = A3 + z * (A4 + z * (A5 + z * (A6 + z * (A7 + z * (A8 + z * (A9 + z * (A10 + z * (A11 + z * (A12 + z * (A13 + z * (A14 + z * (A15 + z * A16))))))))))));
+    return t - t * z * (A1 + z * (A2 + z * p));
+}
+
+export function mAtan(x: float): float {
+    if (isNan(x)) { return x; }
+    const ax = mAbs(x);
+    if (isInf(ax)) {
+        if (x > 0.0) { return HALF_PI; }
+        return -HALF_PI;
+    }
+    let s = 1.0;
+    if (x < 0.0) { s = -1.0; }
+    if (ax <= 0.4375) { return s * atanPoly(ax); }
+    if (ax <= 1.0) {
+        const u = (ax - 1.0) / (ax + 1.0);
+        return s * (PI_V / 4.0 + atanPoly(u));
+    }
+    const iv = 1.0 / ax;
+    let base = 0.0;
+    if (iv <= 0.4375) {
+        base = atanPoly(iv);
+    } else {
+        const u = (iv - 1.0) / (iv + 1.0);
+        base = PI_V / 4.0 + atanPoly(u);
+    }
+    return s * (HALF_PI - base);
+}
+
+export function mAtan2(y: float, x: float): float {
+    if (isNan(x) || isNan(y)) { return nan(); }
+    if (y == 0.0) {
+        const ysign = floatToBits(y) < 0;
+        if (x == 0.0) {
+            if (ysign) {
+                if (x < 0.0) { return -PI_V; }
+                return floatFromBits(SIGN_BIT);
+            }
+            if (x < 0.0) { return PI_V; }
+            return 0.0;
+        }
+        if (ysign) { return floatFromBits(SIGN_BIT); }
+        return 0.0;
+    }
+    if (x == 0.0) {
+        if (y > 0.0) { return HALF_PI; }
+        return -HALF_PI;
+    }
+    if (isInf(x) && isInf(y)) {
+        let hx = -1.0;
+        if (x > 0.0) { hx = 1.0; }
+        let hy = -1.0;
+        if (y > 0.0) { hy = 1.0; }
+        return mAtan2(hy, hx);
+    }
+    if (x > 0.0) { return mAtan(y / x); }
+    const r = mAtan(y / x);
+    if (y > 0.0) { return r + PI_V; }
+    return r - PI_V;
+}
+
+export function mAsin(x: float): float {
+    if (isNan(x)) { return x; }
+    const ax = mAbs(x);
+    if (ax > 1.0) { return nan(); }
+    if (ax == 1.0) {
+        if (x > 0.0) { return HALF_PI; }
+        return -HALF_PI;
+    }
+    return mAtan(x / mSqrt(1.0 - x * x));
+}
+
+export function mAcos(x: float): float {
+    if (isNan(x)) { return x; }
+    const ax = mAbs(x);
+    if (ax > 1.0) { return nan(); }
+    if (x == 1.0) { return 0.0; }
+    if (x == -1.0) { return PI_V; }
+    return HALF_PI - mAsin(x);
+}
+
+// ============ 指数/对数族 ============
+
+const LN2_HI: float = 6.93147180369123816490e-01;
+const LN2_LO: float = 1.90821492927058770002e-10;
+const LOG2E: float = 1.44269504088896338700e+00;
+
+function twoPow(k: int): float {
+    let kc = k;
+    if (kc < -1022) { kc = -1022; }
+    if (kc > 1023) { kc = 1023; }
+    return floatFromBits((1023 + kc) << 52);
+}
+
+export function mExp(x: float): float {
+    if (isNan(x)) { return x; }
+    if (x > 709.782712893384) { return inf(); }
+    if (x < -745.1332191019411) { return 0.0; }
+    const kf = mFloor(LOG2E * x + 0.5);
+    const k = kf as int;
+    const r = (x - kf * LN2_HI) - kf * LN2_LO;
+    let s = 1.0;
+    let n = 14;
+    while (n > 0) {
+        s = 1.0 + (r * s) / (n as float);
+        n = n - 1;
+    }
+    return twoPow(k) * s;
+}
+
+const LG1: float = 6.666666666666735130e-01;
+const LG2: float = 3.999999999940941908e-01;
+const LG3: float = 2.857142874366239149e-01;
+const LG4: float = 2.222219843214978396e-01;
+const LG5: float = 1.818357216161805012e-01;
+const LG6: float = 1.531383769920937332e-01;
+const LG7: float = 1.479819860511658591e-01;
+
+export function mLog(x: float): float {
+    if (isNan(x)) { return x; }
+    if (x < 0.0) { return nan(); }
+    if (x == 0.0) { return -inf(); }
+    if (isInf(x)) { return x; }
+    let b = floatToBits(x);
+    let k = ((b >>> 52) & 2047) - 1023;
+    b = (b & -9218868437227405313) | EXP_ONE;
+    let m = floatFromBits(b);
+    if (m < 0.70710678118654752440) {
+        m = m * 2.0;
+        k = k - 1;
+    }
+    const f = m - 1.0;
+    const s = f / (2.0 + f);
+    const z = s * s;
+    const w = z * z;
+    const t1 = w * (LG2 + w * (LG4 + w * LG6));
+    const t2 = z * (LG1 + w * (LG3 + w * (LG5 + w * LG7)));
+    const r = t2 + t1;
+    const lnM = f - s * (f - r);
+    const kf = k as float;
+    return kf * LN2_HI + (lnM + kf * LN2_LO);
+}
+
+export function mLog2(x: float): float {
+    return mLog(x) * 1.44269504088896340736;
+}
+
+export function mLog10(x: float): float {
+    return mLog(x) * 4.34294481903251816668e-01;
+}
+
+export function mPow(x: float, y: float): float {
+    if (isNan(x) || isNan(y)) { return nan(); }
+    if (y == 0.0) { return 1.0; }
+    if (x == 1.0) { return 1.0; }
+    const yIsInt = mFloor(y) == y;
+    let yIsOdd = false;
+    if (yIsInt) {
+        // @mod(|y|, 2)：|y| 为整数时 |y| − 2·⌊|y|/2⌋ 逐步精确。
+        const ay = mAbs(y);
+        yIsOdd = ay - 2.0 * mFloor(ay / 2.0) == 1.0;
+    }
+    const xNeg = floatToBits(x) < 0;
+    if (x == 0.0) {
+        if (y < 0.0) {
+            if (yIsOdd && xNeg) { return -inf(); }
+            return inf();
+        }
+        if (yIsOdd && xNeg) { return floatFromBits(SIGN_BIT); }
+        return 0.0;
+    }
+    if (x < 0.0 && !yIsInt) { return nan(); }
+    if (isInf(y)) {
+        const ax = mAbs(x);
+        if ((ax < 1.0) == (y > 0.0)) { return 0.0; }
+        return inf();
+    }
+    if (isInf(x)) {
+        if (x > 0.0) {
+            if (y > 0.0) { return inf(); }
+            return 0.0;
+        }
+        if (y > 0.0) {
+            if (yIsOdd) { return -inf(); }
+            return inf();
+        }
+        if (yIsOdd) { return floatFromBits(SIGN_BIT); }
+        return 0.0;
+    }
+    const r = mExp(y * mLog(mAbs(x)));
+    if (x < 0.0 && yIsOdd) { return -r; }
+    return r;
+}
+
+// ============ cbrt（位阶种子＋Newton 迭代） ============
+
+export function mCbrt(x: float): float {
+    if (isNan(x) || isInf(x) || x == 0.0) { return x; }
+    const neg = x < 0.0;
+    let ax = mAbs(x);
+    let b = floatToBits(ax);
+    let k = (b >>> 52) & 2047;
+    if (k == 0) {
+        ax = ax * 18014398509481984.0;
+        b = floatToBits(ax);
+        k = (b >>> 52) & 2047;
+        k = k - 54;
+    }
+    k = (k - 1023) / 3;
+    b = (b & -9218868437227405313) | ((1023 + k) << 52);
+    let t = floatFromBits(b);
+    let i = 0;
+    while (i < 5) {
+        t = t - (t * t * t - ax) / (3.0 * t * t);
+        i = i + 1;
+    }
+    if (neg) { return -t; }
+    return t;
+}

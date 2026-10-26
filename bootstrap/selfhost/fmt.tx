@@ -1,0 +1,738 @@
+// 编译器工具 `taixu fmt` 的太虚实现（去 Zig 第 4 轮第 4 步；docs/design/
+// v052-native-run-test-async-v0.1-20261014.md §八）。原生编译器 bootstrap/taixu.tx
+// 的 fmt 子命令与镜像入口 bootstrap/fmtmirror.tx 共用本件。
+//
+// 名称消歧：本件是编译器工具（src/tools/fmt.zig 的移植），不是 taixu-stdlib 的
+// std/fmt。规则本体＝D2 §9／D9 保守格式化器：行内规范化、嵌套缩进重算、分号补齐，
+// 不重排换行结构，幂等是不变式。对 Zig fmt 能处理的输入逐字节一致（含 2026-10-13
+// 起的容器栈：struct/enum 声明体与字段记录 `{ x: 1 }` 内不补分号，闭合后恢复）。
+// 唯一的扩展：lexer.tx 把 defer、interface 认作关键字（Zig 词法当标识符），二者
+// 也算语句开头——上一行漏分号时同样补齐。
+//
+// 输出流与 Zig CLI 相同：缺省单文件的格式化文本与 --write 摘要走 stdout，其余诊断
+// 走 stderr；退出码 0/1/64。--format=json 同 Zig CLI：stdout 一行
+// {"files":[{path,ok,formatted,msg}],"summary":{total,needs_format,failed}}，不出其余文本（第 6 轮 6a）。
+//
+// 本件须留在 v0.17 子集内：fmtmirror 仍经 Zig VM 的两条前端运行（fmtmirror-probe）。
+
+import { jsonStart } from "./toolchain";
+import {
+    Cur, Tok, Out, nextToken, sliceText,
+    K_EOF, K_IDENT, K_INT, K_FLOAT, K_STR, K_TEMPLATE,
+    K_EXPORT, K_FUNCTION, K_STRUCT, K_ENUM, K_LET, K_CONST,
+    K_IF, K_ELSE, K_WHILE, K_FOR, K_BREAK, K_CONTINUE, K_RETURN,
+    K_TEST, K_IMPORT, K_TRUE, K_FALSE, K_DEFER, K_INTERFACE,
+    K_MINUS, K_LT, K_GT, K_BANG, K_QUESTION, K_TILDE, K_CHAR,
+    K_DOT, K_COMMA, K_SEMI, K_COLON, K_LPAREN, K_RPAREN,
+    K_LBRACE, K_RBRACE, K_LBRACKET, K_RBRACKET, K_COMMENT,
+    K_PIPE, K_ASSIGN, K_FATARROW, K_STAR,
+} from "../lexer";
+import { filePath } from "./file_path";
+import { jsonQuote } from "./json_text";
+
+// token 物化：四平行列表（K_EOF 不入表，与 Zig 同形）。
+struct Toks {
+    kinds: List<int>,
+    texts: List<string>,
+    lines: List<int>,
+    cols: List<int>,
+}
+
+// 格式化器状态（Zig Fmt 同构；prevKind=-1＝无前 token）。
+struct Fmt {
+    toks: Ref<Toks>,
+    parts: List<string>, // 已冲刷的输出分段（末尾两两合并成整串）
+    cur: string, // 当前分段
+    depth: int, // 未闭括号深度（{} [] () 统一；行首缩进 = depth × 4）
+    angles: List<bool>, // 逐 token：是泛型尖括号（类型实参的 `<`、`>`）吗——markAngles 预先算好
+    forIn: List<bool>, // 逐 token：是 for 头里的上下文关键字 in 吗
+    coalesce: List<int>, // 逐 token：`??` 合并运算的第一个 `?` 为 1、第二个为 2，其余 0
+    prevLine: int,
+    prevCol: int, // 上一 token 起始列（移位邻接复原判据）
+    prevKind: int,
+    prevText: string,
+    prevPrevEnd: bool, // 上上个 token 是否表达式结尾（一元 minus 判据）
+    prevClose: bool, // 上个 token 是 `??` 的第二个 `?`（不是表达式结尾：`a ?? -1` 的负号是一元的）
+    lineExprEnd: bool, // 当前行最后 token（非注释）是否表达式结尾（分号补齐判据）
+    items: List<bool>, // 容器栈：true＝表达式/字段容器，false＝语句块
+    itemsN: int, // 容器栈有效深度（items 只增不缩，按 itemsN 复用）
+}
+
+// formatSource 结果：词法错误拒绝格式化（不静默处理坏输入），msg 为首条诊断。
+export struct FmtRes {
+    rejected: bool,
+    text: string,
+    msg: string,
+}
+
+// 单文件结果（Zig FmtFileOutcome 同构）。
+struct FileRes {
+    ok: bool, // false＝读取失败或词法拒绝
+    changed: bool,
+    msg: string,
+    lexInvalid: bool, // 词法非法（1xxx 诊断）——非格式面（--check 跳过不计数）
+    text: string, // ok 时格式化文本
+}
+
+const fmtPartLimit: int = 256;
+
+export function formatSource(src: string): Ref<FmtRes> {
+    const r: Ref<FmtRes> = new FmtRes { rejected: false, text: "", msg: "" };
+    const toks: Ref<Toks> = new Toks { kinds: listNew(), texts: listNew(), lines: listNew(), cols: listNew() };
+    const out: Ref<Out> = new Out { lines: "", errors: "", failed: false, coded: true };
+    const c: Ref<Cur> = new Cur { pos: 0, line: 1, col: 1 };
+    while (true) {
+        const t: Tok = nextToken(src, c, out);
+        if (t.kind == K_EOF) {
+            break;
+        }
+        listPush(toks.kinds, t.kind);
+        listPush(toks.texts, t.text);
+        listPush(toks.lines, t.line);
+        listPush(toks.cols, t.col);
+    }
+    if (out.failed) {
+        r.rejected = true;
+        r.msg = firstErrMsg(out.errors);
+        return r;
+    }
+    const f: Ref<Fmt> = new Fmt {
+        toks: toks,
+        parts: listNew(),
+        cur: "",
+        depth: 0,
+        angles: listNew(),
+        forIn: listNew(),
+        coalesce: listNew(),
+        prevLine: 0,
+        prevCol: 0,
+        prevKind: -1,
+        prevText: "",
+        prevPrevEnd: false,
+        prevClose: false,
+        lineExprEnd: false,
+        items: listNew(),
+        itemsN: 0,
+    };
+    markAngles(f);
+    emitAll(f);
+    // 文件以单换行结尾（幂等：fmt 产物不再多行）。
+    listPush(f.parts, f.cur + "\n");
+    r.text = joinParts(f.parts);
+    return r;
+}
+
+// 分段两两合并（复制总量 n·log n；逐段追加到一个长串是 n²）。
+function joinParts(parts: List<string>): string {
+    let level: List<string> = parts;
+    while (listLen(level) > 1) {
+        const next: List<string> = listNew();
+        let i: int = 0;
+        while (i + 1 < listLen(level)) {
+            listPush(next, (listGet(level, i) catch "") + (listGet(level, i + 1) catch ""));
+            i = i + 2;
+        }
+        if (i < listLen(level)) {
+            listPush(next, (listGet(level, i) catch ""));
+        }
+        level = next;
+    }
+    if (listLen(level) == 0) {
+        return "";
+    }
+    return (listGet(level, 0) catch "");
+}
+
+function cpLen(s: string): int {
+    let n: int = 0;
+    let i: int = 0;
+    const total: int = len(s);
+    while (i < total) {
+        const b: int = byteAt(s, i) catch 127;
+        if (b < 128 || b >= 192) {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// 首条诊断 `! code line col msg` 的 msg 段（码点域切分——len 是字节、strSub/
+// strIndexOf 是码点，不混用；形态不符时回退到剩余部分）。
+function firstErrMsg(errors: string): string {
+    const nl: int = strIndexOf(errors, "\n");
+    let line: string = errors;
+    if (nl > 0) {
+        line = strSub(errors, 0, nl);
+    }
+    let rest: string = line;
+    let k: int = 0;
+    while (k < 4) {
+        const p: int = strIndexOf(rest, " ");
+        if (p < 0) {
+            return rest;
+        }
+        rest = strSub(rest, p + 1, cpLen(rest) - p - 1);
+        k = k + 1;
+    }
+    return rest;
+}
+
+// ============================================================================
+// 发射核心（Zig emitAll/emitOne 逐步同构——语句顺序即判据顺序，勿重排）
+// ============================================================================
+
+function kindAt(f: Ref<Fmt>, i: int): int {
+    return (listGet(f.toks.kinds, i) catch -1);
+}
+
+function emitAll(f: Ref<Fmt>): void {
+    const n: int = listLen(f.toks.kinds);
+    let i: int = 0;
+    while (i < n) {
+        const tKind: int = kindAt(f, i);
+        // 分号补齐判据是“当前新行首 token（穿透行间注释）是否语句/声明开头”：
+        // `let x = 1\n// note\nlet y` 的分号补在注释行之前。
+        let stmtStart: bool = startsStatement(tKind);
+        if (!stmtStart && tKind == K_COMMENT) {
+            let j: int = i + 1;
+            while (j < n && kindAt(f, j) == K_COMMENT) {
+                j = j + 1;
+            }
+            if (j < n) {
+                stmtStart = startsStatement(kindAt(f, j));
+            }
+        }
+        emitOne(f, i, stmtStart, itemsBrace(f, i));
+        i = i + 1;
+    }
+}
+
+// `{` 开的是字段容器吗：前面（到上一个 ; { } 为止）有 struct/enum，或首个非注释
+// token 是标识符且其后紧跟冒号（`{ x: 1 }` 记录）。
+function itemsBrace(f: Ref<Fmt>, at: int): bool {
+    if (kindAt(f, at) != K_LBRACE) {
+        return false;
+    }
+    let before: int = at;
+    while (before > 0) {
+        before = before - 1;
+        const k: int = kindAt(f, before);
+        if (k == K_STRUCT || k == K_ENUM) {
+            return true;
+        }
+        if (k == K_SEMI || k == K_LBRACE || k == K_RBRACE) {
+            break;
+        }
+    }
+    const n: int = listLen(f.toks.kinds);
+    let first: int = at + 1;
+    while (first < n && kindAt(f, first) == K_COMMENT) {
+        first = first + 1;
+    }
+    if (first == n || kindAt(f, first) != K_IDENT) {
+        return false;
+    }
+    let second: int = first + 1;
+    while (second < n && kindAt(f, second) == K_COMMENT) {
+        second = second + 1;
+    }
+    return second < n && kindAt(f, second) == K_COLON;
+}
+
+function statementContext(f: Ref<Fmt>): bool {
+    return f.itemsN == 0 || !(listGet(f.items, f.itemsN - 1) catch false);
+}
+
+function appendStr(f: Ref<Fmt>, s: string): void {
+    f.cur = f.cur + s;
+    if (len(f.cur) >= fmtPartLimit) {
+        listPush(f.parts, f.cur);
+        f.cur = "";
+    }
+}
+
+function spaces(n: int): string {
+    let s: string = "";
+    let i: int = 0;
+    while (i < n) {
+        s = s + " ";
+        i = i + 1;
+    }
+    return s;
+}
+
+function emitOne(f: Ref<Fmt>, i: int, curStmtStart: bool, isItems: bool): void {
+    const tKind: int = kindAt(f, i);
+    const tText: string = (listGet(f.toks.texts, i) catch "");
+    const tLine: int = (listGet(f.toks.lines, i) catch -1);
+    const tCol: int = (listGet(f.toks.cols, i) catch -1);
+    const newline: bool = tLine > f.prevLine && f.prevKind != -1;
+    if (newline) {
+        // 上一行漏分号：以表达式结尾收束且无 semi，当前行首（穿透注释）是
+        // 语句/声明开头或闭花括号，且身处语句块（非字段容器）→ 补齐。
+        if (f.lineExprEnd && curStmtStart && statementContext(f)) {
+            appendStr(f, ";");
+        }
+        appendStr(f, "\n");
+        if (tLine - f.prevLine - 1 >= 1) {
+            appendStr(f, "\n"); // 连续空行压缩至 1
+        }
+    }
+
+    const isCloser: bool = tKind == K_RBRACE || tKind == K_RPAREN || tKind == K_RBRACKET;
+    const closerOnNewline: bool = newline && isCloser;
+    if (closerOnNewline && f.depth > 0) {
+        f.depth = f.depth - 1; // 闭括号对齐其开括号
+    }
+
+    if (newline) {
+        appendStr(f, spaces(f.depth * 4));
+    } else if (f.prevKind != -1) {
+        if (inlineSpace(f, i, tKind, tLine, tCol)) {
+            appendStr(f, " ");
+        }
+    }
+
+    // string/template/char：Tok.text 即原始切片（＝Zig Token.raw），逐字还原。
+    appendStr(f, tText);
+
+    if (tKind == K_LBRACE || tKind == K_LPAREN || tKind == K_LBRACKET) {
+        f.depth = f.depth + 1;
+        const item: bool = tKind != K_LBRACE || isItems;
+        if (f.itemsN < listLen(f.items)) {
+            listSet(f.items, f.itemsN, item);
+        } else {
+            listPush(f.items, item);
+        }
+        f.itemsN = f.itemsN + 1;
+    } else if (isCloser && !closerOnNewline && f.depth > 0) {
+        f.depth = f.depth - 1; // 同行闭合（`{ x: 1 }`）
+    }
+    if (isCloser && f.itemsN > 0) {
+        f.itemsN = f.itemsN - 1;
+    }
+
+    // 三元组滚动：prevPrevEnd 记录“即将成为上上个”的 prev 形态。
+    if (f.prevKind != -1) {
+        f.prevPrevEnd = isExprEnd(f.prevKind) && !f.prevClose;
+    }
+    f.prevClose = coalAt(f, i) == 2;
+    f.prevLine = tLine;
+    f.prevCol = tCol;
+    f.prevKind = tKind;
+    f.prevText = tText;
+    if (tKind != K_COMMENT) {
+        f.lineExprEnd = isExprEnd(tKind) && coalAt(f, i) == 0; // 注释不改变行尾形态；`??` 之后表达式未完
+    }
+}
+
+// 泛型尖括号的认定（同解析器 genericArgsAhead 的前瞻规则；D3 v0.13 起有用户泛型，按名字认不全）：标识符之后的 `<`，往后
+// 只经过标识符、整数、逗号、`?`、`|`、方括号与嵌套的尖括号到达配对的 `>`，且其后是 `(`（显式类型实参的调用 `f<T>(…)`）、
+// `{`（泛型结构体字面量，或返回类型之后的函数体）或类型之后才有的记号（`,` `)` `=` `;` `>` `?` `|` `]` `}` `=>`、文件尾）。
+// 比较运算到不了配对的 `>`（`i < n)`、`a < b && …`），或 `>` 之后接着操作数（`f(a < b, c > d)`）。源中零空白相邻的 `<<`
+// 是移位。认定的那一对及其内层尖括号都标记，排版时紧贴：`List<int>`、`Map<string, List<int>>`、`wrapTo<i32>(x)`。
+function nextCode(f: Ref<Fmt>, from: int): int {
+    const n: int = listLen(f.toks.kinds);
+    let j: int = from;
+    while (j < n && kindAt(f, j) == K_COMMENT) {
+        j = j + 1;
+    }
+    return j;
+}
+
+function markAngles(f: Ref<Fmt>): void {
+    const n: int = listLen(f.toks.kinds);
+    let i: int = 0;
+    while (i < n) {
+        listPush(f.angles, false);
+        listPush(f.forIn, false);
+        listPush(f.coalesce, 0);
+        i = i + 1;
+    }
+    i = 1;
+    while (i < n) {
+        const k: int = kindAt(f, i);
+        // `??`：后缀位置的 `?` 之后紧跟（穿透注释）另一个 `?`，同解析器的双 `?` 前瞻；自左向右成对。
+        if (k == K_QUESTION && coalAt(f, i) == 0) {
+            const q: int = nextCode(f, i + 1);
+            if (kindAt(f, q) == K_QUESTION) {
+                listSet(f.coalesce, i, 1);
+                listSet(f.coalesce, q, 2);
+            }
+        }
+        if (k == K_FOR) {
+            // for (x in …)：K_FOR K_LPAREN K_IDENT K_IDENT("in")（in 是上下文关键字，词法上是标识符）。
+            const a: int = nextCode(f, i + 1);
+            const b: int = nextCode(f, a + 1);
+            const c: int = nextCode(f, b + 1);
+            if (kindAt(f, a) == K_LPAREN && kindAt(f, b) == K_IDENT && kindAt(f, c) == K_IDENT
+                && (listGet(f.toks.texts, c) catch "") == "in") {
+                listSet(f.forIn, c, true);
+            }
+        }
+        if (k == K_LT && kindAt(f, i - 1) == K_IDENT && !shiftPair(f, i)) {
+            markFrom(f, i);
+        }
+        i = i + 1;
+    }
+}
+
+// i 处的 `<` 与其后的 `<` 零空白相邻（`<<` 移位）。
+function shiftPair(f: Ref<Fmt>, i: int): bool {
+    if (kindAt(f, i + 1) != K_LT) {
+        return false;
+    }
+    return (listGet(f.toks.lines, i + 1) catch -1) == (listGet(f.toks.lines, i) catch -2)
+    && (listGet(f.toks.cols, i + 1) catch -1) == (listGet(f.toks.cols, i) catch -2) + 1;
+}
+
+function markFrom(f: Ref<Fmt>, open: int): void {
+    const n: int = listLen(f.toks.kinds);
+    const seen: List<int> = listNew();
+    listPush(seen, open);
+    let depth: int = 0;
+    let j: int = nextCode(f, open + 1);
+    let steps: int = 0;
+    while (j < n && steps < 256) {
+        const k: int = kindAt(f, j);
+        if (k == K_LT) {
+            depth = depth + 1;
+            listPush(seen, j);
+        } else if (k == K_GT) {
+            listPush(seen, j);
+            if (depth == 0) {
+                const after: int = nextCode(f, j + 1);
+                if (after >= n || angleFollow(kindAt(f, after))) {
+                    let s: int = 0;
+                    while (s < listLen(seen)) {
+                        listSet(f.angles, listGet(seen, s) catch 0, true);
+                        s = s + 1;
+                    }
+                }
+                return;
+            }
+            depth = depth - 1;
+        } else if (k != K_IDENT && k != K_INT && k != K_COMMA && k != K_QUESTION && k != K_PIPE
+            && k != K_LBRACKET && k != K_RBRACKET) {
+            return;
+        }
+        j = nextCode(f, j + 1);
+        steps = steps + 1;
+    }
+}
+
+function angleFollow(k: int): bool {
+    return k == K_LPAREN || k == K_LBRACE || k == K_COMMA || k == K_RPAREN || k == K_ASSIGN || k == K_SEMI
+    || k == K_GT || k == K_QUESTION || k == K_PIPE || k == K_RBRACKET || k == K_RBRACE || k == K_FATARROW;
+}
+
+function angleAt(f: Ref<Fmt>, i: int): bool {
+    return (listGet(f.angles, i) catch false);
+}
+
+function coalAt(f: Ref<Fmt>, i: int): int {
+    return (listGet(f.coalesce, i) catch 0);
+}
+
+// 行内前缀空白：false＝紧贴，true＝一空格（默认）。i 为当前 token 的下标（前一 token 为 i − 1）。
+function inlineSpace(f: Ref<Fmt>, i: int, curKind: int, curLine: int, curCol: int): bool {
+    const prev: int = f.prevKind;
+    if (angleAt(f, i)) {
+        return false; // 泛型尖括号：`List<int>` 的 `<`、`>` 都紧贴
+    }
+    // `??` 合并运算同其他双目运算两侧一空格，两个问号紧贴：`a ?? b`（同 C#、TS、Swift、Kotlin 的 `?:`）。
+    const co: int = coalAt(f, i);
+    if (co != 0) {
+        return co == 1;
+    }
+    if (coalAt(f, i - 1) == 2) {
+        return true;
+    }
+    if ((prev == K_LT || prev == K_GT) && angleAt(f, i - 1)) {
+        // 开尖括号之后紧贴（`List<int>`）；收尖括号之后的调用紧贴（`listNew<int>()`），其余照常。
+        if (prev == K_LT || curKind == K_LPAREN) {
+            return false;
+        }
+    }
+    if (curKind == K_DOT && prev == K_COMMA) {
+        return true; // D3 v0.36 外部函数的变参参数 `, ...名: 类型`：逗号后一空格，三个点紧贴参数名
+    }
+    if (curKind == K_STAR && prev == K_FUNCTION) {
+        return false; // 生成器 `function* 名`（D3 v0.22 §6.20，同 JS／TS 的常见排版）：星号紧贴 function，其后一空格
+    }
+    if (curKind == K_COMMA || curKind == K_SEMI || curKind == K_RPAREN || curKind == K_RBRACKET || curKind == K_DOT || curKind == K_QUESTION || curKind == K_COLON) {
+        return false;
+    }
+    if (curKind == K_RBRACE) {
+        return prev != K_LBRACE; // `{}` 紧贴；`... ; }` 前一空格
+    }
+    if (curKind == K_GT) {
+        // 移位邻接复原：源中零空白相邻的 `<`/`>`（`<<` `>>` `>>>`）紧贴发射。
+        if ((prev == K_LT || prev == K_GT) && f.prevLine == curLine && f.prevCol + 1 == curCol) {
+            return false;
+        }
+        return true; // 比较运算空格（泛型的收尖括号已在上面紧贴）
+    }
+    if (curKind == K_LT) {
+        if (prev == K_LT && f.prevLine == curLine && f.prevCol + 1 == curCol) {
+            return false;
+        }
+        return true; // 比较运算（泛型的开尖括号已在上面紧贴）
+    }
+    if (prev == K_LPAREN || prev == K_LBRACKET || prev == K_DOT || prev == K_BANG) {
+        return false;
+    }
+    if (prev == K_TILDE) {
+        return false; // `~` 一元位非：操作数紧贴
+    }
+    if (prev == K_LBRACE) {
+        return true; // `{ x: 1 }`：开括号后一空格
+    }
+    if (prev == K_MINUS) {
+        return f.prevPrevEnd; // 一元负号紧贴（前一非表达式结尾）
+    }
+    if (prev == K_IDENT) {
+        // for 头的 `in` 后接数组字面量：`for (x in [1, 2])`，不是下标（in 词法上是标识符）。
+        if (curKind == K_LBRACKET && (listGet(f.forIn, i - 1) catch false)) {
+            return true;
+        }
+        // `and`/`or` 双目运算符空格不紧贴；`f(...)`/`a[i]` 紧贴。
+        if (curKind == K_LPAREN && (f.prevText == "and" || f.prevText == "or")) {
+            return true;
+        }
+        return curKind != K_LPAREN && curKind != K_LBRACKET;
+    }
+    if (prev == K_RBRACKET) {
+        return curKind != K_IDENT; // `[]T`/`[N]T` 切片/数组类型紧贴
+    }
+    return true; // 默认：双目运算符两侧、相邻词元之间一空格
+}
+
+// 表达式结尾形态（分号补齐判据）。
+function isExprEnd(k: int): bool {
+    return k == K_IDENT || k == K_INT || k == K_CHAR || k == K_FLOAT || k == K_STR || k == K_TEMPLATE
+    || k == K_TRUE || k == K_FALSE || k == K_RPAREN || k == K_RBRACKET || k == K_QUESTION;
+}
+
+// 语句/声明开头（或块收尾）——意味着上一行应是完整语句。
+function startsStatement(k: int): bool {
+    return k == K_LET || k == K_CONST || k == K_RETURN || k == K_IF || k == K_ELSE || k == K_WHILE
+    || k == K_FOR || k == K_BREAK || k == K_CONTINUE || k == K_IMPORT || k == K_EXPORT
+    || k == K_FUNCTION || k == K_STRUCT || k == K_ENUM || k == K_TEST || k == K_RBRACE
+    || k == K_DEFER || k == K_INTERFACE;
+}
+
+// ============================================================================
+// CLI（Zig cmdFmt 同构）
+// ============================================================================
+
+function endsWithTx(s: string): bool {
+    const n: int = len(s);
+    if (n < 3) {
+        return false;
+    }
+    return (byteAt(s, n - 3) catch 0) == 46 && (byteAt(s, n - 2) catch 0) == 116 && (byteAt(s, n - 1) catch 0) == 120;
+}
+
+// 递归收集：listDir 单层名单（字节序）逐条按 entryKind 分类——2 目录就地下钻
+// （DFS 前序）、1 普通文件只收 .tx、3 symlink 与 0 不可判跳过；listDir 失败＝不可读
+// 目录，登记进 fails（显式失败，禁静默）。路径呈现＝root + "/" + name。
+function collectTxFiles(root: string, out: List<string>, fails: List<string>): void {
+    const names: List<string> = listDir(filePath(root)) catch (e) {
+        listPush(fails, root);
+        return;
+    };
+    let i: int = 0;
+    while (i < listLen(names)) {
+        const name: string = (listGet(names, i) catch "");
+        const p: string = root + "/" + name;
+        const ek: int = entryKind(filePath(p));
+        if (ek == 2) {
+            collectTxFiles(p, out, fails);
+        } else if (ek == 1) {
+            if (endsWithTx(name)) {
+                listPush(out, p);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+function fmtFile(p: string, write: bool): Ref<FileRes> {
+    const r: Ref<FileRes> = new FileRes { ok: false, changed: false, msg: "", lexInvalid: false, text: "" };
+    const src: string = readFile(filePath(p)) catch (e) {
+        r.msg = e.message;
+        return r;
+    };
+    const fr: Ref<FmtRes> = formatSource(src);
+    if (fr.rejected) {
+        r.msg = fr.msg;
+        r.lexInvalid = true; // 词法码全表 1xxx＝恒 lex_invalid
+        return r;
+    }
+    r.ok = true;
+    r.changed = fr.text != src;
+    if (r.changed && write) {
+        writeFile(filePath(p), fr.text) catch (e) {
+            r.msg = e.message;
+            r.changed = false;
+            r.ok = false;
+            return r;
+        };
+    }
+    r.text = fr.text;
+    return r;
+}
+
+// `taixu fmt` 的参数（不含子命令名）。返回退出码；用法错误（无路径或 --write 与
+// --check 并用）返回 -64，由调用方打印各自的用法后以 64 退出。
+export function fmtCommand(args: List<string>): int {
+    let write: bool = false;
+    let check: bool = false;
+    let json: bool = false;
+    const paths: List<string> = listNew();
+    let i: int = 0;
+    while (i < listLen(args)) {
+        const a: string = (listGet(args, i) catch "");
+        if (a == "--write") {
+            write = true;
+        } else if (a == "--check") {
+            check = true;
+        } else if (a == "--format=json") {
+            json = true;
+        } else {
+            listPush(paths, a);
+        }
+        i = i + 1;
+    }
+    if (listLen(paths) == 0 || (write && check)) {
+        return -64;
+    }
+
+    // 先分类全部实参（不可读目录登记），随后统一失败裁决。
+    const files: List<string> = listNew();
+    const fails: List<string> = listNew();
+    let k: int = 0;
+    while (k < listLen(paths)) {
+        const a: string = (listGet(paths, k) catch "");
+        if (entryKind(filePath(a)) == 2) {
+            collectTxFiles(a, files, fails);
+        } else if (endsWithTx(a)) {
+            // 文件、symlink 与不可判（不存在）实参：.tx 收录，读失败由 readFile 报出。
+            listPush(files, a);
+        } else {
+            eprint("taixu: fmt 只接受 .tx 文件或目录（得到 " + a + "）");
+            return 64;
+        }
+        k = k + 1;
+    }
+    if (listLen(fails) > 0) {
+        k = 0;
+        while (k < listLen(fails)) {
+            eprint("taixu: fmt: 无法读取目录（" + (listGet(fails, k) catch "") + "）");
+            k = k + 1;
+        }
+        return 1;
+    }
+    const total: int = listLen(files);
+    if (total == 0) {
+        return 0; // 空目录：exit 0 且无输出
+    }
+
+    const res: List<Ref<FileRes>> = listNew();
+    let needFormat: int = 0;
+    let failed: int = 0;
+    let changedTotal: int = 0;
+    k = 0;
+    while (k < total) {
+        const r: Ref<FileRes> = fmtFile((listGet(files, k) catch ""), write);
+        listPush(res, r);
+        if (!r.ok && !r.lexInvalid) {
+            failed = failed + 1; // 词法非法＝非格式面（编译门已拒），跳过不计数
+        }
+        if (r.changed) {
+            changedTotal = changedTotal + 1;
+        }
+        if (r.ok && r.changed) {
+            needFormat = needFormat + 1;
+        }
+        k = k + 1;
+    }
+
+    k = 0;
+    if (json) {
+        let doc: string = jsonStart("fmt/1") + ",\"files\":[";
+        while (k < total) {
+            const r: Ref<FileRes> = (listGet(res, k) catch emptyRes());
+            if (k > 0) {
+                doc = doc + ",";
+            }
+            doc = doc + "{\"path\":" + jsonQuote((listGet(files, k) catch "")) + ",\"ok\":" + boolText(r.ok) + ",\"formatted\":" + boolText(r.ok && !r.changed) + ",";
+            if (len(r.msg) > 0) {
+                doc = doc + "\"msg\":" + jsonQuote(r.msg) + "}";
+            } else {
+                doc = doc + "\"msg\":null}";
+            }
+            k = k + 1;
+        }
+        print(doc + "],\"summary\":{\"total\":" + toStr(total) + ",\"needs_format\":" + toStr(needFormat) + ",\"failed\":" + toStr(failed) + "}}");
+    } else if (check) {
+        while (k < total) {
+            const p: string = (listGet(files, k) catch "");
+            const r: Ref<FileRes> = (listGet(res, k) catch emptyRes());
+            if (!r.ok && r.lexInvalid) {
+                eprint(p + ": 跳过（词法非法——非格式面，编译门已拒）");
+            } else if (!r.ok) {
+                eprint(p + ": 无法格式化（" + r.msg + "）");
+            } else if (r.changed) {
+                eprint(p + ": 需要格式化（taixu fmt --write " + p + "）");
+            }
+            k = k + 1;
+        }
+        eprint("fmt-check: " + toStr(total - needFormat - failed) + " 已规范, " + toStr(needFormat) + " 需格式化, " + toStr(failed) + " 失败");
+    } else if (write) {
+        while (k < total) {
+            const r: Ref<FileRes> = (listGet(res, k) catch emptyRes());
+            if (!r.ok) {
+                eprint((listGet(files, k) catch "") + ": 无法格式化（" + r.msg + "）");
+            }
+            k = k + 1;
+        }
+        print("fmt: " + toStr(total) + " 文件检查, " + toStr(changedTotal) + " 已写回, " + toStr(total - changedTotal - failed) + " 本就规范, " + toStr(failed) + " 失败");
+    } else {
+        const r0: Ref<FileRes> = (listGet(res, 0) catch emptyRes());
+        if (total == 1 && r0.ok) {
+            // 单文件打印格式化结果：产物恒以 '\n' 结尾，print 会再补一个——剥去末字节。
+            print(sliceText(r0.text, 0, len(r0.text) - 1));
+        } else {
+            while (k < total) {
+                const r: Ref<FileRes> = (listGet(res, k) catch emptyRes());
+                if (!r.ok) {
+                    eprint((listGet(files, k) catch "") + ": 无法格式化（" + r.msg + "）");
+                } else if (r.changed) {
+                    eprint((listGet(files, k) catch "") + ": 需要格式化");
+                }
+                k = k + 1;
+            }
+        }
+    }
+    if (failed > 0) {
+        return 1;
+    }
+    if (check && needFormat > 0) {
+        return 1; // 检查未通过（D9 §3）
+    }
+    return 0;
+}
+
+function boolText(b: bool): string {
+    if (b) {
+        return "true";
+    }
+    return "false";
+}
+
+function emptyRes(): Ref<FileRes> {
+    return new FileRes { ok: false, changed: false, msg: "", lexInvalid: false, text: "" };
+}

@@ -1,0 +1,590 @@
+// NRT M2d: file error objects, the file builtins' fallback shells, clock and
+// directory builtins. The kernel's file primitives (__tx_file_wpath,
+// __tx_native_file_write) live in the same object. Linux arms of the
+// directory/clock builtins belong to M5 and fail loudly until then.
+import { StructuredBuffer } from "./assemble";
+import { RtFn, RtOp, L, I, A } from "./rtfn_base";
+import { rtBegin, rtSet, rtOp, rtShift, rtDivMod, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtIf32, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtCallList, rtSyscall, rtRet, rtRetVoid } from "./rtfn";
+import { ARITY, check, text, memcpyName, fatal, trapText, trapAt, arity, argTag, strSpan, nrtTarget } from "./nrt_base";
+import { tRawSyscall, tUnix, tMacos } from "./target";
+import { uxSys, uxMac, uxClock, uxErrno, uxAtFdcwd, uxAtNoFollow, uxStatMode } from "./unix_sys";
+
+export const NRT_SYS_EXPORTS: string = "__tx_nrt_sort_strs __tx_store_file_err __tx_store_wfb_elem_err __tx_bi_read_file_host __tx_bi_write_file_host __tx_bi_write_file_bytes_host __tx_bi_now_ms __tx_bi_entry_kind __tx_bi_list_dir __tx_bi_make_dir __tx_bi_write_executable";
+
+function call7(f: Ref<RtFn>, result: string, target: string, a: Ref<RtOp>, c: Ref<RtOp>, d: Ref<RtOp>, e: Ref<RtOp>, g: Ref<RtOp>, h: Ref<RtOp>, k: Ref<RtOp>): void {
+    const xs: List<Ref<RtOp>> = listNew();
+    listPush(xs, a); listPush(xs, c); listPush(xs, d); listPush(xs, e); listPush(xs, g); listPush(xs, h); listPush(xs, k);
+    rtCallList(f, result, target, xs);
+}
+
+const STATUS_NAMES: string = "ok|invalid argument|out of memory|no such file|access denied|io error|too big";
+
+function emitErrors(b: Ref<StructuredBuffer>): void {
+    // __tx_store_file_err(status, path_idx, fn, pc) → err "{status name}: {path}".
+    const names = strSplit(STATUS_NAMES, "|");
+    const sep = text(b, ": ");
+    let f = rtBegin(b, "__tx_store_file_err", "status path fn pc", "np nl o pp pn q", 7, "bootstrap/selfhost/nrt_sys.tx");
+    rtOp(f, "status", L("status"), "and", I(4294967295));
+    rtIf(f, L("status"), "ule", I(6), "known");
+    rtSet(f, "status", I(6));
+    rtLabel(f, "known");
+    let k = 0;
+    while (k < listLen(names)) { rtIf(f, L("status"), "eq", I(k), "s" + toStr(k)); k = k + 1; }
+    k = 0;
+    while (k < listLen(names)) {
+        const name = listGet(names, k) catch "";
+        rtLabel(f, "s" + toStr(k)); rtSet(f, "np", A(text(b, name))); rtSet(f, "nl", I(len(name))); rtJump(f, "have");
+        k = k + 1;
+    }
+    rtLabel(f, "have");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("path"));
+    rtLoad(f, "pn", L("o"), 40, 8); rtLoad(f, "pp", L("o"), 32, 8);
+    call7(f, "q", "__tx_nrt_cat3", L("np"), L("nl"), A(sep), I(2), L("pp"), L("pn"), I(2));
+    rtRet(f, L("q")); check(f);
+
+    // __tx_nrt_elem_err(pp, pn, kind, value): "<prefix>{d} 不是 int" (kind 0, value -1)
+    // or "<prefix>{d} 越界（须 0..255）" (kind 1) as a new Error; prefix ends in "元素 ".
+    const notInt = " 不是 int";
+    const range = " 越界（须 0..255）";
+    const notIntLabel = text(b, notInt);
+    const rangeLabel = text(b, range);
+    f = rtBegin(b, "__tx_nrt_elem_err", "pp pn kind value", "d0 d1 d2 d3 dp n sp sn q", 7, "bootstrap/selfhost/nrt_sys.tx");
+    rtAddrOf(f, "dp", "d0");
+    rtCall3(f, "n", "__tx_nrt_digits", L("value"), I(10), L("dp"));
+    rtOp(f, "dp", L("dp"), "add", I(32)); rtOp(f, "dp", L("dp"), "sub", L("n"));
+    rtSet(f, "sp", A(rangeLabel)); rtSet(f, "sn", I(len(range)));
+    rtIf32(f, L("kind"), "ne", I(0), "make");
+    rtSet(f, "sp", A(notIntLabel)); rtSet(f, "sn", I(len(notInt)));
+    rtLabel(f, "make");
+    call7(f, "q", "__tx_nrt_cat3", L("pp"), L("pn"), L("dp"), L("n"), L("sp"), L("sn"), I(2));
+    rtRet(f, L("q")); check(f);
+
+    // __tx_store_wfb_elem_err(kind, value, fn, pc): the kernel's writeFileBytes element errors.
+    const wfb = "writeFileBytes: 元素 ";
+    const wfbLabel = text(b, wfb);
+    f = rtBegin(b, "__tx_store_wfb_elem_err", "kind value fn pc", "q", 4, "bootstrap/selfhost/nrt_sys.tx");
+    rtCall4(f, "q", "__tx_nrt_elem_err", A(wfbLabel), I(len(wfb)), L("kind"), L("value"));
+    rtRet(f, L("q")); check(f);
+}
+
+function emitFileFallbacks(b: Ref<StructuredBuffer>): void {
+    // The kernel's file builtins only fall back here on arity/type mismatch;
+    // reaching the end of a type-correct shell means the kernel and NRT disagree.
+    let f = rtBegin(b, "__tx_bi_read_file_host", "win fn pc a nargs", "s t", 5, "bootstrap/selfhost/nrt_sys.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", 6, "type");
+    fatal(b, f, "taixu NRT: readFile 回退与内核判据不一致\n", 70);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "readFile 的实参不是 string");
+    rtRetVoid(f); check(f);
+
+    f = rtBegin(b, "__tx_bi_write_file_host", "win fn pc a nargs", "s t", 5, "bootstrap/selfhost/nrt_sys.tx");
+    arity(b, f, 2);
+    argTag(f, 0, "s", "t", 6, "t0");
+    argTag(f, 1, "s", "t", 6, "t1");
+    fatal(b, f, "taixu NRT: writeFile 回退与内核判据不一致\n", 70);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "t0", 4010, "writeFile 第一实参（路径）不是 string");
+    trapAt(b, f, "t1", 4010, "writeFile 第二实参（内容）不是 string");
+    rtRetVoid(f); check(f);
+
+    // writeFileBytes also falls back for a raw list whose element type is not
+    // int: non-empty → element error; empty → an empty write.
+    const empty = text(b, "\n");
+    f = rtBegin(b, "__tx_bi_write_file_bytes_host", "win fn pc a nargs", "s t l o n pp pn q", 5, "bootstrap/selfhost/nrt_sys.tx");
+    arity(b, f, 2);
+    argTag(f, 0, "s", "t", 6, "t0");
+    argTag(f, 1, "l", "t", -1, "");
+    rtIf(f, L("t"), "eq", I(17), "bytes");
+    rtIf(f, L("t"), "ne", I(15), "t1");
+    rtLoad(f, "o", L("l"), 8, 4); rtCall1(f, "o", "__tx_native_object_address_v1", L("o")); rtLoad(f, "n", L("o"), 40, 8);
+    rtIf(f, L("n"), "ne", I(0), "notint");
+    strSpan(f, "s", "pp", "pn");
+    rtCall4(f, "q", "__tx_native_file_write", L("pp"), L("pn"), A(empty), I(0));
+    rtIf32(f, L("q"), "ne", I(0), "failed");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(4), I(0)); rtRetVoid(f);
+    rtLabel(f, "failed");
+    rtLoad(f, "o", L("s"), 8, 4);
+    rtCall4(f, "q", "__tx_store_file_err", L("q"), L("o"), L("fn"), L("pc"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(5), L("q")); rtRetVoid(f);
+    // Bytes content (D3 v0.18): write its span as is.
+    rtLabel(f, "bytes");
+    strSpan(f, "l", "o", "n");
+    strSpan(f, "s", "pp", "pn");
+    rtCall4(f, "q", "__tx_native_file_write", L("pp"), L("pn"), L("o"), L("n"));
+    rtIf32(f, L("q"), "ne", I(0), "failed");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(4), I(0)); rtRetVoid(f);
+    rtLabel(f, "notint");
+    rtCall4(f, "q", "__tx_store_wfb_elem_err", I(0), I(-1), L("fn"), L("pc"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(5), L("q")); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "t0", 4010, "writeFileBytes 第一实参（路径）不是 string");
+    trapAt(b, f, "t1", 4010, "writeFileBytes 第二实参（内容）不是 List");
+    rtRetVoid(f); check(f);
+}
+
+function emitClockAndEntries(b: Ref<StructuredBuffer>): void {
+    // nowMs(): wall-clock milliseconds since the Unix epoch (floor).
+    let f = rtBegin(b, "__tx_bi_now_ms", "win fn pc a nargs", "ft ns r", 5, "bootstrap/selfhost/nrt_sys.tx");
+    arity(b, f, 0);
+    if (tUnix(nrtTarget())) {
+        // clock_gettime(CLOCK_REALTIME, &ts): ts = {sec, nsec}.
+        rtAddrOf(f, "r", "ft");
+        const xs: List<Ref<RtOp>> = listNew(); listPush(xs, I(uxClock(nrtTarget(), 0))); listPush(xs, L("r"));
+        uxSys(f, nrtTarget(), "", 228, xs);
+        rtOp(f, "r", L("ft"), "imul", I(1000));
+        rtDivMod(f, "ns", "", L("ns"), I(1000000));
+        rtOp(f, "r", L("r"), "add", L("ns"));
+    } else {
+        // FILETIME: 100 ns ticks since 1601-01-01.
+        rtAddrOf(f, "r", "ft");
+        rtCall1(f, "", "GetSystemTimePreciseAsFileTime", L("r"));
+        rtDivMod(f, "r", "", L("ft"), I(10000));
+        rtOp(f, "r", L("r"), "sub", I(11644473600000));
+    }
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(1), L("r")); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    rtRetVoid(f); check(f);
+
+    // entryKind(path): 0 unknown / 1 file / 2 directory / 3 symlink (reparse first).
+    f = rtBegin(b, "__tx_bi_entry_kind", "win fn pc a nargs", "s t p n w at r" + statLocals(), 5, "bootstrap/selfhost/nrt_sys.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", 6, "type");
+    const ut = nrtTarget();
+    if (tUnix(ut)) {
+        // fstatat(AT_FDCWD, path, &st, AT_SYMLINK_NOFOLLOW)（Linux 为 newfstatat）；st_mode 的位置见 uxStatMode。
+        strSpan(f, "s", "p", "n");
+        rtSet(f, "r", I(0));
+        rtIf(f, L("n"), "eq", I(0), "set");
+        rtCall2(f, "t", "__tx_rt_nul_free", L("p"), L("n"));
+        rtIf(f, L("t"), "eq", I(0), "set");
+        rtCall2(f, "w", "__tx_nrt_cpath", L("p"), L("n"));
+        rtIf(f, L("w"), "eq", I(0), "set");
+        rtAddrOf(f, "at", "st0");
+        const xs: List<Ref<RtOp>> = listNew(); listPush(xs, I(uxAtFdcwd(ut))); listPush(xs, L("w")); listPush(xs, L("at")); listPush(xs, I(uxAtNoFollow(ut)));
+        uxSys(f, ut, "t", 262, xs);
+        rtCall1(f, "", "__tx_native_mem_free", L("w"));
+        rtIf(f, L("t"), "ne", I(0), "set");
+        uxStatMode(f, ut, "at", L("at")); rtOp(f, "at", L("at"), "and", I(61440));
+        rtSet(f, "r", I(2)); rtIf(f, L("at"), "eq", I(16384), "set");
+        rtSet(f, "r", I(3)); rtIf(f, L("at"), "eq", I(40960), "set");
+        rtSet(f, "r", I(1)); rtIf(f, L("at"), "eq", I(32768), "set");
+        rtSet(f, "r", I(0));
+        rtLabel(f, "set");
+        rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(1), L("r")); rtRetVoid(f);
+    } else {
+        strSpan(f, "s", "p", "n");
+        rtSet(f, "r", I(0));
+        rtIf(f, L("n"), "eq", I(0), "set");
+        rtCall2(f, "t", "__tx_rt_nul_free", L("p"), L("n"));
+        rtIf(f, L("t"), "eq", I(0), "set");
+        rtCall2(f, "w", "__tx_file_wpath", L("p"), L("n"));
+        rtIf(f, L("w"), "eq", I(0), "set");
+        rtCall1(f, "at", "GetFileAttributesW", L("w"));
+        rtCall1(f, "", "__tx_native_mem_free", L("w"));
+        rtOp(f, "at", L("at"), "and", I(4294967295));
+        rtIf(f, L("at"), "eq", I(4294967295), "set");
+        rtSet(f, "r", I(3));
+        rtOp(f, "t", L("at"), "and", I(1024)); rtIf(f, L("t"), "ne", I(0), "set");
+        rtSet(f, "r", I(2));
+        rtOp(f, "t", L("at"), "and", I(16)); rtIf(f, L("t"), "ne", I(0), "set");
+        rtSet(f, "r", I(1));
+        rtLabel(f, "set");
+        rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(1), L("r")); rtRetVoid(f);
+    }
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "entryKind 的实参不是 string");
+    rtRetVoid(f); check(f);
+}
+
+function one(a: Ref<RtOp>): List<Ref<RtOp>> { const xs: List<Ref<RtOp>> = listNew(); listPush(xs, a); return xs; }
+
+function statLocals(): string {
+    // struct stat is 144 bytes on x86-64 Linux and in macOS's 64-bit-inode layout: 18 quads.
+    let out = "";
+    let k = 0;
+    while (k < 18) { out = out + " st" + toStr(k); k = k + 1; }
+    return out;
+}
+
+function findDataLocals(): string {
+    // WIN32_FIND_DATAW is 592 bytes: 74 quads, cFileName at byte 44.
+    let out = "";
+    let k = 0;
+    while (k < 74) { out = out + " fd" + toStr(k); k = k + 1; }
+    return out;
+}
+
+function emitCPath(b: Ref<StructuredBuffer>): void {
+    // __tx_nrt_cpath(p, n) → NUL-terminated native copy (caller frees); 0 on OOM or when p[0..n) contains NUL
+    // (the system would see a truncated, different path; callers check NUL first to report invalid argument).
+    const f = rtBegin(b, "__tx_nrt_cpath", "p n", "q t", 3, "bootstrap/selfhost/nrt_sys.tx");
+    rtSet(f, "q", I(0));
+    rtCall2(f, "t", "__tx_rt_nul_free", L("p"), L("n"));
+    rtIf(f, L("t"), "eq", I(0), "done");
+    rtOp(f, "t", L("n"), "add", I(1));
+    rtCall2(f, "q", "__tx_native_mem_alloc", L("t"), I(1));
+    rtIf(f, L("q"), "eq", I(0), "done");
+    rtCall3(f, "", memcpyName(), L("q"), L("p"), L("n"));
+    rtOp(f, "t", L("q"), "add", L("n")); rtStore(f, L("t"), 0, I(0), 1);
+    rtLabel(f, "done"); rtRet(f, L("q")); check(f);
+}
+
+function emitListDir(b: Ref<StructuredBuffer>): void {
+    // __tx_nrt_str_less(x, y) → 1 when string x sorts before y by bytes.
+    let f = rtBegin(b, "__tx_nrt_str_less", "x y", "xp xn yp yn m i c d t", 1, "bootstrap/selfhost/nrt_sys.tx");
+    rtCall1(f, "t", "__tx_native_object_address_v1", L("x")); rtLoad(f, "xp", L("t"), 32, 8); rtLoad(f, "xn", L("t"), 40, 8);
+    rtCall1(f, "t", "__tx_native_object_address_v1", L("y")); rtLoad(f, "yp", L("t"), 32, 8); rtLoad(f, "yn", L("t"), 40, 8);
+    rtSet(f, "m", L("xn"));
+    rtIf(f, L("m"), "le", L("yn"), "go");
+    rtSet(f, "m", L("yn"));
+    rtLabel(f, "go");
+    rtSet(f, "i", I(0));
+    rtLabel(f, "loop");
+    rtIf(f, L("i"), "ge", L("m"), "prefix");
+    rtOp(f, "t", L("xp"), "add", L("i")); rtLoad(f, "c", L("t"), 0, 1);
+    rtOp(f, "t", L("yp"), "add", L("i")); rtLoad(f, "d", L("t"), 0, 1);
+    rtIf(f, L("c"), "lt", L("d"), "yes");
+    rtIf(f, L("c"), "gt", L("d"), "no");
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "loop");
+    rtLabel(f, "prefix"); rtIf(f, L("xn"), "lt", L("yn"), "yes");
+    rtLabel(f, "no"); rtRet(f, I(0));
+    rtLabel(f, "yes"); rtRet(f, I(1)); check(f);
+
+    // __tx_nrt_sort_strs(list): insertion sort of a generic list of strings.
+    f = rtBegin(b, "__tx_nrt_sort_strs", "l", "o base n i j kt kp p q t", 2, "bootstrap/selfhost/nrt_sys.tx");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("l"));
+    rtLoad(f, "base", L("o"), 32, 8); rtLoad(f, "n", L("o"), 40, 8);
+    rtSet(f, "i", I(1));
+    rtLabel(f, "outer");
+    rtIf(f, L("i"), "ge", L("n"), "done");
+    rtShift(f, "p", L("i"), "shl", 4); rtOp(f, "p", L("p"), "add", L("base"));
+    rtLoad(f, "kt", L("p"), 0, 8); rtLoad(f, "kp", L("p"), 8, 8);
+    rtOp(f, "j", L("i"), "sub", I(1));
+    rtLabel(f, "inner");
+    rtIf(f, L("j"), "lt", I(0), "place");
+    rtShift(f, "p", L("j"), "shl", 4); rtOp(f, "p", L("p"), "add", L("base"));
+    rtLoad(f, "q", L("p"), 8, 4);
+    rtOp(f, "t", L("kp"), "and", I(4294967295));
+    rtCall2(f, "t", "__tx_nrt_str_less", L("t"), L("q"));
+    rtIf(f, L("t"), "eq", I(0), "place");
+    rtLoad(f, "t", L("p"), 0, 8); rtStore(f, L("p"), 16, L("t"), 8);
+    rtLoad(f, "t", L("p"), 8, 8); rtStore(f, L("p"), 24, L("t"), 8);
+    rtOp(f, "j", L("j"), "sub", I(1)); rtJump(f, "inner");
+    rtLabel(f, "place");
+    rtOp(f, "p", L("j"), "add", I(1)); rtShift(f, "p", L("p"), "shl", 4); rtOp(f, "p", L("p"), "add", L("base"));
+    rtStore(f, L("p"), 0, L("kt"), 8); rtStore(f, L("p"), 8, L("kp"), 8);
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "outer");
+    rtLabel(f, "done"); rtRetVoid(f); check(f);
+
+    // listDir(path): List<string> sorted by bytes, without "." and "..";
+    // Error "{status}: {path}" (empty path → invalid argument).
+    f = rtBegin(b, "__tx_bi_list_dir", "win fn pc a nargs", "s t p n pat w h l nm nl c x cap buf m q st" + findDataLocals(), 8, "bootstrap/selfhost/nrt_sys.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", 6, "type");
+    if (tRawSyscall(nrtTarget())) {
+        // openat(AT_FDCWD, path, O_RDONLY|O_DIRECTORY|O_CLOEXEC) + getdents64 batches.
+        strSpan(f, "s", "p", "n");
+        rtSet(f, "st", I(1));
+        rtIf(f, L("n"), "eq", I(0), "error");
+        rtCall2(f, "x", "__tx_rt_nul_free", L("p"), L("n"));
+        rtIf(f, L("x"), "eq", I(0), "error");
+        rtSet(f, "st", I(3));
+        rtCall2(f, "w", "__tx_nrt_cpath", L("p"), L("n"));
+        rtIf(f, L("w"), "eq", I(0), "error");
+        const op: List<Ref<RtOp>> = listNew(); listPush(op, I(-100)); listPush(op, L("w")); listPush(op, I(589824)); listPush(op, I(0));
+        rtSyscall(f, "h", 257, op);
+        rtCall1(f, "", "__tx_native_mem_free", L("w"));
+        rtIf(f, L("h"), "lt", I(0), "error");
+        rtCall2(f, "buf", "__tx_native_mem_alloc", I(32768), I(8));
+        rtIf(f, L("buf"), "eq", I(0), "oom");
+        rtCall0(f, "l", "__tx_nrt_list_make");
+        rtLabel(f, "batch");
+        const gd: List<Ref<RtOp>> = listNew(); listPush(gd, L("h")); listPush(gd, L("buf")); listPush(gd, I(32768));
+        rtSyscall(f, "m", 217, gd);
+        rtIf(f, L("m"), "le", I(0), "closed");
+        rtSet(f, "c", I(0));
+        rtLabel(f, "entry");
+        rtIf(f, L("c"), "ge", L("m"), "batch");
+        rtOp(f, "nm", L("buf"), "add", L("c")); rtOp(f, "nm", L("nm"), "add", I(19));
+        rtSet(f, "nl", I(0));
+        rtLabel(f, "count");
+        rtOp(f, "t", L("nm"), "add", L("nl")); rtLoad(f, "x", L("t"), 0, 1);
+        rtIf(f, L("x"), "eq", I(0), "counted");
+        rtOp(f, "nl", L("nl"), "add", I(1)); rtJump(f, "count");
+        rtLabel(f, "counted");
+        rtLoad(f, "x", L("nm"), 0, 1);
+        rtIf(f, L("x"), "ne", I(46), "keep");
+        rtIf(f, L("nl"), "eq", I(1), "next");
+        rtLoad(f, "x", L("nm"), 1, 1);
+        rtIf(f, L("nl"), "ne", I(2), "keep");
+        rtIf(f, L("x"), "eq", I(46), "next");
+        rtLabel(f, "keep");
+        rtCall3(f, "q", "__tx_nrt_str_copy", L("nm"), L("nl"), I(1));
+        rtCall3(f, "", "__tx_nrt_list_add", L("l"), I(6), L("q"));
+        rtLabel(f, "next");
+        rtOp(f, "t", L("buf"), "add", L("c")); rtLoad(f, "t", L("t"), 16, 4); rtOp(f, "t", L("t"), "and", I(65535));
+        rtOp(f, "c", L("c"), "add", L("t")); rtJump(f, "entry");
+        rtLabel(f, "closed");
+        const cl: List<Ref<RtOp>> = listNew(); listPush(cl, L("h"));
+        rtSyscall(f, "", 3, cl);
+        rtCall1(f, "", "__tx_native_mem_free", L("buf"));
+        rtCall1(f, "", "__tx_nrt_sort_strs", L("l"));
+        rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(15), L("l")); rtRetVoid(f);
+        rtLabel(f, "error");
+        rtLoad(f, "t", L("s"), 8, 4);
+        rtCall4(f, "q", "__tx_store_file_err", L("st"), L("t"), L("fn"), L("pc"));
+        rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(5), L("q")); rtRetVoid(f);
+        rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRetVoid(f);
+    } else if (tMacos(nrtTarget())) {
+        // opendir／readdir／closedir（M2 设计 E6）：名字在 d_name（偏移 21），长度为 d_namlen（偏移 18，u16）；
+        // 打开失败为状态 3，读到中途出错按读完处理（同 Linux 的 getdents 路径）。
+        strSpan(f, "s", "p", "n");
+        rtSet(f, "st", I(1));
+        rtIf(f, L("n"), "eq", I(0), "error");
+        rtCall2(f, "x", "__tx_rt_nul_free", L("p"), L("n"));
+        rtIf(f, L("x"), "eq", I(0), "error");
+        rtSet(f, "st", I(3));
+        rtCall2(f, "w", "__tx_nrt_cpath", L("p"), L("n"));
+        rtIf(f, L("w"), "eq", I(0), "error");
+        uxMac(f, "h", "opendir", one(L("w")));
+        rtCall1(f, "", "__tx_native_mem_free", L("w"));
+        rtIf(f, L("h"), "le", I(0), "error");
+        rtCall0(f, "l", "__tx_nrt_list_make");
+        rtLabel(f, "entry");
+        uxMac(f, "nm", "readdir", one(L("h")));
+        rtIf(f, L("nm"), "le", I(0), "closed");
+        rtLoad(f, "nl", L("nm"), 18, 2);
+        rtOp(f, "nm", L("nm"), "add", I(21));
+        rtLoad(f, "x", L("nm"), 0, 1);
+        rtIf(f, L("x"), "ne", I(46), "keep");
+        rtIf(f, L("nl"), "eq", I(1), "entry");
+        rtLoad(f, "x", L("nm"), 1, 1);
+        rtIf(f, L("nl"), "ne", I(2), "keep");
+        rtIf(f, L("x"), "eq", I(46), "entry");
+        rtLabel(f, "keep");
+        rtCall3(f, "q", "__tx_nrt_str_copy", L("nm"), L("nl"), I(1));
+        rtCall3(f, "", "__tx_nrt_list_add", L("l"), I(6), L("q"));
+        rtJump(f, "entry");
+        rtLabel(f, "closed");
+        uxMac(f, "", "closedir", one(L("h")));
+        rtCall1(f, "", "__tx_nrt_sort_strs", L("l"));
+        rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(15), L("l")); rtRetVoid(f);
+        rtLabel(f, "error");
+        rtLoad(f, "t", L("s"), 8, 4);
+        rtCall4(f, "q", "__tx_store_file_err", L("st"), L("t"), L("fn"), L("pc"));
+        rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(5), L("q")); rtRetVoid(f);
+    } else {
+        strSpan(f, "s", "p", "n");
+        rtSet(f, "st", I(1));
+        rtIf(f, L("n"), "eq", I(0), "error");
+        rtCall2(f, "x", "__tx_rt_nul_free", L("p"), L("n"));
+        rtIf(f, L("x"), "eq", I(0), "error");
+        rtSet(f, "st", I(3));
+        // pattern = path + "\*"
+        rtOp(f, "t", L("n"), "add", I(2));
+        rtCall2(f, "pat", "__tx_native_mem_alloc", L("t"), I(1));
+        rtIf(f, L("pat"), "eq", I(0), "error");
+        rtCall3(f, "", memcpyName(), L("pat"), L("p"), L("n"));
+        rtOp(f, "t", L("pat"), "add", L("n")); rtStore(f, L("t"), 0, I(92), 1); rtStore(f, L("t"), 1, I(42), 1);
+        rtOp(f, "t", L("n"), "add", I(2));
+        rtCall2(f, "w", "__tx_file_wpath", L("pat"), L("t"));
+        rtCall1(f, "", "__tx_native_mem_free", L("pat"));
+        rtIf(f, L("w"), "eq", I(0), "error");
+        rtAddrOf(f, "t", "fd0");
+        rtCall2(f, "h", "FindFirstFileW", L("w"), L("t"));
+        rtCall1(f, "", "__tx_native_mem_free", L("w"));
+        rtIf(f, L("h"), "eq", I(-1), "error");
+        rtCall0(f, "l", "__tx_nrt_list_make");
+        rtLabel(f, "entry");
+        rtAddrOf(f, "nm", "fd0"); rtOp(f, "nm", L("nm"), "add", I(44));
+        rtSet(f, "nl", I(0));
+        rtLabel(f, "count");
+        rtIf(f, L("nl"), "ge", I(260), "counted");
+        rtOp(f, "t", L("nl"), "add", L("nl")); rtOp(f, "t", L("t"), "add", L("nm")); rtLoad(f, "c", L("t"), 0, 4);
+        rtOp(f, "c", L("c"), "and", I(65535));
+        rtIf(f, L("c"), "eq", I(0), "counted");
+        rtOp(f, "nl", L("nl"), "add", I(1)); rtJump(f, "count");
+        rtLabel(f, "counted");
+        rtLoad(f, "c", L("nm"), 0, 4); rtOp(f, "x", L("c"), "and", I(65535));
+        rtIf(f, L("x"), "ne", I(46), "keep");
+        rtIf(f, L("nl"), "eq", I(1), "next");
+        rtShift(f, "x", L("c"), "shr", 16);
+        rtIf(f, L("nl"), "ne", I(2), "keep");
+        rtIf(f, L("x"), "eq", I(46), "next");
+        rtLabel(f, "keep");
+        rtSet(f, "q", I(0));
+        rtIf(f, L("nl"), "eq", I(0), "add");
+        rtOp(f, "cap", L("nl"), "add", L("nl")); rtOp(f, "cap", L("cap"), "add", L("nl"));
+        rtCall2(f, "buf", "__tx_native_mem_alloc", L("cap"), I(1));
+        rtIf(f, L("buf"), "eq", I(0), "oom");
+        const xs: List<Ref<RtOp>> = listNew();
+        listPush(xs, I(65001)); listPush(xs, I(0)); listPush(xs, L("nm")); listPush(xs, L("nl"));
+        listPush(xs, L("buf")); listPush(xs, L("cap")); listPush(xs, I(0)); listPush(xs, I(0));
+        rtCallList(f, "m", "WideCharToMultiByte", xs);
+        rtOp(f, "m", L("m"), "and", I(4294967295));
+        rtCall3(f, "q", "__tx_nrt_str_copy", L("buf"), L("m"), I(1));
+        rtCall1(f, "", "__tx_native_mem_free", L("buf"));
+        rtJump(f, "push");
+        rtLabel(f, "add");
+        rtCall3(f, "q", "__tx_nrt_str_copy", L("nm"), I(0), I(1));
+        rtLabel(f, "push");
+        rtCall3(f, "", "__tx_nrt_list_add", L("l"), I(6), L("q"));
+        rtLabel(f, "next");
+        rtAddrOf(f, "t", "fd0");
+        rtCall2(f, "t", "FindNextFileW", L("h"), L("t"));
+        rtIf32(f, L("t"), "ne", I(0), "entry");
+        rtCall1(f, "", "FindClose", L("h"));
+        rtCall1(f, "", "__tx_nrt_sort_strs", L("l"));
+        rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(15), L("l")); rtRetVoid(f);
+        rtLabel(f, "error");
+        rtLoad(f, "t", L("s"), 8, 4);
+        rtCall4(f, "q", "__tx_store_file_err", L("st"), L("t"), L("fn"), L("pc"));
+        rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(5), L("q")); rtRetVoid(f);
+        rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRetVoid(f);
+    }
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "listDir 的实参不是 string");
+    rtRetVoid(f); check(f);
+}
+
+function emitMakeDir(b: Ref<StructuredBuffer>): void {
+    // makeDir(path): void | Error — one level; an existing directory is success.
+    const f = rtBegin(b, "__tx_bi_make_dir", "win fn pc a nargs", "s t p n w r st at" + statLocals(), 5, "bootstrap/selfhost/nrt_sys.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", 6, "type");
+    strSpan(f, "s", "p", "n");
+    rtSet(f, "st", I(1));
+    rtIf(f, L("n"), "eq", I(0), "error");
+    rtCall2(f, "r", "__tx_rt_nul_free", L("p"), L("n"));
+    rtIf(f, L("r"), "eq", I(0), "error");
+    const ut = nrtTarget();
+    if (tUnix(ut)) {
+        // mkdirat 与 fstatat 经 uxSys；errno 除 ENAMETOOLONG 外两个 Unix 目标数值相同。
+        rtCall2(f, "w", "__tx_nrt_cpath", L("p"), L("n"));
+        rtIf(f, L("w"), "eq", I(0), "oom");
+        const mk: List<Ref<RtOp>> = listNew(); listPush(mk, I(uxAtFdcwd(ut))); listPush(mk, L("w")); listPush(mk, I(511));
+        uxSys(f, ut, "r", 258, mk);
+        rtIf(f, L("r"), "eq", I(0), "okfree");
+        rtIf(f, L("r"), "ne", I(-17), "errno");
+        // EEXIST: success only when the existing entry is (or links to) a directory.
+        rtAddrOf(f, "at", "st0");
+        const sx: List<Ref<RtOp>> = listNew(); listPush(sx, I(uxAtFdcwd(ut))); listPush(sx, L("w")); listPush(sx, L("at")); listPush(sx, I(0));
+        uxSys(f, ut, "r", 262, sx);
+        rtIf(f, L("r"), "ne", I(0), "free");
+        uxStatMode(f, ut, "at", L("at")); rtOp(f, "at", L("at"), "and", I(61440));
+        rtIf(f, L("at"), "eq", I(16384), "okfree");
+        rtJump(f, "free");
+        rtLabel(f, "errno");
+        rtSet(f, "st", I(3)); rtIf(f, L("r"), "eq", I(-2), "free"); rtIf(f, L("r"), "eq", I(-20), "free");
+        rtSet(f, "st", I(4)); rtIf(f, L("r"), "eq", I(-13), "free"); rtIf(f, L("r"), "eq", I(-1), "free"); rtIf(f, L("r"), "eq", I(-30), "free");
+        rtSet(f, "st", I(1)); rtIf(f, L("r"), "eq", I(0 - uxErrno(ut, "ENAMETOOLONG")), "free");
+        rtSet(f, "st", I(5));
+    } else {
+        rtCall2(f, "w", "__tx_file_wpath", L("p"), L("n"));
+        rtIf(f, L("w"), "eq", I(0), "error");
+        rtCall2(f, "r", "CreateDirectoryW", L("w"), I(0));
+        rtIf32(f, L("r"), "ne", I(0), "okfree");
+        rtCall0(f, "r", "GetLastError");
+        rtOp(f, "r", L("r"), "and", I(4294967295));
+        rtIf(f, L("r"), "ne", I(183), "errno");
+        // ERROR_ALREADY_EXISTS: success only for a directory.
+        rtCall1(f, "at", "GetFileAttributesW", L("w"));
+        rtOp(f, "at", L("at"), "and", I(4294967295));
+        rtIf(f, L("at"), "eq", I(4294967295), "free");
+        rtOp(f, "at", L("at"), "and", I(16));
+        rtIf(f, L("at"), "ne", I(0), "okfree");
+        rtJump(f, "free");
+        rtLabel(f, "errno");
+        rtSet(f, "st", I(3)); rtIf(f, L("r"), "eq", I(2), "free"); rtIf(f, L("r"), "eq", I(3), "free");
+        rtSet(f, "st", I(4)); rtIf(f, L("r"), "eq", I(5), "free");
+        rtSet(f, "st", I(1)); rtIf(f, L("r"), "eq", I(123), "free"); rtIf(f, L("r"), "eq", I(161), "free"); rtIf(f, L("r"), "eq", I(206), "free");
+        rtSet(f, "st", I(5));
+    }
+    rtLabel(f, "free");
+    rtCall1(f, "", "__tx_native_mem_free", L("w"));
+    rtLabel(f, "error");
+    rtLoad(f, "t", L("s"), 8, 4);
+    rtCall4(f, "r", "__tx_store_file_err", L("st"), L("t"), L("fn"), L("pc"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(5), L("r")); rtRetVoid(f);
+    rtLabel(f, "okfree");
+    rtCall1(f, "", "__tx_native_mem_free", L("w"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(4), I(0)); rtRetVoid(f);
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "makeDir 的实参不是 string");
+    rtRetVoid(f); check(f);
+}
+
+function emitWriteExecutable(b: Ref<StructuredBuffer>): void {
+    // writeExecutable(path, bytes): writeFileBytes element rules, executable output.
+    const pre = "writeExecutable: 元素 ";
+    const preLabel = text(b, pre);
+    const f = rtBegin(b, "__tx_bi_write_executable", "win fn pc a nargs", "s t l o p n form elem buf i x v pp pn q", 5, "bootstrap/selfhost/nrt_sys.tx");
+    arity(b, f, 2);
+    argTag(f, 0, "s", "t", 6, "t0");
+    argTag(f, 1, "l", "t", -1, "");
+    rtIf(f, L("t"), "eq", I(17), "bytes");
+    rtIf(f, L("t"), "ne", I(15), "t1");
+    rtLoad(f, "o", L("l"), 8, 4); rtCall1(f, "o", "__tx_native_object_address_v1", L("o"));
+    rtLoad(f, "p", L("o"), 32, 8); rtLoad(f, "n", L("o"), 40, 8);
+    rtLoad(f, "elem", L("o"), 24, 4); rtLoad(f, "form", L("o"), 28, 4);
+    rtOp(f, "x", L("n"), "add", I(1));
+    rtCall2(f, "buf", "__tx_native_mem_alloc", L("x"), I(1));
+    rtIf(f, L("buf"), "eq", I(0), "oom");
+    rtSet(f, "i", I(0));
+    rtLabel(f, "loop");
+    rtIf(f, L("i"), "ge", L("n"), "write");
+    rtIf(f, L("form"), "ne", I(2), "generic");
+    rtIf(f, L("elem"), "ne", I(1), "notint");
+    rtShift(f, "x", L("i"), "shl", 3); rtOp(f, "x", L("x"), "add", L("p")); rtLoad(f, "v", L("x"), 0, 8);
+    rtJump(f, "range");
+    rtLabel(f, "generic");
+    rtShift(f, "x", L("i"), "shl", 4); rtOp(f, "x", L("x"), "add", L("p"));
+    rtLoad(f, "t", L("x"), 0, 1); rtIf(f, L("t"), "ne", I(1), "notint");
+    rtLoad(f, "v", L("x"), 8, 8);
+    rtLabel(f, "range");
+    rtIf(f, L("v"), "lt", I(0), "outside"); rtIf(f, L("v"), "gt", I(255), "outside");
+    rtOp(f, "x", L("buf"), "add", L("i")); rtStore(f, L("x"), 0, L("v"), 1);
+    rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "loop");
+    rtLabel(f, "write");
+    strSpan(f, "s", "pp", "pn");
+    rtCall4(f, "q", "__tx_native_file_write_exec", L("pp"), L("pn"), L("buf"), L("n"));
+    rtCall1(f, "", "__tx_native_mem_free", L("buf"));
+    rtIf32(f, L("q"), "ne", I(0), "failed");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(4), I(0)); rtRetVoid(f);
+    rtLabel(f, "failed");
+    rtLoad(f, "t", L("s"), 8, 4);
+    rtCall4(f, "q", "__tx_store_file_err", L("q"), L("t"), L("fn"), L("pc"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(5), L("q")); rtRetVoid(f);
+    // Bytes content (D3 v0.18): write its span directly, no element checks.
+    rtLabel(f, "bytes");
+    strSpan(f, "l", "p", "n");
+    strSpan(f, "s", "pp", "pn");
+    rtCall4(f, "q", "__tx_native_file_write_exec", L("pp"), L("pn"), L("p"), L("n"));
+    rtIf32(f, L("q"), "ne", I(0), "failed");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(4), I(0)); rtRetVoid(f);
+    rtLabel(f, "notint");
+    rtSet(f, "x", I(0)); rtSet(f, "v", I(-1)); rtJump(f, "element");
+    rtLabel(f, "outside");
+    rtSet(f, "x", I(1));
+    rtLabel(f, "element");
+    rtCall1(f, "", "__tx_native_mem_free", L("buf"));
+    rtCall4(f, "q", "__tx_nrt_elem_err", A(preLabel), I(len(pre)), L("x"), L("v"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(5), L("q")); rtRetVoid(f);
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "t0", 4010, "writeExecutable 第一实参（路径）不是 string");
+    trapAt(b, f, "t1", 4010, "writeExecutable 第二实参（内容）不是 List");
+    rtRetVoid(f); check(f);
+}
+
+export function emitNrtSys(b: Ref<StructuredBuffer>): void {
+    emitErrors(b);
+    emitFileFallbacks(b);
+    emitCPath(b);
+    emitClockAndEntries(b);
+    emitListDir(b);
+    emitMakeDir(b);
+    emitWriteExecutable(b);
+}

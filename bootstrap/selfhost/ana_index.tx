@@ -1,0 +1,596 @@
+// ana_index.tx —— 分析节（SEB1 ANA1）的读出（第 6 轮 6d-3a，LSP 与 MCP 实施设计 §四-2）：把每行的锚解析成名字的
+// 位置（行、字节列、字节长），按（位置，身份）去重并排序。LSP 与开发命令 dev-check --analysis 共用。
+//
+// 锚类见 semamirror 的 ANA_AT_*。精确行要求该处正好起一个同名的标识符记号——解糖时合成在关键字位上的标识符（for-in
+// 的 Map 形、解构的 listGet）因此滤掉；模板串插值里的标识符，解析器按插值段从 1:1 重新计位（TXB1 到 6e 之前不能改），
+// 这些行落不到同名记号上，也滤掉（落在注释、串里的同样不算）。其余锚类从锚出发扫词法记号、按名字找，找不到即丢弃该行。
+//
+// 声明的说明表（ANT1，6d-3b，§四-5）：身份键 → 说明文本，直接由原始行建（不经按记号的解析，prelude 等取不到文本的
+// 模块里的声明也有说明）。
+//
+// 类型位补面（§四-3，同 Zig 版 candidateTypeTokens）：类型标注在 TXB1 里没有位置。每个模块里，已有出现的 struct、enum
+// 身份的名字 → 该身份；未被任何出现占用的同名标识符记号补为该身份（guess）。TXB1 带名字位置之后删去。
+import { nextToken, Cur, Tok, Out, K_EOF, K_IDENT, K_COMMENT, K_IMPORT, K_CATCH, K_LPAREN, K_RPAREN, K_LBRACE, K_RBRACE, K_LBRACKET, K_RBRACKET, K_LT, K_GT, K_COMMA, K_SEMI, K_COLON, K_DOT } from "../lexer";
+import { dbgStr } from "./dbg_out";
+
+const AT_EXACT: int = 0;
+const AT_BIND: int = 1;
+const AT_PARAM: int = 2;
+const AT_CATCH: int = 3;
+const AT_PAT: int = 4;
+const AT_FIELD: int = 5;
+const AT_VARIANT: int = 6;
+const AT_IMPORT: int = 7;
+const AT_LITKEY: int = 8;
+const AT_ENUMPRE: int = 9;
+
+// 一个出现：位置为 1 起的行与字节列；身份为声明的锚（kh＝-1 为没有身份，只供着色），key 为比较用的串。
+export struct AnaOcc {
+    mod: int,
+    line: int,
+    col: int,
+    len: int,
+    tt: int,
+    decl: bool,
+    km: int,
+    kl: int,
+    kc: int,
+    kh: int,
+    key: string, // 比较用的身份串；空串为没有身份（只供着色）
+    name: string,
+    guess: bool, // 类型位补面
+}
+
+struct AnaToks {
+    done: bool,
+    kinds: List<int>,
+    texts: List<string>,
+    lines: List<int>,
+    cols: List<int>,
+}
+
+function lexMod(t: Ref<AnaToks>, src: string): void {
+    const out: Ref<Out> = new Out { lines: "", errors: "", failed: false, coded: true };
+    const c: Ref<Cur> = new Cur { pos: 0, line: 1, col: 1 };
+    while (true) {
+        const k: Tok = nextToken(src, c, out);
+        if (k.kind == K_EOF) { break; }
+        if (k.kind != K_COMMENT) {
+            listPush(t.kinds, k.kind);
+            listPush(t.texts, k.text);
+            listPush(t.lines, k.line);
+            listPush(t.cols, k.col);
+        }
+    }
+    t.done = true;
+}
+
+function kindAt(t: Ref<AnaToks>, i: int): int {
+    if (i < 0) { return K_EOF; }
+    return listGet(t.kinds, i) catch K_EOF;
+}
+
+function identAt(t: Ref<AnaToks>, i: int, name: string): bool {
+    return kindAt(t, i) == K_IDENT && (listGet(t.texts, i) catch "") == name;
+}
+
+// 第一个位置不早于（line, col）的记号。
+function tokFrom(t: Ref<AnaToks>, line: int, col: int): int {
+    let lo = 0;
+    let hi = listLen(t.kinds);
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        const ml = listGet(t.lines, mid) catch 0;
+        const mc = listGet(t.cols, mid) catch 0;
+        if (ml < line || (ml == line && mc < col)) { lo = mid + 1; } else { hi = mid; }
+    }
+    return lo;
+}
+
+// 正好起于（line, col）的记号，没有为 -1。
+function tokExact(t: Ref<AnaToks>, line: int, col: int): int {
+    const i = tokFrom(t, line, col);
+    if ((listGet(t.lines, i) catch 0) == line && (listGet(t.cols, i) catch 0) == col) { return i; }
+    return -1;
+}
+
+function isOpen(k: int): bool { return k == K_LPAREN || k == K_LBRACE || k == K_LBRACKET || k == K_LT; }
+
+function isClose(k: int): bool { return k == K_RPAREN || k == K_RBRACE || k == K_RBRACKET || k == K_GT; }
+
+// open 处的开括号里、深度 1 处开头或逗号之后的名字（colon 时还须后随 `:`，即字段声明）。
+function scanList(t: Ref<AnaToks>, open: int, name: string, colon: bool): int {
+    if (!isOpen(kindAt(t, open))) { return -1; }
+    let depth = 1;
+    let expect = true;
+    let j = open + 1;
+    const n = listLen(t.kinds);
+    while (j < n) {
+        const k = kindAt(t, j);
+        if (isOpen(k)) {
+            depth = depth + 1;
+        } else if (isClose(k)) {
+            depth = depth - 1;
+            if (depth == 0) { return -1; }
+        } else if (depth == 1 && (k == K_COMMA || k == K_SEMI)) {
+            expect = true;
+            j = j + 1;
+            continue;
+        } else if (depth == 1 && expect && k == K_IDENT) {
+            if ((listGet(t.texts, j) catch "") == name && (!colon || kindAt(t, j + 1) == K_COLON)) { return j; }
+        }
+        expect = false;
+        j = j + 1;
+    }
+    return -1;
+}
+
+// 从 i 起第一个 kind 记号（遇到 stop 或文末为 -1）。
+function firstKind(t: Ref<AnaToks>, i: int, kind: int, stop: int): int {
+    let j = i;
+    const n = listLen(t.kinds);
+    while (j < n) {
+        const k = kindAt(t, j);
+        if (k == kind) { return j; }
+        if (k == stop) { return -1; }
+        j = j + 1;
+    }
+    return -1;
+}
+
+// catch 的基起于 i：深度 0 处的第一个 catch，其后 `(` 里的名字。
+function scanCatch(t: Ref<AnaToks>, i: int, name: string): int {
+    let depth = 0;
+    let j = i;
+    const n = listLen(t.kinds);
+    while (j < n) {
+        const k = kindAt(t, j);
+        if (k == K_LPAREN || k == K_LBRACE || k == K_LBRACKET) {
+            depth = depth + 1;
+        } else if (k == K_RPAREN || k == K_RBRACE || k == K_RBRACKET) {
+            depth = depth - 1;
+            if (depth < 0) { return -1; }
+        } else if (depth == 0 && k == K_SEMI) {
+            return -1;
+        } else if (depth == 0 && k == K_CATCH) {
+            if (kindAt(t, j + 1) == K_LPAREN && identAt(t, j + 2, name)) { return j + 2; }
+            return -1;
+        }
+        j = j + 1;
+    }
+    return -1;
+}
+
+// 按锚类找名字的记号；没找到为 -1。
+function scanAnchor(t: Ref<AnaToks>, how: int, line: int, col: int, name: string): int {
+    if (how == AT_EXACT) {
+        const i = tokExact(t, line, col);
+        if (identAt(t, i, name)) { return i; }
+        return -1;
+    }
+    if (how == AT_BIND) {
+        const i = tokExact(t, line, col);
+        if (i < 0) { return -1; }
+        if (kindAt(t, i + 1) == K_LPAREN) { return scanList(t, i + 1, name, false); }
+        if (identAt(t, i + 1, name)) { return i + 1; }
+        return -1;
+    }
+    if (how == AT_PARAM) {
+        const i = tokExact(t, line, col);
+        if (i < 0) { return -1; }
+        return scanList(t, firstKind(t, i, K_LPAREN, K_LBRACE), name, false);
+    }
+    if (how == AT_CATCH) {
+        const i = tokExact(t, line, col);
+        if (i < 0) { return -1; }
+        return scanCatch(t, i, name);
+    }
+    if (how == AT_PAT) {
+        const i = tokExact(t, line, col);
+        if (i < 0) { return -1; }
+        return scanList(t, i + 1, name, false);
+    }
+    if (how == AT_FIELD || how == AT_VARIANT) {
+        const i = tokExact(t, line, col);
+        if (i < 0) { return -1; }
+        return scanList(t, firstKind(t, i, K_LBRACE, K_SEMI), name, how == AT_FIELD);
+    }
+    if (how == AT_IMPORT) {
+        const i = tokExact(t, line, col);
+        if (kindAt(t, i) != K_IMPORT) { return -1; }
+        return scanList(t, i + 1, name, false);
+    }
+    if (how == AT_LITKEY) {
+        const i = tokExact(t, line, col);
+        if (i < 2 || kindAt(t, i - 1) != K_COLON || !identAt(t, i - 2, name)) { return -1; }
+        return i - 2;
+    }
+    if (how == AT_ENUMPRE) {
+        const i = tokExact(t, line, col);
+        if (i < 2 || kindAt(t, i - 1) != K_DOT || !identAt(t, i - 2, name)) { return -1; }
+        return i - 2;
+    }
+    return -1;
+}
+
+export function anaKeyOf(km: int, kl: int, kc: int, kh: int, name: string): string {
+    if (kh < 0) { return ""; }
+    let k = toStr(km) + ":" + toStr(kl) + ":" + toStr(kc) + ":" + toStr(kh);
+    // 精确锚（函数、extern、struct、enum 的声明名）的位置本身唯一，不带名字——方法糖调用的名字是方法名。
+    if (kh != AT_EXACT) { k = k + ":" + name; }
+    return k;
+}
+
+// ints 与 names 为分析节的行（drvAnaInts、drvAnaNames），texts 为各模块的源码（按模块序；空串的模块不解析）。
+export function anaResolve(ints: List<int>, names: List<string>, texts: List<string>): List<Ref<AnaOcc>> {
+    const nmod = listLen(texts);
+    const toks: List<Ref<AnaToks>> = listNew();
+    let mi = 0;
+    while (mi < nmod) {
+        listPush(toks, new AnaToks { done: false, kinds: listNew(), texts: listNew(), lines: listNew(), cols: listNew() });
+        mi = mi + 1;
+    }
+    const out: List<Ref<AnaOcc>> = listNew();
+    const nrow = listLen(names);
+    let r = 0;
+    while (r < nrow) {
+        const b = r * 10;
+        const m = listGet(ints, b) catch -1;
+        const src = listGet(texts, m) catch "";
+        if (m >= 0 && m < nmod && len(src) > 0) {
+            const name = listGet(names, r) catch "";
+            const tk = listGet(toks, m) catch new AnaToks { done: false, kinds: listNew(), texts: listNew(), lines: listNew(), cols: listNew() };
+            if (!tk.done) { lexMod(tk, src); }
+            const j = scanAnchor(tk, listGet(ints, b + 3) catch -1, listGet(ints, b + 1) catch 0, listGet(ints, b + 2) catch 0, name);
+            if (j >= 0) {
+                const line = listGet(tk.lines, j) catch 0;
+                const col = listGet(tk.cols, j) catch 0;
+                const kh = (listGet(ints, b + 9) catch 0) - 1;
+                const km = listGet(ints, b + 6) catch 0;
+                const kl = listGet(ints, b + 7) catch 0;
+                const kc = listGet(ints, b + 8) catch 0;
+                listPush(out, new AnaOcc { mod: m, line: line, col: col, len: len(name), tt: listGet(ints, b + 4) catch 0, decl: ((listGet(ints, b + 5) catch 0) & 1) != 0, km: km, kl: kl, kc: kc, kh: kh, key: anaKeyOf(km, kl, kc, kh, name), name: name, guess: false });
+            }
+        }
+        r = r + 1;
+    }
+    const occs = dedupe(sortOccs(out));
+    // occs 按模块排序：逐模块取它那一段补类型位。
+    const base = listLen(occs);
+    let added = false;
+    let lo = 0;
+    while (lo < base) {
+        const m = (listGet(occs, lo) catch occNone()).mod;
+        let hi = lo;
+        while (hi < base && (listGet(occs, hi) catch occNone()).mod == m) { hi = hi + 1; }
+        const tk = listGet(toks, m) catch new AnaToks { done: false, kinds: listNew(), texts: listNew(), lines: listNew(), cols: listNew() };
+        if (tk.done && typeTokens(occs, lo, hi, m, tk)) { added = true; }
+        lo = hi;
+    }
+    if (added) { return sortOccs(occs); }
+    return occs;
+}
+
+// 索引只复用相同模块身份、相同文本且语义未失效的部分。
+export function anaDirtyModules(oldPaths: List<string>, paths: List<string>, oldTexts: List<string>, texts: List<string>, semantic: List<int>): List<int> {
+    let same = listLen(oldPaths) == listLen(paths) && listLen(oldTexts) == listLen(texts) && listLen(semantic) == listLen(paths);
+    let i = 0;
+    while (same && i < listLen(paths)) {
+        if ((listGet(oldPaths, i) catch "") != (listGet(paths, i) catch "")) { same = false; }
+        i = i + 1;
+    }
+    const out: List<int> = listNew(); i = 0;
+    while (i < listLen(paths)) {
+        let dirty = 1;
+        if (same && (listGet(semantic, i) catch 1) == 0 && (listGet(oldTexts, i) catch "") == (listGet(texts, i) catch "")) { dirty = 0; }
+        listPush(out, dirty); i = i + 1;
+    }
+    return out;
+}
+
+export function anaResolveCached(ints: List<int>, names: List<string>, texts: List<string>, old: List<Ref<AnaOcc>>, dirty: List<int>): List<Ref<AnaOcc>> {
+    const ii: List<int> = listNew(); const nn: List<string> = listNew(); let r = 0;
+    while (r < listLen(names)) {
+        if ((listGet(dirty, listGet(ints, r * 10) catch -1) catch 1) != 0) {
+            let k = 0;
+            while (k < 10) { listPush(ii, listGet(ints, r * 10 + k) catch 0); k = k + 1; }
+            listPush(nn, listGet(names, r) catch "");
+        }
+        r = r + 1;
+    }
+    const fresh = anaResolve(ii, nn, texts);
+    const out: List<Ref<AnaOcc>> = listNew(); let a = 0; let b = 0;
+    while (a < listLen(old) || b < listLen(fresh)) {
+        while (a < listLen(old) && (listGet(dirty, (listGet(old, a) catch occNone()).mod) catch 1) != 0) { a = a + 1; }
+        if (a < listLen(old) && (b >= listLen(fresh) || !occLess(listGet(fresh, b) catch occNone(), listGet(old, a) catch occNone()))) {
+            listPush(out, listGet(old, a) catch occNone()); a = a + 1;
+        } else if (b < listLen(fresh)) { listPush(out, listGet(fresh, b) catch occNone()); b = b + 1; }
+    }
+    return out;
+}
+
+// 类型位补面：occs[lo, hi) 是模块 m 的出现；补上的出现追加在 occs 末尾，返回是否补了。
+function typeTokens(occs: List<Ref<AnaOcc>>, lo: int, hi: int, m: int, t: Ref<AnaToks>): bool {
+    const tyNames: List<Ref<AnaOcc>> = listNew();
+    const used: List<bool> = listNew();
+    const n = listLen(t.kinds);
+    let i = 0;
+    while (i < n) {
+        listPush(used, false);
+        i = i + 1;
+    }
+    let k = lo;
+    while (k < hi) {
+        const x = listGet(occs, k) catch occNone();
+        const j = tokExact(t, x.line, x.col);
+        if (j >= 0) { listSet(used, j, true); }
+        if ((x.tt == 1 || x.tt == 2) && x.kh == AT_EXACT && !hasTyName(tyNames, x.name)) { listPush(tyNames, x); }
+        k = k + 1;
+    }
+    if (listLen(tyNames) == 0) { return false; }
+    let added = false;
+    i = 0;
+    while (i < n) {
+        if (kindAt(t, i) == K_IDENT && !(listGet(used, i) catch true)) {
+            const text = listGet(t.texts, i) catch "";
+            for (x in tyNames) {
+                if (x.name == text) {
+                    listPush(occs, new AnaOcc { mod: m, line: listGet(t.lines, i) catch 0, col: listGet(t.cols, i) catch 0, len: len(text), tt: x.tt, decl: false, km: x.km, kl: x.kl, kc: x.kc, kh: x.kh, key: x.key, name: text, guess: true });
+                    added = true;
+                    break;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return added;
+}
+
+function hasTyName(xs: List<Ref<AnaOcc>>, name: string): bool {
+    for (x in xs) {
+        if (x.name == name) { return true; }
+    }
+    return false;
+}
+
+function occNone(): Ref<AnaOcc> {
+    return new AnaOcc { mod: -1, line: 0, col: 0, len: 0, tt: 0, decl: false, km: 0, kl: 0, kc: 0, kh: -1, key: "", name: "", guess: false };
+}
+
+function strLess(a: string, b: string): bool {
+    const n = len(a);
+    const m = len(b);
+    let i = 0;
+    while (i < n && i < m) {
+        const x = byteAt(a, i) catch 0;
+        const y = byteAt(b, i) catch 0;
+        if (x != y) { return x < y; }
+        i = i + 1;
+    }
+    return n < m;
+}
+
+function occLess(a: Ref<AnaOcc>, b: Ref<AnaOcc>): bool {
+    if (a.mod != b.mod) { return a.mod < b.mod; }
+    if (a.line != b.line) { return a.line < b.line; }
+    if (a.col != b.col) { return a.col < b.col; }
+    return strLess(a.key, b.key);
+}
+
+// 自底向上的归并排序（稳定）。
+function sortOccs(xs: List<Ref<AnaOcc>>): List<Ref<AnaOcc>> {
+    const dummy = occNone();
+    let src = xs;
+    const n = listLen(xs);
+    let width = 1;
+    while (width < n) {
+        const dst: List<Ref<AnaOcc>> = listNew();
+        let lo = 0;
+        while (lo < n) {
+            let i = lo;
+            let mid = lo + width;
+            if (mid > n) { mid = n; }
+            let hi = lo + 2 * width;
+            if (hi > n) { hi = n; }
+            let j = mid;
+            while (i < mid || j < hi) {
+                const a = listGet(src, i) catch dummy;
+                const c = listGet(src, j) catch dummy;
+                if (j >= hi || (i < mid && !occLess(c, a))) {
+                    listPush(dst, a);
+                    i = i + 1;
+                } else {
+                    listPush(dst, c);
+                    j = j + 1;
+                }
+            }
+            lo = hi;
+        }
+        src = dst;
+        width = width * 2;
+    }
+    return src;
+}
+
+// 同一位置同一身份只留一个（泛型多实例的重复行）；其中有一行是声明即算声明。
+function dedupe(xs: List<Ref<AnaOcc>>): List<Ref<AnaOcc>> {
+    const out: List<Ref<AnaOcc>> = listNew();
+    for (o in xs) {
+        const k = listLen(out);
+        if (k > 0) {
+            const p = listGet(out, k - 1) catch o;
+            if (p.mod == o.mod && p.line == o.line && p.col == o.col && p.key == o.key) {
+                if (o.decl) { p.decl = true; }
+                continue;
+            }
+        }
+        listPush(out, o);
+    }
+    return out;
+}
+
+// 一条声明的说明：键同 anaKeyOf；同一键的几条文本不同（泛型体里没写类型的绑定、catch 与模式绑定随实例不同）时 varies，
+// text 取第一条。mod、how、name 供按模块列出声明（补全的 prelude 导出表）。
+export struct AnaDetail {
+    key: string,
+    mod: int,
+    how: int,
+    name: string,
+    text: string,
+    exported: bool,
+    varies: bool,
+}
+
+function detNone(): Ref<AnaDetail> {
+    return new AnaDetail { key: "", mod: -1, how: 0, name: "", text: "", exported: false, varies: false };
+}
+
+// dints、dstrs 为 ANT1 的行（drvAnaDetInts、drvAnaDetStrs：每行 5 个整数，名字与文本两个串）；按键排序、同键合并。
+export function anaDetails(dints: List<int>, dstrs: List<string>): List<Ref<AnaDetail>> {
+    const raw: List<Ref<AnaDetail>> = listNew();
+    const n = listLen(dstrs) / 2;
+    let r = 0;
+    while (r < n) {
+        const b = r * 5;
+        const m = listGet(dints, b) catch 0;
+        const how = listGet(dints, b + 3) catch 0;
+        const name = listGet(dstrs, 2 * r) catch "";
+        listPush(raw, new AnaDetail { key: anaKeyOf(m, listGet(dints, b + 1) catch 0, listGet(dints, b + 2) catch 0, how, name), mod: m, how: how, name: name, text: listGet(dstrs, 2 * r + 1) catch "", exported: ((listGet(dints, b + 4) catch 0) & 1) != 0, varies: false });
+        r = r + 1;
+    }
+    const out: List<Ref<AnaDetail>> = listNew();
+    for (d in sortDets(raw)) {
+        const k = listLen(out);
+        if (k > 0) {
+            const p = listGet(out, k - 1) catch d;
+            if (p.key == d.key) {
+                if (p.text != d.text) { p.varies = true; }
+                if (d.exported) { p.exported = true; }
+                continue;
+            }
+        }
+        listPush(out, d);
+    }
+    return out;
+}
+
+export function anaDetailsCached(dints: List<int>, dstrs: List<string>, old: List<Ref<AnaDetail>>, dirty: List<int>): List<Ref<AnaDetail>> {
+    const ii: List<int> = listNew(); const ss: List<string> = listNew(); let r = 0;
+    while (r < listLen(dstrs) / 2) {
+        if ((listGet(dirty, listGet(dints, r * 5) catch -1) catch 1) != 0) {
+            let k = 0;
+            while (k < 5) { listPush(ii, listGet(dints, r * 5 + k) catch 0); k = k + 1; }
+            listPush(ss, listGet(dstrs, r * 2) catch ""); listPush(ss, listGet(dstrs, r * 2 + 1) catch "");
+        }
+        r = r + 1;
+    }
+    const fresh = anaDetails(ii, ss);
+    const out: List<Ref<AnaDetail>> = listNew(); let a = 0; let b = 0;
+    while (a < listLen(old) || b < listLen(fresh)) {
+        while (a < listLen(old) && (listGet(dirty, (listGet(old, a) catch detNone()).mod) catch 1) != 0) { a = a + 1; }
+        if (a < listLen(old) && (b >= listLen(fresh) || !strLess((listGet(fresh, b) catch detNone()).key, (listGet(old, a) catch detNone()).key))) {
+            listPush(out, listGet(old, a) catch detNone()); a = a + 1;
+        } else if (b < listLen(fresh)) { listPush(out, listGet(fresh, b) catch detNone()); b = b + 1; }
+    }
+    return out;
+}
+
+// 按键二分查找；没有为 None。
+export function anaDetailOf(ds: List<Ref<AnaDetail>>, key: string): Ref<AnaDetail>? {
+    let lo = 0;
+    let hi = listLen(ds);
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        const d = listGet(ds, mid) catch detNone();
+        if (d.key == key) { return d; }
+        if (strLess(d.key, key)) { lo = mid + 1; } else { hi = mid; }
+    }
+    return None;
+}
+
+// 按键的稳定归并排序（同 sortOccs）。
+function sortDets(xs: List<Ref<AnaDetail>>): List<Ref<AnaDetail>> {
+    const dummy = detNone();
+    let src = xs;
+    const n = listLen(xs);
+    let width = 1;
+    while (width < n) {
+        const dst: List<Ref<AnaDetail>> = listNew();
+        let lo = 0;
+        while (lo < n) {
+            let i = lo;
+            let mid = lo + width;
+            if (mid > n) { mid = n; }
+            let hi = lo + 2 * width;
+            if (hi > n) { hi = n; }
+            let j = mid;
+            while (i < mid || j < hi) {
+                const a = listGet(src, i) catch dummy;
+                const c = listGet(src, j) catch dummy;
+                if (j >= hi || (i < mid && !strLess(c.key, a.key))) {
+                    listPush(dst, a);
+                    i = i + 1;
+                } else {
+                    listPush(dst, c);
+                    j = j + 1;
+                }
+            }
+            lo = hi;
+        }
+        src = dst;
+        width = width * 2;
+    }
+    return src;
+}
+
+// semanticTokens legend 的名字（同 Zig 版的 legend 次序）。
+export function anaTtName(tt: int): string {
+    if (tt == 0) { return "function"; }
+    if (tt == 1) { return "struct"; }
+    if (tt == 2) { return "enum"; }
+    if (tt == 3) { return "enumMember"; }
+    if (tt == 4) { return "variable"; }
+    if (tt == 5) { return "parameter"; }
+    if (tt == 6) { return "property"; }
+    return "?";
+}
+
+function howName(h: int): string {
+    if (h == AT_EXACT) { return "exact"; }
+    if (h == AT_BIND) { return "bind"; }
+    if (h == AT_PARAM) { return "param"; }
+    if (h == AT_CATCH) { return "catch"; }
+    if (h == AT_PAT) { return "pat"; }
+    if (h == AT_FIELD) { return "field"; }
+    if (h == AT_VARIANT) { return "variant"; }
+    return "?";
+}
+
+// dev-check --analysis 的输出（每个出现一行 JSON）：位置与键都写成“模块显示名:行:列”，键另带锚类与名字；声明行另带
+// 说明（detail；导出时 export，随泛型实例不同时 varies，detail 为第一条）。
+export function anaJsonLines(occs: List<Ref<AnaOcc>>, displays: List<string>, dets: List<Ref<AnaDetail>>): List<string> {
+    const out: List<string> = listNew();
+    for (o in occs) {
+        let key = "";
+        if (o.kh >= 0) {
+            key = (listGet(displays, o.km) catch "?") + ":" + toStr(o.kl) + ":" + toStr(o.kc) + ":" + howName(o.kh);
+            if (o.kh != AT_EXACT) { key = key + ":" + o.name; }
+        }
+        let decl = "false";
+        if (o.decl) { decl = "true"; }
+        let guess = "";
+        if (o.guess) { guess = ",\"guess\":true"; }
+        let det = "";
+        if (o.decl) {
+            const dv = anaDetailOf(dets, o.key);
+            if (dv != None) {
+                const d = dv catch detNone();
+                det = ",\"detail\":" + dbgStr(d.text);
+                if (d.exported) { det = det + ",\"export\":true"; }
+                if (d.varies) { det = det + ",\"varies\":true"; }
+            }
+        }
+        listPush(out, "{\"ana\":" + dbgStr((listGet(displays, o.mod) catch "?") + ":" + toStr(o.line) + ":" + toStr(o.col)) + ",\"name\":" + dbgStr(o.name) + ",\"tt\":\"" + anaTtName(o.tt) + "\",\"decl\":" + decl + ",\"key\":" + dbgStr(key) + guess + det + "}");
+    }
+    return out;
+}

@@ -1,0 +1,812 @@
+// 调试构建的产物侧薄桩（第 6 轮 6c，docs/design/v052-round6-debug-v0.1-20261018.md §三-5、§四-4）。
+// 检查点 callbi DBG_* 由发射器直调到这里的 __tx_dbg_<名>（参数同 __tx_callbi：win fn pc a），例程随 --debug
+// 构建进程序对象，内核不变。薄桩只做线程过滤、影子栈、新行事件、断点与步进判定、截止时间，外加私有的
+// 二进制控制协议与防错的内存读；名字、类型与值的渲染都在父进程里。
+//
+// 控制通道：父进程把一对管道的句柄（Windows）或文件描述符（Linux、macOS）以 TAIXU_DEBUG_CHANNEL=<读>,<写> 交给产物。
+// 两个 Unix 目标共用 POSIX 的读写、轮询与管道判定（uxSys 与按目标的常量，macOS 适配 M3 设计 G10）；环境：Linux 读
+// /proc/self/environ（静态产物没有 libc），macOS 用内核存下的启动环境 __tx_nrt_envp。
+// 没有这个环境变量时薄桩在第一个检查点记为“无通道”，此后每个检查点一条比较即返回，程序照常运行。
+//
+// 帧格式：u32 长度（不含本字段，小端）＋u8 操作码＋参数（u64 小端，紧排）。
+//   产物→父进程：HELLO 1（版本 2、主线程块、映像地址、函数数）、STOP 2（原因 1 断点／2 步进／3 暂停、函数、pc、
+//                 深度、窗口）、TIMEOUT 3（随后以 3 退出）、FRAMES 回执 4（总深度、存下的帧数、每帧基址/函数/pc）、
+//                 READ 回执 5（实读字节数、数据）。
+//   父进程→产物：ARM 10（函数、pc、值）、RUN 11（模式 0 continue/1 into/2 over/3 out、截止毫秒，0＝无）、
+//                 FRAMES 12、READ 13（地址、长度，≤1 MiB）、PAUSE 14（只在运行中发）。
+// 运行中（6c-5a）：每 8192 个新行事件非阻塞地看一眼控制通道，有帧就处理：ARM 立即生效，PAUSE 在当前新行事件处
+// 停下（原因 3），其余操作码按坏帧处理。停止态收到迟到的 PAUSE 时忽略。
+// 通道读到 EOF、出错或收到坏帧时，产物以 3 退出（父进程已不在）。
+import { StructuredBuffer, asBufferSection, asBufferAlign, asBufferLabel, asBufferByte, asBufferZero } from "./assemble";
+import { RtFn, RtOp, L, I, A, G } from "./rtfn_base";
+import { rtBegin, rtFailed, rtEnd, rtSet, rtSetGlobal, rtOp, rtLoad, rtStore, rtLabel, rtJump, rtIf, rtIf32, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtRet, rtRetVoid, rtSyscall, rtAddrOf, rtDivMod, rtShift } from "./rtfn";
+import { callWinImport, setWinImportTarget } from "./ffi_callbacks";
+import { TB_MASK } from "./thread_block_abi";
+import { DBG_ENTER, DBG_STMT, DBG_LEAVE, DBG_RESUME, dbgBiName } from "./builtin_names";
+import { tKernel32, tRawSyscall, tLinux, tUnix, tMacos } from "./target";
+import { uxSys, uxMac, uxClock, uxConst, uxStatMode } from "./unix_sys";
+
+const MODE_UNINIT: int = 0;
+const MODE_INERT: int = 1;
+const MODE_ACTIVE: int = 2;
+const STACK_MAX: int = 4096;
+const FRAME_BYTES: int = 48; // 基址、函数、pc、本帧上次的行、上次的 pc、刚进入
+const READ_MAX: int = 1048576;
+const CMD_MAX: int = 60;
+const OP_HELLO: int = 1;
+const OP_STOP: int = 2;
+const OP_TIMEOUT: int = 3;
+const OP_FRAMES_R: int = 4;
+const OP_READ_R: int = 5;
+const OP_ARM: int = 10;
+const OP_RUN: int = 11;
+const OP_FRAMES: int = 12;
+const OP_READ: int = 13;
+const OP_PAUSE: int = 14;
+const CHANNEL_VAR: string = "TAIXU_DEBUG_CHANNEL";
+
+let dbgFail: string = "";
+
+function check(f: Ref<RtFn>): void { rtEnd(f); if (len(rtFailed(f)) > 0 && len(dbgFail) == 0) { dbgFail = rtFailed(f); } }
+
+function xs(): List<Ref<RtOp>> { return listNew(); }
+function xs1(a: Ref<RtOp>): List<Ref<RtOp>> { const l = xs(); listPush(l, a); return l; }
+function xs2(a: Ref<RtOp>, b: Ref<RtOp>): List<Ref<RtOp>> { const l = xs1(a); listPush(l, b); return l; }
+function xs3(a: Ref<RtOp>, b: Ref<RtOp>, c: Ref<RtOp>): List<Ref<RtOp>> { const l = xs2(a, b); listPush(l, c); return l; }
+function xs5(a: Ref<RtOp>, b: Ref<RtOp>, c: Ref<RtOp>, d: Ref<RtOp>, e: Ref<RtOp>): List<Ref<RtOp>> {
+    const l = xs3(a, b, c); listPush(l, d); listPush(l, e); return l;
+}
+function xs6(a: Ref<RtOp>, b: Ref<RtOp>, c: Ref<RtOp>, d: Ref<RtOp>, e: Ref<RtOp>, g: Ref<RtOp>): List<Ref<RtOp>> {
+    const l = xs5(a, b, c, d, e); listPush(l, g); return l;
+}
+
+/// 薄桩全部例程与数据；返回空串表示成功，否则为生成错误（未知局部名等）。
+export function dbgEmitRoutines(b: Ref<StructuredBuffer>, t: int): string {
+    dbgFail = "";
+    setWinImportTarget(t);
+    emitData(b, t);
+    emitExit(b, t);
+    emitWrite(b, t);
+    emitRead(b, t);
+    emitNow(b, t);
+    emitSend(b);
+    emitArm(b);
+    emitPoll(b, t);
+    emitInit(b, t);
+    emitLoop(b, t);
+    emitCheckpoint(b);
+    emitEntry(b, DBG_ENTER);
+    emitEntry(b, DBG_STMT);
+    emitEntry(b, DBG_LEAVE);
+    emitEntry(b, DBG_RESUME);
+    return dbgFail;
+}
+
+// 只读常量（环境变量名、Linux 的 /proc/self/environ 路径）与单一 bss 块。
+function emitData(b: Ref<StructuredBuffer>, t: int): void {
+    asBufferSection(b, 1, 1);
+    if (tUnix(t)) {
+        if (tLinux(t)) {
+            asBufferLabel(b, "__tx_dbg_envpath", 1);
+            rawBytes(b, "/proc/self/environ");
+            asBufferByte(b, 0, 1);
+        }
+        asBufferLabel(b, "__tx_dbg_envkey", 1);
+        rawBytes(b, CHANNEL_VAR + "=");
+    } else {
+        asBufferAlign(b, 1, 1);
+        asBufferLabel(b, "__tx_dbg_envname", 1);
+        let i = 0;
+        while (i < len(CHANNEL_VAR)) { asBufferByte(b, byteAt(CHANNEL_VAR, i) catch 0, 1); asBufferByte(b, 0, 1); i = i + 1; }
+        asBufferByte(b, 0, 1);
+        asBufferByte(b, 0, 1);
+    }
+    asBufferSection(b, 3, 1);
+    asBufferAlign(b, 4, 1);
+    const names = "mode tb in out rpipe freq depth run stepd deadline count nf funcs armbase armed obuf pause";
+    const parts = strSplit(names, " ");
+    let k = 0;
+    while (k < listLen(parts)) {
+        asBufferLabel(b, "__tx_dbg_" + (listGet(parts, k) catch ""), 1);
+        asBufferZero(b, 8, 1);
+        k = k + 1;
+    }
+    asBufferLabel(b, "__tx_dbg_cbuf", 1);
+    asBufferZero(b, 64, 1);
+    asBufferLabel(b, "__tx_dbg_iob", 1);
+    asBufferZero(b, 4096, 1);
+    asBufferLabel(b, "__tx_dbg_stack", 1);
+    asBufferZero(b, STACK_MAX * FRAME_BYTES, 1);
+    asBufferSection(b, 0, 1);
+}
+
+function rawBytes(b: Ref<StructuredBuffer>, text: string): void {
+    let i = 0;
+    while (i < len(text)) { asBufferByte(b, byteAt(text, i) catch 0, 1); i = i + 1; }
+}
+
+// __tx_dbg_exit(code)：直接结束进程（父进程已不在、或截止时间到）。
+function emitExit(b: Ref<StructuredBuffer>, t: int): void {
+    const f = rtBegin(b, "__tx_dbg_exit", "code", "gp ef", 1, "bootstrap/selfhost/dbg_rt.tx");
+    if (tRawSyscall(t)) { rtSyscall(f, "", 231, xs1(L("code"))); }
+    else if (tMacos(t)) { uxMac(f, "", "_exit", xs1(L("code"))); }
+    else { callWinImport(f, "", "ExitProcess", xs1(L("code"))); }
+    rtRetVoid(f);
+    check(f);
+}
+
+// __tx_dbg_wr(buf, n)：写满 n 字节到控制通道；失败即退出。
+function emitWrite(b: Ref<StructuredBuffer>, t: int): void {
+    const f = rtBegin(b, "__tx_dbg_wr", "buf n", "r w wp gp ef", 5, "bootstrap/selfhost/dbg_rt.tx");
+    rtLabel(f, "top");
+    rtIf(f, L("n"), "le", I(0), "done");
+    if (tUnix(t)) {
+        uxSys(f, t, "r", 1, xs3(G("__tx_dbg_out"), L("buf"), L("n")));
+        rtIf(f, L("r"), "eq", I(-4), "top");
+        rtIf(f, L("r"), "le", I(0), "die");
+        rtSet(f, "w", L("r"));
+    } else {
+        rtSet(f, "w", I(0));
+        rtAddrOf(f, "wp", "w");
+        callWinImport(f, "r", "WriteFile", xs5(G("__tx_dbg_out"), L("buf"), L("n"), L("wp"), I(0)));
+        rtIf(f, L("r"), "eq", I(0), "die");
+        rtOp(f, "w", L("w"), "and", I(4294967295));
+        rtIf(f, L("w"), "eq", I(0), "die");
+    }
+    rtOp(f, "buf", L("buf"), "add", L("w"));
+    rtOp(f, "n", L("n"), "sub", L("w"));
+    rtJump(f, "top");
+    rtLabel(f, "die");
+    rtCall1(f, "", "__tx_dbg_exit", I(3));
+    rtLabel(f, "done");
+    rtRetVoid(f);
+    check(f);
+}
+
+// __tx_dbg_rd(buf, n)：从控制通道读满 n 字节；EOF 或失败即退出。
+function emitRead(b: Ref<StructuredBuffer>, t: int): void {
+    const f = rtBegin(b, "__tx_dbg_rd", "buf n", "r w wp gp ef", 5, "bootstrap/selfhost/dbg_rt.tx");
+    rtLabel(f, "top");
+    rtIf(f, L("n"), "le", I(0), "done");
+    if (tUnix(t)) {
+        uxSys(f, t, "r", 0, xs3(G("__tx_dbg_in"), L("buf"), L("n")));
+        rtIf(f, L("r"), "eq", I(-4), "top");
+        rtIf(f, L("r"), "le", I(0), "die");
+        rtSet(f, "w", L("r"));
+    } else {
+        rtSet(f, "w", I(0));
+        rtAddrOf(f, "wp", "w");
+        callWinImport(f, "r", "ReadFile", xs5(G("__tx_dbg_in"), L("buf"), L("n"), L("wp"), I(0)));
+        rtIf(f, L("r"), "eq", I(0), "die");
+        rtOp(f, "w", L("w"), "and", I(4294967295));
+        rtIf(f, L("w"), "eq", I(0), "die");
+    }
+    rtOp(f, "buf", L("buf"), "add", L("w"));
+    rtOp(f, "n", L("n"), "sub", L("w"));
+    rtJump(f, "top");
+    rtLabel(f, "die");
+    rtCall1(f, "", "__tx_dbg_exit", I(3));
+    rtLabel(f, "done");
+    rtRetVoid(f);
+    check(f);
+}
+
+// __tx_dbg_now()：单调钟。Windows 为 QueryPerformanceCounter 的计数，Linux、macOS 为纳秒。
+function emitNow(b: Ref<StructuredBuffer>, t: int): void {
+    const f = rtBegin(b, "__tx_dbg_now", "", "sec nsec tp r gp ef", 2, "bootstrap/selfhost/dbg_rt.tx");
+    if (tUnix(t)) {
+        rtAddrOf(f, "tp", "sec");
+        uxSys(f, t, "r", 228, xs2(I(uxClock(t, 1)), L("tp")));
+        rtOp(f, "r", L("sec"), "imul", I(1000000000));
+        rtOp(f, "r", L("r"), "add", L("nsec"));
+    } else {
+        rtSet(f, "sec", I(0));
+        rtAddrOf(f, "tp", "sec");
+        callWinImport(f, "", "QueryPerformanceCounter", xs1(L("tp")));
+        rtSet(f, "r", L("sec"));
+    }
+    rtRet(f, L("r"));
+    check(f);
+}
+
+// __tx_dbg_send(n)：输出缓冲 [obuf+4, obuf+4+n) 已是载荷；补长度后一次写出。
+function emitSend(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "__tx_dbg_send", "n", "ob tot", 2, "bootstrap/selfhost/dbg_rt.tx");
+    rtSet(f, "ob", G("__tx_dbg_obuf"));
+    rtStore(f, L("ob"), 0, L("n"), 4);
+    rtOp(f, "tot", L("n"), "add", I(4));
+    rtCall2(f, "", "__tx_dbg_wr", L("ob"), L("tot"));
+    rtRetVoid(f);
+    check(f);
+}
+
+// __tx_dbg_arm(fn, pc, val)：置位或清除一个断点字节。越界的请求忽略（父进程按自己的表下断点，越界即它的错，
+// 不该弄坏产物）。
+function emitArm(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "__tx_dbg_arm", "x y z", "rec q", 3, "bootstrap/selfhost/dbg_rt.tx");
+    rtIf(f, L("x"), "uge", G("__tx_dbg_nf"), "out");
+    rtOp(f, "rec", L("x"), "imul", I(64));
+    rtOp(f, "rec", L("rec"), "add", G("__tx_dbg_funcs"));
+    rtLoad(f, "q", L("rec"), 56, 8);
+    rtIf(f, L("y"), "uge", L("q"), "out");
+    rtOp(f, "q", L("x"), "imul", I(8));
+    rtOp(f, "q", L("q"), "add", G("__tx_dbg_armbase"));
+    rtLoad(f, "q", L("q"), 0, 8);
+    rtOp(f, "q", L("q"), "add", G("__tx_dbg_armed"));
+    rtOp(f, "q", L("q"), "add", L("y"));
+    rtStore(f, L("q"), 0, L("z"), 1);
+    rtLabel(f, "out");
+    rtRetVoid(f);
+    check(f);
+}
+
+// __tx_dbg_poll(_)：运行中非阻塞地查控制通道，有数据就逐帧处理（ARM 立即生效，PAUSE 记下待停）；其余操作码与
+// 坏帧以 3 退出。Windows PeekNamedPipe 看可读字节数；Unix poll（超时 0），对端关闭时读到 EOF 同样退出。
+function emitPoll(b: Ref<StructuredBuffer>, t: int): void {
+    const f = rtBegin(b, "__tx_dbg_poll", "unused", "av ap pf pp r cb n op x y z gp ef", 6, "bootstrap/selfhost/dbg_rt.tx");
+    rtLabel(f, "top");
+    if (tUnix(t)) {
+        rtOp(f, "pf", G("__tx_dbg_in"), "and", I(4294967295));
+        rtOp(f, "pf", L("pf"), "or", I(4294967296));
+        rtAddrOf(f, "pp", "pf");
+        uxSys(f, t, "r", 7, xs3(L("pp"), I(1), I(0)));
+        rtIf(f, L("r"), "le", I(0), "done");
+    } else {
+        rtSet(f, "av", I(0));
+        rtAddrOf(f, "ap", "av");
+        callWinImport(f, "r", "PeekNamedPipe", xs6(G("__tx_dbg_in"), I(0), I(0), I(0), L("ap"), I(0)));
+        rtIf32(f, L("r"), "eq", I(0), "bad");
+        rtOp(f, "av", L("av"), "and", I(4294967295));
+        rtIf(f, L("av"), "eq", I(0), "done");
+    }
+    rtSet(f, "cb", A("__tx_dbg_cbuf"));
+    rtCall2(f, "", "__tx_dbg_rd", L("cb"), I(4));
+    rtLoad(f, "n", L("cb"), 0, 4);
+    rtIf(f, L("n"), "eq", I(0), "bad");
+    rtIf(f, L("n"), "gt", I(CMD_MAX), "bad");
+    rtCall2(f, "", "__tx_dbg_rd", L("cb"), L("n"));
+    rtLoad(f, "op", L("cb"), 0, 1);
+    rtIf(f, L("op"), "eq", I(OP_PAUSE), "pause");
+    rtIf(f, L("op"), "ne", I(OP_ARM), "bad");
+    rtLoad(f, "x", L("cb"), 1, 8);
+    rtLoad(f, "y", L("cb"), 9, 8);
+    rtLoad(f, "z", L("cb"), 17, 8);
+    rtCall3(f, "", "__tx_dbg_arm", L("x"), L("y"), L("z"));
+    rtJump(f, "top");
+    rtLabel(f, "pause");
+    rtSetGlobal(f, "__tx_dbg_pause", I(1));
+    rtJump(f, "top");
+    rtLabel(f, "bad");
+    rtCall1(f, "", "__tx_dbg_exit", I(3));
+    rtLabel(f, "done");
+    rtRetVoid(f);
+    check(f);
+}
+
+// __tx_dbg_init(win)：第一个检查点。找控制通道；没有就记为无通道。有则分配缓冲与断点字节数组、发 HELLO、
+// 进入命令循环（装填态：父进程先下断点，再以 RUN 放行）。
+// Unix：fd 须是管道（fstat 的 st_mode 为 S_IFIFO），否则跳 inert。借用 IO 缓冲放 struct stat。
+function pipeCheck(f: Ref<RtFn>, t: int, fd: string): void {
+    uxSys(f, t, "t", 5, xs2(L(fd), A("__tx_dbg_iob")));
+    rtIf(f, L("t"), "lt", I(0), "inert");
+    uxStatMode(f, t, "t", A("__tx_dbg_iob"));
+    rtOp(f, "t", L("t"), "and", I(61440));
+    rtIf(f, L("t"), "ne", I(4096), "inert");
+}
+
+function emitInit(b: Ref<StructuredBuffer>, t: int): void {
+    const f = rtBegin(b, "__tx_dbg_init", "win", "n i c st ph a0 a1 fd kp kc img nf funcs k rec tot sz p q t ob gp ef", 5, "bootstrap/selfhost/dbg_rt.tx");
+    rtSetGlobal(f, "__tx_dbg_mode", I(MODE_INERT));
+    rtSet(f, "ph", I(0));
+    rtSet(f, "a0", I(0));
+    rtSet(f, "a1", I(0));
+    if (tLinux(t)) {
+        // 静态产物没有 libc、内核也不导出 envp：读 /proc/self/environ，逐字节匹配“名字=”并解析数值。
+        // st：-1 跳到本项末尾；0..klen-1 已匹配的字节数；klen 在值里。
+        const klen = len(CHANNEL_VAR) + 1;
+        rtSyscall(f, "fd", 2, xs3(A("__tx_dbg_envpath"), I(0), I(0)));
+        rtIf(f, L("fd"), "lt", I(0), "inert");
+        rtSet(f, "st", I(0));
+        rtLabel(f, "chunk");
+        rtSyscall(f, "n", 0, xs3(L("fd"), A("__tx_dbg_iob"), I(4096)));
+        rtIf(f, L("n"), "eq", I(-4), "chunk");
+        rtIf(f, L("n"), "le", I(0), "eof");
+        rtSet(f, "i", I(0));
+        rtLabel(f, "byte");
+        rtIf(f, L("i"), "ge", L("n"), "chunk");
+        rtOp(f, "p", A("__tx_dbg_iob"), "add", L("i"));
+        rtLoad(f, "c", L("p"), 0, 1);
+        rtOp(f, "i", L("i"), "add", I(1));
+        rtIf(f, L("st"), "eq", I(klen), "value");
+        rtIf(f, L("st"), "lt", I(0), "skip");
+        rtOp(f, "kp", A("__tx_dbg_envkey"), "add", L("st"));
+        rtLoad(f, "kc", L("kp"), 0, 1);
+        rtIf(f, L("c"), "ne", L("kc"), "miss");
+        rtOp(f, "st", L("st"), "add", I(1));
+        rtJump(f, "byte");
+        rtLabel(f, "miss");
+        rtSet(f, "st", I(-1));
+        rtIf(f, L("c"), "ne", I(0), "byte");
+        rtSet(f, "st", I(0));
+        rtJump(f, "byte");
+        rtLabel(f, "skip");
+        rtIf(f, L("c"), "ne", I(0), "byte");
+        rtSet(f, "st", I(0));
+        rtJump(f, "byte");
+        rtLabel(f, "value");
+        rtIf(f, L("c"), "eq", I(0), "found");
+        digitStep(f, "bad");
+        rtJump(f, "byte");
+        rtLabel(f, "bad");
+        rtSyscall(f, "", 3, xs1(L("fd")));
+        rtJump(f, "inert");
+        rtLabel(f, "eof");
+        // 值在文件末尾且没有结尾的 NUL 时也算找到。
+        rtSyscall(f, "", 3, xs1(L("fd")));
+        rtIf(f, L("st"), "eq", I(klen), "parsed");
+        rtJump(f, "inert");
+        rtLabel(f, "found");
+        rtSyscall(f, "", 3, xs1(L("fd")));
+    } else if (tMacos(t)) {
+        // 启动环境（内核在 main 存下的 envp）逐项比对“名字=”，命中后解析值。
+        const klen = len(CHANNEL_VAR) + 1;
+        rtSet(f, "kp", G("__tx_nrt_envp"));
+        rtIf(f, L("kp"), "eq", I(0), "inert");
+        rtLabel(f, "envitem");
+        rtLoad(f, "p", L("kp"), 0, 8);
+        rtIf(f, L("p"), "eq", I(0), "inert");
+        rtOp(f, "kp", L("kp"), "add", I(8));
+        rtSet(f, "i", I(0));
+        rtLabel(f, "envkey");
+        rtIf(f, L("i"), "ge", I(klen), "envval");
+        rtOp(f, "q", L("p"), "add", L("i")); rtLoad(f, "c", L("q"), 0, 1);
+        rtOp(f, "q", A("__tx_dbg_envkey"), "add", L("i")); rtLoad(f, "kc", L("q"), 0, 1);
+        rtIf(f, L("c"), "ne", L("kc"), "envitem");
+        rtOp(f, "i", L("i"), "add", I(1));
+        rtJump(f, "envkey");
+        rtLabel(f, "envval");
+        rtOp(f, "q", L("p"), "add", L("i")); rtLoad(f, "c", L("q"), 0, 1);
+        rtIf(f, L("c"), "eq", I(0), "parsed");
+        rtOp(f, "i", L("i"), "add", I(1));
+        digitStep(f, "inert");
+        rtJump(f, "envval");
+    } else {
+        callWinImport(f, "n", "GetEnvironmentVariableW", xs3(A("__tx_dbg_envname"), A("__tx_dbg_iob"), I(64)));
+        rtOp(f, "n", L("n"), "and", I(4294967295));
+        rtIf(f, L("n"), "eq", I(0), "inert");
+        rtIf(f, L("n"), "ge", I(64), "inert");
+        rtSet(f, "i", I(0));
+        rtLabel(f, "wch");
+        rtIf(f, L("i"), "ge", L("n"), "parsed");
+        rtOp(f, "p", L("i"), "add", L("i"));
+        rtOp(f, "p", L("p"), "add", A("__tx_dbg_iob"));
+        rtLoad(f, "c", L("p"), 1, 1);
+        rtIf(f, L("c"), "ne", I(0), "inert");
+        rtLoad(f, "c", L("p"), 0, 1);
+        rtOp(f, "i", L("i"), "add", I(1));
+        digitStep(f, "inert");
+        rtJump(f, "wch");
+    }
+    rtLabel(f, "parsed");
+    rtIf(f, L("ph"), "ne", I(1), "inert");
+    // 两端须是管道（变量可能是父进程的父进程留下的，编号在本进程里无效或另有所指），否则按无通道运行；
+    // 确认后改为不可继承：本产物再起的子进程（runProcess）接不到这条通道（6c-3 加固）。变量本身不清除，
+    // 程序看到的环境与正常构建相同（语义透明）。
+    if (tUnix(t)) {
+        pipeCheck(f, t, "a0");
+        pipeCheck(f, t, "a1");
+        uxSys(f, t, "", 72, xs3(L("a0"), I(uxConst(t, "F_SETFD")), I(1)));
+        uxSys(f, t, "", 72, xs3(L("a1"), I(uxConst(t, "F_SETFD")), I(1)));
+    } else {
+        callWinImport(f, "t", "GetFileType", xs1(L("a0")));
+        rtIf32(f, L("t"), "ne", I(3), "inert");
+        callWinImport(f, "t", "GetFileType", xs1(L("a1")));
+        rtIf32(f, L("t"), "ne", I(3), "inert");
+        callWinImport(f, "", "SetHandleInformation", xs3(L("a0"), I(1), I(0)));
+        callWinImport(f, "", "SetHandleInformation", xs3(L("a1"), I(1), I(0)));
+    }
+    rtSetGlobal(f, "__tx_dbg_in", L("a0"));
+    rtSetGlobal(f, "__tx_dbg_out", L("a1"));
+    rtOp(f, "t", L("win"), "and", I(TB_MASK));
+    rtSetGlobal(f, "__tx_dbg_tb", L("t"));
+    if (tKernel32(t)) {
+        rtSet(f, "t", I(0));
+        rtAddrOf(f, "p", "t");
+        callWinImport(f, "", "QueryPerformanceFrequency", xs1(L("p")));
+        rtSetGlobal(f, "__tx_dbg_freq", L("t"));
+    }
+    rtCall2(f, "ob", "__tx_native_mem_alloc", I(READ_MAX + 64), I(16));
+    rtIf(f, L("ob"), "eq", I(0), "inert");
+    rtSetGlobal(f, "__tx_dbg_obuf", L("ob"));
+    // 断点字节数组：每函数每 pc 一字节，前面是每函数的起点（u64）。
+    rtSet(f, "img", A("__tx_nrt_image"));
+    rtLoad(f, "nf", L("img"), 16, 8);
+    rtLoad(f, "funcs", L("img"), 48, 8);
+    rtSetGlobal(f, "__tx_dbg_nf", L("nf"));
+    rtSetGlobal(f, "__tx_dbg_funcs", L("funcs"));
+    rtSet(f, "tot", I(0));
+    rtSet(f, "k", I(0));
+    rtLabel(f, "sum");
+    rtIf(f, L("k"), "ge", L("nf"), "summed");
+    rtOp(f, "rec", L("k"), "imul", I(64));
+    rtOp(f, "rec", L("rec"), "add", L("funcs"));
+    rtLoad(f, "p", L("rec"), 56, 8);
+    rtOp(f, "tot", L("tot"), "add", L("p"));
+    rtOp(f, "k", L("k"), "add", I(1));
+    rtJump(f, "sum");
+    rtLabel(f, "summed");
+    rtOp(f, "sz", L("nf"), "imul", I(8));
+    rtOp(f, "sz", L("sz"), "add", L("tot"));
+    rtOp(f, "sz", L("sz"), "add", I(16));
+    rtCall2(f, "p", "__tx_native_mem_alloc", L("sz"), I(16));
+    rtIf(f, L("p"), "eq", I(0), "inert");
+    rtSet(f, "k", I(0));
+    rtLabel(f, "zero");
+    rtIf(f, L("k"), "ge", L("sz"), "zeroed");
+    rtOp(f, "q", L("p"), "add", L("k"));
+    rtStore(f, L("q"), 0, I(0), 1);
+    rtOp(f, "k", L("k"), "add", I(1));
+    rtJump(f, "zero");
+    rtLabel(f, "zeroed");
+    rtSetGlobal(f, "__tx_dbg_armbase", L("p"));
+    rtOp(f, "q", L("nf"), "imul", I(8));
+    rtOp(f, "q", L("q"), "add", L("p"));
+    rtSetGlobal(f, "__tx_dbg_armed", L("q"));
+    rtSet(f, "tot", I(0));
+    rtSet(f, "k", I(0));
+    rtLabel(f, "bases");
+    rtIf(f, L("k"), "ge", L("nf"), "based");
+    rtOp(f, "q", L("k"), "imul", I(8));
+    rtOp(f, "q", L("q"), "add", L("p"));
+    rtStore(f, L("q"), 0, L("tot"), 8);
+    rtOp(f, "rec", L("k"), "imul", I(64));
+    rtOp(f, "rec", L("rec"), "add", L("funcs"));
+    rtLoad(f, "q", L("rec"), 56, 8);
+    rtOp(f, "tot", L("tot"), "add", L("q"));
+    rtOp(f, "k", L("k"), "add", I(1));
+    rtJump(f, "bases");
+    rtLabel(f, "based");
+    rtSetGlobal(f, "__tx_dbg_mode", I(MODE_ACTIVE));
+    rtStore(f, L("ob"), 4, I(OP_HELLO), 1);
+    rtStore(f, L("ob"), 5, I(2), 8);
+    rtStore(f, L("ob"), 13, G("__tx_dbg_tb"), 8);
+    rtStore(f, L("ob"), 21, L("img"), 8);
+    rtStore(f, L("ob"), 29, L("nf"), 8);
+    rtCall1(f, "", "__tx_dbg_send", I(33));
+    rtCall1(f, "", "__tx_dbg_loop", I(0));
+    rtLabel(f, "inert");
+    rtRetVoid(f);
+    check(f);
+}
+
+// 通道值“<读>,<写>”的一位：c 为数字则累加到当前段，逗号换段（只许一个），其余字符跳到 bad。
+function digitStep(f: Ref<RtFn>, bad: string): void {
+    rtIf(f, L("c"), "ne", I(44), "dg0");
+    rtIf(f, L("ph"), "ne", I(0), bad);
+    rtSet(f, "ph", I(1));
+    rtJump(f, "dgdone");
+    rtLabel(f, "dg0");
+    rtIf(f, L("c"), "lt", I(48), bad);
+    rtIf(f, L("c"), "gt", I(57), bad);
+    rtOp(f, "c", L("c"), "sub", I(48));
+    rtIf(f, L("ph"), "ne", I(0), "dg1");
+    rtOp(f, "a0", L("a0"), "imul", I(10));
+    rtOp(f, "a0", L("a0"), "add", L("c"));
+    rtJump(f, "dgdone");
+    rtLabel(f, "dg1");
+    rtOp(f, "a1", L("a1"), "imul", I(10));
+    rtOp(f, "a1", L("a1"), "add", L("c"));
+    rtLabel(f, "dgdone");
+}
+
+// __tx_dbg_loop(_)：停止态的命令循环，收到 RUN 后返回。
+function emitLoop(b: Ref<StructuredBuffer>, t: int): void {
+    const f = rtBegin(b, "__tx_dbg_loop", "unused", "cb ob n op x y z q rec t d k e got r lb lp pp pr pw ca cn rm dp gp ef", 6, "bootstrap/selfhost/dbg_rt.tx");
+    rtLabel(f, "top");
+    rtSet(f, "cb", A("__tx_dbg_cbuf"));
+    rtSet(f, "ob", G("__tx_dbg_obuf"));
+    rtCall2(f, "", "__tx_dbg_rd", L("cb"), I(4));
+    rtLoad(f, "n", L("cb"), 0, 4);
+    rtIf(f, L("n"), "eq", I(0), "bad");
+    rtIf(f, L("n"), "gt", I(CMD_MAX), "bad");
+    rtCall2(f, "", "__tx_dbg_rd", L("cb"), L("n"));
+    rtLoad(f, "op", L("cb"), 0, 1);
+    rtLoad(f, "x", L("cb"), 1, 8);
+    rtLoad(f, "y", L("cb"), 9, 8);
+    rtLoad(f, "z", L("cb"), 17, 8);
+    rtIf(f, L("op"), "eq", I(OP_ARM), "arm");
+    rtIf(f, L("op"), "eq", I(OP_RUN), "run");
+    rtIf(f, L("op"), "eq", I(OP_FRAMES), "frames");
+    rtIf(f, L("op"), "eq", I(OP_READ), "read");
+    // 停止态收到迟到的 PAUSE（父进程发出时产物已因别的原因停下）：忽略。
+    rtIf(f, L("op"), "eq", I(OP_PAUSE), "top");
+    rtLabel(f, "bad");
+    rtCall1(f, "", "__tx_dbg_exit", I(3));
+    rtLabel(f, "arm");
+    rtCall3(f, "", "__tx_dbg_arm", L("x"), L("y"), L("z"));
+    rtJump(f, "top");
+    // RUN 模式 截止毫秒：步进的起始深度取当前影子栈深度。
+    rtLabel(f, "run");
+    rtSetGlobal(f, "__tx_dbg_pause", I(0));
+    rtSetGlobal(f, "__tx_dbg_run", L("x"));
+    rtSetGlobal(f, "__tx_dbg_stepd", G("__tx_dbg_depth"));
+    rtSetGlobal(f, "__tx_dbg_count", I(0));
+    rtSetGlobal(f, "__tx_dbg_deadline", I(0));
+    rtIf(f, L("y"), "eq", I(0), "ran");
+    if (tUnix(t)) {
+        rtOp(f, "t", L("y"), "imul", I(1000000));
+    } else {
+        rtOp(f, "t", L("y"), "imul", G("__tx_dbg_freq"));
+        rtDivMod(f, "t", "", L("t"), I(1000));
+    }
+    rtCall1(f, "q", "__tx_dbg_now", I(0));
+    rtOp(f, "t", L("t"), "add", L("q"));
+    rtSetGlobal(f, "__tx_dbg_deadline", L("t"));
+    rtLabel(f, "ran");
+    rtRetVoid(f);
+    // FRAMES：总深度、存下的帧数、每帧（基址, 函数, pc），帧 0 为最外层。
+    rtLabel(f, "frames");
+    rtSet(f, "d", G("__tx_dbg_depth"));
+    rtSet(f, "n", L("d"));
+    rtIf(f, L("n"), "le", I(STACK_MAX), "fcap");
+    rtSet(f, "n", I(STACK_MAX));
+    rtLabel(f, "fcap");
+    rtStore(f, L("ob"), 4, I(OP_FRAMES_R), 1);
+    rtStore(f, L("ob"), 5, L("d"), 8);
+    rtStore(f, L("ob"), 13, L("n"), 8);
+    rtSet(f, "k", I(0));
+    rtLabel(f, "floop");
+    rtIf(f, L("k"), "ge", L("n"), "fdone");
+    rtOp(f, "e", L("k"), "imul", I(FRAME_BYTES));
+    rtOp(f, "e", L("e"), "add", A("__tx_dbg_stack"));
+    rtOp(f, "q", L("k"), "imul", I(24));
+    rtOp(f, "q", L("q"), "add", L("ob"));
+    rtLoad(f, "t", L("e"), 0, 8);
+    rtStore(f, L("q"), 21, L("t"), 8);
+    rtLoad(f, "t", L("e"), 8, 8);
+    rtStore(f, L("q"), 29, L("t"), 8);
+    rtLoad(f, "t", L("e"), 16, 8);
+    rtStore(f, L("q"), 37, L("t"), 8);
+    rtOp(f, "k", L("k"), "add", I(1));
+    rtJump(f, "floop");
+    rtLabel(f, "fdone");
+    rtOp(f, "t", L("n"), "imul", I(24));
+    rtOp(f, "t", L("t"), "add", I(17));
+    rtCall1(f, "", "__tx_dbg_send", L("t"));
+    rtJump(f, "top");
+    // READ 地址 长度：防错地读本进程内存，地址无效时实读 0 字节而不是崩溃（读到第一个不可读的页为止）。
+    // Unix 逐页 write 进私有管道再 read 回来，不可读时 write 得 EFAULT（6c-6b：沙箱里没有 process_vm_readv；XNU 同样得 EFAULT）；
+    // 管道第一次 READ 时建（O_CLOEXEC、O_NONBLOCK），__tx_dbg_rpipe 低 32 位为读端、高 32 位为写端，−1 为建不起来。
+    rtLabel(f, "read");
+    rtIf(f, L("y"), "ule", I(READ_MAX), "rlen");
+    rtSet(f, "y", I(READ_MAX));
+    rtLabel(f, "rlen");
+    rtOp(f, "lb", L("ob"), "add", I(13));
+    rtSet(f, "got", I(0));
+    rtIf(f, L("y"), "eq", I(0), "rdone");
+    if (tUnix(t)) {
+        rtSet(f, "pp", G("__tx_dbg_rpipe"));
+        rtIf(f, L("pp"), "ne", I(0), "rhave");
+        if (tMacos(t)) {
+            rtCall0(f, "", "__tx_nrt_fork_lock");
+            uxMac(f, "r", "pipe", xs1(A("__tx_dbg_rpipe")));
+            rtIf(f, L("r"), "ne", I(0), "rpiped");
+            rtSet(f, "pp", G("__tx_dbg_rpipe"));
+            rtOp(f, "pr", L("pp"), "and", I(4294967295));
+            rtShift(f, "pw", L("pp"), "shr", 32);
+            uxSys(f, t, "", 72, xs3(L("pr"), I(uxConst(t, "F_SETFD")), I(1)));
+            uxSys(f, t, "", 72, xs3(L("pw"), I(uxConst(t, "F_SETFD")), I(1)));
+            uxSys(f, t, "", 72, xs3(L("pr"), I(uxConst(t, "F_SETFL")), I(uxConst(t, "O_NONBLOCK"))));
+            uxSys(f, t, "", 72, xs3(L("pw"), I(uxConst(t, "F_SETFL")), I(uxConst(t, "O_NONBLOCK"))));
+            rtLabel(f, "rpiped");
+            rtCall0(f, "", "__tx_nrt_fork_unlock");
+        } else {
+            rtSyscall(f, "r", 293, xs2(A("__tx_dbg_rpipe"), I(526336)));
+        }
+        rtIf(f, L("r"), "eq", I(0), "rmade");
+        rtSetGlobal(f, "__tx_dbg_rpipe", I(-1));
+        rtLabel(f, "rmade");
+        rtSet(f, "pp", G("__tx_dbg_rpipe"));
+        rtLabel(f, "rhave");
+        rtIf(f, L("pp"), "eq", I(-1), "rdone");
+        rtOp(f, "pr", L("pp"), "and", I(4294967295));
+        rtShift(f, "pw", L("pp"), "shr", 32);
+        rtLabel(f, "rpage");
+        rtIf(f, L("got"), "uge", L("y"), "rdone");
+        // 本次至多写到当前页末：一页要么整页可读、要么不可读。
+        rtOp(f, "ca", L("x"), "add", L("got"));
+        rtOp(f, "cn", L("ca"), "and", I(4095));
+        rtOp(f, "cn", I(4096), "sub", L("cn"));
+        rtOp(f, "rm", L("y"), "sub", L("got"));
+        rtIf(f, L("cn"), "ule", L("rm"), "rcn");
+        rtSet(f, "cn", L("rm"));
+        rtLabel(f, "rcn");
+        uxSys(f, t, "r", 1, xs3(L("pw"), L("ca"), L("cn")));
+        rtIf(f, L("r"), "le", I(0), "rdone");
+        rtOp(f, "dp", L("lb"), "add", L("got"));
+        uxSys(f, t, "q", 0, xs3(L("pr"), L("dp"), L("r")));
+        rtIf(f, L("q"), "eq", L("r"), "rback");
+        // 读回的不对（不应发生）：关掉管道、下次重建，本次到此为止。
+        uxSys(f, t, "", 3, xs1(L("pr")));
+        uxSys(f, t, "", 3, xs1(L("pw")));
+        rtSetGlobal(f, "__tx_dbg_rpipe", I(0));
+        rtJump(f, "rdone");
+        rtLabel(f, "rback");
+        rtOp(f, "got", L("got"), "add", L("r"));
+        rtIf(f, L("r"), "eq", L("cn"), "rpage");
+    } else {
+        rtAddrOf(f, "lp", "got");
+        callWinImport(f, "r", "ReadProcessMemory", xs5(I(-1), L("x"), L("lb"), L("y"), L("lp")));
+        rtIf(f, L("r"), "ne", I(0), "rok");
+        rtSet(f, "got", I(0));
+        rtLabel(f, "rok");
+    }
+    rtLabel(f, "rdone");
+    rtStore(f, L("ob"), 4, I(OP_READ_R), 1);
+    rtStore(f, L("ob"), 5, L("got"), 8);
+    rtOp(f, "t", L("got"), "add", I(9));
+    rtCall1(f, "", "__tx_dbg_send", L("t"));
+    rtJump(f, "top");
+    check(f);
+}
+
+// __tx_dbg_cp(win, fn, pc, kind)：检查点的全部逻辑（见 §四-4）。
+function emitCheckpoint(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "__tx_dbg_cp", "win fn pc kind", "m t d e bs f2 rec nl lines line ll lp en c q z rm sd ob", 4, "bootstrap/selfhost/dbg_rt.tx");
+    rtSet(f, "m", G("__tx_dbg_mode"));
+    rtIf(f, L("m"), "eq", I(MODE_ACTIVE), "active");
+    rtIf(f, L("m"), "ne", I(MODE_UNINIT), "out");
+    rtCall1(f, "", "__tx_dbg_init", L("win"));
+    rtSet(f, "m", G("__tx_dbg_mode"));
+    rtIf(f, L("m"), "ne", I(MODE_ACTIVE), "out");
+    rtLabel(f, "active");
+    // 只停主线程：当前线程块就是 win & TB_MASK。
+    rtOp(f, "t", L("win"), "and", I(TB_MASK));
+    rtIf(f, L("t"), "ne", G("__tx_dbg_tb"), "out");
+    rtSet(f, "d", G("__tx_dbg_depth"));
+    // 影子栈对账：弹掉基址大于 win 的帧；栈顶基址等于 win 则同帧（函数不同即替换）；否则压入。
+    rtLabel(f, "pop");
+    rtIf(f, L("d"), "eq", I(0), "push");
+    rtIf(f, L("d"), "gt", I(STACK_MAX), "deep");
+    rtOp(f, "e", L("d"), "sub", I(1));
+    rtOp(f, "e", L("e"), "imul", I(FRAME_BYTES));
+    rtOp(f, "e", L("e"), "add", A("__tx_dbg_stack"));
+    rtLoad(f, "bs", L("e"), 0, 8);
+    rtIf(f, L("bs"), "eq", L("win"), "same");
+    rtIf(f, L("bs"), "ult", L("win"), "push");
+    rtOp(f, "d", L("d"), "sub", I(1));
+    rtJump(f, "pop");
+    // 超出 STACK_MAX 的帧不存基址，只计深度（不在其中停）。
+    rtLabel(f, "deep");
+    rtIf(f, L("kind"), "eq", I(DBG_LEAVE), "deepleave");
+    rtIf(f, L("kind"), "ne", I(DBG_ENTER), "store");
+    rtOp(f, "d", L("d"), "add", I(1));
+    rtJump(f, "store");
+    rtLabel(f, "deepleave");
+    rtOp(f, "d", L("d"), "sub", I(1));
+    rtJump(f, "store");
+    rtLabel(f, "push");
+    rtIf(f, L("kind"), "eq", I(DBG_LEAVE), "store");
+    rtIf(f, L("d"), "lt", I(STACK_MAX), "pushok");
+    rtOp(f, "d", L("d"), "add", I(1));
+    rtJump(f, "store");
+    rtLabel(f, "pushok");
+    rtOp(f, "e", L("d"), "imul", I(FRAME_BYTES));
+    rtOp(f, "e", L("e"), "add", A("__tx_dbg_stack"));
+    rtStore(f, L("e"), 0, L("win"), 8);
+    rtStore(f, L("e"), 8, L("fn"), 8);
+    rtStore(f, L("e"), 24, I(-1), 8);
+    rtStore(f, L("e"), 32, I(-1), 8);
+    rtStore(f, L("e"), 40, I(1), 8);
+    rtOp(f, "d", L("d"), "add", I(1));
+    rtJump(f, "have");
+    rtLabel(f, "same");
+    rtLoad(f, "f2", L("e"), 8, 8);
+    rtIf(f, L("f2"), "eq", L("fn"), "samefn");
+    rtStore(f, L("e"), 8, L("fn"), 8);
+    rtStore(f, L("e"), 24, I(-1), 8);
+    rtStore(f, L("e"), 40, I(1), 8);
+    rtLabel(f, "samefn");
+    rtIf(f, L("kind"), "eq", I(DBG_ENTER), "reenter");
+    rtIf(f, L("kind"), "ne", I(DBG_RESUME), "have");
+    rtLabel(f, "reenter");
+    rtStore(f, L("e"), 40, I(1), 8);
+    rtLabel(f, "have");
+    rtStore(f, L("e"), 16, L("pc"), 8);
+    rtIf(f, L("kind"), "ne", I(DBG_LEAVE), "notleave");
+    rtOp(f, "d", L("d"), "sub", I(1));
+    rtJump(f, "store");
+    rtLabel(f, "notleave");
+    rtSetGlobal(f, "__tx_dbg_depth", L("d"));
+    rtIf(f, L("kind"), "ne", I(DBG_STMT), "out");
+    // 新行事件：本帧刚进入或恢复、行号变了、或 pc 不大于上次（回跳）。
+    rtOp(f, "rec", L("fn"), "imul", I(64));
+    rtOp(f, "rec", L("rec"), "add", G("__tx_dbg_funcs"));
+    rtLoad(f, "nl", L("rec"), 24, 8);
+    rtSet(f, "line", I(0));
+    rtIf(f, L("pc"), "uge", L("nl"), "lined");
+    rtLoad(f, "lines", L("rec"), 32, 8);
+    rtOp(f, "q", L("pc"), "imul", I(8));
+    rtOp(f, "q", L("q"), "add", L("lines"));
+    rtLoad(f, "line", L("q"), 0, 4);
+    rtLabel(f, "lined");
+    rtLoad(f, "ll", L("e"), 24, 8);
+    rtLoad(f, "lp", L("e"), 32, 8);
+    rtLoad(f, "en", L("e"), 40, 8);
+    rtStore(f, L("e"), 24, L("line"), 8);
+    rtStore(f, L("e"), 32, L("pc"), 8);
+    rtStore(f, L("e"), 40, I(0), 8);
+    rtIf(f, L("en"), "ne", I(0), "newline");
+    rtIf(f, L("line"), "ne", L("ll"), "newline");
+    rtIf(f, L("pc"), "ule", L("lp"), "newline");
+    rtJump(f, "out");
+    rtLabel(f, "newline");
+    // 每 1024 个新行事件：continue 带截止时读一次单调钟；每 8192 个再看一眼控制通道（运行中的 ARM 与 PAUSE，
+    // 6c-5a；一次查询约 5 µs，按 8192 摊薄）。
+    rtOp(f, "c", G("__tx_dbg_count"), "add", I(1));
+    rtSetGlobal(f, "__tx_dbg_count", L("c"));
+    rtOp(f, "q", L("c"), "and", I(1023));
+    rtIf(f, L("q"), "ne", I(0), "decide");
+    rtIf(f, G("__tx_dbg_deadline"), "eq", I(0), "clocked");
+    rtCall1(f, "q", "__tx_dbg_now", I(0));
+    rtIf(f, L("q"), "lt", G("__tx_dbg_deadline"), "clocked");
+    rtSet(f, "ob", G("__tx_dbg_obuf"));
+    rtStore(f, L("ob"), 4, I(OP_TIMEOUT), 1);
+    rtCall1(f, "", "__tx_dbg_send", I(1));
+    rtCall1(f, "", "__tx_dbg_exit", I(3));
+    rtLabel(f, "clocked");
+    rtOp(f, "q", L("c"), "and", I(8191));
+    rtIf(f, L("q"), "ne", I(0), "decide");
+    rtCall1(f, "", "__tx_dbg_poll", I(0));
+    rtIf(f, G("__tx_dbg_pause"), "eq", I(0), "decide");
+    rtSetGlobal(f, "__tx_dbg_pause", I(0));
+    rtSet(f, "c", I(3));
+    rtJump(f, "stop");
+    rtLabel(f, "decide");
+    rtOp(f, "q", L("fn"), "imul", I(8));
+    rtOp(f, "q", L("q"), "add", G("__tx_dbg_armbase"));
+    rtLoad(f, "q", L("q"), 0, 8);
+    rtOp(f, "q", L("q"), "add", G("__tx_dbg_armed"));
+    rtOp(f, "q", L("q"), "add", L("pc"));
+    rtLoad(f, "z", L("q"), 0, 1);
+    rtSet(f, "c", I(1));
+    rtIf(f, L("z"), "ne", I(0), "stop");
+    rtSet(f, "c", I(2));
+    rtSet(f, "rm", G("__tx_dbg_run"));
+    rtSet(f, "sd", G("__tx_dbg_stepd"));
+    rtIf(f, L("rm"), "eq", I(1), "stop");
+    rtIf(f, L("rm"), "ne", I(2), "notover");
+    rtIf(f, L("d"), "le", L("sd"), "stop");
+    rtJump(f, "out");
+    rtLabel(f, "notover");
+    rtIf(f, L("rm"), "ne", I(3), "out");
+    rtIf(f, L("d"), "lt", L("sd"), "stop");
+    rtJump(f, "out");
+    rtLabel(f, "stop");
+    rtSet(f, "ob", G("__tx_dbg_obuf"));
+    rtStore(f, L("ob"), 4, I(OP_STOP), 1);
+    rtStore(f, L("ob"), 5, L("c"), 8);
+    rtStore(f, L("ob"), 13, L("fn"), 8);
+    rtStore(f, L("ob"), 21, L("pc"), 8);
+    rtStore(f, L("ob"), 29, L("d"), 8);
+    rtStore(f, L("ob"), 37, L("win"), 8);
+    rtCall1(f, "", "__tx_dbg_send", I(41));
+    rtCall1(f, "", "__tx_dbg_loop", I(0));
+    rtJump(f, "out");
+    rtLabel(f, "store");
+    rtSetGlobal(f, "__tx_dbg_depth", L("d"));
+    rtLabel(f, "out");
+    rtRetVoid(f);
+    check(f);
+}
+
+// 入口 __tx_dbg_<名>(win, fn, pc, a)：无通道时一次读、一次比较即返回。
+function emitEntry(b: Ref<StructuredBuffer>, id: int): void {
+    const f = rtBegin(b, "__tx_dbg_" + dbgBiName(id), "win fn pc a", "m", 4, "bootstrap/selfhost/dbg_rt.tx");
+    rtSet(f, "m", G("__tx_dbg_mode"));
+    rtIf(f, L("m"), "eq", I(MODE_INERT), "out");
+    rtCall4(f, "", "__tx_dbg_cp", L("win"), L("fn"), L("pc"), I(id));
+    rtLabel(f, "out");
+    rtRetVoid(f);
+    check(f);
+}

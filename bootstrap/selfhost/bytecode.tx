@@ -1,0 +1,1925 @@
+import { ProgramContext, programStringBytes, programStringsEqual } from "./program_context";
+import { RT_BI_BASE, RT_BI_COUNT } from "./builtin_names";
+import { isFwOp } from "./fw_ops";
+// bytecode.tx —— .txc v4 序列化/反序列化的 .tx 承接（V0.50-S5-① 批 B；BOOT-47；
+// D102 §一——src/vm/bytecode/bytecode.zig 编译侧半边的同构移植）。
+//
+// 职责（D102 冻结表：序列化/反序列化）：
+//   ① serializeDump：PROGDUMP v2 文本协议 → Program 内存结构 → .txc v6 字节
+//      （List<int>；字符串驻留去重＋全索引重映射——bytecode.zig serialize 逐字节）；
+//   ② decodeToDump：.txc 字节（v6；也收 Zig 链的 v4 与含 FFI 的 v5，指令字读入即展宽成 v6）
+//      → expectRoom/装载期校验＋verifyProgram → PROGDUMP v2 文本；
+//   ③ roundtripCheck：v6 输入 decode→encode 逐字节恒等锚。
+//
+// TXC v6（容量与编码上限评估 docs/design/v052-capacity-limits-review-v0.1-20261016.md §八）：
+// 指令字 64 位——iABC＝op16|A16<<16|B16<<32|C16<<48，iABx＝op16|A16<<16|Bx32<<32，sBx＝Bx−2^31；
+// GETFLD/SETFLD 的 C：第 15 位为标志、0..14 位为字段号；callbi 编号：内建 0..4095、外部函数 4096..65535。
+// 容器其余部分与 v4 相同（计数与索引均为 LEB128），FFI 尾节在 v6 中按节标识可选。
+//
+// PROGDUMP v2 协议（行文本；字节内容 hex 编码——.tx 无高字节串构造通道；指令字一律 v6）：
+//   PROGDUMP v2 / entry <n>
+//   tys <n>            / t <kind> <a> <b>
+//   decls <n>          / d <module> <name> struct <n> + f <name> <ty>×n
+//                      / d <module> <name> enum <nv> + v <name> <nf> + f×nf
+//   funcs <n>          / fn <name> <module> <reg> <np> <ncode> <nc> <nl> <npty> <ret>
+//                      + i <instr>×ncode + c <tag>…×nc + l <line> <col>×nl + p <ty>×npty
+//   modules <n>        / m <path> <state_ty> <init_fn>
+//   tests <n>          / tt <name> <func>
+//   externs <n>        / e <nameHex> <nparams> <tag…> <ret>
+//   sigs <n>           / s <ret> <np> <p…>
+//   strtab <n>         / h <hex>×n（空内容＝h 单 token 行）
+//
+// 确定性纪律：发射序即字节面（bytecode.zig §6 头注）——本件不自加任何序。
+// 自包含（零 import）。行数超 .tx 软上限＝序列化/反序列化双侧同件的既定范围
+//（D102 §一"内部按行数预算拆分可自主进行"——双侧拆分会撞跨模块 struct 禁令，
+// 单件豁免理由在此登记）。
+
+// ============================================================================
+// §0 常量（bytecode.zig §1 对齐）
+// ============================================================================
+
+// 原生链一律写版本 6（64 位指令字）；冻结的 Zig 加载器只认 4，遇 6 即拒绝。
+const FORMAT_VERSION: int = 6;
+// 解码仍接受 Zig 链的版本 4，以及 D3 v0.23 含 TXFFI 尾节的版本 5（v4 指令字；版本 5 必有 FFI 尾节）。
+const FORMAT_VERSION_V4: int = 4;
+const FORMAT_VERSION_FFI: int = 5;
+const INVALID_ENTRY: int = 0xFFFFFFFF;
+const EXTERN_ID_BASE: int = 4096;
+const EXTERN_ID_BASE_V4: int = 64;
+const SBX_BIAS: int = 2147483648;
+const MAX_BUILTIN_ID: int = 81; // set_env 81（D3 v0.42）、bytes_copy..bytes_set_num 77..80（D3 v0.37）、host_arch 76、bytes_as_list/list_as_bytes 74/75、紧凑列表 list_get/list_set/list_len 71..73、f32_str 70（D3 v0.19 结构化错误 48..52、D3 v0.21 工具链系统内建 53..59、D3 v0.23 ffi_last_error 60、线程第 2 步 thread_spawn/thread_join 61/62、第 4c 步 shared_new..atomic_cas 63..69、O4 第二步 toStr(f32) 70 尾加；Zig seed 冻结于 36；须 < EXTERN_ID_BASE；64 起只出现在 v6 产物里）
+
+// TyKind 声明域（1..18 连续；18＝Bytes，D3 v0.18，仅太虚侧）。
+function tyKindValid(k: int): bool {
+    return k >= 1 && k <= 22; // 19＝Gen<T>（D3 v0.22）、20＝Thread<T>（线程第 2 步）、21＝Shared<T>、22＝Atomic<int>（第 4c 步），仅原生链路
+}
+
+// Op 声明域：1..47 基础区＋200..210 Tier1（valid_op_mask 同构）；48..51 为生成器操作码
+// （D3 v0.22 gen_new/yield/gen_next/gen_close，仅原生链路，Zig VM 不认）；52 为定宽数值转换 cvt
+// （O4 第一步，R[A] = cvt(R[B])，C＝种类 1..26——25/26 为 D3 v0.23 的 floatToBits/floatFromBits，仅原生链路）；
+// 256 起为定宽数值运算族（O4 第二步，R[A] = op(R[B], R[C])，编码见 fw_ops.tx，仅原生链路）。
+function opValid(op: int): bool {
+    if (op >= 1 && op <= 52) { return true; }
+    if (op >= 200 && op <= 210) { return true; }
+    return isFwOp(op);
+}
+
+// 指令字段抽取（v6：iABC＝op[0..16)+A[16..32)+B[32..48)+C[48..64)；Bx＝[32..64)；sBx＝Bx−2^31）。
+// C 用到第 15 位时整字为负，一律逻辑右移。
+function insOp(ins: int): int { return ins & 0xFFFF; }
+function insA(ins: int): int { return (ins >>> 16) & 0xFFFF; }
+function insB(ins: int): int { return (ins >>> 32) & 0xFFFF; }
+function insC(ins: int): int { return (ins >>> 48) & 0xFFFF; }
+function insBx(ins: int): int { return (ins >>> 32) & 0xFFFFFFFF; }
+function insSbx(ins: int): int { return insBx(ins) - SBX_BIAS; }
+
+// v4 指令字（op8|A8|B8|C8；Bx16；sBx＝Bx−32768）展宽为 v6：字段选择子标志 0x80→0x8000，
+// 外部函数编号 64 起→4096 起，sBx 换偏置；用 Bx 的操作码 1、25..29、35、39，用 sBx 的 15..17。
+function opUsesBx(op: int): bool { return op == 1 || (op >= 25 && op <= 29) || op == 35 || op == 39; }
+function widenV4(w: int): int {
+    const op = w & 0xFF;
+    const a = (w >>> 8) & 0xFF;
+    const bx = (w >>> 16) & 0xFFFF;
+    if (opUsesBx(op)) { return op | (a << 16) | (bx << 32); }
+    if (op >= 15 && op <= 17) { return op | (a << 16) | ((bx - 32768 + SBX_BIAS) << 32); }
+    let b = (w >>> 16) & 0xFF;
+    let c = (w >>> 24) & 0xFF;
+    if (op == 20 || op == 21 || op == 203 || op == 210) { c = (c & 0x7F) | ((c & 0x80) << 8); }
+    if (op == 31 && b >= EXTERN_ID_BASE_V4) { b = b - EXTERN_ID_BASE_V4 + EXTERN_ID_BASE; }
+    return op | (a << 16) | (b << 32) | (c << 48);
+}
+
+// ============================================================================
+// §1 文本/字节工具
+// ============================================================================
+
+function hexDigit(v: int): string {
+    if (v < 10) { return toStr(v); }
+    const table = "abcdef";
+    return strSub(table, v - 10, 1);
+}
+
+function hexVal(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    return -1;
+}
+
+function hexEncodeStr(s: string): string {
+    let out = "";
+    let i = 0;
+    const n = len(s);
+    while (i < n) {
+        const b = byteAt(s, i) catch 0;
+        out = out + hexDigit((b >>> 4) & 0xF) + hexDigit(b & 0xF);
+        i = i + 1;
+    }
+    return out;
+}
+
+function hexEncodeByteList(bytes: List<int>, from: int, to: int): string {
+    let out = "";
+    let i = from;
+    while (i < to) {
+        const b = listGet(bytes, i) catch 0;
+        out = out + hexDigit((b >>> 4) & 0xF) + hexDigit(b & 0xF);
+        i = i + 1;
+    }
+    return out;
+}
+
+function hexDecodeTo(s: string, out: List<int>): int {
+    // 解码 hex 串逐字节 append 进 out；非法 hex 返回 -1，否则写入字节数。
+    const n = len(s);
+    if (n % 2 != 0) { return -1; }
+    let i = 0;
+    let count = 0;
+    while (i < n) {
+        const hi = hexVal(byteAt(s, i) catch 0);
+        const lo = hexVal(byteAt(s, i + 1) catch 0);
+        if (hi < 0 || lo < 0) { return -1; }
+        listPush(out, (hi << 4) | lo);
+        i = i + 2;
+        count = count + 1;
+    }
+    return count;
+}
+
+const DEC_BAD: int = -9223372036854775807 - 1;
+
+function dec(v: int): string {
+    return toStr(v);
+}
+
+function parseIntTx(s: string): int {
+    if (len(s) == 0) { return DEC_BAD; }
+    let neg = false;
+    let i = 0;
+    const f = byteAt(s, 0) catch 48;
+    if (f == 45) {
+        neg = true;
+        i = 1;
+        if (len(s) == 1) { return DEC_BAD; }
+    }
+    let v: int = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) catch 48;
+        if (c < 48 || c > 57) { return DEC_BAD; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    if (neg) { return -v; }
+    return v;
+}
+
+function isIntText(s: string): bool {
+    if (len(s) == 0) { return false; }
+    let i = 0;
+    const f = byteAt(s, 0) catch 48;
+    if (f == 45) {
+        i = 1;
+        if (len(s) == 1) { return false; }
+    }
+    while (i < len(s)) {
+        const c = byteAt(s, i) catch 48;
+        if (c < 48 || c > 57) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ============================================================================
+// §2 Program 内存结构
+// ============================================================================
+
+struct Ty {
+    kind: int,
+    a: int,
+    b: int,
+}
+
+struct FieldDecl {
+    name: int,
+    ty: int,
+}
+
+struct VariantDecl {
+    name: int,
+    fields: List<Ref<FieldDecl>>,
+}
+
+struct TypeDecl {
+    module: int,
+    name: int,
+    which: int, // 1=struct 2=enum
+    fields: List<Ref<FieldDecl>>,
+    variants: List<Ref<VariantDecl>>,
+}
+
+struct LineCol {
+    line: int,
+    col: int,
+}
+
+struct Const {
+    tag: int, // 1..9
+    i: int, // int / str 索引 / fn_ref / ty / variant.ty / arr.elem / slice.elem
+    fbits: int, // float 位型
+    vi: int, // variant.idx
+    vlen: int, // arr.len / jump_table.len
+    tbl: List<int>, // jump_table
+}
+
+function constNew(tag: int): Ref<Const> {
+    return new Const { tag: tag, i: 0, fbits: 0, vi: 0, vlen: 0, tbl: listNew() };
+}
+
+struct Fn {
+    name: int,
+    module: int,
+    reg: int,
+    nparams: int,
+    code: List<int>,
+    consts: List<Ref<Const>>,
+    lines: List<Ref<LineCol>>,
+    ptys: List<int>,
+    ret: int,
+}
+
+struct ModuleInfo {
+    path: int,
+    state_ty: int,
+    init_fn: int,
+}
+
+struct TestEntry {
+    name: int,
+    func: int,
+}
+
+struct ExternDecl {
+    name: List<int>, // 原始字节（len+bytes 直写域）
+    tags: List<int>,
+    ret: int,
+}
+
+struct FnSigDesc {
+    ret: int,
+    params: List<int>,
+}
+
+// 字符串表：拼接字节域＋偏移（n+1）——避免嵌套 List<List<int>>。
+struct StrTab {
+    bytes: List<int>,
+    starts: List<int>, // starts[i]..starts[i+1]＝第 i 串
+}
+
+function strCount(starts: List<int>): int {
+    return listLen(starts) - 1;
+}
+
+function strAppend(st: Ref<StrTab>, s: string): void {
+    let i = 0;
+    const n = len(s);
+    while (i < n) {
+        listPush(st.bytes, byteAt(s, i) catch 0);
+        i = i + 1;
+    }
+    listPush(st.starts, listLen(st.bytes));
+}
+
+function strPushBytes(bytes: List<int>, starts: List<int>, add: List<int>): void {
+    let i = 0;
+    while (i < listLen(add)) {
+        listPush(bytes, listGet(add, i) catch 0);
+        i = i + 1;
+    }
+    listPush(starts, listLen(bytes));
+}
+
+function strEqS(sbytes: List<int>, sstarts: List<int>, idx: int, s: string): bool {
+    const from = listGet(sstarts, idx) catch 0;
+    const to = listGet(sstarts, idx + 1) catch 0;
+    if (to - from != len(s)) { return false; }
+    let i = 0;
+    while (i < len(s)) {
+        if ((listGet(sbytes, from + i) catch 0) != (byteAt(s, i) catch 0)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+function strEqSlice(sbytes: List<int>, sstarts: List<int>, idx: int, bytes: List<int>, from: int, to: int): bool {
+    const sfrom = listGet(sstarts, idx) catch 0;
+    const sto = listGet(sstarts, idx + 1) catch 0;
+    if (sto - sfrom != to - from) { return false; }
+    let i = 0;
+    while (i < to - from) {
+        if ((listGet(sbytes, sfrom + i) catch 0) != (listGet(bytes, from + i) catch 0)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+struct Program {
+    tys: List<Ref<Ty>>,
+    decls: List<Ref<TypeDecl>>,
+    funcs: List<Ref<Fn>>,
+    modules: List<Ref<ModuleInfo>>,
+    tests: List<Ref<TestEntry>>,
+    externs: List<Ref<ExternDecl>>,
+    sigs: List<Ref<FnSigDesc>>,
+    st: StrTab,
+    entry: int,
+    ffiRaw: List<int>, // D3 v0.23 TXFFI 尾节载荷（魔数之后的原样字节；空＝无 FFI）
+}
+
+function newProgram(): Ref<Program> {
+    const st = StrTab { bytes: listNew(), starts: listNew() };
+    listPush(st.starts, 0);
+    return new Program {
+        tys: listNew(),
+        decls: listNew(),
+        funcs: listNew(),
+        modules: listNew(),
+        tests: listNew(),
+        externs: listNew(),
+        sigs: listNew(),
+        st: st,
+        entry: INVALID_ENTRY,
+        ffiRaw: listNew(),
+    };
+}
+
+// —— 逐型 dummy getter（listGet catch 默认；每次新建——Ref 列表元素语义）——
+function dummyTy(): Ref<Ty> { return new Ty { kind: 0, a: 0, b: 0 }; }
+function dummyField(): Ref<FieldDecl> { return new FieldDecl { name: 0, ty: 0 }; }
+function dummyVariant(): Ref<VariantDecl> { return new VariantDecl { name: 0, fields: listNew() }; }
+function dummyDecl(): Ref<TypeDecl> { return new TypeDecl { module: 0, name: 0, which: 1, fields: listNew(), variants: listNew() }; }
+function dummyLine(): Ref<LineCol> { return new LineCol { line: 0, col: 0 }; }
+function dummyConst(): Ref<Const> { return new Const { tag: 0, i: 0, fbits: 0, vi: 0, vlen: 0, tbl: listNew() }; }
+function dummyFn(): Ref<Fn> { return new Fn { name: 0, module: 0, reg: 0, nparams: 0, code: listNew(), consts: listNew(), lines: listNew(), ptys: listNew(), ret: 0 }; }
+function dummyModule(): Ref<ModuleInfo> { return new ModuleInfo { path: 0, state_ty: 0, init_fn: 0 }; }
+function dummyTest(): Ref<TestEntry> { return new TestEntry { name: 0, func: 0 }; }
+function dummyExtern(): Ref<ExternDecl> { return new ExternDecl { name: listNew(), tags: listNew(), ret: 0 }; }
+function dummySig(): Ref<FnSigDesc> { return new FnSigDesc { ret: 0, params: listNew() }; }
+
+// ============================================================================
+// §3 Writer（bytecode.zig Writer 同构；缓冲＝List<int>）
+// ============================================================================
+
+function w8(buf: List<int>, v: int): void {
+    listPush(buf, v & 0xFF);
+}
+
+function w16(buf: List<int>, v: int): void {
+    w8(buf, v & 0xFF);
+    w8(buf, (v >>> 8) & 0xFF);
+}
+
+function w64(buf: List<int>, v: int): void {
+    // v 为 i64 位型（可负）；>>> 逻辑右移保证无符号语义。
+    let k = 0;
+    while (k < 8) {
+        w8(buf, (v >>> (k * 8)) & 0xFF);
+        k = k + 1;
+    }
+}
+
+function wbytesStr(buf: List<int>, s: string): void {
+    let i = 0;
+    const n = len(s);
+    while (i < n) {
+        listPush(buf, byteAt(s, i) catch 0);
+        i = i + 1;
+    }
+}
+
+function wbytesSlice(buf: List<int>, bytes: List<int>, from: int, to: int): void {
+    let i = from;
+    while (i < to) {
+        listPush(buf, listGet(bytes, i) catch 0);
+        i = i + 1;
+    }
+}
+
+function wvarint(buf: List<int>, v: int): void {
+    // v＝u64 位型承载（可负＝高位 1）；>>> 逻辑右移至 0 必然终止。
+    let x = v;
+    while (true) {
+        const b = x & 0x7F;
+        x = x >>> 7;
+        if (x == 0) {
+            w8(buf, b);
+            return;
+        }
+        w8(buf, b | 0x80);
+    }
+}
+
+function wzigzag(buf: List<int>, v: int): void {
+    wvarint(buf, (v << 1) ^ (v >> 63));
+}
+
+// ============================================================================
+// §4 serializeDump：PROGDUMP v2 → .txc v6
+// ============================================================================
+
+let tx_last_error: string = "";
+
+export function lastError(): string {
+    return tx_last_error;
+}
+
+function fail(msg: string): bool {
+    tx_last_error = msg;
+    return false;
+}
+
+struct PdRdr {
+    lines: List<string>,
+    pos: int,
+}
+
+function pdOpen(dump: string): Ref<PdRdr> {
+    return new PdRdr { lines: strSplit(dump, "\n"), pos: 0 };
+}
+
+function pdNext(r: Ref<PdRdr>): string {
+    if (r.pos >= listLen(r.lines)) { return ""; }
+    const l = listGet(r.lines, r.pos) catch "";
+    r.pos = r.pos + 1;
+    return l;
+}
+
+function pdFields(line: string): List<string> {
+    return strSplit(line, " ");
+}
+
+function pdF(fields: List<string>, i: int): string {
+    return listGet(fields, i) catch "";
+}
+
+function pdInt(fields: List<string>, i: int): int {
+    return parseIntTx(pdF(fields, i));
+}
+
+// —— 字符串去重（链式哈希；FNV-1a 字节域）——
+const DEDUP_BUCKETS: int = 4096;
+
+struct Dedup {
+    buckets: List<int>, // 头索引（-1 空）
+    next: List<int>, // 链 next（按 uniq 序）
+    uniq: List<int>, // uniq[i]＝st.starts 基的串索引
+}
+
+function dedupNew(): Ref<Dedup> {
+    const d = new Dedup { buckets: listNew(), next: listNew(), uniq: listNew() };
+    let i = 0;
+    while (i < DEDUP_BUCKETS) {
+        listPush(d.buckets, -1);
+        i = i + 1;
+    }
+    return d;
+}
+
+function sliceHash(bytes: List<int>, from: int, to: int): int {
+    let h: int = 2166136261;
+    let i = from;
+    while (i < to) {
+        h = h ^ (listGet(bytes, i) catch 0);
+        h = imul(h, 16777619);
+        i = i + 1;
+    }
+    return h & 0x7FFFFFFF;
+}
+
+function dedupIntern(d: Ref<Dedup>, sbytes: List<int>, sstarts: List<int>, idx: int): int {
+    const from = listGet(sstarts, idx) catch 0;
+    const to = listGet(sstarts, idx + 1) catch 0;
+    const bkt = sliceHash(sbytes, from, to) % DEDUP_BUCKETS;
+    let cur = listGet(d.buckets, bkt) catch -1;
+    while (cur >= 0) {
+        const cand = listGet(d.uniq, cur) catch -1;
+        if (strEqSlice(sbytes, sstarts, cand, sbytes, from, to)) { return cur; }
+        cur = listGet(d.next, cur) catch -1;
+    }
+    const ni = listLen(d.uniq);
+    listPush(d.uniq, idx);
+    listPush(d.next, listGet(d.buckets, bkt) catch -1);
+    listSet(d.buckets, bkt, ni);
+    return ni;
+}
+
+function serializeConstTo(buf: List<int>, c: Ref<Const>): void {
+    if (c.tag == 1) {
+        w8(buf, 1);
+        wzigzag(buf, c.i);
+        return;
+    }
+    if (c.tag == 2) {
+        w8(buf, 2);
+        w64(buf, c.fbits);
+        return;
+    }
+    if (c.tag == 3 || c.tag == 4 || c.tag == 6) {
+        w8(buf, c.tag);
+        wvarint(buf, c.i);
+        return;
+    }
+    if (c.tag == 5) {
+        w8(buf, 5);
+        wvarint(buf, c.vlen);
+        let i = 0;
+        while (i < listLen(c.tbl)) {
+            wvarint(buf, listGet(c.tbl, i) catch 0);
+            i = i + 1;
+        }
+        return;
+    }
+    if (c.tag == 7) {
+        w8(buf, 7);
+        wvarint(buf, c.i);
+        wvarint(buf, c.vi);
+        return;
+    }
+    if (c.tag == 8) {
+        w8(buf, 8);
+        wvarint(buf, c.i);
+        wvarint(buf, c.vlen);
+        return;
+    }
+    if (c.tag == 9) {
+        w8(buf, 9);
+        wvarint(buf, c.i);
+        return;
+    }
+}
+
+// serializeDump：PROGDUMP v2 文本 → .txc v6 字节（失败返回空表＋lastError）。
+export function serializeDump(dump: string): List<int> {
+    tx_last_error = "";
+    const r = pdOpen(dump);
+    const prog = newProgram();
+
+    const head = pdNext(r);
+    if (head != "PROGDUMP v2") {
+        fail("PROGDUMP 魔数不符");
+        return listNew();
+    }
+    let fields = pdFields(pdNext(r));
+    if (pdF(fields, 0) != "entry") { fail("entry 行缺失"); return listNew(); }
+    prog.entry = pdInt(fields, 1);
+
+    // —— tys ——
+    fields = pdFields(pdNext(r));
+    if (pdF(fields, 0) != "tys") { fail("tys 行缺失"); return listNew(); }
+    let n = pdInt(fields, 1);
+    let i = 0;
+    while (i < n) {
+        const f = pdFields(pdNext(r));
+        if (pdF(f, 0) != "t") { fail("tys 记录错"); return listNew(); }
+        listPush(prog.tys, new Ty { kind: pdInt(f, 1), a: pdInt(f, 2), b: pdInt(f, 3) });
+        i = i + 1;
+    }
+
+    // —— decls ——
+    fields = pdFields(pdNext(r));
+    if (pdF(fields, 0) != "decls") { fail("decls 行缺失"); return listNew(); }
+    n = pdInt(fields, 1);
+    i = 0;
+    while (i < n) {
+        const f = pdFields(pdNext(r));
+        if (pdF(f, 0) != "d") { fail("decls 记录错"); return listNew(); }
+        let which = 2;
+        if (pdF(f, 3) == "struct") { which = 1; }
+        const d = new TypeDecl { module: pdInt(f, 1), name: pdInt(f, 2), which: which, fields: listNew(), variants: listNew() };
+        if (d.which == 1) {
+            const nf = pdInt(f, 4);
+            let j = 0;
+            while (j < nf) {
+                const ff = pdFields(pdNext(r));
+                listPush(d.fields, new FieldDecl { name: pdInt(ff, 1), ty: pdInt(ff, 2) });
+                j = j + 1;
+            }
+        } else {
+            const nv = pdInt(f, 4);
+            let j = 0;
+            while (j < nv) {
+                const vf = pdFields(pdNext(r));
+                const v = new VariantDecl { name: pdInt(vf, 1), fields: listNew() };
+                const nff = pdInt(vf, 2);
+                let k = 0;
+                while (k < nff) {
+                    const ff = pdFields(pdNext(r));
+                    listPush(v.fields, new FieldDecl { name: pdInt(ff, 1), ty: pdInt(ff, 2) });
+                    k = k + 1;
+                }
+                listPush(d.variants, v);
+                j = j + 1;
+            }
+        }
+        listPush(prog.decls, d);
+        i = i + 1;
+    }
+
+    // —— funcs ——
+    fields = pdFields(pdNext(r));
+    if (pdF(fields, 0) != "funcs") { fail("funcs 行缺失"); return listNew(); }
+    n = pdInt(fields, 1);
+    i = 0;
+    while (i < n) {
+        const f = pdFields(pdNext(r));
+        if (pdF(f, 0) != "fn") { fail("funcs 记录错"); return listNew(); }
+        const fny = new Fn {
+            name: pdInt(f, 1), module: pdInt(f, 2), reg: pdInt(f, 3), nparams: pdInt(f, 4),
+            code: listNew(), consts: listNew(), lines: listNew(), ptys: listNew(), ret: pdInt(f, 9),
+        };
+        const ncode = pdInt(f, 5);
+        const nconst = pdInt(f, 6);
+        const nline = pdInt(f, 7);
+        const npty = pdInt(f, 8);
+        let j = 0;
+        while (j < ncode) {
+            listPush(fny.code, pdInt(pdFields(pdNext(r)), 1));
+            j = j + 1;
+        }
+        j = 0;
+        while (j < nconst) {
+            const cf = pdFields(pdNext(r));
+            if (pdF(cf, 0) != "c") { fail("consts 记录错"); return listNew(); }
+            const tag = pdInt(cf, 1);
+            const c = constNew(tag);
+            if (tag == 1 || tag == 3 || tag == 4 || tag == 6) {
+                c.i = pdInt(cf, 2);
+            } else if (tag == 2) {
+                c.fbits = pdInt(cf, 2);
+            } else if (tag == 5) {
+                const nt = pdInt(cf, 2);
+                c.vlen = nt;
+                let k = 0;
+                while (k < nt) {
+                    listPush(c.tbl, pdInt(pdFields(pdNext(r)), 1));
+                    k = k + 1;
+                }
+            } else if (tag == 7) {
+                c.i = pdInt(cf, 2);
+                c.vi = pdInt(cf, 3);
+            } else if (tag == 8) {
+                c.i = pdInt(cf, 2);
+                c.vlen = pdInt(cf, 3);
+            } else if (tag == 9) {
+                c.i = pdInt(cf, 2);
+            } else {
+                fail("const tag 越集");
+                return listNew();
+            }
+            listPush(fny.consts, c);
+            j = j + 1;
+        }
+        j = 0;
+        while (j < nline) {
+            const lf = pdFields(pdNext(r));
+            listPush(fny.lines, new LineCol { line: pdInt(lf, 1), col: pdInt(lf, 2) });
+            j = j + 1;
+        }
+        j = 0;
+        while (j < npty) {
+            listPush(fny.ptys, pdInt(pdFields(pdNext(r)), 1));
+            j = j + 1;
+        }
+        listPush(prog.funcs, fny);
+        i = i + 1;
+    }
+
+    // —— modules ——
+    fields = pdFields(pdNext(r));
+    if (pdF(fields, 0) != "modules") { fail("modules 行缺失"); return listNew(); }
+    n = pdInt(fields, 1);
+    i = 0;
+    while (i < n) {
+        const f = pdFields(pdNext(r));
+        listPush(prog.modules, new ModuleInfo { path: pdInt(f, 1), state_ty: pdInt(f, 2), init_fn: pdInt(f, 3) });
+        i = i + 1;
+    }
+
+    // —— tests ——
+    fields = pdFields(pdNext(r));
+    if (pdF(fields, 0) != "tests") { fail("tests 行缺失"); return listNew(); }
+    n = pdInt(fields, 1);
+    i = 0;
+    while (i < n) {
+        const f = pdFields(pdNext(r));
+        listPush(prog.tests, new TestEntry { name: pdInt(f, 1), func: pdInt(f, 2) });
+        i = i + 1;
+    }
+
+    // —— externs ——
+    fields = pdFields(pdNext(r));
+    if (pdF(fields, 0) != "externs") { fail("externs 行缺失"); return listNew(); }
+    n = pdInt(fields, 1);
+    i = 0;
+    while (i < n) {
+        const f = pdFields(pdNext(r));
+        if (pdF(f, 0) != "e") { fail("externs 记录错"); return listNew(); }
+        const e = new ExternDecl { name: listNew(), tags: listNew(), ret: 0 };
+        if (hexDecodeTo(pdF(f, 1), e.name) < 0) { fail("extern 名 hex 非法"); return listNew(); }
+        const nparams = pdInt(f, 2);
+        let k = 0;
+        while (k < nparams) {
+            listPush(e.tags, pdInt(f, 3 + k));
+            k = k + 1;
+        }
+        e.ret = pdInt(f, 3 + nparams);
+        listPush(prog.externs, e);
+        i = i + 1;
+    }
+
+    // —— fn_sigs ——
+    fields = pdFields(pdNext(r));
+    if (pdF(fields, 0) != "sigs") { fail("sigs 行缺失"); return listNew(); }
+    n = pdInt(fields, 1);
+    i = 0;
+    while (i < n) {
+        const f = pdFields(pdNext(r));
+        const sg = new FnSigDesc { ret: pdInt(f, 1), params: listNew() };
+        const np = pdInt(f, 2);
+        let k = 0;
+        while (k < np) {
+            listPush(sg.params, pdInt(f, 3 + k));
+            k = k + 1;
+        }
+        listPush(prog.sigs, sg);
+        i = i + 1;
+    }
+
+    // —— strtab（hex 域；空内容＝h 单 token 行）——
+    fields = pdFields(pdNext(r));
+    if (pdF(fields, 0) != "strtab") { fail("strtab 行缺失"); return listNew(); }
+    n = pdInt(fields, 1);
+    i = 0;
+    while (i < n) {
+        const line = pdNext(r);
+        const ff = pdFields(line);
+        if (pdF(ff, 0) != "h") { fail("strtab 记录错"); return listNew(); }
+        let hexPart = "";
+        if (len(line) >= 3) { hexPart = strSub(line, 2, len(line) - 2); }
+        const tmp: List<int> = listNew();
+        if (hexDecodeTo(hexPart, tmp) < 0) { fail("hex 非法"); return listNew(); }
+        strPushBytes(prog.st.bytes, prog.st.starts, tmp);
+        i = i + 1;
+    }
+
+    // D3 v0.23 FFI：可选 ffi 行（TXFFI 尾节载荷的 hex）。
+    const ffiLine = pdNext(r);
+    if (len(ffiLine) > 4 && strSub(ffiLine, 0, 4) == "ffi ") {
+        if (hexDecodeTo(strSub(ffiLine, 4, len(ffiLine) - 4), prog.ffiRaw) < 0) { fail("ffi hex 非法"); return listNew(); }
+    }
+
+    return emitTxc(prog);
+}
+
+// —— Program → .txc v4 字节（bytecode.zig serialize 逐域）——
+function emitTxc(prog: Ref<Program>): List<int> {
+    const buf: List<int> = listNew();
+    w8(buf, 0x54); // T
+    w8(buf, 0x58); // X
+    w8(buf, 0x43); // C
+    w16(buf, FORMAT_VERSION);
+    wvarint(buf, 0); // flags（保留）
+
+    // —— 字符串驻留表（内容去重＋旧→新索引映射）——
+    const dd = dedupNew();
+    let map: List<int> = listNew();
+    let i = 0;
+    const nstrings = strCount(prog.st.starts);
+    while (i < nstrings) {
+        listPush(map, dedupIntern(dd, prog.st.bytes, prog.st.starts, i));
+        i = i + 1;
+    }
+    wvarint(buf, listLen(dd.uniq));
+    i = 0;
+    while (i < listLen(dd.uniq)) {
+        const idx = listGet(dd.uniq, i) catch 0;
+        const from = listGet(prog.st.starts, idx) catch 0;
+        const to = listGet(prog.st.starts, idx + 1) catch 0;
+        wvarint(buf, to - from);
+        wbytesSlice(buf, prog.st.bytes, from, to);
+        i = i + 1;
+    }
+
+    // types
+    wvarint(buf, listLen(prog.tys));
+    i = 0;
+    while (i < listLen(prog.tys)) {
+        const t = listGet(prog.tys, i) catch dummyTy();
+        w8(buf, t.kind);
+        wvarint(buf, t.a);
+        wvarint(buf, t.b);
+        i = i + 1;
+    }
+
+    // type decls
+    wvarint(buf, listLen(prog.decls));
+    i = 0;
+    while (i < listLen(prog.decls)) {
+        const d = listGet(prog.decls, i) catch dummyDecl();
+        wvarint(buf, d.module);
+        wvarint(buf, mapAt(map, d.name));
+        if (d.which == 1) {
+            w8(buf, 1);
+            wvarint(buf, listLen(d.fields));
+            let j = 0;
+            while (j < listLen(d.fields)) {
+                const fl = listGet(d.fields, j) catch dummyField();
+                wvarint(buf, mapAt(map, fl.name));
+                wvarint(buf, fl.ty);
+                j = j + 1;
+            }
+        } else {
+            w8(buf, 2);
+            wvarint(buf, listLen(d.variants));
+            let j = 0;
+            while (j < listLen(d.variants)) {
+                const v = listGet(d.variants, j) catch dummyVariant();
+                wvarint(buf, mapAt(map, v.name));
+                wvarint(buf, listLen(v.fields));
+                let k = 0;
+                while (k < listLen(v.fields)) {
+                    const fl = listGet(v.fields, k) catch dummyField();
+                    wvarint(buf, mapAt(map, fl.name));
+                    wvarint(buf, fl.ty);
+                    k = k + 1;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    // funcs
+    wvarint(buf, listLen(prog.funcs));
+    i = 0;
+    while (i < listLen(prog.funcs)) {
+        const f = listGet(prog.funcs, i) catch dummyFn();
+        wvarint(buf, mapAt(map, f.name));
+        wvarint(buf, f.module);
+        wvarint(buf, f.reg);
+        wvarint(buf, f.nparams);
+        wvarint(buf, listLen(f.code));
+        let j = 0;
+        while (j < listLen(f.code)) {
+            wvarint(buf, listGet(f.code, j) catch 0);
+            j = j + 1;
+        }
+        wvarint(buf, listLen(f.consts));
+        j = 0;
+        while (j < listLen(f.consts)) {
+            serializeConstTo(buf, listGet(f.consts, j) catch dummyConst());
+            j = j + 1;
+        }
+        wvarint(buf, listLen(f.lines));
+        j = 0;
+        while (j < listLen(f.lines)) {
+            const lc = listGet(f.lines, j) catch dummyLine();
+            wvarint(buf, lc.line);
+            wvarint(buf, lc.col);
+            j = j + 1;
+        }
+        wvarint(buf, listLen(f.ptys));
+        j = 0;
+        while (j < listLen(f.ptys)) {
+            wvarint(buf, listGet(f.ptys, j) catch 0);
+            j = j + 1;
+        }
+        wvarint(buf, f.ret);
+        i = i + 1;
+    }
+
+    // modules
+    wvarint(buf, listLen(prog.modules));
+    i = 0;
+    while (i < listLen(prog.modules)) {
+        const m = listGet(prog.modules, i) catch dummyModule();
+        wvarint(buf, mapAt(map, m.path));
+        wvarint(buf, m.state_ty);
+        wvarint(buf, m.init_fn);
+        i = i + 1;
+    }
+
+    // tests
+    wvarint(buf, listLen(prog.tests));
+    i = 0;
+    while (i < listLen(prog.tests)) {
+        const t = listGet(prog.tests, i) catch dummyTest();
+        wvarint(buf, mapAt(map, t.name));
+        wvarint(buf, t.func);
+        i = i + 1;
+    }
+
+    wvarint(buf, prog.entry);
+
+    // externs 可选尾节（TXEXT）
+    if (listLen(prog.externs) > 0) {
+        wbytesStr(buf, "TXEXT");
+        wvarint(buf, listLen(prog.externs));
+        i = 0;
+        while (i < listLen(prog.externs)) {
+            const e = listGet(prog.externs, i) catch dummyExtern();
+            wvarint(buf, listLen(e.name));
+            wbytesSlice(buf, e.name, 0, listLen(e.name));
+            wvarint(buf, listLen(e.tags));
+            let j = 0;
+            while (j < listLen(e.tags)) {
+                w8(buf, listGet(e.tags, j) catch 0);
+                j = j + 1;
+            }
+            w8(buf, e.ret);
+            i = i + 1;
+        }
+    }
+    // fn_sigs 可选尾节（TXFNT）
+    if (listLen(prog.sigs) > 0) {
+        wbytesStr(buf, "TXFNT");
+        wvarint(buf, listLen(prog.sigs));
+        i = 0;
+        while (i < listLen(prog.sigs)) {
+            const s = listGet(prog.sigs, i) catch dummySig();
+            wvarint(buf, s.ret);
+            wvarint(buf, listLen(s.params));
+            let j = 0;
+            while (j < listLen(s.params)) {
+                wvarint(buf, listGet(s.params, j) catch 0);
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+    }
+    // D3 v0.23 FFI 尾节（TXFFI；v6 中可选，按节标识识别）
+    if (listLen(prog.ffiRaw) > 0) {
+        wbytesStr(buf, "TXFFI");
+        i = 0;
+        while (i < listLen(prog.ffiRaw)) { w8(buf, listGet(prog.ffiRaw, i) catch 0); i = i + 1; }
+    }
+    return buf;
+}
+
+// D3 v0.23 TXFFI 载荷（全部非负，varint）：库名表（长度＋字节）×n；每个 extern 一行、
+// 外部结构体布局、回调签名三张行表（每行：长度＋各值）；回调实参对（个数×2＋各值）。
+export function ffiPayload(libs: List<string>, ext: List<List<int>>, lay: List<List<int>>, cb: List<List<int>>, cbfn: List<int>): List<int> {
+    const buf: List<int> = listNew();
+    wvarint(buf, listLen(libs));
+    let i = 0;
+    while (i < listLen(libs)) {
+        const l = listGet(libs, i) catch "";
+        wvarint(buf, len(l));
+        wbytesStr(buf, l);
+        i = i + 1;
+    }
+    ffiRowsTo(buf, ext);
+    ffiRowsTo(buf, lay);
+    ffiRowsTo(buf, cb);
+    wvarint(buf, listLen(cbfn));
+    i = 0;
+    while (i < listLen(cbfn)) { wvarint(buf, listGet(cbfn, i) catch 0); i = i + 1; }
+    return buf;
+}
+
+function ffiRowsTo(buf: List<int>, rows: List<List<int>>): void {
+    wvarint(buf, listLen(rows));
+    let i = 0;
+    while (i < listLen(rows)) {
+        const row = listGet(rows, i) catch emptyIntsCtx();
+        wvarint(buf, listLen(row));
+        let j = 0;
+        while (j < listLen(row)) { wvarint(buf, listGet(row, j) catch 0); j = j + 1; }
+        i = i + 1;
+    }
+}
+
+export function ffiPayloadHex(libs: List<string>, ext: List<List<int>>, lay: List<List<int>>, cb: List<List<int>>, cbfn: List<int>): string {
+    const b = ffiPayload(libs, ext, lay, cb, cbfn);
+    return hexEncodeByteList(b, 0, listLen(b));
+}
+
+function mapAt(map: List<int>, old: int): int {
+    return listGet(map, old) catch 0;
+}
+
+// ============================================================================
+// §5 Reader＋decodeTxc（bytecode.zig Reader/deserialize 同构；期望_ROOM 守卫随行）
+// ============================================================================
+
+let g_rdr_bad: bool = false;
+
+struct Rdr {
+    data: string,
+    pos: int,
+}
+
+function rdrOpen(data: string): Ref<Rdr> {
+    return new Rdr { data: data, pos: 0 };
+}
+
+function r8(r: Ref<Rdr>): int {
+    if (g_rdr_bad) { return 0; }
+    if (r.pos + 1 > len(r.data)) {
+        g_rdr_bad = true;
+        return 0;
+    }
+    const v = byteAt(r.data, r.pos) catch 0;
+    r.pos = r.pos + 1;
+    return v;
+}
+
+function rbyte(r: Ref<Rdr>): int {
+    return r8(r);
+}
+
+function r16(r: Ref<Rdr>): int {
+    const b0 = r8(r);
+    const b1 = r8(r);
+    return b0 | (b1 << 8);
+}
+
+function rvarint(r: Ref<Rdr>): int {
+    // LEB128——移位越界即结构化拒绝（g_rdr_bad）。
+    let v: int = 0;
+    let shift = 0;
+    while (true) {
+        const b = r8(r);
+        if (g_rdr_bad) { return 0; }
+        if (shift >= 63 && b > 1) {
+            g_rdr_bad = true;
+            return 0;
+        }
+        v = v | ((b & 0x7F) << shift);
+        if ((b & 0x80) == 0) { return v; }
+        shift = shift + 7;
+        if (shift >= 64) {
+            g_rdr_bad = true;
+            return 0;
+        }
+    }
+    return 0;
+}
+
+function rvarU32(r: Ref<Rdr>): int {
+    const v = rvarint(r);
+    // u32 域防护：> 0xFFFFFFFF 即坏（v 为 u64 位型承载；无符号比较用 >>> 对齐）。
+    if (v < 0) {
+        g_rdr_bad = true;
+        return 0;
+    }
+    return v;
+}
+
+function rzigzag(r: Ref<Rdr>): int {
+    const u = rvarint(r);
+    return ((u >>> 1) ^ -(u & 1));
+}
+
+function roomOk(data: string, pos: int, n: int, minElem: int): bool {
+    // 计数上界先验（expectRoom 同构）：剩余字节 ≥ n×minElem。
+    if (n < 0) { return false; }
+    const remain = len(data) - pos;
+    const need = n * minElem;
+    if (need < 0) { return false; } // 溢出防护
+    return remain >= need;
+}
+
+function rbytesTo(r: Ref<Rdr>, n: int, out: List<int>): bool {
+    if (g_rdr_bad) { return false; }
+    if (n < 0 || r.pos + n > len(r.data)) {
+        g_rdr_bad = true;
+        return false;
+    }
+    let i = 0;
+    while (i < n) {
+        listPush(out, byteAt(r.data, r.pos + i) catch 0);
+        i = i + 1;
+    }
+    r.pos = r.pos + n;
+    return true;
+}
+
+function magicAt(r: Ref<Rdr>, m: string): bool {
+    // 探测 r.pos 起是否为 m 的字节（不消费）。
+    if (r.pos + len(m) > len(r.data)) { return false; }
+    let i = 0;
+    while (i < len(m)) {
+        if ((byteAt(r.data, r.pos + i) catch 0) != (byteAt(m, i) catch 0)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+function decodeConst(r: Ref<Rdr>): Ref<Const> {
+    const tag = rbyte(r);
+    if (g_rdr_bad) { return constNew(0); }
+    const c = constNew(tag);
+    if (tag == 1) {
+        c.i = rzigzag(r);
+    } else if (tag == 2) {
+        // float 位型：8 字节 LE 组装（位型不解释）。
+        let v: int = 0;
+        let k = 0;
+        while (k < 8) {
+            v = v | (r8(r) << (k * 8));
+            k = k + 1;
+        }
+        c.fbits = v;
+    } else if (tag == 3 || tag == 4 || tag == 6) {
+        c.i = rvarU32(r);
+    } else if (tag == 5) {
+        const n = rvarU32(r);
+        if (!roomOk(r.data, r.pos, n, 1)) {
+            g_rdr_bad = true;
+            return c;
+        }
+        let k = 0;
+        while (k < n) {
+            listPush(c.tbl, rvarU32(r));
+            k = k + 1;
+        }
+        c.vlen = n;
+    } else if (tag == 7) {
+        c.i = rvarU32(r);
+        c.vi = rvarU32(r);
+    } else if (tag == 8) {
+        c.i = rvarU32(r);
+        c.vlen = rvarint(r);
+    } else if (tag == 9) {
+        c.i = rvarU32(r);
+    } else {
+        g_rdr_bad = true;
+    }
+    return c;
+}
+
+// decodeTxc：.txc 字节（v6；v4/v5 读入即展宽）→ Program（装载期校验＋verifyProgram 同构）。
+// 失败＝lastError 非空（结构化拒绝文字）。
+export function decodeTxc(data: string): Ref<Program> {
+    tx_last_error = "";
+    g_rdr_bad = false;
+    const prog = newProgram();
+    const r = rdrOpen(data);
+
+    // 魔数 TXC（0x54 0x58 0x43）
+    if (r8(r) != 0x54 || r8(r) != 0x58 || r8(r) != 0x43) {
+        fail("BadMagic");
+        return prog;
+    }
+    const ver = r16(r);
+    if (ver != FORMAT_VERSION && ver != FORMAT_VERSION_V4 && ver != FORMAT_VERSION_FFI) {
+        fail("BadVersion");
+        return prog;
+    }
+    rvarint(r); // flags
+
+    // strings（驻留表）
+    const nstrings = rvarU32(r);
+    if (g_rdr_bad || !roomOk(r.data, r.pos, nstrings, 1)) { fail("Corrupt:strings"); return prog; }
+    let i = 0;
+    while (i < nstrings) {
+        const slen = rvarU32(r);
+        if (g_rdr_bad) { fail("Corrupt:string len"); return prog; }
+        const tmp: List<int> = listNew();
+        if (!rbytesTo(r, slen, tmp)) { fail("Corrupt:string bytes"); return prog; }
+        strPushBytes(prog.st.bytes, prog.st.starts, tmp);
+        i = i + 1;
+    }
+
+    // types
+    const ntys = rvarU32(r);
+    if (g_rdr_bad || !roomOk(r.data, r.pos, ntys, 1)) { fail("Corrupt:tys"); return prog; }
+    i = 0;
+    while (i < ntys) {
+        const kind = rbyte(r);
+        const a = rvarU32(r);
+        const b = rvarint(r);
+        if (g_rdr_bad) { fail("Corrupt:ty"); return prog; }
+        if (!tyKindValid(kind)) { fail("Corrupt:ty kind"); return prog; }
+        listPush(prog.tys, new Ty { kind: kind, a: a, b: b });
+        i = i + 1;
+    }
+
+    // decls
+    const ndecls = rvarU32(r);
+    if (g_rdr_bad || !roomOk(r.data, r.pos, ndecls, 1)) { fail("Corrupt:decls"); return prog; }
+    i = 0;
+    while (i < ndecls) {
+        const module = rvarU32(r);
+        const name = rvarU32(r);
+        const which = rbyte(r);
+        if (g_rdr_bad) { fail("Corrupt:decl"); return prog; }
+        const d = new TypeDecl { module: module, name: name, which: which, fields: listNew(), variants: listNew() };
+        if (which == 1) {
+            const nf = rvarU32(r);
+            if (g_rdr_bad || !roomOk(r.data, r.pos, nf, 2)) { fail("Corrupt:fields"); return prog; }
+            let j = 0;
+            while (j < nf) {
+                listPush(d.fields, new FieldDecl { name: rvarU32(r), ty: rvarU32(r) });
+                j = j + 1;
+            }
+        } else if (which == 2) {
+            const nv = rvarU32(r);
+            if (g_rdr_bad || !roomOk(r.data, r.pos, nv, 2)) { fail("Corrupt:variants"); return prog; }
+            let j = 0;
+            while (j < nv) {
+                const vname = rvarU32(r);
+                const nff = rvarU32(r);
+                if (g_rdr_bad || !roomOk(r.data, r.pos, nff, 2)) { fail("Corrupt:vfields"); return prog; }
+                const v = new VariantDecl { name: vname, fields: listNew() };
+                let k = 0;
+                while (k < nff) {
+                    listPush(v.fields, new FieldDecl { name: rvarU32(r), ty: rvarU32(r) });
+                    k = k + 1;
+                }
+                listPush(d.variants, v);
+                j = j + 1;
+            }
+        } else {
+            fail("Corrupt:decl kind");
+            return prog;
+        }
+        listPush(prog.decls, d);
+        i = i + 1;
+    }
+
+    // funcs
+    const nfuncs = rvarU32(r);
+    if (g_rdr_bad || !roomOk(r.data, r.pos, nfuncs, 1)) { fail("Corrupt:funcs"); return prog; }
+    i = 0;
+    while (i < nfuncs) {
+        const name = rvarU32(r);
+        const module = rvarU32(r);
+        const reg = rvarU32(r);
+        const nparams = rvarU32(r);
+        const ncode = rvarU32(r);
+        if (g_rdr_bad || !roomOk(r.data, r.pos, ncode, 1)) { fail("Corrupt:fn head"); return prog; }
+        const fny = new Fn { name: name, module: module, reg: reg, nparams: nparams, code: listNew(), consts: listNew(), lines: listNew(), ptys: listNew(), ret: 0 };
+        let j = 0;
+        while (j < ncode) {
+            // v6 指令字可能第 63 位置位（C 的标志位），不能按 u32 读；v4/v5 的字读入即展宽。
+            let ins = 0;
+            if (ver == FORMAT_VERSION) {
+                ins = rvarint(r);
+            } else {
+                ins = rvarU32(r);
+                if (ins > 4294967295) { g_rdr_bad = true; }
+                ins = widenV4(ins);
+            }
+            if (g_rdr_bad) { fail("Corrupt:instr"); return prog; }
+            if (!opValid(insOp(ins))) { fail("Corrupt:op"); return prog; }
+            listPush(fny.code, ins);
+            j = j + 1;
+        }
+        const nconsts = rvarU32(r);
+        if (g_rdr_bad || !roomOk(r.data, r.pos, nconsts, 1)) { fail("Corrupt:consts"); return prog; }
+        j = 0;
+        while (j < nconsts) {
+            const c = decodeConst(r);
+            if (g_rdr_bad) { fail("Corrupt:const"); return prog; }
+            listPush(fny.consts, c);
+            j = j + 1;
+        }
+        const nlines = rvarU32(r);
+        if (g_rdr_bad || !roomOk(r.data, r.pos, nlines, 2)) { fail("Corrupt:lines"); return prog; }
+        j = 0;
+        while (j < nlines) {
+            const ln = rvarU32(r);
+            const col = rvarU32(r);
+            listPush(fny.lines, new LineCol { line: ln, col: col });
+            j = j + 1;
+        }
+        if (g_rdr_bad) { fail("Corrupt:line"); return prog; }
+        if (listLen(fny.lines) != listLen(fny.code)) { fail("Corrupt:lines!=code"); return prog; }
+        // v3 参数类型表尾段＋v4 返回类型尾段
+        const nptys = rvarU32(r);
+        if (g_rdr_bad || nptys > nparams) { fail("Corrupt:ptys"); return prog; }
+        if (!roomOk(r.data, r.pos, nptys, 1)) { fail("Corrupt:ptys room"); return prog; }
+        j = 0;
+        while (j < nptys) {
+            listPush(fny.ptys, rvarU32(r));
+            j = j + 1;
+        }
+        fny.ret = rvarU32(r);
+        if (g_rdr_bad) { fail("Corrupt:ret"); return prog; }
+        if (fny.ret != INVALID_ENTRY && fny.ret >= listLen(prog.tys)) { fail("Corrupt:ret bounds"); return prog; }
+        listPush(prog.funcs, fny);
+        i = i + 1;
+    }
+
+    // modules
+    const nmods = rvarU32(r);
+    if (g_rdr_bad || !roomOk(r.data, r.pos, nmods, 3)) { fail("Corrupt:modules"); return prog; }
+    i = 0;
+    while (i < nmods) {
+        const p = rvarU32(r);
+        const sty = rvarU32(r);
+        const ifn = rvarU32(r);
+        listPush(prog.modules, new ModuleInfo { path: p, state_ty: sty, init_fn: ifn });
+        i = i + 1;
+    }
+    if (g_rdr_bad) { fail("Corrupt:module"); return prog; }
+
+    // tests
+    const ntests = rvarU32(r);
+    if (g_rdr_bad || !roomOk(r.data, r.pos, ntests, 2)) { fail("Corrupt:tests"); return prog; }
+    i = 0;
+    while (i < ntests) {
+        const nm = rvarU32(r);
+        const fc = rvarU32(r);
+        listPush(prog.tests, new TestEntry { name: nm, func: fc });
+        i = i + 1;
+    }
+    if (g_rdr_bad) { fail("Corrupt:test"); return prog; }
+
+    prog.entry = rvarU32(r);
+    if (g_rdr_bad) { fail("Corrupt:entry"); return prog; }
+
+    // externs 可选尾节（TXEXT）
+    if (magicAt(r, "TXEXT")) {
+        r.pos = r.pos + 5;
+        const nexts = rvarU32(r);
+        if (g_rdr_bad || !roomOk(r.data, r.pos, nexts, 2)) { fail("Corrupt:externs"); return prog; }
+        i = 0;
+        while (i < nexts) {
+            const namelen = rvarU32(r);
+            const e = new ExternDecl { name: listNew(), tags: listNew(), ret: 0 };
+            if (!rbytesTo(r, namelen, e.name)) { fail("Corrupt:ext name"); return prog; }
+            const nparams = rvarU32(r);
+            if (g_rdr_bad || nparams > 255) { fail("Corrupt:ext nparams"); return prog; }
+            let j = 0;
+            while (j < nparams) {
+                listPush(e.tags, rbyte(r));
+                j = j + 1;
+            }
+            e.ret = rbyte(r);
+            if (g_rdr_bad) { fail("Corrupt:ext"); return prog; }
+            listPush(prog.externs, e);
+            i = i + 1;
+        }
+    }
+    // fn_sigs 可选尾节（TXFNT）
+    if (magicAt(r, "TXFNT")) {
+        r.pos = r.pos + 5;
+        const nsigs = rvarU32(r);
+        if (g_rdr_bad || !roomOk(r.data, r.pos, nsigs, 2)) { fail("Corrupt:sigs"); return prog; }
+        i = 0;
+        while (i < nsigs) {
+            const sg = new FnSigDesc { ret: rvarU32(r), params: listNew() };
+            const nparams = rvarU32(r);
+            if (g_rdr_bad || !roomOk(r.data, r.pos, nparams, 1)) { fail("Corrupt:sig"); return prog; }
+            let j = 0;
+            while (j < nparams) {
+                listPush(sg.params, rvarU32(r));
+                j = j + 1;
+            }
+            if (g_rdr_bad) { fail("Corrupt:sig param"); return prog; }
+            listPush(prog.sigs, sg);
+            i = i + 1;
+        }
+    }
+    // D3 v0.23 FFI 尾节（版本 5 必有、版本 6 可选，且是最后一节）。
+    if (ver == FORMAT_VERSION_FFI || (ver == FORMAT_VERSION && magicAt(r, "TXFFI"))) {
+        if (!magicAt(r, "TXFFI")) { fail("Corrupt:ffi magic"); return prog; }
+        r.pos = r.pos + 5;
+        const ffiStart = r.pos;
+        if (!ffiPayloadOk(r, listLen(prog.externs)) || r.pos != len(r.data)) { fail("Corrupt:ffi"); return prog; }
+        let fk = ffiStart;
+        while (fk < r.pos) { listPush(prog.ffiRaw, byteAt(r.data, fk) catch 0); fk = fk + 1; }
+    }
+
+    if (!verifyProgramTx(prog)) { return prog; }
+    return prog;
+}
+
+// TXFFI 载荷结构校验（ffiPayload 的逆；extern 行数须等于 TXEXT 的 extern 数）。
+function ffiPayloadOk(r: Ref<Rdr>, nexts: int): bool {
+    const nlibs = rvarU32(r);
+    if (g_rdr_bad || !roomOk(r.data, r.pos, nlibs, 1)) { return false; }
+    let i = 0;
+    while (i < nlibs) {
+        const ln = rvarU32(r);
+        if (g_rdr_bad || !roomOk(r.data, r.pos, ln, 1)) { return false; }
+        r.pos = r.pos + ln;
+        i = i + 1;
+    }
+    let t = 0;
+    while (t < 3) {
+        const nrows = rvarU32(r);
+        if (g_rdr_bad || !roomOk(r.data, r.pos, nrows, 1)) { return false; }
+        if (t == 0 && nrows != nexts) { return false; }
+        i = 0;
+        while (i < nrows) {
+            const nv = rvarU32(r);
+            if (g_rdr_bad || !roomOk(r.data, r.pos, nv, 1)) { return false; }
+            let j = 0;
+            while (j < nv) { rvarint(r); j = j + 1; }
+            i = i + 1;
+        }
+        t = t + 1;
+    }
+    const npairs = rvarU32(r);
+    if (g_rdr_bad || !roomOk(r.data, r.pos, npairs, 1)) { return false; }
+    i = 0;
+    while (i < npairs) { rvarint(r); i = i + 1; }
+    return !g_rdr_bad;
+}
+
+// ============================================================================
+// §6 verifyProgramTx（bytecode.zig verifyProgram 同构——装载门槛）
+// ============================================================================
+
+function verifyJumpTargetTx(pc: int, ins: int, n: int): bool {
+    const t = pc + 1 + insSbx(ins);
+    return t >= 0 && t < n;
+}
+
+function verifyProgramTx(prog: Ref<Program>): bool {
+    let fi = 0;
+    while (fi < listLen(prog.funcs)) {
+        const f = listGet(prog.funcs, fi) catch dummyFn();
+        if (listLen(f.ptys) > f.nparams) { fail("Corrupt:ptys len"); return false; }
+        let pi = 0;
+        while (pi < listLen(f.ptys)) {
+            if ((listGet(f.ptys, pi) catch 0) >= listLen(prog.tys)) { fail("Corrupt:pty bounds"); return false; }
+            pi = pi + 1;
+        }
+        const n = listLen(f.code);
+        const rc = f.reg;
+        let pc = 0;
+        while (pc < n) {
+            const ins = listGet(f.code, pc) catch 0;
+            const op = insOp(ins);
+            const a = insA(ins);
+            const b = insB(ins);
+            const c = insC(ins);
+            if (op == 1) { // loadk
+                if (a >= rc || insBx(ins) >= listLen(f.consts)) { fail("Corrupt:loadk"); return false; }
+            } else if (op == 2 || op == 3) { // ldbool/ldnone
+                if (a >= rc) { fail("Corrupt:ldbool"); return false; }
+            } else if (op == 4 || op == 10 || op == 11 || op == 18 || op == 19 || op == 24 || op == 36 || op == 37) { // move/neg/not/iserr/isnone/clone/i2f/f2i
+                if (a >= rc || b >= rc) { fail("Corrupt:unary"); return false; }
+            } else if (op == 39 || op == 49 || op == 51) { // await_fut/yield/gen_close
+                if (a >= rc) { fail("Corrupt:await"); return false; }
+            } else if (op == 50) { // gen_next
+                if (a >= rc || b >= rc) { fail("Corrupt:gen_next"); return false; }
+            } else if (op == 52) { // cvt
+                if (a >= rc || b >= rc || c < 1 || c > 26) { fail("Corrupt:cvt"); return false; }
+            } else if (op == 5 || op == 6 || op == 7 || op == 8 || op == 9 || op == 12 || op == 13 || op == 14 || op == 22 || op == 23 || isFwOp(op)) { // add..le/getidx/setidx/定宽运算族
+                if (a >= rc || b >= rc || c >= rc) { fail("Corrupt:ternary"); return false; }
+            } else if (op == 20 || op == 21) { // getfld/setfld
+                if (a >= rc || b >= rc) { fail("Corrupt:fld"); return false; }
+            } else if (op == 25 || op == 26 || op == 27 || op == 28 || op == 29 || op == 35) { // newstruct..switch_op
+                if (a >= rc) { fail("Corrupt:new"); return false; }
+                const bxi = insBx(ins);
+                if (bxi >= listLen(f.consts)) { fail("Corrupt:new bx"); return false; }
+                if (op == 35) {
+                    const ct = listGet(f.consts, bxi) catch dummyConst();
+                    if (ct.tag != 5) { fail("Corrupt:switch const"); return false; }
+                    let k = 0;
+                    while (k < listLen(ct.tbl)) {
+                        if ((listGet(ct.tbl, k) catch 0) >= n) { fail("Corrupt:switch target"); return false; }
+                        k = k + 1;
+                    }
+                }
+            } else if (op == 15) { // jmp
+                if (!verifyJumpTargetTx(pc, ins, n)) { fail("Corrupt:jmp"); return false; }
+            } else if (op == 16 || op == 17) { // jt/jf
+                if (a >= rc) { fail("Corrupt:jcc"); return false; }
+                if (!verifyJumpTargetTx(pc, ins, n)) { fail("Corrupt:jcc target"); return false; }
+            } else if (op == 30 || op == 32 || op == 38 || op == 48) { // call/tailcall/async_start/gen_new
+                if (a >= rc) { fail("Corrupt:call"); return false; }
+                if (a + b > rc) { fail("Corrupt:call window"); return false; }
+            } else if (op == 31) { // callbi
+                if (a >= rc) { fail("Corrupt:callbi"); return false; }
+                if (a + c >= rc) { fail("Corrupt:callbi window"); return false; }
+                const id = b;
+                if (id >= EXTERN_ID_BASE) {
+                    if (id - EXTERN_ID_BASE >= listLen(prog.externs)) { fail("Corrupt:extern id"); return false; }
+                } else if (id >= RT_BI_BASE && id < RT_BI_BASE + RT_BI_COUNT) {
+                    // __rt 内部内建（线程设计 §十六）：内核按编号直接分派。
+                } else if (id == 0 || id > MAX_BUILTIN_ID) { fail("Corrupt:builtin id"); return false; }
+            } else if (op == 33 || op == 34) { // ret/reterr
+                if (a >= rc) { fail("Corrupt:ret"); return false; }
+            } else if (op >= 200 && op <= 210) { // Tier1 特化
+                if (a >= rc || b >= rc || c >= rc) { fail("Corrupt:tier1"); return false; }
+            }
+            pc = pc + 1;
+        }
+        fi = fi + 1;
+    }
+    if (prog.entry != INVALID_ENTRY && prog.entry >= listLen(prog.funcs)) { fail("Corrupt:entry bounds"); return false; }
+    return true;
+}
+
+// ============================================================================
+// §7 decodeToDump＋roundtripCheck（.txc → PROGDUMP v2；往返锚）
+// ============================================================================
+
+function if2line(c: Ref<Const>): string {
+    if (c.tag == 2) { return "c 2 " + dec(c.fbits); }
+    return "c " + dec(c.tag) + " " + dec(c.i);
+}
+
+function dumpStrtabEntry(prog: Ref<Program>, idx: int): string {
+    const from = listGet(prog.st.starts, idx) catch 0;
+    const to = listGet(prog.st.starts, idx + 1) catch 0;
+    return hexEncodeByteList(prog.st.bytes, from, to);
+}
+
+// decodeToDump：.txc 字节 → PROGDUMP v2 文本（失败返回空串＋lastError；v4/v5 的指令字已展宽成 v6）。
+export function decodeToDump(data: string): string {
+    const prog = decodeTxc(data);
+    if (len(tx_last_error) > 0) { return ""; }
+    let out = "";
+    out = out + "PROGDUMP v2\n";
+    out = out + "entry " + dec(prog.entry) + "\n";
+
+    out = out + "tys " + dec(listLen(prog.tys)) + "\n";
+    let i = 0;
+    while (i < listLen(prog.tys)) {
+        const t = listGet(prog.tys, i) catch dummyTy();
+        out = out + "t " + dec(t.kind) + " " + dec(t.a) + " " + dec(t.b) + "\n";
+        i = i + 1;
+    }
+
+    out = out + "decls " + dec(listLen(prog.decls)) + "\n";
+    i = 0;
+    while (i < listLen(prog.decls)) {
+        const d = listGet(prog.decls, i) catch dummyDecl();
+        if (d.which == 1) {
+            out = out + "d " + dec(d.module) + " " + dec(d.name) + " struct " + dec(listLen(d.fields)) + "\n";
+            let j = 0;
+            while (j < listLen(d.fields)) {
+                const fl = listGet(d.fields, j) catch dummyField();
+                out = out + "f " + dec(fl.name) + " " + dec(fl.ty) + "\n";
+                j = j + 1;
+            }
+        } else {
+            out = out + "d " + dec(d.module) + " " + dec(d.name) + " enum " + dec(listLen(d.variants)) + "\n";
+            let j = 0;
+            while (j < listLen(d.variants)) {
+                const v = listGet(d.variants, j) catch dummyVariant();
+                out = out + "v " + dec(v.name) + " " + dec(listLen(v.fields)) + "\n";
+                let k = 0;
+                while (k < listLen(v.fields)) {
+                    const fl = listGet(v.fields, k) catch dummyField();
+                    out = out + "f " + dec(fl.name) + " " + dec(fl.ty) + "\n";
+                    k = k + 1;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    out = out + "funcs " + dec(listLen(prog.funcs)) + "\n";
+    i = 0;
+    while (i < listLen(prog.funcs)) {
+        const f = listGet(prog.funcs, i) catch dummyFn();
+        out = out + "fn " + dec(f.name) + " " + dec(f.module) + " " + dec(f.reg) + " " + dec(f.nparams) + " "
+        + dec(listLen(f.code)) + " " + dec(listLen(f.consts)) + " " + dec(listLen(f.lines)) + " "
+        + dec(listLen(f.ptys)) + " " + dec(f.ret) + "\n";
+        let j = 0;
+        while (j < listLen(f.code)) {
+            out = out + "i " + dec(listGet(f.code, j) catch 0) + "\n";
+            j = j + 1;
+        }
+        j = 0;
+        while (j < listLen(f.consts)) {
+            const c = listGet(f.consts, j) catch dummyConst();
+            if (c.tag == 5) {
+                out = out + "c 5 " + dec(c.vlen) + "\n";
+                let k = 0;
+                while (k < listLen(c.tbl)) {
+                    out = out + "j " + dec(listGet(c.tbl, k) catch 0) + "\n";
+                    k = k + 1;
+                }
+            } else if (c.tag == 7) {
+                out = out + "c 7 " + dec(c.i) + " " + dec(c.vi) + "\n";
+            } else if (c.tag == 8) {
+                out = out + "c 8 " + dec(c.i) + " " + dec(c.vlen) + "\n";
+            } else {
+                out = out + (if2line(c)) + "\n";
+            }
+            j = j + 1;
+        }
+        j = 0;
+        while (j < listLen(f.lines)) {
+            const lc = listGet(f.lines, j) catch dummyLine();
+            out = out + "l " + dec(lc.line) + " " + dec(lc.col) + "\n";
+            j = j + 1;
+        }
+        j = 0;
+        while (j < listLen(f.ptys)) {
+            out = out + "p " + dec(listGet(f.ptys, j) catch 0) + "\n";
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    out = out + "modules " + dec(listLen(prog.modules)) + "\n";
+    i = 0;
+    while (i < listLen(prog.modules)) {
+        const m = listGet(prog.modules, i) catch dummyModule();
+        out = out + "m " + dec(m.path) + " " + dec(m.state_ty) + " " + dec(m.init_fn) + "\n";
+        i = i + 1;
+    }
+
+    out = out + "tests " + dec(listLen(prog.tests)) + "\n";
+    i = 0;
+    while (i < listLen(prog.tests)) {
+        const t = listGet(prog.tests, i) catch dummyTest();
+        out = out + "tt " + dec(t.name) + " " + dec(t.func) + "\n";
+        i = i + 1;
+    }
+
+    out = out + "externs " + dec(listLen(prog.externs)) + "\n";
+    i = 0;
+    while (i < listLen(prog.externs)) {
+        const e = listGet(prog.externs, i) catch dummyExtern();
+        out = out + "e " + hexEncodeByteList(e.name, 0, listLen(e.name));
+        out = out + " " + dec(listLen(e.tags));
+        let j = 0;
+        while (j < listLen(e.tags)) {
+            out = out + " " + dec(listGet(e.tags, j) catch 0);
+            j = j + 1;
+        }
+        out = out + " " + dec(e.ret) + "\n";
+        i = i + 1;
+    }
+
+    out = out + "sigs " + dec(listLen(prog.sigs)) + "\n";
+    i = 0;
+    while (i < listLen(prog.sigs)) {
+        const s = listGet(prog.sigs, i) catch dummySig();
+        out = out + "s " + dec(s.ret) + " " + dec(listLen(s.params));
+        let j = 0;
+        while (j < listLen(s.params)) {
+            out = out + " " + dec(listGet(s.params, j) catch 0);
+            j = j + 1;
+        }
+        out = out + "\n";
+        i = i + 1;
+    }
+
+    const nstr = strCount(prog.st.starts);
+    out = out + "strtab " + dec(nstr) + "\n";
+    i = 0;
+    while (i < nstr) {
+        const hx = dumpStrtabEntry(prog, i);
+        if (len(hx) == 0) {
+            out = out + "h\n";
+        } else {
+            out = out + "h " + hx + "\n";
+        }
+        i = i + 1;
+    }
+    if (listLen(prog.ffiRaw) > 0) {
+        out = out + "ffi " + hexEncodeByteList(prog.ffiRaw, 0, listLen(prog.ffiRaw)) + "\n";
+    }
+    return out;
+}
+
+// roundtripCheck：decode→encode 与输入逐字节比对（只对 v6 输入；v4/v5 读入即展宽，重编码必为 v6）。
+// 返回码：0＝恒等；>0＝首个差异字节偏移＋1；-1＝decode 拒绝；-2＝截断长度差；-3＝非 v6 输入。
+export function roundtripCheck(data: string): int {
+    if ((byteAt(data, 3) catch 0) != FORMAT_VERSION || (byteAt(data, 4) catch 0) != 0) { return -3; }
+    const re = decodeToDump(data);
+    if (len(re) == 0) { return -1; }
+    const back = serializeDump(re);
+    if (listLen(back) == 0 && len(tx_last_error) > 0) { return -1; }
+    const n = len(data);
+    if (listLen(back) != n) { return -2; }
+    let i = 0;
+    while (i < n) {
+        if ((listGet(back, i) catch 0) != (byteAt(data, i) catch 0)) {
+            return i + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+function ctxShape(p: Ref<ProgramContext>): bool {
+    if (p.version != 2 || p.ok != 1 || len(p.error) > 0) { return false; }
+    if (listLen(p.cgRawStrings) > listLen(p.cgStrings)) { return false; }
+    let rawIndex = 0;
+    while (rawIndex < listLen(p.cgRawStrings)) {
+        const raw = listGet(p.cgRawStrings, rawIndex) catch bytesNew(0);
+        if (bytesLen(raw) > 0 && (listGet(p.cgStrings, rawIndex) catch "") != "") { return false; }
+        rawIndex = rawIndex + 1;
+    }
+    if (listLen(p.cgTysA) != listLen(p.cgTysK)) { return false; }
+    if (listLen(p.cgTysB) != listLen(p.cgTysK)) { return false; }
+    if (listLen(p.declNameIdx) != listLen(p.declMods)) { return false; }
+    if (listLen(p.declIsEnum) != listLen(p.declMods)) { return false; }
+    if (listLen(p.declFieldNames) != listLen(p.declMods)) { return false; }
+    if (listLen(p.declFieldTys) != listLen(p.declMods)) { return false; }
+    if (listLen(p.declVariantNames) != listLen(p.declMods)) { return false; }
+    if (listLen(p.declVarFNames) != listLen(p.declMods)) { return false; }
+    if (listLen(p.declVarFTys) != listLen(p.declMods)) { return false; }
+    if (listLen(p.fnModule) != listLen(p.fnNameIdx)) { return false; }
+    if (listLen(p.fnReg) != listLen(p.fnNameIdx)) { return false; }
+    if (listLen(p.fnNparams) != listLen(p.fnNameIdx)) { return false; }
+    if (listLen(p.fnCode) != listLen(p.fnNameIdx)) { return false; }
+    if (listLen(p.fnConstsK) != listLen(p.fnNameIdx)) { return false; }
+    if (listLen(p.fnConstsI) != listLen(p.fnNameIdx)) { return false; }
+    if (listLen(p.fnConstsTbl) != listLen(p.fnNameIdx)) { return false; }
+    if (listLen(p.fnConstsTblLen) != listLen(p.fnNameIdx)) { return false; }
+    if (listLen(p.fnLinesL) != listLen(p.fnNameIdx)) { return false; }
+    if (listLen(p.fnLinesC) != listLen(p.fnNameIdx)) { return false; }
+    if (listLen(p.fnPtys) != listLen(p.fnNameIdx)) { return false; }
+    if (listLen(p.fnRet) != listLen(p.fnNameIdx)) { return false; }
+    if (listLen(p.fnLandings) != listLen(p.fnNameIdx)) { return false; }
+    if (listLen(p.modOutState) != listLen(p.modOutPath)) { return false; }
+    if (listLen(p.modOutInit) != listLen(p.modOutPath)) { return false; }
+    if (listLen(p.testOutFunc) != listLen(p.testOutName)) { return false; }
+    if (listLen(p.extTags) != listLen(p.extNames)) { return false; }
+    if (listLen(p.extRets) != listLen(p.extNames)) { return false; }
+    if (listLen(p.ffiExt) > 0 && listLen(p.ffiExt) != listLen(p.extNames)) { return false; }
+    let i = 0; let variants = 0;
+    while (i < listLen(p.declMods)) {
+        if (listLen(listGet(p.declFieldNames, i) catch emptyIntsCtx()) != listLen(listGet(p.declFieldTys, i) catch emptyIntsCtx())) { return false; }
+        if (listLen(listGet(p.declVarFNames, i) catch emptyIntsCtx()) != listLen(listGet(p.declVarFTys, i) catch emptyIntsCtx())) { return false; }
+        const kind = listGet(p.declIsEnum, i) catch -1;
+        if (kind != 0 && kind != 1) { return false; }
+        if (kind == 1) {
+            const names = listGet(p.declVariantNames, i) catch emptyIntsCtx();
+            let j = 0; let count = 0;
+            while (j < listLen(names)) {
+                const nf = listGet(p.declVarFCnt, variants + j) catch -1;
+                if (nf < 0) { return false; } count = count + nf; j = j + 1;
+            }
+            if (count != listLen(listGet(p.declVarFNames, i) catch emptyIntsCtx())) { return false; }
+            variants = variants + listLen(names);
+        }
+        i = i + 1;
+    }
+    if (variants != listLen(p.declVarFCnt)) { return false; }
+    i = 0;
+    while (i < listLen(p.fnNameIdx)) {
+        const kinds = listGet(p.fnConstsK, i) catch emptyIntsCtx();
+        const vals = listGet(p.fnConstsI, i) catch emptyIntsCtx();
+        const lengths = listGet(p.fnConstsTblLen, i) catch emptyIntsCtx();
+        if (listLen(kinds) != listLen(vals) || listLen(kinds) != listLen(lengths)) { return false; }
+        let j = 0; let count = 0;
+        while (j < listLen(kinds)) {
+            const kind = listGet(kinds, j) catch 0; const size = listGet(lengths, j) catch -1;
+            if (kind < 1 || kind > 9 || size < 0) { return false; }
+            if ((kind == 7 || kind == 8) && size != 2) { return false; }
+            if (kind != 5 && kind != 7 && kind != 8 && size != 0) { return false; }
+            count = count + size; j = j + 1;
+        }
+        if (count != listLen(listGet(p.fnConstsTbl, i) catch emptyIntsCtx())) { return false; }
+        if (listLen(listGet(p.fnLinesL, i) catch emptyIntsCtx()) != listLen(listGet(p.fnLinesC, i) catch emptyIntsCtx())) { return false; }
+        i = i + 1;
+    }
+    i = 0; while (i < listLen(p.fnSigDescs)) {
+        if (listLen(listGet(p.fnSigDescs, i) catch emptyIntsCtx()) < 1) { return false; } i = i + 1;
+    }
+    return true;
+}
+
+struct ProgramBytes { bytes: List<int>, error: string }
+function emptyIntsCtx(): List<int> { return listNew(); }
+export function programBytesOut(r: Ref<ProgramBytes>): List<int> { return r.bytes; }
+export function programBytesError(r: Ref<ProgramBytes>): string { return r.error; }
+export function serializeProgramContext(p: Ref<ProgramContext>): Ref<ProgramBytes> {
+    const result = new ProgramBytes { bytes: listNew(), error: "" };
+    if (!ctxShape(p) || !ctxIdsOk(p)) { result.error = "BadProgramContext"; return result; }
+    // Direct UTF8 string interning; no PROGDUMP, hex bytes or reconstructed Ty/Fn/Const objects.
+    const buckets: List<int> = listNew(); const next: List<int> = listNew();
+    const unique: List<int> = listNew(); const map: List<int> = listNew();
+    let i = 0; while (i < 4096) { listPush(buckets, -1); i = i + 1; }
+    i = 0;
+    while (i < listLen(p.cgStrings)) {
+        const data = programStringBytes(p, i); let h = 2166136261; let k = 0;
+        while (k < bytesLen(data)) { h = imul(h ^ (bytesGet(data, k) catch 0), 16777619); k = k + 1; }
+        const bucket = (h & 0x7FFFFFFF) % 4096;
+        let found = listGet(buckets, bucket) catch -1;
+        while (found >= 0) {
+            if (programStringsEqual(p, listGet(unique, found) catch 0, i)) { break; }
+            found = listGet(next, found) catch -1;
+        }
+        if (found < 0) { found = listLen(unique); listPush(unique, i); listPush(next, listGet(buckets, bucket) catch -1); listSet(buckets, bucket, found); }
+        listPush(map, found); i = i + 1;
+    }
+    const buf = result.bytes;
+    const hasFfi = listLen(p.ffiExt) > 0;
+    w8(buf, 0x54); w8(buf, 0x58); w8(buf, 0x43);
+    w16(buf, FORMAT_VERSION);
+    wvarint(buf, 0);
+    wvarint(buf, listLen(unique)); i = 0;
+    while (i < listLen(unique)) {
+        const data = programStringBytes(p, listGet(unique, i) catch 0); wvarint(buf, bytesLen(data)); let j = 0;
+        while (j < bytesLen(data)) { w8(buf, bytesGet(data, j) catch 0); j = j + 1; } i = i + 1;
+    }
+    wvarint(buf, listLen(p.cgTysK)); i = 0;
+    while (i < listLen(p.cgTysK)) { w8(buf, listGet(p.cgTysK, i) catch 0); wvarint(buf, listGet(p.cgTysA, i) catch 0); wvarint(buf, listGet(p.cgTysB, i) catch 0); i = i + 1; }
+    wvarint(buf, listLen(p.declMods)); i = 0; let variantStart = 0;
+    while (i < listLen(p.declMods)) {
+        wvarint(buf, listGet(p.declMods, i) catch 0); wvarint(buf, mapAt(map, listGet(p.declNameIdx, i) catch 0));
+        if ((listGet(p.declIsEnum, i) catch 0) == 0) {
+            const names = listGet(p.declFieldNames, i) catch emptyIntsCtx(); const tys = listGet(p.declFieldTys, i) catch emptyIntsCtx();
+            w8(buf, 1); wvarint(buf, listLen(names)); let j = 0;
+            while (j < listLen(names)) { wvarint(buf, mapAt(map, listGet(names, j) catch 0)); wvarint(buf, listGet(tys, j) catch 0); j = j + 1; }
+        } else {
+            const names = listGet(p.declVariantNames, i) catch emptyIntsCtx(); const fns = listGet(p.declVarFNames, i) catch emptyIntsCtx(); const tys = listGet(p.declVarFTys, i) catch emptyIntsCtx();
+            w8(buf, 2); wvarint(buf, listLen(names)); let j = 0; let at = 0;
+            while (j < listLen(names)) {
+                const nf = listGet(p.declVarFCnt, variantStart + j) catch 0;
+                wvarint(buf, mapAt(map, listGet(names, j) catch 0)); wvarint(buf, nf); let k = 0;
+                while (k < nf) { wvarint(buf, mapAt(map, listGet(fns, at) catch 0)); wvarint(buf, listGet(tys, at) catch 0); at = at + 1; k = k + 1; }
+                j = j + 1;
+            }
+            variantStart = variantStart + listLen(names);
+        }
+        i = i + 1;
+    }
+    wvarint(buf, listLen(p.fnNameIdx)); i = 0;
+    while (i < listLen(p.fnNameIdx)) {
+        wvarint(buf, mapAt(map, listGet(p.fnNameIdx, i) catch 0));
+        wvarint(buf, listGet(p.fnModule, i) catch 0); wvarint(buf, listGet(p.fnReg, i) catch 0); wvarint(buf, listGet(p.fnNparams, i) catch 0);
+        const code = listGet(p.fnCode, i) catch emptyIntsCtx(); wvarint(buf, listLen(code)); let j = 0;
+        while (j < listLen(code)) { wvarint(buf, listGet(code, j) catch 0); j = j + 1; }
+        const kinds = listGet(p.fnConstsK, i) catch emptyIntsCtx(); const values = listGet(p.fnConstsI, i) catch emptyIntsCtx();
+        const table = listGet(p.fnConstsTbl, i) catch emptyIntsCtx(); const sizes = listGet(p.fnConstsTblLen, i) catch emptyIntsCtx();
+        wvarint(buf, listLen(kinds)); j = 0; let at = 0;
+        while (j < listLen(kinds)) {
+            const kind = listGet(kinds, j) catch 0; const value = listGet(values, j) catch 0; const size = listGet(sizes, j) catch 0;
+            w8(buf, kind);
+            if (kind == 1) { wzigzag(buf, value); }
+            else if (kind == 2) { w64(buf, value); }
+            else if (kind == 5) { wvarint(buf, size); let k = 0; while (k < size) { wvarint(buf, listGet(table, at + k) catch 0); k = k + 1; } }
+            else if (kind == 7 || kind == 8) { wvarint(buf, value); wvarint(buf, listGet(table, at + 1) catch 0); }
+            else if (kind == 3) { wvarint(buf, mapAt(map, value)); }
+            else { wvarint(buf, value); }
+            at = at + size; j = j + 1;
+        }
+        const ll = listGet(p.fnLinesL, i) catch emptyIntsCtx(); const lc = listGet(p.fnLinesC, i) catch emptyIntsCtx(); wvarint(buf, listLen(ll)); j = 0;
+        while (j < listLen(ll)) { wvarint(buf, listGet(ll, j) catch 0); wvarint(buf, listGet(lc, j) catch 0); j = j + 1; }
+        const params = listGet(p.fnPtys, i) catch emptyIntsCtx(); wvarint(buf, listLen(params)); j = 0;
+        while (j < listLen(params)) { wvarint(buf, listGet(params, j) catch 0); j = j + 1; }
+        wvarint(buf, listGet(p.fnRet, i) catch 0); i = i + 1;
+    }
+    wvarint(buf, listLen(p.modOutPath)); i = 0;
+    while (i < listLen(p.modOutPath)) { wvarint(buf, mapAt(map, listGet(p.modOutPath, i) catch 0)); wvarint(buf, listGet(p.modOutState, i) catch 0); wvarint(buf, listGet(p.modOutInit, i) catch 0); i = i + 1; }
+    wvarint(buf, listLen(p.testOutName)); i = 0;
+    while (i < listLen(p.testOutName)) { wvarint(buf, mapAt(map, listGet(p.testOutName, i) catch 0)); wvarint(buf, listGet(p.testOutFunc, i) catch 0); i = i + 1; }
+    wvarint(buf, p.entry);
+    if (listLen(p.extNames) > 0) {
+        wbytesStr(buf, "TXEXT"); wvarint(buf, listLen(p.extNames)); i = 0;
+        while (i < listLen(p.extNames)) { const name = listGet(p.extNames, i) catch ""; const tags = listGet(p.extTags, i) catch emptyIntsCtx();
+            wvarint(buf, len(name)); wbytesStr(buf, name); wvarint(buf, listLen(tags)); let j = 0;
+            while (j < listLen(tags)) { w8(buf, listGet(tags, j) catch 0); j = j + 1; } w8(buf, listGet(p.extRets, i) catch 0); i = i + 1;
+        }
+    }
+    if (listLen(p.fnSigDescs) > 0) {
+        wbytesStr(buf, "TXFNT"); wvarint(buf, listLen(p.fnSigDescs)); i = 0;
+        while (i < listLen(p.fnSigDescs)) { const sig = listGet(p.fnSigDescs, i) catch emptyIntsCtx(); const count = listLen(sig) - 1;
+            wvarint(buf, listGet(sig, count) catch 0); wvarint(buf, count); let j = 0;
+            while (j < count) { wvarint(buf, listGet(sig, j) catch 0); j = j + 1; } i = i + 1;
+        }
+    }
+    if (hasFfi) {
+        wbytesStr(buf, "TXFFI");
+        const pay = ffiPayload(p.ffiLibs, p.ffiExt, p.ffiLay, p.ffiCb, p.ffiCbFn);
+        i = 0;
+        while (i < listLen(pay)) { w8(buf, listGet(pay, i) catch 0); i = i + 1; }
+    }
+    return result;
+}
+
+function ctxIndex(v: int, n: int): bool { return v >= 0 && v < n; }
+function ctxIndexList(values: List<int>, n: int): bool {
+    let i = 0; while (i < listLen(values)) { if (!ctxIndex(listGet(values, i) catch -1, n)) { return false; } i = i + 1; } return true;
+}
+function ctxIndexRows(rows: List<List<int>>, n: int): bool {
+    let i = 0; while (i < listLen(rows)) { if (!ctxIndexList(listGet(rows, i) catch emptyIntsCtx(), n)) { return false; } i = i + 1; } return true;
+}
+function ctxIdsOk(p: Ref<ProgramContext>): bool {
+    const ns = listLen(p.cgStrings); const nt = listLen(p.cgTysK); const nf = listLen(p.fnNameIdx); const nm = listLen(p.modOutPath);
+    if (!ctxIndexList(p.fnNameIdx, ns) || !ctxIndexList(p.declNameIdx, ns) || !ctxIndexList(p.modOutPath, ns) || !ctxIndexList(p.testOutName, ns)) { return false; }
+    if (!ctxIndexRows(p.declFieldNames, ns) || !ctxIndexRows(p.declVariantNames, ns) || !ctxIndexRows(p.declVarFNames, ns)) { return false; }
+    if (!ctxIndexList(p.fnModule, nm) || !ctxIndexList(p.declMods, nm) || !ctxIndexList(p.modOutInit, nf) || !ctxIndexList(p.testOutFunc, nf)) { return false; }
+    if (!ctxIndexList(p.modOutState, nt) || !ctxIndexRows(p.declFieldTys, nt) || !ctxIndexRows(p.declVarFTys, nt) || !ctxIndexRows(p.fnPtys, nt)) { return false; }
+    if (p.entry != INVALID_ENTRY && !ctxIndex(p.entry, nf)) { return false; }
+    let i = 0;
+    while (i < nf) {
+        const ret = listGet(p.fnRet, i) catch -1;
+        if (ret != INVALID_ENTRY && !ctxIndex(ret, nt)) { return false; }
+        const kinds = listGet(p.fnConstsK, i) catch emptyIntsCtx(); const vals = listGet(p.fnConstsI, i) catch emptyIntsCtx(); let j = 0;
+        while (j < listLen(kinds)) {
+            if ((listGet(kinds, j) catch 0) == 3 && !ctxIndex(listGet(vals, j) catch -1, ns)) { return false; } j = j + 1;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+export function programContextValid(p: Ref<ProgramContext>): bool { return ctxShape(p) && ctxIdsOk(p); }

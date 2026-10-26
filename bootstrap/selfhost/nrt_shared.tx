@@ -1,0 +1,328 @@
+// NRT 的 Shared 与 Atomic（线程第 4c 步，docs/design/v052-threads-v0.1-20261015.md §二十一、§二十四）。
+//
+// 共享块：sharedNew(v) 用发送方的共享模式（nrt_send.tx 模式 1）把 v 可达的对象图编成进程级的块，块头 @64 是原子
+// 引用数，最后一份放手时归还块（块里内嵌的共享块引用随之放手）。
+// 句柄 Shared<T>：值标签 20，Obj72 kind 14、payload kind 11；ptr@32 指向块并持块的一份计数，结果值位 @56/@64 缓存
+// 本线程物化出的根（标签 None＝尚未物化）。每个线程按块缓存句柄：线程块 TB_SHARED_CACHE 处的 {ptr, 字节数, 容量}，
+// 每项 16 字节 {块, 句柄号}，句柄归零时摘除。同一个块再次进入本线程（发送进来、嵌在别的块里）时复用句柄，所以
+// 句柄活着时 sharedGet 每次返回同一个物化根（§二十一-1 语义差异第 2 条）。
+// sharedGet(s)：首次在本线程借用物化（__tx_recv_value 模式 1），以后返回缓存的根；根是值类型（struct 值、enum 值、
+// 定长数组）时按值语义交一份拷贝（拷贝可写，其中的句柄仍指向冻结的对象）。
+// Atomic<int>：值标签 21，Obj72 kind 15、payload kind 12，ptr@32 指向 8 字节值单元、len@40 为 8。atomicNew 在本线程
+// 分配单元；从共享块物化出的 Atomic 借用块里的单元（对象头位 32，块地址在 @64），各线程看到同一个单元。五个操作都
+// 是 seqcst：读是普通 8 字节读（x86-64 上与 xchg、lock 前缀的写一起构成顺序一致），写用 xchg，比较交换用
+// lock cmpxchg；加也用 lock cmpxchg 循环，溢出同 `+` trap 4004（环绕须显式）。
+//
+// 归零（nrt.tx 的 __tx_rc_zero_cascade 分派）：句柄摘缓存、放掉缓存的根与块计数；借用载荷的对象放掉块计数（载荷
+// 属于块，不归还）；本线程的 Atomic 归还值单元。线程结束时仍活着的句柄与借用对象由 __tx_thread_drop_live 放掉块计数。
+import { Operand, StructuredBuffer, asBufferLabel, asBufferInstruction, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem } from "./assemble";
+import { RtFn, L, I, A } from "./rtfn_base";
+import { rtBegin, rtSet, rtOp, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtCall5, rtLoadAcq, rtAtomicXchg, rtAtomicCas, rtRet, rtRetVoid } from "./rtfn";
+import { check, arity, argTag, trapText, trapAt, ARITY } from "./nrt_base";
+import { TB_SHARED_CACHE } from "./thread_block_abi";
+
+const TAG_INT: int = 1;
+const TAG_BOOL: int = 3;
+const TAG_NONE: int = 4;
+const TAG_SHARED: int = 20;
+const TAG_ATOMIC: int = 21;
+const LOW32: int = 4294967295;
+// ObjectSpec64 的 site|pk<<32：句柄 payload kind 11、Atomic payload kind 12。
+const SPEC_HANDLE: int = 47244640256;
+const SPEC_ATOMIC: int = 51539607552;
+// 块计数的越线判定与饱和值（2^62、0xC000000000000000）。
+const SHR_LINE: int = 4611686018427387904;
+const SHR_SAT: int = -4611686018427387904;
+
+export const NRT_SHARED_EXPORTS: string = "__tx_bi_shared_new __tx_bi_shared_get __tx_bi_atomic_new __tx_bi_atomic_load __tx_bi_atomic_store __tx_bi_atomic_add __tx_bi_atomic_cas";
+
+function ins(b: Ref<StructuredBuffer>, mn: string, n: int, a: Ref<Operand>, c: Ref<Operand>): void {
+    asBufferInstruction(b, mn, n, a, c, asStructuredMissing(), 1);
+}
+function r64(n: int): Ref<Operand> { return asStructuredReg(0, n); }
+function r32(n: int): Ref<Operand> { return asStructuredReg(1, n); }
+function none(): Ref<Operand> { return asStructuredMissing(); }
+
+// A64（macOS 适配 M4 设计 A7）：交换与比较交换用 rtfn（SWPAL、CASAL；与 LDAR／STLR 合起来顺序一致，同 x86 的加锁指令
+// 对这些单元的效果）。
+function atomicsA64(b: Ref<StructuredBuffer>): void {
+    let f = rtBegin(b, "__tx_atomic_xchg", "p v", "old", 0, "bootstrap/selfhost/nrt_shared.tx");
+    rtAtomicXchg(f, "old", L("p"), 0, L("v"));
+    rtRet(f, L("old")); check(f);
+    f = rtBegin(b, "__tx_atomic_cas", "p e n", "old r", 0, "bootstrap/selfhost/nrt_shared.tx");
+    rtAtomicCas(f, "old", L("p"), 0, L("e"), L("n"));
+    rtSet(f, "r", I(0));
+    rtIf(f, L("old"), "ne", L("e"), "out");
+    rtSet(f, "r", I(1));
+    rtLabel(f, "out");
+    rtRet(f, L("r")); check(f);
+}
+
+/// Shared 与 Atomic 的内核例程。
+export function emitNrtShared(b: Ref<StructuredBuffer>): void {
+    if (b.a64) { atomicsA64(b); emitHandles(b); emitBuiltins(b); return; }
+    // __tx_atomic_xchg(p, v) → 旧值（xchg 带内存操作数即加锁，全屏障）。
+    asBufferLabel(b, "__tx_atomic_xchg", 1);
+    ins(b, "mov", 2, r64(0), r64(2));
+    ins(b, "xchg", 2, asStructuredMem(2, 1, -1, 0, 0, 0, ""), r64(0));
+    ins(b, "ret", 0, none(), none());
+    // __tx_atomic_cas(p, expect, new) → 1 成功、0 失败（lock cmpxchg，全屏障；比较值在 rax）。
+    asBufferLabel(b, "__tx_atomic_cas", 1);
+    ins(b, "mov", 2, r64(0), r64(2));
+    ins(b, "lockcmpxchg", 2, asStructuredMem(2, 1, -1, 0, 0, 0, ""), r64(8));
+    ins(b, "mov", 2, r32(0), asStructuredImm(1));
+    ins(b, "je", 1, asStructuredTarget("__tx_atomic_cas_out"), none());
+    ins(b, "xor", 2, r32(0), r32(0));
+    asBufferLabel(b, "__tx_atomic_cas_out", 1);
+    ins(b, "ret", 0, none(), none());
+    emitHandles(b);
+    emitBuiltins(b);
+}
+
+function emitHandles(b: Ref<StructuredBuffer>): void {
+    // 块计数（64 位，块头 @64）的饱和（容量评估 §五-5 的裁决）：lock xadd 之后看旧值，越过 2^62 即写回饱和值
+    // 0xC000000000000000、永不归还；并发线程要凑齐 2^61 次同时越线才可能回绕。
+    // __tx_shared_inc(blk, n)：块计数加 n。
+    let f = rtBegin(b, "__tx_shared_inc", "blk n", "x old", 2, "bootstrap/selfhost/nrt_shared.tx");
+    rtOp(f, "x", L("blk"), "add", I(64));
+    rtCall2(f, "old", "__tx_atomic_add", L("x"), L("n"));
+    rtIf(f, L("old"), "ule", I(SHR_LINE), "done");
+    rtCall2(f, "", "__tx_atomic_xchg", L("x"), I(SHR_SAT));
+    rtLabel(f, "done"); rtRetVoid(f); check(f);
+
+    // __tx_shared_dec(blk) → 1：放掉的是最后一份，块已无别的持有者、由调用方归还；否则 0（含饱和块，永不归还）。
+    f = rtBegin(b, "__tx_shared_dec", "blk", "x old", 2, "bootstrap/selfhost/nrt_shared.tx");
+    rtOp(f, "x", L("blk"), "add", I(64));
+    rtCall2(f, "old", "__tx_atomic_add", L("x"), I(-1));
+    rtIf(f, L("old"), "ugt", I(SHR_LINE), "sat");
+    rtIf(f, L("old"), "ne", I(1), "keep");
+    rtRet(f, I(1));
+    rtLabel(f, "sat");
+    rtCall2(f, "", "__tx_atomic_xchg", L("x"), I(SHR_SAT));
+    rtLabel(f, "keep"); rtRet(f, I(0)); check(f);
+
+    // __tx_shared_release(blk)：放掉块的一份计数；最后一份归还块（块里嵌的共享块随之放手，__tx_xblk_free 循环处理，不递归）。
+    f = rtBegin(b, "__tx_shared_release", "blk", "last", 1, "bootstrap/selfhost/nrt_shared.tx");
+    rtCall1(f, "last", "__tx_shared_dec", L("blk"));
+    rtIf(f, L("last"), "eq", I(0), "done");
+    rtCall1(f, "", "__tx_xblk_free", L("blk"));
+    rtLabel(f, "done"); rtRetVoid(f); check(f);
+
+    // __tx_shared_handle(blk, take) → 本线程该块的句柄号（调用方持一份新引用）。缓存命中：retain 句柄，take＝1 时
+    // 调用方带来的那份块计数多余，放掉。未命中：建句柄（take＝0 时句柄另加一份块计数），记进缓存。
+    f = rtBegin(b, "__tx_shared_handle", "blk take", "vec p e end idx vt vp va s0 s1 s2 s3 s4 s5 s6 s7 sp", 2, "bootstrap/selfhost/nrt_shared.tx");
+    rtSet(f, "vec", A("__tx_nrt_tb")); rtOp(f, "vec", L("vec"), "add", I(TB_SHARED_CACHE));
+    rtLoad(f, "p", L("vec"), 0, 8); rtLoad(f, "end", L("vec"), 8, 8); rtOp(f, "end", L("end"), "add", L("p"));
+    rtSet(f, "e", L("p"));
+    rtLabel(f, "find");
+    rtIf(f, L("e"), "uge", L("end"), "miss");
+    rtLoad(f, "idx", L("e"), 0, 8);
+    rtIf(f, L("idx"), "eq", L("blk"), "hit");
+    rtOp(f, "e", L("e"), "add", I(16)); rtJump(f, "find");
+    rtLabel(f, "hit");
+    rtLoad(f, "idx", L("e"), 8, 8);
+    rtSet(f, "vt", I(TAG_SHARED)); rtSet(f, "vp", L("idx")); rtAddrOf(f, "va", "vt");
+    rtCall1(f, "", "__tx_retain", L("va"));
+    rtIf(f, L("take"), "eq", I(0), "out");
+    rtCall1(f, "", "__tx_shared_release", L("blk"));
+    rtJump(f, "out");
+    rtLabel(f, "miss");
+    rtIf(f, L("take"), "ne", I(0), "make");
+    rtCall2(f, "", "__tx_shared_inc", L("blk"), I(1));
+    rtLabel(f, "make");
+    rtSet(f, "s0", I(14)); rtSet(f, "s1", I(SPEC_HANDLE)); rtSet(f, "s2", L("blk")); rtSet(f, "s3", I(0));
+    rtSet(f, "s4", I(0)); rtSet(f, "s5", I(0)); rtSet(f, "s6", I(TAG_NONE)); rtSet(f, "s7", I(0));
+    rtAddrOf(f, "sp", "s0");
+    rtCall1(f, "idx", "__tx_native_object_create_v1", L("sp"));
+    rtOp(f, "idx", L("idx"), "and", I(LOW32));
+    rtCall2(f, "e", "__tx_sx_reserve", L("vec"), I(16));
+    rtStore(f, L("e"), 0, L("blk"), 8); rtStore(f, L("e"), 8, L("idx"), 8);
+    rtLabel(f, "out");
+    rtRet(f, L("idx")); check(f);
+
+    // __tx_shared_uncache(idx)：从本线程的缓存摘掉句柄 idx（末项补位）。
+    f = rtBegin(b, "__tx_shared_uncache", "idx", "vec p e end x", 0, "bootstrap/selfhost/nrt_shared.tx");
+    rtOp(f, "idx", L("idx"), "and", I(LOW32));
+    rtSet(f, "vec", A("__tx_nrt_tb")); rtOp(f, "vec", L("vec"), "add", I(TB_SHARED_CACHE));
+    rtLoad(f, "p", L("vec"), 0, 8); rtLoad(f, "end", L("vec"), 8, 8); rtOp(f, "end", L("end"), "add", L("p"));
+    rtSet(f, "e", L("p"));
+    rtLabel(f, "find");
+    rtIf(f, L("e"), "uge", L("end"), "done");
+    rtLoad(f, "x", L("e"), 8, 8);
+    rtIf(f, L("x"), "eq", L("idx"), "hit");
+    rtOp(f, "e", L("e"), "add", I(16)); rtJump(f, "find");
+    rtLabel(f, "hit");
+    rtOp(f, "end", L("end"), "sub", I(16));
+    rtLoad(f, "x", L("end"), 0, 8); rtStore(f, L("e"), 0, L("x"), 8);
+    rtLoad(f, "x", L("end"), 8, 8); rtStore(f, L("e"), 8, L("x"), 8);
+    rtLoad(f, "x", L("vec"), 8, 8); rtOp(f, "x", L("x"), "sub", I(16)); rtStore(f, L("vec"), 8, L("x"), 8);
+    rtLabel(f, "done"); rtRetVoid(f); check(f);
+
+    // __tx_shared_drop(idx)：句柄归零——摘缓存，放掉缓存的根，归还槽位，最后放掉块计数。
+    f = rtBegin(b, "__tx_shared_drop", "idx", "o blk rt rp ra", 1, "bootstrap/selfhost/nrt_shared.tx");
+    rtOp(f, "idx", L("idx"), "and", I(LOW32));
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("idx"));
+    rtLoad(f, "blk", L("o"), 32, 8); rtLoad(f, "rt", L("o"), 56, 8); rtLoad(f, "rp", L("o"), 64, 8);
+    rtCall1(f, "", "__tx_shared_uncache", L("idx"));
+    rtAddrOf(f, "ra", "rt");
+    rtCall1(f, "", "__tx_release", L("ra"));
+    rtCall1(f, "", "__tx_store_zero_tail", L("idx"));
+    rtCall1(f, "", "__tx_shared_release", L("blk"));
+    rtRetVoid(f); check(f);
+
+    // __tx_shared_unborrow(idx)：借用载荷的对象归零——载荷属于块，不归还；归还槽位后放掉块计数。
+    f = rtBegin(b, "__tx_shared_unborrow", "idx", "o blk", 1, "bootstrap/selfhost/nrt_shared.tx");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("idx"));
+    rtLoad(f, "blk", L("o"), 64, 8);
+    rtCall1(f, "", "__tx_store_zero_tail", L("idx"));
+    rtCall1(f, "", "__tx_shared_release", L("blk"));
+    rtRetVoid(f); check(f);
+
+    // __tx_atomic_drop(idx)：本线程的 Atomic 归零——归还值单元与槽位。
+    f = rtBegin(b, "__tx_atomic_drop", "idx", "o p", 1, "bootstrap/selfhost/nrt_shared.tx");
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("idx"));
+    rtLoad(f, "p", L("o"), 32, 8);
+    rtCall1(f, "", "__tx_native_mem_free", L("p"));
+    rtCall1(f, "", "__tx_store_zero_tail", L("idx"));
+    rtRetVoid(f); check(f);
+}
+
+/// 第 0 个实参的 Atomic 值单元地址放进 p（实参不是 Atomic 时跳 type）。
+function atomicCell(f: Ref<RtFn>): void {
+    argTag(f, 0, "s", "t", TAG_ATOMIC, "type");
+    rtLoad(f, "p", L("s"), 8, 4);
+    rtCall1(f, "p", "__tx_native_object_address_v1", L("p"));
+    rtLoad(f, "p", L("p"), 32, 8);
+}
+
+function emitBuiltins(b: Ref<StructuredBuffer>): void {
+    // sharedNew(v): Shared<T> — v 可达的对象图编成共享块（引用数 1，归新句柄）。经函数值、接口值带入不可共享的成分时
+    // trap 4021（静态类型里直接出现的前端已报 3035）。
+    let f = rtBegin(b, "__tx_bi_shared_new", "win fn pc a nargs", "s t blk h", 5, "bootstrap/selfhost/nrt_shared.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", -1, "");
+    rtCall2(f, "blk", "__tx_send_value", L("s"), I(1));
+    rtIf(f, L("blk"), "ult", I(16), "unshare");
+    rtStore(f, L("blk"), 64, I(1), 8);
+    rtCall2(f, "h", "__tx_shared_handle", L("blk"), I(1));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_SHARED), L("h"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    rtLabel(f, "unshare");
+    rtIf(f, L("blk"), "eq", I(2), "unshare2");
+    trapText(b, f, 4021, "sharedNew 的实参经函数值或接口值带入了 Weak、Future、Gen 或 Thread");
+    trapAt(b, f, "unshare2", 4021, "sharedNew 的实参含不可共享的函数值或接口值（其捕获或具体类型含 Weak、Future、Gen、Thread 或平台句柄）");
+    rtRetVoid(f); check(f);
+
+    // sharedGet(s): T — 首次在本线程借用物化并缓存根，以后返回缓存的根（各持一份新引用）。
+    f = rtBegin(b, "__tx_bi_shared_get", "win fn pc a nargs", "s t h o blk ct cp ca", 5, "bootstrap/selfhost/nrt_shared.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", TAG_SHARED, "type");
+    rtLoad(f, "h", L("s"), 8, 4);
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("h"));
+    rtLoad(f, "ct", L("o"), 56, 8); rtLoad(f, "cp", L("o"), 64, 8);
+    rtIf(f, L("ct"), "ne", I(TAG_NONE), "have");
+    rtLoad(f, "blk", L("o"), 32, 8);
+    rtAddrOf(f, "ca", "ct");
+    rtCall3(f, "", "__tx_recv_value", L("blk"), L("ca"), I(1));
+    // 物化会建对象、槽表可能搬移：重新取址后缓存根（句柄持这份引用）。
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("h"));
+    rtStore(f, L("o"), 56, L("ct"), 8); rtStore(f, L("o"), 64, L("cp"), 8);
+    rtLabel(f, "have");
+    rtAddrOf(f, "ca", "ct");
+    rtCall1(f, "", "__tx_retain", L("ca"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), L("ct"), L("cp"));
+    // 值类型的根（struct 值、enum 值、定长数组）按值语义交一份拷贝：拷贝归调用方、可写，其中的句柄（Ref、List、
+    // 字符串等）仍指向冻结的对象；Ref 等句柄类型的根直接交出（同一线程里同一个根）。
+    rtOp(f, "t", L("ct"), "and", I(255));
+    rtIf(f, L("t"), "eq", I(7), "copy"); rtIf(f, L("t"), "eq", I(8), "copy"); rtIf(f, L("t"), "eq", I(10), "copy");
+    rtRetVoid(f);
+    rtLabel(f, "copy");
+    rtCall5(f, "", "__tx_clone", L("win"), L("fn"), L("pc"), L("a"), L("a"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "sharedGet 的实参不是 Shared");
+    rtRetVoid(f); check(f);
+
+    // atomicNew(v: int): Atomic<int> — 本线程分配 8 字节值单元。
+    f = rtBegin(b, "__tx_bi_atomic_new", "win fn pc a nargs", "s t v p s0 s1 s2 s3 s4 s5 s6 s7 sp", 5, "bootstrap/selfhost/nrt_shared.tx");
+    arity(b, f, 1);
+    argTag(f, 0, "s", "t", TAG_INT, "type");
+    rtLoad(f, "v", L("s"), 8, 8);
+    rtCall2(f, "p", "__tx_native_mem_alloc", I(8), I(8));
+    rtIf(f, L("p"), "eq", I(0), "oom");
+    rtStore(f, L("p"), 0, L("v"), 8);
+    rtSet(f, "s0", I(15)); rtSet(f, "s1", I(SPEC_ATOMIC)); rtSet(f, "s2", L("p")); rtSet(f, "s3", I(8));
+    rtSet(f, "s4", I(0)); rtSet(f, "s5", I(0)); rtSet(f, "s6", I(TAG_NONE)); rtSet(f, "s7", I(0));
+    rtAddrOf(f, "sp", "s0");
+    rtCall1(f, "s0", "__tx_native_object_create_v1", L("sp"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_ATOMIC), L("s0"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "atomicNew 的实参不是 int");
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRetVoid(f); check(f);
+
+    // atomicLoad(x): int
+    f = rtBegin(b, "__tx_bi_atomic_load", "win fn pc a nargs", "s t p v", 5, "bootstrap/selfhost/nrt_shared.tx");
+    arity(b, f, 1);
+    atomicCell(f);
+    rtLoadAcq(f, "v", L("p"), 0);
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_INT), L("v"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "atomicLoad 的实参不是 Atomic");
+    rtRetVoid(f); check(f);
+
+    // atomicStore(x, v): void
+    f = rtBegin(b, "__tx_bi_atomic_store", "win fn pc a nargs", "s t p v", 5, "bootstrap/selfhost/nrt_shared.tx");
+    arity(b, f, 2);
+    atomicCell(f);
+    argTag(f, 1, "s", "t", TAG_INT, "type2");
+    rtLoad(f, "v", L("s"), 8, 8);
+    rtCall2(f, "", "__tx_atomic_xchg", L("p"), L("v"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "atomicStore 的第一实参不是 Atomic");
+    trapAt(b, f, "type2", 4010, "atomicStore 的第二实参不是 int");
+    rtRetVoid(f); check(f);
+
+    // atomicAdd(x, d): int — 返回旧值。溢出同 `+` trap 4004（环绕须显式，同 imul）：读、带检查地加、lock cmpxchg
+    // 换上，被别的线程抢先改过就重来；溢出判定（旧值与和异号、增量与和异号）在换上之前，溢出时单元不变。
+    f = rtBegin(b, "__tx_bi_atomic_add", "win fn pc a nargs", "s t p d old sum x y", 5, "bootstrap/selfhost/nrt_shared.tx");
+    arity(b, f, 2);
+    atomicCell(f);
+    argTag(f, 1, "s", "t", TAG_INT, "type2");
+    rtLoad(f, "d", L("s"), 8, 8);
+    rtLabel(f, "retry");
+    rtLoad(f, "old", L("p"), 0, 8);
+    rtOp(f, "sum", L("old"), "add", L("d"));
+    rtOp(f, "x", L("old"), "xor", L("sum")); rtOp(f, "y", L("d"), "xor", L("sum")); rtOp(f, "x", L("x"), "and", L("y"));
+    rtIf(f, L("x"), "lt", I(0), "overflow");
+    rtCall3(f, "x", "__tx_atomic_cas", L("p"), L("old"), L("sum"));
+    rtIf(f, L("x"), "eq", I(0), "retry");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_INT), L("old"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "atomicAdd 的第一实参不是 Atomic");
+    trapAt(b, f, "type2", 4010, "atomicAdd 的第二实参不是 int");
+    trapAt(b, f, "overflow", 4004, "atomicAdd 溢出（int 64 位）");
+    rtRetVoid(f); check(f);
+
+    // atomicCas(x, expect, new): bool — 当前值等于 expect 时换成 new，返回是否换成。
+    f = rtBegin(b, "__tx_bi_atomic_cas", "win fn pc a nargs", "s t p e v", 5, "bootstrap/selfhost/nrt_shared.tx");
+    arity(b, f, 3);
+    atomicCell(f);
+    argTag(f, 1, "s", "t", TAG_INT, "type2");
+    rtLoad(f, "e", L("s"), 8, 8);
+    argTag(f, 2, "s", "t", TAG_INT, "type3");
+    rtLoad(f, "v", L("s"), 8, 8);
+    rtCall3(f, "v", "__tx_atomic_cas", L("p"), L("e"), L("v"));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_BOOL), L("v"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "atomicCas 的第一实参不是 Atomic");
+    trapAt(b, f, "type2", 4010, "atomicCas 的第二实参不是 int");
+    trapAt(b, f, "type3", 4010, "atomicCas 的第三实参不是 int");
+    rtRetVoid(f); check(f);
+}

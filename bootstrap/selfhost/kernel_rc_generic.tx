@@ -1,0 +1,232 @@
+// 引用计数的可移植版（rtfn 写，macOS 适配 M4 设计 A8）：语义与导出名同 runtime_memory_gen.tx 的 rcHeapTag、rcRetain、rcRelease、
+// rcFrameRelease（NRT 形，释放归零交 __tx_zero_dispatch）。值 {tag@0, idx u32@8}；计数表 rc[idx] 是 u32，最高位置位为永生。
+// 快路径：计数直接取自线程块里的槽表状态（TB_SLOTS → {rc 表@0, …}），__tx_nrt_rc_flags 为 0 时普通加减（线程第 4a 步：对象属一个线程）；
+// 旗标非 0 时走通用路：经 __tx_rc_base／__tx_rc_scalar_flag 重取，bit0 标量臂普通加减、否则原子臂；bit1 探针计数
+// （__tx_rc_probe_counts：retain 原子 +0、标量 +8，release 原子 +16、标量 +24；归零不计）。
+// 调用约定：只保证私有约定（rax rcx rdx r8–r11 与 xmm0–5 被破坏，rbx rbp rsi rdi r12–r15 保留；rbx 不写）。手写版的快路径只写
+// rax rdx r8 r9 r11、保留 rcx r10 与全部 xmm。核查（2026-10-24）：生成代码（emitmirror.tx）跨 __tx_retain／__tx_release／
+// __tx_frame_release 只在 r14、r15、rbx 与栈上保值，运算段（寄存器池 r8–r15、xmm2–7）里的结果槽在 emit_record 中已证明不是堆引用，
+// 不会发出释放调用；手写内核例程（runtime_memory_gen.tx 的串、文件、列表、argv，selfhost 的 store_slots、list_*、payload_*、
+// weak_table、intern_table、object_*、windows_argv、linux_argv、file_linux）在这些调用及 __tx_native_mem_* 之后都从栈上重取易失寄存器。
+import { StructuredBuffer, asBufferSection, asBufferLabel, asBufferByte } from "./assemble";
+import { RtFn, L, I, A, G } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtShift, rtLoad, rtStore, rtLabel, rtJump, rtIf, rtIf32, rtCall0, rtCall1, rtCall2, rtCall5, rtAtomicCas, rtRet, rtRetVoid, rtTrap, rtRdataBytes } from "./rtfn";
+
+const MODULE: string = "bootstrap/selfhost/kernel_rc_generic.tx";
+const U32: int = 4294967295;
+const HIGH32: int = -4294967296;
+const TAG_NONE: int = 4;
+const OVER_RELEASE: string = "引用计数下溢：对象被多释放了一次（运行时或编译器缺陷，请回报）";
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// __tx_is_heapref：256 字节表，堆引用的 tag 为 1（同 rcHeapTag 的 NRT 形：5..11、14、15、16，及 NRT 才有的 17..21）。
+function heapTagTable(b: Ref<StructuredBuffer>): void {
+    asBufferSection(b, 1, 1);
+    asBufferLabel(b, "__tx_is_heapref", 1);
+    let i = 0;
+    while (i < 256) {
+        const hit = (i >= 5 && i <= 11) || (i >= 14 && i <= 21);
+        if (hit) { asBufferByte(b, 1, 1); } else { asBufferByte(b, 0, 1); }
+        i = i + 1;
+    }
+    asBufferSection(b, 0, 1);
+}
+
+/// 发出 name(p, delta) → old：原子地把 u32 单元 *p 加 delta（环绕），返回加之前的值（零扩展），即 x86 的 lock xadd dword。
+/// rtfn 的原子接口只有 8 字节单元：对 p 所在、按 8 对齐的单元做比较交换循环（计数表由分配器按 16 字节对齐给出，p 按 4 对齐；小端）。
+/// NRT 的 __tx_rc_scalar_flag 恒报标量臂，这条原子臂在 NRT 内核里走不到，照手写版保留。
+export function rcXadd32Emit(b: Ref<StructuredBuffer>, failures: List<string>, name: string, module: string): void {
+    const f = rtBegin(b, name, "p delta", "w hi o c n x", 0, module);
+    rtOp(f, "w", L("p"), "and", I(-8));
+    rtOp(f, "hi", L("p"), "and", I(4));
+    rtLabel(f, "retry");
+    rtLoad(f, "o", L("w"), 0, 8);
+    rtIf(f, L("hi"), "ne", I(0), "high");
+    rtOp(f, "c", L("o"), "and", I(U32));
+    rtOp(f, "n", L("c"), "add", L("delta"));
+    rtOp(f, "n", L("n"), "and", I(U32));
+    rtOp(f, "x", L("o"), "and", I(HIGH32));
+    rtOp(f, "n", L("n"), "or", L("x"));
+    rtJump(f, "swap");
+    rtLabel(f, "high");
+    rtShift(f, "c", L("o"), "shr", 32);
+    rtOp(f, "n", L("c"), "add", L("delta"));
+    rtShift(f, "n", L("n"), "shl", 32);
+    rtOp(f, "x", L("o"), "and", I(U32));
+    rtOp(f, "n", L("n"), "or", L("x"));
+    rtLabel(f, "swap");
+    rtAtomicCas(f, "x", L("w"), 0, L("o"), L("n"));
+    rtIf(f, L("x"), "ne", L("o"), "retry");
+    rtRet(f, L("c"));
+    done(f, failures);
+}
+
+/// 若槽 v 的 tag 不是堆引用则转 out（局部 x 被改写）；只读 v 指向的 tag 字节。
+export function rcHeapTest(f: Ref<RtFn>, v: string, out: string): void {
+    rtLoad(f, "x", L(v), 0, 1);
+    rtOp(f, "x", A("__tx_is_heapref"), "add", L("x"));
+    rtLoad(f, "x", L("x"), 0, 1);
+    rtIf(f, L("x"), "eq", I(0), out);
+}
+
+// 快路径的头：非堆引用或永生转 out，计数旗标非 0 转 generic；否则 idx＝v 的 idx、p＝&rc[idx]、rc＝*p（u32）。
+function fastHead(f: Ref<RtFn>, out: string, generic: string): void {
+    rcHeapTest(f, "v", out);
+    rtLoad(f, "idx", L("v"), 8, 4);
+    rtSet(f, "p", G("__tx_nrt_slots"));
+    rtLoad(f, "p", L("p"), 0, 8);
+    rtShift(f, "x", L("idx"), "shl", 2);
+    rtOp(f, "p", L("p"), "add", L("x"));
+    rtLoad(f, "rc", L("p"), 0, 4);
+    rtIf32(f, L("rc"), "lt", I(0), out);
+    rtLoad(f, "x", A("__tx_nrt_rc_flags"), 0, 4);
+    rtIf(f, L("x"), "ne", I(0), generic);
+}
+
+// 通用路的头（手写版的 rcHead）：重查 tag，计数表基址经 __tx_rc_base；永生转 out；再取旗标进 fl。
+function genericHead(f: Ref<RtFn>, out: string): void {
+    rcHeapTest(f, "v", out);
+    rtLoad(f, "idx", L("v"), 8, 4);
+    rtCall0(f, "p", "__tx_rc_base");
+    rtShift(f, "x", L("idx"), "shl", 2);
+    rtOp(f, "p", L("p"), "add", L("x"));
+    rtLoad(f, "rc", L("p"), 0, 4);
+    rtIf32(f, L("rc"), "lt", I(0), out);
+    rtCall0(f, "fl", "__tx_rc_scalar_flag");
+}
+
+// 探针计数：fl 的 bit1 置位时 __tx_rc_probe_counts()[k] 加一（k 为局部里的字节偏移），然后转 out。
+function probeCount(f: Ref<RtFn>, out: string): void {
+    rtOp(f, "x", L("fl"), "and", I(2));
+    rtIf(f, L("x"), "eq", I(0), out);
+    rtCall0(f, "x", "__tx_rc_probe_counts");
+    rtOp(f, "x", L("x"), "add", L("k"));
+    rtLoad(f, "rc", L("x"), 0, 8);
+    rtOp(f, "rc", L("rc"), "add", I(1));
+    rtStore(f, L("x"), 0, L("rc"), 8);
+    rtJump(f, out);
+}
+
+// __tx_retain(v)：v 指向一个值槽。
+function retainFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_retain", "v", "x idx p rc fl k", 2, MODULE);
+    fastHead(f, "out", "generic");
+    rtOp(f, "rc", L("rc"), "add", I(1));
+    rtStore(f, L("p"), 0, L("rc"), 4);
+    rtLabel(f, "out");
+    rtRetVoid(f);
+    rtLabel(f, "generic");
+    genericHead(f, "out");
+    rtOp(f, "x", L("fl"), "and", I(1));
+    rtIf(f, L("x"), "ne", I(0), "scalar");
+    rtCall2(f, "", "__tx_rcg_xadd32", L("p"), I(1));
+    rtSet(f, "k", I(0));
+    probeCount(f, "out");
+    rtLabel(f, "scalar");
+    rtLoad(f, "rc", L("p"), 0, 4);
+    rtOp(f, "rc", L("rc"), "add", I(1));
+    rtStore(f, L("p"), 0, L("rc"), 4);
+    rtSet(f, "k", I(8));
+    probeCount(f, "out");
+    done(f, failures);
+}
+
+// __tx_release(v)：计数减到 0（原子臂为减之前是 1）时 __tx_zero_dispatch(idx)。
+function releaseFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_release", "v", "x idx p rc fl k", 2, MODULE);
+    fastHead(f, "out", "generic");
+    rtOp(f, "rc", L("rc"), "sub", I(1));
+    rtStore(f, L("p"), 0, L("rc"), 4);
+    rtIf32(f, L("rc"), "le", I(0), "zchk");
+    rtLabel(f, "out");
+    rtRetVoid(f);
+    rtLabel(f, "generic");
+    genericHead(f, "out");
+    rtOp(f, "x", L("fl"), "and", I(1));
+    rtIf(f, L("x"), "ne", I(0), "scalar");
+    rtCall2(f, "x", "__tx_rcg_xadd32", L("p"), I(-1));
+    rtIf32(f, L("x"), "ule", I(1), "xchk");
+    rtSet(f, "k", I(16));
+    probeCount(f, "out");
+    rtLabel(f, "scalar");
+    rtLoad(f, "rc", L("p"), 0, 4);
+    rtOp(f, "rc", L("rc"), "sub", I(1));
+    rtStore(f, L("p"), 0, L("rc"), 4);
+    rtIf32(f, L("rc"), "le", I(0), "zchk");
+    rtSet(f, "k", I(24));
+    probeCount(f, "out");
+    // 减之前已是 0（运行时缺陷）：减后为 −1、原子臂的旧值为 0（运行时加固设计 H1）。
+    rtLabel(f, "xchk");
+    rtIf32(f, L("x"), "eq", I(0), "over");
+    rtJump(f, "zero");
+    rtLabel(f, "zchk");
+    rtIf32(f, L("rc"), "ne", I(0), "over");
+    rtLabel(f, "zero");
+    rtCall1(f, "", "__tx_zero_dispatch", L("idx"));
+    rtRetVoid(f);
+    rtLabel(f, "over");
+    rtCall0(f, "", "__tx_rc_over_release");
+    rtTrap(f);
+    done(f, failures);
+}
+
+/// __tx_rc_over_release()：计数已为 0 的对象又被释放（过度释放，运行时或编译器缺陷；运行时加固设计 H1）。以 4012 终止，
+/// 不带源码位置（释放发生在运行时内部）。手写的 x86 释放（NRT 形）同样转到这里。
+export function rcOverReleaseEmit(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    rtRdataBytes(b, "__tx_rc_over_release_message", OVER_RELEASE);
+    const f = rtBegin(b, "__tx_rc_over_release", "", "", 5, MODULE);
+    rtCall5(f, "", "__tx_trap", I(U32), I(0), I(4012), A("__tx_rc_over_release_message"), I(len(OVER_RELEASE)));
+    rtTrap(f);
+    done(f, failures);
+}
+
+// __tx_frame_release(win, count, a)：槽 [0, count) 中除 a 外逐个释放（堆引用才调 __tx_release）并清成 None，最后清 win[a]。
+// __tx_frame_release_from(win, count, a, from)：只处理 [from, count)；a < from 时不清 win[a]（借用参数函数的参数槽留给调用方）。
+// 计数与下标按 64 位无符号比较（同手写版）。手写版把游标放在 rbx 上调 __tx_release，这里 rbx 不变（游标与窗口在同一线程区域，
+// 求得的线程块相同）。
+function frameReleaseFn(b: Ref<StructuredBuffer>, failures: List<string>, name: string, withFrom: bool): void {
+    let params = "win count a";
+    let locals = "from i cur x";
+    if (withFrom) { params = "win count a from"; locals = "i cur x"; }
+    const f = rtBegin(b, name, params, locals, 1, MODULE);
+    if (!withFrom) { rtSet(f, "from", I(0)); }
+    rtSet(f, "i", L("from"));
+    rtShift(f, "cur", L("from"), "shl", 4);
+    rtOp(f, "cur", L("cur"), "add", L("win"));
+    rtLabel(f, "loop");
+    rtIf(f, L("i"), "uge", L("count"), "end");
+    rtIf(f, L("i"), "eq", L("a"), "next");
+    rcHeapTest(f, "cur", "clear");
+    rtCall1(f, "", "__tx_release", L("cur"));
+    rtLabel(f, "clear");
+    rtStore(f, L("cur"), 0, I(TAG_NONE), 8);
+    rtStore(f, L("cur"), 8, I(0), 8);
+    rtLabel(f, "next");
+    rtOp(f, "cur", L("cur"), "add", I(16));
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "loop");
+    rtLabel(f, "end");
+    rtIf(f, L("a"), "ult", L("from"), "keep");
+    rtShift(f, "x", L("a"), "shl", 4);
+    rtOp(f, "x", L("x"), "add", L("win"));
+    rtStore(f, L("x"), 0, I(TAG_NONE), 8);
+    rtStore(f, L("x"), 8, I(0), 8);
+    rtLabel(f, "keep");
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+/// 发出引用计数的函数（含 __tx_is_heapref 表）；rtfn 的失败记进 failures。t 为目标编号（只在语义随目标不同时用）。
+export function rcGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    heapTagTable(b);
+    retainFn(b, failures);
+    releaseFn(b, failures);
+    frameReleaseFn(b, failures, "__tx_frame_release", false);
+    frameReleaseFn(b, failures, "__tx_frame_release_from", true);
+    rcXadd32Emit(b, failures, "__tx_rcg_xadd32", MODULE);
+    rcOverReleaseEmit(b, failures);
+}

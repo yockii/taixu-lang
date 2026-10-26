@@ -1,0 +1,756 @@
+// taixu.tx —— 自举编译器 CLI 入口（V0.50-S5-① 批 E；D102 §一——源码入口
+// 冻结：`taixu build taixu` 精确映射本文件；stage-A/B/C 同源递归集）。
+//
+// 职责（D102 表）：CLI 解析、错误退出、写出——编译调度委托
+// bootstrap/selfhost/driver.tx（模块发现/SEIN1/mirror/codegen 编排）。
+//
+// 用法：
+//   taixu build <entry.tx|taixu> --out <产物目录>
+//   （`taixu build taixu` 的目标名 `taixu` 精确映射 bootstrap/taixu.tx）
+//
+// 退出码：0 成；64 用法；1 编译失败（诊断走 stderr 面结构化打印）。
+// run 转发程序退出码（异常终止为 3）；test 0 全过、2 有失败、1 编译失败。
+// fmt：0 成（--check 时全部已规范）；1 有失败或 --check 未过；64 用法。
+
+import { drvNativeRuntime, drvSetToolchain, drvSetStatic, drvLinkReport, drvSetTiming, drvDiagOut, drvBytesOut, drvSetKernel, drvSetPrelude, drvSetTestMode, drvSetLeakCheck, drvSetPortable, drvSetDebug, drvSetStrip, drvTestNames, drvCheck, drvCheckDiags, drvSetOverlay, drvNormPath } from "./selfhost/driver";
+import { dbgStr } from "./selfhost/dbg_out";
+import { TOOLCHAIN_VERSION, DIAGNOSTIC_VERSION, VERSION_GATE, jsonStart, schemasJson } from "./selfhost/toolchain";
+import { registrySummary, changesJson, changesMarkdown } from "./selfhost/change_registry";
+import { linkMapEnable, linkMapScope } from "./selfhost/link_map_data";
+import { linkMapFinish, linkMapText, linkMapJson } from "./selfhost/link_map";
+import { filePath } from "./selfhost/file_path";
+import { fmtCommand } from "./selfhost/fmt";
+import { explainCommand } from "./selfhost/explain";
+import { diagsDoc, trapArray, testsDoc } from "./selfhost/cli_json";
+import { docCommand } from "./selfhost/doc";
+import { initCommand } from "./selfhost/init";
+import { debugSession } from "./selfhost/debug_session";
+import { dapServe } from "./selfhost/dap";
+import { disasmCommand } from "./selfhost/disasm";
+import { compileProfileCommand } from "./selfhost/compile_profile";
+import { mcpServe } from "./selfhost/mcp";
+import { lspServe } from "./selfhost/lsp";
+import { serviceOptions } from "./selfhost/service_options";
+import { serviceConfigure, serviceError, serviceWarnings } from "./selfhost/service_files";
+import { anaDevLines, anaDevSelfCheck } from "./selfhost/ana_dev";
+import { runHostPath, runScratchExe, runBuildHost, runChild, runTests, runCapNew, runStderrPlain } from "./selfhost/run_core";
+import { T_X64_LINUX, T_X64_MACOS, T_ARM64_MACOS, targetName, tUnix, tMacos } from "./selfhost/target";
+import { hostTargetId, targetFlagHost } from "./selfhost/target_host";
+import { pathIsSep } from "./selfhost/path_sep";
+
+// 版本号（version 子命令与 MCP 的 serverInfo.version 共用）。
+const CLI_VERSION: string = TOOLCHAIN_VERSION;
+const LSP_FEATURES: string = "diagnostics,formatting,documentSymbol,hover,signatureHelp,completion,definition,references,rename,semanticTokens";
+const MCP_TOOLS: string = "compile,run,test,disasm,debug_start,debug_breakpoint,debug_step,debug_continue,debug_frames,debug_inspect,debug_stops,debug_kill";
+
+function cpCountCli(s: string): int {
+    let pos = 0;
+    let count = 0;
+    while (pos < len(s)) {
+        const c = byteAt(s, pos) catch 0;
+        if (c >= 240) { pos = pos + 4; }
+        else if (c >= 224) { pos = pos + 3; }
+        else if (c >= 192) { pos = pos + 2; }
+        else { pos = pos + 1; }
+        count = count + 1;
+    }
+    return count;
+}
+
+// NRT kernels embedded at compile time (M7). The build script generates them
+// with the previous compiler before building this one; see scripts/nrt-bootstrap.py.
+// 内核按目标编号整块选取（每个目标一份内核）。
+function embeddedKernel(t: int): Bytes {
+    if (t == T_X64_LINUX) { return embedBytes("nrt-kernel/kernel-linux.o"); }
+    if (t == T_X64_MACOS) { return embedBytes("nrt-kernel/kernel-macos.o"); }
+    if (t == T_ARM64_MACOS) { return embedBytes("nrt-kernel/kernel-macos-aarch64.o"); }
+    return embedBytes("nrt-kernel/kernel.obj");
+}
+
+// --heap-check 的检测内核（设计 v052-heap-check-tool）：页堆（每块独立映射、保护页、隔离区不复用地址、账本核对重复与非法
+// 释放）加对象号隔离（释放的号码先入隔离环，此间的过度释放落在计数为 0 的号码上、以 4012 报出）。构建时与标准内核一并生成。
+function embeddedHeapKernel(t: int): Bytes {
+    if (t == T_X64_LINUX) { return embedBytes("nrt-kernel/kernel-linux-heapcheck.o"); }
+    if (t == T_X64_MACOS) { return embedBytes("nrt-kernel/kernel-macos-heapcheck.o"); }
+    if (t == T_ARM64_MACOS) { return embedBytes("nrt-kernel/kernel-macos-aarch64-heapcheck.o"); }
+    return embedBytes("nrt-kernel/kernel-heapcheck.obj");
+}
+
+// build／run／test 的 --heap-check：产物链接检测内核。
+let heapCheck: bool = false;
+function productKernel(t: int): Bytes {
+    if (heapCheck) { return embeddedHeapKernel(t); }
+    return embeddedKernel(t);
+}
+
+// 编译器自带 prelude 源（D3 v0.20 §6.19），同内核在构建时嵌入；程序用到其中的名字时驱动才载入。
+function embeddedPrelude(): string {
+    return bytesToStr(embedBytes("../prelude/collections.tx")) catch "";
+}
+
+function usageCli(): void {
+    eprint("用法: taixu build <entry.tx|taixu> [--target=windows|linux|macos|<三元组>] --out <目录>（原生运行时 NRT，内核已内嵌；缺省目标为宿主平台；不带架构的系统名按宿主架构取，三元组如 x86_64-macos、aarch64-macos）");
+    eprint("      taixu run [--toolchain] [--format=json] <file.tx> [程序参数...]（按宿主目标编译到临时目录后运行，转发退出码）");
+    eprint("      taixu test [--toolchain] [--format=json] <file.tx>（每个 test 块在独立进程中运行；0 全过、2 有失败、1 编译失败）");
+    eprint("      taixu fmt [--write|--check] [--format=json] <file.tx|目录>...（保守格式化；缺省单文件输出到 stdout）");
+    eprint("      taixu bench [--toolchain] [--format=json] [--rounds N] <file.tx>（编译一次、每轮一个进程运行 main，报中位/最小/最大）");
+    eprint("指定内核: --link-object <NRT 内核对象>（覆盖内嵌内核，测量与开发用）");
+    eprint("--codegen=portable（build/run/test，开发用）: 生成代码改走可移植渲染器（arm64 后端用的同一份渲染逻辑），供与缺省渲染器对照");
+    eprint("--toolchain: 放行工具链专用内建（writeExecutable、runProcess、getEnv 等）；构建编译器自身时使用");
+    eprint("--leak-check（build/run/test）: 产物正常退出时检查仍存活的对象（引用计数成环等），有则按种类与分配位置报告到 stderr、退出码 23");
+    eprint("--lib（build）: 入口模块不要求 main，照常编译与链接（检查库模块能编成原生代码）；产物运行即报“程序没有 main 入口”，不是给 C 调用的库");
+    eprint("--heap-check（build/run/test）: 链接检测内核——页堆（越界、释放后使用、重复与非法释放）加对象号隔离（对象号复用前的过度释放），查出即报 4012；很慢、耗内存，只供调试；可与 --leak-check、--debug 同用，与 --link-object 互斥");
+    eprint("--debug（build）: 插桩调试构建，供调试会话驱动；单独运行时行为与正常构建相同；与 --lib、--leak-check 互斥");
+    eprint("--debug（run）: 调试会话——stdin/stdout 上的 NDJSON 协议（breakpoint_set/breakpoint_fn/continue/step/frames/inspect/stops/kill），产物的输出成 stdout 事件");
+    eprint("--static: Linux 产物须静态（调用了 from \"库\" 的外部函数则报 3033）；Windows 产物总经导入表使用系统 DLL，不受影响");
+    eprint("--strip（build）: Linux 与 macOS 产物不带函数符号（缺省带：ELF 的 .symtab、Mach-O 的本地符号，函数名为 <模块>.<函数>）");
+    eprint("诊断: --time 分阶段计时（stderr）；--map <文件> [--map-format=text|json] [--map-scope=functions|all] 写出函数范围与帧事件（缺省函数视图；系统展开未提供）");
+    eprint("--format=json: 诊断按 tx_Diag 输出（stderr {\"schema\":\"diag/1\",\"diags\":[…]}；test 的结果 stdout {\"schema\":\"tests/1\",\"tests\":[…],\"summary\":…}）");
+    eprint("查询: version / capabilities [--format=json] / changes [--format=json]");
+    eprint("      taixu explain [诊断码]（诊断码与运行期码的解释与修复建议；无参数列出全表）");
+    eprint("      taixu doc [--format=json] [--out-dir=<目录>] <file.tx|目录>（/// 文档注释生成 API 参考）");
+    eprint("      taixu init <项目名> [--template=console|library]，或 taixu init <模板> <项目名>（项目脚手架）");
+    eprint("      taixu dap（调试适配器：stdin/stdout 上的 Debug Adapter Protocol，供 VS Code 等编辑器启动）");
+    eprint("      taixu lsp [--stdio] [--toolchain] [--workspace DIR] [--library-root DIR] [--allow-mount-type TYPE]（语言服务器：stdin/stdout 上的 Language Server Protocol，供编辑器启动）");
+    eprint("      taixu disasm [--format=json] [--toolchain] [--target=windows|linux|macos|<三元组>] <file.tx>（按函数和源码行显示原生汇编；暂只有 x86_64）");
+    eprint("      taixu profile compile <file.tx> [--format=json] [--top N]（编译画像；--help 查看计数范围）");
+    eprint("      taixu mcp（MCP 服务器：stdin/stdout 上一行一条的 JSON-RPC；compile、run、test、disasm 与 debug_* 调试工具）");
+    eprint("        服务根由启动操作者设置，可重复 --workspace／--library-root；缺省工作区为 cwd，显式本地库环境与可执行文件同目录的标准库也纳入。协议不能扩权，拒绝网络路径与链接；Linux 上主机共享挂载（9p、drvfs、virtiofs 等）缺省拒绝，启动操作者可用 --allow-mount-type TYPE 逐类开启。");
+    eprint("        mcp [--workspace DIR] [--library-root DIR] [--allow-mount-type TYPE] [--trust-workspace] [--worker-memory-mib N] [--worker-cpu-s N] [--request-timeout-ms N]");
+    eprint("        worker 缺省 4096MiB／CPU 60s（worker 生命周期累计，Windows 只计用户态），请求墙钟 10000ms；64 个产物槽。执行仅允许明确信任的本地工作区；资源限额不是不可信代码沙箱。");
+}
+
+function readableCli(path: string): int {
+    const text: string = readFile(filePath(path)) catch (e) { return 0; };
+    return 1;
+}
+
+function main(args: []string): int {
+    // 原生和 VM 都传入程序参数，不含程序名或源码路径。
+    let rest: List<string> = listNew();
+    let i = 0;
+    if (len(args) == 0) { usageCli(); return 64; }
+    const command = args[i];
+    if (command == "version" || command == "--version") {
+        if (i + 1 != len(args)) { usageCli(); return 64; }
+        print("taixu " + CLI_VERSION + " native bootstrap compiler (" + targetName(hostTargetId()) + ")");
+        return 0;
+    }
+    if (command == "capabilities") {
+        if (len(args) == 2 && args[1] == "--format=json") {
+            print(jsonStart("capabilities/1") + ",\"capabilities\":{\"toolchain_version\":\"" + TOOLCHAIN_VERSION + "\",\"diagnostic_version\":\"" + DIAGNOSTIC_VERSION + "\",\"version_gate\":\"" + VERSION_GATE + "\",\"schemas\":" + schemasJson() + ",\"change_registry\":" + registrySummary() + ",\"build\":\"native\",\"run\":\"native\",\"run_debug\":\"native\",\"test\":\"native\",\"fmt\":\"native\",\"explain\":\"native\",\"doc\":\"native\",\"init\":\"native\",\"bench\":\"native\",\"disasm\":\"native\",\"profile\":\"compile\",\"profile_schema\":\"compile-profile/1\",\"link_map\":\"text,json\",\"link_map_schema\":\"link-map/6\",\"link_map_scopes\":\"functions,all\",\"link_map_default_scope\":\"functions\",\"link_map_object_metadata\":\"txfn/3\",\"link_map_function_ranges\":\"producer-declared\",\"link_map_frame_events\":\"partial-producer-declared\",\"link_map_stack_models\":\"fixed-call,process-entry,thread-entry,stack-transition,stack-disposal\",\"dap\":\"native\",\"lsp\":\"native\",\"lsp_file_policy\":\"local_roots\",\"lsp_network_paths\":false,\"lsp_features\":\"" + LSP_FEATURES + "\",\"mcp\":\"native\",\"mcp_execution_default\":\"deny\",\"mcp_worker\":\"persistent_limited\",\"mcp_request_timeout\":\"parent_wall_clock\",\"mcp_untrusted_sandbox_verified\":false,\"mcp_error_schema\":\"tool-error/1\",\"mcp_tools\":\"" + MCP_TOOLS + "\",\"diag_format\":\"tx_Diag JSON（severity/code/msg/module/line/col）\",\"frontend\":\"tx\",\"target\":\"x86_64-windows,x86_64-linux,x86_64-macos,aarch64-macos\",\"target_preview\":\"\",\"runtime\":\"nrt-embedded\",\"compiler\":\"native-tx\",\"retired\":\"zig-frontend,bytecode,vm,gui-host\"}}");
+            return 0;
+        }
+        if (i + 1 != len(args)) { usageCli(); return 64; }
+        print("toolchain_version=" + TOOLCHAIN_VERSION + "; diagnostic_version=" + DIAGNOSTIC_VERSION + "; version_gate=" + VERSION_GATE + "; build=native; run=native; run --debug=native; test=native; fmt=native; explain=native; doc=native; init=native; bench=native; disasm=native; profile=compile; link_map=text,json; dap=native; lsp=native(" + LSP_FEATURES + "); mcp=native(" + MCP_TOOLS + "); format=json(run,test,fmt,doc,bench,capabilities,profile-compile,disasm); frontend=tx; target=x86_64-windows,x86_64-linux,x86_64-macos,aarch64-macos; runtime=nrt-embedded; compiler=native-tx");
+        print("lsp_file_policy=local_roots; lsp_network_paths=false; mcp_execution_default=deny; mcp_worker=persistent_limited; mcp_request_timeout=parent_wall_clock; mcp_untrusted_sandbox_verified=false; mcp_error_schema=tool-error/1");
+        print("build 生成原生产物；旧 aot 命令、Zig 前端与公开 VM 已退场");
+        return 0;
+    }
+    if (command == "changes") {
+        if (len(args) == 2 && args[1] == "--format=json") { print(changesJson()); return 0; }
+        if (len(args) != 1) { usageCli(); return 64; }
+        print(changesMarkdown()); return 0;
+    }
+    if (command == "--help" || command == "help") {
+        if (i + 1 != len(args)) { usageCli(); return 64; }
+        usageCli(); return 0;
+    }
+    if (command == "run") { return cmdRun(args); }
+    if (command == "dap") {
+        // 第 6 轮 6c-5b（调试实施设计 §四-8）：调试适配器，进程内编译调试构建。
+        if (i + 1 != len(args)) { usageCli(); return 64; }
+        drvSetKernel(embeddedKernel(hostTargetId()));
+        drvSetPrelude(embeddedPrelude());
+        return dapServe();
+    }
+    if (command == "lsp") {
+        const c = serviceOptions(args, i + 1, false);
+        if (len(c.error) > 0) { eprint(c.error); usageCli(); return 64; }
+        if (!serviceConfigure(c.workspaces, c.libraries, c.mountTypes)) { eprint("taixu lsp: " + serviceError()); return 64; }
+        for (w in serviceWarnings()) { eprint("taixu lsp: " + w); }
+        drvSetToolchain(c.toolchain); drvSetPrelude(embeddedPrelude()); return lspServe(CLI_VERSION);
+    }
+    if (command == "mcp") {
+        const c = serviceOptions(args, i + 1, true);
+        if (len(c.error) > 0) { eprint(c.error); usageCli(); return 64; }
+        if (!serviceConfigure(c.workspaces, c.libraries, c.mountTypes)) { eprint("taixu mcp: " + serviceError()); return 64; }
+        for (w in serviceWarnings()) { eprint("taixu mcp: " + w); }
+        drvSetKernel(embeddedKernel(hostTargetId())); drvSetPrelude(embeddedPrelude()); return mcpServe(CLI_VERSION, c);
+    }
+    if (command == "disasm") {
+        drvSetPrelude(embeddedPrelude());
+        const rc = disasmCommand(args, hostTargetId());
+        if (rc == -64) { usageCli(); return 64; }
+        return rc;
+    }
+    if (command == "profile") {
+        drvSetPrelude(embeddedPrelude());
+        return compileProfileCommand(args, embeddedKernel);
+    }
+    if (command == "test") { return cmdTest(args); }
+    if (command == "dev-check") { return cmdDevCheck(args); }
+    if (command == "fmt") { return cmdFmt(args); }
+    if (command == "explain") { return explainCommand(args); }
+    if (command == "bench") { return cmdBench(args); }
+    if (command == "doc") {
+        const rc = docCommand(args);
+        if (rc == -64) { usageCli(); return 64; }
+        return rc;
+    }
+    if (command == "init") {
+        const rc = initCommand(args);
+        if (rc == -64) { usageCli(); return 64; }
+        return rc;
+    }
+    if (command != "build") { eprint("taixu: 不支持的命令 " + command); usageCli(); return 64; }
+    i = i + 1;
+    while (i < len(args)) {
+        listPush(rest, args[i]);
+        i = i + 1;
+    }
+    let entry = "";
+    let out = "";
+    let mapPath = "";
+    let mapFormat = "";
+    let mapScope = "";
+    const objects: List<string> = listNew();
+    let t = -1;
+    let requireMain = 1;
+    let leakFlag = 0;
+    let debugFlag = 0;
+    let staticFlag = 0;
+    i = 0;
+    while (i < listLen(rest)) {
+        const tok = listGet(rest, i) catch "";
+        if ((tok == "--out" || tok == "-o") && i + 1 < listLen(rest)) {
+            out = listGet(rest, i + 1) catch "";
+            i = i + 2;
+            continue;
+        }
+        if (tok == "--shim" || tok == "--object") {
+            eprint("taixu: " + tok + " 已移除：产物一律由原生链接器直接生成");
+            return 64;
+        }
+        if (tok == "--map" && i + 1 < listLen(rest)) {
+            mapPath = listGet(rest, i + 1) catch "";
+            if (len(mapPath) == 0 || strIndexOf(mapPath, "-") == 0) { eprint("taixu: --map 缺少文件路径"); return 64; }
+            i = i + 2;
+            continue;
+        }
+        if (tok == "--map-format=text" || tok == "--map-format=json") { mapFormat = tok; i = i + 1; continue; }
+        if (tok == "--map-scope=functions" || tok == "--map-scope=all") {
+            mapScope = "functions"; if (tok == "--map-scope=all") { mapScope = "all"; }
+            i = i + 1; continue;
+        }
+        if (tok == "--lib") { requireMain = 0; i = i + 1; continue; }
+        if (tok == "--link-object-list" && i + 1 < listLen(rest)) {
+            const path = listGet(rest, i + 1) catch "";
+            const content: string = readFile(filePath(path)) catch (e) {
+                eprint("taixu: 对象清单读取失败 " + path + ": " + e.message);
+                return 1;
+            };
+            const lines = strSplit(content, "\n");
+            let li = 0;
+            while (li < listLen(lines)) {
+                let line = listGet(lines, li) catch "";
+                if (len(line) > 0 && (byteAt(line, len(line) - 1) catch 0) == 13) {
+                    line = strSub(line, 0, cpCountCli(line) - 1);
+                }
+                if (len(line) > 0) { listPush(objects, line); }
+                li = li + 1;
+            }
+            i = i + 2;
+            continue;
+        }
+        if (tok == "--link-object" && i + 1 < listLen(rest)) {
+            listPush(objects, listGet(rest, i + 1) catch "");
+            i = i + 2;
+            continue;
+        }
+        if (targetFlagHost(tok) >= 0) { t = targetFlagHost(tok); i = i + 1; continue; }
+        if (tok == "--native") { i = i + 1; continue; }
+        if (tok == "--toolchain") { drvSetToolchain(true); i = i + 1; continue; }
+        if (tok == "--static") { drvSetStatic(true); staticFlag = 1; i = i + 1; continue; }
+        if (tok == "--strip") { drvSetStrip(true); i = i + 1; continue; }
+        if (tok == "--leak-check") { drvSetLeakCheck(true); leakFlag = 1; i = i + 1; continue; }
+        if (tok == "--heap-check") { heapCheck = true; i = i + 1; continue; }
+        if (tok == "--codegen=portable") { drvSetPortable(true); i = i + 1; continue; }
+        if (tok == "--debug") { debugFlag = 1; i = i + 1; continue; }
+        if (tok == "--time") { drvSetTiming(true); i = i + 1; continue; }
+        if (tok == "--runtime=native") { i = i + 1; continue; }
+        if (tok == "--bytecode") { eprint("taixu: 字节码产物已退场，请使用原生 build --out <目录>"); return 64; }
+        if (tok == "--frontend=tx") { i = i + 1; continue; }
+        if (tok == "--frontend" && i + 1 < listLen(rest)) {
+            const frontend = listGet(rest, i + 1) catch "";
+            if (frontend != "tx") { eprint("taixu: 本代只支持 tx 前端，拒绝 " + frontend); return 64; }
+            i = i + 2;
+            continue;
+        }
+        if (strIndexOf(tok, "--frontend=") == 0) {
+            eprint("taixu: 本代只支持 tx 前端，拒绝 " + tok);
+            return 64;
+        }
+        if (strIndexOf(tok, "-") == 0 || len(entry) > 0) {
+            eprint("taixu: 不支持或缺少参数的选项 " + tok);
+            return 64;
+        }
+        entry = tok;
+        i = i + 1;
+    }
+    if (len(entry) == 0 || len(out) == 0) {
+        usageCli();
+        return 64;
+    }
+    if (len(mapFormat) > 0 && len(mapPath) == 0) { eprint("taixu: --map-format 需要 --map <文件>"); return 64; }
+    if (len(mapScope) > 0 && len(mapPath) == 0) { eprint("taixu: --map-scope 需要 --map <文件>"); return 64; }
+    linkMapEnable(len(mapPath) > 0);
+    if (len(mapScope) == 0) { mapScope = "functions"; } linkMapScope(mapScope);
+    if (strIndexOf(out, "-") == 0) {
+        eprint("taixu: --out 缺少路径参数（以 - 开头的路径请加 ./）"); return 64;
+    }
+    if (debugFlag == 1) {
+        // 调试实施设计 §三-4 第 7 条：插桩只进原生可执行产物；泄漏检查与调试会话分开跑。
+        if (requireMain == 0 || leakFlag == 1) { eprint("taixu: --debug 与 --lib、--leak-check 互斥"); return 64; }
+        drvSetDebug(true);
+    }
+    // 缺省目标＝宿主平台（编译器自身的目标，D3 v0.21 hostTarget）。
+    if (t < 0) { t = hostTargetId(); }
+    // macOS 产物总经 libSystem 动态链接（系统不提供稳定的系统调用接口），没有静态形态。--lib 在各目标上相同（入口不要求 main）。
+    if (tMacos(t) && staticFlag == 1) { eprint("taixu: macOS 目标没有静态产物（经 libSystem 动态链接），不支持 --static"); return 64; }
+    if (heapCheck && listLen(objects) > 0) { eprint("taixu: --heap-check 与 --link-object 互斥（检测内核已内嵌）"); return 64; }
+    if (listLen(objects) == 0) { drvSetKernel(productKernel(t)); }
+    drvSetPrelude(embeddedPrelude());
+    // 同名真实文件优先；仅缺失时把精确目标名 taixu 映射到冻结入口。
+    if (entry == "taixu" && readableCli(entry) == 0) { entry = "bootstrap/taixu.tx"; }
+    // native 形：out＝目录——产物 <dir>/<stem>.exe（stem＝入口主名）。
+    const stem = stemCli(entry);
+    // 分隔符按宿主（产物写在宿主上；提示里的路径同宿主写法），扩展名按目标。
+    let sep = "/"; if (hostTarget() == "windows") { sep = "\\"; }
+    let exePath = out + sep + stem + ".exe";
+    if (tUnix(t)) { exePath = out + sep + stem; }
+    if (len(mapPath) > 0 && mapPathKey(mapPath) == mapPathKey(exePath)) { eprint("taixu: --map 路径不能与可执行产物相同"); return 64; }
+    // Create --out (one level) before compiling, so a bad path fails fast.
+    makeDir(filePath(out)) catch (e) {
+        eprint("taixu: 无法创建输出目录 " + out + ": " + e.message);
+        return 1;
+    };
+    const built = drvNativeRuntime(entry, requireMain, objects, t);
+    if (built != 0) {
+        eprint(drvDiagOut());
+        return 1;
+    }
+    // Native products are executables: toolchain-only writer (executable bit on POSIX).
+    writeExecutable(filePath(exePath), drvBytesOut()) catch (e) {
+        eprint("taixu: 写出失败 " + exePath + ": " + e.message);
+        return 1;
+    };
+    print("taixu: " + exePath + "（" + toStr(bytesLen(drvBytesOut())) + " 字节）");
+    if (len(drvLinkReport()) > 0) { print("taixu: " + drvLinkReport()); }
+    if (len(mapPath) > 0) {
+        const facts = linkMapFinish(drvBytesOut()); let rendered = "";
+        if (mapFormat == "--map-format=json") { rendered = linkMapJson(facts); } else { rendered = linkMapText(facts); }
+        writeFileBytes(filePath(mapPath), bytesFromStr(rendered + "\n")) catch (e) {
+            eprint("taixu: 写出失败 " + mapPath + ": " + e.message);
+            return 1;
+        };
+    }
+    return 0;
+
+}
+
+// Comparison only: caller paths stay unchanged. No privileged dependency in file_path.
+function mapPathKey(path: string): string {
+    let p = filePath(path); const cwd = filePath(currentDir() catch "");
+    const drive = len(p) > 1 && (byteAt(p, 1) catch 0) == 58;
+    if (!drive && strIndexOf(p, "/") != 0) { p = cwd + "/" + p; }
+    else if (!drive && hostTarget() == "windows" && strIndexOf(p, "//") != 0 && len(cwd) > 1) { p = strSub(cwd, 0, 2) + p; }
+    p = drvNormPath(p);
+    if (hostTarget() == "windows") {
+        const bytes = bytesFromStr(p); let i = 0;
+        while (i < bytesLen(bytes)) { const c = bytesGet(bytes, i) catch 0; if (c >= 65 && c <= 90) { bytesSet(bytes, i, c + 32); } i = i + 1; }
+        return bytesToStr(bytes) catch p;
+    }
+    return p;
+}
+
+// 入口主名：路径最后一段去扩展名（F3：码点域扫描——len 字节与 strSub 码点不混用）。
+function stemCli(entry: string): string {
+    let stem = entry;
+    const cps = cpCountCli(stem);
+    let at = -1;
+    let j = 0;
+    while (j < cps) {
+        const c = byteAt(strSub(stem, j, 1), 0) catch 46;
+        if (pathIsSep(c)) { at = j; }
+        j = j + 1;
+    }
+    if (at >= 0) { stem = strSub(stem, at + 1, cps - at - 1); }
+    const dot = strIndexOf(stem, ".");
+    if (dot > 0) { stem = strSub(stem, 0, dot); }
+    return stem;
+}
+
+// —— 原生 run/test（去 Zig 第 4 轮；docs/design/v052-native-run-test-async-v0.1-20261014.md §六、§七）——
+
+// 交给 runProcess 的路径：Windows 保留反斜杠，Linux 换成正斜杠。
+function hostPath(p: string): string { return runHostPath(p); }
+
+// 临时产物：<临时目录>\taixu-<用途>-<主名>-<单调时钟>[.exe]，用完即删。
+function scratchExe(kind: string, entry: string): string { return runScratchExe(kind, entry); }
+
+// run/test 的 --format=json（runOptions 设置）。
+let cliJson: bool = false;
+// run --debug（第 6 轮 6c-4b，调试实施设计 §四-5）：调试会话。
+let runDebug: bool = false;
+let runLeak: bool = false;
+
+// 编译诊断写 stderr：缺省为驱动文本，--format=json 时为 {"schema":"diag/1","diags":[…]}。
+function emitDiagText(text: string): void {
+    if (cliJson) { eprint(diagsDoc(text)); }
+    else { eprint(text); }
+}
+
+// 按宿主目标把 entry 编译成可执行文件 exe；失败时诊断已写 stderr，返回 1。
+function buildHostExe(entry: string, requireMain: int, exe: string): int {
+    drvSetKernel(productKernel(hostTargetId()));
+    drvSetPrelude(embeddedPrelude());
+    const r = runBuildHost(entry, requireMain, exe);
+    if (r.ok) { return 0; }
+    if (len(r.diags) > 0) { emitDiagText(r.diags); }
+    else { eprint(r.error); }
+    return 1;
+}
+
+// taixu fmt [--write|--check] <file.tx|目录>...：实现在 selfhost/fmt.tx（与 Zig CLI 逐字节一致）。
+function cmdFmt(args: []string): int {
+    const rest: List<string> = listNew();
+    let i = 1;
+    while (i < len(args)) { listPush(rest, args[i]); i = i + 1; }
+    const rc = fmtCommand(rest);
+    if (rc == -64) { usageCli(); return 64; }
+    return rc;
+}
+
+// 文件之前的选项；返回文件参数的下标，-1 表示已报错（退出码 64）。
+function runOptions(cmd: string, args: []string): int { return optionsFrom(cmd, args, 1, false); }
+
+// 从 start 起解析选项，返回第一个非选项实参的下标；trailing 为真时解析的是文件之后的部分（test 文件后的选项），全是选项即
+// 返回 len(args)。出错得 -1（-2 为互斥，已报）。
+function optionsFrom(cmd: string, args: []string, start: int, trailing: bool): int {
+    let i = start;
+    while (i < len(args)) {
+        const tok = args[i];
+        if (tok == "--toolchain") { drvSetToolchain(true); i = i + 1; continue; }
+        if (tok == "--static") { drvSetStatic(true); i = i + 1; continue; }
+        if (tok == "--leak-check") { drvSetLeakCheck(true); runLeak = true; i = i + 1; continue; }
+        if (tok == "--heap-check") { heapCheck = true; i = i + 1; continue; }
+        if (tok == "--codegen=portable") { drvSetPortable(true); i = i + 1; continue; }
+        if (tok == "--format=json") { cliJson = true; i = i + 1; continue; }
+        if (tok == "--debug" && cmd == "run") { runDebug = true; i = i + 1; continue; }
+        if (strIndexOf(tok, "-") != 0) {
+            if (runDebug && cliJson) {
+                eprint("taixu: --debug 与 --format=json 互斥（诊断走调试协议事件）");
+                return -2;
+            }
+            if (runDebug && runLeak) {
+                eprint("taixu: --debug 与 --lib、--leak-check 互斥");
+                return -2;
+            }
+            return i;
+        }
+        let name = tok;
+        const eq = strIndexOf(tok, "=");
+        if (eq > 0) { name = strSub(tok, 0, eq); }
+        if (strIndexOf(" --replay --frame --out-dir --auto ", " " + name + " ") >= 0) {
+            // GUI 回放与定格属外部 GUI 库的测试协议（第 6 轮设计 v0.2）：产物自己读 TAIXU_REPLAY 等环境变量（D35）。
+            eprint("taixu: " + tok + " 是 GUI 回放与定格的旧选项；GUI 引擎属外部库，当前处于迁移空窗，请查看外部库的测试协议");
+        } else if (strIndexOf(" --tier --tier0 --mem-report --profile-out --debug --watch --frontend ", " " + name + " ") >= 0) {
+            eprint("taixu: " + tok + " 已退场或当前不支持；请查看 taixu " + cmd + " 的用法");
+        } else {
+            eprint("taixu: " + cmd + " 不支持的选项 " + tok);
+        }
+        return -1;
+    }
+    if (trailing) { return len(args); }
+    eprint("taixu: " + cmd + " 缺少 .tx 文件");
+    return -1;
+}
+
+// taixu run [--toolchain] [--format=json] <file.tx> [程序参数...]：文件之后的一切原样交给程序。
+// --format=json 时程序的 stderr 先落临时文件，结束后 trap 行换成 {"schema":"diag/1","diags":[…]}、其余行原样转出
+// （stdout 照常直通；stderr 与 stdout 的先后交错因此不保留）。
+function cmdRun(args: []string): int {
+    const at = runOptions("run", args);
+    if (at == -2) { return 64; }
+    if (at < 0) { usageCli(); return 64; }
+    const entry = args[at];
+    const progArgs: List<string> = listNew();
+    let k = at + 1;
+    while (k < len(args)) {
+        listPush(progArgs, args[k]);
+        k = k + 1;
+    }
+    if (runDebug) {
+        const dexe = scratchExe("debug", entry);
+        drvSetKernel(productKernel(hostTargetId()));
+        drvSetPrelude(embeddedPrelude());
+        return debugSession(entry, progArgs, dexe, hostPath(dexe));
+    }
+    const exe = scratchExe("run", entry);
+    if (buildHostExe(entry, 1, exe) != 0) { return 1; }
+    const r = runChild(exe, progArgs, 0, false, cliJson, runCapNew());
+    removeFile(filePath(exe)) catch (e) {};
+    if (len(r.startError) > 0) {
+        eprint("taixu: 无法启动程序: " + r.startError);
+        return 3;
+    }
+    if (cliJson) {
+        forwardStderr(r.err);
+        const traps = trapArray(r.err);
+        if (traps != "[]") { eprint(jsonStart("diag/1") + ",\"diags\":" + traps + "}"); }
+    }
+    return childExit(r.code);
+}
+
+// taixu bench [--toolchain] [--format=json] [--rounds N] <file.tx>：编译一次，每轮起一个进程运行 main（不带
+// 程序参数），输出每轮耗时与中位/最小/最大（同 Zig CLI 的 bench；耗时含进程启动，Zig 版是同一进程里的
+// VM 运行；Zig 版按排序后的耗时标“round i”，这里按实际轮次）。程序 trap 或异常终止即停，退出码 3；
+// 正常退出码不论（同 Zig 版忽略 main 的返回值）。
+function cmdBench(args: []string): int {
+    let rounds = 10;
+    let entry = "";
+    let i = 1;
+    while (i < len(args)) {
+        const a = args[i];
+        if (a == "--format=json") { cliJson = true; }
+        else if (a == "--toolchain") { drvSetToolchain(true); }
+        else if (a == "--rounds" && i + 1 < len(args)) {
+            i = i + 1;
+            rounds = roundsArg(args[i]);
+            if (rounds < 0) { eprint("taixu: --rounds 需要正整数"); return 64; }
+            if (rounds == 0 || rounds > 10000) { usageCli(); return 64; }
+        } else if (strIndexOf(a, "--tier") == 0 || strIndexOf(a, "--frontend") == 0) {
+            eprint("taixu: " + a + " 属于已退场或未提供的选项，原生 bench 不支持（旧 VM 执行层已退场）");
+            return 64;
+        } else if (len(entry) == 0 && strIndexOf(a, "-") != 0) { entry = a; }
+        else { usageCli(); return 64; }
+        i = i + 1;
+    }
+    if (len(entry) == 0) { usageCli(); return 64; }
+    const c0 = monoNs();
+    const exe = scratchExe("bench", entry);
+    if (buildHostExe(entry, 1, exe) != 0) { return 1; }
+    const compileUs = (monoNs() - c0) / 1000;
+    const errPath = exe + ".stderr";
+    const times: List<int> = listNew();
+    const noArgs: List<string> = listNew();
+    let r = 0;
+    while (r < rounds) {
+        const s0 = monoNs();
+        const code = runProcess(hostPath(exe), noArgs, hostPath(errPath)) catch -1;
+        const us = (monoNs() - s0) / 1000;
+        const errText = readFile(filePath(errPath)) catch "";
+        removeFile(filePath(errPath)) catch (e) {};
+        forwardStderr(errText);
+        const traps = trapArray(errText);
+        if (code == -1 || traps != "[]" || code < 0 || code > 255) {
+            removeFile(filePath(exe)) catch (e) {};
+            if (code == -1) { eprint("taixu: 无法启动程序"); return 3; }
+            if (traps != "[]") {
+                if (cliJson) { eprint(jsonStart("diag/1") + ",\"diags\":" + traps + "}"); }
+                else { eprint(trapLines(errText)); }
+                return 3;
+            }
+            return childExit(code);
+        }
+        listPush(times, us);
+        r = r + 1;
+    }
+    removeFile(filePath(exe)) catch (e) {};
+    const sorted = sortedInts(times);
+    const median = listGet(sorted, rounds / 2) catch 0;
+    const mn = listGet(sorted, 0) catch 0;
+    const mx = listGet(sorted, rounds - 1) catch 0;
+    if (cliJson) {
+        let arr = "";
+        let k = 0;
+        while (k < rounds) {
+            if (k > 0) { arr = arr + ","; }
+            arr = arr + toStr(listGet(times, k) catch 0);
+            k = k + 1;
+        }
+        print(jsonStart("bench/1") + ",\"bench\":{\"rounds\":[" + arr + "],\"median_us\":" + toStr(median) + ",\"min_us\":" + toStr(mn) + ",\"max_us\":" + toStr(mx) + ",\"compile_us\":" + toStr(compileUs) + ",\"runtime\":\"native\"}}");
+        return 0;
+    }
+    let k = 0;
+    while (k < rounds) {
+        print("round " + toStr(k + 1) + ": " + toStr(listGet(times, k) catch 0) + "us");
+        k = k + 1;
+    }
+    print("median " + toStr(median) + "us / min " + toStr(mn) + "us / max " + toStr(mx) + "us（compile " + toStr(compileUs) + "us，原生，每轮含进程启动）");
+    return 0;
+}
+
+// 1 到 9 位十进制数；否则 -1。
+function roundsArg(s: string): int {
+    if (len(s) == 0 || len(s) > 9) { return -1; }
+    let v = 0;
+    let i = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) catch 0;
+        if (c < 48 || c > 57) { return -1; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+// 升序副本（插入排序，轮数至多 10000）。
+function sortedInts(xs: List<int>): List<int> {
+    const out: List<int> = listNew();
+    for (x in xs) {
+        let at = listLen(out);
+        while (at > 0 && (listGet(out, at - 1) catch 0) > x) { at = at - 1; }
+        listInsert(out, at, x);
+    }
+    return out;
+}
+
+// stderr 文本里的 trap 行（去 CR，换行连接）。
+function trapLines(text: string): string {
+    let out = "";
+    for (ln in strSplit(text, "\n")) {
+        if (strIndexOf(ln, "[runtime:") >= 0) {
+            let t = ln;
+            const cr = strIndexOf(t, "\r");
+            if (cr >= 0) { t = strSub(t, 0, cr); }
+            if (len(out) > 0) { out = out + "\n"; }
+            out = out + t;
+        }
+    }
+    return out;
+}
+
+// 子进程退出码：0..255 原样；Windows 异常码、Linux 信号按运行时错误（3）。
+function childExit(code: int): int {
+    if (code >= 0 && code <= 255) { return code; }
+    if (code < 0) { eprint("taixu: 程序被信号 " + toStr(0 - code) + " 终止"); }
+    else { eprint("taixu: 程序异常终止（退出码 0x" + hexCli(code) + "）"); }
+    return 3;
+}
+
+function hexCli(v: int): string {
+    const digits = "0123456789ABCDEF";
+    let out = "";
+    let x = v;
+    let n = 0;
+    while (n < 8) {
+        out = strSub(digits, x % 16, 1) + out;
+        x = x / 16;
+        n = n + 1;
+    }
+    return out;
+}
+
+// taixu test [--toolchain] [--format=json] <file.tx>：每个 test 块在独立进程中运行（trap 只判该
+// test 失败），结果在全部运行后统一输出，格式同 Zig CLI（耗时含进程启动，仅作参考）。test 没有要转发给程序的实参，
+// 文件之后的选项同样认（taixu test main.tx --leak-check，同 build）。
+function cmdTest(args: []string): int {
+    const at = runOptions("test", args);
+    if (at < 0) { usageCli(); return 64; }
+    const end = optionsFrom("test", args, at + 1, true);
+    if (end == -2) { return 64; }
+    if (end < 0) { usageCli(); return 64; }
+    if (end != len(args)) { eprint("taixu: test 只接受一个 .tx 文件"); return 64; }
+    const entry = args[at];
+    drvSetTestMode(true);
+    const exe = scratchExe("test", entry);
+    if (buildHostExe(entry, 0, exe) != 0) { return 1; }
+    const r = runTests(exe, drvTestNames(), 0, false);
+    removeFile(filePath(exe)) catch (e) {};
+    if (cliJson) { print(testsDoc(r.entries, r.passed, r.failed)); }
+    else {
+        for (line in r.lines) { print(line); }
+        print(toStr(r.passed) + " passed, " + toStr(r.failed) + " failed");
+    }
+    if (r.failed > 0) { return 2; }
+    return 0;
+}
+
+// 子进程 stderr 中除 trap 行以外的内容原样转出（test 里的 eprint 等）。
+function forwardStderr(text: string): void {
+    const plain = runStderrPlain(text);
+    if (len(plain) == 0) { return; }
+    const b = bytesFromStr(plain);
+    eprint(bytesToStr(bytesSlice(b, 0, bytesLen(b) - 1)) catch "");
+}
+
+// 隐藏开发命令（第 6 轮 6d-1，LSP 与 MCP 实施设计 §三-6；用法不列，同 Zig CLI 的 dev-* 先例，不构成对外承诺）：
+// taixu dev-check [--toolchain] [--target=windows|linux|macos|<三元组>] [--analysis | --analysis-check] [--overlay <路径> <内容文件>]... <入口>...
+// 同一进程里依次对各入口做 LSP 检查（drvCheck）。每个入口一行 {"entry","count"}，每条诊断一行
+// {"code","path","module","line","col","msg","hint"}，再一行 {"text"}（与 taixu build 同格式的诊断文本）。
+// --analysis（6d-3a）另输出分析节的每个出现一行 {"ana","name","tt","decl","key"}；--analysis-check 先不带、再带分析节
+// 各查一次并比对，另输出一行 {"anacheck"}（"ok" 或不同之处）。
+// 退出码 0 无诊断、1 有诊断、3 自检不过、64 用法。
+function cmdDevCheck(args: []string): int {
+    let t = hostTargetId();
+    let tool = false;
+    let ana = 0;
+    const ovPaths: List<string> = listNew();
+    const ovTexts: List<string> = listNew();
+    const entries: List<string> = listNew();
+    let i = 1;
+    while (i < len(args)) {
+        const a = args[i];
+        if (a == "--toolchain") {
+            tool = true;
+        } else if (targetFlagHost(a) >= 0) {
+            t = targetFlagHost(a);
+        } else if (a == "--analysis") {
+            ana = 1;
+        } else if (a == "--analysis-check") {
+            ana = 2;
+        } else if (a == "--overlay") {
+            if (i + 2 >= len(args)) { usageCli(); return 64; }
+            const text: string = readFile(filePath(args[i + 2])) catch (e) {
+                eprint("taixu: dev-check 读不到覆盖层内容 " + args[i + 2] + "：" + e.message);
+                return 1;
+            };
+            listPush(ovPaths, args[i + 1]);
+            listPush(ovTexts, text);
+            i = i + 2;
+        } else if (strIndexOf(a, "-") == 0) {
+            usageCli();
+            return 64;
+        } else {
+            listPush(entries, a);
+        }
+        i = i + 1;
+    }
+    if (listLen(entries) == 0) { usageCli(); return 64; }
+    drvSetToolchain(tool);
+    drvSetPrelude(embeddedPrelude());
+    drvSetOverlay(ovPaths, ovTexts);
+    let rc = 0;
+    for (entry in entries) {
+        let check = "";
+        if (ana == 2) { check = anaDevSelfCheck(entry, t); } else { drvCheck(entry, t, ana == 1); }
+        const n = listLen(drvCheckDiags());
+        if (n > 0 && rc == 0) { rc = 1; }
+        print("{\"entry\":" + dbgStr(entry) + ",\"count\":" + toStr(n) + "}");
+        for (d in drvCheckDiags()) {
+            let hint = "false";
+            if (d.hint) { hint = "true"; }
+            print("{\"code\":" + toStr(d.code) + ",\"path\":" + dbgStr(d.path) + ",\"module\":" + dbgStr(d.display) + ",\"line\":" + toStr(d.line) + ",\"col\":" + toStr(d.col) + ",\"msg\":" + dbgStr(d.msg) + ",\"hint\":" + hint + "}");
+        }
+        print("{\"text\":" + dbgStr(drvDiagOut()) + "}");
+        if (ana == 1) {
+            for (ln in anaDevLines(ovPaths, ovTexts, embeddedPrelude())) { print(ln); }
+        } else if (ana == 2) {
+            if (len(check) == 0) { check = "ok"; } else { rc = 3; }
+            print("{\"anacheck\":" + dbgStr(check) + "}");
+        }
+    }
+    return rc;
+}

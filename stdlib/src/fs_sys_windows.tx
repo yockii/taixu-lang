@@ -1,0 +1,161 @@
+// std/fs 系统面的 Windows 目标文件（D3 v0.23 按目标选择文件；导出面同 fs_sys.tx）：kernel32 的 W 版接口，
+// 路径经 wstr 转 UTF-16，返回的 UTF-16 名字经 sys_text 转回（不成对的代理项替换为 U+FFFD）。
+// 语义同 Zig 宿主 win32/fsops.zig；statSize 改用 GetFileAttributesExW（原文用 FindFirstFileW，路径含
+// 通配符时会匹配别的文件）。含 NUL 的路径按失败处理。
+import { u16At, wideLen, wideToStr, nulFree, bytePrefix } from "./sys_text";
+
+declare type SECURITY_ATTRIBUTES;
+declare function GetFileAttributesW(name: wstr): u32 from "kernel32";
+declare function GetFileAttributesExW(name: wstr, level: i32, info: Bytes): i32 from "kernel32";
+declare function CreateDirectoryW(name: wstr, sa: SECURITY_ATTRIBUTES?): i32 from "kernel32";
+declare function DeleteFileW(name: wstr): i32 from "kernel32";
+declare function RemoveDirectoryW(name: wstr): i32 from "kernel32";
+declare function MoveFileW(src: wstr, dst: wstr): i32 from "kernel32";
+declare function GetCurrentDirectoryW(n: u32, buf: Bytes): u32 from "kernel32";
+declare function FindFirstFileW(pattern: wstr, data: Bytes): isize from "kernel32";
+declare function FindNextFileW(h: isize, data: Bytes): i32 from "kernel32";
+declare function FindClose(h: isize): i32 from "kernel32";
+
+const ATTR_DIRECTORY: int = 16;
+const NO_ATTRS: int = 4294967295;
+// WIN32_FIND_DATAW：592 字节，cFileName（260 个 UTF-16 码元）在偏移 44。
+const FIND_DATA_SIZE: int = 592;
+const FIND_NAME_OFF: int = 44;
+
+// 文件属性；不存在或路径不可用返回 −1。
+function attrsOf(path: string): int {
+    if (!nulFree(path) || len(path) == 0) {
+        return -1;
+    }
+    const a = GetFileAttributesW(path) as int;
+    if (a == NO_ATTRS) {
+        return -1;
+    }
+    return a;
+}
+
+export function sysExists(path: string): bool {
+    return attrsOf(path) >= 0;
+}
+
+export function sysMkdir(path: string): int {
+    if (!nulFree(path) || len(path) == 0) {
+        return -1;
+    }
+    if (CreateDirectoryW(path, None) != 0) {
+        return 0;
+    }
+    return -1;
+}
+
+// 逐级建目录：已存在且是目录视为成功；途经的 `/`、`\` 前缀不存在就建。
+export function sysMkdirs(path: string): int {
+    const a = attrsOf(path);
+    if (a >= 0) {
+        if ((a & ATTR_DIRECTORY) != 0) {
+            return 0;
+        }
+        return -1;
+    }
+    let i: int = 1;
+    while (i < len(path)) {
+        const c = byteAt(path, i) catch 0;
+        if (c == 47 || c == 92) {
+            const pre = bytePrefix(path, i);
+            if (!sysExists(pre) && sysMkdir(pre) != 0) {
+                return -1;
+            }
+        }
+        i = i + 1;
+    }
+    return sysMkdir(path);
+}
+
+export function sysRemove(path: string): int {
+    if (!nulFree(path) || len(path) == 0) {
+        return -1;
+    }
+    if (DeleteFileW(path) != 0) {
+        return 0;
+    }
+    if (RemoveDirectoryW(path) != 0) {
+        return 0;
+    }
+    return -1;
+}
+
+export function sysRename(from: string, to: string): int {
+    if (!nulFree(from) || !nulFree(to) || len(from) == 0 || len(to) == 0) {
+        return -1;
+    }
+    if (MoveFileW(from, to) != 0) {
+        return 0;
+    }
+    return -1;
+}
+
+export function sysStatSize(path: string): int {
+    if (!nulFree(path) || len(path) == 0) {
+        return -1;
+    }
+    // WIN32_FILE_ATTRIBUTE_DATA：nFileSizeHigh 在偏移 28，nFileSizeLow 在 32。
+    const info = bytesNew(36);
+    if (GetFileAttributesExW(path, 0, info) == 0) {
+        return -1;
+    }
+    return u32At(info, 28) * 4294967296 + u32At(info, 32);
+}
+
+export function sysStatIsDir(path: string): int {
+    const a = attrsOf(path);
+    if (a < 0) {
+        return -1;
+    }
+    if ((a & ATTR_DIRECTORY) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+export function sysCwd(): string {
+    let cap: int = 1024;
+    while (true) {
+        const buf = bytesNew(cap * 2);
+        const n = GetCurrentDirectoryW(cap as u32, buf) as int;
+        if (n == 0) {
+            return "";
+        }
+        if (n < cap) {
+            return wideToStr(buf, 0, n);
+        }
+        cap = n + 1;
+    }
+    return "";
+}
+
+export function sysListDir(path: string): List<string> | Error {
+    if (!nulFree(path)) {
+        return err("cannot open: " + path);
+    }
+    const data = bytesNew(FIND_DATA_SIZE);
+    const h = FindFirstFileW(path + "\\*", data);
+    if (h == -1) {
+        return err("cannot open: " + path);
+    }
+    const names: List<string> = listNew();
+    while (true) {
+        const name = wideToStr(data, FIND_NAME_OFF, wideLen(data, FIND_NAME_OFF, 260));
+        if (name != "." && name != "..") {
+            listPush(names, name);
+        }
+        if (FindNextFileW(h, data) == 0) {
+            break;
+        }
+    }
+    FindClose(h);
+    return names;
+}
+
+function u32At(b: Bytes, off: int): int {
+    return u16At(b, off) + u16At(b, off + 2) * 65536;
+}

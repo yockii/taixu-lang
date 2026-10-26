@@ -1,0 +1,166 @@
+// std/net TCP 系统面的 Linux 目标文件（D3 v0.23 按目标选择文件；导出面同 net_sys.tx）：全部经 from syscall
+// （x86_64 调用号），产物保持静态、不依赖 libc。句柄表与地址规则见 net_impl.tx。
+// 与 Zig 宿主（libc send/recv）的差别：发送带 MSG_NOSIGNAL，对端已关闭时返回失败而不是 SIGPIPE 杀掉进程；
+// 套接字带 CLOEXEC；被信号打断（EINTR）的 accept/send/recv 自动重试。recv 的 UTF-8 规则同 Windows 文件。
+import { slotAlloc, slotPeek, slotTake, sockaddrOf, sockaddrAny } from "./net_impl";
+import { lossyStr, utf8Complete, seqLen } from "./sys_text";
+
+declare function lxSocket(domain: int, kind: int, proto: int): int from syscall 41;
+declare function lxConnect(fd: int, addr: Bytes, alen: int): int from syscall 42;
+declare function lxSendto(fd: int, buf: Bytes, n: int, flags: int, addr: int, alen: int): int from syscall 44;
+declare function lxRecvfrom(fd: int, buf: Bytes, n: int, flags: int, addr: int, alen: int): int from syscall 45;
+declare function lxBind(fd: int, addr: Bytes, alen: int): int from syscall 49;
+declare function lxListen(fd: int, backlog: int): int from syscall 50;
+declare function lxAccept4(fd: int, addr: Bytes, alen: Bytes, flags: int): int from syscall 288;
+declare function lxClose(fd: int): int from syscall 3;
+
+const AF_INET: int = 2;
+// SOCK_STREAM | SOCK_CLOEXEC
+const STREAM_CLOEXEC: int = 524289;
+const SOCK_CLOEXEC: int = 524288;
+const MSG_PEEK: int = 2;
+const MSG_WAITALL: int = 256;
+const MSG_NOSIGNAL: int = 16384;
+const EINTR: int = 4;
+
+// 新套接字登记进句柄表；表满时关闭它并报失败。
+function adopt(fd: int): int {
+    const slot = slotAlloc(fd);
+    if (slot < 0) {
+        lxClose(fd);
+    }
+    return slot;
+}
+
+export function sysTcpConnect(host: string, port: int): int {
+    if (port <= 0 || port > 65535) {
+        return -1;
+    }
+    const sa = sockaddrOf(host, port);
+    if (bytesLen(sa) == 0) {
+        return -1;
+    }
+    const fd = lxSocket(AF_INET, STREAM_CLOEXEC, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    if (lxConnect(fd, sa, 16) != 0) {
+        lxClose(fd);
+        return -1;
+    }
+    return adopt(fd);
+}
+
+export function sysTcpListen(port: int): int {
+    if (port < 0 || port > 65535) {
+        return -1;
+    }
+    const fd = lxSocket(AF_INET, STREAM_CLOEXEC, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    if (lxBind(fd, sockaddrAny(port), 16) != 0 || lxListen(fd, 8) != 0) {
+        lxClose(fd);
+        return -1;
+    }
+    return adopt(fd);
+}
+
+export function sysTcpAccept(l: int): int {
+    const ls = slotPeek(l);
+    if (ls < 0) {
+        return -1;
+    }
+    while (true) {
+        const alen = bytesNew(4);
+        bytesSet(alen, 0, 16);
+        const fd = lxAccept4(ls, bytesNew(16), alen, SOCK_CLOEXEC);
+        if (fd == -EINTR) {
+            continue;
+        }
+        if (fd < 0) {
+            return -1;
+        }
+        return adopt(fd);
+    }
+    return -1;
+}
+
+export function sysTcpSend(fd: int, data: string): int {
+    const s = slotPeek(fd);
+    if (s < 0) {
+        return -1;
+    }
+    const n = len(data);
+    if (n == 0) {
+        return 0;
+    }
+    if (n > 2147483647) {
+        return -1;
+    }
+    const buf = bytesFromStr(data);
+    while (true) {
+        const r = lxSendto(s, buf, n, MSG_NOSIGNAL, 0, 0);
+        if (r == -EINTR) {
+            continue;
+        }
+        if (r < 0) {
+            return -1;
+        }
+        return r;
+    }
+    return -1;
+}
+
+function recvRetry(s: int, buf: Bytes, n: int, flags: int): int {
+    while (true) {
+        const r = lxRecvfrom(s, buf, n, flags, 0, 0);
+        if (r != -EINTR) {
+            return r;
+        }
+    }
+    return -1;
+}
+
+export function sysTcpRecv(fd: int, max: int): string | Error {
+    const s = slotPeek(fd);
+    if (s < 0) {
+        return err("net: bad socket");
+    }
+    if (max <= 0) {
+        return err("net: recv max must be positive");
+    }
+    let n: int = max;
+    if (n > 1048576) {
+        n = 1048576;
+    }
+    const buf = bytesNew(n + 4);
+    const got = recvRetry(s, buf, n, MSG_PEEK);
+    if (got == 0) {
+        return "";
+    }
+    if (got < 0) {
+        return err("net: recv failed");
+    }
+    let keep: int = utf8Complete(buf, got);
+    let flags: int = 0;
+    if (keep == 0) {
+        keep = seqLen(bytesGet(buf, 0) catch 0);
+        flags = MSG_WAITALL;
+    }
+    const r = recvRetry(s, buf, keep, flags);
+    if (r == 0) {
+        return "";
+    }
+    if (r < 0) {
+        return err("net: recv failed");
+    }
+    return lossyStr(bytesSlice(buf, 0, r));
+}
+
+export function sysTcpClose(fd: int): void {
+    const s = slotTake(fd);
+    if (s >= 0) {
+        lxClose(s);
+    }
+}

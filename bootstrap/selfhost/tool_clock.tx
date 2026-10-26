@@ -1,0 +1,77 @@
+// 工具链例程的单调毫秒钟与睡眠（tool_rt 的 ioWait、procWait 与各截止判断共用）。
+// Windows 的 GetTickCount64 与 Sleep 以系统时钟中断为粒度（缺省约 15.6 ms）：ioWait(h, m, 1) 实际要睡满一个周期，
+// MCP 父进程每轮只送 4 KiB 请求，1 MiB 就要约 5 s。钟改为 QueryPerformanceCounter；睡眠改用高精度可等待计时器
+// （CREATE_WAITABLE_TIMER_HIGH_RESOLUTION，Windows 10 1803 起，CPython 3.11 的 time.sleep 与 Go 运行时同法），
+// 每次新建、用完即关，线程之间不共享；创建或设定失败时回落 Sleep。
+import { StructuredBuffer } from "./assemble";
+import { L, I } from "./rtfn_base";
+import { rtBegin, rtSet, rtOp, rtDivMod, rtAddrOf, rtLabel, rtIf, rtIf32, rtSyscall, rtRet, rtRetVoid } from "./rtfn";
+import { callWinImport } from "./ffi_callbacks";
+import { toolCheck, xs0, xs1, xs2, xs4, xs6 } from "./tool_base";
+import { tUnix } from "./target";
+import { uxSys, uxClock } from "./unix_sys";
+
+const TIMER_HIGH_RESOLUTION: int = 2;
+const TIMER_ALL_ACCESS: int = 2031619;
+const WAIT_INFINITE: int = 4294967295;
+
+export function emitToolClock(b: Ref<StructuredBuffer>, t: int): void {
+    emitNow(b, t);
+    emitSleep(b, t);
+}
+
+// __tx_tool_now() → 单调毫秒。
+function emitNow(b: Ref<StructuredBuffer>, t: int): void {
+    const f = rtBegin(b, "__tx_tool_now", "", "sec nsec tp r q c fq hi lo gp ef", 2, "bootstrap/selfhost/tool_clock.tx");
+    if (tUnix(t)) {
+        rtAddrOf(f, "tp", "sec");
+        uxSys(f, t, "", 228, xs2(I(uxClock(t, 1)), L("tp")));
+        rtOp(f, "r", L("sec"), "imul", I(1000));
+        rtDivMod(f, "q", "", L("nsec"), I(1000000));
+        rtOp(f, "r", L("r"), "add", L("q"));
+    } else {
+        rtAddrOf(f, "tp", "c");
+        callWinImport(f, "", "QueryPerformanceCounter", xs1(L("tp")));
+        rtAddrOf(f, "tp", "fq");
+        callWinImport(f, "", "QueryPerformanceFrequency", xs1(L("tp")));
+        // 先整除再换算余数：计数乘 1000 在高频计数器上会溢出。
+        rtDivMod(f, "hi", "lo", L("c"), L("fq"));
+        rtOp(f, "r", L("hi"), "imul", I(1000));
+        rtOp(f, "lo", L("lo"), "imul", I(1000));
+        rtDivMod(f, "lo", "", L("lo"), L("fq"));
+        rtOp(f, "r", L("r"), "add", L("lo"));
+    }
+    rtRet(f, L("r"));
+    toolCheck(f);
+}
+
+// __tx_tool_sleep(ms)。
+function emitSleep(b: Ref<StructuredBuffer>, t: int): void {
+    const f = rtBegin(b, "__tx_tool_sleep", "ms", "sec nsec tp r h due dp gp ef", 6, "bootstrap/selfhost/tool_clock.tx");
+    if (tUnix(t)) {
+        rtDivMod(f, "sec", "nsec", L("ms"), I(1000));
+        rtOp(f, "nsec", L("nsec"), "imul", I(1000000));
+        rtAddrOf(f, "tp", "sec");
+        rtLabel(f, "again");
+        uxSys(f, t, "r", 35, xs2(L("tp"), L("tp")));
+        rtIf(f, L("r"), "eq", I(-4), "again");
+    } else {
+        rtIf(f, L("ms"), "le", I(0), "plain");
+        callWinImport(f, "h", "CreateWaitableTimerExW", xs4(I(0), I(0), I(TIMER_HIGH_RESOLUTION), I(TIMER_ALL_ACCESS)));
+        rtIf(f, L("h"), "eq", I(0), "plain");
+        // 负的到期时间为相对时长，单位 100 ns。
+        rtOp(f, "due", L("ms"), "imul", I(-10000));
+        rtAddrOf(f, "dp", "due");
+        callWinImport(f, "r", "SetWaitableTimer", xs6(L("h"), L("dp"), I(0), I(0), I(0), I(0)));
+        rtIf32(f, L("r"), "eq", I(0), "close");
+        callWinImport(f, "", "WaitForSingleObject", xs2(L("h"), I(WAIT_INFINITE)));
+        rtLabel(f, "close");
+        callWinImport(f, "", "CloseHandle", xs1(L("h")));
+        rtIf32(f, L("r"), "ne", I(0), "done");
+        rtLabel(f, "plain");
+        callWinImport(f, "", "Sleep", xs1(L("ms")));
+        rtLabel(f, "done");
+    }
+    rtRetVoid(f);
+    toolCheck(f);
+}

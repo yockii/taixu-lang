@@ -1,0 +1,127 @@
+// 归零释放的可移植版（rtfn 写，macOS 适配 M4 设计 A8）：语义与导出名同 runtime_memory_gen.tx 的 zeroDispatch、zeroContainer
+// （带载荷、NRT 形）。计数归零的对象经 __tx_zero_dispatch(idx) 按 __tx_store_zero_kind 分派：0 交 __tx_rc_zero_cascade，1 非空 bytes
+// 先放掉字节缓冲再收尾，2 空 bytes 只收尾，3 容器交 __tx_zero_container。容器逐个减子引用的计数（臂同 __tx_release 的通用路，
+// 探针 +48／+56），归零的子对象递归派发；递归深度计数（线程块 TB_ZERO_DEPTH，u32）超过 8192 时整个容器交 __tx_rc_zero_cascade
+// （压进本线程的待释放表），最外层释放帧收尾时由 __tx_zero_drain 迭代清空。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, L, I, A } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtShift, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtIf32, rtCall0, rtCall1, rtCall2, rtRetVoid } from "./rtfn";
+import { rcXadd32Emit, rcHeapTest } from "./kernel_rc_generic";
+import { TB_ZERO_DEPTH, TB_ZERO_PENDING } from "./thread_block_abi";
+import { PAYLOAD_VIEW_BYTES, PAYLOAD_OFF_CHILDREN, PAYLOAD_OFF_LEN } from "./payload_abi";
+
+const MODULE: string = "bootstrap/selfhost/kernel_zero_generic.tx";
+const U32: int = 4294967295;
+const DEPTH_GUARD: int = 8192;
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// __tx_zero_dispatch(idx)：idx 取低 32 位。
+function dispatchFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_zero_dispatch", "idx", "k p", 1, MODULE);
+    rtOp(f, "idx", L("idx"), "and", I(U32));
+    rtCall1(f, "k", "__tx_store_zero_kind", L("idx"));
+    rtIf32(f, L("k"), "eq", I(0), "host");
+    rtIf32(f, L("k"), "eq", I(2), "tail");
+    rtIf32(f, L("k"), "eq", I(3), "container");
+    rtCall1(f, "p", "__tx_store_str_ptr", L("idx"));
+    rtCall1(f, "", "__tx_native_mem_free", L("p"));
+    rtLabel(f, "tail");
+    rtCall1(f, "", "__tx_store_zero_tail", L("idx"));
+    rtRetVoid(f);
+    rtLabel(f, "container");
+    rtCall1(f, "", "__tx_zero_container", L("idx"));
+    rtRetVoid(f);
+    rtLabel(f, "host");
+    rtCall1(f, "", "__tx_rc_zero_cascade", L("idx"));
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+// 深度计数加 delta（u32 环绕），结果留在局部 d。
+function depthAdd(f: Ref<RtFn>, delta: int): void {
+    rtLoad(f, "d", A("__tx_nrt_tb"), TB_ZERO_DEPTH, 4);
+    rtOp(f, "d", L("d"), "add", I(delta));
+    rtStore(f, A("__tx_nrt_tb"), TB_ZERO_DEPTH, L("d"), 4);
+}
+
+// __tx_zero_container(idx)：载荷视图（PAYLOAD_VIEW_BYTES 字节）放在连续的局部 v0.. 里，经 __tx_store_payload_view 填写，
+// 最后交 __tx_native_payload_dispose_v1 放掉背板。
+function containerFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    let view = "";
+    let k = 0;
+    while (k * 8 < PAYLOAD_VIEW_BYTES) { view = view + " v" + toStr(k); k = k + 1; }
+    const f = rtBegin(b, "__tx_zero_container", "idx", "d fl vp span n cur slot x cidx p rc k" + view, 2, MODULE);
+    rtOp(f, "idx", L("idx"), "and", I(U32));
+    depthAdd(f, 1);
+    rtIf32(f, L("d"), "ule", I(DEPTH_GUARD), "ok");
+    depthAdd(f, -1);
+    rtCall1(f, "", "__tx_rc_zero_cascade", L("idx"));
+    rtRetVoid(f);
+    rtLabel(f, "ok");
+    // 臂旗标取一次（bit0 标量臂、bit1 探针计数）。
+    rtCall0(f, "fl", "__tx_rc_scalar_flag");
+    rtAddrOf(f, "vp", "v0");
+    rtCall2(f, "", "__tx_store_payload_view", L("idx"), L("vp"));
+    rtLoad(f, "span", L("vp"), PAYLOAD_OFF_CHILDREN, 8);
+    rtLoad(f, "n", L("vp"), PAYLOAD_OFF_LEN, 8);
+    rtSet(f, "cur", I(0));
+    rtLabel(f, "loop");
+    rtIf(f, L("cur"), "uge", L("n"), "done");
+    rtShift(f, "slot", L("cur"), "shl", 4);
+    rtOp(f, "slot", L("slot"), "add", L("span"));
+    rcHeapTest(f, "slot", "next");
+    rtLoad(f, "cidx", L("slot"), 8, 4);
+    rtCall0(f, "p", "__tx_rc_base");
+    rtShift(f, "x", L("cidx"), "shl", 2);
+    rtOp(f, "p", L("p"), "add", L("x"));
+    rtLoad(f, "rc", L("p"), 0, 4);
+    rtIf32(f, L("rc"), "lt", I(0), "next");
+    rtOp(f, "x", L("fl"), "and", I(1));
+    rtIf(f, L("x"), "ne", I(0), "scalar");
+    rtCall2(f, "x", "__tx_zcg_xadd32", L("p"), I(-1));
+    rtIf32(f, L("x"), "eq", I(1), "childzero");
+    rtSet(f, "k", I(48));
+    rtJump(f, "probe");
+    rtLabel(f, "scalar");
+    rtLoad(f, "rc", L("p"), 0, 4);
+    rtOp(f, "rc", L("rc"), "sub", I(1));
+    rtStore(f, L("p"), 0, L("rc"), 4);
+    rtIf32(f, L("rc"), "eq", I(0), "childzero");
+    rtSet(f, "k", I(56));
+    rtLabel(f, "probe");
+    rtOp(f, "x", L("fl"), "and", I(2));
+    rtIf(f, L("x"), "eq", I(0), "next");
+    rtCall0(f, "x", "__tx_rc_probe_counts");
+    rtOp(f, "x", L("x"), "add", L("k"));
+    rtLoad(f, "rc", L("x"), 0, 8);
+    rtOp(f, "rc", L("rc"), "add", I(1));
+    rtStore(f, L("x"), 0, L("rc"), 8);
+    rtJump(f, "next");
+    rtLabel(f, "childzero");
+    rtCall1(f, "", "__tx_zero_dispatch", L("cidx"));
+    rtLabel(f, "next");
+    rtOp(f, "cur", L("cur"), "add", I(1));
+    rtJump(f, "loop");
+    // 背板释放、收尾（弱引用通知与归还槽位）；待释放表非空时交 __tx_zero_drain（它只在深度仍为 1 时清空），最后深度归还。
+    rtLabel(f, "done");
+    rtCall1(f, "", "__tx_native_payload_dispose_v1", L("vp"));
+    rtCall1(f, "", "__tx_store_zero_tail", L("idx"));
+    rtLoad(f, "x", A("__tx_nrt_tb"), TB_ZERO_PENDING + 8, 8);
+    rtIf(f, L("x"), "eq", I(0), "nodrain");
+    rtCall0(f, "", "__tx_zero_drain");
+    rtLabel(f, "nodrain");
+    depthAdd(f, -1);
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+/// 发出归零释放的函数；rtfn 的失败记进 failures。t 为目标编号（只在语义随目标不同时用）。
+export function zeroGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    dispatchFn(b, failures);
+    containerFn(b, failures);
+    rcXadd32Emit(b, failures, "__tx_zcg_xadd32", MODULE);
+}

@@ -1,0 +1,254 @@
+// Windows UTF-16 acquisition; cleanup leaves caller outputs unchanged on failure.
+// The running byte total lives in r14, not rbx: rbx is the value-slot window from which the
+// kernel derives the thread block (and the per-thread heap), threads design §十二/§十三.
+import { Operand, StructuredBuffer, asBufferInstruction, asBufferLabel, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem } from "./assemble";
+import { L, I } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtShift, rtLoad, rtStore, rtLabel, rtJump, rtIf, rtCall2, rtRet } from "./rtfn";
+function reg(n: int): Ref<Operand> { return asStructuredReg(0, n); }
+function reg32(n: int): Ref<Operand> { return asStructuredReg(1, n); }
+function immediate(n: int): Ref<Operand> { return asStructuredImm(n); }
+function mem64(base: int, off: int): Ref<Operand> { return asStructuredMem(2, base, -1, 0, off, 0, ""); }
+function mem32(base: int, off: int): Ref<Operand> { return asStructuredMem(1, base, -1, 0, off, 0, ""); }
+function stackMemory(off: int): Ref<Operand> { return mem64(4, off); }
+function idxMem64(base: int, idx: int): Ref<Operand> { return asStructuredMem(2, base, idx, 3, 0, 0, ""); }
+function target(n: string): Ref<Operand> { return asStructuredTarget(n); }
+function emit(b: Ref<StructuredBuffer>, op: string, count: int, x: Ref<Operand>, y: Ref<Operand>): void { asBufferInstruction(b, op, count, x, y, asStructuredMissing(), 1); }
+function one(b: Ref<StructuredBuffer>, op: string, x: Ref<Operand>): void { emit(b, op, 1, x, asStructuredMissing()); }
+function zero(b: Ref<StructuredBuffer>, op: string): void { emit(b, op, 0, asStructuredMissing(), asStructuredMissing()); }
+function label(b: Ref<StructuredBuffer>, n: string): void { asBufferLabel(b, n, 1); }
+// 命令行自己拆（不经 shell32 的 CommandLineToArgvW）：它在内存不足时失败报 GetLastError 127（ERROR_PROC_NOT_FOUND），
+// 与真正的系统失败分不开，取参数表内存不足就会被报成用法错误。Rust std、Go 同样按 GetCommandLineW 自己拆。
+// 规则逐条照 CommandLineToArgvW（以随机差分对照真实 API 定下，见 tests/runtime-security/argv-split.c）：
+// - argv[0]：以引号开头则到下一个引号为止（无转义；引号后紧接的字符起下一个参数）；否则到第一个 ≤ 0x20 的
+//   code unit 为止，且吞掉这一个；随后跳过空格与制表符。命令行为空时 argv[0] 为空串（CommandLineToArgvW 给
+//   可执行文件路径；太虚不把 argv[0] 交给程序）。
+// - 其余参数：引号外的空格、制表符分隔参数（连续的算一个）；2n 个反斜杠后跟引号得 n 个反斜杠且引号切换引号态，
+//   2n+1 个得 n 个反斜杠与字面引号；不跟引号的反斜杠照原样；连续引号每满 3 个出一个字面引号（qc 计数）。
+// 一块原生分配：指针表 (n+2)×8 字节，其后为 NUL 结尾的 UTF-16 串（至多 n 个字符加 argc ≤ n+1 个 NUL）。
+// 返回 0 成功，2 内存不足（*out_argv、*out_argc 不动）。
+function splitEmit(buf: Ref<StructuredBuffer>): string {
+    const f = rtBegin(buf, "__tx_win_cmdline_split", "cmd out_argv out_argc", "n c s d base argc bc qc t", 2, "bootstrap/selfhost/windows_argv.tx");
+    rtSet(f, "n", I(0)); rtSet(f, "s", L("cmd"));
+    rtLabel(f, "len");
+    rtLoad(f, "c", L("s"), 0, 2);
+    rtIf(f, L("c"), "eq", I(0), "sized");
+    rtOp(f, "s", L("s"), "add", I(2)); rtOp(f, "n", L("n"), "add", I(1)); rtJump(f, "len");
+    rtLabel(f, "sized");
+    // (n+2)*8 + (2n+2)*2 = 12n + 20，取整到 8。
+    rtOp(f, "t", L("n"), "imul", I(12)); rtOp(f, "t", L("t"), "add", I(27)); rtOp(f, "t", L("t"), "and", I(-8));
+    rtCall2(f, "base", "__tx_native_mem_alloc", L("t"), I(8));
+    rtIf(f, L("base"), "eq", I(0), "oom");
+    rtOp(f, "t", L("n"), "add", I(2)); rtShift(f, "t", L("t"), "shl", 3); rtOp(f, "d", L("base"), "add", L("t"));
+    rtStore(f, L("base"), 0, L("d"), 8); rtSet(f, "argc", I(1)); rtSet(f, "s", L("cmd"));
+    rtLoad(f, "c", L("s"), 0, 2);
+    rtIf(f, L("c"), "ne", I(34), "a0plain");
+    rtOp(f, "s", L("s"), "add", I(2));
+    rtLabel(f, "a0quoted");
+    rtLoad(f, "c", L("s"), 0, 2);
+    rtIf(f, L("c"), "eq", I(0), "a0end");
+    rtOp(f, "s", L("s"), "add", I(2));
+    rtIf(f, L("c"), "eq", I(34), "a0end");
+    rtStore(f, L("d"), 0, L("c"), 2); rtOp(f, "d", L("d"), "add", I(2)); rtJump(f, "a0quoted");
+    rtLabel(f, "a0plain");
+    rtLoad(f, "c", L("s"), 0, 2);
+    rtIf(f, L("c"), "ule", I(32), "a0stop");
+    rtStore(f, L("d"), 0, L("c"), 2); rtOp(f, "d", L("d"), "add", I(2)); rtOp(f, "s", L("s"), "add", I(2)); rtJump(f, "a0plain");
+    rtLabel(f, "a0stop");
+    rtIf(f, L("c"), "eq", I(0), "a0end");
+    rtOp(f, "s", L("s"), "add", I(2));
+    rtLabel(f, "a0end");
+    rtStore(f, L("d"), 0, I(0), 2); rtOp(f, "d", L("d"), "add", I(2));
+    rtLabel(f, "skip0");
+    rtLoad(f, "c", L("s"), 0, 2);
+    rtIf(f, L("c"), "eq", I(32), "skip0next");
+    rtIf(f, L("c"), "eq", I(9), "skip0next");
+    rtIf(f, L("c"), "eq", I(0), "done");
+    rtJump(f, "start");
+    rtLabel(f, "skip0next"); rtOp(f, "s", L("s"), "add", I(2)); rtJump(f, "skip0");
+    // 新参数从 d 开始：argv[argc] = d。
+    rtLabel(f, "start");
+    rtShift(f, "t", L("argc"), "shl", 3); rtOp(f, "t", L("t"), "add", L("base")); rtStore(f, L("t"), 0, L("d"), 8);
+    rtOp(f, "argc", L("argc"), "add", I(1)); rtSet(f, "bc", I(0)); rtSet(f, "qc", I(0));
+    rtLabel(f, "loop");
+    rtLoad(f, "c", L("s"), 0, 2);
+    rtIf(f, L("c"), "eq", I(0), "finish");
+    rtIf(f, L("qc"), "ne", I(0), "notspace");
+    rtIf(f, L("c"), "eq", I(32), "space");
+    rtIf(f, L("c"), "eq", I(9), "space");
+    rtLabel(f, "notspace");
+    rtIf(f, L("c"), "eq", I(92), "backslash");
+    rtIf(f, L("c"), "eq", I(34), "quote");
+    rtStore(f, L("d"), 0, L("c"), 2); rtOp(f, "d", L("d"), "add", I(2)); rtSet(f, "bc", I(0)); rtOp(f, "s", L("s"), "add", I(2)); rtJump(f, "loop");
+    rtLabel(f, "backslash");
+    rtStore(f, L("d"), 0, L("c"), 2); rtOp(f, "d", L("d"), "add", I(2)); rtOp(f, "bc", L("bc"), "add", I(1)); rtOp(f, "s", L("s"), "add", I(2)); rtJump(f, "loop");
+    // 引号前已照抄 bc 个反斜杠（各 2 字节）：偶数退回 bc/2 个（bc 字节）且切换引号态；奇数退回 (bc+1)/2 个
+    // （bc+1 字节）再写字面引号。
+    rtLabel(f, "quote");
+    rtOp(f, "t", L("bc"), "and", I(1));
+    rtIf(f, L("t"), "ne", I(0), "escaped");
+    rtOp(f, "d", L("d"), "sub", L("bc")); rtOp(f, "qc", L("qc"), "add", I(1)); rtJump(f, "quoted");
+    rtLabel(f, "escaped");
+    rtOp(f, "d", L("d"), "sub", L("bc")); rtOp(f, "d", L("d"), "sub", I(1));
+    rtStore(f, L("d"), 0, I(34), 2); rtOp(f, "d", L("d"), "add", I(2));
+    rtLabel(f, "quoted");
+    rtOp(f, "s", L("s"), "add", I(2)); rtSet(f, "bc", I(0));
+    rtLabel(f, "qrun");
+    rtLoad(f, "c", L("s"), 0, 2);
+    rtIf(f, L("c"), "ne", I(34), "qend");
+    rtOp(f, "qc", L("qc"), "add", I(1));
+    rtIf(f, L("qc"), "ne", I(3), "qnext");
+    rtStore(f, L("d"), 0, I(34), 2); rtOp(f, "d", L("d"), "add", I(2)); rtSet(f, "qc", I(0));
+    rtLabel(f, "qnext"); rtOp(f, "s", L("s"), "add", I(2)); rtJump(f, "qrun");
+    rtLabel(f, "qend");
+    rtIf(f, L("qc"), "ne", I(2), "loop");
+    rtSet(f, "qc", I(0)); rtJump(f, "loop");
+    rtLabel(f, "space");
+    rtStore(f, L("d"), 0, I(0), 2); rtOp(f, "d", L("d"), "add", I(2)); rtSet(f, "bc", I(0));
+    rtLabel(f, "gap");
+    rtOp(f, "s", L("s"), "add", I(2));
+    rtLoad(f, "c", L("s"), 0, 2);
+    rtIf(f, L("c"), "eq", I(32), "gap");
+    rtIf(f, L("c"), "eq", I(9), "gap");
+    rtIf(f, L("c"), "eq", I(0), "done");
+    rtShift(f, "t", L("argc"), "shl", 3); rtOp(f, "t", L("t"), "add", L("base")); rtStore(f, L("t"), 0, L("d"), 8);
+    rtOp(f, "argc", L("argc"), "add", I(1)); rtJump(f, "loop");
+    rtLabel(f, "finish");
+    rtStore(f, L("d"), 0, I(0), 2);
+    rtLabel(f, "done");
+    rtStore(f, L("out_argv"), 0, L("base"), 8); rtStore(f, L("out_argc"), 0, L("argc"), 4);
+    rtRet(f, I(0));
+    rtLabel(f, "oom"); rtRet(f, I(2));
+    rtEnd(f);
+    return rtFailed(f);
+}
+
+/// 发出 __tx_native_argv_acquire 与命令行拆分；返回 rtfn 的失败说明（空为成功）。
+export function windowsArgvEmit(buf: Ref<StructuredBuffer>): string {
+    label(buf, "__tx_native_argv_acquire");
+    one(buf, "push", reg(14));
+    one(buf, "push", reg(12));
+    one(buf, "push", reg(13));
+    emit(buf, "sub", 2, reg(4), immediate(128));
+    emit(buf, "mov", 2, mem64(4, 64), reg(1));
+    emit(buf, "mov", 2, mem64(4, 72), reg(2));
+    emit(buf, "mov", 2, mem64(4, 88), immediate(0));
+    emit(buf, "mov", 2, mem64(4, 104), immediate(0));
+    one(buf, "call", target("GetCommandLineW"));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_va_sysfail"));
+    emit(buf, "mov", 2, mem64(4, 80), reg(0));
+    emit(buf, "mov", 2, reg(1), reg(0));
+    emit(buf, "lea", 2, reg(2), stackMemory(88));
+    emit(buf, "lea", 2, reg(8), stackMemory(96));
+    one(buf, "call", target("__tx_win_cmdline_split"));
+    emit(buf, "test", 2, reg32(0), reg32(0));
+    one(buf, "jne", target("__tx_va_oomfail"));
+    emit(buf, "mov", 2, reg32(12), mem32(4, 96));
+    emit(buf, "cmp", 2, reg32(12), immediate(1));
+    one(buf, "jl", target("__tx_va_sysfail"));
+    emit(buf, "lea", 2, reg(14), asStructuredMem(2, 12, -1, 0, 1, 0, ""));
+    emit(buf, "shl", 2, reg(14), immediate(3));
+    emit(buf, "xor", 2, reg32(13), reg32(13));
+    label(buf, "__tx_va_szloop");
+    emit(buf, "cmp", 2, reg(13), reg(12));
+    one(buf, "jae", target("__tx_va_conv"));
+    emit(buf, "mov", 2, reg(1), immediate(65001));
+    emit(buf, "mov", 2, reg(2), immediate(128));
+    emit(buf, "mov", 2, reg(8), mem64(4, 88));
+    emit(buf, "mov", 2, reg(8), idxMem64(8, 13));
+    emit(buf, "mov", 2, reg32(9), immediate(-1));
+    emit(buf, "mov", 2, mem64(4, 32), immediate(0));
+    emit(buf, "mov", 2, mem64(4, 40), immediate(0));
+    emit(buf, "mov", 2, mem64(4, 48), immediate(0));
+    emit(buf, "mov", 2, mem64(4, 56), immediate(0));
+    one(buf, "call", target("WideCharToMultiByte"));
+    emit(buf, "cmp", 2, reg32(0), immediate(0));
+    one(buf, "jle", target("__tx_va_badu"));
+    emit(buf, "mov", 2, reg32(10), reg32(0));
+    emit(buf, "add", 2, reg(14), reg(10));
+    one(buf, "inc", reg(13));
+    one(buf, "jmp", target("__tx_va_szloop"));
+    label(buf, "__tx_va_conv");
+    emit(buf, "mov", 2, mem64(4, 112), reg(14));
+    emit(buf, "mov", 2, reg(1), reg(14));
+    emit(buf, "mov", 2, reg32(2), immediate(1));
+    one(buf, "call", target("__tx_native_mem_alloc"));
+    emit(buf, "test", 2, reg(0), reg(0));
+    one(buf, "jz", target("__tx_va_oomfail"));
+    emit(buf, "mov", 2, mem64(4, 104), reg(0));
+    emit(buf, "xor", 2, reg32(14), reg32(14));
+    emit(buf, "xor", 2, reg32(13), reg32(13));
+    label(buf, "__tx_va_cloop");
+    emit(buf, "cmp", 2, reg(13), reg(12));
+    one(buf, "jae", target("__tx_va_term"));
+    emit(buf, "mov", 2, reg(1), immediate(65001));
+    emit(buf, "mov", 2, reg(2), immediate(128));
+    emit(buf, "mov", 2, reg(8), mem64(4, 88));
+    emit(buf, "mov", 2, reg(8), idxMem64(8, 13));
+    emit(buf, "mov", 2, reg32(9), immediate(-1));
+    emit(buf, "mov", 2, reg(10), mem64(4, 104));
+    emit(buf, "lea", 2, reg(11), asStructuredMem(2, 12, -1, 0, 1, 0, ""));
+    emit(buf, "shl", 2, reg(11), immediate(3));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "add", 2, reg(10), reg(14));
+    emit(buf, "mov", 2, mem64(4, 32), reg(10));
+    emit(buf, "mov", 2, reg(11), mem64(4, 112));
+    emit(buf, "sub", 2, reg(11), reg(14));
+    emit(buf, "lea", 2, reg(0), asStructuredMem(2, 12, -1, 0, 1, 0, ""));
+    emit(buf, "shl", 2, reg(0), immediate(3));
+    emit(buf, "sub", 2, reg(11), reg(0));
+    emit(buf, "mov", 2, mem64(4, 40), reg(11));
+    emit(buf, "mov", 2, mem64(4, 48), immediate(0));
+    emit(buf, "mov", 2, mem64(4, 56), immediate(0));
+    one(buf, "call", target("WideCharToMultiByte"));
+    emit(buf, "cmp", 2, reg32(0), immediate(0));
+    one(buf, "jle", target("__tx_va_badu"));
+    emit(buf, "mov", 2, reg(10), mem64(4, 104));
+    emit(buf, "lea", 2, reg(11), asStructuredMem(2, 12, -1, 0, 1, 0, ""));
+    emit(buf, "shl", 2, reg(11), immediate(3));
+    emit(buf, "add", 2, reg(10), reg(11));
+    emit(buf, "add", 2, reg(10), reg(14));
+    emit(buf, "mov", 2, reg(11), mem64(4, 104));
+    emit(buf, "mov", 2, idxMem64(11, 13), reg(10));
+    emit(buf, "mov", 2, reg32(10), reg32(0));
+    emit(buf, "add", 2, reg(14), reg(10));
+    one(buf, "inc", reg(13));
+    one(buf, "jmp", target("__tx_va_cloop"));
+    label(buf, "__tx_va_term");
+    emit(buf, "mov", 2, reg(10), mem64(4, 104));
+    emit(buf, "mov", 2, idxMem64(10, 12), immediate(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 88));
+    one(buf, "call", target("__tx_native_mem_free"));
+    emit(buf, "mov", 2, reg(10), mem64(4, 64));
+    emit(buf, "mov", 2, reg(11), mem64(4, 104));
+    emit(buf, "mov", 2, mem64(10, 0), reg(11));
+    emit(buf, "mov", 2, reg(10), mem64(4, 72));
+    emit(buf, "mov", 2, mem32(10, 0), reg32(12));
+    emit(buf, "xor", 2, reg32(0), reg32(0));
+    one(buf, "jmp", target("__tx_va_done"));
+    label(buf, "__tx_va_sysfail");
+    emit(buf, "mov", 2, reg32(0), immediate(5));
+    one(buf, "jmp", target("__tx_va_cleanup"));
+    label(buf, "__tx_va_badu");
+    emit(buf, "mov", 2, reg32(0), immediate(1));
+    one(buf, "jmp", target("__tx_va_cleanup"));
+    label(buf, "__tx_va_oomfail");
+    emit(buf, "mov", 2, reg32(0), immediate(2));
+    label(buf, "__tx_va_cleanup");
+    emit(buf, "mov", 2, mem32(4, 120), reg32(0));
+    emit(buf, "mov", 2, reg(1), mem64(4, 104));
+    emit(buf, "test", 2, reg(1), reg(1)); one(buf, "jz", target("__tx_va_local_cleanup"));
+    one(buf, "call", target("__tx_native_mem_free"));
+    label(buf, "__tx_va_local_cleanup");
+    emit(buf, "mov", 2, reg(1), mem64(4, 88));
+    emit(buf, "test", 2, reg(1), reg(1)); one(buf, "jz", target("__tx_va_cleaned"));
+    one(buf, "call", target("__tx_native_mem_free"));
+    label(buf, "__tx_va_cleaned"); emit(buf, "mov", 2, reg32(0), mem32(4, 120));
+    label(buf, "__tx_va_done");
+    emit(buf, "add", 2, reg(4), immediate(128));
+    one(buf, "pop", reg(13));
+    one(buf, "pop", reg(12));
+    one(buf, "pop", reg(14));
+    zero(buf, "ret");
+    return splitEmit(buf);
+}

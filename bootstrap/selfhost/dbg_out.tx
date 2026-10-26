@@ -1,0 +1,286 @@
+// dbg_out.tx —— 调试会话的输出与路径工具（第 6 轮 6c-4b，调试实施设计 §四-5；VM 调试协议参考 §一、§二、§六）。
+// - JSON 串的转义同 VM（main_cmds.zig appendJsonString）：" \ 与 \n \r \t 照常，其余小于 0x20 的字节写 \u00xx
+//   （小写十六进制，不写 \b \f），0x7F 及以上原样；
+// - 事件一行一条，整行超过 1 MiB 时换成 error 事件；缺省写 stdout，DAP 与 MCP 打开队列后收进队列（6c-5a）；MCP 的队列
+//   有上限（超出淘汰最老的、记下丢过行），产物 stderr 记成尾部而不入队（6c-6，调试实施设计 §四-9）；
+// - 绝对路径按 VM 的 std.fs.path.resolve：拼上当前目录，消去 . 与 ..，Windows 盘符大写、分隔符为 \；
+// - 模块匹配同 VM（全路径相等，或最后一个分隔符之后的部分相等；类 Unix 上只认 /，\ 是名字里的普通字符，见
+//   docs/design/v052-path-canonical-v0.1-20261025.md），原生对每个模块的绝对路径与
+//   导入说明符各比一次，同名模块全部列出（调试实施设计 §三-4 第 5 条、§五）。
+
+import { pathOnWindows } from "./path_sep";
+
+const EVENT_MAX: int = 1048576;
+const HEXD: string = "0123456789abcdef";
+
+// JSON 串字面量（带引号）。
+export function dbgStr(s: string): string {
+    const n = len(s);
+    let plain = true;
+    let i = 0;
+    while (i < n && plain) {
+        const c = byteAt(s, i) catch 0;
+        if (c < 32 || c == 34 || c == 92) { plain = false; }
+        i = i + 1;
+    }
+    if (plain) { return "\"" + s + "\""; }
+    const out = bytesNew(0);
+    bytesPush(out, 34);
+    i = 0;
+    while (i < n) {
+        const c = byteAt(s, i) catch 0;
+        if (c == 34 || c == 92) {
+            bytesPush(out, 92);
+            bytesPush(out, c);
+        } else if (c == 10) {
+            bytesPush(out, 92);
+            bytesPush(out, 110);
+        } else if (c == 13) {
+            bytesPush(out, 92);
+            bytesPush(out, 114);
+        } else if (c == 9) {
+            bytesPush(out, 92);
+            bytesPush(out, 116);
+        } else if (c < 32) {
+            bytesAppend(out, bytesFromStr("\\u00"));
+            bytesPush(out, byteAt(HEXD, c >> 4) catch 48);
+            bytesPush(out, byteAt(HEXD, c & 15) catch 48);
+        } else {
+            bytesPush(out, c);
+        }
+        i = i + 1;
+    }
+    bytesPush(out, 34);
+    return bytesToStr(out) catch "\"\"";
+}
+
+// 写一条事件（一行）；超过 1 MiB 时换成 error 事件。
+// 事件队列（DAP、MCP 用）：打开后 dbgEmit 不再写 stdout。dbgCap 大于 0 时只留最新的 dbgCap 条（MCP）：队列涨到两倍时
+// 截去最老的一半，取走时再截到 dbgCap，丢过行记在 dbgDropped。
+let dbgQueued: bool = false;
+let dbgQueue: List<string> = listNew();
+let dbgCap: int = 0;
+let dbgDropped: bool = false;
+// MCP：产物 stderr 只留最后 ERR_TAIL 字节（在字符边界）并计总字节数，不入队。
+const ERR_TAIL: int = 2048;
+let dbgErrKeep: bool = false;
+let dbgErrTail: string = "";
+let dbgErrTotal: int = 0;
+
+export function dbgQueueOn(): void { dbgQueued = true; }
+
+// MCP 用的队列：只留最新的 cap 条，产物 stderr 记成尾部。
+export function dbgQueueCapped(cap: int): void {
+    dbgQueued = true;
+    dbgCap = cap;
+    dbgErrKeep = true;
+}
+
+// 只留 xs 的最后 n 条。
+function lastItems(xs: List<string>, n: int): List<string> {
+    const out: List<string> = listNew();
+    let k = listLen(xs) - n;
+    if (k < 0) { k = 0; }
+    while (k < listLen(xs)) {
+        listPush(out, listGet(xs, k) catch "");
+        k = k + 1;
+    }
+    return out;
+}
+
+// 取走队列里的全部事件（先到先出）。
+export function dbgTakeEvents(): List<string> {
+    let out = dbgQueue;
+    dbgQueue = listNew();
+    if (dbgCap > 0 && listLen(out) > dbgCap) {
+        out = lastItems(out, dbgCap);
+        dbgDropped = true;
+    }
+    return out;
+}
+
+// 上次调用以来队列是否丢过行（读后清零）。
+export function dbgTakeDropped(): bool {
+    const d = dbgDropped;
+    dbgDropped = false;
+    return d;
+}
+
+// s 的最后至多 n 字节，起点挪到字符边界。
+export function dbgTail(s: string, n: int): string {
+    const b = bytesFromStr(s);
+    let a = bytesLen(b) - n;
+    if (a <= 0) { return s; }
+    while (a < bytesLen(b) && ((bytesGet(b, a) catch 0) & 192) == 128) { a = a + 1; }
+    return bytesToStr(bytesSlice(b, a, bytesLen(b) - a)) catch "";
+}
+
+// 上次调用以来产物 stderr 的尾部与字节数（读后清零）。
+export function dbgTakeErrTail(): string {
+    const t = dbgErrTail;
+    dbgErrTail = "";
+    return t;
+}
+
+export function dbgTakeErrTotal(): int {
+    const n = dbgErrTotal;
+    dbgErrTotal = 0;
+    return n;
+}
+
+// 产物 stderr 的一行（不是 trap 的）：缺省写本进程 stderr；队列打开时作为内部事件 stderr 入队（DAP 翻成 output）；
+// MCP 记成尾部。
+export function dbgStderr(line: string): void {
+    if (dbgErrKeep) {
+        dbgErrTail = dbgTail(dbgErrTail + line + "\n", ERR_TAIL);
+        dbgErrTotal = dbgErrTotal + len(line) + 1;
+        return;
+    }
+    if (dbgQueued) {
+        listPush(dbgQueue, "{\"event\":\"stderr\",\"text\":" + dbgStr(line) + "}");
+        return;
+    }
+    eprint(line);
+}
+
+export function dbgEmit(line: string): void {
+    let text = line;
+    if (len(text) > EVENT_MAX) { text = "{\"event\":\"error\",\"message\":\"事件载荷超过 1MiB 上限\"}"; }
+    if (dbgQueued) {
+        listPush(dbgQueue, text);
+        if (dbgCap > 0 && listLen(dbgQueue) >= 2 * dbgCap) {
+            dbgQueue = lastItems(dbgQueue, dbgCap);
+            dbgDropped = true;
+        }
+        return;
+    }
+    stdoutWrite(bytesFromStr(text + "\n"));
+}
+
+export function dbgError(message: string): void {
+    dbgEmit("{\"event\":\"error\",\"message\":" + dbgStr(message) + "}");
+}
+
+// windows 规则下 / 与 \ 都是分隔符，否则只有 /（类 Unix 上 \ 是名字里的普通字符）。
+function isSep(c: int, windows: bool): bool { return c == 47 || (windows && c == 92); }
+
+function isLetter(c: int): bool { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122); }
+
+// 按分隔符切段（windows 规则下 / 与 \，否则只有 /），消去空段与 .，.. 退一段（不越过根）。
+// 按字节取子串（码点边界由调用方保证）。
+function bsub(s: string, from: int, n: int): string {
+    if (n <= 0) { return ""; }
+    return bytesToStr(bytesSlice(bytesFromStr(s), from, n)) catch "";
+}
+
+function segments(p: string, into: List<string>, windows: bool): void {
+    const n = len(p);
+    const pb = bytesFromStr(p);
+    let start = 0;
+    let i = 0;
+    while (i <= n) {
+        const c = byteAt(p, i) catch 47;
+        if (i == n || isSep(c, windows)) {
+            if (i > start) {
+                const seg = bytesToStr(bytesSlice(pb, start, i - start)) catch "";
+                if (seg == "..") {
+                    if (listLen(into) > 0) { listRemoveAt(into, listLen(into) - 1); }
+                } else if (seg != ".") {
+                    listPush(into, seg);
+                }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+}
+
+function joinSegs(prefix: string, segs: List<string>, sep: string): string {
+    let out = prefix;
+    let k = 0;
+    while (k < listLen(segs)) {
+        if (k > 0) { out = out + sep; }
+        out = out + (listGet(segs, k) catch "");
+        k = k + 1;
+    }
+    return out;
+}
+
+function upperDrive(p: string): string {
+    const c = byteAt(p, 0) catch 0;
+    if (c >= 97 && c <= 122) {
+        const b = bytesFromStr(p);
+        bytesSet(b, 0, c - 32);
+        return bytesToStr(b) catch p;
+    }
+    return p;
+}
+
+// path 相对 cwd 的绝对路径（windows 为真时按 Windows 规则）。
+export function dbgAbsPath(cwd: string, path: string, windows: bool): string {
+    if (!windows) {
+        const segs: List<string> = listNew();
+        if ((byteAt(path, 0) catch 0) != 47) { segments(cwd, segs, false); }
+        segments(path, segs, false);
+        return joinSegs("/", segs, "/");
+    }
+    const c0 = byteAt(path, 0) catch 0;
+    const c1 = byteAt(path, 1) catch 0;
+    const c2 = byteAt(path, 2) catch 0;
+    // UNC：\\服务器\共享\…，原样规范化。
+    if (isSep(c0, true) && isSep(c1, true)) {
+        const segs: List<string> = listNew();
+        segments(path, segs, true);
+        return joinSegs("\\\\", segs, "\\");
+    }
+    let drive = "";
+    const segs: List<string> = listNew();
+    if (isLetter(c0) && c1 == 58) {
+        drive = upperDrive(bsub(path, 0, 2));
+        if (!isSep(c2, true)) {
+            // C:相对：同盘符时接在当前目录之后。
+            if (upperDrive(bsub(cwd, 0, 2)) == drive) { segments(bsub(cwd, 2, len(cwd) - 2), segs, true); }
+        }
+        segments(bsub(path, 2, len(path) - 2), segs, true);
+    } else {
+        drive = upperDrive(bsub(cwd, 0, 2));
+        if (!isSep(c0, true)) { segments(bsub(cwd, 2, len(cwd) - 2), segs, true); }
+        segments(path, segs, true);
+    }
+    return joinSegs(drive + "\\", segs, "\\");
+}
+
+// 最后一个 / 之后的部分；Windows 宿主上再取其中最后一个 \ 之后。
+export function dbgBase(p: string): string {
+    let cut = 0;
+    let i = 0;
+    while (i < len(p)) {
+        if ((byteAt(p, i) catch 0) == 47) { cut = i + 1; }
+        i = i + 1;
+    }
+    const s = bsub(p, cut, len(p) - cut);
+    if (!pathOnWindows()) { return s; }
+    cut = 0;
+    i = 0;
+    while (i < len(s)) {
+        if ((byteAt(s, i) catch 0) == 92) { cut = i + 1; }
+        i = i + 1;
+    }
+    return bsub(s, cut, len(s) - cut);
+}
+
+function oneMatch(cand: string, want: string): bool {
+    if (len(cand) == 0) { return false; }
+    return cand == want || dbgBase(cand) == want;
+}
+
+// 匹配的模块号：按绝对路径与说明符各比一次；同名模块全部列出（调试实施设计 §三-4 第 5 条；VM 只取最后一个）。
+export function dbgModulesOf(abs: List<string>, specs: List<string>, want: string): List<int> {
+    const hits: List<int> = listNew();
+    let m = 0;
+    while (m < listLen(abs)) {
+        if (oneMatch(listGet(abs, m) catch "", want) || oneMatch(listGet(specs, m) catch "", want)) { listPush(hits, m); }
+        m = m + 1;
+    }
+    return hits;
+}

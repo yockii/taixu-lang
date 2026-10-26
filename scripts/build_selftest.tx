@@ -1,0 +1,225 @@
+// 构建驱动的自检（docs/design/v052-build-driver-v0.1-20261025.md）：门里的 bootstrap 步只走常规路径（全新工作目录、不补固定阶段），
+// 这里在临时目录里确定性地检查其余部分——解 tar（含 pax 路径与 ustar 前缀；拒绝 ..、绝对路径、反斜杠、冒号、链接与截断，且不在
+// 目标之外写出任何东西）、运行目录的修剪（只删已完成或一天未完成的；正在跑的、无标记的、无关的都留下；清掉 .trash- 残留）与路径辅助。
+// 运行：taixu run --toolchain scripts/build_selftest.tx（gate.tx 的 build-driver 步）。
+import { DONE_MARK, RUN_MARK, baseOf, deleteTree, dirOf, freshRunDir, join, kindOf, mkdirs, nat, parseDigits, safeRel, untar }
+from "./build_lib";
+import { osRealPath } from "./build_os";
+
+struct Tally {
+    pass: int,
+    fail: int,
+}
+
+function check(t: Ref<Tally>, name: string, ok: bool, detail: string): void {
+    if (ok) {
+        t.pass = t.pass + 1;
+        print("PASS " + name);
+    } else {
+        t.fail = t.fail + 1;
+        print("FAIL " + name + "：" + detail);
+    }
+}
+
+// ---- 合成 tar ----
+
+function putStr(b: Bytes, at: int, s: string): void {
+    const src = bytesFromStr(s);
+    bytesCopy(b, at, src, 0, bytesLen(src));
+}
+
+function octal(v: int, width: int): string {
+    let s = "";
+    let x: int = v;
+    while (x > 0) {
+        s = toStr(x % 8) + s;
+        x = x / 8;
+    }
+    while (len(s) < width) {
+        s = "0" + s;
+    }
+    return s;
+}
+
+// 一个条目：512 字节的 ustar 头，其后是补齐到 512 的数据。kind 为类型字节（'0' 文件、'5' 目录、'x'／'g' pax 头、'2' 链接）。
+function entry(t: Bytes, name: string, data: string, kind: int, prefix: string): void {
+    const body = bytesFromStr(data);
+    const h = bytesNew(512);
+    putStr(h, 0, name);
+    putStr(h, 100, "0000644");
+    putStr(h, 108, "0000000");
+    putStr(h, 116, "0000000");
+    putStr(h, 124, octal(bytesLen(body), 11));
+    putStr(h, 136, "00000000000");
+    putStr(h, 148, "        ");
+    bytesSet(h, 156, kind);
+    putStr(h, 257, "ustar");
+    putStr(h, 263, "00");
+    putStr(h, 345, prefix);
+    bytesAppend(t, h);
+    bytesAppend(t, body);
+    const pad = (512 - bytesLen(body) % 512) % 512;
+    bytesAppend(t, bytesNew(pad));
+}
+
+// pax 记录："长度 键=值\n"，长度含它自己的位数。
+function paxRecord(key: string, value: string): string {
+    const rest = " " + key + "=" + value + "\n";
+    let n: int = len(rest) + 1;
+    while (len(toStr(n)) + len(rest) != n) {
+        n = n + 1;
+    }
+    return toStr(n) + rest;
+}
+
+function finish(t: Bytes): Bytes {
+    bytesAppend(t, bytesNew(1024));
+    return t;
+}
+
+function tarWith(name: string, data: string, kind: int): Bytes {
+    const t = bytesNew(0);
+    entry(t, name, data, kind, "");
+    return finish(t);
+}
+
+function untarFails(t: Bytes, dest: string, needle: string): string {
+    let message = "";
+    untar(t, dest) catch (e) {
+        message = e.message;
+    };
+    if (len(message) == 0) {
+        return "没有拒绝";
+    }
+    if (strIndexOf(message, needle) < 0) {
+        return "拒绝文案不含“" + needle + "”：" + message;
+    }
+    return "";
+}
+
+function testTar(t: Ref<Tally>, base: string): void {
+    const dest = join(base, "tar-ok");
+    const tar = bytesNew(0);
+    entry(tar, "pax_global_header", paxRecord("comment", "0123456789abcdef"), 103, "");
+    entry(tar, "d/", "", 53, "");
+    entry(tar, "d/a.txt", "hello", 48, "");
+    entry(tar, "PaxHeaders/x", paxRecord("path", "d/long/path/that-is-only-in-the-pax-header.txt"), 120, "");
+    entry(tar, "ignored-short-name", "world", 48, "");
+    entry(tar, "q.txt", "pq", 48, "p/r");
+    let message = "";
+    untar(finish(tar), dest) catch (e) {
+        message = e.message;
+    };
+    check(t, "tar：解出", len(message) == 0, message);
+    check(t, "tar：目录条目", kindOf(join(dest, "d")) == 2, "");
+    check(t, "tar：普通文件", (readFile(join(dest, "d/a.txt")) catch "") == "hello", "");
+    check(t, "tar：pax 路径代替头里的名字", (readFile(join(dest, "d/long/path/that-is-only-in-the-pax-header.txt")) catch "") == "world"
+        && kindOf(join(dest, "ignored-short-name")) == 0, "");
+    check(t, "tar：ustar 前缀", (readFile(join(dest, "p/r/q.txt")) catch "") == "pq", "");
+    check(t, "tar：pax 全局头不落盘", kindOf(join(dest, "pax_global_header")) == 0, "");
+
+    const bad = join(base, "tar-bad");
+    mkdirs(bad);
+    check(t, "tar：拒绝 ..", len(untarFails(tarWith("../evil.txt", "x", 48), bad, "不安全")) == 0
+        && kindOf(join(base, "evil.txt")) == 0, untarFails(tarWith("../evil.txt", "x", 48), bad, "不安全"));
+    check(t, "tar：拒绝中间的 ..", len(untarFails(tarWith("a/../../evil2.txt", "x", 48), bad, "不安全")) == 0
+        && kindOf(join(base, "evil2.txt")) == 0, "");
+    check(t, "tar：拒绝绝对路径", len(untarFails(tarWith("/abs.txt", "x", 48), bad, "不安全")) == 0, "");
+    check(t, "tar：拒绝反斜杠", len(untarFails(tarWith("a\\b.txt", "x", 48), bad, "不安全")) == 0, "");
+    check(t, "tar：拒绝冒号（盘符与 ADS）", len(untarFails(tarWith("c:x.txt", "x", 48), bad, "不安全")) == 0, "");
+    check(t, "tar：拒绝符号链接条目", len(untarFails(tarWith("link", "", 50), bad, "不支持")) == 0, "");
+    const evilPax = bytesNew(0);
+    entry(evilPax, "PaxHeaders/y", paxRecord("path", "../pax-evil.txt"), 120, "");
+    entry(evilPax, "fine.txt", "x", 48, "");
+    check(t, "tar：拒绝 pax 路径里的 ..", len(untarFails(finish(evilPax), bad, "不安全")) == 0
+        && kindOf(join(base, "pax-evil.txt")) == 0, "");
+    // 截断：头里声明 100 字节，实际只给 512 字节的头。
+    const cut = bytesNew(0);
+    entry(cut, "cut.txt", "", 48, "");
+    putStr(cut, 124, octal(100000, 11));
+    check(t, "tar：截断的数据", len(untarFails(cut, bad, "损坏")) == 0, untarFails(cut, bad, "损坏"));
+    check(t, "tar：被拒的条目都没有写出", kindOf(join(bad, "link")) == 0 && kindOf(join(bad, "fine.txt")) == 0, "");
+}
+
+// ---- 运行目录 ----
+
+function fakeRun(base: string, name: string, started: string, done: bool): void {
+    const dir = join(base, name);
+    mkdirs(join(dir, "sub"));
+    writeFile(join(dir, "sub/f.txt"), "x") catch (e) {};
+    writeFile(join(dir, RUN_MARK), "{\"pid\": 1, \"started\": " + started + "}\n") catch (e) {};
+    if (done) {
+        writeFile(join(dir, DONE_MARK), "") catch (e) {};
+    }
+}
+
+function testRuns(t: Ref<Tally>, base: string): void {
+    const runs = join(base, "runs");
+    mkdirs(runs);
+    const now = nowMs() / 1000;
+    fakeRun(runs, "build-old-done", "100.5", true);
+    fakeRun(runs, "build-old-crashed", "200", false);
+    fakeRun(runs, "build-recent", toStr(now - 1) + ".25", false);
+    fakeRun(runs, "build-running", toStr(now - 2), false);
+    mkdirs(join(runs, "build-nomark/x"));
+    mkdirs(join(runs, ".trash-build-left/y"));
+    writeFile(join(runs, ".trash-build-left/y/z.txt"), "z") catch (e) {};
+    mkdirs(join(runs, "other"));
+    writeFile(join(runs, "other/keep.txt"), "k") catch (e) {};
+    const current = freshRunDir(runs, "build-", 2) catch (e) {
+        check(t, "运行目录：新建", false, e.message);
+        return;
+    };
+    check(t, "运行目录：新建并打标", kindOf(join(current, RUN_MARK)) == 1 && dirOf(current) == runs, current);
+    check(t, "运行目录：删已完成的旧运行", kindOf(join(runs, "build-old-done")) == 0, "");
+    check(t, "运行目录：删一天未完成的", kindOf(join(runs, "build-old-crashed")) == 0, "");
+    check(t, "运行目录：留最近的", kindOf(join(runs, "build-recent")) == 2, "");
+    check(t, "运行目录：超出名额但仍在跑的不删", kindOf(join(runs, "build-running")) == 2, "");
+    check(t, "运行目录：没有标记的不动", kindOf(join(runs, "build-nomark/x")) == 2, "");
+    check(t, "运行目录：无关目录不动", (readFile(join(runs, "other/keep.txt")) catch "") == "k", "");
+    check(t, "运行目录：清掉 .trash- 残留", kindOf(join(runs, ".trash-build-left")) == 0, "");
+    const none: List<string> = listNew();
+    const names = localListDir(nat(runs), "") catch none;
+    let trash: int = 0;
+    for (n in names) {
+        if (strIndexOf(n, ".trash-") == 0) {
+            trash = trash + 1;
+        }
+    }
+    check(t, "运行目录：删除不留 .trash-", trash == 0, toStr(trash));
+    const again = freshRunDir(runs, "build-", 2) catch (e) {
+        check(t, "运行目录：再建", false, e.message);
+        return;
+    };
+    check(t, "运行目录：同一毫秒也不重名", again != current && kindOf(again) == 2, again);
+}
+
+// ---- 路径 ----
+
+function testPaths(t: Ref<Tally>): void {
+    check(t, "路径：join", join("a", "b") == "a/b" && join("a/", "b") == "a/b" && join("", "b") == "b", "");
+    check(t, "路径：dirOf／baseOf", dirOf("x/y/z.txt") == "x/y" && baseOf("x/y/z.txt") == "z.txt" && baseOf("x\\y.txt") == "y.txt", "");
+    check(t, "路径：safeRel", safeRel("a/b.txt") && safeRel("a/..b/c") && !safeRel("") && !safeRel("a/../b") && !safeRel("/a")
+        && !safeRel("a\\b") && !safeRel("a:b"), "");
+    check(t, "数字：parseDigits", parseDigits("1234") == 1234 && parseDigits("") == -1 && parseDigits("12a") == -1, "");
+}
+
+export function main(args: []string): int {
+    const t = new Tally { pass: 0, fail: 0 };
+    // 临时目录可能经过链接（macOS 的 /var 即 /private/var），local* 内建拒绝路径里的链接：先取真实路径。
+    const base = join(osRealPath(tempDir()), "taixu-build-selftest-" + toStr(nowMs()));
+    if (!mkdirs(base)) {
+        print("FAIL 建不了临时目录：" + base);
+        return 1;
+    }
+    testPaths(t);
+    testTar(t, base);
+    testRuns(t, base);
+    check(t, "收尾：删掉临时目录", deleteTree(base) && kindOf(base) == 0, base);
+    if (t.fail == 0) {
+        print("SUMMARY PASS build-driver: " + toStr(t.pass) + " checks, 0 failed");
+        return 0;
+    }
+    print("SUMMARY FAIL build-driver: " + toStr(t.pass + t.fail) + " checks, " + toStr(t.fail) + " failed");
+    return 1;
+}

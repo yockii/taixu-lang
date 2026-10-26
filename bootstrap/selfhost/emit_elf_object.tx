@@ -1,0 +1,257 @@
+// ELF64 ET_REL object layer. Reads assembler state; never mutates source bytes.
+import { asImgA64 } from "./assemble";
+import { asImgText, asImgRdata, asImgData, asImgBssSize, asImgAlignPow, asFailedAs, asSymCountL, asSymNameL, asSymSecL, asSymOffL, asSymNeededL, asFixCountL, asFixSecL, asFixAtL, asFixKindL, asFixSymL, asFixAddendL } from "./assemble";
+import { NativeFunctionImage } from "./native_function_data";
+import { nativeFunctionEncode } from "./native_function_codec";
+
+struct ElfObjectResult { ok: int, bytes: Bytes, error: string }
+struct ElfSection { name: string, kind: int, flags: int, alignment: int, entrySize: int, link: int, info: int, size: int, offset: int, nameAt: int, bytes: Bytes }
+struct ElfNames { heads: List<int>, next: List<int>, names: List<string>, definitions: List<int>, globals: List<int>, required: List<int>, indices: List<int> }
+
+function word(out: Bytes, value: int, width: int): void {
+    let i = 0;
+    while (i < width) { bytesPush(out, (value >>> (8 * i)) & 255); i = i + 1; }
+}
+// The image already contains bytes; copy into a separately owned section.
+function copyImage(out: Bytes, source: Bytes): void {
+    bytesAppend(out, source);
+}
+function stringAt(out: Bytes, name: string): int {
+    const at = bytesLen(out);
+    bytesAppend(out, bytesFromStr(name));
+    bytesPush(out, 0); return at;
+}
+function validName(name: string): bool {
+    if (len(name) == 0) { return false; }
+    let i = 0;
+    while (i < len(name)) { if ((byteAt(name, i) catch 0) == 0) { return false; } i = i + 1; }
+    return true;
+}
+function hash(name: string): int {
+    let h = 2166136261; let i = 0;
+    while (i < len(name)) { h = ((h ^ (byteAt(name, i) catch 0)) * 16777619) & 4294967295; i = i + 1; }
+    return h;
+}
+function namesNew(): Ref<ElfNames> {
+    const n = new ElfNames { heads: listNew(), next: listNew(), names: listNew(), definitions: listNew(), globals: listNew(), required: listNew(), indices: listNew() };
+    let buckets = 4096;
+    while (buckets < asSymCountL() * 2 && buckets < 1048576) { buckets = buckets * 2; }
+    let i = 0; while (i < buckets) { listPush(n.heads, -1); i = i + 1; } return n;
+}
+function find(n: Ref<ElfNames>, name: string): int {
+    let i = listGet(n.heads, hash(name) & (listLen(n.heads) - 1)) catch -1;
+    while (i >= 0) {
+        if ((listGet(n.names, i) catch "") == name) { return i; }
+        i = listGet(n.next, i) catch -1;
+    }
+    return -1;
+}
+function add(n: Ref<ElfNames>, name: string, definition: int, globalFlag: int): int {
+    const i = listLen(n.names); const bucket = hash(name) & (listLen(n.heads) - 1);
+    listPush(n.names, name); listPush(n.next, listGet(n.heads, bucket) catch -1);
+    listSet(n.heads, bucket, i); listPush(n.definitions, definition);
+    listPush(n.globals, globalFlag); listPush(n.required, globalFlag); listPush(n.indices, 0); return i;
+}
+function section(name: string, kind: int, flags: int, alignment: int, bytes: Bytes): Ref<ElfSection> {
+    return new ElfSection { name: name, kind: kind, flags: flags, alignment: alignment, entrySize: 0, link: 0, info: 0, size: bytesLen(bytes), offset: 0, nameAt: 0, bytes: bytes };
+}
+function fail(message: string): Ref<ElfObjectResult> {
+    return new ElfObjectResult { ok: 0, bytes: bytesNew(0), error: message };
+}
+// A64 映像（macOS 适配 M4 设计 A3）的修补 kind → R_AARCH64_*：1 ABS64，2 CALL26，3 JUMP26，4 ADR_PREL_PG_HI21，
+// 5 ADD_ABS_LO12_NC，6..10 LDST8/16/32/64/128_ABS_LO12_NC；其余得 -1。
+function a64RelocType(kind: int): int {
+    if (kind == 1) { return 257; }
+    if (kind == 2) { return 283; }
+    if (kind == 3) { return 282; }
+    if (kind == 4) { return 275; }
+    if (kind == 5) { return 277; }
+    if (kind == 6) { return 278; }
+    if (kind == 7) { return 284; }
+    if (kind == 8) { return 285; }
+    if (kind == 9) { return 286; }
+    if (kind == 10) { return 299; }
+    return -1;
+}
+// 写出前能就地定下的修补：x86 的同节 PC32，A64 的同节 CALL26／JUMP26（与相对位置无关）。
+function bindsLocally(kind: int, a64: bool): bool {
+    if (a64) { return kind == 2 || kind == 3; }
+    return kind == 0;
+}
+function symbol(table: Bytes, strings: Bytes, n: Ref<ElfNames>, i: int): void {
+    listSet(n.indices, i, bytesLen(table) / 24);
+    word(table, stringAt(strings, listGet(n.names, i) catch ""), 4);
+    word(table, (listGet(n.globals, i) catch 0) << 4, 1); word(table, 0, 1);
+    const def = listGet(n.definitions, i) catch -1;
+    if (def < 0) { word(table, 0, 2); word(table, 0, 8); }
+    else { word(table, asSymSecL(def) + 1, 2); word(table, asSymOffL(def), 8); }
+    word(table, 0, 8);
+}
+
+export function elfWriteObject(exports: List<string>): Ref<ElfObjectResult> {
+    return write(exports, new NativeFunctionImage { ok: false, error: "", isa: "", functions: listNew() });
+}
+export function elfWriteObjectFunctions(exports: List<string>, functions: Ref<NativeFunctionImage>): Ref<ElfObjectResult> {
+    assert(functions.ok, "object function collection failed:" + functions.error); return write(exports, functions);
+}
+function write(exports: List<string>, functions: Ref<NativeFunctionImage>): Ref<ElfObjectResult> {
+    if (asFailedAs() != 0) { return fail("AssemblerFailed"); }
+    const a64 = asImgA64() == 1;
+    const sections: List<Ref<ElfSection>> = listNew();
+    const missing = section("", 0, 0, 1, bytesNew(0));
+    let sec = 0;
+    while (sec < 4) {
+        const power = asImgAlignPow(sec);
+        if (power < 0 || power > 20) { return fail("UnsupportedSectionAlignment"); }
+        const bytes = bytesNew(0);
+        let name = ".text"; let flags = 6; let kind = 1;
+        if (sec == 0) { copyImage(bytes, asImgText()); }
+        else if (sec == 1) { name = ".rodata"; flags = 2; copyImage(bytes, asImgRdata()); }
+        else if (sec == 2) { name = ".data"; flags = 3; copyImage(bytes, asImgData()); }
+        else { name = ".bss"; flags = 3; kind = 8; }
+        const s = section(name, kind, flags, 1 << power, bytes);
+        if (sec == 3) { s.size = asImgBssSize(); if (s.size < 0 || s.size > 4294967295) { return fail("BadBssSize"); } }
+        listPush(sections, s); sec = sec + 1;
+    }
+    const names = namesNew(); let i = 0;
+    while (i < asSymCountL()) {
+        // Labels the assembler fully resolved never reach the object.
+        if (asSymNeededL(i) == 0) { i = i + 1; continue; }
+        const name = asSymNameL(i); const s = asSymSecL(i); const off = asSymOffL(i);
+        if (!validName(name) || find(names, name) >= 0) { return fail("BadSymbolName"); }
+        if (s < 0 || s > 3 || off < 0) { return fail("BadSymbol"); }
+        const owner = listGet(sections, s) catch missing;
+        if (owner.kind == 0) { return fail("BadSection"); }
+        if (off > owner.size) { return fail("BadSymbol"); }
+        add(names, name, i, 0); i = i + 1;
+    }
+    i = 0;
+    while (i < listLen(exports)) {
+        const name = listGet(exports, i) catch ""; const found = find(names, name);
+        if (found < 0) { return fail("MissingExport:" + name); }
+        if ((listGet(names.globals, found) catch 0) != 0) { return fail("DuplicateExport:" + name); }
+        listSet(names.globals, found, 1); listSet(names.required, found, 1); i = i + 1;
+    }
+    i = 0;
+    while (i < asFixCountL()) {
+        const name = asFixSymL(i);
+        if (!validName(name)) { return fail("BadSymbolName"); }
+        let found = find(names, name);
+        if (found < 0) { found = add(names, name, -1, 1); }
+        const def = listGet(names.definitions, found) catch -1;
+        // Only LOCAL same-section PC32 (A64: CALL26/JUMP26) can bind before final section layout.
+        if (!bindsLocally(asFixKindL(i), a64) || def < 0 || (listGet(names.globals, found) catch 0) != 0 || asSymSecL(def) != asFixSecL(i)) {
+            listSet(names.required, found, 1);
+        }
+        i = i + 1;
+    }
+    const strings = bytesNew(1);
+    const table = bytesNew(0); word(table, 0, 8); word(table, 0, 8); word(table, 0, 8);
+    let binding = 0; let firstGlobal = 1;
+    while (binding < 2) {
+        i = 0;
+        while (i < listLen(names.names)) {
+            if ((listGet(names.globals, i) catch 0) == binding && (listGet(names.required, i) catch 0) == 1) { symbol(table, strings, names, i); }
+            i = i + 1;
+        }
+        if (binding == 0) { firstGlobal = bytesLen(table) / 24; }
+        binding = binding + 1;
+    }
+    sec = 0;
+    while (sec < 3) {
+        const owner = listGet(sections, sec) catch missing;
+        if (owner.kind == 0) { return fail("BadSection"); }
+        const r = section(".rela" + owner.name, 4, 0, 8, bytesNew(0));
+        r.link = 8; r.info = sec + 1; r.entrySize = 24; listPush(sections, r); sec = sec + 1;
+    }
+    i = 0;
+    while (i < asFixCountL()) {
+        const s = asFixSecL(i); const at = asFixAtL(i); const kind = asFixKindL(i);
+        if (s < 0 || s > 2) { return fail("BadRelocation"); }
+        let width = 4; let typ = 2; let addend = asFixAddendL(i);
+        if (a64) {
+            // A64：RELA 加数原样（S+A−P 以指令自身为 P），指令字里的操作码位保留，只有立即数位为零。
+            typ = a64RelocType(kind);
+            if (typ < 0 || (kind != 1 && s != 0)) { return fail("BadRelocation"); }
+            if (kind == 1) { width = 8; }
+        } else if (kind != 0 && kind != 1) { return fail("BadRelocation"); }
+        else if (kind == 1) { width = 8; typ = 1; }
+        else {
+            if (addend < -9223372036854775804) { return fail("RelativeRelocationOutOfRange"); }
+            addend = addend - 4;
+        }
+        const owner = listGet(sections, s) catch missing;
+        if (owner.kind == 0) { return fail("BadSection"); }
+        if (at < 0 || owner.size < width || at > owner.size - width) { return fail("BadRelocation"); }
+        const r = listGet(sections, s + 4) catch missing;
+        if (r.kind == 0) { return fail("BadSection"); }
+        const found = find(names, asFixSymL(i)); const index = listGet(names.indices, found) catch 0;
+        const def = listGet(names.definitions, found) catch -1;
+        if (a64 && bindsLocally(kind, true) && def >= 0 && (listGet(names.globals, found) catch 0) == 0 && asSymSecL(def) == s) {
+            const delta = asSymOffL(def) + addend - at;
+            if (delta % 4 != 0 || delta < -134217728 || delta > 134217724) { return fail("RelativeRelocationOutOfRange"); }
+            const insn = (bytesGet(owner.bytes, at) catch 0) | ((bytesGet(owner.bytes, at + 1) catch 0) << 8) | ((bytesGet(owner.bytes, at + 2) catch 0) << 16) | ((bytesGet(owner.bytes, at + 3) catch 0) << 24);
+            const value = (insn & 4227858432) | ((delta / 4) & 67108863);
+            let j = 0; while (j < 4) { bytesSet(owner.bytes, at + j, (value >>> (j * 8)) & 255); j = j + 1; }
+        } else if (kind == 0 && !a64 && def >= 0 && (listGet(names.globals, found) catch 0) == 0 && asSymSecL(def) == s) {
+            const delta = asSymOffL(def) - at;
+            if (addend < -2147483648 - delta || addend > 2147483647 - delta) { return fail("RelativeRelocationOutOfRange"); }
+            const value = delta + addend;
+            let j = 0; while (j < 4) { bytesSet(owner.bytes, at + j, (value >>> (j * 8)) & 255); j = j + 1; }
+        } else {
+            if (index == 0) { return fail("BadRelocationSymbol"); }
+            word(r.bytes, at, 8); word(r.bytes, (index << 32) | typ, 8); word(r.bytes, addend, 8);
+            if (!a64 || kind == 1) { let j = 0; while (j < width) { bytesSet(owner.bytes, at + j, 0); j = j + 1; } }
+        }
+        r.size = bytesLen(r.bytes); i = i + 1;
+    }
+    const syms = section(".symtab", 2, 0, 8, table); syms.link = 9; syms.info = firstGlobal; syms.entrySize = 24;
+    listPush(sections, syms); listPush(sections, section(".strtab", 3, 0, 1, strings));
+    const sectionNames = bytesNew(1);
+    const shstrings = section(".shstrtab", 3, 0, 1, sectionNames); listPush(sections, shstrings);
+    listPush(sections, section(".note.GNU-stack", 1, 0, 1, bytesNew(0)));
+    if (functions.ok) {
+        const code = listGet(sections, 0) catch missing;
+        listPush(sections, section(".txfn", 1, 0, 1, nativeFunctionEncode(functions, code.bytes, 1)));
+    }
+    i = 0;
+    while (i < listLen(sections)) {
+        const s = listGet(sections, i) catch missing;
+        if (s.kind == 0) { return fail("BadSection"); }
+        s.nameAt = stringAt(sectionNames, s.name); i = i + 1;
+    }
+    shstrings.size = bytesLen(sectionNames);
+    const out = bytesNew(0);
+    word(out, 127, 1); word(out, 69, 1); word(out, 76, 1); word(out, 70, 1);
+    word(out, 2, 1); word(out, 1, 1); word(out, 1, 1); word(out, 0, 1); word(out, 0, 8);
+    let machine = 62;
+    if (a64) { machine = 183; }
+    word(out, 1, 2); word(out, machine, 2); word(out, 1, 4);
+    word(out, 0, 8); word(out, 0, 8); word(out, 0, 8); word(out, 0, 4);
+    word(out, 64, 2); word(out, 0, 2); word(out, 0, 2); word(out, 64, 2); word(out, listLen(sections) + 1, 2); word(out, 10, 2);
+    i = 0;
+    while (i < listLen(sections)) {
+        const s = listGet(sections, i) catch missing;
+        if (s.kind == 0) { return fail("BadSection"); }
+        while ((bytesLen(out) & (s.alignment - 1)) != 0) { bytesPush(out, 0); }
+        s.offset = bytesLen(out);
+        if (s.kind != 8) { bytesAppend(out, s.bytes); }
+        i = i + 1;
+    }
+    while ((bytesLen(out) & 7) != 0) { bytesPush(out, 0); }
+    const sectionTable = bytesLen(out);
+    i = 0; while (i < 8) { bytesSet(out, 40 + i, (sectionTable >>> (i * 8)) & 255); i = i + 1; }
+    bytesAppend(out, bytesNew(64));
+    i = 0;
+    while (i < listLen(sections)) {
+        const s = listGet(sections, i) catch missing;
+        if (s.kind == 0) { return fail("BadSection"); }
+        word(out, s.nameAt, 4); word(out, s.kind, 4); word(out, s.flags, 8); word(out, 0, 8);
+        word(out, s.offset, 8); word(out, s.size, 8); word(out, s.link, 4); word(out, s.info, 4);
+        word(out, s.alignment, 8); word(out, s.entrySize, 8); i = i + 1;
+    }
+    return new ElfObjectResult { ok: 1, bytes: out, error: "" };
+}
+export function elfObjectOk(result: Ref<ElfObjectResult>): int { return result.ok; }
+export function elfObjectBytes(result: Ref<ElfObjectResult>): Bytes { return result.bytes; }
+export function elfObjectError(result: Ref<ElfObjectResult>): string { return result.error; }

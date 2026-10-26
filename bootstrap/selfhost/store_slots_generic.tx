@@ -1,0 +1,243 @@
+// 对象槽存储的可移植版（rtfn 写，macOS 适配 M4 设计 A8）：语义与导出名同 store_slots.tx。
+// 状态 64 字节 {标志数组@0, 链数组@8, 已用槽数@16, 容量@24, 空闲链头@32, 空闲数@40, 对象数组@48, 对象大小@56}；
+// 标志与链数组每槽一个 u32，对象数组每槽“对象大小”字节。空闲链头为 0xFFFFFFFF 表示无；在用槽的链项为 0xFFFFFFFE。
+// 扩容三个数组一起换（容量翻倍，起始 64，上限 0xFFFFFFFE），后一个分配失败时归还先前分配的。
+// 检测形态（页堆内核，--generic=heapcheck；设计 v052-heap-check-tool）另有对象号隔离：释放的号码不挂回空闲链头（后进先出、
+// 下一次分配即复用），链项记“隔离中”0xFFFFFFFD、计数保持 0，入先进先出的隔离环（ring 项，首次释放时分配，环满时最早的号码
+// 才挂回空闲链）。此间对它多出的一次释放落在计数为 0 的号码上，由运行时加固 H1 报 4012——不会悄悄减掉复用了它的新对象的计数。
+// 状态随之加三项 {隔离环@64, 环首@72, 环内项数@80}，前 64 字节布局不变（RC 快路径、泄漏检查、调试视图照旧按它读）。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, L, I } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtShift, rtLoad, rtStore, rtLabel, rtJump, rtIf, rtCall1, rtCall2, rtCall3, rtRet, rtRetVoid } from "./rtfn";
+import { tSysV } from "./target";
+
+const MODULE: string = "bootstrap/selfhost/store_slots_generic.tx";
+const MASK32: int = 4294967295;
+const NONE: int = 4294967295;
+const IN_USE: int = 4294967294;
+const QUARANTINED: int = 4294967293;
+const STATE: int = 64;
+const QSTATE: int = 88;
+/// 页堆内核的隔离环项数（2 的幂）：同页堆的块隔离环。测试探针另给小容量，以便在测试分配器的范围内测满环与出环。
+export const SLOTS_QUARANTINE_RING: int = 65536;
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// create(stride u32) → 状态，或 0（stride 为 0、分配失败）。
+function createFn(b: Ref<StructuredBuffer>, failures: List<string>, fill: string, quarantine: bool): void {
+    let size = STATE;
+    if (quarantine) { size = QSTATE; }
+    const f = rtBegin(b, "__tx_native_slots_create_v2", "stride", "s", 3, MODULE);
+    rtOp(f, "stride", L("stride"), "and", I(MASK32));
+    rtIf(f, L("stride"), "eq", I(0), "bad");
+    rtCall2(f, "s", "__tx_native_mem_alloc", I(size), I(8));
+    rtIf(f, L("s"), "eq", I(0), "bad");
+    rtCall3(f, "", fill, L("s"), I(0), I(size));
+    rtStore(f, L("s"), 32, I(NONE), 8);
+    rtStore(f, L("s"), 56, L("stride"), 8);
+    rtRet(f, L("s"));
+    rtLabel(f, "bad");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// acquire(state) → 槽号（标志置 1、链项置在用），或 0xFFFFFFFF（状态为空、槽数已达上限、分配失败）。
+// 先取空闲链；没有时追加，满了先扩容（拷贝已用部分、归还旧数组）。
+function acquireFn(b: Ref<StructuredBuffer>, failures: List<string>, copy: string): void {
+    const f = rtBegin(b, "__tx_native_slots_acquire_v2", "st", "idx ncap flags next objs n x y", 3, MODULE);
+    rtIf(f, L("st"), "eq", I(0), "fail");
+    rtLoad(f, "idx", L("st"), 32, 8);
+    rtIf(f, L("idx"), "ne", I(NONE), "pop");
+    rtLoad(f, "idx", L("st"), 16, 8);
+    rtIf(f, L("idx"), "uge", I(IN_USE), "fail");
+    rtLoad(f, "ncap", L("st"), 24, 8);
+    rtIf(f, L("idx"), "ult", L("ncap"), "append");
+    rtIf(f, L("ncap"), "ne", I(0), "double");
+    rtSet(f, "ncap", I(64));
+    rtJump(f, "capacity");
+    rtLabel(f, "double");
+    rtShift(f, "ncap", L("ncap"), "shl", 1);
+    rtIf(f, L("ncap"), "ule", I(IN_USE), "capacity");
+    rtSet(f, "ncap", I(IN_USE));
+    rtLabel(f, "capacity");
+    rtShift(f, "x", L("ncap"), "shl", 2);
+    rtCall2(f, "flags", "__tx_native_mem_alloc", L("x"), I(4));
+    rtIf(f, L("flags"), "eq", I(0), "fail");
+    rtShift(f, "x", L("ncap"), "shl", 2);
+    rtCall2(f, "next", "__tx_native_mem_alloc", L("x"), I(4));
+    rtIf(f, L("next"), "eq", I(0), "second_fail");
+    rtLoad(f, "y", L("st"), 56, 8);
+    rtOp(f, "x", L("ncap"), "imul", L("y"));
+    rtCall2(f, "objs", "__tx_native_mem_alloc", L("x"), I(16));
+    rtIf(f, L("objs"), "eq", I(0), "third_fail");
+    rtLoad(f, "n", L("st"), 16, 8);
+    rtShift(f, "n", L("n"), "shl", 2);
+    rtIf(f, L("n"), "eq", I(0), "copied");
+    rtLoad(f, "x", L("st"), 0, 8);
+    rtCall3(f, "", copy, L("flags"), L("x"), L("n"));
+    rtLoad(f, "x", L("st"), 8, 8);
+    rtCall3(f, "", copy, L("next"), L("x"), L("n"));
+    rtLoad(f, "n", L("st"), 16, 8);
+    rtLoad(f, "y", L("st"), 56, 8);
+    rtOp(f, "n", L("n"), "imul", L("y"));
+    rtLoad(f, "x", L("st"), 48, 8);
+    rtCall3(f, "", copy, L("objs"), L("x"), L("n"));
+    rtLabel(f, "copied");
+    rtLoad(f, "x", L("st"), 0, 8);
+    rtCall1(f, "", "__tx_native_mem_free", L("x"));
+    rtLoad(f, "x", L("st"), 8, 8);
+    rtCall1(f, "", "__tx_native_mem_free", L("x"));
+    rtLoad(f, "x", L("st"), 48, 8);
+    rtCall1(f, "", "__tx_native_mem_free", L("x"));
+    rtStore(f, L("st"), 0, L("flags"), 8);
+    rtStore(f, L("st"), 8, L("next"), 8);
+    rtStore(f, L("st"), 24, L("ncap"), 8);
+    rtStore(f, L("st"), 48, L("objs"), 8);
+    rtLoad(f, "idx", L("st"), 16, 8);
+    rtLabel(f, "append");
+    rtOp(f, "x", L("idx"), "add", I(1));
+    rtStore(f, L("st"), 16, L("x"), 8);
+    rtJump(f, "live");
+    rtLabel(f, "pop");
+    rtShift(f, "x", L("idx"), "shl", 2);
+    rtLoad(f, "y", L("st"), 8, 8);
+    rtOp(f, "x", L("x"), "add", L("y"));
+    rtLoad(f, "x", L("x"), 0, 4);
+    rtStore(f, L("st"), 32, L("x"), 8);
+    rtLoad(f, "x", L("st"), 40, 8);
+    rtOp(f, "x", L("x"), "sub", I(1));
+    rtStore(f, L("st"), 40, L("x"), 8);
+    rtLabel(f, "live");
+    rtShift(f, "x", L("idx"), "shl", 2);
+    rtLoad(f, "y", L("st"), 0, 8);
+    rtOp(f, "y", L("y"), "add", L("x"));
+    rtStore(f, L("y"), 0, I(1), 4);
+    rtLoad(f, "y", L("st"), 8, 8);
+    rtOp(f, "y", L("y"), "add", L("x"));
+    rtStore(f, L("y"), 0, I(IN_USE), 4);
+    rtRet(f, L("idx"));
+    rtLabel(f, "third_fail");
+    rtCall1(f, "", "__tx_native_mem_free", L("next"));
+    rtLabel(f, "second_fail");
+    rtCall1(f, "", "__tx_native_mem_free", L("flags"));
+    rtLabel(f, "fail");
+    rtRet(f, I(NONE));
+    done(f, failures);
+}
+
+// free(state, idx u32) → 1，或 0（状态为空、越界、槽不在用、标志不为 0）：槽挂回空闲链头；检测形态改入隔离环（见文件头）。
+function freeFn(b: Ref<StructuredBuffer>, failures: List<string>, quarantine: bool, ring: int): void {
+    // 标准形态的局部与调用数照旧（内核逐字节不变）；检测形态多四个局部、一次分配调用。
+    let locals = "e g x";
+    let calls = 0;
+    if (quarantine) { locals = "e g x r h n o"; calls = 2; }
+    const f = rtBegin(b, "__tx_native_slots_free_v2", "st idx", locals, calls, MODULE);
+    rtIf(f, L("st"), "eq", I(0), "bad");
+    rtOp(f, "idx", L("idx"), "and", I(MASK32));
+    rtLoad(f, "x", L("st"), 16, 8);
+    rtIf(f, L("idx"), "uge", L("x"), "bad");
+    rtShift(f, "x", L("idx"), "shl", 2);
+    rtLoad(f, "e", L("st"), 8, 8);
+    rtOp(f, "e", L("e"), "add", L("x"));
+    rtLoad(f, "g", L("e"), 0, 4);
+    rtIf(f, L("g"), "ne", I(IN_USE), "bad");
+    rtLoad(f, "g", L("st"), 0, 8);
+    rtOp(f, "g", L("g"), "add", L("x"));
+    rtLoad(f, "g", L("g"), 0, 4);
+    rtIf(f, L("g"), "ne", I(0), "bad");
+    if (quarantine) { quarantineTail(f, ring); }
+    rtLabel(f, "link");
+    rtLoad(f, "x", L("st"), 32, 8);
+    rtStore(f, L("e"), 0, L("x"), 4);
+    rtStore(f, L("st"), 32, L("idx"), 8);
+    rtLoad(f, "x", L("st"), 40, 8);
+    rtOp(f, "x", L("x"), "add", I(1));
+    rtStore(f, L("st"), 40, L("x"), 8);
+    rtRet(f, I(1));
+    rtLabel(f, "bad");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// free 的检测形态（e 为本槽链项的地址）：链项记隔离中，号码入环尾；环满时最早的号码出环、挂回空闲链头。隔离环分配不了时
+// 退回 link（这一个号码照常挂回空闲链，不隔离）——检查工具不另造失败。
+function quarantineTail(f: Ref<RtFn>, ring: int): void {
+    rtStore(f, L("e"), 0, I(QUARANTINED), 4);
+    rtLoad(f, "r", L("st"), 64, 8);
+    rtIf(f, L("r"), "ne", I(0), "ring");
+    rtCall2(f, "r", "__tx_native_mem_alloc", I(ring * 4), I(4));
+    rtIf(f, L("r"), "eq", I(0), "link");
+    rtStore(f, L("st"), 64, L("r"), 8);
+    rtLabel(f, "ring");
+    rtLoad(f, "n", L("st"), 80, 8);
+    rtIf(f, L("n"), "ult", I(ring), "push");
+    rtLoad(f, "h", L("st"), 72, 8);
+    rtShift(f, "x", L("h"), "shl", 2);
+    rtOp(f, "x", L("x"), "add", L("r"));
+    rtLoad(f, "o", L("x"), 0, 4);
+    rtShift(f, "x", L("o"), "shl", 2);
+    rtLoad(f, "g", L("st"), 8, 8);
+    rtOp(f, "x", L("x"), "add", L("g"));
+    rtLoad(f, "g", L("st"), 32, 8);
+    rtStore(f, L("x"), 0, L("g"), 4);
+    rtStore(f, L("st"), 32, L("o"), 8);
+    rtLoad(f, "g", L("st"), 40, 8);
+    rtOp(f, "g", L("g"), "add", I(1));
+    rtStore(f, L("st"), 40, L("g"), 8);
+    rtOp(f, "h", L("h"), "add", I(1));
+    rtOp(f, "h", L("h"), "and", I(ring - 1));
+    rtStore(f, L("st"), 72, L("h"), 8);
+    rtOp(f, "n", L("n"), "sub", I(1));
+    rtLabel(f, "push");
+    rtLoad(f, "h", L("st"), 72, 8);
+    rtOp(f, "x", L("h"), "add", L("n"));
+    rtOp(f, "x", L("x"), "and", I(ring - 1));
+    rtShift(f, "x", L("x"), "shl", 2);
+    rtOp(f, "x", L("x"), "add", L("r"));
+    rtStore(f, L("x"), 0, L("idx"), 4);
+    rtOp(f, "n", L("n"), "add", I(1));
+    rtStore(f, L("st"), 80, L("n"), 8);
+    rtRet(f, I(1));
+}
+
+// destroy(state)：归还三个数组（检测形态另有隔离环）与状态本身；状态为空时什么也不做。
+function destroyFn(b: Ref<StructuredBuffer>, failures: List<string>, quarantine: bool): void {
+    const f = rtBegin(b, "__tx_native_slots_destroy_v2", "st", "x", 1, MODULE);
+    rtIf(f, L("st"), "eq", I(0), "out");
+    if (quarantine) {
+        rtLoad(f, "x", L("st"), 64, 8);
+        rtIf(f, L("x"), "eq", I(0), "noring");
+        rtCall1(f, "", "__tx_native_mem_free", L("x"));
+        rtLabel(f, "noring");
+    }
+    rtLoad(f, "x", L("st"), 0, 8);
+    rtCall1(f, "", "__tx_native_mem_free", L("x"));
+    rtLoad(f, "x", L("st"), 8, 8);
+    rtCall1(f, "", "__tx_native_mem_free", L("x"));
+    rtLoad(f, "x", L("st"), 48, 8);
+    rtCall1(f, "", "__tx_native_mem_free", L("x"));
+    rtCall1(f, "", "__tx_native_mem_free", L("st"));
+    rtLabel(f, "out");
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+/// 发出对象槽存储的函数；rtfn 的失败记进 failures。t 为目标编号：SysV 目标的内核内拷贝与填充走私有约定的
+/// __tx_linux_memcpy／__tx_linux_memset（导出的 memcpy／memset 在那里是 C 约定），其余目标直接用 memcpy／memset。
+/// ring 非 0 时发检测形态（对象号隔离，见文件头；ring 为隔离环项数，2 的幂），只给页堆内核与测试探针用；0 为标准形态。
+export function storeSlotsGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int, ring: int): void {
+    const quarantine = ring > 0;
+    let copy = "memcpy";
+    let fill = "memset";
+    if (tSysV(t)) {
+        copy = "__tx_linux_memcpy";
+        fill = "__tx_linux_memset";
+    }
+    createFn(b, failures, fill, quarantine);
+    acquireFn(b, failures, copy);
+    freeFn(b, failures, quarantine, ring);
+    destroyFn(b, failures, quarantine);
+}

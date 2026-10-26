@@ -1,0 +1,315 @@
+// 取页失败注入的穷举扫描（docs/design/v052-oom-fault-v0.1-20261025.md §四；gate.tx 的 oom-fault 步）：由给定编译器编出内核生成器，
+// 生成本宿主目标的 --generic=oomfault 内核，以 --link-object 编出各负载。每个负载先不注入跑一遍取期望输出，再按持续模式
+// N = 1, 2…逐个跑到某一轮没有注入（此前的最大 N 记为总次数 T），最后对 N = 1..T 各跑一次一次性模式 N:1。每轮只许“跑完”或
+// “致命 OOM”两种结局（classify）。环境变量经工具链内建 setEnv（D3 v0.42）设给子进程（子进程的环境取本进程环境表的当前内容，D3 v0.39）。
+// 运行：taixu run --toolchain scripts/test_oom_fault.tx --compiler <taixu> --work <目录> [--root <仓库>]
+import { absolute, exeName, join, list1, mkdirs, plus, step, words } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { Outcome, Tally, capture, check, linesOf, summary, tallyNew } from "./test_lib";
+import { jsonQuote } from "../bootstrap/selfhost/json_text";
+
+const VAR: string = "TAIXU_TEST_FAIL_PAGES";
+const MARK: string = "oomfault: injected\n";
+const OOM: string = "taixu: 内存不足\n";
+const JOIN_FAILED: string = "JOIN_FAILED";
+// 单轮至多 60 秒；两个流各留末尾 64 KiB。
+const RUN_NS: int = 60000000000;
+const KEEP: int = 65536;
+// 持续模式的 N 超过它仍有注入，即视为扫描不收敛。
+const MAX_T: int = 20000;
+// 报告里至多留这么多条不合同的运行。
+const MAX_BAD: int = 20;
+const KERNEL_FLAGS: string = "--with-move --with-alloc --with-rc --with-str --with-strb --with-zero --with-list --with-file --with-argv --with-store-slots --with-nrt";
+// 负载（tests/runtime-security/<名>.tx）与其期望输出的前缀，成对排列。
+const WORKLOADS: string = "oom-sweep PASS_OOM_SWEEP oom-fault-deep PASS_OOM_DEEP";
+
+struct Opts {
+    compiler: string,
+    work: string,
+    root: string,
+}
+
+// 一个负载的扫描结果：总次数 T，持续模式与一次性模式的“跑完”“致命 OOM”轮数，一次性模式里没有发生注入的轮数，跑完时
+// 出现过 JOIN_FAILED（线程创建失败被接住）的轮数，不合同的轮数与其中前 MAX_BAD 条的报告行。
+struct Sweep {
+    total: int,
+    keepPass: int,
+    keepOom: int,
+    oncePass: int,
+    onceOom: int,
+    onceQuiet: int,
+    recovered: int,
+    bad: int,
+    rows: List<string>,
+}
+
+// 结局：“pass” 跑完——退出码 0，stdout 末行为期望输出、其前只有 JOIN_FAILED，stderr 除注入标记外为空；“oom” 致命 OOM——退出码 3，
+// stderr 除注入标记外恰为 “taixu: 内存不足”，stdout 只有 JOIN_FAILED；其余为不合同，返回说明。
+function classify(r: Ref<Outcome>, expected: string): string {
+    if (r.timedOut) {
+        return "超时";
+    }
+    if (r.binary) {
+        return "输出不是合法 UTF-8";
+    }
+    // stderr 按行比较，去掉（至多一行）注入标记。
+    let rest = "";
+    let marked: bool = false;
+    for (line in linesOf(r.err)) {
+        if (!marked && line + "\n" == MARK) {
+            marked = true;
+        } else {
+            rest = rest + line + "\n";
+        }
+    }
+    const lines = linesOf(r.out);
+    const n = listLen(lines);
+    let joins: int = 0;
+    for (line in lines) {
+        if (line == JOIN_FAILED) {
+            joins = joins + 1;
+        }
+    }
+    if (r.code == 0 && len(rest) == 0 && n == joins + 1 && (listGet(lines, n - 1) catch "") == expected) {
+        return "pass";
+    }
+    if (r.code == 3 && rest == OOM && n == joins) {
+        return "oom";
+    }
+    return "退出码 " + toStr(r.code);
+}
+
+function injected(r: Ref<Outcome>): bool {
+    return strIndexOf(r.err, MARK) >= 0;
+}
+
+function runWith(exe: string, dir: string, value: string): Ref<Outcome> | Error {
+    setEnv(VAR, value) catch (e) {
+        return e;
+    };
+    const none: List<string> = listNew();
+    return capture(exe, none, dir, RUN_NS, KEEP);
+}
+
+function badRow(name: string, mode: string, value: string, r: Ref<Outcome>, why: string): string {
+    return "{\"workload\":" + jsonQuote(name) + ",\"mode\":" + jsonQuote(mode) + ",\"value\":" + jsonQuote(value) + ",\"why\":" + jsonQuote(why)
+    + ",\"exit\":" + toStr(r.code) + ",\"stdout\":" + jsonQuote(r.out) + ",\"stderr\":" + jsonQuote(r.err) + "}";
+}
+
+function note(s: Ref<Sweep>, row: string): void {
+    s.bad = s.bad + 1;
+    if (listLen(s.rows) < MAX_BAD) {
+        listPush(s.rows, row);
+    }
+}
+
+// 对 exe 做两种模式的扫描；baseline 为不注入时的期望输出。运行本身失败（起不了进程、设不了变量）时得 Error。
+function sweep(name: string, exe: string, dir: string, expected: string): Ref<Sweep> | Error {
+    const s = new Sweep { total: 0, keepPass: 0, keepOom: 0, oncePass: 0, onceOom: 0, onceQuiet: 0, recovered: 0, bad: 0, rows: listNew() };
+    let n: int = 1;
+    while (true) {
+        const value = toStr(n);
+        const r = runWith(exe, dir, value) catch (e) {
+            return e;
+        };
+        const kind = classify(r, expected);
+        if (!injected(r)) {
+            // 这一轮没有发生注入：总次数为此前的最大 N，这一轮须与基线相同。
+            if (kind != "pass" || strIndexOf(r.out, JOIN_FAILED) >= 0) {
+                note(s, badRow(name, "persistent", value, r, "未注入却不同于基线：" + kind));
+            }
+            s.total = n - 1;
+            break;
+        }
+        if (kind == "pass") {
+            s.keepPass = s.keepPass + 1;
+        } else if (kind == "oom") {
+            s.keepOom = s.keepOom + 1;
+        } else {
+            note(s, badRow(name, "persistent", value, r, kind));
+        }
+        n = n + 1;
+        if (n > MAX_T) {
+            s.total = -1;
+            return s;
+        }
+    }
+    n = 1;
+    while (n <= s.total) {
+        const value = toStr(n) + ":1";
+        const r = runWith(exe, dir, value) catch (e) {
+            return e;
+        };
+        const kind = classify(r, expected);
+        if (!injected(r)) {
+            s.onceQuiet = s.onceQuiet + 1;
+        }
+        if (kind == "pass") {
+            s.oncePass = s.oncePass + 1;
+            if (strIndexOf(r.out, JOIN_FAILED) >= 0) {
+                s.recovered = s.recovered + 1;
+            }
+        } else if (kind == "oom") {
+            s.onceOom = s.onceOom + 1;
+        } else {
+            note(s, badRow(name, "once", value, r, kind));
+        }
+        n = n + 1;
+    }
+    return s;
+}
+
+function parseOpts(args: []string): Ref<Opts> | Error {
+    const o = new Opts { compiler: "", work: "", root: "" };
+    let i: int = 0;
+    while (i < len(args)) {
+        const a = args[i];
+        if (i + 1 >= len(args)) {
+            return err("缺少取值或未知参数：" + a);
+        }
+        const v = args[i + 1];
+        if (a == "--compiler") {
+            o.compiler = v;
+        } else if (a == "--work") {
+            o.work = v;
+        } else if (a == "--root") {
+            o.root = v;
+        } else {
+            return err("未知参数：" + a);
+        }
+        i = i + 2;
+    }
+    if (len(o.compiler) == 0 || len(o.work) == 0) {
+        return err("用法：taixu run --toolchain scripts/test_oom_fault.tx --compiler <taixu> --work <目录> [--root <仓库>]");
+    }
+    if (len(o.root) == 0) {
+        o.root = currentDir() catch ".";
+    }
+    o.root = osRealPath(absolute(o.root));
+    o.compiler = osRealPath(absolute(o.compiler));
+    if (!mkdirs(absolute(o.work))) {
+        return err("建不了工作目录：" + o.work);
+    }
+    o.work = osRealPath(absolute(o.work));
+    return o;
+}
+
+// 本宿主的内核目标与内核文件名（同 test-heap-check.py）。
+function hostKernel(): List<string> {
+    const host = hostTarget();
+    if (host == "windows") {
+        return words("x86_64-windows kernel.obj");
+    }
+    if (host == "macos") {
+        return words("aarch64-macos kernel-macos-aarch64.o");
+    }
+    return words("x86_64-linux kernel-linux.o");
+}
+
+function sweepJson(name: string, s: Ref<Sweep>): string {
+    let rows = "";
+    for (r in s.rows) {
+        if (len(rows) > 0) {
+            rows = rows + ",";
+        }
+        rows = rows + r;
+    }
+    return "{\"workload\":" + jsonQuote(name) + ",\"total\":" + toStr(s.total) + ",\"persistent\":{\"pass\":" + toStr(s.keepPass) + ",\"oom\":"
+    + toStr(s.keepOom) + "},\"once\":{\"pass\":" + toStr(s.oncePass) + ",\"oom\":" + toStr(s.onceOom) + ",\"not_injected\":"
+    + toStr(s.onceQuiet) + ",\"recovered\":" + toStr(s.recovered) + "},\"out_of_contract\":" + toStr(s.bad) + ",\"examples\":[" + rows + "]}";
+}
+
+// 编出负载 name（链接注入内核 kernel），取基线后扫描；报告行追加进 parts。
+function workload(t: Ref<Tally>, o: Ref<Opts>, kernel: string, name: string, prefix: string, parts: List<string>): void {
+    const dir = join(o.work, name);
+    const src = "tests/runtime-security/" + name + ".tx";
+    step(o.compiler, plus(plus(list1("build"), list1(src)), plus(plus(list1("--link-object"), list1(kernel)), plus(list1("--out"), list1(dir)))), o.root) catch (e) {
+        check(t, name + "：编出负载", false, e.message);
+        return;
+    };
+    const exe = join(dir, exeName(name));
+    const base = runWith(exe, dir, "") catch (e) {
+        check(t, name + "：不注入的基线", false, e.message);
+        return;
+    };
+    const lines = linesOf(base.out);
+    const expected = listGet(lines, listLen(lines) - 1) catch "";
+    if (!check(t, name + "：不注入的基线", base.code == 0 && listLen(lines) == 1 && strIndexOf(expected, prefix + " ") == 0 && len(base.err) == 0,
+            "退出码 " + toStr(base.code) + "，stdout " + base.out + "，stderr " + base.err)) {
+        return;
+    }
+    // 负控制：用编译器内嵌的标准内核编出的同一负载不理会变量（注入只在测试内核里）。
+    const stdDir = dir + "-standard";
+    step(o.compiler, plus(plus(list1("build"), list1(src)), plus(list1("--out"), list1(stdDir))), o.root) catch (e) {
+        check(t, name + "：编出标准内核的负载", false, e.message);
+        return;
+    };
+    const plain = runWith(join(stdDir, exeName(name)), stdDir, "1") catch (e) {
+        check(t, name + "：标准内核不理会变量", false, e.message);
+        return;
+    };
+    check(t, name + "：标准内核不理会变量", plain.code == 0 && plain.out == base.out && len(plain.err) == 0,
+        "退出码 " + toStr(plain.code) + "，stdout " + plain.out + "，stderr " + plain.err);
+    const s = sweep(name, exe, dir, expected) catch (e) {
+        check(t, name + "：扫描", false, e.message);
+        return;
+    };
+    listPush(parts, sweepJson(name, s));
+    print(name + "：T=" + toStr(s.total) + "；持续模式 跑完 " + toStr(s.keepPass) + "、致命 OOM " + toStr(s.keepOom) + "；一次性模式 跑完 "
+        + toStr(s.oncePass) + "（其中接住线程创建失败 " + toStr(s.recovered) + "）、致命 OOM " + toStr(s.onceOom) + "、未注入 " + toStr(s.onceQuiet)
+        + "；不合同 " + toStr(s.bad));
+    check(t, name + "：扫描收敛", s.total >= 0, "持续模式到 N=" + toStr(MAX_T) + " 仍有注入");
+    check(t, name + "：闸门生效（持续模式 N=1 即有注入）", s.total >= 1, "N=1 没有注入");
+    check(t, name + "：每轮只有跑完或致命 OOM 两种结局", s.bad == 0, toStr(s.bad) + " 轮不合同，见 report.json");
+    check(t, name + "：一次性模式各轮都有注入", s.onceQuiet == 0, toStr(s.onceQuiet) + " 轮未注入");
+    check(t, name + "：线程创建失败被接住后跑完", s.recovered > 0, "一次性模式里没有这样的轮次");
+}
+
+export function main(args: []string): int {
+    const t = tallyNew();
+    const o = parseOpts(args) catch (e) {
+        eprint(e.message);
+        return 2;
+    };
+    const kt = hostKernel();
+    const target = listGet(kt, 0) catch "";
+    // 内核生成器（Linux 上显式按 linux 目标编，同 test-heap-check.py）。
+    let tflag: List<string> = listNew();
+    if (hostTarget() == "linux") {
+        tflag = list1("--target=linux");
+    }
+    const genDir = join(o.work, "gen");
+    step(o.compiler, plus(plus(words("build bootstrap/runtime_memory_gen.tx --runtime=native"), tflag), plus(list1("--out"), list1(genDir))), o.root) catch (e) {
+        check(t, "oom-fault：编出内核生成器", false, e.message);
+        return summary(t, "oom-fault");
+    };
+    const kernel = join(join(o.work, "kernel"), listGet(kt, 1) catch "");
+    mkdirs(join(o.work, "kernel"));
+    const gen = join(genDir, exeName("runtime_memory_gen"));
+    step(gen, plus(plus(plus(list1("--target"), list1(target)), list1(kernel)), plus(words(KERNEL_FLAGS), list1("--generic=oomfault"))), o.work) catch (e) {
+        check(t, "oom-fault：生成 " + target + " 的注入内核", false, e.message);
+        return summary(t, "oom-fault");
+    };
+    const parts: List<string> = listNew();
+    const pairs = words(WORKLOADS);
+    let i: int = 0;
+    while (i + 1 < listLen(pairs)) {
+        workload(t, o, kernel, listGet(pairs, i) catch "", listGet(pairs, i + 1) catch "", parts);
+        i = i + 2;
+    }
+    let report = "{\"target\":" + jsonQuote(target) + ",\"workloads\":[";
+    let k: int = 0;
+    while (k < listLen(parts)) {
+        if (k > 0) {
+            report = report + ",";
+        }
+        report = report + (listGet(parts, k) catch "");
+        k = k + 1;
+    }
+    report = report + "]}\n";
+    writeFile(join(o.work, "report.json"), report) catch (e) {
+        check(t, "oom-fault：写报告", false, e.message);
+    };
+    print("report " + join(o.work, "report.json"));
+    return summary(t, "oom-fault");
+}

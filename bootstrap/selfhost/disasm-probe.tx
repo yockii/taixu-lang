@@ -1,0 +1,178 @@
+// 原生清单→文本汇编→机器码与未解析修补点的独立回环（6d-5）。
+// A64（第二个实参 aarch64，macOS 适配 M4 设计 A11）没有文本汇编器可回环，改为逐行对照映像：清单的每条指令行依次就是代码节里
+// f_0 起的一个字（反汇编文本相同）；最后一个操作数改写成标号的，核对跳转距离正好落到该标号；改写成符号的，核对同一位置有
+// 指向该符号、种类相符的修补。标号行的位置须是该标号的偏移，函数之间只许对齐用的零字。
+import { drvDisasm, drvDisasmRelease, drvDiagOut, drvSetPrelude, drvSetToolchain } from "./driver";
+import { AsListingRow, asListingGet, asImgText, asResolveLocalFixups, asSymIndexL, asSymOffL,
+    asFixCountL, asFixSecL, asFixAtL, asFixKindL, asFixSymL, asFixAddendL,
+    assembleText, asFailedAs, asLastErrAs, asLastLineAs, FIX_A64_CALL26, FIX_A64_JUMP26, FIX_A64_PAGE21, FIX_A64_ADD_LO12 } from "./assemble";
+import { disasmAssembly } from "./disasm";
+import { a64Disasm } from "./a64_disasm";
+import { T_X64_WINDOWS, T_X64_LINUX, T_ARM64_MACOS } from "./target";
+
+function intAt(xs: Bytes, i: int): int { return bytesGet(xs, i) catch -1; }
+function textFixups(start: int): List<string> {
+    const out: List<string> = listNew(); let i = 0;
+    while (i < asFixCountL()) {
+        if (asFixSecL(i) == 0 && asFixAtL(i) >= start) {
+            listPush(out, toStr(asFixAtL(i) - start) + ":" + toStr(asFixKindL(i)) + ":" + asFixSymL(i) + ":" + toStr(asFixAddendL(i)));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+function fixAt(xs: List<string>, i: int): string { return listGet(xs, i) catch ""; }
+
+function wordAt(xs: Bytes, at: int): int {
+    return intAt(xs, at) | (intAt(xs, at + 1) << 8) | (intAt(xs, at + 2) << 16) | (intAt(xs, at + 3) << 24);
+}
+// 一行汇编文本拆成 [助记符, 操作数…]；方括号里的逗号不拆。
+function textParts(t: string): List<string> {
+    const out: List<string> = listNew();
+    let sp = 0;
+    while (sp < len(t) && (byteAt(t, sp) catch 0) != 32) { sp = sp + 1; }
+    listPush(out, strSub(t, 0, sp));
+    let depth = 0; let from = sp + 1; let i = sp + 1;
+    while (i < len(t)) {
+        const ch = byteAt(t, i) catch 0;
+        if (ch == 91) { depth = depth + 1; }
+        if (ch == 93) { depth = depth - 1; }
+        if (ch == 44 && depth == 0) { listPush(out, strSub(t, from, i - from)); from = i + 2; i = i + 1; }
+        i = i + 1;
+    }
+    if (from < len(t)) { listPush(out, strSub(t, from, len(t) - from)); }
+    return out;
+}
+function rowParts(r: Ref<AsListingRow>): List<string> {
+    const out: List<string> = listNew();
+    listPush(out, r.name);
+    for (o in r.ops) { listPush(out, o); }
+    return out;
+}
+function textFixAt(at: int): int {
+    let i = 0;
+    while (i < asFixCountL()) {
+        if (asFixSecL(i) == 0 && asFixAtL(i) == at) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+// 修补处清单应写的最后一个操作数（decoded 是原字反汇编的最后一个操作数，立即数为 0）。
+function fixShown(i: int, decoded: string): string {
+    let s = asFixSymL(i);
+    const addend = asFixAddendL(i);
+    if (addend > 0) { s = s + "+" + toStr(addend); }
+    if (addend < 0) { s = s + "-" + toStr(-addend); }
+    const kind = asFixKindL(i);
+    if (kind == FIX_A64_CALL26 || kind == FIX_A64_JUMP26) { if (decoded != "#0") { return "?"; } return s; }
+    if (kind == FIX_A64_PAGE21) { if (decoded != "#0") { return "?"; } return s + "@PAGE"; }
+    if (kind == FIX_A64_ADD_LO12) { if (decoded != "#0") { return "?"; } return s + "@PAGEOFF"; }
+    if (len(decoded) < 4 || strSub(decoded, len(decoded) - 3, 3) != "#0]") { return "?"; }
+    return strSub(decoded, 0, len(decoded) - 3) + s + "@PAGEOFF]";
+}
+function checkA64(path: string): int {
+    if (drvDisasm(path, T_ARM64_MACOS, 0) != 0) { eprint(drvDiagOut()); return 1; }
+    const rows = asListingGet();
+    const text = asImgText();
+    const f0 = asSymIndexL("f_0");
+    if (listLen(rows) == 0 || f0 < 0) { eprint("missing f_0"); return 2; }
+    let pos = asSymOffL(f0);
+    let words = 0; let labels = 0; let fixes = 0; let branches = 0; let pads = 0;
+    let k = 0;
+    for (r in rows) {
+        k = k + 1;
+        if (r.kind == 2) {
+            const si = asSymIndexL(r.name);
+            if (si < 0) { eprint("label not defined: " + r.name); return 3; }
+            const off = asSymOffL(si);
+            const fnStart = len(r.name) > 2 && strSub(r.name, 0, 2) == "f_";
+            while (fnStart && pos < off && wordAt(text, pos) == 0) { pos = pos + 4; pads = pads + 1; }
+            if (off != pos) { eprint("label " + r.name + " at " + toStr(off) + ", listed at " + toStr(pos)); return 4; }
+            labels = labels + 1;
+            continue;
+        }
+        if (pos + 4 > bytesLen(text)) { eprint("listing runs past the code section at row " + toStr(k)); return 5; }
+        const got = textParts(a64Disasm(wordAt(text, pos)));
+        const want = rowParts(r);
+        const n = listLen(got);
+        let same = n == listLen(want);
+        let i = 0;
+        while (same && i < n - 1) { if (fixAt(got, i) != fixAt(want, i)) { same = false; } i = i + 1; }
+        if (!same) { eprint("row " + toStr(k) + " at " + toStr(pos) + ": listed " + strJoinParts(want) + ", code " + strJoinParts(got)); return 6; }
+        const last = fixAt(got, n - 1);
+        const shown = fixAt(want, n - 1);
+        if (last != shown) {
+            const fi = textFixAt(pos);
+            if (fi >= 0) {
+                if (fixShown(fi, last) != shown) { eprint("row " + toStr(k) + " at " + toStr(pos) + ": fixup shown as " + shown + ", expected " + fixShown(fi, last)); return 7; }
+                fixes = fixes + 1;
+            } else {
+                const si = asSymIndexL(shown);
+                if (si < 0 || "#" + toStr(asSymOffL(si) - pos) != last) {
+                    eprint("row " + toStr(k) + " at " + toStr(pos) + ": target " + shown + " does not match " + last); return 8;
+                }
+                branches = branches + 1;
+            }
+        }
+        pos = pos + 4;
+        words = words + 1;
+    }
+    drvDisasmRelease();
+    print("PASS a64 rows=" + toStr(listLen(rows)) + " words=" + toStr(words) + " labels=" + toStr(labels) + " fixups="
+        + toStr(fixes) + " branches=" + toStr(branches) + " pads=" + toStr(pads));
+    return 0;
+}
+function strJoinParts(xs: List<string>): string {
+    let out = fixAt(xs, 0);
+    let i = 1;
+    while (i < listLen(xs)) {
+        if (i == 1) { out = out + " "; } else { out = out + ", "; }
+        out = out + fixAt(xs, i);
+        i = i + 1;
+    }
+    return out;
+}
+
+export function main(args: []string): int {
+    if (len(args) != 2) { return 64; }
+    drvSetToolchain(true);
+    drvSetPrelude(bytesToStr(embedBytes("../../prelude/collections.tx")) catch "");
+    if (args[1] == "aarch64") { return checkA64(args[0]); }
+    let t = T_X64_WINDOWS;
+    if (args[1] == "linux") { t = T_X64_LINUX; }
+    if (drvDisasm(args[0], t, 0) != 0) { eprint(drvDiagOut()); return 1; }
+    const rows = asListingGet();
+    const asm = disasmAssembly(rows);
+    asResolveLocalFixups();
+    const original = asImgText();
+    let start = 0;
+    if (listLen(rows) > 0) { start = asSymOffL(asSymIndexL("f_0")); }
+    if (start < 0) { eprint("missing f_0"); return 2; }
+    const fixes = textFixups(start);
+    drvDisasmRelease();
+    const rebuilt = assembleText(asm);
+    if (asFailedAs() == 1) {
+        const lines = strSplit(asm, "\n");
+        eprint(asLastErrAs() + " line " + toStr(asLastLineAs()) + ": " + fixAt(lines, asLastLineAs() - 1));
+        return 3;
+    }
+    asResolveLocalFixups();
+    const actual = asImgText();
+    if (bytesLen(original) - start != bytesLen(actual)) {
+        eprint("size " + toStr(bytesLen(original) - start) + " != " + toStr(bytesLen(actual))); return 4;
+    }
+    let i = 0;
+    while (i < bytesLen(actual)) {
+        if (intAt(original, i + start) != intAt(actual, i)) { eprint("byte mismatch " + toStr(i)); return 5; }
+        i = i + 1;
+    }
+    const newFixes = textFixups(0);
+    if (listLen(fixes) != listLen(newFixes)) { eprint("fixup count"); return 6; }
+    i = 0;
+    while (i < listLen(fixes)) {
+        if (fixAt(fixes, i) != fixAt(newFixes, i)) { eprint("fixup mismatch " + toStr(i)); return 7; }
+        i = i + 1;
+    }
+    print("PASS bytes=" + toStr(bytesLen(actual)) + " rows=" + toStr(listLen(rows)) + " fixups=" + toStr(listLen(fixes)));
+    return 0;
+}

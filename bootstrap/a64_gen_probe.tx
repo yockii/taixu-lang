@@ -1,0 +1,284 @@
+// 指令宏 gen_ops 的 A64 落地探针（macOS 适配 M4 设计 A9 修订）：用指令宏写一个小程序，链接成 Mach-O arm64。在 Apple Silicon 上
+// 运行：逐项核对，全部相符打印 “a64 gen ok” 并 exit(0)；第 k 项不符即 exit(k)。x86 落地由 portable-codegen 门组随语料验证，
+// 这里补的是只在 A64 上才走到的写法（立即数合法化、大偏移、溢出判据、浮点无序、调用约定、帧与被调方保存寄存器）。
+// 用法：a64_gen_probe <输出目录>。
+import { Gen, GArg, genNew, genLabel, genJmp, genMovI, genLd, genSt, genStI, genLdX, genStX, genLea, genLeaSym, genLdSym, genSp, genBrSp, genOp, genOpI, genNeg, genNot, genOpO, genNegO, genDivRem, genBr, genBrI, genSet, genSetI, genFop, genFBr, genFSet, genI2F, genF32Round, genCall, genCallR, genRes, genRes2, genSetRes, genFnBegin, genFnEpilogue, genWinFromArg, gaI, gaSym, G_W, G_K0, G_K1, G_T0, G_T1, G_T2, G_SP } from "./selfhost/gen_ops";
+import { asBufferSection, asBufferLabel, asBufferZero, asBufferByte, asStructuredBegin, asFailedAs, asLastErrAs } from "./selfhost/assemble";
+import { a64BufferSubmit, a64Emit, a64MovImm } from "./selfhost/a64_asm";
+import { a64LogicalShifted, a64DataProc3, a64BranchReg } from "./selfhost/a64_encode";
+import { elfWriteObject, elfObjectOk, elfObjectBytes, elfObjectError } from "./selfhost/emit_elf_object";
+import { linkMachO, machoBytes, machoError, machoImportReset, machoIdentifierFor } from "./selfhost/link_macho";
+
+const INT_MAX: int = 9223372036854775807;
+const INT_MIN: int = -9223372036854775807 - 1;
+const F_1_5: int = 4609434218613702656;
+const F_2_25: int = 4612248968380809216;
+const F_1: int = 4607182418800017408;
+const F_2: int = 4611686018427387904;
+const F_NAN: int = 9221120237041090560;
+
+function one(a: Ref<GArg>): List<Ref<GArg>> { const xs: List<Ref<GArg>> = listNew(); listPush(xs, a); return xs; }
+
+// exit(k)
+function fail(g: Ref<Gen>, k: int): void {
+    genLdSym(g, 8, G_T2, "__imp_exit");
+    genCallR(g, G_T2, one(gaI(k)));
+}
+// r 与 want 不等时 exit(k)。
+function check(g: Ref<Gen>, k: int, r: int, want: int): void {
+    const ok = "ok" + toStr(k);
+    genBrI(g, "eq", r, want, ok);
+    fail(g, k);
+    genLabel(g, ok);
+}
+// 比较转移：taken 为期望是否转移。
+function brTest(g: Ref<Gen>, k: int, cc: string, a: int, b: int, taken: bool, fp: bool): void {
+    const yes = "y" + toStr(k);
+    const done = "d" + toStr(k);
+    if (fp) { genFBr(g, cc, a, b, yes); } else { genBr(g, cc, a, b, yes); }
+    if (taken) { fail(g, k); } else { genJmp(g, done); }
+    genLabel(g, yes);
+    if (!taken) { fail(g, k); }
+    genLabel(g, done);
+}
+// 带溢出出口的运算：overflow 为期望是否溢出；不溢出时核对结果，溢出时核对目的未被改写。
+function ovTest(g: Ref<Gen>, k: int, op: string, a: int, b: int, overflow: bool, want: int): void {
+    const ov = "ov" + toStr(k);
+    const done = "od" + toStr(k);
+    genMovI(g, G_T1, a);
+    genMovI(g, G_T2, b);
+    genMovI(g, G_T0, 12345);
+    if (op == "neg") { genNegO(g, G_T0, G_T1, ov); } else { genOpO(g, op, G_T0, G_T1, G_T2, ov); }
+    if (overflow) { fail(g, k); } else { check(g, k, G_T0, want); genJmp(g, done); }
+    genLabel(g, ov);
+    if (overflow) { check(g, k, G_T0, 12345); } else { fail(g, k); }
+    genLabel(g, done);
+}
+function opTest(g: Ref<Gen>, k: int, op: string, a: int, b: int, want: int): void {
+    genMovI(g, G_T1, a);
+    genMovI(g, G_T2, b);
+    genOp(g, op, G_T0, G_T1, G_T2);
+    check(g, k, G_T0, want);
+}
+function opITest(g: Ref<Gen>, k: int, op: string, a: int, imm: int, want: int): void {
+    genMovI(g, G_T1, a);
+    genOpI(g, op, G_T0, G_T1, imm);
+    check(g, k, G_T0, want);
+}
+function fopTest(g: Ref<Gen>, k: int, op: string, want: int): void {
+    genMovI(g, G_T1, F_1_5);
+    genMovI(g, G_T2, F_2_25);
+    genFop(g, op, G_T0, G_T1, G_T2);
+    check(g, k, G_T0, want);
+}
+
+// 手写的被调方：x0 + 2·x1 + … + 7·x6，第二结果 x1 ＝ 第一个实参。
+function sum7(g: Ref<Gen>): void {
+    asBufferLabel(g.b, "p_sum7", 1);
+    a64Emit(g.b, a64LogicalShifted(1, 1, 0, 16, 31, 0, 0, 0), "mov x16, x0");
+    let k = 1;
+    while (k <= 6) {
+        a64MovImm(g.b, 9, k + 1);
+        a64Emit(g.b, a64DataProc3(1, 0, 0, 0, k, 9, 0), "madd");
+        k = k + 1;
+    }
+    a64Emit(g.b, a64LogicalShifted(1, 1, 0, 1, 31, 16, 0, 0), "mov x1, x16");
+    a64Emit(g.b, a64BranchReg(2, 30), "ret");
+}
+
+// 指令宏写的被调方 f_2：改写 W K0 K1 后返回 W + 5；帧尾须恢复调用方的 x19–x21。
+function clobber(g: Ref<Gen>): void {
+    genFnBegin(g, 2, 16);
+    genWinFromArg(g);
+    genOpI(g, "add", G_T0, G_W, 5);
+    genMovI(g, G_K0, 7);
+    genMovI(g, G_K1, 8);
+    genMovI(g, G_W, 9);
+    genSetRes(g, G_T0);
+    genFnEpilogue(g);
+}
+
+function mainFn(g: Ref<Gen>): void {
+    genFnBegin(g, 0, 64);
+    // 1..2 立即数
+    genMovI(g, G_T0, 1311768467463790320); check(g, 1, G_T0, 1311768467463790320);
+    genMovI(g, G_T0, -5); check(g, 2, G_T0, -5);
+    // 3..12 三地址运算（移位计数按 64 取模）
+    opTest(g, 3, "add", 40, 2, 42);
+    opTest(g, 4, "sub", 5, 9, -4);
+    opTest(g, 5, "and", 61680, 4080, 240);
+    opTest(g, 6, "or", 61440, 15, 61455);
+    opTest(g, 7, "xor", 255, 15, 240);
+    opTest(g, 8, "mul", -6, 7, -42);
+    opTest(g, 9, "shl", 1, 63, INT_MIN);
+    opTest(g, 10, "shr", INT_MIN, 63, 1);
+    opTest(g, 11, "sar", INT_MIN, 63, -1);
+    opTest(g, 12, "shl", 1, 65, 2);
+    // 13..21 带立即数（含合法化）
+    opITest(g, 13, "add", 1, 1193046, 1193047);
+    opITest(g, 14, "add", 1, 549755813632, 549755813633);
+    opITest(g, 15, "sub", 10000, 5000, 5000);
+    opITest(g, 16, "and", 4660, 65280, 4608);
+    opITest(g, 17, "and", 1048575, 74565, 74565);
+    opITest(g, 18, "xor", 0, -1, -1);
+    opITest(g, 19, "shl", 3, 4, 48);
+    opITest(g, 20, "shr", -16, 60, 15);
+    opITest(g, 21, "sar", -16, 2, -4);
+    genMovI(g, G_T1, 5); genNeg(g, G_T0, G_T1); check(g, 22, G_T0, -5);
+    genMovI(g, G_T1, 0); genNot(g, G_T0, G_T1); check(g, 23, G_T0, -1);
+    // 24..38 溢出判据
+    ovTest(g, 24, "add", 1, 2, false, 3);
+    ovTest(g, 25, "add", INT_MAX, 1, true, 0);
+    ovTest(g, 26, "sub", INT_MIN, 1, true, 0);
+    ovTest(g, 27, "sub", -5, INT_MAX - 8, false, INT_MIN + 4);
+    ovTest(g, 28, "mul", INT_MAX, 2, true, 0);
+    ovTest(g, 29, "mul", -1, INT_MAX, false, -INT_MAX);
+    ovTest(g, 30, "mul", INT_MIN, -1, true, 0);
+    ovTest(g, 31, "addu", -1, 1, true, 0);
+    ovTest(g, 32, "addu", INT_MAX, 1, false, INT_MIN);
+    ovTest(g, 33, "subu", 0, 1, true, 0);
+    ovTest(g, 34, "subu", 5, 3, false, 2);
+    ovTest(g, 35, "mulu", 4294967296, 4294967296, true, 0);
+    ovTest(g, 36, "mulu", 4294967296, 2147483648, false, INT_MIN);
+    ovTest(g, 37, "neg", INT_MIN, 0, true, 0);
+    ovTest(g, 38, "neg", 7, 0, false, -7);
+    // 39..42 除法
+    genMovI(g, G_T1, -7); genMovI(g, G_T2, 2);
+    genDivRem(g, true, G_T0, G_K0, G_T1, G_T2); check(g, 39, G_T0, -3); check(g, 40, G_K0, -1);
+    genMovI(g, G_T1, -1); genMovI(g, G_T2, 3);
+    genDivRem(g, false, G_T0, G_K0, G_T1, G_T2); check(g, 41, G_T0, 6148914691236517205); check(g, 42, G_K0, 0);
+    // 43..52 比较转移（-1 与 1）
+    genMovI(g, G_K0, -1); genMovI(g, G_K1, 1);
+    brTest(g, 43, "lt", G_K0, G_K1, true, false);
+    brTest(g, 44, "le", G_K0, G_K1, true, false);
+    brTest(g, 45, "gt", G_K0, G_K1, false, false);
+    brTest(g, 46, "ge", G_K0, G_K1, false, false);
+    brTest(g, 47, "eq", G_K0, G_K1, false, false);
+    brTest(g, 48, "ne", G_K0, G_K1, true, false);
+    brTest(g, 49, "ult", G_K0, G_K1, false, false);
+    brTest(g, 50, "ule", G_K0, G_K1, false, false);
+    brTest(g, 51, "ugt", G_K0, G_K1, true, false);
+    brTest(g, 52, "uge", G_K0, G_K1, true, false);
+    // 53..56 与立即数比较（cbz／cbnz、大立即数、负立即数）
+    genMovI(g, G_T0, 0); genBrI(g, "eq", G_T0, 0, "c53"); fail(g, 53); genLabel(g, "c53");
+    genBrI(g, "ne", G_T0, 0, "f54"); genJmp(g, "c54"); genLabel(g, "f54"); fail(g, 54); genLabel(g, "c54");
+    genMovI(g, G_T0, 5000000000); genBrI(g, "eq", G_T0, 5000000000, "c55"); fail(g, 55); genLabel(g, "c55");
+    genMovI(g, G_T0, -6000); genBrI(g, "lt", G_T0, -5000, "c56"); fail(g, 56); genLabel(g, "c56");
+    // 57..59 置位
+    genSet(g, "lt", G_T0, G_K0, G_K1); check(g, 57, G_T0, 1);
+    genSetI(g, "ugt", G_T0, G_K0, 1); check(g, 58, G_T0, 1);
+    genSetI(g, "eq", G_T0, G_K0, 1); check(g, 59, G_T0, 0);
+    // 60..63 浮点运算
+    fopTest(g, 60, "fadd", 4615626668101337088);
+    fopTest(g, 61, "fsub", -4618441417868443648);
+    fopTest(g, 62, "fmul", 4614782243171205120);
+    fopTest(g, 63, "fdiv", 4604180019048437077);
+    // 64..79 浮点比较（有序：1.0 与 2.0；无序：1.0 与 NaN）
+    genMovI(g, G_K0, F_1); genMovI(g, G_K1, F_2);
+    brTest(g, 64, "lt", G_K0, G_K1, true, true);
+    brTest(g, 65, "le", G_K0, G_K1, true, true);
+    brTest(g, 66, "gt", G_K0, G_K1, false, true);
+    brTest(g, 67, "ge", G_K0, G_K1, false, true);
+    brTest(g, 68, "eq", G_K0, G_K1, false, true);
+    brTest(g, 69, "ne", G_K0, G_K1, true, true);
+    brTest(g, 70, "nlt", G_K0, G_K1, false, true);
+    brTest(g, 71, "nle", G_K1, G_K0, true, true);
+    genMovI(g, G_K1, F_NAN);
+    brTest(g, 72, "lt", G_K0, G_K1, false, true);
+    brTest(g, 73, "le", G_K0, G_K1, false, true);
+    brTest(g, 74, "ge", G_K0, G_K1, false, true);
+    brTest(g, 75, "eq", G_K1, G_K1, false, true);
+    brTest(g, 76, "ne", G_K1, G_K1, true, true);
+    brTest(g, 77, "nlt", G_K0, G_K1, true, true);
+    brTest(g, 78, "nle", G_K0, G_K1, true, true);
+    genFSet(g, "lt", G_T0, G_K0, G_K1); check(g, 79, G_T0, 0);
+    genFSet(g, "eq", G_T0, G_K1, G_K1); check(g, 80, G_T0, 0);
+    genMovI(g, G_K1, F_2);
+    genFSet(g, "le", G_T0, G_K0, G_K1); check(g, 81, G_T0, 1);
+    genFSet(g, "eq", G_T0, G_K1, G_K1); check(g, 82, G_T0, 1);
+    // 83..84 转换
+    genMovI(g, G_T1, -3); genI2F(g, G_T0, G_T1); check(g, 83, G_T0, -4609434218613702656);
+    genMovI(g, G_T1, 4591870180066957722); genF32Round(g, G_T0, G_T1); check(g, 84, G_T0, 4591870180174331904);
+    // 85..99 读写（W 指向 64 KiB 的 p_data）
+    genLeaSym(g, G_W, "p_data");
+    genMovI(g, G_T1, 1234605616436508552); genSt(g, 8, G_W, 0, G_T1);
+    genLd(g, 8, G_T0, G_W, 0); check(g, 85, G_T0, 1234605616436508552);
+    genLd(g, 4, G_T0, G_W, 0); check(g, 86, G_T0, 1432778632);
+    genLd(g, 2, G_T0, G_W, 0); check(g, 87, G_T0, 30600);
+    genLd(g, 1, G_T0, G_W, 7); check(g, 88, G_T0, 17);
+    genStI(g, 4, G_W, 40000, 305419896); genLd(g, 4, G_T0, G_W, 40000); check(g, 89, G_T0, 305419896);
+    genStI(g, 1, G_W, 16, 171); genLd(g, 1, G_T0, G_W, 16); check(g, 90, G_T0, 171);
+    genStI(g, 8, G_W, 24, 99); genStI(g, 8, G_W, 24, 0); genLd(g, 8, G_T0, G_W, 24); check(g, 91, G_T0, 0);
+    genMovI(g, G_T1, 131071); genSt(g, 2, G_W, 32, G_T1); genLd(g, 2, G_T0, G_W, 32); check(g, 92, G_T0, 65535);
+    genMovI(g, G_T1, 3); genMovI(g, G_T2, 777); genStX(g, 8, G_W, G_T1, G_T2, true);
+    genLdX(g, 8, G_T0, G_W, G_T1, true); check(g, 93, G_T0, 777);
+    genLd(g, 8, G_T0, G_W, 24); check(g, 94, G_T0, 777);
+    genMovI(g, G_T1, 100); genMovI(g, G_T2, 90); genStX(g, 1, G_W, G_T1, G_T2, false);
+    genLd(g, 1, G_T0, G_W, 100); check(g, 95, G_T0, 90);
+    genLea(g, G_T1, G_W, 40000); genLd(g, 4, G_T0, G_T1, 0); check(g, 96, G_T0, 305419896);
+    genLeaSym(g, G_T0, "p_data"); brTest(g, 97, "eq", G_T0, G_W, true, false);
+    genLdSym(g, 8, G_T0, "p_data"); check(g, 98, G_T0, 1234605616436508552);
+    genLdSym(g, 4, G_T0, "p_data"); check(g, 99, G_T0, 1432778632);
+    // 100..102 帧与栈指针
+    genStI(g, 8, G_SP, 8, 4242); genLd(g, 8, G_T0, G_SP, 8); check(g, 100, G_T0, 4242);
+    genSp(g, G_T0);
+    genBrSp(g, "ule", G_T0, "c101"); fail(g, 101); genLabel(g, "c101");
+    genOpI(g, "sub", G_T1, G_T0, 16);
+    genBrSp(g, "ugt", G_T1, "c102"); fail(g, 102); genLabel(g, "c102");
+    // 103..108 调用：7 个实参、第二结果、间接调用、被调方保存 W K0 K1
+    const args: List<Ref<GArg>> = listNew();
+    let k = 1;
+    while (k <= 7) { listPush(args, gaI(k)); k = k + 1; }
+    genCall(g, "p_sum7", args);
+    genRes(g, G_T0); genRes2(g, G_T1);
+    check(g, 103, G_T0, 140); check(g, 104, G_T1, 1);
+    genLeaSym(g, G_T1, "p_sum7");
+    genCallR(g, G_T1, args);
+    genRes(g, G_T0); check(g, 105, G_T0, 140);
+    genMovI(g, G_K0, 1001); genMovI(g, G_K1, 2002);
+    genCall(g, "f_2", one(gaI(50)));
+    genRes(g, G_T0); check(g, 106, G_T0, 55);
+    check(g, 107, G_K0, 1001);
+    check(g, 108, G_K1, 2002);
+    genLeaSym(g, G_T0, "p_data"); brTest(g, 109, "eq", G_T0, G_W, true, false);
+    // 打印并返回 0
+    genLdSym(g, 8, G_T2, "__imp_write");
+    const wargs: List<Ref<GArg>> = listNew(); listPush(wargs, gaI(1)); listPush(wargs, gaSym("p_msg")); listPush(wargs, gaI(11));
+    genCallR(g, G_T2, wargs);
+    genMovI(g, G_T0, 0);
+    genSetRes(g, G_T0);
+    genFnEpilogue(g);
+}
+
+function main(args: []string): int {
+    if (len(args) < 1) { eprint("usage: a64_gen_probe <outdir>"); return 64; }
+    const g = genNew(true);
+    asBufferSection(g.b, 0, 1);
+    mainFn(g);
+    clobber(g);
+    sum7(g);
+    asBufferSection(g.b, 1, 1);
+    asBufferLabel(g.b, "p_msg", 1);
+    const msg = "a64 gen ok\n";
+    let i = 0;
+    while (i < len(msg)) { asBufferByte(g.b, byteAt(msg, i) catch 0, 1); i = i + 1; }
+    asBufferSection(g.b, 3, 1);
+    asBufferLabel(g.b, "p_data", 1);
+    asBufferZero(g.b, 65544, 1);
+    asBufferSection(g.b, 0, 1);
+    if (len(g.failed) > 0) { eprint("gen: " + g.failed); return 69; }
+    asStructuredBegin();
+    a64BufferSubmit(g.b);
+    if (asFailedAs() != 0) { eprint("asm: " + asLastErrAs()); return 65; }
+    const exports: List<string> = listNew(); listPush(exports, "f_0");
+    const r = elfWriteObject(exports);
+    if (elfObjectOk(r) != 1) { eprint("elf: " + elfObjectError(r)); return 66; }
+    const objects: List<Bytes> = listNew(); listPush(objects, elfObjectBytes(r));
+    const path = args[0] + "/gen_ok";
+    machoImportReset();
+    machoIdentifierFor(path);
+    if (linkMachO(objects, "f_0") != 0) { eprint("link: " + machoError()); return 67; }
+    writeFileBytes(path, machoBytes()) catch (e) { eprint(e.message); return 68; };
+    print("PASS_A64_GEN");
+    return 0;
+}

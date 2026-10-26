@@ -1,0 +1,576 @@
+// 数值慢路的可移植版（rtfn 写，macOS 适配 M4 设计 A8）：语义与导出名同 scalar_ops.tx 与 scalar_fw.tx（定宽运算族在
+// scalar_fw_generic.tx）。值 {标签@0（8 字节写出）, 载荷@8}；标签 1 int、2 float（f64 位）、3 bool。返回状态：0 成功、1 操作数类型异常、
+// 2 溢出、3 除数为零、4 移位计数越界、5 不支持、6 浮点转整数越界、9 定宽转换越界（转换种类决定 6 或 9）；失败时不写出口。
+// rtfn 没有的原语在这里拼出，作为内部函数（__tx_sg_*）供本模块与定宽运算族调用：
+// - 按变量移位：计数按位分解成至多 6 次常数移位（O(log)），计数取低 6 位（同 x86 的 shl r64, cl）；
+// - 64 位乘法溢出：用除法验证——a≠0 时乘积没溢出当且仅当 (a×b 的环绕积)/a == b（截断除法：若商为 b，则环绕积 = a×b + 余数，
+//   而环绕积 ≡ a×b (mod 2^64)、|余数| < |a| ≤ 2^63，余数只能为 0，即积是精确的）；a＝−1 时只有 b＝INT_MIN 溢出，事先排除，
+//   这样除法既不会除零也不会 INT_MIN/−1。无符号同理，用下面的无符号除法；
+// - 无符号 64 位除法：由有符号除法拼出（Hacker's Delight 9-3）；
+// - int→f32：|x| ≤ 2^53 时先转双精度（精确）再舍入一次；更大的数把低 11 位并成粘滞位后再转（结果与 cvtsi2ss 的单次舍入相同）。
+// 单精度一律按 D3 §6.21-18 以双精度计算后 rtF64ToF32Bits 舍入。浮点→整数用 IEEE 分解（不用截断指令）。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, L, I } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtShift, rtDivMod, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtCall1, rtCall2, rtCall3, rtRet, rtFop, rtFIf, rtIntToF64, rtF64ToF32Bits, rtF32BitsToF64 } from "./rtfn";
+import { fwOpsGenericEmit } from "./scalar_fw_generic";
+
+const MODULE: string = "bootstrap/selfhost/scalar_ops_generic.tx";
+const MASK32: int = 4294967295;
+const INT_MIN: int = -9223372036854775807 - 1;
+const SIGN_BIT: int = -9223372036854775807 - 1;
+const FRAC_MASK: int = 4503599627370495;
+const IMPLICIT_ONE: int = 4503599627370496;
+// −2^63 的双精度位（0xC3E0000000000000）：浮点→int 唯一合法的指数 1086 的值。
+const F64_INT_MIN: int = -4332462841530417152;
+// 2048.0 的双精度位（2^11）。
+const F64_2048: int = 4656722014701092864;
+const TWO_POW_53: int = 9007199254740992;
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// ---------------------------------------------------------------------------
+// 内部助手
+// ---------------------------------------------------------------------------
+
+// __tx_sg_shl／shr／sar(x, n) → x 按 n（取低 6 位）移位：n 的每一位对应一次常数移位。
+function shiftFn(b: Ref<StructuredBuffer>, failures: List<string>, name: string, op: string): void {
+    const f = rtBegin(b, name, "x n", "t", 0, MODULE);
+    let bit = 32;
+    while (bit >= 1) {
+        rtOp(f, "t", L("n"), "and", I(bit));
+        rtIf(f, L("t"), "eq", I(0), "skip" + toStr(bit));
+        rtShift(f, "x", L("x"), op, bit);
+        rtLabel(f, "skip" + toStr(bit));
+        bit = bit / 2;
+    }
+    rtRet(f, L("x"));
+    done(f, failures);
+}
+
+// __tx_sg_smulov(a, b) → 1 若 a×b 越出有符号 64 位，否则 0（除法验证，见文件头）。
+function smulovFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_sg_smulov", "a b", "r q", 0, MODULE);
+    rtIf(f, L("a"), "eq", I(0), "ok");
+    rtIf(f, L("a"), "ne", I(-1), "check");
+    rtIf(f, L("b"), "eq", I(INT_MIN), "ovf");
+    rtJump(f, "ok");
+    rtLabel(f, "check");
+    rtOp(f, "r", L("a"), "imul", L("b"));
+    rtDivMod(f, "q", "", L("r"), L("a"));
+    rtIf(f, L("q"), "ne", L("b"), "ovf");
+    rtLabel(f, "ok");
+    rtRet(f, I(0));
+    rtLabel(f, "ovf");
+    rtRet(f, I(1));
+    done(f, failures);
+}
+
+// __tx_sg_udiv(a, b, rp) → a / b（无符号），*rp ＝ a % b；b 须非零（调用方先查）。
+// b ≥ 2^63：商只能是 0 或 1。a < 2^63：两数都可作非负有符号数直接除。否则（a ≥ 2^63、0 < b < 2^63）：q ＝ ((a >> 1) / b) << 1，
+// 余数 a − q×b ≤ 2b − 1，至多再修正一次。
+function udivFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_sg_udiv", "a b rp", "q r h", 0, MODULE);
+    rtIf(f, L("b"), "ge", I(0), "small");
+    rtSet(f, "q", I(0));
+    rtSet(f, "r", L("a"));
+    rtIf(f, L("a"), "ult", L("b"), "out");
+    rtSet(f, "q", I(1));
+    rtOp(f, "r", L("a"), "sub", L("b"));
+    rtJump(f, "out");
+    rtLabel(f, "small");
+    rtIf(f, L("a"), "lt", I(0), "high");
+    rtDivMod(f, "q", "r", L("a"), L("b"));
+    rtJump(f, "out");
+    rtLabel(f, "high");
+    rtShift(f, "h", L("a"), "shr", 1);
+    rtDivMod(f, "q", "", L("h"), L("b"));
+    rtShift(f, "q", L("q"), "shl", 1);
+    rtOp(f, "h", L("q"), "imul", L("b"));
+    rtOp(f, "r", L("a"), "sub", L("h"));
+    rtIf(f, L("r"), "ult", L("b"), "out");
+    rtOp(f, "q", L("q"), "add", I(1));
+    rtOp(f, "r", L("r"), "sub", L("b"));
+    rtLabel(f, "out");
+    rtStore(f, L("rp"), 0, L("r"), 8);
+    rtRet(f, L("q"));
+    done(f, failures);
+}
+
+// __tx_sg_umulov(a, b) → 1 若 a×b 越出无符号 64 位，否则 0（除法验证，见文件头）。
+function umulovFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_sg_umulov", "a b", "r q rem rp", 3, MODULE);
+    rtIf(f, L("a"), "eq", I(0), "ok");
+    rtOp(f, "r", L("a"), "imul", L("b"));
+    rtAddrOf(f, "rp", "rem");
+    rtCall3(f, "q", "__tx_sg_udiv", L("r"), L("a"), L("rp"));
+    rtIf(f, L("q"), "ne", L("b"), "ovf");
+    rtLabel(f, "ok");
+    rtRet(f, I(0));
+    rtLabel(f, "ovf");
+    rtRet(f, I(1));
+    done(f, failures);
+}
+
+// __tx_sg_i2f32(x) → 有符号 64 位整数 x 就近舍入到单精度后的双精度位（同 cvtsi2ss＋cvtss2sd）。
+// |x| ≤ 2^53 时转双精度是精确的，只有一次舍入。更大时 |x| ≥ 2^53，单精度的舍入位在第 29 位以上：把低 11 位并成第 11 位的粘滞位
+// （舍入位与“其下是否非零”都不变），得到的 y < 2^53 可精确转双精度，再乘 2^11（精确）、按符号取负（精确）后舍入一次。
+function i2f32Fn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_sg_i2f32", "x", "u neg lo y v", 0, MODULE);
+    rtIf(f, L("x"), "gt", I(TWO_POW_53), "big");
+    rtIf(f, L("x"), "lt", I(-TWO_POW_53), "big");
+    rtIntToF64(f, "v", L("x"));
+    rtJump(f, "round");
+    rtLabel(f, "big");
+    rtSet(f, "neg", I(0));
+    rtSet(f, "u", L("x"));
+    rtIf(f, L("x"), "ge", I(0), "pos");
+    rtOp(f, "u", I(0), "sub", L("x"));
+    rtSet(f, "neg", I(1));
+    rtLabel(f, "pos");
+    rtShift(f, "y", L("u"), "shr", 11);
+    rtOp(f, "lo", L("u"), "and", I(2047));
+    rtIf(f, L("lo"), "eq", I(0), "exact");
+    rtOp(f, "y", L("y"), "or", I(1));
+    rtLabel(f, "exact");
+    rtIntToF64(f, "v", L("y"));
+    rtFop(f, "v", L("v"), "fmul", I(F64_2048));
+    rtIf(f, L("neg"), "eq", I(0), "round");
+    rtOp(f, "v", L("v"), "xor", I(SIGN_BIT));
+    rtLabel(f, "round");
+    rtF64ToF32Bits(f, "v", L("v"));
+    rtF32BitsToF64(f, "v", L("v"));
+    rtRet(f, L("v"));
+    done(f, failures);
+}
+
+// __tx_sg_fmag(x) → 双精度 x 的整数部分的绝对值（尾数补上隐含位后按指数移位）；须 1023 ≤ 指数 ≤ 1086（调用方先查）。
+function fmagFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_sg_fmag", "x", "e m n", 2, MODULE);
+    rtShift(f, "e", L("x"), "shr", 52);
+    rtOp(f, "e", L("e"), "and", I(2047));
+    rtOp(f, "m", L("x"), "and", I(FRAC_MASK));
+    rtOp(f, "m", L("m"), "or", I(IMPLICIT_ONE));
+    rtIf(f, L("e"), "uge", I(1075), "left");
+    rtOp(f, "n", I(1075), "sub", L("e"));
+    rtCall2(f, "m", "__tx_sg_shr", L("m"), L("n"));
+    rtRet(f, L("m"));
+    rtLabel(f, "left");
+    rtOp(f, "n", L("e"), "sub", I(1075));
+    rtCall2(f, "m", "__tx_sg_shl", L("m"), L("n"));
+    rtRet(f, L("m"));
+    done(f, failures);
+}
+
+// ---------------------------------------------------------------------------
+// 二元：__tx_native_scalar_binary_v1(op, pb, pc, out)
+// ---------------------------------------------------------------------------
+
+function binaryFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_scalar_binary_v1", "op pb pc out", "ta tb x y r t", 2, MODULE);
+    rtOp(f, "op", L("op"), "and", I(MASK32));
+    rtLoad(f, "ta", L("pb"), 0, 1);
+    rtLoad(f, "tb", L("pc"), 0, 1);
+    rtIf(f, L("ta"), "ne", L("tb"), "type");
+    rtIf(f, L("ta"), "eq", I(2), "float");
+    rtIf(f, L("ta"), "ne", I(1), "type");
+    // 两个输入在写出口之前全部读出。
+    rtLoad(f, "x", L("pb"), 8, 8);
+    rtLoad(f, "y", L("pc"), 8, 8);
+    rtIf(f, L("op"), "eq", I(5), "add");
+    rtIf(f, L("op"), "eq", I(6), "sub");
+    rtIf(f, L("op"), "eq", I(7), "mul");
+    rtIf(f, L("op"), "eq", I(8), "div");
+    rtIf(f, L("op"), "eq", I(9), "mod");
+    rtIf(f, L("op"), "eq", I(12), "eq");
+    rtIf(f, L("op"), "eq", I(13), "lt");
+    rtIf(f, L("op"), "eq", I(14), "le");
+    rtIf(f, L("op"), "eq", I(40), "and");
+    rtIf(f, L("op"), "eq", I(41), "or");
+    rtIf(f, L("op"), "eq", I(42), "xor");
+    rtIf(f, L("op"), "eq", I(44), "shl");
+    rtIf(f, L("op"), "eq", I(45), "shr");
+    rtIf(f, L("op"), "eq", I(46), "sar");
+    rtIf(f, L("op"), "eq", I(47), "imul");
+    rtJump(f, "unsupported");
+    // 加：和与两个加数的符号都不同即溢出；减：被减数与减数异号且差与被减数异号即溢出。
+    rtLabel(f, "add");
+    rtOp(f, "r", L("x"), "add", L("y"));
+    rtOp(f, "t", L("x"), "xor", L("r"));
+    rtOp(f, "x", L("y"), "xor", L("r"));
+    rtOp(f, "t", L("t"), "and", L("x"));
+    rtIf(f, L("t"), "lt", I(0), "overflow");
+    rtJump(f, "int");
+    rtLabel(f, "sub");
+    rtOp(f, "r", L("x"), "sub", L("y"));
+    rtOp(f, "t", L("x"), "xor", L("y"));
+    rtOp(f, "x", L("x"), "xor", L("r"));
+    rtOp(f, "t", L("t"), "and", L("x"));
+    rtIf(f, L("t"), "lt", I(0), "overflow");
+    rtJump(f, "int");
+    rtLabel(f, "mul");
+    rtCall2(f, "t", "__tx_sg_smulov", L("x"), L("y"));
+    rtIf(f, L("t"), "ne", I(0), "overflow");
+    rtOp(f, "r", L("x"), "imul", L("y"));
+    rtJump(f, "int");
+    rtLabel(f, "and");
+    rtOp(f, "r", L("x"), "and", L("y"));
+    rtJump(f, "int");
+    rtLabel(f, "or");
+    rtOp(f, "r", L("x"), "or", L("y"));
+    rtJump(f, "int");
+    rtLabel(f, "xor");
+    rtOp(f, "r", L("x"), "xor", L("y"));
+    rtJump(f, "int");
+    rtLabel(f, "imul");
+    rtOp(f, "r", L("x"), "imul", L("y"));
+    rtJump(f, "int");
+    // 移位：计数按无符号与 63 比较，负数与过大一并越界。
+    rtLabel(f, "shl");
+    rtIf(f, L("y"), "ugt", I(63), "shift");
+    rtCall2(f, "r", "__tx_sg_shl", L("x"), L("y"));
+    rtJump(f, "int");
+    rtLabel(f, "shr");
+    rtIf(f, L("y"), "ugt", I(63), "shift");
+    rtCall2(f, "r", "__tx_sg_shr", L("x"), L("y"));
+    rtJump(f, "int");
+    rtLabel(f, "sar");
+    rtIf(f, L("y"), "ugt", I(63), "shift");
+    rtCall2(f, "r", "__tx_sg_sar", L("x"), L("y"));
+    rtJump(f, "int");
+    // 除：除零状态 3，INT_MIN / −1 溢出；取余：INT_MIN % −1 得 0。
+    rtLabel(f, "div");
+    rtIf(f, L("y"), "eq", I(0), "zero");
+    rtIf(f, L("x"), "ne", I(INT_MIN), "divdo");
+    rtIf(f, L("y"), "ne", I(-1), "divdo");
+    rtJump(f, "overflow");
+    rtLabel(f, "divdo");
+    rtDivMod(f, "r", "", L("x"), L("y"));
+    rtJump(f, "int");
+    rtLabel(f, "mod");
+    rtIf(f, L("y"), "eq", I(0), "zero");
+    rtIf(f, L("x"), "ne", I(INT_MIN), "moddo");
+    rtIf(f, L("y"), "ne", I(-1), "moddo");
+    rtSet(f, "r", I(0));
+    rtJump(f, "int");
+    rtLabel(f, "moddo");
+    rtDivMod(f, "", "r", L("x"), L("y"));
+    rtJump(f, "int");
+    rtLabel(f, "eq");
+    rtSet(f, "r", I(1));
+    rtIf(f, L("x"), "eq", L("y"), "bool");
+    rtSet(f, "r", I(0));
+    rtJump(f, "bool");
+    rtLabel(f, "lt");
+    rtSet(f, "r", I(1));
+    rtIf(f, L("x"), "lt", L("y"), "bool");
+    rtSet(f, "r", I(0));
+    rtJump(f, "bool");
+    rtLabel(f, "le");
+    rtSet(f, "r", I(1));
+    rtIf(f, L("x"), "le", L("y"), "bool");
+    rtSet(f, "r", I(0));
+    rtJump(f, "bool");
+    // 浮点：加减乘除；比较按 IEEE（有 NaN 时 ==、<、<= 都不成立）；其余运算类型异常。
+    rtLabel(f, "float");
+    rtLoad(f, "x", L("pb"), 8, 8);
+    rtLoad(f, "y", L("pc"), 8, 8);
+    rtIf(f, L("op"), "eq", I(5), "fadd");
+    rtIf(f, L("op"), "eq", I(6), "fsub");
+    rtIf(f, L("op"), "eq", I(7), "fmul");
+    rtIf(f, L("op"), "eq", I(8), "fdiv");
+    rtIf(f, L("op"), "eq", I(12), "feq");
+    rtIf(f, L("op"), "eq", I(13), "flt");
+    rtIf(f, L("op"), "eq", I(14), "fle");
+    rtJump(f, "type");
+    rtLabel(f, "fadd");
+    rtFop(f, "r", L("x"), "fadd", L("y"));
+    rtJump(f, "ftag");
+    rtLabel(f, "fsub");
+    rtFop(f, "r", L("x"), "fsub", L("y"));
+    rtJump(f, "ftag");
+    rtLabel(f, "fmul");
+    rtFop(f, "r", L("x"), "fmul", L("y"));
+    rtJump(f, "ftag");
+    rtLabel(f, "fdiv");
+    rtFop(f, "r", L("x"), "fdiv", L("y"));
+    rtJump(f, "ftag");
+    rtLabel(f, "feq");
+    rtSet(f, "r", I(1));
+    rtFIf(f, L("x"), "eq", L("y"), "bool");
+    rtSet(f, "r", I(0));
+    rtJump(f, "bool");
+    rtLabel(f, "flt");
+    rtSet(f, "r", I(1));
+    rtFIf(f, L("x"), "lt", L("y"), "bool");
+    rtSet(f, "r", I(0));
+    rtJump(f, "bool");
+    rtLabel(f, "fle");
+    rtSet(f, "r", I(1));
+    rtFIf(f, L("x"), "le", L("y"), "bool");
+    rtSet(f, "r", I(0));
+    rtJump(f, "bool");
+    rtLabel(f, "int");
+    rtSet(f, "t", I(1));
+    rtJump(f, "write");
+    rtLabel(f, "ftag");
+    rtSet(f, "t", I(2));
+    rtJump(f, "write");
+    rtLabel(f, "bool");
+    rtSet(f, "t", I(3));
+    rtLabel(f, "write");
+    rtStore(f, L("out"), 0, L("t"), 8);
+    rtStore(f, L("out"), 8, L("r"), 8);
+    rtRet(f, I(0));
+    rtLabel(f, "type");
+    rtRet(f, I(1));
+    rtLabel(f, "overflow");
+    rtRet(f, I(2));
+    rtLabel(f, "zero");
+    rtRet(f, I(3));
+    rtLabel(f, "shift");
+    rtRet(f, I(4));
+    rtLabel(f, "unsupported");
+    rtRet(f, I(5));
+    done(f, failures);
+}
+
+// ---------------------------------------------------------------------------
+// 一元：__tx_native_scalar_unary_v1(op, ps, out)；op ≥ 100 为定宽数值转换（op＝100＋种类）
+// ---------------------------------------------------------------------------
+
+function unaryFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_scalar_unary_v1", "op ps out", "tag x r e k st", 2, MODULE);
+    rtOp(f, "op", L("op"), "and", I(MASK32));
+    rtLoad(f, "tag", L("ps"), 0, 1);
+    rtLoad(f, "x", L("ps"), 8, 8);
+    rtIf(f, L("op"), "uge", I(100), "cvt");
+    rtIf(f, L("op"), "eq", I(36), "i2f");
+    rtIf(f, L("op"), "eq", I(37), "f2i");
+    rtIf(f, L("op"), "eq", I(11), "not");
+    rtIf(f, L("op"), "eq", I(43), "bnot");
+    rtIf(f, L("op"), "ne", I(10), "type");
+    // 取负：float 翻转符号位；int 的 INT_MIN 溢出。
+    rtIf(f, L("tag"), "eq", I(2), "fneg");
+    rtIf(f, L("tag"), "ne", I(1), "type");
+    rtIf(f, L("x"), "eq", I(INT_MIN), "overflow");
+    rtOp(f, "x", I(0), "sub", L("x"));
+    rtJump(f, "write");
+    rtLabel(f, "fneg");
+    rtOp(f, "x", L("x"), "xor", I(SIGN_BIT));
+    rtJump(f, "write");
+    rtLabel(f, "not");
+    rtIf(f, L("tag"), "ne", I(3), "type");
+    rtSet(f, "r", I(1));
+    rtIf(f, L("x"), "eq", I(0), "notz");
+    rtSet(f, "r", I(0));
+    rtLabel(f, "notz");
+    rtSet(f, "x", L("r"));
+    rtJump(f, "write");
+    rtLabel(f, "bnot");
+    rtIf(f, L("tag"), "ne", I(1), "type");
+    rtOp(f, "x", L("x"), "xor", I(-1));
+    rtLabel(f, "write");
+    rtStore(f, L("out"), 0, L("tag"), 8);
+    rtStore(f, L("out"), 8, L("x"), 8);
+    rtRet(f, I(0));
+    rtLabel(f, "i2f");
+    rtIf(f, L("tag"), "ne", I(1), "type");
+    rtIntToF64(f, "x", L("x"));
+    rtSet(f, "tag", I(2));
+    rtJump(f, "write");
+    // 浮点→int（IEEE 分解）：|x| < 1 得 0；指数 > 1086（含 inf、NaN）越界；指数 1086 只有 −2^63 合法。
+    rtLabel(f, "f2i");
+    rtIf(f, L("tag"), "ne", I(2), "type");
+    rtShift(f, "e", L("x"), "shr", 52);
+    rtOp(f, "e", L("e"), "and", I(2047));
+    rtIf(f, L("e"), "ult", I(1023), "fzero");
+    rtIf(f, L("e"), "ugt", I(1086), "cvtovf");
+    rtIf(f, L("e"), "eq", I(1086), "fmin");
+    rtCall1(f, "r", "__tx_sg_fmag", L("x"));
+    rtIf(f, L("x"), "ge", I(0), "fpos");
+    rtOp(f, "r", I(0), "sub", L("r"));
+    rtLabel(f, "fpos");
+    rtSet(f, "x", L("r"));
+    rtJump(f, "fint");
+    rtLabel(f, "fmin");
+    rtIf(f, L("x"), "ne", I(F64_INT_MIN), "cvtovf");
+    rtSet(f, "x", I(INT_MIN));
+    rtJump(f, "fint");
+    rtLabel(f, "fzero");
+    rtSet(f, "x", I(0));
+    rtLabel(f, "fint");
+    rtSet(f, "tag", I(1));
+    rtJump(f, "write");
+    rtLabel(f, "cvtovf");
+    rtRet(f, I(6));
+    rtLabel(f, "overflow");
+    rtRet(f, I(2));
+    rtLabel(f, "type");
+    rtRet(f, I(1));
+    cvtOps(f);
+    done(f, failures);
+}
+
+// 范围检查一臂：种类为 kind 时检查 x ∈ [lo, hi]（有符号比较），越界走 cfail（状态在 st）。
+function cvtRange(f: Ref<RtFn>, kind: int, lo: int, hi: int): void {
+    const skip = "crng" + toStr(kind);
+    rtIf(f, L("k"), "ne", I(kind), skip);
+    rtIf(f, L("x"), "lt", I(lo), "cfail");
+    rtIf(f, L("x"), "gt", I(hi), "cfail");
+    rtJump(f, "cint");
+    rtLabel(f, skip);
+}
+
+// 窄整数环绕一臂：x 的低 bits 位按有符号或无符号扩展回 64 位。
+function cvtWrap(f: Ref<RtFn>, label: string, bits: int, signed: bool): void {
+    rtLabel(f, label);
+    if (signed) {
+        rtShift(f, "x", L("x"), "shl", 64 - bits);
+        rtShift(f, "x", L("x"), "sar", 64 - bits);
+    } else {
+        let mask = 255;
+        if (bits == 16) { mask = 65535; }
+        if (bits == 32) { mask = MASK32; }
+        rtOp(f, "x", L("x"), "and", I(mask));
+    }
+    rtJump(f, "cint");
+}
+
+// r ← (x >>> 1) | (x & 1)：无符号值取半且保留粘滞位，转浮点后加倍得正确舍入（同手写版 cvtHalve）。
+function cvtHalve(f: Ref<RtFn>): void {
+    rtShift(f, "r", L("x"), "shr", 1);
+    rtOp(f, "e", L("x"), "and", I(1));
+    rtOp(f, "r", L("r"), "or", L("e"));
+}
+
+// 定宽数值转换（docs/design/v052-fixed-width-numerics-v0.1-20261015.md §五-3）：种类 k＝op−100。
+// 1..6 收窄检查到 i8/i16/i32/u8/u16/u32，7 非负检查，越界状态 9；8..13 wrapTo 截断到同序六种；14 整数→f32，15 u64→float，
+// 16 u64→f32；17 float→f32（有限值溢出状态 9）；18..23 同 1..6 但越界状态 6；24 float→u64（越界、NaN 状态 6）；25 floatToBits、
+// 26 floatFromBits 只换标签。
+function cvtOps(f: Ref<RtFn>): void {
+    rtLabel(f, "cvt");
+    rtOp(f, "k", L("op"), "sub", I(100));
+    rtIf(f, L("k"), "eq", I(25), "cfbits");
+    rtIf(f, L("k"), "eq", I(26), "cbitsf");
+    rtIf(f, L("k"), "eq", I(17), "cf2f32");
+    rtIf(f, L("k"), "eq", I(24), "cf2u");
+    rtIf(f, L("tag"), "ne", I(1), "type");
+    rtSet(f, "st", I(9));
+    rtIf(f, L("k"), "eq", I(7), "cnonneg");
+    rtIf(f, L("k"), "eq", I(14), "ci2f32");
+    rtIf(f, L("k"), "eq", I(15), "cu2f");
+    rtIf(f, L("k"), "eq", I(16), "cu2f32");
+    rtIf(f, L("k"), "eq", I(8), "cw8");
+    rtIf(f, L("k"), "eq", I(9), "cw16");
+    rtIf(f, L("k"), "eq", I(10), "cw32");
+    rtIf(f, L("k"), "eq", I(11), "cwu8");
+    rtIf(f, L("k"), "eq", I(12), "cwu16");
+    rtIf(f, L("k"), "eq", I(13), "cwu32");
+    rtIf(f, L("k"), "ult", I(18), "crng");
+    rtSet(f, "st", I(6));
+    rtOp(f, "k", L("k"), "sub", I(17));
+    rtLabel(f, "crng");
+    cvtRange(f, 1, -128, 127);
+    cvtRange(f, 2, -32768, 32767);
+    cvtRange(f, 3, -2147483647 - 1, 2147483647);
+    cvtRange(f, 4, 0, 255);
+    cvtRange(f, 5, 0, 65535);
+    cvtRange(f, 6, 0, 4294967295);
+    rtJump(f, "type");
+    rtLabel(f, "cnonneg");
+    rtIf(f, L("x"), "lt", I(0), "cfail");
+    rtJump(f, "cint");
+    cvtWrap(f, "cw8", 8, true);
+    cvtWrap(f, "cw16", 16, true);
+    cvtWrap(f, "cw32", 32, true);
+    cvtWrap(f, "cwu8", 8, false);
+    cvtWrap(f, "cwu16", 16, false);
+    cvtWrap(f, "cwu32", 32, false);
+    rtLabel(f, "ci2f32");
+    rtCall1(f, "x", "__tx_sg_i2f32", L("x"));
+    rtJump(f, "cfloat");
+    // 无符号 64 位：最高位为 0 直接转；否则取半（保留最低位防双重舍入）转后加倍（加倍是精确的）。
+    rtLabel(f, "cu2f");
+    rtIf(f, L("x"), "lt", I(0), "cu2fhi");
+    rtIntToF64(f, "x", L("x"));
+    rtJump(f, "cfloat");
+    rtLabel(f, "cu2fhi");
+    cvtHalve(f);
+    rtIntToF64(f, "r", L("r"));
+    rtFop(f, "x", L("r"), "fadd", L("r"));
+    rtJump(f, "cfloat");
+    rtLabel(f, "cu2f32");
+    rtIf(f, L("x"), "lt", I(0), "cu2f32hi");
+    rtCall1(f, "x", "__tx_sg_i2f32", L("x"));
+    rtJump(f, "cfloat");
+    rtLabel(f, "cu2f32hi");
+    cvtHalve(f);
+    rtCall1(f, "r", "__tx_sg_i2f32", L("r"));
+    rtFop(f, "x", L("r"), "fadd", L("r"));
+    rtJump(f, "cfloat");
+    // float→f32：结果为 ±inf/NaN 而源有限即溢出（状态 9）；源本身为 inf/NaN 原样通过。
+    rtLabel(f, "cf2f32");
+    rtIf(f, L("tag"), "ne", I(2), "type");
+    rtF64ToF32Bits(f, "r", L("x"));
+    rtF32BitsToF64(f, "r", L("r"));
+    rtShift(f, "e", L("r"), "shr", 52);
+    rtOp(f, "e", L("e"), "and", I(2047));
+    rtIf(f, L("e"), "ne", I(2047), "cf2f32ok");
+    rtShift(f, "e", L("x"), "shr", 52);
+    rtOp(f, "e", L("e"), "and", I(2047));
+    rtIf(f, L("e"), "eq", I(2047), "cf2f32ok");
+    rtSet(f, "st", I(9));
+    rtJump(f, "cfail");
+    rtLabel(f, "cf2f32ok");
+    rtSet(f, "x", L("r"));
+    rtSet(f, "tag", I(2));
+    rtJump(f, "write");
+    // float→u64：|x| < 1 得 0；负数、NaN、≥ 2^64 状态 6；其余按 IEEE 分解移位（同 f2i）。
+    rtLabel(f, "cf2u");
+    rtIf(f, L("tag"), "ne", I(2), "type");
+    rtSet(f, "st", I(6));
+    rtShift(f, "e", L("x"), "shr", 52);
+    rtOp(f, "e", L("e"), "and", I(2047));
+    rtIf(f, L("e"), "ult", I(1023), "cf2uzero");
+    rtIf(f, L("x"), "lt", I(0), "cfail");
+    rtIf(f, L("e"), "ugt", I(1086), "cfail");
+    rtCall1(f, "x", "__tx_sg_fmag", L("x"));
+    rtJump(f, "cint");
+    rtLabel(f, "cf2uzero");
+    rtSet(f, "x", I(0));
+    rtJump(f, "cint");
+    rtLabel(f, "cfbits");
+    rtIf(f, L("tag"), "ne", I(2), "type");
+    rtJump(f, "cint");
+    rtLabel(f, "cbitsf");
+    rtIf(f, L("tag"), "ne", I(1), "type");
+    rtSet(f, "tag", I(2));
+    rtJump(f, "write");
+    rtLabel(f, "cint");
+    rtSet(f, "tag", I(1));
+    rtJump(f, "write");
+    rtLabel(f, "cfloat");
+    rtSet(f, "tag", I(2));
+    rtJump(f, "write");
+    rtLabel(f, "cfail");
+    rtRet(f, L("st"));
+}
+
+/// 发出数值慢路（二元、一元与定宽转换、定宽运算族）与它们共用的内部助手；rtfn 的失败记进 failures。t 为目标编号（语义不随目标变，
+/// 未用）。
+export function scalarOpsGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    shiftFn(b, failures, "__tx_sg_shl", "shl");
+    shiftFn(b, failures, "__tx_sg_shr", "shr");
+    shiftFn(b, failures, "__tx_sg_sar", "sar");
+    smulovFn(b, failures);
+    udivFn(b, failures);
+    umulovFn(b, failures);
+    i2f32Fn(b, failures);
+    fmagFn(b, failures);
+    binaryFn(b, failures);
+    unaryFn(b, failures);
+    fwOpsGenericEmit(b, failures);
+}

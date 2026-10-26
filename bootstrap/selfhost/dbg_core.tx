@@ -1,0 +1,540 @@
+// dbg_core.tx —— 调试会话的引擎核心（第 6 轮 6c-5a，调试实施设计 §四-5“6c-5 实施前修订”）。
+//
+// 编译调试构建（保留 ProgramContext 的函数名、行表与变量表）、起产物（带控制通道，stdin 接空，stdout、stderr 走
+// 管道）、模块与函数名表、断点解析与 ARM、运行控制、frames、停止历史与收尾。运行控制不阻塞：coreRun 发 RUN，
+// corePump 处理产物的 STOP、TIMEOUT、输出与退出并报状态，前端决定要不要同时等客户端。
+// 事件是 NDJSON 文本（VM 调试协议参考 §四），经 dbg_out 的出口发出：run --debug 直接写 stdout，DAP 收进队列再翻译。
+import { ProgramContext } from "./program_context";
+import { JsonValue, jsonParse, jsonGet } from "./json_parse";
+import { DbgProc, wireNew, wireSend, wireFrame, wirePumpIn, wireDrainOut, wireLine, wireU64, wireWait, wireText, OP_HELLO, OP_STOP, OP_TIMEOUT, OP_FRAMES_R, OP_ARM, OP_RUN, OP_FRAMES, OP_PAUSE } from "./dbg_wire";
+import { dbgStr, dbgEmit, dbgError, dbgAbsPath, dbgStderr } from "./dbg_out";
+import { DbgView, viewNew, viewRefresh } from "./dbg_view";
+import { diagsArray } from "./cli_json";
+import { runtimeCodeOf } from "./explain";
+import { filePath } from "./file_path";
+import { serviceKind } from "./service_files";
+import { DBG_STMT } from "./builtin_names";
+import { drvSetDebug, drvSetTestMode, drvNativeRuntime, drvLastContext, drvDiagOut, drvBytesOut, drvModulePathList, drvModuleDisplayList } from "./driver";
+import { hostTargetId } from "./target_host";
+
+export const ST_LOADING: int = 0;
+export const ST_RUNNING: int = 1;
+export const ST_STOPPED: int = 2;
+export const ST_ENDED: int = 3;
+// corePump 的结果。
+export const PUMP_RUNNING: int = 0;
+export const PUMP_STOPPED: int = 1;
+export const PUMP_ENDED: int = 2;
+export const SESSION_MS: int = 1800000;
+const STOPS_MAX: int = 256;
+const SLOTS_MAX: int = 65536;
+const LOW32: int = 4294967295;
+
+export struct Sess {
+    ctx: Ref<ProgramContext>,
+    p: Ref<DbgProc>,
+    v: Ref<DbgView>,
+    absMods: List<string>,
+    specMods: List<string>,
+    fnNames: List<string>,
+    start: int,
+    state: int,
+    stops: List<string>,
+    traps: List<string>,
+    errPend: Bytes,
+    // 运行中父进程兜底的截止（毫秒钟，0 为无）、结束时的退出码、临时产物、上次 corePump 时客户端 stdin 是否就绪、
+    // 上次停下的原因（1 断点、2 步进、3 暂停）。
+    deadline: int,
+    code: int,
+    exe: string,
+    stdinReady: bool,
+    why: int,
+}
+
+export struct DbgFrame {
+    win: int,
+    fn: int,
+    pc: int,
+}
+
+// coreLaunch 失败时的退出码。
+let coreCode: int = 0;
+
+export function coreLastCode(): int { return coreCode; }
+
+export function nowMsS(): int { return monoNs() / 1000000; }
+
+function noStrs(): List<string> { return listNew(); }
+function noInts(): List<int> { return listNew(); }
+
+export function hasInt(xs: List<int>, x: int): bool {
+    let k = 0;
+    while (k < listLen(xs)) {
+        if ((listGet(xs, k) catch -1) == x) { return true; }
+        k = k + 1;
+    }
+    return false;
+}
+
+// —— 编译与起产物 ——
+
+// 驱动的诊断文本转 compile_failed 的 diags：模块换成绝对路径（按显示名找模块），键序同 VM。
+function diagsOf(text: string, cwd: string, windows: bool): string {
+    const arr = jsonParse(bytesFromStr(diagsArray(text))) catch (e) { return "[]"; };
+    const paths = drvModulePathList();
+    const shows = drvModuleDisplayList();
+    let out = "[";
+    let k = 0;
+    while (k < listLen(arr.items)) {
+        const d = listGet(arr.items, k) catch arr;
+        let module = strField(d, "module");
+        let m = 0;
+        while (m < listLen(shows)) {
+            if ((listGet(shows, m) catch "") == module) { module = dbgAbsPath(cwd, filePath(listGet(paths, m) catch ""), windows); }
+            m = m + 1;
+        }
+        let sevText = "warning";
+        if (strField(d, "severity") == "error") { sevText = "error"; }
+        if (k > 0) { out = out + ","; }
+        out = out + "{\"severity\":\"" + sevText + "\",\"code\":" + toStr(intField(d, "code")) + ",\"msg\":" + dbgStr(strField(d, "msg")) + ",\"module\":" + dbgStr(module) + ",\"line\":" + toStr(intField(d, "line")) + ",\"col\":" + toStr(intField(d, "col")) + "}";
+        k = k + 1;
+    }
+    return out + "]";
+}
+
+export function intField(d: Ref<JsonValue>, key: string): int {
+    const v = jsonGet(d, key) catch None;
+    if (v == None) { return 0; }
+    return (v catch d).i;
+}
+
+export function strField(d: Ref<JsonValue>, key: string): string {
+    const v = jsonGet(d, key) catch None;
+    if (v == None) { return ""; }
+    return (v catch d).s;
+}
+
+// 编译 entry（按本进程当前目录 cwd 解析）的调试构建到 exe，发 ready，在 runDir（空串为继承）里起产物并等 HELLO。
+// 编译或起产物失败时发 compile_failed 或 error 事件、得 Error（退出码见 coreLastCode）；产物起来就退出时会话
+// 已是结束态（事件已发）。
+export function coreLaunch(entry: string, cwd: string, progArgs: List<string>, exe: string, exeHost: string, runDir: string): Ref<Sess> | Error {
+    const windows = hostTarget() == "windows";
+    const absEntry = dbgAbsPath(cwd, filePath(entry), windows);
+    coreCode = 1;
+    if (serviceKind(entry) != 1) {
+        dbgEmit("{\"event\":\"compile_failed\",\"diags\":[{\"severity\":\"error\",\"code\":3008,\"msg\":" + dbgStr("无法读取模块 " + absEntry + "：FileNotFound") + ",\"module\":" + dbgStr(absEntry) + ",\"line\":1,\"col\":1}]}");
+        return err("launch");
+    }
+    drvSetTestMode(false);
+    drvSetDebug(true);
+    const objects: List<string> = listNew();
+    // 调试产物在宿主上运行：编译目标即宿主（windows 只管宿主的路径规则）。
+    const built = drvNativeRuntime(entry, 1, objects, hostTargetId());
+    if (built != 0) {
+        dbgEmit("{\"event\":\"compile_failed\",\"diags\":" + diagsOf(drvDiagOut(), cwd, windows) + "}");
+        return err("launch");
+    }
+    writeExecutable(filePath(exe), drvBytesOut()) catch (e) {
+        dbgEmit("{\"event\":\"compile_failed\",\"diags\":[{\"severity\":\"error\",\"code\":0,\"msg\":" + dbgStr("写出调试产物失败：" + e.message) + ",\"module\":" + dbgStr(absEntry) + ",\"line\":0,\"col\":0}]}");
+        return err("launch");
+    };
+    const ctx = drvLastContext() catch (e) {
+        dbgError(e.message);
+        return err("launch");
+    };
+    const s = sessNew(ctx, cwd, windows, exe);
+    emitReady(s);
+    const h = procSpawn(exeHost, progArgs, runDir, 2) catch (e) {
+        dbgError("无法启动调试产物：" + e.message);
+        removeFile(filePath(exe)) catch (e2) {};
+        coreCode = 3;
+        return err("launch");
+    };
+    coreCode = 0;
+    s.p = wireNew(h);
+    s.v = viewNew(ctx, s.p, 0, s.fnNames);
+    const hello = wireWait(s.p, OP_HELLO);
+    if (bytesLen(hello) < 33) {
+        coreFinish(s);
+    } else {
+        s.v.tb = wireU64(hello, 9);
+    }
+    return s;
+}
+
+// 关掉产物的句柄（仍在运行时先结束），删除临时产物。
+export function coreClose(s: Ref<Sess>): void {
+    if (s.p.h != 0) { procClose(s.p.h); }
+    s.p.h = 0;
+    removeFile(filePath(s.exe)) catch (e) {};
+}
+
+function sessNew(ctx: Ref<ProgramContext>, cwd: string, windows: bool, exe: string): Ref<Sess> {
+    const absMods: List<string> = listNew();
+    const specMods: List<string> = listNew();
+    const paths = drvModulePathList();
+    let m = 0;
+    while (m < listLen(ctx.modOutPath)) {
+        const p = listGet(paths, m) catch "";
+        if (p == "<prelude>") { listPush(absMods, p); } else { listPush(absMods, dbgAbsPath(cwd, filePath(p), windows)); }
+        listPush(specMods, listGet(ctx.cgStrings, listGet(ctx.modOutPath, m) catch 0) catch "");
+        m = m + 1;
+    }
+    const s = new Sess { ctx: ctx, p: wireNew(0), v: viewNew(ctx, wireNew(0), 0, listNew()), absMods: absMods, specMods: specMods, fnNames: listNew(), start: nowMsS(), state: ST_LOADING, stops: listNew(), traps: listNew(), errPend: bytesNew(0), deadline: 0, code: 0, exe: exe, stdinReady: false, why: 0 };
+    let f = 0;
+    while (f < listLen(ctx.fnNameIdx)) {
+        listPush(s.fnNames, closureName(s, listGet(ctx.cgStrings, listGet(ctx.fnNameIdx, f) catch 0) catch "?"));
+        f = f + 1;
+    }
+    return s;
+}
+
+// 闭包名 #closure@<显示名>:<行>:<列> 里的显示名换成模块的绝对路径（同 VM）。
+function closureName(s: Ref<Sess>, name: string): string {
+    const pre = "#closure@";
+    if (strIndexOf(name, pre) != 0) { return name; }
+    const b = bytesFromStr(name);
+    const n = bytesLen(b);
+    let c2 = -1;
+    let c1 = -1;
+    let i = n - 1;
+    while (i >= 0 && c1 < 0) {
+        if ((bytesGet(b, i) catch 0) == 58) {
+            if (c2 < 0) { c2 = i; } else { c1 = i; }
+        }
+        i = i - 1;
+    }
+    if (c1 <= len(pre)) { return name; }
+    const show = bytesToStr(bytesSlice(b, len(pre), c1 - len(pre))) catch "";
+    let m = 0;
+    while (m < listLen(s.specMods)) {
+        if ((listGet(s.specMods, m) catch "") == show) {
+            return pre + (listGet(s.absMods, m) catch show) + (bytesToStr(bytesSlice(b, c1, n - c1)) catch "");
+        }
+        m = m + 1;
+    }
+    return name;
+}
+
+function emitReady(s: Ref<Sess>): void {
+    let mods = "";
+    let m = 0;
+    while (m < listLen(s.absMods)) {
+        if (m > 0) { mods = mods + ","; }
+        mods = mods + "{\"index\":" + toStr(m) + ",\"path\":" + dbgStr(listGet(s.absMods, m) catch "") + "}";
+        m = m + 1;
+    }
+    let fns = "";
+    let f = 0;
+    while (f < listLen(s.fnNames)) {
+        if (f > 0) { fns = fns + ","; }
+        fns = fns + "{\"index\":" + toStr(f) + ",\"name\":" + dbgStr(listGet(s.fnNames, f) catch "") + ",\"module\":" + toStr(listGet(s.ctx.fnModule, f) catch 0) + ",\"nparams\":" + toStr(listGet(s.ctx.fnNparams, f) catch 0) + "}";
+        f = f + 1;
+    }
+    dbgEmit("{\"event\":\"ready\",\"protocol\":\"debug/1\",\"modules\":[" + mods + "],\"functions\":[" + fns + "]}");
+}
+
+// —— 断点 ——
+
+function stmtPcs(s: Ref<Sess>, f: int): List<int> {
+    const out: List<int> = listNew();
+    const code = listGet(s.ctx.fnCode, f) catch noInts();
+    let pc = 0;
+    while (pc < listLen(code)) {
+        const ins = listGet(code, pc) catch 0;
+        if ((ins & 65535) == 31 && ((ins >> 32) & 65535) == DBG_STMT) { listPush(out, pc); }
+        pc = pc + 1;
+    }
+    return out;
+}
+
+// 模块 mods 里行号为 line 的全部语句检查点，每个编码为 函数×2^32＋pc（调试实施设计 §五：语句检查点个数）。
+export function corePoints(s: Ref<Sess>, mods: List<int>, line: int): List<int> {
+    const out: List<int> = listNew();
+    let f = 0;
+    while (f < listLen(s.ctx.fnModule)) {
+        if (hasInt(mods, listGet(s.ctx.fnModule, f) catch -1)) {
+            const lines = listGet(s.ctx.fnLinesL, f) catch noInts();
+            const pcs = stmtPcs(s, f);
+            let k = 0;
+            while (k < listLen(pcs)) {
+                const pc = listGet(pcs, k) catch 0;
+                if ((listGet(lines, pc) catch -1) == line) { listPush(out, f * 4294967296 + pc); }
+                k = k + 1;
+            }
+        }
+        f = f + 1;
+    }
+    return out;
+}
+
+// 第一个名为 name 的函数体的第一条语句（调试实施设计 §五）；没有为 −1。
+export function coreFnPoint(s: Ref<Sess>, name: string): int {
+    let f = 0;
+    while (f < listLen(s.fnNames)) {
+        if ((listGet(s.fnNames, f) catch "") == name) {
+            const pcs = stmtPcs(s, f);
+            if (listLen(pcs) > 0) { return f * 4294967296 + (listGet(pcs, 0) catch 0); }
+            return -1;
+        }
+        f = f + 1;
+    }
+    return -1;
+}
+
+// 置位（val 1）或清除（0）一个断点；产物运行中也立即生效（薄桩运行中查通道，§三-4 第 8 条）。
+export function coreArm(s: Ref<Sess>, point: int, val: int): bool {
+    return wireSend(s.p, OP_ARM, point >> 32, point & LOW32, val, 3);
+}
+
+// —— 运行与停止 ——
+
+export function lineAt(s: Ref<Sess>, f: int, pc: int): int {
+    return listGet(listGet(s.ctx.fnLinesL, f) catch noInts(), pc) catch 0;
+}
+
+export function colAt(s: Ref<Sess>, f: int, pc: int): int {
+    return listGet(listGet(s.ctx.fnLinesC, f) catch noInts(), pc) catch 0;
+}
+
+export function fnText(s: Ref<Sess>, f: int): string {
+    return listGet(s.fnNames, f) catch "?";
+}
+
+// 发 RUN（模式 0 continue/1 into/2 over/3 out、截止毫秒 0 为无），进入运行态；deadline 是父进程兜底的截止（毫秒钟，
+// 0 为无）。通道已断时按产物结束收尾并得 false。
+export function coreRun(s: Ref<Sess>, mode: int, ms: int, deadline: int): bool {
+    s.deadline = deadline;
+    if (!wireSend(s.p, OP_RUN, mode, ms, 0, 2)) {
+        coreFinish(s);
+        return false;
+    }
+    s.state = ST_RUNNING;
+    return true;
+}
+
+// 运行中请产物停下（停在下一个新行事件处，原因 3）。
+export function corePause(s: Ref<Sess>): bool {
+    return wireSend(s.p, OP_PAUSE, 0, 0, 0, 0);
+}
+
+// 运行中推进一次：先处理已收齐的帧；没有停下或结束就最多等 ms 毫秒（withStdin 时也等客户端 stdin，就绪记在
+// s.stdinReady），收产物的输出与帧。返回 PUMP_RUNNING、PUMP_STOPPED 或 PUMP_ENDED（事件已发）。
+export function corePump(s: Ref<Sess>, ms: int, withStdin: bool): int {
+    s.stdinReady = false;
+    const r = takeFrames(s);
+    if (r != PUMP_RUNNING) { return r; }
+    if (!s.p.ctlOpen && !s.p.outOpen && !s.p.errOpen) {
+        coreFinish(s);
+        return PUMP_ENDED;
+    }
+    if (!s.p.ctlOpen && (procWait(s.p.h, 0) catch -999) != -999) {
+        coreFinish(s);
+        return PUMP_ENDED;
+    }
+    if (s.deadline > 0 && nowMsS() > s.deadline + 2000) {
+        // 产物卡在外部调用或睡眠里时，薄桩查不到截止：父进程收尾（调试实施设计 §四-5 第 5 条）。
+        killProduct(s);
+        flushOut(s, true);
+        dbgEmit("{\"event\":\"exited\",\"code\":3,\"reason\":\"timeout\"}");
+        s.state = ST_ENDED;
+        s.code = 3;
+        return PUMP_ENDED;
+    }
+    const got = wirePumpIn(s.p, ms, withStdin);
+    if ((got & 8) != 0) { s.stdinReady = true; }
+    flushOut(s, false);
+    flushErr(s, false);
+    return takeFrames(s);
+}
+
+function takeFrames(s: Ref<Sess>): int {
+    while (true) {
+        const f = wireFrame(s.p);
+        if (bytesLen(f) == 0) { return PUMP_RUNNING; }
+        const op = bytesGet(f, 0) catch 0;
+        if (op == OP_STOP) {
+            wireDrainOut(s.p);
+            flushOut(s, false);
+            onStop(s, f);
+            return PUMP_STOPPED;
+        }
+        if (op == OP_TIMEOUT) {
+            wireDrainOut(s.p);
+            flushOut(s, true);
+            const w = procWait(s.p.h, 5000) catch -1;
+            flushErr(s, true);
+            dbgEmit("{\"event\":\"exited\",\"code\":3,\"reason\":\"timeout\"}");
+            s.state = ST_ENDED;
+            s.code = 3;
+            return PUMP_ENDED;
+        }
+    }
+    return PUMP_RUNNING;
+}
+
+function onStop(s: Ref<Sess>, f: Bytes): void {
+    const why = wireU64(f, 1);
+    const fn = wireU64(f, 9);
+    const pc = wireU64(f, 17);
+    const depth = wireU64(f, 25);
+    let reason = "step";
+    if (why == 1) { reason = "breakpoint"; }
+    if (why == 3) { reason = "pause"; }
+    s.why = why;
+    const body = "\"reason\":\"" + reason + "\",\"fn_index\":" + toStr(fn) + ",\"fn\":" + dbgStr(fnText(s, fn)) + ",\"pc\":" + toStr(pc) + ",\"line\":" + toStr(lineAt(s, fn, pc)) + ",\"col\":" + toStr(colAt(s, fn, pc)) + ",\"depth\":" + toStr(depth);
+    listPush(s.stops, "{" + body + ",\"at_ms\":" + toStr(nowMs()) + "}");
+    if (listLen(s.stops) > STOPS_MAX) { listRemoveAt(s.stops, 0); }
+    s.state = ST_STOPPED;
+    viewRefresh(s.v);
+    dbgEmit("{\"event\":\"stopped\"," + body + "}");
+}
+
+// 产物 stdout 的完整行各一条 stdout 事件（final 时连没有换行的尾巴）。
+function flushOut(s: Ref<Sess>, final: bool): void {
+    while (true) {
+        const line = wireLine(s.p, final);
+        if (line == None) { return; }
+        dbgEmit("{\"event\":\"stdout\",\"text\":" + dbgStr(line catch "") + "}");
+    }
+}
+
+// 产物 stderr 里不是 trap 的行原样转出（dbgStderr：run --debug 写本进程 stderr，DAP 翻成 output）；trap 行留到结束时翻成
+// trapped 事件。
+function flushErr(s: Ref<Sess>, final: bool): void {
+    bytesAppend(s.errPend, s.p.err);
+    s.p.err = bytesNew(0);
+    while (true) {
+        const n = bytesLen(s.errPend);
+        let i = 0;
+        let found = -1;
+        while (i < n && found < 0) {
+            if ((bytesGet(s.errPend, i) catch 0) == 10) { found = i; }
+            i = i + 1;
+        }
+        if (found < 0) {
+            if (!final || n == 0) { return; }
+            found = n;
+        }
+        const line = wireText(bytesSlice(s.errPend, 0, found));
+        let rest = n - found - 1;
+        if (rest < 0) { rest = 0; }
+        s.errPend = bytesSlice(s.errPend, n - rest, rest);
+        if (strIndexOf(line, "[runtime:") >= 0) { listPush(s.traps, line); } else { dbgStderr(line); }
+        if (found == n) { return; }
+    }
+}
+
+// 产物已结束（或通道断开）：收尾输出，翻成 trapped 或 exited；返回会话退出码。
+export function coreFinish(s: Ref<Sess>): int {
+    let guard = 0;
+    while ((s.p.outOpen || s.p.errOpen) && guard < 100) {
+        wirePumpIn(s.p, 100, false);
+        guard = guard + 1;
+    }
+    flushOut(s, true);
+    flushErr(s, true);
+    const code = procWait(s.p.h, 10000) catch -1;
+    s.state = ST_ENDED;
+    if (code == 3 && listLen(s.traps) > 0) {
+        dbgEmit(trappedEvent(s, listGet(s.traps, listLen(s.traps) - 1) catch ""));
+        s.code = 3;
+        return 3;
+    }
+    dbgEmit("{\"event\":\"exited\",\"code\":" + toStr(code) + "}");
+    s.code = 3;
+    if (code >= 0 && code <= 255) { s.code = code; }
+    return s.code;
+}
+
+// trap 行 `模块:行:列: [runtime:名] 消息` 转 trapped 事件；模块换成绝对路径（取不到为 <unknown>）。
+function trappedEvent(s: Ref<Sess>, line: string): string {
+    const d = jsonParse(bytesFromStr(diagsArray(line))) catch (e) { return "{\"event\":\"exited\",\"code\":3}"; };
+    const one = listGet(d.items, 0) catch d;
+    let name = "runtime_error";
+    const at = strIndexOf(line, "[runtime:");
+    if (at >= 0) {
+        const rest = bytesToStr(bytesSlice(bytesFromStr(line), at + 9, len(line) - at - 9)) catch "";
+        const close = strIndexOf(rest, "]");
+        if (close > 0) { name = strSub(rest, 0, close); }
+    }
+    const show = strField(one, "module");
+    let module = "<unknown>";
+    let m = 0;
+    while (m < listLen(s.specMods)) {
+        if ((listGet(s.specMods, m) catch "") == show) { module = listGet(s.absMods, m) catch show; }
+        m = m + 1;
+    }
+    return "{\"event\":\"trapped\",\"code\":" + toStr(runtimeCodeOf(name)) + ",\"code_name\":" + dbgStr(name) + ",\"msg\":" + dbgStr(strField(one, "msg")) + ",\"module\":" + dbgStr(module) + ",\"line\":" + toStr(intField(one, "line")) + ",\"col\":" + toStr(intField(one, "col")) + "}";
+}
+
+function killProduct(s: Ref<Sess>): void {
+    procKill(s.p.h);
+    const w = procWait(s.p.h, 5000) catch -1;
+}
+
+// 结束产物，不发事件（DAP 的 disconnect、terminate）。
+export function coreKill(s: Ref<Sess>): void {
+    if (s.state != ST_ENDED) { killProduct(s); }
+    s.state = ST_ENDED;
+}
+
+// kill、客户端 EOF（code 0）与会话硬顶（code 3）：结束产物并发 exited。
+export function coreEnd(s: Ref<Sess>, reason: string, code: int): int {
+    killProduct(s);
+    dbgEmit("{\"event\":\"exited\",\"code\":" + toStr(code) + ",\"reason\":\"" + reason + "\"}");
+    s.state = ST_ENDED;
+    s.code = code;
+    return code;
+}
+
+// —— 栈帧与变量表 ——
+
+export function framesOf(s: Ref<Sess>): List<Ref<DbgFrame>> {
+    const out: List<Ref<DbgFrame>> = listNew();
+    if (s.state != ST_STOPPED || !wireSend(s.p, OP_FRAMES, 0, 0, 0, 0)) { return out; }
+    const f = wireWait(s.p, OP_FRAMES_R);
+    if (bytesLen(f) < 17) { return out; }
+    const n = wireU64(f, 9);
+    let k = 0;
+    while (k < n && 17 + 24 * k + 24 <= bytesLen(f)) {
+        listPush(out, new DbgFrame { win: wireU64(f, 17 + 24 * k), fn: wireU64(f, 25 + 24 * k), pc: wireU64(f, 33 + 24 * k) });
+        k = k + 1;
+    }
+    return out;
+}
+
+export function regCount(s: Ref<Sess>, f: int): int {
+    let r = listGet(s.ctx.fnReg, f) catch 0;
+    if (r > SLOTS_MAX) { r = SLOTS_MAX; }
+    return r;
+}
+
+// 函数 f 在 pc 处占槽 slot 的变量在变量表里的序号（调试实施设计 §四-3）；没有为 −1。
+export function varIdx(s: Ref<Sess>, f: int, pc: int, slot: int): int {
+    const vars = listGet(s.ctx.dbg.vars, f) catch noInts();
+    let k = 0;
+    while (k * 4 < listLen(vars)) {
+        if ((listGet(vars, k * 4) catch -1) == slot && (listGet(vars, k * 4 + 2) catch 0) <= pc && pc < (listGet(vars, k * 4 + 3) catch 0)) { return k; }
+        k = k + 1;
+    }
+    return -1;
+}
+
+// 变量的静态类型（SEB1 池号）；不是具名变量为 −1。
+export function varTy(s: Ref<Sess>, f: int, k: int): int {
+    if (k < 0) { return -1; }
+    return listGet(listGet(s.ctx.dbg.vars, f) catch noInts(), k * 4 + 1) catch -1;
+}
+
+export function varName(s: Ref<Sess>, f: int, k: int): string {
+    if (k < 0) { return ""; }
+    return listGet(listGet(s.ctx.dbg.varNames, f) catch noStrs(), k) catch "";
+}
+
+// 变量的类型拼写（sema 给的源码写法）。
+export function varTyText(s: Ref<Sess>, f: int, k: int): string {
+    const ty = varTy(s, f, k);
+    if (ty < 0) { return ""; }
+    return listGet(s.ctx.dbg.tyNames, ty) catch "";
+}

@@ -1,0 +1,678 @@
+// 外部函数调用桩（D3 v0.23 FFI，去 Zig 第 5 轮第 2 步；docs/design/v052-ffi-platform-v0.1-20261015.md
+// §五-3）。每个带 from 的外部函数生成一个 __tx_ffi_<extern 序>：形同内建处理例程
+// (win fn pc a)，从窗口槽取实参并检查标签、按目标调用约定放好（Windows 经导入槽 __imp_<名>
+// 间接调用，Linux from syscall 直接发系统调用）、立即保存系统错误码、转换返回值后释放临时
+// 缓冲、写回结果槽。程序代码对它的调用仍是 callbi 4096+序（TXC v6）的通用路，只是调用目标换成桩
+// （emitmirror emSetFfiStubs）；不用 FFI 的程序不生成任何桩，产物不变。
+//
+// 封送种类码见 semamirror FfiX：1..10 定宽（i8 i16 i32 u8 u16 u32 u64 isize usize f32）、11 int、
+// 12 float、13 bool、14 string（UTF-8 C 串，原 cstr）、15 wstr、16 Bytes、17 句柄、18 可空句柄、19 Ref<外部结构体>、
+// 20 回调；返回另有 0 void。ffiExt、ffiLay 行形见 program_context.tx。
+import { ffiTargetMessage } from "./ffi_target";
+import { StructuredBuffer } from "./assemble";
+import { RtFn, RtOp, L, I, A, G } from "./rtfn_base";
+import { rtBegin, rtFailed, rtEnd, rtLabel, rtJump, rtIf, rtSet, rtSetGlobal, rtOp, rtShift, rtLoad, rtStore, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtCall5, rtRetVoid, rtRdataBytes, rtCallC, rtSyscall, rtF64ToF32Bits, rtF32BitsToF64 } from "./rtfn";
+import { ProgramContext } from "./program_context";
+import { cbName, cbPairs, cbEmitAll, callWinImport } from "./ffi_callbacks";
+import { tPe, tElf, tSysV, tWindows, tMacos } from "./target";
+import { MAC_LIBSYSTEM, macDylib, macLinkName } from "./macos_symbols";
+import { macKernelImports } from "./unix_sys";
+
+let ffiTextCount: int = 0;
+let ffiFail: string = "";
+const stubIdx: List<int> = listNew();
+
+export function ffiStubError(): string { return ffiFail; }
+export function ffiStubIndices(): List<int> { return stubIdx; }
+
+function check(f: Ref<RtFn>): void { rtEnd(f); if (len(rtFailed(f)) > 0 && len(ffiFail) == 0) { ffiFail = rtFailed(f); } }
+
+function ffiText(b: Ref<StructuredBuffer>, value: string): string {
+    const label = "__tx_ffi_text_" + toStr(ffiTextCount);
+    ffiTextCount = ffiTextCount + 1;
+    rtRdataBytes(b, label, value);
+    return label;
+}
+
+function ffiTrap(b: Ref<StructuredBuffer>, f: Ref<RtFn>, label: string, code: int, message: string): void {
+    rtLabel(f, label);
+    const t = ffiText(b, message);
+    rtCall5(f, "", "__tx_trap", L("fn"), L("pc"), I(code), A(t), I(len(message)));
+    rtRetVoid(f);
+}
+
+function rowAt(p: Ref<ProgramContext>, xi: int): List<int> {
+    const empty: List<int> = listNew();
+    return listGet(p.ffiExt, xi) catch empty;
+}
+
+function kindAt(row: List<int>, i: int): int { return listGet(row, 9 + i * 2) catch 0; }
+
+/// 库名 → PE 导入的 DLL 名：不带扩展名时补 .dll。
+export function ffiDllName(lib: string): string {
+    let i = 0;
+    while (i < len(lib)) {
+        if ((byteAt(lib, i) catch 0) == 46) { return lib; }
+        i = i + 1;
+    }
+    return lib + ".dll";
+}
+
+/// 外部函数 name（来自库 lib）的导入符号（导入槽为 __imp_<它>）：macOS 上从 libSystem 导入的按 Apple 头文件改名
+/// （macos_symbols.tx，同 C 程序），其余即声明名。
+export function ffiImportSymbol(name: string, lib: string, t: int): string {
+    if (tMacos(t) && macDylib(lib) == MAC_LIBSYSTEM) { return macLinkName(name, t); }
+    return name;
+}
+
+function ffiDiag(p: Ref<ProgramContext>, row: List<int>, msg: string): string {
+    const mod = listGet(row, 5) catch 0;
+    const display = listGet(p.cgStrings, listGet(p.modOutPath, mod) catch 0) catch "?";
+    return display + ":" + toStr(listGet(row, 6) catch 0) + ":" + toStr(listGet(row, 7) catch 0) + ": error 3033: " + msg + "\n  └─ 处置详见: taixu explain 3033\n";
+}
+
+/// 按目标检查程序实际调用的外部函数（used[序]＝1）能否生成调用桩，登记要生成的 extern 序
+/// （emSetFfiStubs 用）。返回渲染好的 3033 诊断（空串＝通过）。只声明不调用的外部函数不检查、
+/// 不生成桩、不产生导入（例如共用文件里另一目标的声明）。宿主 extern（方式 0）不生成桩，调用时仍 trap 4013。
+export function ffiPrepare(p: Ref<ProgramContext>, used: List<int>, t: int, requireStatic: bool): string {
+    while (listLen(stubIdx) > 0) { listRemoveAt(stubIdx, listLen(stubIdx) - 1); }
+    ffiFail = "";
+    let out = "";
+    let xi = 0;
+    while (xi < listLen(p.ffiExt)) {
+        const row = rowAt(p, xi);
+        const mode = listGet(row, 0) catch 0;
+        const name = listGet(p.extNames, xi) catch "";
+        let ok = mode != 0 && (listGet(used, xi) catch 0) == 1;
+        // 目标检查与语义分析同一判定（ffi_target.tx）；语义分析已报的到不了这里，这里兜底未带目标的调用方。
+        const targetMsg = ffiTargetMessage(mode, name, libOf(p, row), hasWide(row), t);
+        if (ok && len(targetMsg) > 0) {
+            out = out + ffiDiag(p, row, targetMsg);
+            ok = false;
+        }
+        // macOS：导入槽按名字归属一个库，与内核经 libSystem 导入的符号同名的只能也来自 libSystem（M2 设计 F2）。
+        if (ok && mode == 1 && tMacos(t) && macDylib(libOf(p, row)) != MAC_LIBSYSTEM && macKernelImports(ffiImportSymbol(name, libOf(p, row), t), t)) {
+            out = out + ffiDiag(p, row, "外部函数 " + name + " 来自 \"" + libOf(p, row) + "\"：运行时经 libSystem 导入了同名函数，同一个符号名只能从一个库导入");
+            ok = false;
+        }
+        if (ok && mode == 1 && tElf(t) && requireStatic) {
+            out = out + ffiDiag(p, row, "外部函数 " + name + " 来自 \"" + libOf(p, row) + "\"，产物须动态链接；--static 要求静态产物（Linux 上可改用 from syscall）");
+            ok = false;
+        }
+        if (ok && mode == 1) {
+            // 同一个符号名只能从一个库导入（导入表按名字归属 DLL）。
+            let yi = 0;
+            while (yi < xi) {
+                const other = rowAt(p, yi);
+                if ((listGet(used, yi) catch 0) == 1 && (listGet(other, 0) catch 0) == 1 && (listGet(p.extNames, yi) catch "") == name && (listGet(other, 1) catch 0) != (listGet(row, 1) catch 0)) {
+                    out = out + ffiDiag(p, row, "外部函数 " + name + " 在不同模块里声明了不同的库（" + (listGet(p.ffiLibs, (listGet(other, 1) catch 1) - 1) catch "?") + "、" + (listGet(p.ffiLibs, (listGet(row, 1) catch 1) - 1) catch "?") + "）；同一个符号名只能从一个库导入");
+                    ok = false;
+                }
+                yi = yi + 1;
+            }
+        }
+        if (ok) { listPush(stubIdx, xi); }
+        xi = xi + 1;
+    }
+    return out;
+}
+
+function libOf(p: Ref<ProgramContext>, row: List<int>): string {
+    return listGet(p.ffiLibs, (listGet(row, 1) catch 1) - 1) catch "";
+}
+
+function hasWide(row: List<int>): bool {
+    if ((listGet(row, 3) catch 0) == 15) { return true; }
+    let i = 0;
+    while (i < (listGet(row, 8) catch 0)) {
+        if (kindAt(row, i) == 15) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// 构建报告（无 FFI 调用时为空串）：Windows 列出导入的外部 DLL；Linux 写明产物形态——动态时
+/// 列出库与引入它的模块，只用 from syscall 时为静态。
+export function ffiLinkReport(p: Ref<ProgramContext>, t: int): string {
+    const libs: List<string> = listNew();
+    const mods: List<string> = listNew();
+    let any = false;
+    let i = 0;
+    while (i < listLen(stubIdx)) {
+        const xi = listGet(stubIdx, i) catch 0;
+        const row = rowAt(p, xi);
+        any = true;
+        if ((listGet(row, 0) catch 0) == 1) {
+            let lib = libOf(p, row);
+            if (tPe(t)) { lib = ffiDllName(lib); }
+            if (tMacos(t)) { lib = macDylib(lib); }
+            const mod = listGet(p.cgStrings, listGet(p.modOutPath, listGet(row, 5) catch 0) catch 0) catch "?";
+            let at = -1;
+            let j = 0;
+            while (j < listLen(libs)) {
+                if ((listGet(libs, j) catch "") == lib) { at = j; }
+                j = j + 1;
+            }
+            if (at < 0) {
+                listPush(libs, lib);
+                listPush(mods, mod);
+            } else {
+                const seen = listGet(mods, at) catch "";
+                if (strIndexOf("、" + seen + "、", "、" + mod + "、") < 0) { listSet(mods, at, seen + "、" + mod); }
+            }
+        }
+        i = i + 1;
+    }
+    if (!any) { return ""; }
+    let text = "";
+    i = 0;
+    while (i < listLen(libs)) {
+        if (i > 0) { text = text + "、"; }
+        text = text + (listGet(libs, i) catch "") + "（" + (listGet(mods, i) catch "") + "）";
+        i = i + 1;
+    }
+    if (tPe(t) || tMacos(t)) {
+        if (listLen(libs) == 0) { return ""; }
+        return "外部库 " + text;
+    }
+    if (listLen(libs) == 0) { return "静态产物（外部函数均为 from syscall）"; }
+    let libc = false;
+    i = 0;
+    while (i < listLen(libs)) {
+        if ((listGet(libs, i) catch "") == "libc.so.6") { libc = true; }
+        i = i + 1;
+    }
+    if (!libc) { text = text + "、libc.so.6（错误码与退出）"; }
+    return "动态链接 " + text + "；解释器 /lib64/ld-linux-x86-64.so.2";
+}
+
+/// 运行期期望的实参槽标签：整数族与句柄 1、浮点 2、bool 3、字符串 6、Bytes 17（可空句柄另判）。
+function argTag(k: int): int {
+    if ((k >= 1 && k <= 9) || k == 11 || k == 17) { return 1; }
+    if (k == 10 || k == 12) { return 2; }
+    if (k == 13) { return 3; }
+    if (k == 14 || k == 15) { return 6; }
+    if (k == 16) { return 17; }
+    if (k == 19) { return 9; }
+    if (k == 20) { return 12; }
+    return -1;
+}
+
+/// 生成 ffiPrepare 登记的全部调用桩。
+export function ffiEmitStubs(b: Ref<StructuredBuffer>, p: Ref<ProgramContext>, t: int): void {
+    let i = 0;
+    while (i < listLen(stubIdx)) {
+        const xi = listGet(stubIdx, i) catch 0;
+        stubEmit(b, p, xi, listGet(p.extNames, xi) catch "", rowAt(p, xi), t);
+        i = i + 1;
+    }
+    const cbErr = cbEmitAll(b, p, t);
+    if (len(cbErr) > 0 && len(ffiFail) == 0) { ffiFail = cbErr; }
+}
+
+function stubEmit(b: Ref<StructuredBuffer>, p: Ref<ProgramContext>, xi: int, name: string, row: List<int>, t: int): void {
+    const mode = listGet(row, 0) catch 0;
+    const rk = listGet(row, 3) catch 0;
+    const np = listGet(row, 8) catch 0;
+    // D3 v0.36：第 nfix 个参数起按 C 变参约定传（行尾的定参个数，见 program_context.tx）。
+    const nfix = listGet(row, 9 + np * 2) catch np;
+    let locals = "fp ri rf e q n c rt rp gp ef";
+    const hasCb = listLen(p.ffiCbFn) > 0 && mode == 1;
+    if (hasCb) { locals = locals + " cw"; }
+    let depth = 0;
+    let i = 0;
+    while (i < np) {
+        locals = locals + " s" + toStr(i) + " t" + toStr(i) + " v" + toStr(i) + " m" + toStr(i);
+        if (kindAt(row, i) == 19) {
+            const dd = layDepth(p, auxAt(row, i));
+            if (dd > depth) { depth = dd; }
+        }
+        i = i + 1;
+    }
+    if (depth > 0) { locals = locals + " ao ap ad ae av w0 w1"; }
+    i = 0;
+    while (i < depth) { locals = locals + " o" + toStr(i) + " p" + toStr(i); i = i + 1; }
+    let maxArgs = np;
+    if (maxArgs < 6) { maxArgs = 6; }
+    // Apple arm64 的变参一律在栈上：栈区按“8 个寄存器实参之后”留足全部参数。
+    if (nfix < np) { maxArgs = 8 + np; }
+    const f = rtBegin(b, "__tx_ffi_" + toStr(xi), "win fn pc a", locals, maxArgs, "bootstrap/selfhost/ffi_stubs.tx");
+    const args: List<Ref<RtOp>> = listNew();
+    const cls: List<int> = listNew();
+    i = 0;
+    while (i < np) {
+        const k = kindAt(row, i);
+        const si = "s" + toStr(i);
+        const ti = "t" + toStr(i);
+        const vi = "v" + toStr(i);
+        const mi = "m" + toStr(i);
+        rtSet(f, mi, I(0));
+        rtCall3(f, si, "__tx_nrt_arg", L("win"), L("a"), I(i));
+        rtLoad(f, ti, L(si), 0, 1);
+        if (k == 18) {
+            // 可空句柄：None 传空指针。
+            rtSet(f, vi, I(0));
+            rtIf(f, L(ti), "eq", I(4), "a" + toStr(i));
+            rtIf(f, L(ti), "ne", I(1), "type");
+            rtLoad(f, vi, L(si), 8, 8);
+            rtLabel(f, "a" + toStr(i));
+        } else {
+            rtIf(f, L(ti), "ne", I(argTag(k)), "type");
+            if (k == 14 || k == 15) {
+                stubCString(f, k, si, vi, mi, i, t);
+            } else if (k == 19) {
+                // Ref<外部结构体>：按 C 布局拷到临时缓冲（调用后拷回）。
+                const li = auxAt(row, i);
+                const sz = roundUp8(listGet(layAt(p, li), 1) catch 0);
+                rtCall2(f, mi, "__tx_native_mem_alloc", I(sz), I(8));
+                rtIf(f, L(mi), "eq", I(0), "oom");
+                zeroBuf(f, mi, sz);
+                rtLoad(f, "q", L(si), 8, 4);
+                rtCall1(f, "o0", "__tx_native_object_address_v1", L("q"));
+                // 调用后要回写：冻结的 struct（来自 Shared）在调用前 trap 4022（线程第 4b 步）。
+                rtLoad(f, "q", L("o0"), 0, 4); rtOp(f, "q", L("q"), "and", I(16)); rtIf(f, L("q"), "ne", I(0), "frozen");
+                structCopy(f, p, li, 0, mi, 0, true);
+                rtSet(f, vi, L(mi));
+            } else if (k == 20) {
+                stubCallback(f, p, row, i, vi);
+            } else if (k == 16) {
+                // Bytes：对象存活与 backing 地址稳定分别保证；64 为临时 FFI 借用位。
+                rtLoad(f, mi, L(si), 8, 4);
+                rtSet(f, "q", L(mi));
+                rtCall1(f, "q", "__tx_native_object_address_v1", L("q"));
+                // Bytes 按可写缓冲封送；交给 C 或 syscall 前同样执行 Shared 冻结检查。
+                rtLoad(f, "e", L("q"), 0, 4);
+                rtOp(f, "e", L("e"), "and", I(16));
+                rtIf(f, L("e"), "ne", I(0), "frozen_bytes");
+                rtLoad(f, ti, L("q"), 0, 4);
+                rtOp(f, "e", L(ti), "or", I(64)); rtStore(f, L("q"), 0, L("e"), 4);
+                rtOp(f, ti, L(ti), "and", I(64));
+                rtLoad(f, vi, L("q"), 32, 8);
+            } else {
+                rtLoad(f, vi, L(si), 8, 8);
+                // 变参位置上的 f32 按 C 的默认实参提升以 double 传（槽里本是 f64 位）。
+                if (k == 10 && i < nfix) { rtF64ToF32Bits(f, vi, L(vi)); }
+            }
+        }
+        listPush(args, L(vi));
+        if (i >= nfix) { listPush(cls, cVarClass(k)); } else { listPush(cls, cClass(k)); }
+        i = i + 1;
+    }
+    if (mode == 2) {
+        rtSyscall(f, "ri", listGet(row, 2) catch 0, args);
+    } else {
+        if (hasCb) { cbWindowEnter(f, np); }
+        rtSet(f, "fp", G("__imp_" + ffiImportSymbol(name, libOf(p, row), t)));
+        rtCallC(f, "ri", "rf", "fp", args, cls, tSysV(t));
+        // 调用约定随 C 交界（tSysV）；系统错误码随操作系统：Windows 的 GetLastError，否则 libc 的 errno。
+        if (tWindows(t)) {
+            // 系统错误码须紧接着取（后续任何 Win32 调用都可能覆盖它）。
+            const noArgs: List<Ref<RtOp>> = listNew();
+            callWinImport(f, "e", "GetLastError", noArgs);
+            rtOp(f, "e", L("e"), "and", I(4294967295));
+            rtSetGlobal(f, "__tx_ffi_last_error", L("e"));
+        } else {
+            // libc errno（线程局部，经 __errno_location 取地址；macOS 为 __error）。
+            const noArgs: List<Ref<RtOp>> = listNew();
+            const noCls: List<int> = listNew();
+            if (tMacos(t)) { rtSet(f, "gp", G("__imp___error")); } else { rtSet(f, "gp", G("__imp___errno_location")); }
+            rtCallC(f, "e", "ef", "gp", noArgs, noCls, tSysV(t));
+            rtLoad(f, "e", L("e"), 0, 4);
+            rtSetGlobal(f, "__tx_ffi_last_error", L("e"));
+        }
+        if (hasCb) { rtSetGlobal(f, "__tx_ffi_cb_win", L("cw")); }
+    }
+    // Ref<外部结构体> 拷回：按 C 布局把缓冲写回结构体对象（字段对象重新取址）。
+    i = 0;
+    while (i < np) {
+        if (kindAt(row, i) == 19) {
+            rtCall3(f, "q", "__tx_nrt_arg", L("win"), L("a"), I(i));
+            rtLoad(f, "q", L("q"), 8, 4);
+            rtCall1(f, "o0", "__tx_native_object_address_v1", L("q"));
+            structCopy(f, p, auxAt(row, i), 0, "m" + toStr(i), 0, false);
+        }
+        i = i + 1;
+    }
+    // 先转换返回值（string/wstr 返回值可能指向实参缓冲），再释放临时缓冲，最后写结果槽。
+    stubResult(f, rk);
+    // 逆序恢复支持重复 Bytes 实参与嵌套借用；对象表可能已由回调扩容，重新按索引取址。
+    i = np - 1;
+    while (i >= 0) {
+        if (kindAt(row, i) == 16) {
+            rtCall1(f, "q", "__tx_native_object_address_v1", L("m" + toStr(i)));
+            rtLoad(f, "e", L("q"), 0, 4); rtOp(f, "e", L("e"), "and", I(4294967231));
+            rtOp(f, "e", L("e"), "or", L("t" + toStr(i))); rtStore(f, L("q"), 0, L("e"), 4);
+        }
+        i = i - 1;
+    }
+    i = 0;
+    while (i < np) {
+        const k = kindAt(row, i);
+        if (k == 14 || k == 15 || k == 19) { rtCall1(f, "", "__tx_native_mem_free", L("m" + toStr(i))); }
+        i = i + 1;
+    }
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), L("rt"), L("rp"));
+    rtRetVoid(f);
+    ffiTrap(b, f, "type", 4010, "外部函数 " + name + " 的实参类型与声明不符");
+    ffiTrap(b, f, "nul", 4019, "外部函数 " + name + " 的字符串实参含 NUL 字节，不能作为 C 字符串");
+    ffiTrap(b, f, "frozen", 4022, "外部函数 " + name + " 的 Ref 实参指向冻结的 struct（调用后要回写）（来自 Shared，深度不可变）");
+    ffiTrap(b, f, "frozen_bytes", 4022, "外部函数 " + name + " 的 Bytes 实参是冻结的 Bytes（来自 Shared，深度不可变）");
+    rtLabel(f, "oom");
+    rtCall0(f, "", "__tx_native_object_oom_v1");
+    rtRetVoid(f);
+    check(f);
+}
+
+function auxAt(row: List<int>, i: int): int { return listGet(row, 10 + i * 2) catch 0; }
+
+function layAt(p: Ref<ProgramContext>, li: int): List<int> {
+    const empty: List<int> = listNew();
+    return listGet(p.ffiLay, li) catch empty;
+}
+
+function roundUp8(n: int): int { return (n + 7) / 8 * 8; }
+
+/// 外部结构体按值嵌套的层数（拷入拷出每层用一组局部 o<层>／p<层>）。
+function layDepth(p: Ref<ProgramContext>, li: int): int {
+    const row = layAt(p, li);
+    const nf = listGet(row, 3) catch 0;
+    let d = 1;
+    let j = 0;
+    while (j < nf) {
+        if ((listGet(row, 5 + j * 4) catch 0) == 19) {
+            const sub = 1 + layDepth(p, listGet(row, 7 + j * 4) catch 0);
+            if (sub > d) { d = sub; }
+        }
+        j = j + 1;
+    }
+    return d;
+}
+
+// rtCallC 的实参类别：f32 6、float 1；窄整数带宽度（32／16／8 位为 3／4／5，只影响 Apple arm64 栈上的紧排），其余 0。
+function cClass(k: int): int {
+    if (k == 10) { return 6; }
+    if (k == 12) { return 1; }
+    if (k == 3 || k == 6) { return 3; }
+    if (k == 2 || k == 5) { return 4; }
+    if (k == 1 || k == 4 || k == 13) { return 5; }
+    return 0;
+}
+
+// 变参位置上的类别（C 的默认实参提升）：float、f32 以 double 传（7）；其余整数、bool、指针类各占一个 8 字节变参槽（2）——
+// 槽里的整数本是按类型扩展好的 64 位值，窄整数与 bool 因此即提升后的 int。
+function cVarClass(k: int): int {
+    if (k == 10 || k == 12) { return 7; }
+    return 2;
+}
+
+function scalarWidth(k: int): int {
+    if (k == 1 || k == 4) { return 1; }
+    if (k == 2 || k == 5) { return 2; }
+    if (k == 3 || k == 6 || k == 10) { return 4; }
+    return 8;
+}
+
+let copyLabel: int = 0;
+function nextLabel(tag: string): string {
+    copyLabel = copyLabel + 1;
+    return tag + toStr(copyLabel);
+}
+
+/// 缓冲清零（结构体的对齐填充对 C 端可见）。
+function zeroBuf(f: Ref<RtFn>, buf: string, size: int): void {
+    const top = nextLabel("zb");
+    const done = nextLabel("zb");
+    rtSet(f, "ad", L(buf));
+    rtSet(f, "ae", I(0));
+    rtLabel(f, top);
+    rtIf(f, L("ae"), "ge", I(size / 8), done);
+    rtStore(f, L("ad"), 0, I(0), 8);
+    rtOp(f, "ad", L("ad"), "add", I(8));
+    rtOp(f, "ae", L("ae"), "add", I(1));
+    rtJump(f, top);
+    rtLabel(f, done);
+}
+
+/// 槽载荷（太虚值，定宽整数已扩展、f32 为 f64）→ 缓冲 addr+off 处的 C 标量。i16/u16 按两个字节写。
+function storeScalar(f: Ref<RtFn>, k: int, addr: string, off: int, v: string): void {
+    const w = scalarWidth(k);
+    if (k == 10) {
+        rtF64ToF32Bits(f, "w0", L(v));
+        rtStore(f, L(addr), off, L("w0"), 4);
+        return;
+    }
+    if (w == 2) {
+        rtStore(f, L(addr), off, L(v), 1);
+        rtShift(f, "w1", L(v), "shr", 8);
+        rtStore(f, L(addr), off + 1, L("w1"), 1);
+        return;
+    }
+    rtStore(f, L(addr), off, L(v), w);
+}
+
+/// 缓冲 addr+off 处的 C 标量 → 槽载荷：窄整数按种类符号或零扩展，f32 转回 f64。
+function loadScalar(f: Ref<RtFn>, k: int, addr: string, off: int, dst: string): void {
+    const w = scalarWidth(k);
+    if (w == 1) {
+        rtLoad(f, dst, L(addr), off, 1);
+        if (k == 1) { rtShift(f, dst, L(dst), "shl", 56); rtShift(f, dst, L(dst), "sar", 56); }
+        return;
+    }
+    if (w == 2) {
+        rtLoad(f, "w0", L(addr), off, 1);
+        rtLoad(f, "w1", L(addr), off + 1, 1);
+        rtShift(f, "w1", L("w1"), "shl", 8);
+        rtOp(f, dst, L("w0"), "or", L("w1"));
+        if (k == 2) { rtShift(f, dst, L(dst), "shl", 48); rtShift(f, dst, L(dst), "sar", 48); }
+        return;
+    }
+    if (w == 4) {
+        rtLoad(f, dst, L(addr), off, 4);
+        if (k == 3) { rtShift(f, dst, L(dst), "shl", 32); rtShift(f, dst, L(dst), "sar", 32); }
+        if (k == 10) { rtF32BitsToF64(f, dst, L(dst)); }
+        return;
+    }
+    rtLoad(f, dst, L(addr), off, 8);
+}
+
+/// 字段槽（span 基址 pd 的第 j 个）须为对象标签 tag（7 结构体值、10 定长数组），取其对象地址到 dst。
+function fieldObject(f: Ref<RtFn>, pd: string, j: int, tag: int, dst: string): void {
+    rtLoad(f, "q", L(pd), 16 * j, 1);
+    rtIf(f, L("q"), "ne", I(tag), "type");
+    rtLoad(f, "q", L(pd), 16 * j + 8, 4);
+    rtCall1(f, dst, "__tx_native_object_address_v1", L("q"));
+}
+
+/// 定长数组字段：元素槽（16 字节一格）与缓冲里连续的 C 标量互拷；元素数须与布局一致。
+function arrayCopy(f: Ref<RtFn>, pd: string, j: int, k: int, cnt: int, buf: string, off: int, toC: bool): void {
+    fieldObject(f, pd, j, 10, "ao");
+    rtLoad(f, "q", L("ao"), 24, 4);
+    rtIf(f, L("q"), "ne", I(cnt), "type");
+    rtLoad(f, "ap", L("ao"), 32, 8);
+    rtOp(f, "ad", L(buf), "add", I(off));
+    rtSet(f, "ae", I(0));
+    const top = nextLabel("ar");
+    const done = nextLabel("ar");
+    rtLabel(f, top);
+    rtIf(f, L("ae"), "ge", I(cnt), done);
+    if (toC) {
+        rtLoad(f, "av", L("ap"), 8, 8);
+        storeScalar(f, k, "ad", 0, "av");
+    } else {
+        loadScalar(f, k, "ad", 0, "av");
+        rtStore(f, L("ap"), 8, L("av"), 8);
+    }
+    rtOp(f, "ap", L("ap"), "add", I(16));
+    rtOp(f, "ad", L("ad"), "add", I(scalarWidth(k)));
+    rtOp(f, "ae", L("ae"), "add", I(1));
+    rtJump(f, top);
+    rtLabel(f, done);
+}
+
+/// 外部结构体对象 o<d>（对象地址）与缓冲 buf+base 互拷（toC＝拷入）。字段槽按声明序排在对象
+/// span 里（16 字节一格）；按值嵌套的外部结构体递归（容器内的嵌套值在持久边界都已 clone、
+/// 由容器唯一持有，原地写回与 a.b.c = v 的语义一致）；标量字段只改载荷，标签不变。
+function structCopy(f: Ref<RtFn>, p: Ref<ProgramContext>, li: int, d: int, buf: string, base: int, toC: bool): void {
+    const row = layAt(p, li);
+    const nf = listGet(row, 3) catch 0;
+    const od = "o" + toStr(d);
+    const pd = "p" + toStr(d);
+    rtLoad(f, pd, L(od), 32, 8);
+    let j = 0;
+    while (j < nf) {
+        const off = base + (listGet(row, 4 + j * 4) catch 0);
+        const k = listGet(row, 5 + j * 4) catch 0;
+        const cnt = listGet(row, 6 + j * 4) catch 1;
+        const aux = listGet(row, 7 + j * 4) catch 0;
+        if (k == 19) {
+            fieldObject(f, pd, j, 7, "o" + toStr(d + 1));
+            structCopy(f, p, aux, d + 1, buf, off, toC);
+        } else if (cnt > 1) {
+            arrayCopy(f, pd, j, k, cnt, buf, off, toC);
+        } else {
+            // 元素数 1：标量字段或 [1]T，按槽标签分开。
+            const arr = nextLabel("a1");
+            const done = nextLabel("a1");
+            rtLoad(f, "q", L(pd), 16 * j, 1);
+            rtIf(f, L("q"), "eq", I(10), arr);
+            if (toC) {
+                rtLoad(f, "av", L(pd), 16 * j + 8, 8);
+                storeScalar(f, k, buf, off, "av");
+            } else {
+                loadScalar(f, k, buf, off, "av");
+                rtStore(f, L(pd), 16 * j + 8, L("av"), 8);
+            }
+            rtJump(f, done);
+            rtLabel(f, arr);
+            arrayCopy(f, pd, j, k, 1, buf, off, toC);
+            rtLabel(f, done);
+        }
+        j = j + 1;
+    }
+}
+
+/// string（C 串）：拷到临时缓冲并补 NUL；wstr：转成 NUL 结尾的 UTF-16（Windows）。串内含 NUL 字节则 trap 4019。
+function stubCString(f: Ref<RtFn>, k: int, si: string, vi: string, mi: string, i: int, t: int): void {
+    const zl = "z" + toStr(i);
+    const zd = "zd" + toStr(i);
+    rtLoad(f, "q", L(si), 8, 4);
+    rtCall1(f, "q", "__tx_native_object_address_v1", L("q"));
+    rtLoad(f, "n", L("q"), 40, 8);
+    rtLoad(f, "q", L("q"), 32, 8);
+    rtSet(f, "c", I(0));
+    rtLabel(f, zl);
+    rtIf(f, L("c"), "uge", L("n"), zd);
+    rtOp(f, "e", L("q"), "add", L("c"));
+    rtLoad(f, "e", L("e"), 0, 1);
+    rtIf(f, L("e"), "eq", I(0), "nul");
+    rtOp(f, "c", L("c"), "add", I(1));
+    rtJump(f, zl);
+    rtLabel(f, zd);
+    if (k == 14) {
+        rtOp(f, "e", L("n"), "add", I(1));
+        rtCall2(f, mi, "__tx_native_mem_alloc", L("e"), I(1));
+        rtIf(f, L(mi), "eq", I(0), "oom");
+        let cpy = "memcpy";
+        if (tSysV(t)) { cpy = "__tx_linux_memcpy"; }
+        rtCall3(f, "", cpy, L(mi), L("q"), L("n"));
+        rtOp(f, "e", L(mi), "add", L("n"));
+        rtStore(f, L("e"), 0, I(0), 1);
+    } else {
+        // __tx_file_wpath 对空串返回 0（文件原语据此报 EINVAL），空串在这里直接给只含 NUL 的缓冲。
+        const we = "we" + toStr(i);
+        const wd = "wd" + toStr(i);
+        rtIf(f, L("n"), "ne", I(0), we);
+        rtCall2(f, mi, "__tx_native_mem_alloc", I(4), I(1));
+        rtIf(f, L(mi), "eq", I(0), "oom");
+        rtStore(f, L(mi), 0, I(0), 4);
+        rtJump(f, wd);
+        rtLabel(f, we);
+        rtCall2(f, mi, "__tx_file_wpath", L("q"), L("n"));
+        rtIf(f, L(mi), "eq", I(0), "oom");
+        rtLabel(f, wd);
+    }
+    rtSet(f, vi, L(mi));
+}
+
+/// 回调实参：槽里是顶层函数值（标签 12，载荷＝函数序），换成该（函数, 回调签名）蹦床的地址。
+function stubCallback(f: Ref<RtFn>, p: Ref<ProgramContext>, row: List<int>, i: int, vi: string): void {
+    const sig = auxAt(row, i);
+    const pairs = cbPairs(p);
+    const found = "cb" + toStr(i);
+    rtLoad(f, "q", L("s" + toStr(i)), 8, 4);
+    let j = 0;
+    while (j + 1 < listLen(pairs)) {
+        if ((listGet(pairs, j + 1) catch -1) == sig) {
+            const fnIdx = listGet(pairs, j) catch -1;
+            const next = "cbn" + toStr(i) + "_" + toStr(j);
+            rtIf(f, L("q"), "ne", I(fnIdx), next);
+            rtSet(f, vi, A(cbName(fnIdx, sig)));
+            rtJump(f, found);
+            rtLabel(f, next);
+        }
+        j = j + 2;
+    }
+    rtJump(f, "type");
+    rtLabel(f, found);
+}
+
+/// 程序有回调时，每次库函数调用前把回调窗口登记为本桩实参之后的位置（win＋16×(a＋参数数＋1)），
+/// 旧值存 cw、调用后恢复（蹦床另据 TLS 槽与线程块里的线程号拒绝别的线程）。
+function cbWindowEnter(f: Ref<RtFn>, np: int): void {
+    rtSet(f, "cw", G("__tx_ffi_cb_win"));
+    rtOp(f, "q", L("a"), "and", I(4294967295));
+    rtOp(f, "q", L("q"), "add", I(np + 1));
+    rtShift(f, "q", L("q"), "shl", 4);
+    rtOp(f, "q", L("q"), "add", L("win"));
+    rtSetGlobal(f, "__tx_ffi_cb_win", L("q"));
+}
+
+/// 返回值 → (rt 标签, rp 载荷)。窄整数按种类符号或零扩展；bool 只看低 8 位；可空句柄空指针得 None。
+function stubResult(f: Ref<RtFn>, rk: int): void {
+    rtSet(f, "rt", I(1));
+    rtSet(f, "rp", L("ri"));
+    if (rk == 0) { rtSet(f, "rt", I(4)); rtSet(f, "rp", I(0)); return; }
+    if (rk == 1) { rtShift(f, "rp", L("ri"), "shl", 56); rtShift(f, "rp", L("rp"), "sar", 56); return; }
+    if (rk == 2) { rtShift(f, "rp", L("ri"), "shl", 48); rtShift(f, "rp", L("rp"), "sar", 48); return; }
+    if (rk == 3) { rtShift(f, "rp", L("ri"), "shl", 32); rtShift(f, "rp", L("rp"), "sar", 32); return; }
+    if (rk == 4) { rtOp(f, "rp", L("ri"), "and", I(255)); return; }
+    if (rk == 5) { rtOp(f, "rp", L("ri"), "and", I(65535)); return; }
+    if (rk == 6) { rtOp(f, "rp", L("ri"), "and", I(4294967295)); return; }
+    if (rk == 18) {
+        rtIf(f, L("ri"), "ne", I(0), "rsome");
+        rtSet(f, "rt", I(4));
+        rtLabel(f, "rsome");
+        return;
+    }
+    if (rk == 13) {
+        rtSet(f, "rt", I(3));
+        rtOp(f, "rp", L("ri"), "and", I(255));
+        rtIf(f, L("rp"), "eq", I(0), "rbool");
+        rtSet(f, "rp", I(1));
+        rtLabel(f, "rbool");
+        return;
+    }
+    if (rk == 10 || rk == 12) {
+        rtSet(f, "rt", I(2));
+        if (rk == 10) { rtF32BitsToF64(f, "rp", L("rf")); } else { rtSet(f, "rp", L("rf")); }
+        return;
+    }
+    if (rk == 14) {
+        rtSet(f, "rt", I(6));
+        rtCall1(f, "rp", "__tx_ffi_cstr_to_str", L("ri"));
+        return;
+    }
+    if (rk == 15) {
+        // 宽串返回（Windows）：空指针得空串。
+        rtSet(f, "rt", I(6));
+        rtSet(f, "n", I(0));
+        rtIf(f, L("ri"), "eq", I(0), "rwide");
+        const lenArgs: List<Ref<RtOp>> = listNew();
+        listPush(lenArgs, L("ri"));
+        callWinImport(f, "n", "lstrlenW", lenArgs);
+        rtOp(f, "n", L("n"), "and", I(4294967295));
+        rtLabel(f, "rwide");
+        rtCall2(f, "rp", "__tx_nrt_wide_to_str", L("ri"), L("n"));
+        return;
+    }
+}

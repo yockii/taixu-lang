@@ -1,0 +1,180 @@
+// ============================================================================
+// 平台层共用的文本编解码（D3 v0.23；FFI 与平台层设计 §五-6）。内部模块：只由 fs_sys、net_sys 的
+// _windows.tx / _linux.tx / _macos.tx 引用，不属标准库公共接口。
+//
+// 太虚的 string 恒为合法 UTF-8，系统给出的字节（Linux 文件名、环境变量、网络数据）与 UTF-16
+// （Windows W 版接口）在这里转换：非法 UTF-8 与不成对的代理项一律替换为 U+FFFD（与 FFI 签名里 string、
+// wstr 返回值同一规则；Windows 侧与 Zig 宿主的 WideCharToMultiByte 结果相同）。
+// ============================================================================
+
+// 把码点按 UTF-8 追加到 out。
+export function pushCp(out: Bytes, cp: int): void {
+    if (cp < 128) {
+        bytesPush(out, cp);
+    } else if (cp < 2048) {
+        bytesPush(out, 192 + (cp >> 6));
+        bytesPush(out, 128 + (cp & 63));
+    } else if (cp < 65536) {
+        bytesPush(out, 224 + (cp >> 12));
+        bytesPush(out, 128 + ((cp >> 6) & 63));
+        bytesPush(out, 128 + (cp & 63));
+    } else {
+        bytesPush(out, 240 + (cp >> 18));
+        bytesPush(out, 128 + ((cp >> 12) & 63));
+        bytesPush(out, 128 + ((cp >> 6) & 63));
+        bytesPush(out, 128 + (cp & 63));
+    }
+}
+
+function byteOf(b: Bytes, i: int): int {
+    return bytesGet(b, i) catch 0;
+}
+
+// b[off..] 处的 UTF-16LE 码元。
+export function u16At(b: Bytes, off: int): int {
+    return byteOf(b, off) + byteOf(b, off + 1) * 256;
+}
+
+// b[off..] 起、至多 maxUnits 个码元里第一个 NUL 之前的码元数。
+export function wideLen(b: Bytes, off: int, maxUnits: int): int {
+    let n: int = 0;
+    while (n < maxUnits && off + 2 * n + 1 < bytesLen(b)) {
+        if (u16At(b, off + 2 * n) == 0) {
+            return n;
+        }
+        n = n + 1;
+    }
+    return n;
+}
+
+// UTF-16LE（b[off..]，units 个码元）转字符串；不成对的代理项替换为 U+FFFD。
+export function wideToStr(b: Bytes, off: int, units: int): string {
+    const out = bytesNew(0);
+    let i: int = 0;
+    while (i < units) {
+        const u = u16At(b, off + 2 * i);
+        i = i + 1;
+        let cp: int = u;
+        if (u >= 0xD800 && u < 0xDC00) {
+            cp = 0xFFFD;
+            if (i < units) {
+                const v = u16At(b, off + 2 * i);
+                if (v >= 0xDC00 && v < 0xE000) {
+                    cp = 0x10000 + (u - 0xD800) * 1024 + (v - 0xDC00);
+                    i = i + 1;
+                }
+            }
+        } else if (u >= 0xDC00 && u < 0xE000) {
+            cp = 0xFFFD;
+        }
+        pushCp(out, cp);
+    }
+    return bytesToStr(out) catch "";
+}
+
+// 首字节决定的 UTF-8 序列长度（非法首字节记 1）。
+export function seqLen(lead: int): int {
+    if (lead < 128) {
+        return 1;
+    }
+    if (lead >= 194 && lead < 224) {
+        return 2;
+    }
+    if (lead >= 224 && lead < 240) {
+        return 3;
+    }
+    if (lead >= 240 && lead < 245) {
+        return 4;
+    }
+    return 1;
+}
+
+// b[i..n) 处一个合法 UTF-8 序列的码点；不合法返回 -1（过长编码、代理项、超出 U+10FFFF 均不合法）。
+function decodeAt(b: Bytes, i: int, n: int): int {
+    const c = byteOf(b, i);
+    const k = seqLen(c);
+    if (k == 1) {
+        if (c < 128) {
+            return c;
+        }
+        return -1;
+    }
+    if (i + k > n) {
+        return -1;
+    }
+    let cp: int = c & (127 >> k);
+    let j: int = 1;
+    while (j < k) {
+        const d = byteOf(b, i + j);
+        if (d < 128 || d >= 192) {
+            return -1;
+        }
+        cp = cp * 64 + (d - 128);
+        j = j + 1;
+    }
+    if (k == 3 && (cp < 2048 || (cp >= 0xD800 && cp < 0xE000))) {
+        return -1;
+    }
+    if (k == 4 && (cp < 65536 || cp > 0x10FFFF)) {
+        return -1;
+    }
+    return cp;
+}
+
+// 系统给出的字节转字符串：合法 UTF-8 原样，非法字节逐个替换为 U+FFFD。
+export function lossyStr(b: Bytes): string {
+    const s = bytesToStr(b) catch (e) {
+        return lossySlow(b);
+    };
+    return s;
+}
+
+function lossySlow(b: Bytes): string {
+    const n = bytesLen(b);
+    const out = bytesNew(0);
+    let i: int = 0;
+    while (i < n) {
+        const cp = decodeAt(b, i, n);
+        if (cp < 0) {
+            pushCp(out, 0xFFFD);
+            i = i + 1;
+        } else {
+            pushCp(out, cp);
+            i = i + seqLen(byteOf(b, i));
+        }
+    }
+    return bytesToStr(out) catch "";
+}
+
+// b[0..n) 去掉末尾被截断的 UTF-8 序列后的长度（网络分块接收时把半个字符留给下一次）。
+export function utf8Complete(b: Bytes, n: int): int {
+    let p: int = n - 1;
+    while (p >= 0 && p >= n - 3) {
+        const c = byteOf(b, p);
+        if (c < 128 || c >= 192) {
+            if (p + seqLen(c) > n) {
+                return p;
+            }
+            return n;
+        }
+        p = p - 1;
+    }
+    return n;
+}
+
+// 不含 NUL（含 NUL 的路径、名字传给系统接口会被截断，平台层直接按失败处理）。
+export function nulFree(s: string): bool {
+    let i: int = 0;
+    while (i < len(s)) {
+        if ((byteAt(s, i) catch 1) == 0) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// s 的前 n 个字节（n 须落在字符边界上）。
+export function bytePrefix(s: string, n: int): string {
+    return bytesToStr(bytesSlice(bytesFromStr(s), 0, n)) catch "";
+}

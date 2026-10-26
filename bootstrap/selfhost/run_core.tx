@@ -1,0 +1,345 @@
+// CLI 与 MCP 的 run/test 共用核心（第 6 轮 6d-4b；LSP 与 MCP 实施设计 §四-6、四-7）。
+// CLI 继承交互流，MCP 捕获双管道；编译、测试顺序与失败诊断共用，不经第二个编译器进程。
+import { jsonStart } from "./toolchain";
+import { drvNativeRuntime, drvDiagOut, drvBytesOut } from "./driver";
+import { filePath } from "./file_path";
+import { wireText } from "./dbg_wire";
+import { trapArray, plainDiagArray, testEntry, testsDoc } from "./cli_json";
+import { jsonQuote } from "./json_text";
+import { hostTargetId } from "./target_host";
+import { pathIsSep, pathHostJoin } from "./path_sep";
+
+const CAP_LIMIT: int = 1048576;
+const CAP_HEAD: int = 786432;
+const CAP_TAIL: int = 262144;
+
+function octet(b: Bytes, at: int): int { return bytesGet(b, at) catch 0; }
+function strAt(xs: List<string>, at: int): string { return listGet(xs, at) catch ""; }
+
+export function runHostPath(path: string): string {
+    if (hostTarget() == "windows") { return path; }
+    return filePath(path);
+}
+
+export function runScratchExe(kind: string, entry: string): string {
+    const b = bytesFromStr(entry);
+    let at = 0;
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = octet(b, i);
+        if (pathIsSep(c)) { at = i + 1; }
+        i = i + 1;
+    }
+    i = at;
+    while (i < bytesLen(b) && octet(b, i) != 46) { i = i + 1; }
+    if (i == at) { i = bytesLen(b); }
+    const stem = bytesToStr(bytesSlice(b, at, i - at)) catch "";
+    let p = pathHostJoin(tempDir(), "taixu-" + kind + "-" + stem + "-" + toStr(monoNs()));
+    if (hostTarget() == "windows") { p = p + ".exe"; }
+    return p;
+}
+
+export struct RunBuild {
+    ok: bool,
+    diags: string,
+    error: string,
+}
+
+// kernel/prelude 与模式由 CLI 或 MCP 装配；失败不写产物。
+export function runBuildHost(entry: string, requireMain: int, exe: string): Ref<RunBuild> {
+    const r = new RunBuild { ok: false, diags: "", error: "" };
+    const objects: List<string> = listNew();
+    // 产物在宿主上运行：目标即宿主。
+    const code = drvNativeRuntime(entry, requireMain, objects, hostTargetId());
+    if (code != 0) { r.diags = drvDiagOut(); return r; }
+    writeExecutable(filePath(exe), drvBytesOut()) catch (e) {
+        r.error = "taixu: 写出失败 " + exe + ": " + e.message;
+        removeFile(filePath(exe)) catch (ignored) {};
+        return r;
+    };
+    r.ok = true;
+    return r;
+}
+
+export struct RunCap {
+    head: Bytes,
+    tail: Bytes,
+    pending: Bytes,
+    total: int,
+}
+
+export function runCapNew(): Ref<RunCap> {
+    return new RunCap { head: bytesNew(0), tail: bytesNew(0), pending: bytesNew(0), total: 0 };
+}
+
+// 末尾是合法 UTF-8 序列的未完成前缀时暂存（至多三字节）；非法字节由 wireText 处理。
+function readyBytes(b: Bytes): int {
+    const n = bytesLen(b);
+    if (n == 0) { return 0; }
+    let a = n - 1;
+    while (a > 0 && n - a < 4 && (octet(b, a) & 192) == 128) { a = a - 1; }
+    const c = octet(b, a);
+    let need = 0;
+    if (c >= 194 && c <= 223) { need = 2; }
+    else if (c >= 224 && c <= 239) { need = 3; }
+    else if (c >= 240 && c <= 244) { need = 4; }
+    if (need == 0 || n - a >= need) { return n; }
+    let i = a + 1;
+    while (i < n) {
+        const d = octet(b, i);
+        if (d < 128 || d > 191) { return n; }
+        if (i == a + 1 && ((c == 224 && d < 160) || (c == 237 && d > 159) || (c == 240 && d < 144) || (c == 244 && d > 143))) { return n; }
+        i = i + 1;
+    }
+    return a;
+}
+
+function capKeep(s: Ref<RunCap>, b: Bytes): void {
+    const n = bytesLen(b);
+    s.total = s.total + n;
+    let take = CAP_HEAD - bytesLen(s.head);
+    if (take > n) { take = n; }
+    if (take > 0) { bytesAppend(s.head, bytesSlice(b, 0, take)); }
+    if (take < n) { bytesAppend(s.tail, bytesSlice(b, take, n - take)); }
+    const have = bytesLen(s.tail);
+    if (have > CAP_TAIL) { s.tail = bytesSlice(s.tail, have - CAP_TAIL, CAP_TAIL); }
+}
+
+function capAdd(s: Ref<RunCap>, b: Bytes, n: int): void {
+    const joined = s.pending;
+    bytesAppend(joined, bytesSlice(b, 0, n));
+    const ready = readyBytes(joined);
+    capKeep(s, bytesFromStr(wireText(bytesSlice(joined, 0, ready))));
+    s.pending = bytesSlice(joined, ready, bytesLen(joined) - ready);
+}
+
+function capEnd(s: Ref<RunCap>): void {
+    capKeep(s, bytesFromStr(wireText(s.pending)));
+    s.pending = bytesNew(0);
+}
+
+export function runCapAddBytes(s: Ref<RunCap>, b: Bytes, n: int): void { capAdd(s, b, n); }
+
+export function runCapAddText(s: Ref<RunCap>, text: string): void {
+    capEnd(s);
+    capKeep(s, bytesFromStr(text));
+}
+
+export function runCapTruncated(s: Ref<RunCap>): bool { return s.total > CAP_LIMIT; }
+
+export function runCapText(s: Ref<RunCap>): string {
+    capEnd(s);
+    if (s.total <= CAP_LIMIT) {
+        const all = bytesSlice(s.head, 0, bytesLen(s.head));
+        bytesAppend(all, s.tail);
+        return bytesToStr(all) catch "";
+    }
+    const hn = readyBytes(s.head);
+    let a = 0;
+    let mark = "";
+    while (true) {
+        while (a < bytesLen(s.tail) && (octet(s.tail, a) & 192) == 128) { a = a + 1; }
+        const tn = bytesLen(s.tail) - a;
+        mark = "\n…（截去 " + toStr(s.total - hn - tn) + " 字节）…\n";
+        const excess = hn + tn + len(mark) - CAP_LIMIT;
+        if (excess <= 0) { break; }
+        a = a + excess;
+    }
+    return (bytesToStr(bytesSlice(s.head, 0, hn)) catch "") + mark + (bytesToStr(bytesSlice(s.tail, a, bytesLen(s.tail) - a)) catch "");
+}
+
+export struct RunChild {
+    code: int,
+    startError: string,
+    err: string,
+    durationUs: int,
+    timedOut: bool,
+    truncated: bool,
+    started: bool,
+}
+
+function inheritChild(exe: string, args: List<string>, ep: string, r: Ref<RunChild>): int {
+    return runProcess(runHostPath(exe), args, runHostPath(ep)) catch (e) {
+        r.startError = e.message;
+        return -1;
+    };
+}
+
+// deadline 为绝对纳秒；0 不限时。capture 为假时保留 CLI 的 stdin/stdout 与 stderr 装配。
+export function runChild(exe: string, args: List<string>, deadline: int, capture: bool, captureErr: bool, out: Ref<RunCap>): Ref<RunChild> {
+    const r = new RunChild { code: -1, startError: "", err: "", durationUs: 0, timedOut: false, truncated: false, started: false };
+    const start = monoNs();
+    if (deadline > 0 && start >= deadline) { r.timedOut = true; return r; }
+    r.started = true;
+    if (!capture) {
+        let ep = "";
+        if (captureErr) { ep = exe + ".stderr"; }
+        r.code = inheritChild(exe, args, ep, r);
+        r.durationUs = (monoNs() - start) / 1000;
+        if (captureErr) {
+            r.err = readFile(filePath(ep)) catch "";
+            removeFile(filePath(ep)) catch (e) {};
+        }
+        return r;
+    }
+    const h = procSpawn(runHostPath(exe), args, "", 0) catch (e) { r.startError = e.message; return r; };
+    const err = runCapNew();
+    const buf = bytesNew(65536);
+    let outOpen = true;
+    let errOpen = true;
+    let ended = false;
+    let drainUntil = 0;
+    while (true) {
+        const now = monoNs();
+        // 先收退出再判截止：在截止前已退出、只是本轮才看到的进程不算超时。
+        if (!ended) {
+            const w = procWait(h, 0);
+            if (w != None) {
+                r.code = w catch -1;
+                ended = true;
+                if (drainUntil == 0) { drainUntil = now + 2000000000; }
+            }
+        }
+        if (!ended && !r.timedOut && deadline > 0 && now >= deadline) {
+            r.timedOut = true;
+            procKill(h);
+            drainUntil = now + 2000000000;
+        }
+        if ((ended && !outOpen && !errOpen) || (drainUntil > 0 && now >= drainUntil)) { break; }
+        let ms = 50;
+        let until = deadline;
+        if (drainUntil > 0) { until = drainUntil; }
+        if (until > 0 && until - now < 50000000) { ms = (until - now + 999999) / 1000000; }
+        if (ms < 0) { ms = 0; }
+        let mask = 0;
+        if (outOpen) { mask = mask | 2; }
+        if (errOpen) { mask = mask | 4; }
+        if (mask == 0) { const waited = procWait(h, ms); continue; }
+        const ready = ioWait(h, mask, ms);
+        if ((ready & 2) != 0) {
+            const n = procRead(h, 1, buf);
+            if (n < 0) { outOpen = false; } else if (n > 0) { capAdd(out, buf, n); }
+        }
+        if ((ready & 4) != 0) {
+            const n = procRead(h, 2, buf);
+            if (n < 0) { errOpen = false; } else if (n > 0) { capAdd(err, buf, n); }
+        }
+    }
+    procClose(h);
+    if (r.timedOut) { r.code = -1; }
+    capEnd(out);
+    r.err = runCapText(err);
+    r.truncated = runCapTruncated(out) || runCapTruncated(err);
+    r.durationUs = (monoNs() - start) / 1000;
+    return r;
+}
+
+// 与 CLI 同形：保留非 trap 的非空行，trap 转成末尾结构化诊断。
+export function runStderrPlain(text: string): string {
+    let out = "";
+    for (raw in strSplit(text, "\n")) {
+        let line = raw;
+        const b = bytesFromStr(line);
+        if (bytesLen(b) > 0 && octet(b, bytesLen(b) - 1) == 13) { line = bytesToStr(bytesSlice(b, 0, bytesLen(b) - 1)) catch ""; }
+        if (len(line) > 0 && strIndexOf(line, "[runtime:") < 0) { out = out + line + "\n"; }
+    }
+    return out;
+}
+
+export function runStderrJson(text: string): string {
+    let out = runStderrPlain(text);
+    const traps = trapArray(text);
+    if (traps != "[]") { out = out + jsonStart("diag/1") + ",\"diags\":" + traps + "}\n"; }
+    return out;
+}
+
+function pad3(v: int): string {
+    if (v < 10) { return "00" + toStr(v); }
+    if (v < 100) { return "0" + toStr(v); }
+    return toStr(v);
+}
+
+function testFailure(code: int, text: string): string {
+    for (line in strSplit(text, "\n")) {
+        const b = bytesFromStr(line);
+        const prefix = bytesFromStr("[runtime:");
+        let i = 0;
+        while (i + bytesLen(prefix) <= bytesLen(b)) {
+            let k = 0;
+            while (k < bytesLen(prefix) && octet(b, i + k) == octet(prefix, k)) { k = k + 1; }
+            if (k == bytesLen(prefix)) {
+                const start = i + k;
+                let close = start;
+                while (close < bytesLen(b) && octet(b, close) != 93) { close = close + 1; }
+                if (close < bytesLen(b)) {
+                    let msg = close + 1;
+                    if (octet(b, msg) == 32) { msg = msg + 1; }
+                    let end = bytesLen(b);
+                    if (end > msg && octet(b, end - 1) == 13) { end = end - 1; }
+                    return (bytesToStr(bytesSlice(b, start, close - start)) catch "") + ": " + (bytesToStr(bytesSlice(b, msg, end - msg)) catch "");
+                }
+            }
+            i = i + 1;
+        }
+    }
+    if (code == -1) { return "runtime_error: 无法启动测试进程"; }
+    return "runtime_error: 退出码 " + toStr(code);
+}
+
+export struct RunTests {
+    lines: List<string>,
+    entries: List<string>,
+    passed: int,
+    failed: int,
+    timedOut: bool,
+    timeoutTest: string,
+    startError: string,
+    stdout: string,
+    stderr: string,
+    truncated: bool,
+}
+
+export function runTests(exe: string, names: List<string>, deadline: int, capture: bool): Ref<RunTests> {
+    const r = new RunTests { lines: listNew(), entries: listNew(), passed: 0, failed: 0, timedOut: false, timeoutTest: "", startError: "", stdout: "", stderr: "", truncated: false };
+    const out = runCapNew();
+    const err = runCapNew();
+    let t = 0;
+    while (t < listLen(names)) {
+        const name = strAt(names, t);
+        const av: List<string> = listNew();
+        listPush(av, toStr(t));
+        const c = runChild(exe, av, deadline, capture, true, out);
+        // 截止在两个 test 之间到达：余下的都没跑，不记项、不计入 summary，也没有“超时的 test”。
+        if (!c.started && c.timedOut) { r.timedOut = true; break; }
+        if (c.code == 0) {
+            r.passed = r.passed + 1;
+            listPush(r.lines, "✓ test " + jsonQuote(name) + " (" + toStr(c.durationUs / 1000) + "." + pad3(c.durationUs % 1000) + "ms)");
+            listPush(r.entries, testEntry(name, true, c.durationUs, "[]"));
+        } else {
+            r.failed = r.failed + 1;
+            let why = testFailure(c.code, c.err);
+            if (c.timedOut) { why = "runtime_error: 测试超时"; }
+            listPush(r.lines, "✗ test " + jsonQuote(name) + " — " + why);
+            let diags = trapArray(c.err);
+            if (diags == "[]") { diags = plainDiagArray(0, why); }
+            listPush(r.entries, testEntry(name, false, c.durationUs, diags));
+        }
+        const plain = runStderrPlain(c.err);
+        if (capture) { runCapAddText(err, plain); }
+        else if (len(plain) > 0) {
+            const b = bytesFromStr(plain);
+            eprint(bytesToStr(bytesSlice(b, 0, bytesLen(b) - 1)) catch "");
+        }
+        r.truncated = r.truncated || c.truncated;
+        if (c.timedOut) { r.timedOut = true; r.timeoutTest = name; break; }
+        if (len(c.startError) > 0) { r.startError = c.startError; if (capture) { break; } }
+        t = t + 1;
+    }
+    if (capture) {
+        runCapAddText(out, testsDoc(r.entries, r.passed, r.failed) + "\n");
+        r.stdout = runCapText(out);
+        r.stderr = runCapText(err);
+        r.truncated = r.truncated || runCapTruncated(out) || runCapTruncated(err);
+    }
+    return r;
+}

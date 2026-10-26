@@ -1,0 +1,367 @@
+// rtfn 的寄存器分配（docs/design/v052-rtfn-regalloc-v0.1-20261024.md §八）：rtEnd 发射之前，对记录下的接口调用求活跃性，把未取址的
+// 局部分到池中的易失寄存器（x86 r8 r9 r10；A64 x0..x8、x13 x14 x15），结果写进 f.homes（每个局部一项，−1 为栈槽）；跨调用
+// 仍活的，在该调用两侧存取自己的槽（RtCall.saves）。写池中寄存器的降低（写入表，设计 §八-2）：x86 调用的实参与间接目标 r10、
+// C 调用、系统调用、双返回值与比较交换（先写 r8）；A64 调用与 C 调用的实参（x0 起）、返回值；其余只写临时寄存器（x86 rax rcx rdx r11，
+// A64 x9..x12 x16 x17 与浮点）。按 E（读完操作数前写的）与 C（调用本身破坏的）记在 earlyOf／lateOf；漏项时 rtfnGuardWrite 报 RegAllocClobber。
+import { RtOp, RtFn, RtCall, OP_LOCAL, rtfnFail, rtfnCall } from "./rtfn_base";
+import { K_LOAD_REG, K_STORE_REG, K_SET, K_OP, K_SHIFT, K_DIVMOD, K_LOAD, K_ADDR_OF, K_LABEL, K_JUMP, K_IF, K_IF32 } from "./rtfn_base";
+import { K_CALL, K_CALL_C, K_F64_TO_F32, K_F32_TO_F64, K_SYSCALL, K_FOP, K_FIF, K_INT_TO_F64, K_LOAD_ACQ } from "./rtfn_base";
+import { K_ATOMIC_ADD, K_ATOMIC_CAS, K_ATOMIC_XCHG, K_RET, K_RET2, K_RET_VOID, K_TRAP } from "./rtfn_base";
+
+// ---------------------------------------------------------------- 位集（每个局部一位，64 位一字）
+
+function bsNew(words: int): List<int> { const s: List<int> = listNew(); let k = 0; while (k < words) { listPush(s, 0); k = k + 1; } return s; }
+function bsHas(s: List<int>, i: int): bool { return (((listGet(s, i / 64) catch 0) >>> (i % 64)) & 1) == 1; }
+function bsAdd(s: List<int>, i: int): void { listSet(s, i / 64, (listGet(s, i / 64) catch 0) | (1 << (i % 64))); }
+function bsDel(s: List<int>, i: int): void { listSet(s, i / 64, (listGet(s, i / 64) catch 0) & (-1 - (1 << (i % 64)))); }
+function bsCopy(s: List<int>): List<int> { const t: List<int> = listNew(); for (w in s) { listPush(t, w); } return t; }
+function bsOr(s: List<int>, t: List<int>): void {
+    let k = 0;
+    while (k < listLen(s)) { listSet(s, k, (listGet(s, k) catch 0) | (listGet(t, k) catch 0)); k = k + 1; }
+}
+function bsEqual(s: List<int>, t: List<int>): bool {
+    let k = 0;
+    while (k < listLen(s)) { if ((listGet(s, k) catch 0) != (listGet(t, k) catch 0)) { return false; } k = k + 1; }
+    return true;
+}
+
+// 冲突关系：n×n 位矩阵平铺，局部 a 的一行从 a*words 起。
+function clashAdd(m: List<int>, words: int, a: int, b: int): void {
+    const at = a * words + b / 64;
+    listSet(m, at, (listGet(m, at) catch 0) | (1 << (b % 64)));
+}
+function clashHas(m: List<int>, words: int, a: int, b: int): bool { return (((listGet(m, a * words + b / 64) catch 0) >>> (b % 64)) & 1) == 1; }
+
+// ---------------------------------------------------------------- 定义与使用
+
+function localIndex(f: Ref<RtFn>, name: string): int {
+    let k = 0;
+    while (k < listLen(f.locals)) { if ((listGet(f.locals, k) catch "") == name) { return k; } k = k + 1; }
+    return -1;
+}
+function useOp(f: Ref<RtFn>, out: List<int>, x: Ref<RtOp>): void {
+    if (x.kind == OP_LOCAL) { const i = localIndex(f, x.name); if (i >= 0) { listPush(out, i); } }
+}
+function useName(f: Ref<RtFn>, out: List<int>, name: string): void {
+    if (len(name) > 0) { const i = localIndex(f, name); if (i >= 0) { listPush(out, i); } }
+}
+function indirect(target: string): bool { return len(target) > 1 && (byteAt(target, 0) catch 0) == 42; }
+
+/// 记录 c 读的局部（下标）。
+function usesOf(f: Ref<RtFn>, c: Ref<RtCall>): List<int> {
+    const out: List<int> = listNew();
+    const k = c.k;
+    if (k == K_CALL) {
+        for (x in c.args) { useOp(f, out, x); }
+        if (indirect(c.s2)) { useName(f, out, strSub(c.s2, 1, len(c.s2) - 1)); }
+        return out;
+    }
+    if (k == K_CALL_C) { for (x in c.args) { useOp(f, out, x); } useName(f, out, c.s3); return out; }
+    if (k == K_SYSCALL) { for (x in c.args) { useOp(f, out, x); } return out; }
+    // 其余接口的操作数都在 o1..o3（未用的是立即数）。
+    useOp(f, out, c.o1); useOp(f, out, c.o2); useOp(f, out, c.o3);
+    return out;
+}
+
+/// 记录 c 写的局部（下标）。
+function defsOf(f: Ref<RtFn>, c: Ref<RtCall>): List<int> {
+    const out: List<int> = listNew();
+    const k = c.k;
+    if (k == K_STORE_REG || k == K_SET || k == K_OP || k == K_SHIFT || k == K_LOAD || k == K_CALL || k == K_SYSCALL
+        || k == K_F64_TO_F32 || k == K_F32_TO_F64 || k == K_FOP || k == K_INT_TO_F64 || k == K_LOAD_ACQ
+        || k == K_ATOMIC_ADD || k == K_ATOMIC_CAS || k == K_ATOMIC_XCHG) { useName(f, out, c.s1); }
+    if (k == K_DIVMOD || k == K_CALL_C) { useName(f, out, c.s1); useName(f, out, c.s2); }
+    return out;
+}
+
+// ---------------------------------------------------------------- 控制流
+
+function labelAt(f: Ref<RtFn>, label: string): int {
+    let i = 0;
+    while (i < listLen(f.calls)) {
+        const c = listGet(f.calls, i) catch rtfnCall(-1);
+        if (c.k == K_LABEL && c.s1 == label) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// 记录 i 的后继（下标）。
+function succsOf(f: Ref<RtFn>, i: int): List<int> {
+    const out: List<int> = listNew();
+    const c = listGet(f.calls, i) catch rtfnCall(-1);
+    const k = c.k;
+    if (k == K_RET || k == K_RET2 || k == K_RET_VOID || k == K_TRAP) { return out; }
+    if (k == K_JUMP) { const t = labelAt(f, c.s1); if (t >= 0) { listPush(out, t); } return out; }
+    if (k == K_IF || k == K_IF32 || k == K_FIF) { const t = labelAt(f, c.s2); if (t >= 0) { listPush(out, t); } }
+    if (i + 1 < listLen(f.calls)) { listPush(out, i + 1); }
+    return out;
+}
+
+// ---------------------------------------------------------------- 写池中寄存器的两组（位掩码）
+
+const X86_POOL_MASK: int = 1792; // r8 r9 r10
+const A64_POOL_MASK: int = 57855; // x0..x8 x13 x14 x15
+function poolMask(f: Ref<RtFn>): int { if (f.a64) { return A64_POOL_MASK; } return X86_POOL_MASK; }
+
+/// E(c)：降低在读完操作数之前写的池中寄存器。
+function earlyOf(f: Ref<RtFn>, c: Ref<RtCall>): int {
+    const k = c.k;
+    if (f.a64) {
+        // 调用：栈上实参经 x9，间接目标进 x16，再依次写 x0..x7；C 调用的整数实参从严按 x0..x7 全写；双返回值先写 x1 再写 x0
+        // （单返回值只一条 mov 后即返回，不算）；A64 没有裸系统调用，从严按池全写。
+        if (k == K_CALL) { let n = listLen(c.args); if (n > 8) { n = 8; } return (1 << n) - 1; }
+        if (k == K_CALL_C) { return 255; }
+        if (k == K_RET2) { return 3; }
+        if (k == K_SYSCALL) { return A64_POOL_MASK; }
+        return 0;
+    }
+    // 双返回值先写 r8；比较交换先把 desired 放进 r8 再取 expect。
+    if (k == K_RET2 || k == K_ATOMIC_CAS) { return 1 << 8; }
+    if (k == K_CALL) {
+        // 间接目标先进 r10，实参再依次进 rcx rdx r8 r9。
+        let m = 0;
+        if (listLen(c.args) >= 3) { m = m | (1 << 8); }
+        if (listLen(c.args) >= 4) { m = m | (1 << 9); }
+        if (indirect(c.s2)) { m = m | (1 << 10); }
+        return m;
+    }
+    // C 调用（实参寄存器与函数指针 r10）、系统调用（rdi rsi rdx r10 r8 r9）：从严按池全写。
+    if (k == K_CALL_C || k == K_SYSCALL) { return X86_POOL_MASK; }
+    return 0;
+}
+
+/// C(c)：c 本身破坏的池中寄存器（调用破坏全部易失；x86 的 syscall 指令只破坏 rcx r11 与 rax，不在池中）。
+function lateOf(f: Ref<RtFn>, c: Ref<RtCall>): int {
+    const k = c.k;
+    if (k == K_CALL || k == K_CALL_C || (f.a64 && k == K_SYSCALL)) { return poolMask(f); }
+    return 0;
+}
+
+// rtLoadReg／rtStoreReg 点名的寄存器若在池中，其位（A64 经 x86 号 9..11 → x13..x15 的映射）。
+function namedMask(f: Ref<RtFn>, r: int): int {
+    if (!f.a64) { if (r >= 8 && r <= 10) { return 1 << r; } return 0; }
+    if (r >= 9 && r <= 11) { return 1 << (r + 4); }
+    return 0;
+}
+
+// ---------------------------------------------------------------- 分配
+
+struct Rec {
+    defs: List<int>,
+    uses: List<int>,
+    succs: List<int>,
+    live: List<int>,
+    out: List<int>,
+}
+function emptyRec(words: int): Ref<Rec> {
+    return new Rec { defs: listNew(), uses: listNew(), succs: listNew(), live: bsNew(words), out: bsNew(words) };
+}
+
+/// 为 f 的局部选家，写进 f.homes（每个局部一项：寄存器号，−1 为栈槽）。函数里有取址的整个不分配。
+export function rtfnAllocate(f: Ref<RtFn>): void {
+    const n = listLen(f.locals);
+    const homes: List<int> = listNew();
+    let k = 0;
+    while (k < n) { listPush(homes, -1); k = k + 1; }
+    f.homes = homes;
+    const m = listLen(f.calls);
+    if (m == 0 || n == 0) { return; }
+    const words = (n + 63) / 64;
+    const recs: List<Ref<Rec>> = listNew();
+    let banned = 0;
+    let i = 0;
+    while (i < m) {
+        const c = listGet(f.calls, i) catch rtfnCall(-1);
+        if (c.k == K_ADDR_OF) { return; }
+        if (c.k == K_LOAD_REG || c.k == K_STORE_REG) { banned = banned | namedMask(f, c.n1); }
+        listPush(recs, new Rec { defs: defsOf(f, c), uses: usesOf(f, c), succs: succsOf(f, i), live: bsNew(words), out: bsNew(words) });
+        i = i + 1;
+    }
+    // 活跃性：后向迭代到不动点。
+    let changed = true;
+    while (changed) {
+        changed = false;
+        i = m - 1;
+        while (i >= 0) {
+            const r = listGet(recs, i) catch emptyRec(words);
+            const out = bsNew(words);
+            for (s in r.succs) { bsOr(out, (listGet(recs, s) catch emptyRec(words)).live); }
+            const live = bsCopy(out);
+            for (d in r.defs) { bsDel(live, d); }
+            for (u in r.uses) { bsAdd(live, u); }
+            if (!bsEqual(live, r.live) || !bsEqual(out, r.out)) { r.live = live; r.out = out; changed = true; }
+            i = i - 1;
+        }
+    }
+    // 每个局部不可用的寄存器（forbid）、局部间的冲突（clash）、有读的局部（used）。
+    const forbid: List<int> = listNew();
+    const count: List<int> = listNew();
+    k = 0;
+    while (k < n) { listPush(forbid, banned); listPush(count, 0); k = k + 1; }
+    const clash = bsNew(n * words);
+    const used = bsNew(words);
+    i = 0;
+    while (i < m) {
+        const c = listGet(f.calls, i) catch rtfnCall(-1);
+        const r = listGet(recs, i) catch emptyRec(words);
+        const early = earlyOf(f, c);
+        // 本条读的局部不能在 E 里（读之前已被改写）；只是经过的局部由 saves 在两侧存取，不受限。
+        for (u in r.uses) { bsAdd(used, u); listSet(forbid, u, (listGet(forbid, u) catch 0) | early); listSet(count, u, (listGet(count, u) catch 0) + 1); }
+        for (d in r.defs) { listSet(count, d, (listGet(count, d) catch 0) + 1); }
+        for (d in r.defs) {
+            k = 0;
+            while (k < n) {
+                if (k != d && bsHas(r.out, k)) { clashAdd(clash, words, d, k); clashAdd(clash, words, k, d); }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    // 入口：参数与入口处已活跃的局部同时“定义”，两两冲突。
+    const entry = bsCopy((listGet(recs, 0) catch emptyRec(words)).live);
+    k = 0;
+    while (k < f.nparams) { bsAdd(entry, k); k = k + 1; }
+    let a = 0;
+    while (a < n) {
+        if (bsHas(entry, a)) {
+            let b = 0;
+            while (b < n) { if (b != a && bsHas(entry, b)) { clashAdd(clash, words, a, b); } b = b + 1; }
+        }
+        a = a + 1;
+    }
+    // 着色：出现次数多的先挑（同数按局部次序），取池中第一个可用的寄存器。
+    const pool = poolMask(f);
+    const done = bsNew(words);
+    let round = 0;
+    while (round < n) {
+        k = -1;
+        let q = 0;
+        while (q < n) {
+            if (!bsHas(done, q) && (k < 0 || (listGet(count, q) catch 0) > (listGet(count, k) catch 0))) { k = q; }
+            q = q + 1;
+        }
+        bsAdd(done, k);
+        round = round + 1;
+        if (bsHas(used, k)) {
+            const no = listGet(forbid, k) catch -1;
+            // 先试参数自己的入参寄存器（序言免搬），再按号试。
+            const pref = argReg(f, k);
+            let t = -1;
+            while (t < 32 && (listGet(homes, k) catch 0) < 0) {
+                let r = t;
+                if (t < 0) { r = pref; }
+                if (r >= 0 && ((pool >>> r) & 1) == 1 && ((no >>> r) & 1) == 0) {
+                    let taken = false;
+                    let j = 0;
+                    while (j < n) { if ((listGet(homes, j) catch -1) == r && clashHas(clash, words, k, j)) { taken = true; } j = j + 1; }
+                    if (!taken) { listSet(homes, k, r); }
+                }
+                t = t + 1;
+            }
+        }
+    }
+    // 跨本条仍活、家会被本条改写的寄存器局部：本条两侧存取自己的槽。
+    i = 0;
+    while (i < m) {
+        const c = listGet(f.calls, i) catch rtfnCall(-1);
+        const r = listGet(recs, i) catch emptyRec(words);
+        const hit = earlyOf(f, c) | lateOf(f, c);
+        if (hit != 0) {
+            k = 0;
+            while (k < n) {
+                const h = listGet(homes, k) catch -1;
+                if (h >= 0 && ((hit >>> h) & 1) == 1 && bsHas(r.live, k) && bsHas(r.out, k) && !intIn(r.defs, k)) { listPush(c.saves, k); }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    // 发射期自查用：每条前后仍活、非本条定义、未存槽的寄存器局部的家。
+    i = 0;
+    while (i < m) {
+        const c = listGet(f.calls, i) catch rtfnCall(-1);
+        const r = listGet(recs, i) catch emptyRec(words);
+        let keep = 0;
+        k = 0;
+        while (k < n) {
+            const h = listGet(homes, k) catch -1;
+            if (h >= 0 && (bsHas(r.live, k) || bsHas(r.out, k)) && !intIn(r.defs, k) && !intIn(c.saves, k)) { keep = keep | (1 << h); }
+            k = k + 1;
+        }
+        c.keep = keep;
+        i = i + 1;
+    }
+    // 自查：入口与每条记录前后，同一寄存器上的局部不同时活跃。
+    selfCheck(f, entry, homes, n);
+    for (r in recs) { selfCheck(f, r.live, homes, n); selfCheck(f, r.out, homes, n); }
+}
+
+// 第 k 个参数的入参寄存器（A64 x0..x7；x86 rcx rdx r8 r9）；不是参数或在栈上为 −1。
+function argReg(f: Ref<RtFn>, k: int): int {
+    if (k >= f.nparams) { return -1; }
+    if (f.a64) { if (k < 8) { return k; } return -1; }
+    if (k == 0) { return 1; }
+    if (k == 1) { return 2; }
+    if (k == 2) { return 8; }
+    if (k == 3) { return 9; }
+    return -1;
+}
+
+function intIn(xs: List<int>, x: int): bool { for (y in xs) { if (y == x) { return true; } } return false; }
+
+function selfCheck(f: Ref<RtFn>, s: List<int>, homes: List<int>, n: int): void {
+    let seen = 0;
+    let k = 0;
+    while (k < n) {
+        const r = listGet(homes, k) catch -1;
+        if (r >= 0 && bsHas(s, k)) {
+            if (((seen >>> r) & 1) == 1) { rtfnFail(f, "RegAllocConflict"); return; }
+            seen = seen | (1 << r);
+        }
+        k = k + 1;
+    }
+}
+
+// ---------------------------------------------------------------- 并行赋值
+
+/// dsts[k] ← srcs[k]（寄存器号；dsts 互不相同）的一个串行次序，平铺为（目标, 来源）对；成环时先把环上一个目标的旧值存进 temp。
+export function rtfnParallelMoves(dsts: List<int>, srcs: List<int>, temp: int): List<int> {
+    let pd: List<int> = listNew();
+    let ps: List<int> = listNew();
+    let k = 0;
+    while (k < listLen(dsts)) {
+        const d = listGet(dsts, k) catch -1;
+        const s = listGet(srcs, k) catch -1;
+        if (d != s) { listPush(pd, d); listPush(ps, s); }
+        k = k + 1;
+    }
+    const out: List<int> = listNew();
+    while (listLen(pd) > 0) {
+        let pick = -1;
+        k = 0;
+        while (k < listLen(pd) && pick < 0) {
+            const d = listGet(pd, k) catch -1;
+            let blocked = false;
+            let j = 0;
+            while (j < listLen(ps)) { if (j != k && (listGet(ps, j) catch -1) == d) { blocked = true; } j = j + 1; }
+            if (!blocked) { pick = k; }
+            k = k + 1;
+        }
+        if (pick < 0) {
+            // 余下的都在环上：先把第一个目标的旧值存进 temp，读它的改读 temp。
+            const d0 = listGet(pd, 0) catch -1;
+            listPush(out, temp); listPush(out, d0);
+            k = 0;
+            while (k < listLen(ps)) { if ((listGet(ps, k) catch -1) == d0) { listSet(ps, k, temp); } k = k + 1; }
+            pick = 0;
+        }
+        listPush(out, listGet(pd, pick) catch -1); listPush(out, listGet(ps, pick) catch -1);
+        const nd: List<int> = listNew();
+        const ns: List<int> = listNew();
+        k = 0;
+        while (k < listLen(pd)) { if (k != pick) { listPush(nd, listGet(pd, k) catch -1); listPush(ns, listGet(ps, k) catch -1); } k = k + 1; }
+        pd = nd; ps = ns;
+    }
+    return out;
+}

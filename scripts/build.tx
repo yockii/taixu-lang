@@ -1,0 +1,574 @@
+// 自举构建驱动（docs/design/v052-build-driver-v0.1-20261025.md）：只凭源码与一个原生 taixu 重建出 C=D 不动点，不经 Python。
+// 用法（在仓库根运行）：taixu run --toolchain scripts/build.tx [--compiler <原生 taixu>] [--work <目录>] [--out <目录>]
+//   [--sync-docs] [--keep-runs N] [--start-stage K] [--link-object <内核对象>] [--root <仓库根>]
+// 流程同 build.py 的原生路径与 nrt-bootstrap.py：编不了的固定阶段逐个补上，用（最后一个阶段的）编译器编内核生成器并生成
+// 各目标内核，编 B（嵌入新内核）、B → C → D，C 须等于 D；D 再编一次内核生成器，生成的内核须与嵌入的相同；D 原子地放到
+// --out 并写 build.json（字段同 build.py，gate.tx 读其中的 work 找 B）。Zig 时代的历史重放（--seed／--zig）仍在 build.py。
+import { sha256Hex } from "../bootstrap/selfhost/sha256";
+import { JsonValue, JSON_NULL, JSON_STR, jsonNew, jsonParseStr, jsonGet } from "../bootstrap/selfhost/json_parse";
+import { jsonQuote } from "../bootstrap/selfhost/json_text";
+import { osRealPath, osRename } from "./build_os";
+import { absolute, byteSub, copyFile, exeName, findInPath, finishRunDir, freshRunDir, join, kindOf, list1, mkdirs, nothing, parseDigits,
+    plus, readBytes, removeTree, runIn, shaOf, startsWith, step, trimLine, untar, words } from "./build_lib";
+
+const KERNEL_FLAGS: string = "--with-move --with-alloc --with-rc --with-str --with-strb --with-zero --with-list --with-file --with-argv --with-store-slots --with-nrt";
+// 目标与内核对象名（taixu.tx 以 nrt-kernel/<名> 嵌入；较早的固定阶段没有 macOS 的两个，也没有 -heapcheck 的四个）。
+// 名字带 -heapcheck 的是 --heap-check 用的检测内核（页堆＋对象号隔离，设计 v052-heap-check-tool），生成时加 --generic=heapcheck。
+const KERNEL_TARGETS: string = "x86_64-windows x86_64-linux x86_64-macos aarch64-macos x86_64-windows x86_64-linux x86_64-macos aarch64-macos";
+const KERNEL_NAMES: string = "kernel.obj kernel-linux.o kernel-macos.o kernel-macos-aarch64.o kernel-heapcheck.obj kernel-linux-heapcheck.o kernel-macos-heapcheck.o kernel-macos-aarch64-heapcheck.o";
+
+struct Opts {
+    root: string,
+    compiler: string,
+    work: string,
+    out: string,
+    link: string,
+    syncDocs: bool,
+    keepRuns: int,
+    startStage: int,
+}
+
+// ---- 固定阶段 ----
+
+// 每个固定阶段引入的、此后编译器源码要用的东西（--toolchain 编译）。编译器编得了第 k 个探针，就不必从第 k 阶段起补。
+function stageProbe(k: int): string {
+    const m = "export function main(args: []string): int ";
+    if (k == 1) { return m + "{ print(hostTarget() + toStr(monoNs())); return 0; }\n"; }
+    if (k == 2) { return m + "{ const b = bytesNew(1); return stdinRead(b, 0); }\n"; }
+    if (k == 3) { return m + "{ print(currentDir() catch \"\"); return 0; }\n"; }
+    if (k == 4) { return m + "{ return fileSize(\"x\") catch 0; }\n"; }
+    if (k == 5) { return m + "{\n    const n = localFileSize(\".\", \"x\") catch 0;\n    return procTryWrite(0, 0, bytesNew(0)) + n;\n}\n"; }
+    if (k == 6) { return m + "{\n    return listLen(localListDir(\".\", \"\") catch (e) { return 0; });\n}\n"; }
+    // 7 引入的是语法：外部函数签名里的 string 与 C 变参参数（只声明不调用，不检查目标、不链接）。
+    if (k == 7) {
+        return "declare function snprintf(buf: Bytes, size: usize, format: string, ...value: int): i32 from \"libc.so.6\";\n" + m + "{ return 0; }\n";
+    }
+    return "";
+}
+
+function pinnedStages(root: string): List<string> {
+    const out: List<string> = listNew();
+    let k: int = 1;
+    while (kindOf(join(root, "bootstrap/STAGE" + toStr(k))) == 1) {
+        const text = readFile(join(root, "bootstrap/STAGE" + toStr(k))) catch "";
+        listPush(out, trimLine(text));
+        k = k + 1;
+    }
+    return out;
+}
+
+function firstNeededStage(compiler: string, link: List<string>, tflag: List<string>, work: string, stages: List<string>): int | Error {
+    let k: int = listLen(stages);
+    while (k >= 1) {
+        const probe = stageProbe(k);
+        if (len(probe) == 0) {
+            return err("bootstrap/STAGE" + toStr(k) + " 没有特征探针（scripts/build.tx 的 stageProbe）");
+        }
+        const dir = join(work, "probe-" + toStr(k));
+        makeDir(dir) catch (e) {
+            return err("建不了探针目录：" + dir);
+        };
+        writeFile(join(dir, "probe.tx"), probe) catch (e) {
+            return err("写不了探针：" + dir);
+        };
+        const args = plus(plus(plus(list1("build"), list1("probe.tx")), plus(list1("--toolchain"), tflag)), plus(link, plus(list1("--out"), list1(join(dir, "out")))));
+        const r = runIn(compiler, args, dir, false, false) catch (e) {
+            return e;
+        };
+        removeTree(dir);
+        if (r.code == 0) {
+            return k + 1;
+        }
+        k = k - 1;
+    }
+    return 1;
+}
+
+// 取出提交的 bootstrap/（及 prelude/，若有）到 dest（git archive 成 tar 再在这里解开，不检出、不动索引）。
+function extractStage(git: string, root: string, commit: string, dest: string, work: string): void | Error {
+    const errFile = join(work, "git-stderr.txt");
+    const paths: List<string> = listNew();
+    listPush(paths, "bootstrap");
+    const probe = plus(plus(list1("-C"), list1(root)), plus(list1("cat-file"), plus(list1("-e"), list1(commit + ":prelude"))));
+    if ((runProcess(git, probe, errFile) catch -1) == 0) {
+        listPush(paths, "prelude");
+    }
+    const tar = join(work, "stage.tar");
+    const args = plus(plus(list1("-C"), list1(root)), plus(plus(list1("archive"), list1("--format=tar")), plus(plus(list1("-o"), list1(tar)), plus(list1(commit), paths))));
+    if ((runProcess(git, args, errFile) catch -1) != 0) {
+        return err("git archive 失败：" + commit + "（" + trimLine(readFile(errFile) catch "") + "）");
+    }
+    const t = readBytes(tar) catch (e) {
+        return e;
+    };
+    if (!mkdirs(dest)) {
+        return err("建不了：" + dest);
+    }
+    untar(t, dest) catch (e) {
+        return e;
+    };
+    removeFile(tar) catch (e) {};
+    return nothing();
+}
+
+// ---- 内核 ----
+
+// 源码树嵌入的内核（目标、对象名）：taixu.tx 里出现 nrt-kernel/<名> 的那些。
+function kernelsOf(tree: string): List<string> {
+    const text = readFile(join(tree, "bootstrap/taixu.tx")) catch "";
+    const targets = words(KERNEL_TARGETS);
+    const names = words(KERNEL_NAMES);
+    const out: List<string> = listNew();
+    let i: int = 0;
+    while (i < listLen(names)) {
+        const name = listGet(names, i) catch "";
+        if (strIndexOf(text, "nrt-kernel/" + name) >= 0) {
+            listPush(out, listGet(targets, i) catch "");
+            listPush(out, name);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// 生成 kernels（目标、名交替）到 outDir，得各对象的 sha256（名、值交替）。
+function generateKernels(generator: string, outDir: string, kernels: List<string>, root: string): List<string> | Error {
+    if (!mkdirs(outDir)) {
+        return err("建不了：" + outDir);
+    }
+    const sums: List<string> = listNew();
+    let i: int = 0;
+    while (i + 1 < listLen(kernels)) {
+        const target = listGet(kernels, i) catch "";
+        const name = listGet(kernels, i + 1) catch "";
+        let args = plus(plus(list1("--target"), list1(target)), plus(list1(join(outDir, name)), words(KERNEL_FLAGS)));
+        if (strIndexOf(name, "-heapcheck") >= 0) {
+            args = plus(args, list1("--generic=heapcheck"));
+        }
+        step(generator, args, root) catch (e) {
+            return e;
+        };
+        listPush(sums, name);
+        listPush(sums, shaOf(join(outDir, name)));
+        i = i + 2;
+    }
+    return sums;
+}
+
+function sameList(a: List<string>, b: List<string>): bool {
+    if (listLen(a) != listLen(b)) {
+        return false;
+    }
+    let i: int = 0;
+    while (i < listLen(a)) {
+        if ((listGet(a, i) catch "a") != (listGet(b, i) catch "b")) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---- 派生文档（同 sync_toolchain_docs.py：内容只由太虚渲染）----
+
+function sourceVersion(root: string): string | Error {
+    const text = readFile(join(root, "bootstrap/selfhost/toolchain.tx")) catch (e) {
+        return e;
+    };
+    const key = "export const TOOLCHAIN_VERSION: string = \"";
+    let found = "";
+    let count: int = 0;
+    for (line in strSplit(text, "\n")) {
+        const l = trimLine(line);
+        if (startsWith(l, key) && (byteAt(l, len(l) - 1) ?? 0) == 59 && (byteAt(l, len(l) - 2) ?? 0) == 34) {
+            found = byteSub(l, len(key), len(l) - len(key) - 2);
+            count = count + 1;
+        }
+    }
+    if (count != 1 || len(found) == 0) {
+        return err("toolchain.tx 必须只有一个字面量 TOOLCHAIN_VERSION 定义");
+    }
+    return found;
+}
+
+// 对象的成员（缺席或不是对象时得 None）与字符串值（缺席或不是字符串时得 ""）。
+function field(v: Ref<JsonValue>?, key: string): Ref<JsonValue>? {
+    return jsonGet(v ?? jsonNew(JSON_NULL), key);
+}
+
+function text(v: Ref<JsonValue>?): string {
+    const x = v ?? jsonNew(JSON_NULL);
+    if (x.kind != JSON_STR) {
+        return "";
+    }
+    return x.s;
+}
+
+function capture(compiler: string, args: List<string>, root: string): string | Error {
+    const r = runIn(compiler, args, root, true, false) catch (e) {
+        return e;
+    };
+    if (r.code != 0) {
+        return err("退出码 " + toStr(r.code) + "：" + compiler + " " + (listGet(args, 0) catch ""));
+    }
+    return bytesToStr(r.out) catch (e) {
+        return err("输出不是合法的 UTF-8：" + compiler);
+    };
+}
+
+function lfOnly(s: string): string {
+    const b = bytesFromStr(s);
+    const out = bytesNew(0);
+    let i: int = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) ?? 0;
+        if (c != 13 || (bytesGet(b, i + 1) ?? 0) != 10) {
+            bytesPush(out, c);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(out) catch s;
+}
+
+// 写入得 true，已一致得 false。
+function syncDocs(compiler: string, root: string): bool | Error {
+    const version = sourceVersion(root) catch (e) {
+        return e;
+    };
+    const capText = capture(compiler, plus(list1("capabilities"), list1("--format=json")), root) catch (e) {
+        return e;
+    };
+    const cap = jsonParseStr(capText) catch (e) {
+        return err("capabilities 不是 JSON");
+    };
+    const data = field(cap, "capabilities");
+    const registry = text(field(field(data, "change_registry"), "sha256"));
+    const changes = readBytes(join(root, "bootstrap/changes.tx")) catch (e) {
+        return e;
+    };
+    if (text(field(cap, "schema")) != "capabilities/1" || text(field(data, "compiler")) != "native-tx"
+        || text(field(data, "toolchain_version")) != version) {
+        return err("所选编译器与当前源码产品版本不一致；请先构建当前源码");
+    }
+    if (registry != sha256Hex(changes)) {
+        return err("所选编译器内嵌变更注册表与当前源码不一致；请先重新构建");
+    }
+    const listText = capture(compiler, plus(list1("changes"), list1("--format=json")), root) catch (e) {
+        return e;
+    };
+    const listed = jsonParseStr(listText) catch (e) {
+        return err("changes --format=json 不是 JSON");
+    };
+    if (text(field(listed, "schema")) != "changes/1" || text(field(listed, "toolchain_version")) != version) {
+        return err("编译器 changes 与 capabilities 的产品版本不一致");
+    }
+    const rendered = capture(compiler, list1("changes"), root) catch (e) {
+        return e;
+    };
+    let doc = lfOnly(rendered);
+    if (strIndexOf(doc, "\r") >= 0 || !startsWith(doc, "# 太虚工具链兼容变更\n")) {
+        return err("changes 文档格式无效");
+    }
+    doc = trimLine(doc) + "\n";
+    const path = join(root, "docs/ai/toolchain-changes.md");
+    const current = readFile(path) catch "";
+    if (current == doc) {
+        return false;
+    }
+    writeFile(path, doc) catch (e) {
+        return e;
+    };
+    return true;
+}
+
+// ---- 主流程 ----
+
+function usage(msg: string): int {
+    eprint("scripts/build.tx：" + msg);
+    eprint("用法：taixu run --toolchain scripts/build.tx [--compiler <原生 taixu>] [--work <目录>] [--out <目录>] [--sync-docs] [--keep-runs N] [--start-stage K] [--link-object <内核对象>] [--root <仓库根>]");
+    return 2;
+}
+
+function parseOpts(args: []string): Ref<Opts> | Error {
+    const o = new Opts { root: "", compiler: getEnv("TAIXU_NATIVE") ?? "", work: "", out: "", link: "", syncDocs: false, keepRuns: 3, startStage: 0 };
+    let i: int = 0;
+    while (i < len(args)) {
+        const a = args[i];
+        if (a == "--sync-docs") {
+            o.syncDocs = true;
+            i = i + 1;
+            continue;
+        }
+        if (i + 1 >= len(args)) {
+            return err("缺少取值或未知参数：" + a);
+        }
+        const v = args[i + 1];
+        if (a == "--compiler") {
+            o.compiler = v;
+        } else if (a == "--work") {
+            o.work = v;
+        } else if (a == "--out") {
+            o.out = v;
+        } else if (a == "--root") {
+            o.root = v;
+        } else if (a == "--link-object") {
+            o.link = v;
+        } else if (a == "--keep-runs") {
+            o.keepRuns = parseDigits(v);
+            if (o.keepRuns < 0) {
+                return err("--keep-runs 须为非负整数：" + v);
+            }
+        } else if (a == "--start-stage") {
+            o.startStage = parseDigits(v);
+            if (o.startStage < 1) {
+                return err("--start-stage 须为正整数：" + v);
+            }
+        } else {
+            return err("未知参数：" + a);
+        }
+        i = i + 2;
+    }
+    if (len(o.root) == 0) {
+        o.root = currentDir() catch ".";
+    }
+    // 取真实路径：local* 内建拒绝路径里的符号链接（macOS 的 /tmp、/var，软链的家目录等）。
+    o.root = osRealPath(absolute(o.root));
+    if (len(o.compiler) == 0) {
+        return err("请给出 --compiler <原生 taixu>（或设环境变量 TAIXU_NATIVE）");
+    }
+    o.compiler = osRealPath(absolute(o.compiler));
+    if (len(o.work) == 0) {
+        o.work = join(o.root, "work/native-build");
+    }
+    if (len(o.out) == 0) {
+        o.out = join(o.root, "work/native/bin");
+    }
+    o.work = absolute(o.work);
+    o.out = absolute(o.out);
+    if (len(o.link) > 0) {
+        o.link = osRealPath(absolute(o.link));
+    }
+    return o;
+}
+
+// 本机的构建目标旗标（同 nrt-bootstrap.py：产物以本机为目标）。
+function targetFlag(): List<string> {
+    const out: List<string> = listNew();
+    if (hostTarget() == "linux") {
+        listPush(out, "--target=linux");
+    } else if (hostTarget() == "macos") {
+        if (hostArch() == "aarch64") {
+            listPush(out, "--target=aarch64-macos");
+        } else {
+            listPush(out, "--target=macos");
+        }
+    }
+    return out;
+}
+
+function build(o: Ref<Opts>, current: string): string | Error {
+    const root = o.root;
+    const boot = join(current, "bootstrap");
+    makeDir(boot) catch (e) {
+        return err("建不了：" + boot);
+    };
+    const tflag = targetFlag();
+    let a0 = o.compiler;
+    let a0Link: List<string> = listNew();
+    if (len(o.link) > 0) {
+        a0Link = plus(list1("--link-object"), list1(o.link));
+    }
+    const stages = pinnedStages(root);
+    let start = o.startStage;
+    if (start == 0) {
+        start = firstNeededStage(a0, a0Link, tflag, boot, stages) catch (e) {
+            return e;
+        };
+    }
+    print("compiler " + a0 + " starts at pinned stage " + toStr(start));
+    const builtStages: List<string> = listNew();
+    let k: int = start;
+    while (k <= listLen(stages)) {
+        const pin = listGet(stages, k - 1) catch "";
+        const git = findInPath("git");
+        if (len(git) == 0) {
+            return err("补固定阶段要用 git，PATH 里找不到");
+        }
+        const name = "s" + toStr(k);
+        const src = join(boot, name + "-src");
+        extractStage(git, root, pin, src, boot) catch (e) {
+            return e;
+        };
+        const genDir = join(boot, name + "-gen");
+        step(a0, plus(plus(plus(list1("build"), list1("bootstrap/runtime_memory_gen.tx")), plus(list1("--runtime=native"), tflag)), plus(a0Link, plus(list1("--out"), list1(genDir)))), src) catch (e) {
+            return e;
+        };
+        generateKernels(join(genDir, exeName("runtime_memory_gen")), join(src, "bootstrap/nrt-kernel"), kernelsOf(src), root) catch (e) {
+            return e;
+        };
+        step(a0, plus(plus(plus(list1("build"), list1("bootstrap/taixu.tx")), plus(plus(list1("--toolchain"), list1("--runtime=native")), tflag)), plus(a0Link, plus(list1("--out"), list1(join(boot, name))))), src) catch (e) {
+            return e;
+        };
+        removeTree(src);
+        listPush(builtStages, name);
+        print("stage" + toStr(k) + " " + pin);
+        a0 = join(join(boot, name), exeName("taixu"));
+        a0Link = listNew();
+        k = k + 1;
+    }
+    // 当前内核：由上一个编译器编出的生成器生成，随后嵌入。
+    const gen = join(boot, "gen");
+    step(a0, plus(plus(plus(list1("build"), list1("bootstrap/runtime_memory_gen.tx")), plus(list1("--runtime=native"), tflag)), plus(a0Link, plus(list1("--out"), list1(gen)))), root) catch (e) {
+        return e;
+    };
+    const currentKernels = kernelsOf(root);
+    const embedded = generateKernels(join(gen, exeName("runtime_memory_gen")), join(root, "bootstrap/nrt-kernel"), currentKernels, root) catch (e) {
+        return e;
+    };
+    let i: int = 1;
+    while (i < listLen(currentKernels)) {
+        const name = listGet(currentKernels, i) catch "";
+        if (!copyFile(join(join(root, "bootstrap/nrt-kernel"), name), join(boot, name), false)) {
+            return err("拷贝内核失败：" + name);
+        }
+        i = i + 2;
+    }
+    // B 由上一个编译器编出（可能还用旧内核运行），它嵌入当前内核并以之编 C；比较 C 与 D。
+    step(a0, plus(plus(plus(list1("build"), list1("bootstrap/taixu.tx")), plus(plus(list1("--toolchain"), list1("--runtime=native")), tflag)), plus(a0Link, plus(list1("--out"), list1(join(boot, "b"))))), root) catch (e) {
+        return e;
+    };
+    let prev = join(join(boot, "b"), exeName("taixu"));
+    for (stage in strSplit("c d", " ")) {
+        step(prev, plus(plus(plus(list1("build"), list1("bootstrap/taixu.tx")), plus(list1("--toolchain"), tflag)), plus(list1("--out"), list1(join(boot, stage)))), root) catch (e) {
+            return e;
+        };
+        prev = join(join(boot, stage), exeName("taixu"));
+    }
+    // 嵌入的内核须是当前生成器的产物。
+    step(prev, plus(plus(plus(list1("build"), list1("bootstrap/runtime_memory_gen.tx")), tflag), plus(list1("--out"), list1(join(boot, "gen-d")))), root) catch (e) {
+        return e;
+    };
+    const again = generateKernels(join(join(boot, "gen-d"), exeName("runtime_memory_gen")), join(boot, "kernels-d"), currentKernels, root) catch (e) {
+        return e;
+    };
+    const names = plus(builtStages, words("b c d"));
+    const sums: List<string> = listNew();
+    for (n in names) {
+        listPush(sums, shaOf(join(join(boot, n), exeName("taixu"))));
+    }
+    print("stage0 compiler " + o.compiler);
+    i = 0;
+    while (i + 1 < listLen(embedded)) {
+        print("kernel " + (listGet(embedded, i) catch "") + " " + (listGet(embedded, i + 1) catch ""));
+        i = i + 2;
+    }
+    i = 0;
+    while (i < listLen(names)) {
+        print((listGet(names, i) catch "") + " " + (listGet(sums, i) catch ""));
+        i = i + 1;
+    }
+    const n = listLen(sums);
+    const hb = listGet(sums, n - 3) catch "";
+    const hc = listGet(sums, n - 2) catch "";
+    const hd = listGet(sums, n - 1) catch "";
+    if (len(hd) == 0 || hc != hd) {
+        return err("No fixpoint: C != D");
+    }
+    if (!sameList(again, embedded)) {
+        return err("Kernels from the D-built generator differ from the embedded kernels");
+    }
+    print("PASS staged bootstrap; compiler " + join(join(boot, "d"), exeName("taixu")));
+    return hb + " " + hc + " " + hd;
+}
+
+function boolText(v: bool): string {
+    if (v) {
+        return "true";
+    }
+    return "false";
+}
+
+function pyBool(v: bool): string {
+    if (v) {
+        return "True";
+    }
+    return "False";
+}
+
+function run(o: Ref<Opts>): int | Error {
+    if (kindOf(join(o.root, "bootstrap/taixu.tx")) != 1) {
+        return err("找不到 " + join(o.root, "bootstrap/taixu.tx") + "：请在仓库根运行或给出 --root");
+    }
+    const capText = capture(o.compiler, plus(list1("capabilities"), list1("--format=json")), o.root) catch (e) {
+        return err("所选编译器不能运行：" + e.message);
+    };
+    const cap = jsonParseStr(capText) catch (e) {
+        return err("所选编译器的 capabilities 不是 JSON");
+    };
+    if (text(field(field(cap, "capabilities"), "compiler")) != "native-tx") {
+        return err("所选编译器不是原生太虚；Zig seed 请经 build.py --seed 显式提供");
+    }
+    const originSha = shaOf(o.compiler);
+    // 工作目录与输出目录先建好再取真实路径（同 --root）。
+    if (!mkdirs(o.work) || !mkdirs(o.out)) {
+        return err("建不了工作或输出目录：" + o.work + "、" + o.out);
+    }
+    o.work = osRealPath(o.work);
+    o.out = osRealPath(o.out);
+    const current = freshRunDir(o.work, "build-", o.keepRuns) catch (e) {
+        return e;
+    };
+    const hashes = build(o, current) catch (e) {
+        finishRunDir(current);
+        return e;
+    };
+    const h = strSplit(hashes, " ");
+    const hb = listGet(h, 0) catch "";
+    const hc = listGet(h, 1) catch "";
+    const hd = listGet(h, 2) catch "";
+    const d = join(join(join(current, "bootstrap"), "d"), exeName("taixu"));
+    if (o.syncDocs) {
+        const changed = syncDocs(d, o.root) catch (e) {
+            finishRunDir(current);
+            return e;
+        };
+        if (changed) {
+            print("派生文档： 已同步");
+        } else {
+            print("派生文档： 已一致");
+        }
+    }
+    if (!mkdirs(o.out)) {
+        finishRunDir(current);
+        return err("建不了输出目录：" + o.out);
+    }
+    const binary = join(o.out, exeName("taixu"));
+    const pending = binary + ".pending";
+    if (!copyFile(d, pending, true) || !osRename(pending, binary)) {
+        finishRunDir(current);
+        return err("放不到输出目录：" + binary);
+    }
+    const record = "{\n  \"compiler\": " + jsonQuote(binary) + ",\n  \"sha256\": " + jsonQuote(hd) + ",\n  \"stages\": {\n    \"b\": "
+    + jsonQuote(hb) + ",\n    \"c\": " + jsonQuote(hc) + ",\n    \"d\": " + jsonQuote(hd) + "\n  },\n  \"initial_generation_matches_fixpoint\": "
+    + boolText(hb == hd) + ",\n  \"origin\": {\n    \"kind\": \"native\",\n    \"sha256\": " + jsonQuote(originSha) + "\n  },\n  \"platform\": "
+    + jsonQuote(hostTarget() + "-" + hostArch()) + ",\n  \"work\": " + jsonQuote(current) + "\n}\n";
+    writeFile(join(o.out, "build.json"), record) catch (e) {
+        finishRunDir(current);
+        return e;
+    };
+    finishRunDir(current);
+    print("PASS C=D " + hd + " B=D: " + pyBool(hb == hd) + " ");
+    print("编译器: " + binary);
+    return 0;
+}
+
+export function main(args: []string): int {
+    const o = parseOpts(args) catch (e) {
+        return usage(e.message);
+    };
+    const code = run(o) catch (e) {
+        eprint("构建失败: " + e.message);
+        return 1;
+    };
+    return code;
+}

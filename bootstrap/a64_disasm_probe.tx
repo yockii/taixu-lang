@@ -1,0 +1,286 @@
+// A64 反汇编核对（macOS 适配 M4 设计 A2、A11）：
+//   a64_disasm_probe <encodings.txt>
+//     tests/a64/encodings.txt 的正例逐条把编码译回文本，须与汇编列逐字相同；另核一组固定例（nop、dmb ish，以及子集外或
+//     编码函数拒绝的字须得 .inst）。逐条报出不符的（行号、期望、实得），全部相符才打印 PASS_A64_DISASM <正例数> <固定例数>。
+//   a64_disasm_probe --scan <文件> <起点> <字节数> [--dump]
+//     把文件这一段按 4 字节小端逐字反汇编，打印 SCAN_A64_DISASM <字数> <.inst 数>，并列出前 64 个 .inst 的位置；--dump 时
+//     逐字打印“位置 文本”。起点、字节数写十进制或 0x 十六进制。
+//   a64_disasm_probe --words <十六进制>…
+//     逐个反汇编，每行打印“编码 文本”。
+//   a64_disasm_probe --fuzz <种子> <次数> [--dump]
+//     按形式轮流随机取字段交给编码函数，编得出的字都须反汇编得出（不得 .inst）：编码表之外再证两边子集一致。打印
+//     FUZZ_A64_DISASM <编出的字数> <.inst 数>，有 .inst 时逐个报出并返回 1；--dump 时逐字打印“编码 文本”（供外部汇编器重编核对）。
+import { a64Disasm } from "./selfhost/a64_disasm";
+import { a64AddSubImm, a64LogicalImm, a64MoveWide, a64Bitfield, a64Adr, a64AddSubShifted, a64AddSubExt, a64LogicalShifted, a64DataProc2, a64DataProc3, a64CondSelect } from "./selfhost/a64_encode";
+import { a64LdStUImm, a64LdStImm9, a64LdStReg, a64LdStPair, a64AtomicAl, a64Casal, a64AcqRel, a64Branch, a64BranchCond, a64CompareBranch, a64TestBranch, a64BranchReg, a64Brk } from "./selfhost/a64_encode";
+import { a64FpInt, a64FpUnary, a64FpBinary, a64Fcmp } from "./selfhost/a64_encode";
+
+struct Num { v: int, ok: bool }
+
+// 非负整数：十进制或十六进制（radix 16，不带前缀），至多 15 位，不会溢出。
+function digitsOf(s: string, from: int, radix: int): Ref<Num> {
+    const bad = new Num { v: 0, ok: false };
+    if (len(s) <= from || len(s) - from > 15) { return bad; }
+    let v = 0;
+    let i = from;
+    while (i < len(s)) {
+        const c = byteAt(s, i) catch 0;
+        let d = -1;
+        if (c >= 48 && c <= 57) { d = c - 48; }
+        if (radix == 16 && c >= 97 && c <= 102) { d = c - 87; }
+        if (radix == 16 && c >= 65 && c <= 70) { d = c - 55; }
+        if (d < 0) { return bad; }
+        v = v * radix + d;
+        i = i + 1;
+    }
+    return new Num { v: v, ok: true };
+}
+function parseNum(s: string): Ref<Num> {
+    if (len(s) > 2 && strSub(s, 0, 2) == "0x") { return digitsOf(s, 2, 16); }
+    return digitsOf(s, 0, 10);
+}
+// 指令字：恰好 8 位十六进制。
+function parseWord(s: string): Ref<Num> {
+    if (len(s) != 8) { return new Num { v: 0, ok: false }; }
+    return digitsOf(s, 0, 16);
+}
+
+function hex(v: int, width: int): string {
+    const digits = "0123456789abcdef";
+    let s = "";
+    let x = v;
+    while (x != 0 || len(s) < width) {
+        s = strSub(digits, x & 15, 1) + s;
+        x = x >>> 4;
+    }
+    return s;
+}
+
+// 固定例“编码=期望文本”：编码表只有正例的编码，这里补上严格性（子集外、编码函数拒绝的字须得 .inst）与两个常量。
+function fixedCases(): List<string> {
+    const c: List<string> = listNew();
+    listPush(c, "d503201f=nop");
+    listPush(c, "d5033bbf=dmb ish");
+    listPush(c, "00000000=.inst 0x00000000");
+    listPush(c, "ffffffff=.inst 0xffffffff");
+    listPush(c, "5400000e=b.al #0");
+    listPush(c, "5400000f=.inst 0x5400000f"); // b.nv：编码函数只收条件 0..14
+    listPush(c, "9a82f020=csel x0, x1, x2, nv"); // csel 收条件 15
+    listPush(c, "1200f020=and w0, w1, #0x55555555");
+    listPush(c, "1202f020=.inst 0x1202f020"); // 同一个值，immr 带了元素宽度以外的位（非规范）
+    listPush(c, "13400020=.inst 0x13400020"); // 32 位 sbfm 而 N＝1
+    listPush(c, "0a028020=.inst 0x0a028020"); // 32 位 and 移位量 32
+    listPush(c, "8b225420=.inst 0x8b225420"); // 扩展寄存器移位量 5
+    listPush(c, "f8400820=.inst 0xf8400820"); // ldtr（imm9 形 mode 2）
+    listPush(c, "a8017bfd=.inst 0xa8017bfd"); // stnp（成对 mode 0）
+    listPush(c, "69410440=.inst 0x69410440"); // ldpsw
+    listPush(c, "3dc00420=.inst 0x3dc00420"); // ldr q0
+    listPush(c, "b8600041=.inst 0xb8600041"); // ldaddl（只收 al）
+    listPush(c, "88a0fc41=.inst 0x88a0fc41"); // casl
+    listPush(c, "1e212010=.inst 0x1e212010"); // fcmpe
+    listPush(c, "d61f03e0=br xzr");
+    listPush(c, "d43e0000=brk #0xf000");
+    // CONSTRAINED UNPREDICTABLE（编码函数拒绝）与紧邻的合法写法。
+    listPush(c, "384076b5=.inst 0x384076b5"); // ldrb w21, [x21], #7：后变址写回基址即数据寄存器
+    listPush(c, "f81f8ca5=.inst 0xf81f8ca5"); // str x5, [x5, #-8]!
+    listPush(c, "f84080a5=ldur x5, [x5, #8]"); // 不写回时同号合法
+    listPush(c, "a8c11063=.inst 0xa8c11063"); // ldp x3, x4, [x3], #16
+    listPush(c, "a9bf1083=.inst 0xa9bf1083"); // stp x3, x4, [x4, #-16]!
+    listPush(c, "a9411be6=.inst 0xa9411be6"); // ldp x6, x6, [sp, #16]：两目标同号
+    listPush(c, "6d411be6=.inst 0x6d411be6"); // ldp d6, d6, [sp, #16]
+    listPush(c, "a9011be6=stp x6, x6, [sp, #16]"); // stp 两源同号合法
+    return c;
+}
+
+function checkTable(path: string): int {
+    const text = readFile(path) catch (e) { eprint(e.message); return 65; };
+    const lines = strSplit(text, "\n");
+    let count = 0;
+    let failures = 0;
+    let i = 0;
+    while (i < listLen(lines)) {
+        let line = listGet(lines, i) catch "";
+        i = i + 1;
+        if (len(line) > 0 && (byteAt(line, len(line) - 1) catch 0) == 13) { line = strSub(line, 0, len(line) - 1); }
+        const c0 = byteAt(line, 0) catch 0;
+        if (len(line) == 0 || c0 == 35 || c0 == 33) { continue; }
+        const parts = strSplit(line, " | ");
+        if (listLen(parts) != 3) { eprint("line " + toStr(i) + ": malformed"); return 66; }
+        const want = listGet(parts, 1) catch "";
+        const w = parseWord(listGet(parts, 2) catch "");
+        let got = "(bad hex)";
+        if (w.ok) { got = a64Disasm(w.v); }
+        if (got != want) {
+            failures = failures + 1;
+            eprint("line " + toStr(i) + ": " + (listGet(parts, 2) catch "") + " want \"" + want + "\" got \"" + got + "\"");
+        }
+        count = count + 1;
+    }
+    const fixed = fixedCases();
+    let k = 0;
+    while (k < listLen(fixed)) {
+        const pair = strSplit(listGet(fixed, k) catch "", "=");
+        const want = listGet(pair, 1) catch "";
+        const w = parseWord(listGet(pair, 0) catch "");
+        let got = "(bad hex)";
+        if (w.ok) { got = a64Disasm(w.v); }
+        if (got != want) {
+            failures = failures + 1;
+            eprint("fixed " + (listGet(pair, 0) catch "") + ": want \"" + want + "\" got \"" + got + "\"");
+        }
+        k = k + 1;
+    }
+    // 只看低 32 位。
+    if (a64Disasm(0x1D503201F) != "nop" || a64Disasm(-1) != ".inst 0xffffffff") {
+        failures = failures + 1;
+        eprint("fixed: high bits not ignored");
+    }
+    if (failures > 0) { eprint("FAIL " + toStr(failures) + " of " + toStr(count + listLen(fixed) + 1)); return 1; }
+    print("PASS_A64_DISASM " + toStr(count) + " " + toStr(listLen(fixed) + 1));
+    return 0;
+}
+
+function scan(path: string, from: int, count: int, dump: bool): int {
+    const b = readFileBytes(path) catch (e) { eprint(e.message); return 65; };
+    if (count % 4 != 0 || from + count > bytesLen(b)) { eprint("range outside file or not whole words"); return 64; }
+    let words = 0;
+    let inst = 0;
+    let k = from;
+    while (k < from + count) {
+        const w = (bytesGet(b, k) catch 0) | ((bytesGet(b, k + 1) catch 0) << 8) | ((bytesGet(b, k + 2) catch 0) << 16) | ((bytesGet(b, k + 3) catch 0) << 24);
+        const t = a64Disasm(w);
+        if (dump) { print(hex(k, 8) + " " + t); }
+        if ((byteAt(t, 0) catch 0) == 46) {
+            inst = inst + 1;
+            if (!dump && inst <= 64) { print("inst " + hex(k, 8) + " " + t); }
+        }
+        words = words + 1;
+        k = k + 4;
+    }
+    print("SCAN_A64_DISASM " + toStr(words) + " " + toStr(inst));
+    return 0;
+}
+
+// xorshift64 伪随机：below(g, n) 得 0..n−1。
+struct Rng { s: int }
+function below(g: Ref<Rng>, n: int): int {
+    let x = g.s;
+    x = x ^ (x << 13);
+    x = x ^ (x >>> 7);
+    x = x ^ (x << 17);
+    g.s = x;
+    return (x >>> 1) % n;
+}
+
+// 随机的逻辑立即数：元素宽 2..64（32 位形到 32）、连续 1 的个数与循环右移量随机，再铺满整个宽度。
+function bitmask(g: Ref<Rng>, sf: int): int {
+    const width = 32 + sf * 32;
+    const esize = 2 << below(g, 5 + sf);
+    const ones = 1 + below(g, esize - 1);
+    const rot = below(g, esize);
+    let elem = -1 >>> (64 - ones);
+    if (rot > 0) {
+        elem = (elem >>> rot) | (elem << (esize - rot));
+        if (esize < 64) { elem = elem & ((1 << esize) - 1); }
+    }
+    let k = esize;
+    while (k < width) {
+        elem = elem | (elem << k);
+        k = k * 2;
+    }
+    return elem;
+}
+
+// 第 form 种编码函数（编码表的 28 种形式）配一组随机字段；字段有意略出合法范围，编不出的得 -1。
+function fuzzOne(g: Ref<Rng>, form: int): int {
+    const sf = below(g, 2);
+    const a = below(g, 32);
+    const b = below(g, 32);
+    const c = below(g, 32);
+    const d = below(g, 32);
+    const size = below(g, 4);
+    const v = below(g, 2);
+    const opc = below(g, 4);
+    if (form == 0) { return a64AddSubImm(sf, below(g, 2), below(g, 2), a, b, below(g, 4096), below(g, 2)); }
+    if (form == 1) { return a64LogicalImm(sf, opc, a, b, bitmask(g, sf)); }
+    if (form == 2) { return a64MoveWide(sf, opc, a, below(g, 65536), below(g, 4)); }
+    if (form == 3) { return a64Bitfield(sf, below(g, 3), a, b, below(g, 64), below(g, 64)); }
+    if (form == 4) { return a64Adr(below(g, 2), a, below(g, 2097152) - 1048576); }
+    if (form == 5) { return a64AddSubShifted(sf, below(g, 2), below(g, 2), a, b, c, below(g, 3), below(g, 64)); }
+    if (form == 6) { return a64AddSubExt(sf, below(g, 2), below(g, 2), a, b, c, below(g, 8), below(g, 6)); }
+    if (form == 7) { return a64LogicalShifted(sf, opc, below(g, 2), a, b, c, below(g, 4), below(g, 64)); }
+    if (form == 8) { return a64DataProc2(sf, below(g, 12), a, b, c); }
+    if (form == 9) { return a64DataProc3(sf, below(g, 7), below(g, 2), a, b, c, d); }
+    if (form == 10) { return a64CondSelect(sf, below(g, 2), below(g, 2), a, b, c, below(g, 16)); }
+    if (form == 11) { return a64LdStUImm(size, v, opc, a, b, below(g, 4096) << size); }
+    if (form == 12) { return a64LdStImm9(size, v, opc, a, b, below(g, 512) - 256, below(g, 4)); }
+    if (form == 13) { return a64LdStReg(size, v, opc, a, b, c, below(g, 8), below(g, 2)); }
+    if (form == 14) { return a64LdStPair(below(g, 3), v, below(g, 2), a, b, c, (below(g, 128) - 64) * (4 << below(g, 2)), below(g, 4)); }
+    if (form == 15) { return a64AtomicAl(size, below(g, 2), a, b, c); }
+    if (form == 16) { return a64Casal(size, a, b, c); }
+    if (form == 17) { return a64AcqRel(below(g, 3), size, a, b); }
+    if (form == 18) { return a64Branch(below(g, 2), (below(g, 67108864) - 33554432) * 4); }
+    if (form == 19) { return a64BranchCond(below(g, 16), (below(g, 524288) - 262144) * 4); }
+    if (form == 20) { return a64CompareBranch(sf, below(g, 2), a, (below(g, 524288) - 262144) * 4); }
+    if (form == 21) { return a64TestBranch(below(g, 2), a, below(g, 64), (below(g, 16384) - 8192) * 4); }
+    if (form == 22) { return a64BranchReg(below(g, 3), a); }
+    if (form == 23) { return a64Brk(below(g, 65536)); }
+    if (form == 24) { return a64FpInt(sf, below(g, 2), below(g, 4), below(g, 8), a, b); }
+    if (form == 25) { return a64FpUnary(below(g, 2), below(g, 6), a, b); }
+    if (form == 26) { return a64FpBinary(below(g, 2), below(g, 4), a, b, c); }
+    const zero = below(g, 2);
+    return a64Fcmp(below(g, 2), a, b * (1 - zero), zero);
+}
+
+function fuzz(seed: int, count: int, dump: bool): int {
+    const g = new Rng { s: (seed << 17) ^ (seed << 3) ^ 88172645463325252 };
+    if (g.s == 0) { g.s = 1; }
+    let encoded = 0;
+    let inst = 0;
+    let i = 0;
+    while (i < count) {
+        const w = fuzzOne(g, i % 28);
+        if (w >= 0) {
+            encoded = encoded + 1;
+            const t = a64Disasm(w);
+            if (dump) { print(hex(w, 8) + " " + t); }
+            if ((byteAt(t, 0) catch 0) == 46) {
+                inst = inst + 1;
+                eprint("form " + toStr(i % 28) + ": encoder word " + hex(w, 8) + " decodes to .inst");
+            }
+        }
+        i = i + 1;
+    }
+    print("FUZZ_A64_DISASM " + toStr(encoded) + " " + toStr(inst));
+    if (inst > 0) { return 1; }
+    return 0;
+}
+
+function main(args: []string): int {
+    if ((len(args) == 3 || len(args) == 4) && args[0] == "--fuzz") {
+        const seed = parseNum(args[1]);
+        const count = parseNum(args[2]);
+        const dump = len(args) == 4 && args[3] == "--dump";
+        if (!seed.ok || !count.ok || (len(args) == 4 && !dump)) { eprint("usage: a64_disasm_probe --fuzz <seed> <count> [--dump]"); return 64; }
+        return fuzz(seed.v, count.v, dump);
+    }
+    if (len(args) >= 1 && args[0] == "--words") {
+        let i = 1;
+        while (i < len(args)) {
+            const w = parseWord(args[i]);
+            if (!w.ok) { eprint("bad word: " + args[i]); return 64; }
+            print(args[i] + " " + a64Disasm(w.v));
+            i = i + 1;
+        }
+        return 0;
+    }
+    if ((len(args) == 4 || len(args) == 5) && args[0] == "--scan") {
+        const from = parseNum(args[2]);
+        const count = parseNum(args[3]);
+        const dump = len(args) == 5 && args[4] == "--dump";
+        if (!from.ok || !count.ok || (len(args) == 5 && !dump)) { eprint("usage: a64_disasm_probe --scan <file> <offset> <bytes> [--dump]"); return 64; }
+        return scan(args[1], from.v, count.v, dump);
+    }
+    if (len(args) != 1) { eprint("usage: a64_disasm_probe <encodings.txt> | --scan <file> <offset> <bytes> [--dump] | --words <hex>..."); return 64; }
+    return checkTable(args[0]);
+}

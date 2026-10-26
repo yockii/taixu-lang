@@ -1,0 +1,252 @@
+// lsp_sig.tx —— 原生 LSP 的 signatureHelp（第 6 轮 6d-3b2，LSP 与 MCP 实施设计 §四-5）。
+//
+// 找调用：太虚的解析器按语句恢复，未闭合的 `(` 使所在语句整个丢掉，所以按当前文本的记号从光标往左找第一个包住光标的
+// `(`（跳过已闭合的括号组），途中遇 `{`、`}`、`;` 在深度 0 即停（同 TS 的块边界）；`(` 之前是标识符（可隔一段 `<…>`
+// 型参）才是调用，否则（分组括号）接着往外找。光标须在 `(` 之后（在函数名上不给，改正 Zig 版第 14 条）。
+// 被调者：函数名处的出现的身份 → 声明的说明；没有出现时按名字在该处可见的声明里找，再找内建。label 为说明（或内建的
+// 签名），形参组为 label 里的第一个括号组，在深度 0 的逗号处切开，偏移按 utf-16 计。方法糖调用不含接收者。
+// activeParameter 为 `(` 与光标之间深度 0 的逗号数，不小于形参数时取形参数（不高亮）。
+import { Root, diagRoots } from "./lsp_diag";
+import { AnaOcc, AnaDetail, anaDetailOf } from "./ana_index";
+import { LspDoc, docKey, posToOffset } from "./lsp_docs";
+import { Builtin, builtinNamed } from "./lsp_builtins";
+import { DocToks, docToks, tokKind, tokStart, tokMatch, tokBefore, visibleAt, occAt } from "./lsp_scope";
+import { K_IDENT, K_DOT, K_LPAREN, K_RPAREN, K_LBRACE, K_RBRACE, K_LBRACKET, K_RBRACKET, K_LT, K_GT, K_COMMA, K_SEMI, K_COMMENT } from "../lexer";
+import { dbgStr } from "./dbg_out";
+
+function modOf(r: Ref<Root>, key: string): int {
+    let i = 0;
+    while (i < listLen(r.paths)) {
+        const p = listGet(r.paths, i) catch "";
+        if (p != "<prelude>" && docKey(p) == key) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 字符串 s 的前 n 个字节的 utf-16 码元数。
+function utf16Units(s: string, n: int): int {
+    let u = 0;
+    let i = 0;
+    while (i < n) {
+        const b = byteAt(s, i) catch 0;
+        if (b < 128) {
+            u = u + 1;
+            i = i + 1;
+        } else if (b >= 240) {
+            u = u + 2;
+            i = i + 4;
+        } else if (b >= 224) {
+            u = u + 1;
+            i = i + 3;
+        } else {
+            u = u + 1;
+            i = i + 2;
+        }
+    }
+    return u;
+}
+
+// label 里形参的 [起, 止) 字节偏移（成对放在表里）：第一个括号组里深度 0 的逗号处切开，去掉两侧空格；`=>` 的 `>`
+// 不算闭括号。没有括号组为空表。
+function paramSpans(label: string): List<int> {
+    const out: List<int> = listNew();
+    const open = strByteIndex(label, 40);
+    if (open < 0) { return out; }
+    let depth = 0;
+    let start = open + 1;
+    let i = open + 1;
+    const n = len(label);
+    while (i < n) {
+        const c = byteAt(label, i) catch 0;
+        const prev = byteAt(label, i - 1) catch 0;
+        if (c == 40 || c == 91 || c == 60) { depth = depth + 1; }
+        if (c == 41 || c == 93 || (c == 62 && prev != 61)) {
+            if (depth == 0) {
+                if (c == 41) {
+                    pushSpan(out, label, start, i);
+                    return out;
+                }
+            } else {
+                depth = depth - 1;
+            }
+        }
+        if (c == 44 && depth == 0) {
+            pushSpan(out, label, start, i);
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+function pushSpan(out: List<int>, s: string, a: int, b: int): void {
+    let x = a;
+    let y = b;
+    while (x < y && (byteAt(s, x) catch 0) == 32) { x = x + 1; }
+    while (y > x && (byteAt(s, y - 1) catch 0) == 32) { y = y - 1; }
+    // 空括号组 `()` 没有形参。
+    if (x == y) { return; }
+    listPush(out, x);
+    listPush(out, y);
+}
+
+function strByteIndex(s: string, b: int): int {
+    let i = 0;
+    while (i < len(s)) {
+        if ((byteAt(s, i) catch -1) == b) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 身份可调：函数（含外部函数）、变体（`E.V(…)`、`new E.V(…)`），或类型为函数类型的绑定、形参、字段（说明里有 `) => `）。
+function callable(tt: int, text: string): bool {
+    if (tt == 0 || tt == 3) { return true; }
+    return (tt == 4 || tt == 5 || tt == 6) && strIndexOf(text, ") => ") >= 0;
+}
+
+function sigJson(label: string, spans: List<int>, skip: int, active: int): string {
+    let params = "";
+    let np = 0;
+    let k = skip * 2;
+    while (k + 1 < listLen(spans)) {
+        if (np > 0) { params = params + ","; }
+        const a = listGet(spans, k) catch 0;
+        const b = listGet(spans, k + 1) catch 0;
+        params = params + "{\"label\":[" + toStr(utf16Units(label, a)) + "," + toStr(utf16Units(label, b)) + "]}";
+        np = np + 1;
+        k = k + 2;
+    }
+    let act = active;
+    if (act >= np) { act = np; }
+    return "{\"signatures\":[{\"label\":" + dbgStr(label) + ",\"parameters\":[" + params + "],\"activeParameter\":" + toStr(act) + "}],\"activeSignature\":0,\"activeParameter\":" + toStr(act) + "}";
+}
+
+// 包住偏移 off 的调用的 `(`（记号下标；没有为 -1）：往左走，已闭合的括号组（含实参里的块）整组跳过；包住光标的 `{` 或
+// 深度 0 的 `;` 即停；包住光标的 `(` 之前是被调名才是调用，否则（分组括号）接着往外找。
+function callParen(t: Ref<DocToks>, off: int): int {
+    let j = tokBefore(t, off);
+    while (j >= 0) {
+        const k = tokKind(t, j);
+        if (k == K_RPAREN || k == K_RBRACKET || k == K_RBRACE) {
+            const m = tokMatch(t, j);
+            if (m < 0) { return -1; }
+            j = m - 1;
+        } else if (k == K_LBRACE || k == K_SEMI) {
+            return -1;
+        } else if (k == K_LPAREN && calleeOf(t, j) >= 0) {
+            return j;
+        } else {
+            j = j - 1;
+        }
+    }
+    return -1;
+}
+
+// `(` 之前的被调名（记号下标；没有为 -1）：标识符，可隔一段配对的 `<…>` 型参。
+function calleeOf(t: Ref<DocToks>, p: int): int {
+    let j = p - 1;
+    while (j >= 0 && tokKind(t, j) == K_COMMENT) { j = j - 1; }
+    if (tokKind(t, j) == K_GT) {
+        let depth = 0;
+        while (j >= 0) {
+            const k = tokKind(t, j);
+            if (k == K_GT) { depth = depth + 1; }
+            if (k == K_LT) {
+                depth = depth - 1;
+                if (depth == 0) { break; }
+            }
+            j = j - 1;
+        }
+        j = j - 1;
+    }
+    if (j >= 0 && tokKind(t, j) == K_IDENT) { return j; }
+    return -1;
+}
+
+// `(` 与 off 之间深度 0 的逗号数。
+function commasBefore(t: Ref<DocToks>, p: int, off: int): int {
+    let n = 0;
+    let j = p + 1;
+    while (j < listLen(t.kinds) && tokStart(t, j) < off) {
+        const k = tokKind(t, j);
+        if ((k == K_LPAREN || k == K_LBRACKET || k == K_LBRACE) && tokMatch(t, j) > j) {
+            j = tokMatch(t, j) + 1;
+        } else {
+            if (k == K_COMMA) { n = n + 1; }
+            j = j + 1;
+        }
+    }
+    return n;
+}
+
+function lineCol(text: string, off: int): List<int> {
+    let line = 1;
+    let ls = 0;
+    let i = 0;
+    while (i < off) {
+        if ((byteAt(text, i) catch 0) == 10) {
+            line = line + 1;
+            ls = i + 1;
+        }
+        i = i + 1;
+    }
+    const out: List<int> = listNew();
+    listPush(out, line);
+    listPush(out, off - ls + 1);
+    return out;
+}
+
+// textDocument/signatureHelp 的结果（JSON 文本，没有为 null）。调用前该文档的入口已同步分析。
+export function signatureAt(d: Ref<LspDoc>, line: int, ch: int, enc: int): string {
+    const t = docToks(d.text);
+    const off = posToOffset(d, line, ch, enc);
+    const p = callParen(t, off);
+    if (p < 0) { return "null"; }
+    const c = calleeOf(t, p);
+    const name = listGet(t.texts, c) catch "";
+    const active = commasBefore(t, p, off);
+    const sugar = c > 0 && tokKind(t, c - 1) == K_DOT;
+    for (r in diagRoots()) {
+        const m = modOf(r, d.key);
+        if (m >= 0) {
+            const lc = lineCol(d.text, tokStart(t, c));
+            const ov = occAt(r.occs, m, listGet(lc, 0) catch 0, listGet(lc, 1) catch 0);
+            let key = "";
+            let tt = -1;
+            if (ov != None) {
+                const o = ov catch new AnaOcc { mod: -1, line: 0, col: 0, len: 0, tt: 0, decl: false, km: 0, kl: 0, kc: 0, kh: -1, key: "", name: "", guess: false };
+                key = o.key;
+                tt = o.tt;
+            } else if (!sugar) {
+                for (v in visibleAt(r, m, d.text, t, tokStart(t, c))) {
+                    if (v.name == name) {
+                        key = v.key;
+                        tt = v.tt;
+                    }
+                }
+            }
+            if (len(key) > 0) {
+                const dv = anaDetailOf(r.dets, key);
+                if (dv == None) { return "null"; }
+                const det = dv catch new AnaDetail { key: "", mod: -1, how: 0, name: "", text: "", exported: false, varies: false };
+                if (!callable(tt, det.text)) { return "null"; }
+                let skip = 0;
+                if (sugar && tt == 0) { skip = 1; }
+                return sigJson(det.text, paramSpans(det.text), skip, active);
+            }
+            if (sugar) { return "null"; }
+            return builtinSig(name, active);
+        }
+    }
+    if (sugar) { return "null"; }
+    return builtinSig(name, active);
+}
+
+function builtinSig(name: string, active: int): string {
+    const bv = builtinNamed(name);
+    if (bv == None) { return "null"; }
+    const b = bv catch new Builtin { name: "", sig: "", doc: "", toolchain: false };
+    return sigJson(b.sig, paramSpans(b.sig), 0, active);
+}

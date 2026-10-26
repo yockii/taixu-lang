@@ -1,0 +1,98 @@
+// 工具链受限子进程的 OS 资源原语。资源限额不等于不可信代码沙箱。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, L, I } from "./rtfn_base";
+import { rtBegin, rtAddrOf, rtSet, rtOp, rtLoad, rtStore, rtLabel, rtJump, rtIf, rtIf32, rtCall0, rtRet, rtRetVoid, rtSyscall, rtLoadAcq } from "./rtfn";
+import { callWinImport } from "./ffi_callbacks";
+import { R_JOB, R_PROC, R_DONE, xs0, xs1, xs2, xs3, xs4, toolCheck, toolArgInt, toolTrap } from "./tool_base";
+import { tRawSyscall, tWindows, tUnix } from "./target";
+import { uxSys } from "./unix_sys";
+
+export function budgetArguments(f: Ref<RtFn>): void {
+    toolArgInt(f, 4, "budgetMem", "budget_bad");
+    toolArgInt(f, 5, "budgetCpu", "budget_bad");
+    rtIf(f, L("budgetMem"), "le", I(0), "budget_bad");
+    rtIf(f, L("budgetCpu"), "le", I(0), "budget_bad");
+    rtIf(f, L("budgetCpu"), "gt", I(922337203685), "budget_bad");
+}
+
+export function budgetArgumentTrap(b: Ref<StructuredBuffer>, f: Ref<RtFn>): void {
+    toolTrap(b, f, "budget_bad", 4010, "procSpawnLimited 的内存字节数与 CPU 秒数须为正整数，CPU 秒数不能超过 922337203685");
+    rtRetVoid(f);
+}
+
+export function emitBudgetHelpers(b: Ref<StructuredBuffer>, t: int): void {
+    // 作业对象（job）是 Windows 的进程模型。
+    if (!tWindows(t)) { return; }
+    let slots = "";
+    let i = 0;
+    while (i < 18) { slots = slots + " j" + toStr(i); i = i + 1; }
+    const f = rtBegin(b, "__tx_tool_budget_new", "memory cpu", "job p error gp ef" + slots, 4, "bootstrap/selfhost/tool_budget.tx");
+    callWinImport(f, "job", "CreateJobObjectW", xs2(I(0), I(0)));
+    rtIf(f, L("job"), "eq", I(0), "out");
+    i = 0;
+    while (i < 18) { rtSet(f, "j" + toStr(i), I(0)); i = i + 1; }
+    rtAddrOf(f, "p", "j0");
+    rtOp(f, "cpu", L("cpu"), "imul", I(10000000));
+    rtStore(f, L("p"), 0, L("cpu"), 8);
+    rtStore(f, L("p"), 8, L("cpu"), 8);
+    // PROCESS_TIME | JOB_TIME | ACTIVE_PROCESS | PROCESS_MEMORY | JOB_MEMORY |
+    // DIE_ON_UNHANDLED_EXCEPTION | KILL_ON_JOB_CLOSE；不允许 breakaway。
+    rtStore(f, L("p"), 16, I(9998), 4);
+    rtStore(f, L("p"), 40, I(32), 4);
+    rtStore(f, L("p"), 112, L("memory"), 8);
+    rtStore(f, L("p"), 120, L("memory"), 8);
+    callWinImport(f, "error", "SetInformationJobObject", xs4(L("job"), I(9), L("p"), I(144)));
+    rtIf32(f, L("error"), "ne", I(0), "out");
+    callWinImport(f, "error", "GetLastError", xs0());
+    callWinImport(f, "", "CloseHandle", xs1(L("job")));
+    callWinImport(f, "", "SetLastError", xs1(L("error")));
+    rtSet(f, "job", I(0));
+    rtLabel(f, "out");
+    rtRet(f, L("job"));
+    toolCheck(f);
+}
+
+// vfork 子进程内只使用局部槽与系统调用。失败向父进程返回专用错误域，绝不 exec。
+export function budgetLinuxChild(f: Ref<RtFn>): void {
+    rtSyscall(f, "w", 109, xs2(I(0), I(0)));
+    rtIf(f, L("w"), "lt", I(0), "budget_child_fail");
+    rtAddrOf(f, "lim", "rl0");
+    rtSet(f, "rl0", L("budgetMem")); rtSet(f, "rl1", L("budgetMem"));
+    rtSyscall(f, "w", 302, xs4(I(0), I(9), L("lim"), I(0)));
+    rtIf(f, L("w"), "lt", I(0), "budget_child_fail");
+    rtSet(f, "rl0", L("budgetCpu")); rtSet(f, "rl1", L("budgetCpu"));
+    rtSyscall(f, "w", 302, xs4(I(0), I(0), L("lim"), I(0)));
+    rtIf(f, L("w"), "lt", I(0), "budget_child_fail");
+    rtSet(f, "rl0", I(0)); rtSet(f, "rl1", I(0));
+    rtSyscall(f, "w", 302, xs4(I(0), I(4), L("lim"), I(0)));
+    rtIf(f, L("w"), "ge", I(0), "budget_child_ok");
+    rtLabel(f, "budget_child_fail");
+    rtOp(f, "cerr", I(8192), "sub", L("w"));
+    rtSyscall(f, "", 231, xs1(I(127)));
+    rtLabel(f, "budget_child_ok");
+}
+
+// Linux 仅在主进程尚未被回收时按进程组终止，避免 PID/PGID 复用；Windows 使用仍持有的 job 句柄。
+export function budgetKill(f: Ref<RtFn>, t: int): void {
+    rtLoad(f, "x", L("rec"), R_JOB, 8);
+    rtIf(f, L("x"), "eq", I(0), "budget_kill_done");
+    if (tUnix(t)) {
+        rtLoadAcq(f, "x", L("rec"), R_DONE);
+        rtIf(f, L("x"), "ne", I(0), "budget_kill_done");
+        rtLoad(f, "x", L("rec"), R_PROC, 8);
+        rtIf(f, L("x"), "le", I(0), "budget_kill_done");
+        rtOp(f, "x", I(0), "sub", L("x"));
+        uxSys(f, t, "", 62, xs2(L("x"), I(9)));
+    } else {
+        callWinImport(f, "", "TerminateJobObject", xs2(L("x"), I(1)));
+    }
+    rtLabel(f, "budget_kill_done");
+}
+
+export function budgetCloseWindows(f: Ref<RtFn>): void {
+    rtLoad(f, "x", L("rec"), R_JOB, 8);
+    rtIf(f, L("x"), "eq", I(0), "budget_close_done");
+    callWinImport(f, "", "CloseHandle", xs1(L("x")));
+    rtStore(f, L("rec"), R_JOB, I(0), 8);
+    rtLabel(f, "budget_close_done");
+}

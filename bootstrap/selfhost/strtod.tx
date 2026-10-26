@@ -1,0 +1,382 @@
+// strtod.tx——十进制文本→IEEE754 f64 位型的纯整数移植（批 B2 立卷；R 修复
+// 重写＝小模长 bignum 全域正确舍入——与 zig std.fmt.parseFloat 逐位一致，
+// round-to-nearest-even）。
+//
+// 旧版 i64 N/10^k 物化在 ±大指数面溢出（6.02e23→inf）且终段 N 装配误乘
+// 10^kk（3.14e-2 错值）——两缺陷同根：N/10^k 的 i64 域无法承载大 ±指数。
+// 重写算法：value＝D×10^E（D＝显著十进数字，E＝指数−小数位数折算）。
+//   num＝D×5^max(E,0)、den＝5^max(−E,0) ⇒ value＝(num/den)×2^E。
+//   30-bit limb 小端平面 bignum（List<int>）承载；num<<sh / den 移位减
+//   长除取商顶 56 位（54 存储＋守卫＋降位）＋sticky，near-even 舍入成
+//   Q54∈[2^53,2^54)；ee＝hi−55−sh＋s＋E（s＝商 56 位规格化位移 1|2），
+//   biased＝ee＋1073。次正规（biased≤0）右移 near-even 舍入；溢出→±inf；
+//   零→±0。
+//
+// 域：十进制字面量全域（指数解析 ±400 界；显著数字截 40 位——40≫2×
+// 54×log10(2) 保证截断不翻舍入决策；截断非零折入 sticky 保守面）。
+
+// —— bignum 基元（30-bit limb 小端）——
+
+const BN_BASE: int = 1073741824; // 2^30
+const BN_MASK: int = 0x3FFFFFFF;
+
+function bnBitlen(x: List<int>): int {
+    const n = listLen(x);
+    let top = n - 1;
+    while (top >= 0) {
+        if ((listGet(x, top) catch 0) != 0) { break; }
+        top = top - 1;
+    }
+    if (top < 0) { return 0; }
+    let v = listGet(x, top) catch 0;
+    let b = 0;
+    while (v > 0) { b = b + 1; v = v >>> 1; }
+    return top * 30 + b;
+}
+
+function bnCmp(a: List<int>, b: List<int>): int {
+    // 有效位长比较（trim 高位零 limb——bnShl 垫底零 limb 不得计长）。
+    let at = listLen(a) - 1;
+    while (at >= 0) {
+        if ((listGet(a, at) catch 0) != 0) { break; }
+        at = at - 1;
+    }
+    let bt = listLen(b) - 1;
+    while (bt >= 0) {
+        if ((listGet(b, bt) catch 0) != 0) { break; }
+        bt = bt - 1;
+    }
+    if (at != bt) {
+        if (at > bt) { return 1; }
+        return -1;
+    }
+    let i = at;
+    while (i >= 0) {
+        const av = listGet(a, i) catch 0;
+        const bv = listGet(b, i) catch 0;
+        if (av != bv) {
+            if (av > bv) { return 1; }
+            return -1;
+        }
+        i = i - 1;
+    }
+    return 0;
+}
+
+function bnSubInplace(a: List<int>, b: List<int>): void {
+    // a −= b（调用方保证 a ≥ b）。
+    let borrow = 0;
+    let i = 0;
+    const n = listLen(a);
+    while (i < n) {
+        const av = listGet(a, i) catch 0;
+        const bv = (listGet(b, i) catch 0) + borrow;
+        if (av >= bv) {
+            listSet(a, i, av - bv);
+            borrow = 0;
+        } else {
+            listSet(a, i, av + BN_BASE - bv);
+            borrow = 1;
+        }
+        i = i + 1;
+    }
+}
+
+function bnShl(x: List<int>, s: int): List<int> {
+    if (s <= 0) {
+        const same: List<int> = listNew();
+        let i0 = 0;
+        while (i0 < listLen(x)) { listPush(same, listGet(x, i0) catch 0); i0 = i0 + 1; }
+        return same;
+    }
+    const limbSh = s / 30;
+    const bitSh = s - limbSh * 30;
+    const n = listLen(x);
+    const out: List<int> = listNew();
+    let i = 0;
+    while (i < limbSh) { listPush(out, 0); i = i + 1; }
+    let carry = 0;
+    i = 0;
+    while (i < n) {
+        const v = listGet(x, i) catch 0;
+        const prod = v << bitSh;
+        const cur = (prod & BN_MASK) + carry;
+        listPush(out, cur & BN_MASK);
+        carry = (prod >>> 30) + (cur >>> 30);
+        i = i + 1;
+    }
+    if (carry > 0) { listPush(out, carry); }
+    let top = listLen(out) - 1;
+    while (top > 0) {
+        if ((listGet(out, top) catch 0) != 0) { break; }
+        listRemoveAt(out, top);
+        top = top - 1;
+    }
+    return out;
+}
+
+function bnMulSmall5(x: List<int>): void {
+    // x ×= 5（就地——5^k 逐步构建；limb×5＋carry < 2^33）。
+    let carry = 0;
+    let i = 0;
+    const n = listLen(x);
+    while (i < n) {
+        const v = (listGet(x, i) catch 0) * 5 + carry;
+        listSet(x, i, v & BN_MASK);
+        carry = v >>> 30;
+        i = i + 1;
+    }
+    while (carry > 0) {
+        listPush(x, carry & BN_MASK);
+        carry = carry >>> 30;
+    }
+}
+
+function bnMulSmall10Add(x: List<int>, d: int): void {
+    // x ×= 10 ＋ d（数字装配专用）。
+    let carry = d;
+    let i = 0;
+    const n = listLen(x);
+    while (i < n) {
+        const v = (listGet(x, i) catch 0) * 10 + carry;
+        listSet(x, i, v & BN_MASK);
+        carry = v >>> 30;
+        i = i + 1;
+    }
+    while (carry > 0) {
+        listPush(x, carry & BN_MASK);
+        carry = carry >>> 30;
+    }
+}
+
+function bnBitlenOfInt(v: int): int {
+    if (v <= 0) { return 0; }
+    let b = 0;
+    let x = v;
+    while (x > 0) { b = b + 1; x = x >>> 1; }
+    return b;
+}
+
+// —— 长除商顶位（sdQ56/sdS/sdSticky/sdBiasedRaw 承载返回）——
+let sdQ56: int = 0;
+let sdS: int = 0;
+let sdSticky: int = 0;
+let sdBiasedRaw: int = 0;
+
+function bnDivTop(num: List<int>, den: List<int>, bigE: int): void {
+    // num<<sh / den 商顶 56 位＋sticky → near-even 54 位 Q54＋ee。
+    const blN = bnBitlen(num);
+    const blD = bnBitlen(den);
+    const diff = blN - blD;
+    let sh = 0;
+    if (diff < 55) { sh = 55 - diff; }
+    const hi = diff + sh;
+    const r = bnShl(num, sh);
+    // 商位 [hi .. hi−55]（56 位——q56 bit0＝位置 hi−55）。
+    let q56: int = 0;
+    let j = hi;
+    while (j >= hi - 55) {
+        const t = bnShl(den, j);
+        if (bnCmp(r, t) >= 0) {
+            bnSubInplace(r, t);
+            q56 = q56 | (1 << (j - hi + 55));
+        }
+        j = j - 1;
+    }
+    // sticky＝余数非零（ε＝Q_rem/2^(hi−55)≠0——floor 位与纯小数余都算；
+    // r≥den 旧判丢纯小数余——62907577e-9 族 1 ULP 活捉）。
+    let sticky = 0;
+    let zi = 0;
+    while (zi < listLen(r)) {
+        if ((listGet(r, zi) catch 0) != 0) { sticky = 1; break; }
+        zi = zi + 1;
+    }
+    // 规格化：q56∈[2^54,2^56)——s＝bl(q56)−54∈{1,2}。ee0＝hi−55+E−sh
+    //（value＝q56×2^ee0＋ε，ε<ulp 非零 ⟺ sticky）；biasedRaw＝ee0＋s＋1076。
+    // 舍入在组装级自 q56 单级 near-even（两级链会损耗 sticky——0.1/31 例活捉）。
+    const s = bnBitlenOfInt(q56) - 54;
+    sdQ56 = q56;
+    sdS = s;
+    sdSticky = sticky;
+    sdBiasedRaw = hi - 55 + bigE - sh + s + 1076;
+}
+
+function infBits(neg: bool): int {
+    let bits: int = 2047 << 52;
+    if (neg) { bits = bits | (-9223372036854775807 - 1); }
+    return bits;
+}
+
+// —— IEEE754 组装（Q54∈[2^53,2^54)，biased＝ee＋1073）——
+function sdAssemble(q56: int, s: int, sticky: int, biasedRaw: int, neg: bool): int {
+    if (biasedRaw >= 2047) { return infBits(neg); }
+    if (biasedRaw >= 1) {
+        // 正规：m̂＝round_half_even(q56/2^(s+1)＋ε)——low 与半界比较，恰半
+        // 时 sticky（ε≠0）或奇 base 入（near-even）。
+        const half = 1 << s;
+        const low = q56 & ((1 << (s + 1)) - 1);
+        let m = q56 >>> (s + 1);
+        if (low > half) { m = m + 1; }
+        else if (low == half && (sticky == 1 || (m & 1) == 1)) { m = m + 1; }
+        let useBiased = biasedRaw;
+        if (m >= 9007199254740992) { m = m >>> 1; useBiased = biasedRaw + 1; }
+        let bits = ((useBiased << 52) & 0x7FFFFFFFFFFFFFFF) | (m - 4503599627370496);
+        if (neg) { bits = bits | (-9223372036854775807 - 1); }
+        return bits;
+    }
+    // 次正规：field＝round_half_even(q56×2^T＋ε)，T＝biasedRaw−s−2 ⇒
+    // 右移 sh＝s＋2−biasedRaw（≥3）；移位域钳制（S1 位移 0..63）。
+    const sh = s + 2 - biasedRaw;
+    if (sh >= 60) {
+        if (neg) { return -9223372036854775807 - 1; }
+        return 0;
+    }
+    const half = 1 << (sh - 1);
+    const low = q56 & ((1 << sh) - 1);
+    let field = q56 >>> sh;
+    if (low > half) { field = field + 1; }
+    else if (low == half && (sticky == 1 || (field & 1) == 1)) { field = field + 1; }
+    if (field >= 4503599627370496) {
+        // 2^52 进位——升最小正规（biased 1，尾码 0）。
+        let bits = 1 << 52;
+        if (neg) { bits = bits | (-9223372036854775807 - 1); }
+        return bits;
+    }
+    if (field == 0) {
+        if (neg) { return -9223372036854775807 - 1; }
+        return 0;
+    }
+    let bits = field;
+    if (neg) { bits = bits | (-9223372036854775807 - 1); }
+    return bits;
+}
+
+// 便捷入口：十进制文本（[−]int.frac[e±d] 形）→ 位型。
+export function strtodBits(raw: string): int {
+    const k = sdParse(raw);
+    if (k == 1) { return sdZero(sdNeg); }
+    if (k == 2) { return infBits(sdNeg); }
+    return sdAssemble(sdQ56, sdS, sdSticky, sdBiasedRaw, sdNeg);
+}
+
+// 定宽数值（O4 第二步）：十进制文本直接正确舍入到最近的 f32（不经 f64，免去两次舍入），
+// 结果按运行期的 f32 表示返回该值的 f64 位型。
+export function strtodF32Bits(raw: string): int {
+    const k = sdParse(raw);
+    if (k == 1) { return sdZero(sdNeg); }
+    if (k == 2) { return infBits(sdNeg); }
+    return sdAssemble32(sdQ56, sdS, sdSticky, sdBiasedRaw, sdNeg);
+}
+
+function sdZero(neg: bool): int {
+    if (neg) { return -9223372036854775807 - 1; }
+    return 0;
+}
+
+// f32 组装：q56 的顶 24 位为有效数（near-even，sticky 同 f64），f32 偏置指数＝biasedRaw−896；
+// 次正规按 2^−149 的倍数舍入；再把这个 f32 值精确写成 f64 位型。
+function sdAssemble32(q56: int, s: int, sticky: int, biasedRaw: int, neg: bool): int {
+    let b32 = biasedRaw - 896;
+    let sh = s + 30;
+    if (b32 < 1) { sh = s + 31 - b32; }
+    if (sh >= 60) { return sdZero(neg); }
+    const half = 1 << (sh - 1);
+    const low = q56 & ((1 << sh) - 1);
+    let m = q56 >>> sh;
+    if (low > half) { m = m + 1; }
+    else if (low == half && (sticky == 1 || (m & 1) == 1)) { m = m + 1; }
+    if (b32 >= 1 && m >= 16777216) { m = m >>> 1; b32 = b32 + 1; }
+    if (b32 >= 255) { return infBits(neg); }
+    if (m == 0) { return sdZero(neg); }
+    // 值＝m×2^(e−23)：正规时 e＝b32−127；次正规时 e＝−126（m＜2^23，进位到 2^23 即最小正规）。
+    let e = b32 - 127;
+    if (b32 < 1) { e = -126; }
+    let top = 0;
+    let t = m;
+    while (t > 1) { t = t >>> 1; top = top + 1; }
+    let bits = ((e - 23 + top + 1023) << 52) | ((m << (52 - top)) & 4503599627370495);
+    if (neg) { bits = bits | (-9223372036854775807 - 1); }
+    return bits;
+}
+
+let sdNeg: bool = false;
+
+// 解析十进制文本：0＝有效值（商顶位在 sdQ56/sdS/sdSticky/sdBiasedRaw），1＝零，2＝溢出到 ±inf；符号在 sdNeg。
+function sdParse(raw: string): int {
+    let neg = false;
+    let i = 0;
+    if (len(raw) > 0 && (byteAt(raw, 0) catch 48) == 45) { neg = true; i = 1; }
+    sdNeg = neg;
+    const digits: List<int> = listNew();
+    let fracCount = 0;
+    let seenDot = false;
+    let exp = 0;
+    let anyDigit = false;
+    while (i < len(raw)) {
+        const c = byteAt(raw, i) catch 48;
+        if (c == 46) { seenDot = true; i = i + 1; continue; }
+        if (c == 101 || c == 69) {
+            i = i + 1;
+            let eneg = false;
+            if (i < len(raw) && (byteAt(raw, i) catch 48) == 43) { i = i + 1; }
+            else if (i < len(raw) && (byteAt(raw, i) catch 48) == 45) { eneg = true; i = i + 1; }
+            while (i < len(raw)) {
+                const d = byteAt(raw, i) catch 48;
+                if (d < 48 || d > 57) { break; }
+                exp = exp * 10 + (d - 48);
+                if (exp > 400) { exp = 400; }
+                i = i + 1;
+            }
+            if (eneg) { exp = -exp; }
+            break;
+        }
+        if (c < 48 || c > 57) { break; }
+        anyDigit = true;
+        listPush(digits, c - 48);
+        if (seenDot) { fracCount = fracCount + 1; }
+        i = i + 1;
+    }
+    if (anyDigit == false) { return 1; }
+    // 显著化：剥前导零；剥尾零（E 随补）。
+    while (listLen(digits) > 0 && (listGet(digits, 0) catch 0) == 0) { listRemoveAt(digits, 0); }
+    let E = exp - fracCount;
+    while (listLen(digits) > 0 && (listGet(digits, listLen(digits) - 1) catch 0) == 0) {
+        listRemoveAt(digits, listLen(digits) - 1);
+        E = E + 1;
+    }
+    if (listLen(digits) == 0) { return 1; }
+    // 显著数字截 340 位：E 随移（截断位权＝10^E 补偿——40 版掉位不改 E
+    // 的量级错为 10^−k 活捉）＋截断非零折 sticky。340≫9＋3×54×log10(2)
+    //（Clinger 正规面）＋次正规底（10^−340＜2^−1129）＝double 域正确舍入。
+    let stickyTrunc = 0;
+    while (listLen(digits) > 340) {
+        const dropped = listGet(digits, listLen(digits) - 1) catch 0;
+        listRemoveAt(digits, listLen(digits) - 1);
+        E = E + 1;
+        if (dropped != 0) { stickyTrunc = 1; }
+    }
+    // E 域钳制（病态长字面量规模界；±430 判据：10^430>max_double、
+    // 10^(−430+40)<min_subnormal——决策面在域外）。
+    if (E > 430) { return 2; }
+    if (E < -430) { return 1; }
+    // num＝D；den＝1；E>0 ⇒ num×5^E；E<0 ⇒ den＝5^−E。
+    const num: List<int> = listNew();
+    listPush(num, 0);
+    let di = 0;
+    while (di < listLen(digits)) {
+        bnMulSmall10Add(num, listGet(digits, di) catch 0);
+        di = di + 1;
+    }
+    const den: List<int> = listNew();
+    listPush(den, 1);
+    if (E > 0) {
+        let k = 0;
+        while (k < E) { bnMulSmall5(num); k = k + 1; }
+    } else if (E < 0) {
+        let k = 0;
+        while (k < -E) { bnMulSmall5(den); k = k + 1; }
+    }
+    bnDivTop(num, den, E);
+    if (stickyTrunc == 1) { sdSticky = 1; }
+    return 0;
+}

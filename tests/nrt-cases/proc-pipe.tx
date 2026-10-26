@@ -1,0 +1,324 @@
+// 第 6 轮 6c-3 工具链进程与标准输入内建（TOOL-103；仅 --toolchain，伴文件 proc-pipe.toolchain）。程序以子模式启动
+// 自身，核对：回声往返与分段读、stdinRead 超时、stdoutWrite 不补换行、大载荷同时排干 stdout 与 stderr（不死锁、
+// 两路分离）、选中的流都已读完时 ioWait 立即返回、超时等待与 kill、stdin 接空设备时读到 EOF、程序不存在、
+// 工作目录（有效与无效）、控制通道的环境变量与对端关闭后的读写。
+const CHANNEL: string = "TAIXU_DEBUG_CHANNEL";
+const MARKER: string = "taixu-proc-pipe-cwd.txt";
+
+function sep(): string {
+    if (hostTarget() == "windows") { return "\\"; }
+    return "/";
+}
+
+function argvOf(mode: string): List< string> {
+    const xs: List< string> = listNew();
+    listPush(xs, mode);
+    return xs;
+}
+
+function out(s: string): int {
+    const n = stdoutWrite(bytesFromStr(s));
+    if (n != len(s)) { return 1; }
+    return 0;
+}
+
+function pause(ms: int): void {
+    const end = monoNs() + ms * 1000000;
+    while (monoNs() < end) {
+        const spin = 0;
+    }
+}
+
+function repeatChar(c: string, n: int): string {
+    let s = c;
+    while (len(s) < n) { s = s + s; }
+    return strSub(s, 0, n);
+}
+
+// —— 子模式 ——
+
+function childEcho(): int {
+    const buf = bytesNew(64);
+    const first = stdinRead(buf, 50);
+    if (out("t=" + toStr(first) + "\n") != 0) { return 6; }
+    let seen = "";
+    while (strIndexOf(seen, "quit\n") < 0) {
+        const n = stdinRead(buf, 10000);
+        if (n < 0) { return 3; }
+        if (n == 0) { return 4; }
+        const chunk = bytesSlice(buf, 0, n);
+        if (stdoutWrite(chunk) != n) { return 5; }
+        seen = seen + (bytesToStr(chunk) catch "?");
+    }
+    return 0;
+}
+
+function childBig(): int {
+    const a = bytesNew(4096);
+    let k = 0;
+    while (k < 64) {
+        let i = 0;
+        while (i < 4096) {
+            bytesSet(a, i, (k * 4096 + i) % 251);
+            i = i + 1;
+        }
+        if (stdoutWrite(a) != 4096) { return 3; }
+        eprint(repeatChar(strSub("abcdefghijklmnopqrstuvwxyz", k % 26, 1), 4095));
+        k = k + 1;
+    }
+    return 7;
+}
+
+function childBlock(): int {
+    const r = stdinRead(bytesNew(8), 100000);
+    return 40 + r;
+}
+
+function childEof(): int {
+    const r = stdinRead(bytesNew(8), 5000);
+    return out("eof=" + toStr(r) + "\n");
+}
+
+function childCwd(): int {
+    const text = readFile(MARKER) catch "<unreadable>";
+    return out("cwd=" + text + "\n");
+}
+
+function childEnv(): int {
+    const v = getEnv(CHANNEL) catch "";
+    if (len(v) == 0) { return out("channel=none\n"); }
+    const comma = strIndexOf(v, ",");
+    let ok = comma > 0 && comma < len(v) - 1;
+    let i = 0;
+    while (i < len(v)) {
+        const c = byteAt(v, i) catch 0;
+        if (i != comma && (c < 48 || c > 57)) { ok = false; }
+        i = i + 1;
+    }
+    return out("channel=" + toStr(ok) + "\n");
+}
+
+// —— 父进程 ——
+
+// 从 stdout 读到含 want 为止；超时或流尾时在末尾标出。
+function readUntil(h: int, want: string, buf: Bytes): string {
+    let got = "";
+    while (strIndexOf(got, want) < 0) {
+        const r = ioWait(h, 2, 10000);
+        if (r == 0) { return got + "<timeout>"; }
+        const n = procRead(h, 1, buf);
+        if (n < 0) { return got + "<eof>"; }
+        got = got + (bytesToStr(bytesSlice(buf, 0, n)) catch "?");
+    }
+    return got;
+}
+
+function spawnError(exe: string, mode: string, cwd: string): string {
+    const h = procSpawn(exe, argvOf(mode), cwd, 0) catch (e) { return e.message; };
+    procClose(h);
+    return "started";
+}
+
+function testEcho(me: string): void {
+    const h = procSpawn(me, argvOf("echo"), "", 1) catch (e) {
+        print("echo spawn failed: " + e.message);
+        return;
+    };
+    const buf = bytesNew(64);
+    print("echo first line: " + toStr(readUntil(h, "\n", buf) == "t=0\n"));
+    print("write hel: " + toStr(procWrite(h, 0, bytesFromStr("hel"))));
+    pause(30);
+    print("write lo: " + toStr(procWrite(h, 0, bytesFromStr("lo\n"))));
+    print("echo round trip: " + toStr(readUntil(h, "hello\n", buf) == "hello\n"));
+    procWrite(h, 0, bytesFromStr("quit\n"));
+    print("echo tail: " + toStr(readUntil(h, "<never>", buf) == "quit\n<eof>"));
+    print("echo exit: " + toStr(procWait(h, 10000) catch -999));
+    print("read after eof: " + toStr(procRead(h, 1, buf)));
+    print("write after exit: " + toStr(procWrite(h, 0, bytesFromStr("late\n"))));
+    procClose(h);
+}
+
+function sumBytes(buf: Bytes, n: int): int {
+    let s = 0;
+    let i = 0;
+    while (i < n) {
+        s = s + (bytesGet(buf, i) catch 0);
+        i = i + 1;
+    }
+    return s;
+}
+
+function testBig(me: string): void {
+    const h = procSpawn(me, argvOf("big"), "", 0) catch (e) {
+        print("big spawn failed: " + e.message);
+        return;
+    };
+    const buf = bytesNew(65536);
+    let outN = 0;
+    let errN = 0;
+    let outSum = 0;
+    let errSum = 0;
+    let outOpen = true;
+    let errOpen = true;
+    while (outOpen || errOpen) {
+        let mask = 0;
+        if (outOpen) { mask = mask | 2; }
+        if (errOpen) { mask = mask | 4; }
+        const r = ioWait(h, mask, 10000);
+        if (r == 0) {
+            print("big: timeout");
+            break;
+        }
+        if ((r & 2) != 0) {
+            const n = procRead(h, 1, buf);
+            if (n < 0) { outOpen = false; } else { outN = outN + n; outSum = outSum + sumBytes(buf, n); }
+        }
+        if ((r & 4) != 0) {
+            const n = procRead(h, 2, buf);
+            if (n < 0) { errOpen = false; } else { errN = errN + n; errSum = errSum + sumBytes(buf, n); }
+        }
+    }
+    print("big exit: " + toStr(procWait(h, 10000) catch -999));
+    print("big stdout bytes: " + toStr(outN) + ", stderr bytes: " + toStr(errN));
+    let wantOut = 0;
+    let p = 0;
+    while (p < 64 * 4096) {
+        wantOut = wantOut + p % 251;
+        p = p + 1;
+    }
+    let wantErr = 0;
+    let k = 0;
+    while (k < 64) {
+        wantErr = wantErr + 4095 * (97 + k % 26) + 10;
+        k = k + 1;
+    }
+    print("big stdout content ok: " + toStr(outSum == wantOut));
+    print("big stderr content ok: " + toStr(errSum == wantErr));
+    const t0 = monoNs();
+    print("wait on closed streams: " + toStr(ioWait(h, 6, 10000)));
+    print("returned at once: " + toStr(monoNs() - t0 < 5000000000));
+    procClose(h);
+}
+
+function testKill(me: string): void {
+    const h = procSpawn(me, argvOf("block"), "", 1) catch (e) {
+        print("block spawn failed: " + e.message);
+        return;
+    };
+    print("wait before kill: " + toStr(procWait(h, 100) catch -999));
+    procKill(h);
+    const code = procWait(h, 10000) catch -999;
+    print("killed: " + toStr(code == 1 || code == -9));
+    procKill(h);
+    print("wait again: " + toStr((procWait(h, 0) catch -999) == code));
+    procClose(h);
+}
+
+function testEof(me: string): void {
+    const h = procSpawn(me, argvOf("eof"), "", 0) catch (e) {
+        print("eof spawn failed: " + e.message);
+        return;
+    };
+    const buf = bytesNew(64);
+    print("stdin eof: " + toStr(readUntil(h, "<never>", buf) == "eof=-1\n<eof>"));
+    print("eof exit: " + toStr(procWait(h, 10000) catch -999));
+    print("write to null stdin: " + toStr(procWrite(h, 0, bytesFromStr("x"))));
+    procClose(h);
+}
+
+function testCwd(me: string, tmp: string): void {
+    const marker = tmp + sep() + MARKER;
+    writeFile(marker, "marker-ok") catch (e) {
+        print("marker write failed: " + e.message);
+        return;
+    };
+    const h = procSpawn(me, argvOf("cwd"), tmp, 0) catch (e) {
+        print("cwd spawn failed: " + e.message);
+        return;
+    };
+    const buf = bytesNew(64);
+    print("cwd: " + toStr(readUntil(h, "<never>", buf) == "cwd=marker-ok\n<eof>"));
+    print("cwd exit: " + toStr(procWait(h, 10000) catch -999));
+    procClose(h);
+    removeFile(marker) catch (e) { print("marker remove failed: " + e.message); };
+    const badDir = tmp + sep() + "taixu-proc-pipe-no-such-dir";
+    const m = spawnError(me, "cwd", badDir);
+    print("bad cwd: " + toStr(strIndexOf(m, "no such file") >= 0 && strIndexOf(m, "taixu-proc-pipe-no-such-dir") >= 0));
+}
+
+// 带控制通道的子进程读到流尾。本程序的调试构建（语义透明门以 --debug 构建全部用例）里，子进程的薄桩会在通道上
+// 先发 HELLO（37 字节）再等命令：收齐后回一个 RUN continue，让它照常运行；普通构建的子进程不写通道。
+function drainWithChannel(h: int, buf: Bytes): string {
+    let got = "";
+    let ctlBytes = 0;
+    let answered = false;
+    let ctlOpen = true;
+    while (true) {
+        let mask = 2;
+        if (ctlOpen) { mask = mask | 8; }
+        const r = ioWait(h, mask, 10000);
+        if (r == 0) { return got + "<timeout>"; }
+        if ((r & 8) != 0) {
+            const n = procRead(h, 3, buf);
+            if (n < 0) { ctlOpen = false; } else { ctlBytes = ctlBytes + n; }
+            if (!answered && ctlBytes >= 37) {
+                answered = true;
+                const run = bytesNew(21);
+                bytesSet(run, 0, 17);
+                bytesSet(run, 4, 11);
+                if (procWrite(h, 3, run) != 21) { return got + "<run failed>"; }
+            }
+        }
+        if ((r & 2) != 0) {
+            const n = procRead(h, 1, buf);
+            if (n < 0) { return got + "<eof>"; }
+            got = got + (bytesToStr(bytesSlice(buf, 0, n)) catch "?");
+        }
+    }
+    return got;
+}
+
+function testChannel(me: string): void {
+    const buf = bytesNew(64);
+    const h = procSpawn(me, argvOf("env"), "", 2) catch (e) {
+        print("channel spawn failed: " + e.message);
+        return;
+    };
+    print("with channel: " + toStr(drainWithChannel(h, buf) == "channel=true\n<eof>"));
+    print("channel exit: " + toStr(procWait(h, 10000) catch -999));
+    print("channel read after exit: " + toStr(procRead(h, 3, buf)));
+    print("channel write after exit: " + toStr(procWrite(h, 3, bytesFromStr("x"))));
+    procClose(h);
+    const g = procSpawn(me, argvOf("env"), "", 0) catch (e) {
+        print("plain spawn failed: " + e.message);
+        return;
+    };
+    print("without channel: " + toStr(readUntil(g, "<never>", buf) == "channel=none\n<eof>"));
+    print("no channel read: " + toStr(procRead(g, 3, buf)));
+    procClose(g);
+}
+
+function main(args: []string): int {
+    if (len(args) > 0) {
+        const mode = args[0];
+        if (mode == "echo") { return childEcho(); }
+        if (mode == "big") { return childBig(); }
+        if (mode == "block") { return childBlock(); }
+        if (mode == "eof") { return childEof(); }
+        if (mode == "cwd") { return childCwd(); }
+        if (mode == "env") { return childEnv(); }
+        return 99;
+    }
+    const me = selfExePath();
+    const tmp = tempDir();
+    testEcho(me);
+    testBig(me);
+    testKill(me);
+    testEof(me);
+    testCwd(me, tmp);
+    testChannel(me);
+    const m = spawnError(tmp + sep() + "taixu-proc-pipe-no-such-program", "x", "");
+    print("missing program: " + toStr(strIndexOf(m, "no such file") >= 0));
+    print("empty path: " + toStr(strIndexOf(spawnError("", "x", ""), "invalid argument") >= 0));
+    return 0;
+}

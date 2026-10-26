@@ -1,0 +1,251 @@
+// 分配器的可移植版（rtfn 写，macOS 适配 M4 设计 A8）：语义与导出名同 runtime_memory_gen.tx 的 allocProc、freeProc、reallocProc（NRT 形）。
+// 每线程一个堆，状态在线程块里（thread_block_abi.tx）：TB_MEM_STATE 起 11 条尺寸类空闲链（16..16384，各 8 字节）、TB_MEM_PAGES 小块页链、
+// TB_BIG_CACHE 大块缓存（{数@0, 总字节@8}，16 项 {基址@16+16i, 页长@24+16i}）、TB_BIG_LIST 活着的大块链。
+// 小块：块头 16 字节，分配态是数据尺寸、空闲态是链指针，用户指针＝块头＋16；新页 max(尺寸×8+144, 65536) 字节，页头 {下一页@0, 页长@8}，
+// 自偏移 16 起逐块雕刻，首块留用，其余按地址升序推入本类链。大块：总长＝(need+32+4095) & −4096，块头 32 字节 {prev, next, 总长, 0}，
+// 用户指针＝基址＋32（[用户指针−16] 仍是总长，释放据此区分大小块）；释放时缓存未满（≤16 项、≤64 MiB）则入缓存，否则整页归还。
+// 页经平台适配例程取得与归还（kname）。只保证私有约定：易失寄存器被破坏（调用点核查见 kernel_rc_generic.tx 的文件注释）。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, L, I, A } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtShift, rtLoad, rtStore, rtLabel, rtJump, rtIf, rtCall1, rtCall2, rtCall3, rtCall4, rtRet, rtRetVoid } from "./rtfn";
+import { TB_MEM_STATE, TB_MEM_PAGES, TB_BIG_CACHE, TB_BIG_LIST } from "./thread_block_abi";
+import { tSysV, tRawSyscall, tMacos, tKernel32 } from "./target";
+
+const MODULE: string = "bootstrap/selfhost/kernel_alloc_generic.tx";
+// need＋32＋4095 不溢出（有符号）的最大 need：手写版两次 add 后各有一个 jo。
+const BIG_NEED_MAX: int = 9223372036854771680;
+const SMALL_MAX: int = 16384;
+// 释放时据块头长度区分：小块的数据尺寸 ≤ 16384，大块的总长 ≥ 20480。
+const SMALL_HEAD_MAX: int = 16400;
+const CACHE_ITEMS: int = 16;
+const CACHE_BYTES: int = 67108864;
+// VirtualAlloc 的 MEM_COMMIT|MEM_RESERVE、PAGE_READWRITE；VirtualFree 的 MEM_RELEASE（页适配器按同样的实参位置取用）。
+const MEM_COMMIT_RESERVE: int = 12288;
+const PAGE_RW: int = 4;
+const MEM_RELEASE: int = 32768;
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// 内核内部的调用名（同 runtime_memory_gen.tx 的 nativeName）：SysV 目标的 memcpy／memset 改调私有约定的 __tx_linux_*；
+// 不经 kernel32 的目标由页适配器代替 VirtualAlloc／VirtualFree。
+function kname(t: int, name: string): string {
+    if (tSysV(t) && (name == "memcpy" || name == "memset" || name == "memmove")) { return "__tx_linux_" + name; }
+    if (tRawSyscall(t)) {
+        if (name == "VirtualAlloc") { return "__tx_linux_page_alloc"; }
+        if (name == "VirtualFree") { return "__tx_linux_page_free"; }
+    }
+    if (tMacos(t)) {
+        if (name == "VirtualAlloc") { return "__tx_mac_page_alloc"; }
+        if (name == "VirtualFree") { return "__tx_mac_page_free"; }
+    }
+    return name;
+}
+
+// fl = 本线程尺寸类 size 的空闲链头的地址：TB_MEM_STATE 起，k = size/16 逐半至 ≤1（等价 ctz(size/16)，同手写版的 ciWalk）。
+function classList(f: Ref<RtFn>, fl: string, size: string, k: string, tag: string): void {
+    rtSet(f, fl, A("__tx_nrt_tb"));
+    rtOp(f, fl, L(fl), "add", I(TB_MEM_STATE));
+    rtShift(f, k, L(size), "shr", 4);
+    rtLabel(f, tag);
+    rtIf(f, L(k), "ule", I(1), tag + "done");
+    rtOp(f, fl, L(fl), "add", I(8));
+    rtShift(f, k, L(k), "shr", 1);
+    rtJump(f, tag);
+    rtLabel(f, tag + "done");
+}
+
+// __tx_native_mem_alloc(size, align) → 指针，或 0（size 为负、align 不是 1..16 的 2 的幂、大块长度溢出、取页失败）。
+function allocFn(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    const f = rtBegin(b, "__tx_native_mem_alloc", "size align", "need total cache n i e base x ds fl k head pp page cur stride", 4, MODULE);
+    rtIf(f, L("size"), "lt", I(0), "null");
+    rtIf(f, L("align"), "eq", I(0), "null");
+    rtIf(f, L("align"), "ugt", I(16), "null");
+    rtOp(f, "x", L("align"), "sub", I(1));
+    rtOp(f, "x", L("x"), "and", L("align"));
+    rtIf(f, L("x"), "ne", I(0), "null");
+    rtSet(f, "need", L("size"));
+    rtIf(f, L("need"), "uge", I(1), "need1");
+    rtSet(f, "need", I(1));
+    rtLabel(f, "need1");
+    rtIf(f, L("align"), "ule", L("need"), "need2");
+    rtSet(f, "need", L("align"));
+    rtLabel(f, "need2");
+    rtIf(f, L("need"), "ule", I(SMALL_MAX), "small");
+    // 大块：先在缓存里找页长恰好相等的项（命中则移出、末项补位，整块清零后复用，与新映射的页同为全零）。
+    rtIf(f, L("need"), "gt", I(BIG_NEED_MAX), "null");
+    rtOp(f, "total", L("need"), "add", I(4127));
+    rtOp(f, "total", L("total"), "and", I(-4096));
+    rtSet(f, "cache", A("__tx_nrt_tb"));
+    rtOp(f, "cache", L("cache"), "add", I(TB_BIG_CACHE));
+    rtLoad(f, "n", L("cache"), 0, 8);
+    rtSet(f, "i", I(0));
+    rtLabel(f, "scan");
+    rtIf(f, L("i"), "uge", L("n"), "miss");
+    rtShift(f, "e", L("i"), "shl", 4);
+    rtOp(f, "e", L("e"), "add", L("cache"));
+    rtLoad(f, "x", L("e"), 24, 8);
+    rtIf(f, L("total"), "eq", L("x"), "hit");
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "scan");
+    rtLabel(f, "hit");
+    rtLoad(f, "base", L("e"), 16, 8);
+    rtOp(f, "n", L("n"), "sub", I(1));
+    rtStore(f, L("cache"), 0, L("n"), 8);
+    rtShift(f, "x", L("n"), "shl", 4);
+    rtOp(f, "i", L("x"), "add", L("cache"));
+    rtLoad(f, "x", L("i"), 16, 8);
+    rtStore(f, L("e"), 16, L("x"), 8);
+    rtLoad(f, "x", L("i"), 24, 8);
+    rtStore(f, L("e"), 24, L("x"), 8);
+    rtLoad(f, "x", L("cache"), 8, 8);
+    rtOp(f, "x", L("x"), "sub", L("total"));
+    rtStore(f, L("cache"), 8, L("x"), 8);
+    rtCall3(f, "", kname(t, "memset"), L("base"), I(0), L("total"));
+    rtJump(f, "link");
+    rtLabel(f, "miss");
+    rtCall4(f, "base", kname(t, "VirtualAlloc"), I(0), L("total"), I(MEM_COMMIT_RESERVE), I(PAGE_RW));
+    rtIf(f, L("base"), "eq", I(0), "null");
+    // 块头 {prev@0 = 0, next@8 = 原链头, 总长@16}，头插进本线程的大块链；[基址+24] 不写（新页与清零后的缓存块都是 0）。
+    rtLabel(f, "link");
+    rtStore(f, L("base"), 16, L("total"), 8);
+    rtStore(f, L("base"), 0, I(0), 8);
+    rtLoad(f, "head", A("__tx_nrt_tb"), TB_BIG_LIST, 8);
+    rtStore(f, L("base"), 8, L("head"), 8);
+    rtIf(f, L("head"), "eq", I(0), "linked");
+    rtStore(f, L("head"), 0, L("base"), 8);
+    rtLabel(f, "linked");
+    rtStore(f, A("__tx_nrt_tb"), TB_BIG_LIST, L("base"), 8);
+    rtOp(f, "x", L("base"), "add", I(32));
+    rtRet(f, L("x"));
+    rtLabel(f, "null");
+    rtRet(f, I(0));
+    // 小块：数据尺寸从 16 倍增到 ≥ need，本类链非空则取链头。
+    rtLabel(f, "small");
+    rtSet(f, "ds", I(16));
+    rtLabel(f, "grow");
+    rtIf(f, L("ds"), "uge", L("need"), "grown");
+    rtOp(f, "ds", L("ds"), "add", L("ds"));
+    rtJump(f, "grow");
+    rtLabel(f, "grown");
+    classList(f, "fl", "ds", "k", "ci");
+    rtLoad(f, "head", L("fl"), 0, 8);
+    rtIf(f, L("head"), "eq", I(0), "carve");
+    rtLoad(f, "x", L("head"), 0, 8);
+    rtStore(f, L("fl"), 0, L("x"), 8);
+    rtStore(f, L("head"), 0, L("ds"), 8);
+    rtOp(f, "x", L("head"), "add", I(16));
+    rtRet(f, L("x"));
+    // 新页入本线程的页链，再逐块雕刻：每块先写长度，首块留用，其余块头改写为链指针推入本类链。
+    rtLabel(f, "carve");
+    rtShift(f, "pp", L("ds"), "shl", 3);
+    rtOp(f, "pp", L("pp"), "add", I(144));
+    rtIf(f, L("pp"), "uge", I(65536), "pp");
+    rtSet(f, "pp", I(65536));
+    rtLabel(f, "pp");
+    rtCall4(f, "page", kname(t, "VirtualAlloc"), I(0), L("pp"), I(MEM_COMMIT_RESERVE), I(PAGE_RW));
+    rtIf(f, L("page"), "eq", I(0), "null");
+    rtLoad(f, "x", A("__tx_nrt_tb"), TB_MEM_PAGES, 8);
+    rtStore(f, L("page"), 0, L("x"), 8);
+    rtStore(f, L("page"), 8, L("pp"), 8);
+    rtStore(f, A("__tx_nrt_tb"), TB_MEM_PAGES, L("page"), 8);
+    rtOp(f, "stride", L("ds"), "add", I(16));
+    rtOp(f, "cur", L("page"), "add", I(16));
+    rtLabel(f, "carving");
+    rtOp(f, "x", L("cur"), "sub", L("page"));
+    rtOp(f, "x", L("x"), "add", L("stride"));
+    rtIf(f, L("x"), "ugt", L("pp"), "carved");
+    rtStore(f, L("cur"), 0, L("ds"), 8);
+    rtOp(f, "x", L("page"), "add", I(16));
+    rtIf(f, L("cur"), "eq", L("x"), "kept");
+    rtLoad(f, "x", L("fl"), 0, 8);
+    rtStore(f, L("cur"), 0, L("x"), 8);
+    rtStore(f, L("fl"), 0, L("cur"), 8);
+    rtLabel(f, "kept");
+    rtOp(f, "cur", L("cur"), "add", L("stride"));
+    rtJump(f, "carving");
+    rtLabel(f, "carved");
+    rtOp(f, "x", L("page"), "add", I(32));
+    rtRet(f, L("x"));
+    done(f, failures);
+}
+
+// __tx_native_mem_free(ptr)：空指针什么也不做。小块推入本类链；大块先从本线程的大块链摘下，再入缓存或整页归还。
+function freeFn(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    const f = rtBegin(b, "__tx_native_mem_free", "ptr", "h size base prev next cache n x fl k", 3, MODULE);
+    rtIf(f, L("ptr"), "eq", I(0), "out");
+    rtOp(f, "h", L("ptr"), "sub", I(16));
+    rtLoad(f, "size", L("h"), 0, 8);
+    rtIf(f, L("size"), "ule", I(SMALL_HEAD_MAX), "small");
+    rtOp(f, "base", L("h"), "sub", I(16));
+    rtLoad(f, "prev", L("base"), 0, 8);
+    rtLoad(f, "next", L("base"), 8, 8);
+    rtIf(f, L("prev"), "eq", I(0), "unhead");
+    rtStore(f, L("prev"), 8, L("next"), 8);
+    rtJump(f, "unnext");
+    rtLabel(f, "unhead");
+    rtStore(f, A("__tx_nrt_tb"), TB_BIG_LIST, L("next"), 8);
+    rtLabel(f, "unnext");
+    rtIf(f, L("next"), "eq", I(0), "unlinked");
+    rtStore(f, L("next"), 0, L("prev"), 8);
+    rtLabel(f, "unlinked");
+    rtSet(f, "cache", A("__tx_nrt_tb"));
+    rtOp(f, "cache", L("cache"), "add", I(TB_BIG_CACHE));
+    rtLoad(f, "n", L("cache"), 0, 8);
+    rtIf(f, L("n"), "uge", I(CACHE_ITEMS), "release");
+    rtLoad(f, "x", L("cache"), 8, 8);
+    rtOp(f, "x", L("x"), "add", L("size"));
+    rtIf(f, L("x"), "ugt", I(CACHE_BYTES), "release");
+    rtStore(f, L("cache"), 8, L("x"), 8);
+    rtShift(f, "x", L("n"), "shl", 4);
+    rtOp(f, "x", L("x"), "add", L("cache"));
+    rtStore(f, L("x"), 16, L("base"), 8);
+    rtStore(f, L("x"), 24, L("size"), 8);
+    rtOp(f, "n", L("n"), "add", I(1));
+    rtStore(f, L("cache"), 0, L("n"), 8);
+    rtRetVoid(f);
+    // 整页归还：VirtualFree(基址, 0, MEM_RELEASE)；页适配器的第二个实参是长度（munmap 要它）。
+    rtLabel(f, "release");
+    if (tKernel32(t)) { rtCall3(f, "", kname(t, "VirtualFree"), L("base"), I(0), I(MEM_RELEASE)); }
+    else { rtCall3(f, "", kname(t, "VirtualFree"), L("base"), L("size"), I(MEM_RELEASE)); }
+    rtLabel(f, "out");
+    rtRetVoid(f);
+    rtLabel(f, "small");
+    classList(f, "fl", "size", "k", "ci");
+    rtLoad(f, "x", L("fl"), 0, 8);
+    rtStore(f, L("h"), 0, L("x"), 8);
+    rtStore(f, L("fl"), 0, L("h"), 8);
+    rtRetVoid(f);
+    done(f, failures);
+}
+
+// __tx_native_mem_realloc(ptr, old, new, align)：new 为 0 得 0；alloc(new, align) 失败得 0（原块不动）；ptr 非空且 old 非零时拷
+// min(old, new) 字节；然后 free(ptr)（ptr 为空时 free 什么也不做），返回新块。
+function reallocFn(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    const f = rtBegin(b, "__tx_native_mem_realloc", "ptr old size align", "q n", 3, MODULE);
+    rtIf(f, L("size"), "eq", I(0), "null");
+    rtCall2(f, "q", "__tx_native_mem_alloc", L("size"), L("align"));
+    rtIf(f, L("q"), "eq", I(0), "null");
+    rtIf(f, L("ptr"), "eq", I(0), "copied");
+    rtIf(f, L("old"), "eq", I(0), "copied");
+    rtSet(f, "n", L("old"));
+    rtIf(f, L("n"), "ule", L("size"), "copy");
+    rtSet(f, "n", L("size"));
+    rtLabel(f, "copy");
+    rtCall3(f, "", kname(t, "memcpy"), L("q"), L("ptr"), L("n"));
+    rtLabel(f, "copied");
+    rtCall1(f, "", "__tx_native_mem_free", L("ptr"));
+    rtRet(f, L("q"));
+    rtLabel(f, "null");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+/// 发出分配器的函数；rtfn 的失败记进 failures。t 为目标编号（只在语义随目标不同时用）。
+export function allocGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
+    allocFn(b, failures, t);
+    freeFn(b, failures, t);
+    reallocFn(b, failures, t);
+}

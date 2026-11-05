@@ -1,10 +1,10 @@
-// 调试构建的产物侧薄桩（第 6 轮 6c，docs/design/v052-round6-debug-v0.1-20261018.md §三-5、§四-4）。
+// 调试构建的产物侧薄桩（§四-4）。
 // 检查点 callbi DBG_* 由发射器直调到这里的 __tx_dbg_<名>（参数同 __tx_callbi：win fn pc a），例程随 --debug
 // 构建进程序对象，内核不变。薄桩只做线程过滤、影子栈、新行事件、断点与步进判定、截止时间，外加私有的
 // 二进制控制协议与防错的内存读；名字、类型与值的渲染都在父进程里。
 //
 // 控制通道：父进程把一对管道的句柄（Windows）或文件描述符（Linux、macOS）以 TAIXU_DEBUG_CHANNEL=<读>,<写> 交给产物。
-// 两个 Unix 目标共用 POSIX 的读写、轮询与管道判定（uxSys 与按目标的常量，macOS 适配 M3 设计 G10）；环境：Linux 读
+// 两个 Unix 目标共用 POSIX 的读写、轮询与管道判定（uxSys 与按目标的常量）；环境：Linux 读
 // /proc/self/environ（静态产物没有 libc），macOS 用内核存下的启动环境 __tx_nrt_envp。
 // 没有这个环境变量时薄桩在第一个检查点记为“无通道”，此后每个检查点一条比较即返回，程序照常运行。
 //
@@ -14,7 +14,7 @@
 //                 READ 回执 5（实读字节数、数据）。
 //   父进程→产物：ARM 10（函数、pc、值）、RUN 11（模式 0 continue/1 into/2 over/3 out、截止毫秒，0＝无）、
 //                 FRAMES 12、READ 13（地址、长度，≤1 MiB）、PAUSE 14（只在运行中发）。
-// 运行中（6c-5a）：每 8192 个新行事件非阻塞地看一眼控制通道，有帧就处理：ARM 立即生效，PAUSE 在当前新行事件处
+// 运行中：每 8192 个新行事件非阻塞地看一眼控制通道，有帧就处理：ARM 立即生效，PAUSE 在当前新行事件处
 // 停下（原因 3），其余操作码按坏帧处理。停止态收到迟到的 PAUSE 时忽略。
 // 通道读到 EOF、出错或收到坏帧时，产物以 3 退出（父进程已不在）。
 import { StructuredBuffer, asBufferSection, asBufferAlign, asBufferLabel, asBufferByte, asBufferZero } from "./assemble";
@@ -24,7 +24,7 @@ import { callWinImport, setWinImportTarget } from "./ffi_callbacks";
 import { TB_MASK } from "./thread_block_abi";
 import { DBG_ENTER, DBG_STMT, DBG_LEAVE, DBG_RESUME, dbgBiName } from "./builtin_names";
 import { tKernel32, tRawSyscall, tLinux, tUnix, tMacos } from "./target";
-import { uxSys, uxMac, uxClock, uxConst, uxStatMode } from "./unix_sys";
+import { uxSys, uxMac, uxClock, uxConst, uxStatMode, uxPoll } from "./unix_sys";
 
 const MODE_UNINIT: int = 0;
 const MODE_INERT: int = 1;
@@ -243,13 +243,13 @@ function emitArm(b: Ref<StructuredBuffer>): void {
 // __tx_dbg_poll(_)：运行中非阻塞地查控制通道，有数据就逐帧处理（ARM 立即生效，PAUSE 记下待停）；其余操作码与
 // 坏帧以 3 退出。Windows PeekNamedPipe 看可读字节数；Unix poll（超时 0），对端关闭时读到 EOF 同样退出。
 function emitPoll(b: Ref<StructuredBuffer>, t: int): void {
-    const f = rtBegin(b, "__tx_dbg_poll", "unused", "av ap pf pp r cb n op x y z gp ef", 6, "bootstrap/selfhost/dbg_rt.tx");
+    const f = rtBegin(b, "__tx_dbg_poll", "unused", "av ap pf pp r cb n op x y z ts tn tp gp ef", 6, "bootstrap/selfhost/dbg_rt.tx");
     rtLabel(f, "top");
     if (tUnix(t)) {
         rtOp(f, "pf", G("__tx_dbg_in"), "and", I(4294967295));
         rtOp(f, "pf", L("pf"), "or", I(4294967296));
         rtAddrOf(f, "pp", "pf");
-        uxSys(f, t, "r", 7, xs3(L("pp"), I(1), I(0)));
+        uxPoll(f, t, "r", L("pp"), I(1), I(0), "ts", "tn", "tp");
         rtIf(f, L("r"), "le", I(0), "done");
     } else {
         rtSet(f, "av", I(0));
@@ -390,7 +390,7 @@ function emitInit(b: Ref<StructuredBuffer>, t: int): void {
     rtLabel(f, "parsed");
     rtIf(f, L("ph"), "ne", I(1), "inert");
     // 两端须是管道（变量可能是父进程的父进程留下的，编号在本进程里无效或另有所指），否则按无通道运行；
-    // 确认后改为不可继承：本产物再起的子进程（runProcess）接不到这条通道（6c-3 加固）。变量本身不清除，
+    // 确认后改为不可继承：本产物再起的子进程（runProcess）接不到这条通道（加固）。变量本身不清除，
     // 程序看到的环境与正常构建相同（语义透明）。
     if (tUnix(t)) {
         pipeCheck(f, t, "a0");
@@ -575,7 +575,7 @@ function emitLoop(b: Ref<StructuredBuffer>, t: int): void {
     rtCall1(f, "", "__tx_dbg_send", L("t"));
     rtJump(f, "top");
     // READ 地址 长度：防错地读本进程内存，地址无效时实读 0 字节而不是崩溃（读到第一个不可读的页为止）。
-    // Unix 逐页 write 进私有管道再 read 回来，不可读时 write 得 EFAULT（6c-6b：沙箱里没有 process_vm_readv；XNU 同样得 EFAULT）；
+    // Unix 逐页 write 进私有管道再 read 回来，不可读时 write 得 EFAULT（沙箱里没有 process_vm_readv；XNU 同样得 EFAULT）；
     // 管道第一次 READ 时建（O_CLOEXEC、O_NONBLOCK），__tx_dbg_rpipe 低 32 位为读端、高 32 位为写端，−1 为建不起来。
     rtLabel(f, "read");
     rtIf(f, L("y"), "ule", I(READ_MAX), "rlen");
@@ -742,7 +742,7 @@ function emitCheckpoint(b: Ref<StructuredBuffer>): void {
     rtJump(f, "out");
     rtLabel(f, "newline");
     // 每 1024 个新行事件：continue 带截止时读一次单调钟；每 8192 个再看一眼控制通道（运行中的 ARM 与 PAUSE，
-    // 6c-5a；一次查询约 5 µs，按 8192 摊薄）。
+    // 一次查询约 5 µs，按 8192 摊薄）。
     rtOp(f, "c", G("__tx_dbg_count"), "add", I(1));
     rtSetGlobal(f, "__tx_dbg_count", L("c"));
     rtOp(f, "q", L("c"), "and", I(1023));

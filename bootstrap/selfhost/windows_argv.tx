@@ -1,9 +1,9 @@
 // Windows UTF-16 acquisition; cleanup leaves caller outputs unchanged on failure.
 // The running byte total lives in r14, not rbx: rbx is the value-slot window from which the
 // kernel derives the thread block (and the per-thread heap), threads design §十二/§十三.
-import { Operand, StructuredBuffer, asBufferInstruction, asBufferLabel, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem } from "./assemble";
-import { L, I } from "./rtfn_base";
-import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtShift, rtLoad, rtStore, rtLabel, rtJump, rtIf, rtCall2, rtRet } from "./rtfn";
+import { Operand, StructuredBuffer, asBufferInstruction, asBufferLabel, asBufferFunctionBegin, asBufferFunctionPrologueEnd, asBufferFunctionEpilogueStart, asBufferFrame, asBufferFunctionEnd, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem } from "./assemble";
+import { RtFn, RtOp, L, I } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtShift, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtCall0, rtCall1, rtCall2, rtCall3, rtCallList, rtRet } from "./rtfn";
 function reg(n: int): Ref<Operand> { return asStructuredReg(0, n); }
 function reg32(n: int): Ref<Operand> { return asStructuredReg(1, n); }
 function immediate(n: int): Ref<Operand> { return asStructuredImm(n); }
@@ -123,12 +123,15 @@ function splitEmit(buf: Ref<StructuredBuffer>): string {
 }
 
 /// 发出 __tx_native_argv_acquire 与命令行拆分；返回 rtfn 的失败说明（空为成功）。
+// 登记为手写函数（runtime-manual，PE 规范化 P3 第 7 项）：push r14、r12、r13＋sub 128，唯一的出口撤帧返回。
 export function windowsArgvEmit(buf: Ref<StructuredBuffer>): string {
+    asBufferFunctionBegin(buf, "bootstrap/selfhost/windows_argv.tx", "__tx_native_argv_acquire", "runtime-manual");
     label(buf, "__tx_native_argv_acquire");
-    one(buf, "push", reg(14));
-    one(buf, "push", reg(12));
-    one(buf, "push", reg(13));
-    emit(buf, "sub", 2, reg(4), immediate(128));
+    asBufferFrame(buf, "push-nonvolatile", 14, 8);
+    asBufferFrame(buf, "push-nonvolatile", 12, 8);
+    asBufferFrame(buf, "push-nonvolatile", 13, 8);
+    asBufferFrame(buf, "allocate-stack", 4, 128);
+    asBufferFunctionPrologueEnd(buf);
     emit(buf, "mov", 2, mem64(4, 64), reg(1));
     emit(buf, "mov", 2, mem64(4, 72), reg(2));
     emit(buf, "mov", 2, mem64(4, 88), immediate(0));
@@ -245,10 +248,81 @@ export function windowsArgvEmit(buf: Ref<StructuredBuffer>): string {
     one(buf, "call", target("__tx_native_mem_free"));
     label(buf, "__tx_va_cleaned"); emit(buf, "mov", 2, reg32(0), mem32(4, 120));
     label(buf, "__tx_va_done");
-    emit(buf, "add", 2, reg(4), immediate(128));
-    one(buf, "pop", reg(13));
-    one(buf, "pop", reg(12));
-    one(buf, "pop", reg(14));
-    zero(buf, "ret");
+    asBufferFunctionEpilogueStart(buf);
+    asBufferFrame(buf, "release-stack", 4, 128);
+    asBufferFrame(buf, "pop-nonvolatile", 13, 8);
+    asBufferFrame(buf, "pop-nonvolatile", 12, 8);
+    asBufferFrame(buf, "pop-nonvolatile", 14, 8);
+    asBufferFrame(buf, "return", -1, 8);
+    asBufferFunctionEnd(buf);
+    return splitEmit(buf);
+}
+
+// 可移植版（rtfn）：语义同上面的手写版，供 --generic=entry 的 Windows 内核（x86_64 的可移植内核、A6 起的
+// aarch64）；x86_64 Windows 的缺省内核仍发手写版。(out_argv, out_argc) → 0 成功、1 参数不是合法 UTF-16（WC_ERR_INVALID_CHARS）、
+// 2 内存不足、5 取命令行失败；出错时出参不动。一块原生分配：指针表 (argc+1)×8 字节（末项 0），其后为各参数的 NUL 结尾 UTF-8。
+// 局部：wl 拆出的 UTF-16 参数表（拆分写入，取址）、argc 参数个数（拆分写入 4 字节，取址）、tot 总字节、hd 指针表字节、off 已写串字节。
+// 与手写版的差别：WideCharToMultiByte 的结果按低 32 位判（ARM64 上 w0 返回时高位不定），判“≤ 0”写成“为 0 或高位置 1”。
+function acquireEmit(buf: Ref<StructuredBuffer>): string {
+    const f = rtBegin(buf, "__tx_native_argv_acquire", "out_argv out_argc", "wl argc buf tot hd off i r s x c st cmd", 8, "bootstrap/selfhost/windows_argv.tx");
+    rtSet(f, "wl", I(0)); rtSet(f, "argc", I(0)); rtSet(f, "buf", I(0));
+    rtCall0(f, "cmd", "GetCommandLineW");
+    rtIf(f, L("cmd"), "eq", I(0), "sysfail");
+    rtAddrOf(f, "s", "wl"); rtAddrOf(f, "x", "argc");
+    rtCall3(f, "r", "__tx_win_cmdline_split", L("cmd"), L("s"), L("x"));
+    rtOp(f, "r", L("r"), "and", I(4294967295));
+    rtIf(f, L("r"), "ne", I(0), "oom");
+    rtOp(f, "argc", L("argc"), "and", I(4294967295));
+    rtIf(f, L("argc"), "lt", I(1), "sysfail");
+    rtOp(f, "hd", L("argc"), "add", I(1)); rtShift(f, "hd", L("hd"), "shl", 3);
+    rtSet(f, "tot", L("hd")); rtSet(f, "i", I(0));
+    rtLabel(f, "size");
+    rtIf(f, L("i"), "eq", L("argc"), "conv");
+    rtShift(f, "x", L("i"), "shl", 3); rtOp(f, "x", L("x"), "add", L("wl")); rtLoad(f, "s", L("x"), 0, 8);
+    wctmb(f, I(0), I(0));
+    rtOp(f, "tot", L("tot"), "add", L("r")); rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "size");
+    rtLabel(f, "conv");
+    rtCall2(f, "buf", "__tx_native_mem_alloc", L("tot"), I(1));
+    rtIf(f, L("buf"), "eq", I(0), "oom");
+    rtSet(f, "off", I(0)); rtSet(f, "i", I(0));
+    rtLabel(f, "cloop");
+    rtIf(f, L("i"), "eq", L("argc"), "term");
+    rtShift(f, "x", L("i"), "shl", 3); rtOp(f, "x", L("x"), "add", L("wl")); rtLoad(f, "s", L("x"), 0, 8);
+    rtOp(f, "x", L("buf"), "add", L("hd")); rtOp(f, "x", L("x"), "add", L("off"));
+    rtOp(f, "c", L("tot"), "sub", L("off")); rtOp(f, "c", L("c"), "sub", L("hd"));
+    wctmb(f, L("x"), L("c"));
+    rtShift(f, "c", L("i"), "shl", 3); rtOp(f, "c", L("c"), "add", L("buf")); rtStore(f, L("c"), 0, L("x"), 8);
+    rtOp(f, "off", L("off"), "add", L("r")); rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "cloop");
+    rtLabel(f, "term");
+    rtShift(f, "x", L("argc"), "shl", 3); rtOp(f, "x", L("x"), "add", L("buf")); rtStore(f, L("x"), 0, I(0), 8);
+    rtCall1(f, "", "__tx_native_mem_free", L("wl"));
+    rtStore(f, L("out_argv"), 0, L("buf"), 8); rtStore(f, L("out_argc"), 0, L("argc"), 4);
+    rtRet(f, I(0));
+    rtLabel(f, "sysfail"); rtSet(f, "st", I(5)); rtJump(f, "cleanup");
+    rtLabel(f, "badu"); rtSet(f, "st", I(1)); rtJump(f, "cleanup");
+    rtLabel(f, "oom"); rtSet(f, "st", I(2));
+    rtLabel(f, "cleanup");
+    rtCall1(f, "", "__tx_native_mem_free", L("buf"));
+    rtCall1(f, "", "__tx_native_mem_free", L("wl"));
+    rtRet(f, L("st"));
+    rtEnd(f);
+    return rtFailed(f);
+}
+
+// r = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, s, -1, dst, cap, 0, 0) 的低 32 位；为 0 或为负（高位置 1）转 badu。
+function wctmb(f: Ref<RtFn>, dst: Ref<RtOp>, cap: Ref<RtOp>): void {
+    const xs: List<Ref<RtOp>> = listNew();
+    listPush(xs, I(65001)); listPush(xs, I(128)); listPush(xs, L("s")); listPush(xs, I(-1));
+    listPush(xs, dst); listPush(xs, cap); listPush(xs, I(0)); listPush(xs, I(0));
+    rtCallList(f, "r", "WideCharToMultiByte", xs);
+    rtOp(f, "r", L("r"), "and", I(4294967295));
+    rtIf(f, L("r"), "eq", I(0), "badu");
+    rtIf(f, L("r"), "ugt", I(2147483647), "badu");
+}
+
+/// 可移植版：发出 rtfn 写的 __tx_native_argv_acquire 与命令行拆分；返回 rtfn 的失败说明（空为成功）。
+export function windowsArgvPortableEmit(buf: Ref<StructuredBuffer>): string {
+    const fail = acquireEmit(buf);
+    if (len(fail) > 0) { return fail; }
     return splitEmit(buf);
 }

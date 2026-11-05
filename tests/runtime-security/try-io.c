@@ -77,7 +77,7 @@ int main(void) {
     uint64_t start = GetTickCount64();
 #else
 #if defined(__APPLE__)
-    /* 父进程交下 SIG_IGN 时原样保留（M3 设计 G5）：在第一次调用（装空处理函数）之前分出子进程核对，写坏管道仍得 −1。 */
+    /* 父进程交下 SIG_IGN 时原样保留（M3）：在第一次调用（装空处理函数）之前分出子进程核对，写坏管道仍得 −1。 */
     pid_t child = fork();
     require(child >= 0, "fork");
     if (child == 0) {

@@ -9,18 +9,23 @@ Without explicit cases, check every emitted diagnostic's explain entry, native
 capabilities, frozen doc/init behavior, newer-syntax docs, safe template creation,
 gui/ root discovery and internal-builtin rejection, and debug/DAP/MCP flag errors.
 The GUI engine is external; only pure layout and root-resolution behavior remain.
-Frozen behavior was captured before the Zig cleanup; no Zig executable is used.
+A built product that cannot be launched (on Windows typically an antivirus block)
+fails only its own row; a group that raises OSError fails as one row, and the
+remaining groups still run.
+The expectations are frozen; only the native compiler is run.
 """
 import argparse
 import importlib.util
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 
 ROOT = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location('nrt_products', ROOT / 'scripts' / 'test-nrt-products.py')
@@ -29,6 +34,20 @@ _spec.loader.exec_module(nrt_products)
 
 RETIRED_FLAGS = ('--mem-report', '--tier', '--format', '--debug', '--replay', '--frame', '--out-dir', '--auto')
 COMPANIONS = ('.out', '.err', '.test', '.testjson', '.json', '.disasm', '.disasmjson')
+# Windows 拒绝启动被杀软判为病毒或潜在垃圾软件的映像：ERROR_VIRUS_INFECTED（225）、ERROR_VIRUS_DELETED（226）。Defender 云端机器学习
+# 曾按哈希拦过 tests/debug/basic.tx 的产物，判定随字节漂移（docs/design/v052-pe-x64-normalize-v0.1-20261103.md）。
+AV_WINERRORS = (225, 226)
+
+
+def run_product(argv, **kw):
+    """运行编出的产物，同 subprocess.run(capture_output=True)。启动失败（典型是 Windows 上被杀软拦截）不抛出：退出码记 -1，原因以
+    LAUNCH_FAILED 开头写进 stderr（同 test-nrt-products 超时记 TIMEOUT），只有这一行判失败，同组其余行与其余各组照跑。"""
+    try:
+        return subprocess.run([str(a) for a in argv], capture_output=True, **kw)
+    except OSError as e:
+        winerror = getattr(e, 'winerror', None)
+        why = 'blocked by antivirus' if winerror in AV_WINERRORS else type(e).__name__
+        return subprocess.CompletedProcess(argv, -1, b'', ('LAUNCH_FAILED %s (errno=%s winerror=%s)' % (why, e.errno, winerror)).encode('ascii'))
 
 
 def companion(tx, ext):
@@ -52,7 +71,7 @@ def needles(content):
 
 def classify(tx):
     """([(kind, expected exit, expectation, extra flags, row suffix)...], None), or (None, reason).
-    Precedence follows build_tools/e2e_runner.zig, except that `.test` and `.testjson` both run."""
+    Precedence: `.test` and `.testjson` (both run), then `.json`, `.err`, `.out`."""
     specs = []
     t = companion(tx, '.test')
     if t is not None:
@@ -105,8 +124,8 @@ def explain_rows(compiler):
     cap = subprocess.run([str(compiler), 'capabilities', '--format=json'], capture_output=True, timeout=60)
     try:
         caps = json.loads(cap.stdout.decode('utf-8'))['capabilities']
-        # 6c-7：调试三面（run --debug、dap、mcp 的 debug_*）为 native；6d-2：lsp 为 native，lsp_features 列已做的请求
-        # （6d-3a2 增 definition、references、rename，6d-3a3 增 semanticTokens，6d-3b1 增 hover）。
+        # 调试三面（run --debug、dap、mcp 的 debug_*）为 native；：lsp 为 native，lsp_features 列已做的请求
+        # （增 definition、references、rename，增 semanticTokens，增 hover）。
         mcp_tools = 'compile,run,test,disasm,debug_start,debug_breakpoint,debug_step,debug_continue,debug_frames,debug_inspect,debug_stops,debug_kill'
         cap_ok = cap.returncode == 0 and caps.get('fmt') == 'native' and caps.get('explain') == 'native' \
             and caps.get('run_debug') == 'native' and caps.get('dap') == 'native' and caps.get('mcp') == 'native' \
@@ -143,7 +162,7 @@ def capabilities_text_matches(text, caps):
     lsp, mcp = 'native(%s)' % caps['lsp_features'], 'native(%s)' % caps['mcp_tools']
     if pairs.get('lsp') != lsp or pairs.get('mcp') != mcp or pairs.get('run --debug') != caps.get('run_debug'):
         return False, 'lsp/mcp/run --debug differ from JSON'
-    for key in ('toolchain_version', 'diagnostic_version', 'version_gate', 'build', 'run', 'test', 'fmt', 'explain', 'doc',
+    for key in ('toolchain_version', 'diagnostic_version', 'build', 'run', 'test', 'fmt', 'explain', 'doc',
                 'init', 'bench', 'disasm', 'profile', 'link_map', 'dap', 'frontend', 'target', 'runtime', 'compiler',
                 'lsp_file_policy', 'mcp_execution_default', 'mcp_worker', 'mcp_request_timeout', 'mcp_error_schema'):
         if pairs.get(key) != caps.get(key):
@@ -173,8 +192,9 @@ def debug_build_rows(compiler):
             if b.returncode != 0 or not exe.exists():
                 results.append((tag, None, b.stderr.decode('utf-8', 'replace')[:300]))
                 continue
-            r = subprocess.run([str(exe)], capture_output=True, timeout=60)
-            results.append((tag, (r.returncode, r.stdout, r.stderr), exe.stat().st_size))
+            size = exe.stat().st_size  # 先取：被杀软拦截的产物可能随即被隔离删除
+            r = run_product([exe], timeout=60)
+            results.append((tag, (r.returncode, r.stdout, r.stderr), size))
         (_, normal, nsize), (_, debug, dsize) = results
         ok = normal is not None and debug is not None and normal == debug and normal[0] == 10
         rows.append(('debug-build:transparent', ok, 'normal=%r debug=%r sizes=%r/%r' % (normal, debug, nsize, dsize)))
@@ -183,17 +203,17 @@ def debug_build_rows(compiler):
             text = r.stderr.decode('utf-8', 'replace')
             rows.append(('debug-build:excl' + other[0], r.returncode == 64 and ('字节码产物已退场' if other == ['--bytecode'] else '--debug 与 --lib、--leak-check 互斥') in text,
                          'exit=%d err=%r' % (r.returncode, text[:200])))
-        # 第 6 轮 6c-4b：run --debug 的旗标冲突（文案同 VM，退出码 64，stdout 无输出）与找不到入口文件（compile_failed 3008）。
+        # run --debug 的旗标冲突（文案同 VM，退出码 64，stdout 无输出）与找不到入口文件（compile_failed 3008）。
         for other, want in ((['--format=json'], '--debug 与 --format=json 互斥'),
                             (['--leak-check'], '--debug 与 --lib、--leak-check 互斥')):
             r = subprocess.run([str(compiler), 'run', '--debug', *other, str(src)], capture_output=True, timeout=120, stdin=subprocess.DEVNULL)
             text = r.stderr.decode('utf-8', 'replace')
             rows.append(('debug-run:excl' + other[0], r.returncode == 64 and want in text and r.stdout == b'',
                          'exit=%d out=%r err=%r' % (r.returncode, r.stdout[:100], text[:200])))
-        # 第 6 轮 6c-5b：`taixu dap` 不接受多余参数（64）；会话本身由 scripts/dap-e2e.py 与 test-native-debug.py 的 dap 用例覆盖。
+        # `taixu dap` 不接受多余参数（64）；会话本身由 scripts/dap-e2e.py 与 test-native-debug.py 的 dap 用例覆盖。
         r = subprocess.run([str(compiler), 'dap', 'extra'], capture_output=True, timeout=120, stdin=subprocess.DEVNULL)
         rows.append(('dap:extra-arg', r.returncode == 64 and r.stdout == b'', 'exit=%d out=%r' % (r.returncode, r.stdout[:100])))
-        # 第 6 轮 6c-6：`taixu mcp` 同样不接受多余参数；服务器本身由 scripts/mcp-debug-e2e.py 与 test-native-debug.py 的 mcp 用例覆盖。
+        # `taixu mcp` 同样不接受多余参数；服务器本身由 scripts/mcp-debug-e2e.py 与 test-native-debug.py 的 mcp 用例覆盖。
         r = subprocess.run([str(compiler), 'mcp', 'extra'], capture_output=True, timeout=120, stdin=subprocess.DEVNULL)
         rows.append(('mcp:extra-arg', r.returncode == 64 and r.stdout == b'', 'exit=%d out=%r' % (r.returncode, r.stdout[:100])))
         missing = work / 'no-such.tx'
@@ -203,7 +223,7 @@ def debug_build_rows(compiler):
                      and 'FileNotFound' in out, 'exit=%d out=%r' % (r.returncode, out[:300])))
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    # 第 6 轮 6c-3（TOOL-103）：进程与标准输入内建的例程只进原生产物，字节码构建用到它们即报错、不出产物。
+    #进程与标准输入内建的例程只进原生产物，字节码构建用到它们即报错、不出产物。
     work = Path(tempfile.mkdtemp(prefix='tx-toolbc-'))
     try:
         src = ROOT / 'tests' / 'nrt-cases' / 'proc-pipe.tx'
@@ -233,10 +253,29 @@ def lib_build_rows(compiler):
         rows.append(('lib-build:built', r.returncode == 0 and exe.exists(),
                      'exit=%d err=%r' % (r.returncode, r.stderr.decode('utf-8', 'replace')[:200])))
         if exe.exists():
-            p = subprocess.run([str(exe)], capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+            p = run_product([exe], timeout=60, stdin=subprocess.DEVNULL)
             err = p.stderr.decode('utf-8', 'replace')
             rows.append(('lib-build:run-traps', p.returncode == 3 and '程序没有 main 入口' in err and p.stdout == b'',
                          'exit=%d out=%r err=%r' % (p.returncode, p.stdout[:100], err[:200])))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return rows
+
+
+def ffi_mem_report_rows(compiler):
+    """Rows (name, ok, detail) for the build report's external-memory line (D3 v0.48 §6.8-18): ffi-mem.tx creates regions at
+    9 source positions, all in its own module, so the build prints "外部内存区：ffi-mem.tx（9 处）" after the foreign-library line;
+    a program with foreign functions but no regions (ffi-front.tx) prints no such line. Host target, every host."""
+    rows = []
+    work = Path(tempfile.mkdtemp(prefix='tx-memrep-'))
+    cases = ROOT / 'tests' / 'nrt-cases'
+    try:
+        for name, want in [('ffi-mem.tx', 'taixu: 外部内存区：ffi-mem.tx（9 处）'), ('ffi-front.tx', None)]:
+            r = subprocess.run([str(compiler), 'build', name, '--out', str(work / name)], cwd=cases, capture_output=True, timeout=300)
+            lines = r.stdout.decode('utf-8', 'replace').splitlines()
+            mem = [l for l in lines if l.startswith('taixu: 外部内存区')]
+            ok = r.returncode == 0 and (mem == [want] if want else mem == [])
+            rows.append(('build-report:ffi-mem:' + name, ok, 'exit=%d lines=%r err=%r' % (r.returncode, lines[-3:], r.stderr.decode('utf-8', 'replace')[:200])))
     finally:
         shutil.rmtree(work, ignore_errors=True)
     return rows
@@ -268,7 +307,7 @@ def heap_check_rows(compiler):
         if made['standard'].exists() and made['heapcheck'].exists():
             rows.append(('heap-check:detection-kernel', b'heapcheck:' in made['heapcheck'].read_bytes()
                          and b'heapcheck:' not in made['standard'].read_bytes(), 'marker'))
-            p = subprocess.run([str(made['heapcheck'])], capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+            p = run_product([made['heapcheck']], timeout=60, stdin=subprocess.DEVNULL)
             rows.append(('heap-check:runs', p.returncode == 0 and p.stdout.replace(b'\r\n', b'\n') == b'ok\n',
                          'exit=%d out=%r err=%r' % (p.returncode, p.stdout[:100], p.stderr[:200])))
         r = subprocess.run([str(compiler), 'run', '--heap-check', '--leak-check', str(src)], capture_output=True, timeout=300,
@@ -416,7 +455,7 @@ def run_spec(compiler, tx, name, spec, argv):
 
 
 def path_rows(compiler):
-    """路径规范形（docs/design/v052-path-canonical-v0.1-20261025.md）：类 Unix 上 \\ 是名字里的普通字符——名为 back\\slash.tx
+    """路径规范形：类 Unix 上 \\ 是名字里的普通字符——名为 back\\slash.tx
     的入口导入同目录模块，构建、运行，产物名为 back\\slash；循环导入的诊断里路径按宿主显示（Windows 为 \\，其余为 /）。"""
     rows = []
     windows = os.name == 'nt'
@@ -449,7 +488,7 @@ def path_rows(compiler):
         rows.append(('paths:posix-backslash-build', code == 0 and product.is_file() and not (work / 'back').exists(),
                      'exit=%d out=%r' % (code, both[:400])))
         if product.is_file():
-            p = subprocess.run([str(product)], cwd=work, capture_output=True, timeout=60)
+            p = run_product([product], cwd=work, timeout=60)
             rows.append(('paths:posix-backslash-product', p.returncode == 0 and p.stdout == b'back-slash ok\n',
                          'exit=%d out=%r' % (p.returncode, p.stdout[:200])))
         code, out, both = run(['run', 'back\\slash.tx'])
@@ -479,7 +518,8 @@ def main():
     for tx in txs:
         name = str(tx.relative_to(ROOT)).replace('\\', '/')
         specs, why = classify(tx)
-        reason = why or nrt_products.skip_reason(tx, 'windows' if os.name == 'nt' else ('macos' if sys.platform == 'darwin' else 'linux'))
+        reason = why or nrt_products.skip_reason(tx, 'windows' if os.name == 'nt' else ('macos' if sys.platform == 'darwin' else 'linux'),
+                                                 'aarch64' if platform.machine().lower() in ('arm64', 'aarch64') else 'x86_64')
         argv = []
         a = companion(tx, '.argv')
         if a is not None:
@@ -495,9 +535,14 @@ def main():
             rows.append(row)
             print(f"{row['status']:5} {row['case']}" + (f"  {row.get('detail', '')[:200]!r}" if row['status'] == 'FAIL' else ''), flush=True)
     if not args.cases:
-        extra = explain_rows(compiler) + test_option_rows(compiler) + stdlib_root_rows(compiler) + gui_root_rows(compiler) + debug_build_rows(compiler) + lib_build_rows(compiler)
-        extra += heap_check_rows(compiler)
-        extra += tool_rows(compiler) + path_rows(compiler)
+        extra = []
+        for group in (explain_rows, test_option_rows, stdlib_root_rows, gui_root_rows, debug_build_rows, lib_build_rows,
+                      heap_check_rows, ffi_mem_report_rows, tool_rows, path_rows):
+            try:
+                extra += group(compiler)
+            except OSError:
+                # 运行或读取失败（如产物被杀软隔离后读不到）：这一组记一行失败，其余各组照跑；产物启动失败已由 run_product 逐行记。
+                extra.append((group.__name__ + ':aborted', False, traceback.format_exc()[-600:]))
         for name, ok, detail in extra:
             if ok is None:
                 row = {'case': name, 'status': 'SKIP', 'reason': detail}

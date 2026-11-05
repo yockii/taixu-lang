@@ -1,11 +1,11 @@
-"""A64 编码表的生成与核对（macOS 适配 M4 设计 A2）。
+"""A64 编码表的生成与核对。
 
 每种指令形式按 bootstrap/selfhost/a64_encode.tx 里编码函数的参数顺序列出字段，生成对应的汇编文本，交给一个独立的
-汇编器（测试机的 Apple clang，或 zig 自带的 LLVM：`zig cc -target aarch64-macos`）汇编，从 Mach-O 目标文件的
+汇编器（测试机的 Apple clang，或 LLVM 的 `clang -target aarch64-macos`）汇编，从 Mach-O 目标文件的
 __text 取出编码，写成 tests/a64/encodings.txt。负例（编码函数必须拒绝的字段）不经汇编器，单列在表尾。
 
   python scripts/a64-encodings.py --cc "clang -arch arm64"            # 重新生成（测试机）
-  python scripts/a64-encodings.py --cc "zig cc -target aarch64-macos" --check   # 与已入库的表核对
+  python scripts/a64-encodings.py --cc "clang -target aarch64-macos" --check   # 与已入库的表核对
 
 两个汇编器给出的表须逐字节相同才入库。表里的汇编文本只用基本助记符（不用 mov、cmp、lsl 等别名），反汇编器的往返
 核对以它为准。
@@ -163,6 +163,14 @@ def casal(size, rs, rt, rn):
     return 'casal %s, %s, [%s]' % (r(rs, size - 2), r(rt, size - 2), r(rn, sp=True))
 
 
+def ldaxr(size, rt, rn):
+    return 'ldaxr %s, [%s]' % (r(rt, size - 2), r(rn, sp=True))
+
+
+def stlxr(size, rs, rt, rn):
+    return 'stlxr %s, %s, [%s]' % (r(rs, 0), r(rt, size - 2), r(rn, sp=True))
+
+
 def acq_rel(kind, size, rt, rn):
     m = ['ldar', 'stlr', 'ldapr'][kind] + {0: 'b', 1: 'h', 2: '', 3: ''}[size]
     return '%s %s, [%s]' % (m, r(rt, 1 if size == 3 else 0), r(rn, sp=True))
@@ -192,6 +200,25 @@ def brk(imm16):
     return 'brk #0x%x' % imm16
 
 
+def svc(imm16):
+    return 'svc #0x%x' % imm16
+
+
+# 系统寄存器（o0:op1:CRn:CRm:op2，op0＝3）：TPIDR_EL0 写名字，其余写通用名 s3_<op1>_c<CRn>_c<CRm>_<op2>。
+def sysreg(v):
+    if v == 24194:
+        return 'tpidr_el0'
+    return 's3_%d_c%d_c%d_%d' % ((v >> 11) & 7, (v >> 7) & 15, (v >> 3) & 15, v & 7)
+
+
+def mrs(rt, v):
+    return 'mrs %s, %s' % (r(rt), sysreg(v))
+
+
+def msr(v, rt):
+    return 'msr %s, %s' % (sysreg(v), r(rt))
+
+
 def fp_int(sf, ftype, rmode, opcode, rd, rn):
     m = {(0, 6): 'fmov', (0, 7): 'fmov', (0, 2): 'scvtf', (0, 3): 'ucvtf', (3, 0): 'fcvtzs', (3, 1): 'fcvtzu'}[(rmode, opcode)]
     if (rmode, opcode) in ((0, 7), (0, 2), (0, 3)):
@@ -219,8 +246,9 @@ FORMS = {
     'addsub_imm': addsub_imm, 'logical_imm': logical_imm, 'move_wide': move_wide, 'bitfield': bitfield, 'adr': adr,
     'addsub_shifted': addsub_shifted, 'addsub_ext': addsub_ext, 'logical_shifted': logical_shifted, 'dp2': dp2, 'dp3': dp3,
     'cond_select': cond_select, 'ldst_uimm': ldst_uimm, 'ldst_imm9': ldst_imm9, 'ldst_reg': ldst_reg, 'ldst_pair': ldst_pair,
-    'atomic_al': atomic_al, 'casal': casal, 'acq_rel': acq_rel, 'branch': branch, 'branch_cond': branch_cond,
-    'compare_branch': compare_branch, 'test_branch': test_branch, 'branch_reg': branch_reg, 'brk': brk,
+    'atomic_al': atomic_al, 'casal': casal, 'ldaxr': ldaxr, 'stlxr': stlxr, 'acq_rel': acq_rel, 'branch': branch,
+    'branch_cond': branch_cond, 'compare_branch': compare_branch, 'test_branch': test_branch, 'branch_reg': branch_reg, 'brk': brk,
+    'svc': svc, 'mrs': mrs, 'msr': msr,
     'fp_int': fp_int, 'fp_unary': fp_unary, 'fp_binary': fp_binary, 'fcmp': fcmp,
 }
 
@@ -335,6 +363,11 @@ def positive_cases():
             for swp in (0, 1):
                 c.append(('atomic_al', size, swp, rs, rt, rn))
             c.append(('casal', size, rs, rt, rn))
+        for rt, rn in ((0, 1), (31, 31), (16, 9), (30, 19)):
+            c.append(('ldaxr', size, rt, rn))
+        # stlxr 的状态寄存器不得与数据或基址寄存器同号（CONSTRAINED UNPREDICTABLE，见负例）；数据与基址同号合法。
+        for rs, rt, rn in ((17, 16, 9), (1, 2, 31), (8, 0, 0), (31, 30, 19)):
+            c.append(('stlxr', size, rs, rt, rn))
     for kind in range(3):
         for size in range(4):
             for rt, rn in ((0, 1), (31, 31), (30, 19)):
@@ -360,6 +393,12 @@ def positive_cases():
             c.append(('branch_reg', kind, rn))
     for imm in (0, 1, 0xf000, 0xffff):
         c.append(('brk', imm))
+        c.append(('svc', imm))
+    # TPIDR_EL0、TPIDRRO_EL0、FPCR、NZCV、op0＝3 的两端。
+    for v in (24194, 24195, 23072, 23056, 16384, 32767):
+        for rt in (0, 16, 31):
+            c.append(('mrs', rt, v))
+            c.append(('msr', v, rt))
     for sf in (0, 1):
         for ftype in (0, 1):
             for rmode, opcode in ((0, 2), (0, 3), (3, 0), (3, 1)):
@@ -413,6 +452,8 @@ NEGATIVE = [
     ('ldst_pair', 2, 0, 1, 3, 4, 3, 16, 1), ('ldst_pair', 2, 0, 0, 3, 4, 4, -16, 3), ('ldst_pair', 0, 0, 0, 7, 8, 7, 8, 3),
     ('ldst_pair', 2, 0, 1, 6, 6, 31, 16, 2), ('ldst_pair', 1, 1, 1, 6, 6, 31, 16, 2),
     ('atomic_al', 1, 0, 0, 1, 2), ('casal', 0, 0, 1, 2), ('acq_rel', 3, 3, 0, 1),
+    ('ldaxr', 1, 0, 1), ('ldaxr', 3, 32, 1), ('stlxr', 1, 2, 0, 1), ('stlxr', 3, 2, 2, 5), ('stlxr', 3, 5, 2, 5),
+    ('stlxr', 2, 31, 31, 3), ('svc', 65536), ('svc', -1), ('mrs', 0, 16383), ('mrs', 0, 32768), ('msr', 16383, 0), ('mrs', 32, 24194),
     ('branch', 0, 2), ('branch', 0, 134217728), ('branch', 1, -134217732),
     ('branch_cond', 15, 0), ('branch_cond', 0, 1048576), ('branch_cond', 0, 6),
     ('compare_branch', 1, 0, 0, -1048580), ('test_branch', 0, 0, 64, 0), ('test_branch', 0, 0, 0, 32768),
@@ -457,7 +498,7 @@ def render(cc):
     texts = [FORMS[c[0]](*c[1:]) for c in cases]
     words = assemble(cc, texts)
     assert len(words) == len(cases), (len(words), len(cases))
-    out = ['# A64 编码表：scripts/a64-encodings.py 生成（独立汇编器：Apple clang 或 zig cc -target aarch64-macos，两者须一致）。',
+    out = ['# A64 编码表：scripts/a64-encodings.py 生成（独立汇编器：Apple clang 或 LLVM 的 clang -target aarch64-macos，两者须一致）。',
            '# 正例：形式 字段… | 汇编 | 编码（十六进制）；负例以 ! 开头，编码函数须返回 -1。']
     for c, t, w in zip(cases, texts, words):
         out.append('%s | %s | %08x' % (' '.join(map(str, c)), t, w))
@@ -468,7 +509,7 @@ def render(cc):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--cc', required=True, help='汇编器命令，如 "clang -arch arm64" 或 "zig cc -target aarch64-macos"')
+    ap.add_argument('--cc', required=True, help='汇编器命令，如 "clang -arch arm64" 或 "clang -target aarch64-macos"')
     ap.add_argument('--check', action='store_true', help='只与已入库的表核对，不写文件')
     a = ap.parse_args()
     text = render(a.cc)

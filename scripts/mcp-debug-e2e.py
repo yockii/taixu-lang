@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Native `taixu mcp` end-to-end check (round 6 step 6d-4, LSP/MCP design §四-6; debug design §四-9, §六).
+"""Native `taixu mcp` end-to-end check (round 6 step LSP/MCP design §四-6; debug design §四-9, §六).
 
 Starts `taixu mcp` on stdio (one JSON-RPC message per line) with a private temporary directory (TMP/TEMP/TMPDIR, so
 the debug products it writes can be watched) and checks:
-- port of the five debug_* tests of src/tools/mcp.zig: tools/list names the eight debug tools with JSON Schema
+- the five debug_* scenarios: tools/list names the eight debug tools with JSON Schema
   2020-12 and server/discover lists debug_kill; a full session (session "1", ready, breakpoint_set, stopped in main
   with reason breakpoint, frames, the module state slot inspected as a ref, stops, kill, then an unknown session);
   a 5,000-line flood (exited still arrives, events_truncated, valid JSON); idle_timeout_s 1 (after 1.2 s the

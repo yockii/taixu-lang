@@ -1,4 +1,4 @@
-// A64 汇编层（macOS 适配 M4 设计 A2、A3，docs/design/v052-macos-m4-arm64-v0.1-20261024.md）：A64 代码写进 asBufferNewA64 建的
+// A64 汇编层：A64 代码写进 asBufferNewA64 建的
 // StructuredBuffer（数据、标号、节切换照常用 asBuffer*），提交时做跨度定长再写进当前汇编映像。
 // - 指令字由 a64_encode 的纯函数编好再交进来；本层只管标号、跳转与符号修补。编码函数拒绝的指令（-1）记成失败条目，
 //   提交时报出（缓冲常在 asStructuredBegin 之前填好，那时还没有映像可记失败）。
@@ -6,12 +6,13 @@
 //   b 目标”，重算偏移直到不再变化（LLVM BranchRelaxation 的做法）。只会由短变长，所以一定收敛。
 // - 目标不在本缓冲的 b／bl 交给修补（JUMP26／CALL26），由 ELF 写出或链接器定；条件跳转只许跳到本缓冲里的标号。
 // - 符号地址：adrp＋add（PAGE21＋ADD_LO12）、adrp＋读写（PAGE21＋LDSTn_LO12）。x16／x17 留给这里与链接器，不分配给值。
-import { StructuredBuffer, StructuredEntry, asStructuredImm, asStructuredSection, asStructuredLabel, asStructuredAlign, asStructuredByte, asStructuredQuad, asStructuredAddress, asStructuredZero, asStructuredAddressAddend } from "./assemble";
-import { asA64Word, asA64Here, asImgA64, asSetA64, asFailWith, asFailedAs, FIX_A64_CALL26, FIX_A64_JUMP26, FIX_A64_PAGE21, FIX_A64_ADD_LO12, FIX_A64_LDST8 } from "./assemble";
+import { StructuredBuffer, StructuredEntry, A64_OS_WINDOWS, asStructuredImm, asStructuredSection, asStructuredLabel, asStructuredAlign, asStructuredByte, asStructuredQuad, asStructuredAddress, asStructuredZero, asStructuredAddressAddend } from "./assemble";
+import { asA64Word, asA64Here, asImgIsa, asSetIsa, asFailWith, asFailedAs, FIX_A64_CALL26, FIX_A64_JUMP26, FIX_A64_PAGE21, FIX_A64_ADD_LO12, FIX_A64_LDST8 } from "./assemble";
 import { nativeFunctionsActive, nativeFunctionsIsa, nativeFunctionBegin, nativeFunctionOwnedBegin, nativeFunctionBoundaryBegin, nativeFunctionEnd, nativeFunctionPrologueEnd, nativeFunctionEpilogueStart, nativeFunctionEvent } from "./native_function_data";
 import { a64Adr, a64AddSubImm, a64AddSubExt, a64LdStUImm, a64LdStImm9, a64LdStReg, a64Branch, a64BranchCond, a64CompareBranch, a64TestBranch, a64InvertCond, a64MoveWide, a64LogicalImm } from "./a64_encode";
 import { asListingActive, asListingA64 } from "./assemble";
 import { a64Disasm } from "./a64_disasm";
+import { ISA_A64 } from "./target";
 
 const K_WORD: int = 20;
 const K_FIX: int = 21;
@@ -33,7 +34,7 @@ function add(buf: Ref<StructuredBuffer>, kind: int, nops: int, value: int, name:
 }
 function fail(buf: Ref<StructuredBuffer>, why: string): void { add(buf, K_FAIL, 0, 0, why, 0); }
 
-/// 帧事件（函数目录，M4 设计 §A5）：描述从 first 号条目（发射前记下的条目数）起到此为止的指令，不占字节；提交时按两端的
+/// 帧事件（函数目录，M4）：描述从 first 号条目（发射前记下的条目数）起到此为止的指令，不占字节；提交时按两端的
 /// 偏移记进目录。只记往回数的条目数，缓冲拼接后仍然成立。一条指令的几个事件（stp 的两个寄存器）依次跟在它后面。
 export function a64Frame(buf: Ref<StructuredBuffer>, first: int, kind: string, reg: int, bytes: int): void {
     if (!nativeFunctionsActive()) { return; }
@@ -42,9 +43,20 @@ export function a64Frame(buf: Ref<StructuredBuffer>, first: int, kind: string, r
             b: asStructuredImm(reg), c: m, value: 0, name: kind, line: buf.line });
 }
 /// sp -= bytes（序言的分配）：与 a64AddImm 同样的指令，每条一个分配事件；超过 24 位时按 lsl #12 的最大块逐条减（每条都是 16 的
-/// 倍数，中间状态也对齐），不经 x17。
+/// 倍数，中间状态也对齐），不经 x17。Windows（a64Os 为 A64_OS_WINDOWS）上不少于 4096 字节的分配照微软的约定先逐页触碰：
+/// x15＝字节数／16、bl __tx_chkstk（windows_a64.tx；改写 x16、x17、lr 与标志位，调用方都在存好 lr 之后才分配），再
+/// sub sp, sp, x15, uxtx #4。分配事件记在这一组指令上（序言的事件首尾相接；sp 在组末才变，展开码为
+/// 每条 mov、bl 各一个 nop 再加分配）。
 export function a64FrameAlloc(buf: Ref<StructuredBuffer>, bytes: int): void {
     if (bytes < 0 || bytes % 16 != 0) { fail(buf, "BadFrameAllocation"); return; }
+    if (buf.a64Os == A64_OS_WINDOWS && bytes >= 4096) {
+        const probed = listLen(buf.entries);
+        a64MovImm(buf, 15, bytes / 16);
+        a64B(buf, 1, "__tx_chkstk");
+        a64Emit(buf, a64AddSubExt(1, 1, 0, 31, 31, 15, 3, 4), "sub sp, sp, x15, uxtx #4");
+        a64Frame(buf, probed, "allocate-stack", 31, bytes);
+        return;
+    }
     let v = bytes;
     while (v >= 4096) {
         let chunk = v >>> 12;
@@ -62,7 +74,7 @@ export function a64FrameAlloc(buf: Ref<StructuredBuffer>, bytes: int): void {
 }
 /// 一条编好的指令；word 为 -1（编码函数拒绝）时记失败并说明是哪条。
 export function a64Emit(buf: Ref<StructuredBuffer>, word: int, what: string): void {
-    if (!buf.a64) { fail(buf, "NotA64Buffer"); return; }
+    if (buf.isa != ISA_A64) { fail(buf, "NotA64Buffer"); return; }
     if (word < 0) { fail(buf, "UnencodableInstruction:" + what); return; }
     add(buf, K_WORD, 0, word, "", 0);
 }
@@ -221,7 +233,7 @@ export function a64BufferX86Sites(buf: Ref<StructuredBuffer>): List<string> {
     return out;
 }
 
-// 函数清单（设计 A11，disasm 与 profile compile）：每写出一个字记一行，a64Disasm 的文本拆成助记符与操作数（方括号里的逗号不拆）。
+// 函数清单（disasm 与 profile compile）：每写出一个字记一行，a64Disasm 的文本拆成助记符与操作数（方括号里的逗号不拆）。
 // target 非空时改写最后一个操作数：本缓冲内的跳转写目标标号；修补处写符号，按 Apple 汇编的写法——adrp 写 sym@PAGE，
 // add 与读写的低 12 位写 sym@PAGEOFF（读写的 [x16, #0] 改成 [x16, sym@PAGEOFF]），b／bl 写 sym。
 function listWord(fn: int, line: int, word: int, fix: int, target: string): void {
@@ -265,10 +277,10 @@ function symText(sym: string, addend: int): string {
 
 export function a64BufferSubmit(buf: Ref<StructuredBuffer>): void {
     if (asFailedAs() != 0) { return; }
-    if (!buf.a64) { asFailWith("NotA64Buffer", 1); return; }
-    if (asImgA64() != 1) {
+    if (buf.isa != ISA_A64) { asFailWith("NotA64Buffer", 1); return; }
+    if (asImgIsa() != ISA_A64) {
         if (asA64Here() != 0) { asFailWith("MixedArchitectureImage", 1); return; }
-        asSetA64();
+        asSetIsa(ISA_A64);
     }
     nativeFunctionsIsa("aarch64");
     asStructuredSection(0);

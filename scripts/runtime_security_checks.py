@@ -6,6 +6,7 @@ dependency only; neither the language compiler nor generated programs use it.
 import hashlib
 import json
 import os
+import platform
 from pathlib import Path
 import shutil
 import struct
@@ -73,8 +74,11 @@ def security_checks(compiler, parent, check):
         check('independent-security: TX build '+name, p.returncode == 0, p.stderr)
         return out / (Path(source).stem+suffix) if p.returncode == 0 else None
 
-    # (目标三元组, cc 的架构参数, 名字后缀)：macOS 宿主为 Apple silicon，arm64 原生、x86_64 经 Rosetta（目标文件为 Mach-O）。
-    arches = [('aarch64-macos', [], '-aarch64'), ('x86_64-macos', ['-arch', 'x86_64'], '-x86_64')] if macos else [('x86_64-'+target, [], '')]
+    # (目标三元组, cc 的架构参数, 名字后缀)：macOS 宿主为 Apple silicon，arm64 原生、x86_64 经 Rosetta（目标文件为 Mach-O）；
+    # Linux 按宿主架构（aarch64 宿主的系统 C 编译器只链 aarch64 对象）。
+    a64_linux = not windows and not macos and platform.machine() in ('aarch64', 'arm64')
+    arches = ([('aarch64-macos', [], '-aarch64'), ('x86_64-macos', ['-arch', 'x86_64'], '-x86_64')] if macos else
+              [('aarch64-linux' if a64_linux else 'x86_64-'+target, [], '')])
     # 访问无权限页：Windows 0xC0000005；Linux SIGSEGV；macOS 为 SIGBUS 或 SIGSEGV。
     fault = [3221225477] if windows else ([-10, 138, -11, 139] if macos else [-11, 139])
     generators = {}
@@ -111,6 +115,10 @@ def security_checks(compiler, parent, check):
                 row = execute(work/binary, label=name, processes=2 if cname == 'argv-split.c' else 1)  # argv 驱动逐个起子进程走完整取参路径
                 marker = {'rc-boundary.c':'PASS RC', 'slot-faults.c':'PASS slots:', 'try-io.c':'PASS try-write', 'weak-faults.c':'PASS weak:', 'argv-split.c':'PASS argv:'}[cname]
                 check('independent-security: '+name, row['exit'] == 0 and marker in row['stdout'], row)
+                if cname == 'rc-boundary.c' and triple == 'aarch64-linux':
+                    # 同一驱动强制走 LL/SC（TX_A64_LLSC=1）：原子的两种形态都在真机上核对（缺省按 auxv 的 LSE 标志）。
+                    row = execute(work/binary, label=name+'-llsc', extra_env={'TX_A64_LLSC': '1'})
+                    check('independent-security: '+name+' LL/SC', row['exit'] == 0 and 'atomics llsc' in row['stdout'] and marker in row['stdout'], row)
                 if cname == 'rc-boundary.c' and mode in ('nrt', 'generic'):
                     # 过度释放（运行时加固 H1）：计数已为 0 再释放，快路径与三个通用臂都以 4012 终止、不返回。
                     for arm in range(4):
@@ -160,8 +168,9 @@ def security_checks(compiler, parent, check):
     # macOS 按 LC_LOAD_DYLIB 绑定库路径（D3 外部库写法：绝对路径、@executable_path/、@loader_path/），给绝对路径；其余宿主
     # 产物旁边的库即可（同 test-heap-check.py）。
     named = str(work / library) if macos else library
-    # 回调前后被调方保存的向量寄存器：Windows xmm6–15、Apple arm64 d8–d15（宿主为 Apple silicon，产物为 aarch64-macos）。
-    simd = ['xmm-windows.S'] if windows else (['simd-arm64.S'] if macos else [])
+    # 回调前后被调方保存的向量寄存器：Windows xmm6–15、arm64 d8–d15（Apple silicon 上产物为 aarch64-macos，aarch64 Linux 上
+    # 为 aarch64-linux；x86_64 的 SysV 没有被调方保存的向量寄存器）。
+    simd = ['xmm-windows.S'] if windows else (['simd-arm64.S'] if macos or a64_linux else [])
     if not cbuild(library, ['ffi-probe.c', *simd], ['-shared', *(['-static-libgcc'] if windows else ['-fPIC'])]):
         return
     for mode, flags in [('normal', []), ('leak', ['--leak-check']), ('debug', ['--debug'])]:

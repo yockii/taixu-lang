@@ -1,10 +1,10 @@
 // Native runtime (NRT) M1: process state, program image, Store core, entry,
-// callbi/print, trap and OS output. Contract: docs/design/v052-native-runtime-nrt-v0.1-20261013.md.
+// callbi/print, trap and OS output. Contract: .
 // Provides, under their existing names, the host symbols that generated code
-// and the generated kernel previously took from the Zig execution host.
-import { StructuredBuffer, asBufferLabel, asBufferSection, asBufferAlign, asBufferByte, asBufferQuad, asBufferZero, asBufferAddress, asBufferInstruction, asBufferBoundaryBegin, asBufferFunctionEnd, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem } from "./assemble";
+// and the generated kernel link against.
+import { StructuredBuffer, asBufferLabel, asBufferSection, asBufferAlign, asBufferByte, asBufferQuad, asBufferZero, asBufferAddress, asBufferInstruction, asBufferBoundaryBegin, asBufferFunctionBegin, asManualBegin, asManualLeaf, asBufferFunctionPrologueEnd, asBufferFunctionEpilogueStart, asBufferFrame, asBufferFunctionEnd, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem } from "./assemble";
 import { ARITY, check, text, memcpyName, fatal, trapText, arity, argTag, nrtBaseReset, nrtTarget, nrtLastError } from "./nrt_base";
-import { tElf, tSysV, tKernel32, tRawSyscall, tUnix, tMacos, tLinux, tPe } from "./target";
+import { tElf, tSysV, tKernel32, tRawSyscall, tUnix, tMacos, tLinux, tPe, tA64, ISA_X86_64, ISA_A64, ISA_LA64, ISA_RV64, T_LA64_LINUX, T_RV64_LINUX } from "./target";
 import { uxSys, uxMac, macSysEmit } from "./unix_sys";
 import { emitNrtErrors, NRT_ERROR_EXPORTS } from "./nrt_errors";
 import { emitNrtLists, NRT_LIST_EXPORTS } from "./nrt_lists";
@@ -16,6 +16,7 @@ import { emitNrtAsync, NRT_ASYNC_EXPORTS } from "./nrt_async";
 import { emitNrtGen, NRT_GEN_EXPORTS } from "./nrt_gen";
 import { emitNrtFloat } from "./nrt_float";
 import { nrtFfiEmit, nrtFfiBss, nrtFfiExports } from "./nrt_ffi";
+import { emitNrtFfiMem, NRT_FFIMEM_EXPORTS } from "./nrt_ffimem";
 import { RtFn, RtOp, L, I, A, G } from "./rtfn_base";
 import { rtBegin, rtFailed, rtSet, rtSetGlobal, rtOp, rtShift, rtDivMod, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtIf32, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtCall5, rtCall6, rtCallList, rtCallC, rtSyscall, rtRet, rtRetVoid, rtRdataBytes, rtF64ToF32Bits } from "./rtfn";
 import { TB_MASK, TB_SLOTS, TB_HEADER, TB_STACK_INIT, TB_REGION, TB_ZERO_DEPTH, TB_ZERO_PENDING } from "./thread_block_abi";
@@ -23,6 +24,10 @@ import { EXTERN_ID_BASE, BI_TABLE_LEN, RT_BI_BASE } from "./builtin_names";
 import { emitNrtRt, nrtRtBss, nrtRtDispatch } from "./nrt_rt";
 import { emitNrtRegion, emitNrtStack, emitNrtTls, emitNrtDie, nrtThreadBss, NRT_THREAD_EXPORTS } from "./nrt_thread";
 import { emitNrtSpawn, nrtSpawnBss, nrtSpawnExports } from "./nrt_spawn";
+import { linuxA64Start } from "./linux_a64";
+import { windowsA64Start, windowsA64Chkstk } from "./windows_a64";
+import { linuxLa64Start, linuxLa64Rodata } from "./linux_la64";
+import { linuxRv64Start, linuxRv64Data } from "./linux_rv64";
 import { emitNrtSend, nrtSendBss } from "./nrt_send";
 import { emitNrtShared, NRT_SHARED_EXPORTS } from "./nrt_shared";
 import { emitNrtLeak, nrtLeakBss, leakStamp } from "./nrt_leak";
@@ -96,7 +101,7 @@ function emitWrite(b: Ref<StructuredBuffer>, name: string, die: bool): void {
         rtIf(f, L("n"), "gt", I(0), "again");
         rtJump(f, "done");
         if (tMacos(nrtTarget())) {
-            // macOS（M3 设计 G5）：工具链例程给 SIGPIPE 装了空处理函数（__tx_nrt_nopipe 为 2）时，写坏管道只得 EPIPE。
+            // macOS（M3）：工具链例程给 SIGPIPE 装了空处理函数（__tx_nrt_nopipe 为 2）时，写坏管道只得 EPIPE。
             // 标准输出／错误遇坏管道仍按 SIGPIPE 结束，与 Linux 一致（同 Go 的 sigpipe()）：复位为缺省后向本进程重发。
             // 处置是父进程交下的 SIG_IGN 或程序自装的处理函数时（状态不为 2），同 Linux 只得 EPIPE、继续执行。
             rtLabel(f, "epipe");
@@ -228,32 +233,37 @@ function emitExit(b: Ref<StructuredBuffer>): void {
 // Store core
 // ---------------------------------------------------------------------------
 
-// 可移植版（macOS 适配 M4 设计 A8）：内核生成器的 --generic=leaves 让热叶与 __tx_strb_stat 改由 nrt_leaves_generic.tx 发出，
+// 可移植版：内核生成器的 --generic=leaves 让热叶与 __tx_strb_stat 改由 nrt_leaves_generic.tx 发出，
 // 这里不再发手写版。缺省不选，产物逐字节不变。
 let genericLeaves = false;
 export function nrtGenericLeaves(on: bool): void { genericLeaves = on; }
 
+// 热叶都是叶函数，登记为手写函数（runtime-manual，PE 规范化 P3 第 7 项）。
+function hotLeaf(b: Ref<StructuredBuffer>, name: string): void { asManualBegin(b, "bootstrap/selfhost/nrt.tx", name); asManualLeaf(b); }
 function emitHotLeaves(b: Ref<StructuredBuffer>): void {
     // __tx_rc_base: rc_ptr of the native slot state (may move on growth); the slot
     // state pointer is a thread-block field (TB = rbx & TB_MASK).
-    asBufferLabel(b, "__tx_rc_base", 1);
+    hotLeaf(b, "__tx_rc_base");
     asBufferInstruction(b, "mov", 2, asStructuredReg(0, 0), asStructuredReg(0, 3), asStructuredMissing(), 1);
     asBufferInstruction(b, "and", 2, asStructuredReg(0, 0), asStructuredImm(TB_MASK), asStructuredMissing(), 1);
     asBufferInstruction(b, "mov", 2, asStructuredReg(0, 0), asStructuredMem(2, 0, -1, 0, TB_SLOTS, 0, ""), asStructuredMissing(), 1);
     asBufferInstruction(b, "mov", 2, asStructuredReg(0, 0), asStructuredMem(2, 0, -1, 0, 0, 0, ""), asStructuredMissing(), 1);
     asBufferInstruction(b, "ret", 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1);
+    asBufferFunctionEnd(b);
     // __tx_rc_scalar_flag: bit0 scalar arm, bit1 probe counting. The NRT always reports the scalar arm
     // (threads step 4a: every object belongs to one thread; shared blocks count atomically on their own),
     // so the generic paths (list push retain, zero cascade, probe counting) count with plain adds too.
-    asBufferLabel(b, "__tx_rc_scalar_flag", 1);
+    hotLeaf(b, "__tx_rc_scalar_flag");
     asBufferInstruction(b, "mov", 2, asStructuredReg(1, 0), asStructuredMem(1, -1, -1, 0, 0, 1, "__tx_nrt_rc_flags"), asStructuredMissing(), 1);
     asBufferInstruction(b, "or", 2, asStructuredReg(1, 0), asStructuredImm(1), asStructuredMissing(), 1);
     asBufferInstruction(b, "ret", 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1);
-    asBufferLabel(b, "__tx_rc_probe_counts", 1);
+    asBufferFunctionEnd(b);
+    hotLeaf(b, "__tx_rc_probe_counts");
     asBufferInstruction(b, "lea", 2, asStructuredReg(0, 0), asStructuredMem(2, -1, -1, 0, 0, 1, "__tx_nrt_probe_counts"), asStructuredMissing(), 1);
     asBufferInstruction(b, "ret", 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1);
+    asBufferFunctionEnd(b);
     // __tx_native_object_address_v1(idx) = objects_ptr + idx * 72.
-    asBufferLabel(b, "__tx_native_object_address_v1", 1);
+    hotLeaf(b, "__tx_native_object_address_v1");
     // idx * 72 = (idx * 8) + (idx * 64), u32 index zero-extended first.
     asBufferInstruction(b, "mov", 2, asStructuredReg(1, 0), asStructuredReg(1, 1), asStructuredMissing(), 1);
     asBufferInstruction(b, "shl", 2, asStructuredReg(0, 0), asStructuredImm(3), asStructuredMissing(), 1);
@@ -265,14 +275,17 @@ function emitHotLeaves(b: Ref<StructuredBuffer>): void {
     asBufferInstruction(b, "mov", 2, asStructuredReg(0, 10), asStructuredMem(2, 10, -1, 0, TB_SLOTS, 0, ""), asStructuredMissing(), 1);
     asBufferInstruction(b, "add", 2, asStructuredReg(0, 0), asStructuredMem(2, 10, -1, 0, 48, 0, ""), asStructuredMissing(), 1);
     asBufferInstruction(b, "ret", 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1);
+    asBufferFunctionEnd(b);
     // __tx_site_of(fn, pc) → 分配点：未开泄漏检查时为 0（只多一次标志读取）；开启时转 __tx_leak_site_of（nrt_leak.tx）。
-    asBufferLabel(b, "__tx_site_of", 1);
+    hotLeaf(b, "__tx_site_of");
     asBufferInstruction(b, "mov", 2, asStructuredReg(1, 0), asStructuredMem(1, -1, -1, 0, 0, 1, "__tx_leak_on"), asStructuredMissing(), 1);
     asBufferInstruction(b, "test", 2, asStructuredReg(1, 0), asStructuredReg(1, 0), asStructuredMissing(), 1);
     asBufferInstruction(b, "jne", 1, asStructuredTarget("__tx_leak_site_of"), asStructuredMissing(), asStructuredMissing(), 1);
     asBufferInstruction(b, "ret", 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1);
-    asBufferLabel(b, "__tx_native_construct_stat_v1", 1);
+    asBufferFunctionEnd(b);
+    hotLeaf(b, "__tx_native_construct_stat_v1");
     asBufferInstruction(b, "ret", 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1);
+    asBufferFunctionEnd(b);
 }
 
 function emitStore(b: Ref<StructuredBuffer>): void {
@@ -319,7 +332,7 @@ function emitStore(b: Ref<StructuredBuffer>): void {
     check(f);
 
     // __tx_nrt_new_u8list(ptr, n, cap) → idx：Bytes 与紧凑 List<u8> 共用的对象形态（kind 10、pk 7、form 3、elem 4；
-    // O4 第二步 2c2）。cap 按字节计且 ≥ n；cap≠0 当且仅当 ptr 是本对象独占的块。
+    // ）。cap 按字节计且 ≥ n；cap≠0 当且仅当 ptr 是本对象独占的块。
     f = rtBegin(b, "__tx_nrt_new_u8list", "ptr n cap", "s0 s1 s2 s3 s4 s5 s6 s7 sp", 1, "bootstrap/selfhost/nrt.tx");
     rtSet(f, "s0", I(10)); rtSet(f, "s1", I(30064771072)); rtSet(f, "s2", L("ptr")); rtSet(f, "s3", L("n")); rtSet(f, "s4", L("cap"));
     rtSet(f, "s5", I(12884901892)); rtSet(f, "s6", I(4)); rtSet(f, "s7", I(0));
@@ -393,7 +406,7 @@ function emitStore(b: Ref<StructuredBuffer>): void {
     rtCall1(f, "o", "__tx_native_object_address_v1", L("idx")); rtLoad(f, "o", L("o"), 32, 8); rtRet(f, L("o")); check(f);
     f = rtBegin(b, "__tx_store_str_len", "idx", "o", 1, "bootstrap/selfhost/nrt.tx");
     rtCall1(f, "o", "__tx_native_object_address_v1", L("idx")); rtLoad(f, "o", L("o"), 40, 8); rtRet(f, L("o")); check(f);
-    // 换缓冲即清容量 cap@48（字符串原地追加设计 §四-A 硬约束：旧容量大于新缓冲时下一次追加越界写）。
+    // 换缓冲即清容量 cap@48（硬约束：旧容量大于新缓冲时下一次追加越界写）。
     f = rtBegin(b, "__tx_store_str_set_span", "idx ptr n", "o fl", 1, "bootstrap/selfhost/nrt.tx");
     rtCall1(f, "o", "__tx_native_object_address_v1", L("idx"));
     rtStore(f, L("o"), 32, L("ptr"), 8); rtStore(f, L("o"), 40, L("n"), 8); rtStore(f, L("o"), 48, I(0), 8);
@@ -660,7 +673,7 @@ function emitEntry(b: Ref<StructuredBuffer>): void {
     rtIf(f, L("x"), "ne", L("y"), "mismatch");
     rtOp(f, "i", L("i"), "add", I(4));
     rtJump(f, "cmploop");
-    // 启动对象界（线程间发送按序号传启动对象，线程设计 §十八）：各线程启动后的槽表长度须与主线程相同。
+    // 启动对象界（线程间发送按序号传启动对象）：各线程启动后的槽表长度须与主线程相同。
     rtLabel(f, "cmpslots");
     rtSet(f, "x", G("__tx_nrt_slots")); rtLoad(f, "x", L("x"), 16, 8);
     rtIf(f, L("x"), "ne", G("__tx_nrt_startup_slots"), "mismatch");
@@ -763,7 +776,6 @@ function emitEntry(b: Ref<StructuredBuffer>): void {
     rtJump(f, "chosen");
     rtLabel(f, "bymain");
     rtLoad(f, "entry", L("img"), NRT_IMG_ENTRY, 8);
-    rtSetGlobal(f, "__tx_task_main", I(1));
     rtLabel(f, "chosen");
     rtIf(f, L("entry"), "lt", I(0), "nomain");
     rtIf(f, L("entry"), "uge", G("__tx_rt_table_len"), "range");
@@ -773,7 +785,7 @@ function emitEntry(b: Ref<StructuredBuffer>): void {
     rtShift(f, "st", L("entry"), "shl", 4); rtOp(f, "st", L("st"), "add", G("__tx_rt_table_ptr")); rtLoad(f, "st", L("st"), 12, 4);
     rtIf(f, L("np"), "eq", I(1), "argvmain");
     // main 不带参数（及测试入口）：命令行参数的字符串对象交不出去，在此释放；装参数的原生数组随即归还
-    // （此前两者都不释放，泄漏检查设计 §三-5）。
+    // （此前两者都不释放）。
     rtSet(f, "s0", I(0));
     rtLabel(f, "argvrel");
     rtIf(f, L("s0"), "ge", L("count"), "argvdone");
@@ -827,16 +839,10 @@ function emitEntry(b: Ref<StructuredBuffer>): void {
     // 入口调用的 __tx_entry_finish 在 nrt_leak.tx：先调本例程，开启泄漏检查时再扫描。
     const failNl = text(b, "\n");
     f = rtBegin(b, "__tx_entry_result", "", "win tag v s o p n bt bp", 3, "bootstrap/selfhost/nrt.tx");
-    // 调度泵（原生异步）：main 同步体排空后 FIFO 跑完就绪任务；任务窗口从
-    // main 结果槽之后开始，main 的结果原样留到这里取用。测试入口不进泵（同 VM）。
-    rtIf(f, G("__tx_task_main"), "eq", I(0), "test_tasks");
-    rtCall0(f, "", "__tx_task_pump");
-    rtJump(f, "pumped");
-    rtLabel(f, "test_tasks");
-    rtCall0(f, "", "__tx_task_discard_tests");
-    rtLabel(f, "pumped");
-    // main 返回后等全部线程结束再退出（线程设计 §十三-4；没有线程时只读一次计数）。
-    rtCall0(f, "", "__tx_thread_wait_all");
+    // 入口返回（D3 v0.53，main 与 test 入口相同）：取消全部未完成的任务（挂起中的先执行已登记的 defer），任务窗口从入口
+    // 结果槽之后开始，结果原样留到这里取用；未 join 的线程随进程结束，不再等它们。
+    rtSet(f, "win", G("__tx_nrt_entry_win")); rtOp(f, "win", L("win"), "add", I(16));
+    rtCall1(f, "", "__tx_task_cancel_all", L("win"));
     rtSet(f, "win", G("__tx_nrt_entry_win"));
     rtLoad(f, "tag", L("win"), 0, 1); rtLoad(f, "v", L("win"), 8, 8);
     rtIf(f, L("tag"), "eq", I(5), "failed");
@@ -887,13 +893,13 @@ function emitEntry(b: Ref<StructuredBuffer>): void {
 // Trap reporting: `module:line:col: [runtime:name] msg\n` to stderr, exit 3.
 // ---------------------------------------------------------------------------
 
-const RUNTIME_NAMES: string = "div_by_zero out_of_bounds stack_overflow int_overflow f2i_overflow bad_opcode resource_depth panicked assert_failed bad_type not_exhaustive corrupt_code extern sched_deadlock exit_pending shift_count gen_running narrow_range ffi_arg ffi_callback unsendable frozen_write leak ffi_buffer_borrow";
+const RUNTIME_NAMES: string = "div_by_zero out_of_bounds stack_overflow int_overflow f2i_overflow bad_opcode resource_depth panicked assert_failed bad_type not_exhaustive corrupt_code extern sched_deadlock exit_pending shift_count gen_running narrow_range ffi_arg ffi_callback unsendable frozen_write leak ffi_buffer_borrow ffi_mem";
 
 function emitTrap(b: Ref<StructuredBuffer>): void {
-    // Name table: {ptr, len} for codes 4001..4024 (4017 gen_running, D3 v0.22; 4018 narrow_range, fixed-width as;
+    // Name table: {ptr, len} for codes 4001..4025 (4017 gen_running, D3 v0.22; 4018 narrow_range, fixed-width as;
     // 4019 ffi_arg, D3 v0.23 FFI argument marshaling; 4020 ffi_callback, callback outside a call or thread;
-    // 4021 unsendable, threads §十八、§二十; 4022 frozen_write, threads §二十一-2; 4023 leak, 泄漏检查设计 §三-4，
-    // 只用于泄漏报告的首行，不是 trap; 4024 ffi_buffer_borrow).
+    // 4021 unsendable, threads §十八、§二十; 4022 frozen_write, threads §二十一-2; 4023 leak,
+    // 只用于泄漏报告的首行，不是 trap; 4024 ffi_buffer_borrow; 4025 ffi_mem, D3 v0.48 外部内存区).
     const names = strSplit(RUNTIME_NAMES, " ");
     const labels: List<string> = listNew();
     let k = 0;
@@ -948,30 +954,18 @@ function emitTrap(b: Ref<StructuredBuffer>): void {
     const open = text(b, ": [runtime:");
     const close = text(b, "] ");
     const nl = text(b, "\n");
-    const pendA = "；另有 ";
-    const pendB = " 个未决任务（结构化出口守护——发后即忘任务未 join/未取消）";
-    const pendAL = text(b, pendA);
-    const pendBL = text(b, pendB);
-    // __tx_trap(fn, pc, code, mp, ml): the pending-task count of the structured-exit
-    // guard (D26 §三-7) comes from the thread block; formatting and exit are in the core.
-    f = rtBegin(b, "__tx_trap", "fn pc code mp ml", "x", 6, "bootstrap/selfhost/nrt.tx");
-    rtSet(f, "x", I(0));
-    rtIf(f, G("__tx_task_main"), "eq", I(0), "go");
-    rtOp(f, "x", L("code"), "and", I(4294967295));
-    rtIf(f, L("x"), "eq", I(4014), "none");
-    rtCall0(f, "x", "__tx_task_pending");
-    rtJump(f, "go");
-    rtLabel(f, "none"); rtSet(f, "x", I(0));
-    rtLabel(f, "go");
-    rtCall6(f, "", "__tx_trap_core", L("fn"), L("pc"), L("code"), L("mp"), L("ml"), L("x"));
+    // __tx_trap(fn, pc, code, mp, ml): formatting and exit are in the core. (D3 v0.53 dropped the structured-exit
+    // guard's pending-task suffix: tasks still pending when the entry ends are cancelled, not an error.)
+    f = rtBegin(b, "__tx_trap", "fn pc code mp ml", "", 6, "bootstrap/selfhost/nrt.tx");
+    rtCall5(f, "", "__tx_trap_core", L("fn"), L("pc"), L("code"), L("mp"), L("ml"));
     rtRetVoid(f); check(f);
     // __tx_trap_bare: no thread block (FFI callback entered on a foreign thread or outside a call).
     f = rtBegin(b, "__tx_trap_bare", "fn pc code mp ml", "", 6, "bootstrap/selfhost/nrt.tx");
-    rtCall6(f, "", "__tx_trap_core", L("fn"), L("pc"), L("code"), L("mp"), L("ml"), I(0));
+    rtCall5(f, "", "__tx_trap_core", L("fn"), L("pc"), L("code"), L("mp"), L("ml"));
     rtRetVoid(f); check(f);
     // __tx_trap_core(fn, pc, code, mp, ml, pending): touches only the image and process state;
     // the process-level fatal lock keeps concurrent traps from interleaving (threads §十一-4).
-    f = rtBegin(b, "__tx_trap_core", "fn pc code mp ml pending", "buf pos img e mod line col lp nl x y", 4, "bootstrap/selfhost/nrt.tx");
+    f = rtBegin(b, "__tx_trap_core", "fn pc code mp ml", "buf pos img e mod line col lp nl x y", 4, "bootstrap/selfhost/nrt.tx");
     rtCall0(f, "", "__tx_nrt_die_enter");
     rtSet(f, "buf", A("__tx_nrt_trap_buf"));
     rtSet(f, "pos", I(0));
@@ -1015,12 +1009,6 @@ function emitTrap(b: Ref<StructuredBuffer>): void {
     rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), A(close), I(2));
     rtOp(f, "ml", L("ml"), "and", I(4294967295));
     rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), L("mp"), L("ml"));
-    // 结构化出口守护（D26 §三-7）：main 或任务以 trap 结束时附未决任务计数。
-    rtIf(f, L("pending"), "eq", I(0), "annotated");
-    rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), A(pendAL), I(len(pendA)));
-    rtCall3(f, "pos", "__tx_nrt_put_udec", L("buf"), L("pos"), L("pending"));
-    rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), A(pendBL), I(len(pendB)));
-    rtLabel(f, "annotated");
     rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), A(nl), I(1));
     rtCall3(f, "", "__tx_nrt_write_die", I(2), L("buf"), L("pos"));
     rtCall1(f, "", "__tx_nrt_exit", I(3));
@@ -1109,7 +1097,7 @@ function emitBuiltins2(b: Ref<StructuredBuffer>): void {
 
     // listNew(): empty generic list (kind 10, payload list 7, form 1). With one argument — a fixed-width
     // kind code (1..6 i8..u32, 10 f32), emitted by codegen from the static List<T> — the list is compact
-    // (form 3, elem = kind; O4 step 2, list_compact.tx).
+    // (form 3, elem = kind; step 2, list_compact.tx).
     f = rtBegin(b, "__tx_bi_list_new", "win fn pc a nargs", "s0 s1 s2 s3 s4 s5 s6 s7 sp k t", 5, "bootstrap/selfhost/nrt.tx");
     rtSet(f, "s5", I(4294967296));
     rtIf32(f, L("nargs"), "eq", I(0), "make");
@@ -1176,7 +1164,7 @@ function emitBuiltins2(b: Ref<StructuredBuffer>): void {
     rtRetVoid(f); check(f);
 
     // strConcat(s...): one allocation for all string arguments. 首叶唯一持有（rc==1、非帧、非驻留）、
-    // 非空且至少两叶时改为在首叶对象上按容量追加其余各叶（字符串原地追加设计 §四-C）：结果与首叶
+    // 非空且至少两叶时改为在首叶对象上按容量追加其余各叶：结果与首叶
     // 同一对象，结果槽另持一个引用；rc==1 意味着别的叶不可能是同一对象。
     f = rtBegin(b, "__tx_bi_str_concat", "win fn pc a nargs", "i v t o total q at n", 5, "bootstrap/selfhost/nrt.tx");
     rtIf32(f, L("nargs"), "lt", I(1), "few");
@@ -1295,7 +1283,7 @@ function emitBuiltins2(b: Ref<StructuredBuffer>): void {
     rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1");
     rtRetVoid(f); check(f);
 
-    // toStr(f32)（O4 第二步，BuiltinId 70）：实参是能精确表示为 f32 的 float，按 f32 的最短往返表示。
+    // toStr(f32)（BuiltinId 70）：实参是能精确表示为 f32 的 float，按 f32 的最短往返表示。
     f = rtBegin(b, "__tx_bi_f32_str", "win fn pc a nargs", "v t x o", 5, "bootstrap/selfhost/nrt.tx");
     arity(b, f, 1);
     rtCall3(f, "v", "__tx_nrt_arg", L("win"), L("a"), I(0));
@@ -1311,8 +1299,9 @@ function emitBuiltins2(b: Ref<StructuredBuffer>): void {
 
     // strb_stat: development counters only; NRT carries no strb report.
     if (!genericLeaves) {
-        asBufferLabel(b, "__tx_strb_stat", 1);
+        hotLeaf(b, "__tx_strb_stat");
         asBufferInstruction(b, "ret", 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1);
+        asBufferFunctionEnd(b);
     }
 
     // __tx_nrt_const(fn, bx) → address of the {kind,a,b,c} record, or 0.
@@ -1397,7 +1386,7 @@ export function nrtBss(b: Ref<StructuredBuffer>): void {
     const names = strSplit("__tx_rt_table_ptr __tx_rt_table_len __tx_nrt_rc_flags __tx_nrt_out __tx_nrt_err __tx_nrt_envp", " ");
     let k = 0;
     while (k < listLen(names)) { asBufferLabel(b, listGet(names, k) catch "", 1); asBufferZero(b, 8, 1); k = k + 1; }
-    // macOS：SIGPIPE 处置的状态字（工具链例程 __tx_tool_nopipe 写，内核写标准输出／错误遇 EPIPE 时读；M3 设计 G5）。
+    // macOS：SIGPIPE 处置的状态字（工具链例程 __tx_tool_nopipe 写，内核写标准输出／错误遇 EPIPE 时读；M3）。
     if (tMacos(nrtTarget())) { asBufferLabel(b, "__tx_nrt_nopipe", 1); asBufferZero(b, 8, 1); }
     // macOS：fork 锁的锁字（nrt_proc.tx 的 __tx_nrt_fork_lock）。
     if (tMacos(nrtTarget())) { asBufferLabel(b, "__tx_nrt_fork_flag", 1); asBufferZero(b, 8, 1); }
@@ -1423,13 +1412,54 @@ export function nrtExports(): List<string> {
     // 链接器据此建立平台 TLS：Windows 的 TLS 目录（数据目录 9）、Linux 的 PT_TLS 模板。
     // macOS 的 TLV 描述符由链接器合成（link_macho.tx），内核不带模板。
     if (tElf(nrtTarget())) { listPush(out, "__tx_tls_template"); } else if (tPe(nrtTarget())) { listPush(out, "__tx_tls_directory"); }
-    const more = strSplit(NRT_THREAD_EXPORTS + " " + NRT_ASYNC_EXPORTS + " " + NRT_GEN_EXPORTS + " " + nrtSpawnExports() + " " + NRT_SHARED_EXPORTS + " " + NRT_LIST_EXPORTS + " " + NRT_TEXT_EXPORTS + " " + NRT_SYS_EXPORTS + " " + NRT_PROC_EXPORTS + " " + NRT_BYTES_EXPORTS + " " + NRT_ERROR_EXPORTS + " " + nrtFfiExports(), " ");
+    const more = strSplit(NRT_THREAD_EXPORTS + " " + NRT_ASYNC_EXPORTS + " " + NRT_GEN_EXPORTS + " " + nrtSpawnExports() + " " + NRT_SHARED_EXPORTS + " " + NRT_LIST_EXPORTS + " " + NRT_TEXT_EXPORTS + " " + NRT_SYS_EXPORTS + " " + NRT_PROC_EXPORTS + " " + NRT_BYTES_EXPORTS + " " + NRT_ERROR_EXPORTS + " " + nrtFfiExports() + " " + NRT_FFIMEM_EXPORTS, " ");
     k = 0;
     while (k < listLen(more)) { listPush(out, listGet(more, k) catch ""); k = k + 1; }
     if (tElf(nrtTarget())) { listPush(out, "_start"); }
+    // 程序映像里的 rtfn 例程（工具链例程等）的原子操作读它（aarch64 的 Linux 与 Windows）。
+    if (tA64(nrtTarget()) && !tMacos(nrtTarget())) { listPush(out, "__tx_a64_lse"); }
+    // Windows：PE 入口与程序映像里大帧序言调的栈探测在内核里（aarch64 见 windows_a64.tx）。
+    if (tPe(nrtTarget())) { listPush(out, "__tx_entry"); listPush(out, "__tx_chkstk"); }
+    // 程序映像里的工具链例程与调试运行时把 fstat／newfstatat 改写成 statx 时取它作空路径（loongarch64-linux）。
+    if (nrtTarget() == T_LA64_LINUX) { listPush(out, "__tx_la64_empty"); }
+    // 链接器在动态产物里把它置 1（riscv64-linux 的 _start 据此不动线程指针，linux_rv64.tx）。
+    if (nrtTarget() == T_RV64_LINUX) { listPush(out, "__tx_dynamic_image"); }
     // 程序映像里的工具链例程（procSpawn 的子进程环境）取当前环境的快照（nrt_rt.tx，D3 v0.39）。
     if (tUnix(nrtTarget())) { listPush(out, "__tx_rt_env_block"); }
     return out;
+}
+
+/// x86_64-windows 的进程入口（PE 规范化 P3，同 aarch64-windows 由内核提供）：系统按平台约定调用，入口 rsp≡8（mod 16），
+/// sub 40 使调用点 16 对齐并留出 32 字节影子区；__tx_native_entry 以 ExitProcess 结束、不返回，尾声照常写出以便展开信息描述。
+function emitWindowsX64Start(b: Ref<StructuredBuffer>): void {
+    const none = asStructuredMissing();
+    asBufferFunctionBegin(b, "bootstrap/selfhost/nrt.tx", "__tx_entry", "process-thread-entry");
+    asBufferLabel(b, "__tx_entry", 1);
+    asBufferFrame(b, "allocate-stack", 4, 40);
+    asBufferFunctionPrologueEnd(b);
+    asBufferInstruction(b, "call", 1, asStructuredTarget("__tx_native_entry"), none, none, 1);
+    asBufferFunctionEpilogueStart(b);
+    asBufferFrame(b, "release-stack", 4, 40);
+    asBufferFrame(b, "return", -1, 8);
+    asBufferFunctionEnd(b);
+}
+
+/// __tx_chkstk（x86_64-windows，微软 __chkstk 的约定）：rax＝要分配的字节数，从调用方的 rsp 起逐页下移、各读一次（落在保护页上即由
+/// 系统扩栈），直到越过新栈顶；只改 r10、r11 与标志位，rax 与 rsp 不变（调用方随后 sub rsp, rax）。叶函数（登记为 runtime-manual），
+/// 不需要展开信息。
+function emitWindowsX64Chkstk(b: Ref<StructuredBuffer>): void {
+    const none = asStructuredMissing();
+    asManualBegin(b, "bootstrap/selfhost/nrt.tx", "__tx_chkstk"); asManualLeaf(b);
+    asBufferInstruction(b, "lea", 2, asStructuredReg(0, 11), asStructuredMem(2, 4, -1, 0, 8, 0, ""), none, 1);
+    asBufferInstruction(b, "mov", 2, asStructuredReg(0, 10), asStructuredReg(0, 11), none, 1);
+    asBufferInstruction(b, "sub", 2, asStructuredReg(0, 10), asStructuredReg(0, 0), none, 1);
+    asBufferLabel(b, "__tx_chkstk_page", 1);
+    asBufferInstruction(b, "sub", 2, asStructuredReg(0, 11), asStructuredImm(4096), none, 1);
+    asBufferInstruction(b, "cmp", 2, asStructuredReg(0, 10), asStructuredMem(3, 11, -1, 0, 0, 0, ""), none, 1);
+    asBufferInstruction(b, "cmp", 2, asStructuredReg(0, 11), asStructuredReg(0, 10), none, 1);
+    asBufferInstruction(b, "ja", 1, asStructuredTarget("__tx_chkstk_page"), none, none, 1);
+    asBufferInstruction(b, "ret", 0, none, none, none, 1);
+    asBufferFunctionEnd(b);
 }
 
 /// Linux process entry without libc: (argc, argv) from the initial stack into
@@ -1486,7 +1516,13 @@ function emitLinuxStart(b: Ref<StructuredBuffer>): void {
 export function nrtEmit(b: Ref<StructuredBuffer>, t: int): int {
     nrtBaseReset(t);
     asBufferSection(b, 0, 1);
-    if (tElf(t)) { emitLinuxStart(b); }
+    if (tElf(t)) {
+        if (b.isa == ISA_A64) { linuxA64Start(b); } else if (b.isa == ISA_LA64) { linuxLa64Start(b); linuxLa64Rodata(b); }
+        else if (b.isa == ISA_RV64) { linuxRv64Start(b); linuxRv64Data(b); } else { emitLinuxStart(b); }
+    }
+    // Windows：进程入口与栈探测在内核里（aarch64 见 windows_a64.tx）。
+    if (tPe(t) && b.isa == ISA_A64) { windowsA64Start(b); windowsA64Chkstk(b); }
+    if (tPe(t) && b.isa == ISA_X86_64) { emitWindowsX64Start(b); emitWindowsX64Chkstk(b); }
     if (tMacos(t)) { macSysEmit(b); }
     emitWrite(b, "__tx_nrt_write", false);
     emitWrite(b, "__tx_nrt_write_die", true);
@@ -1516,6 +1552,7 @@ export function nrtEmit(b: Ref<StructuredBuffer>, t: int): int {
     emitNrtBytes(b);
     emitNrtLeak(b);
     nrtFfiEmit(b);
+    emitNrtFfiMem(b);
     if (len(nrtLastError()) > 0) { return 1; }
     return 0;
 }

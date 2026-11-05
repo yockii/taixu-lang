@@ -1,6 +1,6 @@
-// 可重定位目标文件链接的公共核心（macOS 适配 M1 设计 E2，docs/design/v052-macos-m1-macho-v0.1-20261024.md）：
+// 可重定位目标文件链接的公共核心：
 // 读入并校验我们自己的 ELF64 x86-64 可重定位目标文件，按节标志分成 text/rodata/data/bss 四组放置，全局符号解析，
-// 拷贝节字节，应用 RELA（R_X86_64_64/PC32/PLT32/32/32S；arm64 的 R_AARCH64_*，见 a64Relocate，macOS 适配 M4 设计 A3）。可执行文件格式（ELF、Mach-O）由各自的写出器决定：
+// 拷贝节字节，应用 RELA（R_X86_64_64/PC32/PLT32/32/32S；arm64 的 R_AARCH64_*，见 a64Relocate）。可执行文件格式（ELF、Mach-O）由各自的写出器决定：
 // 写出器定各组的虚拟地址，再调这里拷节与重定位。约定：映像里虚拟地址与文件偏移只差一个常数 base（写出器给出），
 // 即 文件偏移 = 虚拟地址 − base。本模块从 link_elf_objects.tx 原样搬出，检查与先后次序不变（Linux 产物逐字节不变）。
 import { BinaryName, rawName, rawNameOf, rawNameNone, rawNameSize, rawNameEqual, rawNameText } from "./binary_name";
@@ -28,7 +28,12 @@ let symCache: List<List<int>> = listNew();
 let symResolvedCache: List<List<int>> = listNew();
 let placedAt: List<List<int>> = listNew(); // [对象][节号] → placed 下标，未放置 −1
 let symtabAt: List<int> = listNew(); // 各对象的符号表节号；checkObject 全部通过后才填
-let machine: int = 62; // 第一个对象的 e_machine（62 x86-64、183 aarch64），其余须相同
+let machine: int = 62; // 第一个对象的 e_machine（62 x86-64、183 aarch64、258 loongarch64、243 riscv64），其余须相同
+// RISC-V 的 PCREL_HI20：位置（虚拟地址的十进制）→ S+A−P；PCREL_LO12 的符号指向所配的 auipc，按它取值，等本轮全部重定位之后应用。
+let rvHi: Map<string, int> = mapNew();
+let rvLoAt: List<int> = listNew();
+let rvLoKind: List<int> = listNew();
+let rvLoLabel: List<int> = listNew();
 const BUCKETS: int = 16384;
 
 /// 目标文件的 e_machine（不是 ELF 时得 -1）：写出器据此在 lkoBegin 之前选格式参数。
@@ -221,6 +226,29 @@ export function lkoUndefinedWithPrefix(prefix: string): List<string> {
     return names;
 }
 
+/// 外部符号：各目标文件里引用（未定义、非 LOCAL）而没有任何目标文件定义（非 UNDEF 的 GLOBAL／WEAK，同 lkoDefineGlobals）的
+/// 符号名，按首次出现的次序去重。PE 写出器据此在定组基址之前算出要合成的导入桩（link_pe_objects.tx）。须在 lkoBegin 成功之后调用。
+export function lkoUndefinedExternal(): List<string> {
+    const refs = lkoUndefinedWithPrefix("");
+    const defined: Map<string, int> = mapNew();
+    let o = 0;
+    while (o < listLen(objs)) {
+        const st = symtabOf(o);
+        const count = shSize(o, st) / 24;
+        let s = shInfo(o, st);
+        while (s < count) {
+            const at = symAt(o, s);
+            const bind = rd(o, at + 4, 1) >>> 4;
+            if (rd(o, at + 6, 2) != SHN_UNDEF && (bind == 1 || bind == 2)) { mapSet(defined, rawNameText(symName(o, s)), 1); }
+            s = s + 1;
+        }
+        o = o + 1;
+    }
+    const out: List<string> = listNew();
+    for (n in refs) { if (!mapHas(defined, n)) { listPush(out, n); } }
+    return out;
+}
+
 function hasName(names: List<string>, x: string): bool {
     for (n in names) { if (n == x) { return true; } }
     return false;
@@ -282,8 +310,14 @@ function checkObject(o: int): int {
     if (rd(o, 0, 4) != 1179403647 || rd(o, 4, 1) != 2 || rd(o, 5, 1) != 1) { return lkoReject("NotElf64LittleEndian"); }
     if (rd(o, 16, 2) != 1 || rd(o, 18, 2) != machine) {
         if (machine == 183) { return lkoReject("NotAArch64Relocatable"); }
+        if (machine == 258) { return lkoReject("NotLoongArchRelocatable"); }
+        if (machine == 243) { return lkoReject("NotRiscvRelocatable"); }
         return lkoReject("NotX8664Relocatable");
     }
+    // 龙芯：只收 LP64D＋OBJABI v1（e_flags 0x43；v0 的对象用栈式重定位，lld 同样拒收）。
+    if (machine == 258 && rd(o, 48, 4) != 67) { return lkoReject("NotLoongArchLp64dV1"); }
+    // RISC-V：只收双精度浮点 ABI（e_flags 位 1..2 为 2）、不是 RVE 的对象；RVC、TSO 位不论（GNU ld 与 lld 同样拒收浮点 ABI 不同的）。
+    if (machine == 243 && ((rd(o, 48, 4) & 6) != 4 || (rd(o, 48, 4) & 8) != 0)) { return lkoReject("NotRiscvLp64d"); }
     if (rd(o, 58, 2) != 64 || shCount(o) == 0 || !fits(rd(o, 40, 8), shCount(o) * 64, bytesLen(data))) { return lkoReject("BadSectionHeaders"); }
     const st = symtabOf(o); if (st < 0) { return lkoReject("MissingSymtab"); }
     let section = 1;
@@ -325,7 +359,10 @@ export function lkoBegin(objects: List<Bytes>, mapTarget: string): int {
     globalNames = listNew(); globalAddrs = listNew(); globalKinds = listNew(); buckets = listNew(); symCache = listNew(); symResolvedCache = listNew();
     placedAt = listNew(); symtabAt = listNew();
     machine = 62;
-    if (listLen(objs) > 0 && lkoObjectMachine(listGet(objs, 0) catch noBytes()) == 183) { machine = 183; }
+    if (listLen(objs) > 0) {
+        const first = lkoObjectMachine(listGet(objs, 0) catch noBytes());
+        if (first == 183 || first == 258 || first == 243) { machine = first; }
+    }
     let h = 0;
     while (h < BUCKETS) { listPush(buckets, listNew()); h = h + 1; }
     let g = 0;
@@ -457,6 +494,7 @@ function patch(out: Bytes, at: int, value: int, width: int): void {
 
 /// Relocations。absSites 收集每个 64 位绝对地址重定位的位置（虚拟地址），供需要加载期 rebase 的格式使用（PIE 的 Mach-O）。
 export function lkoRelocate(out: Bytes, base: int, absSites: List<int>): int {
+    rvHi = mapNew(); rvLoAt = listNew(); rvLoKind = listNew(); rvLoLabel = listNew();
     let o = 0;
     while (o < listLen(objs)) {
         let r = 1;
@@ -485,7 +523,8 @@ export function lkoRelocate(out: Bytes, base: int, absSites: List<int>): int {
                         if (sym >= symCount) { return lkoReject("BadRelocationSymbol"); }
                         const s = listGet(cacheO, sym) catch -1;
                         if ((listGet(resolvedO, sym) catch 0) == 0) { return lkoReject("MissingSymbol:" + rawNameText(symName(o, sym))); }
-                        let width = 4; if (kind == 1 || (machine == 183 && kind == 257)) { width = 8; }
+                        let width = 4; if (kind == 1 || (machine == 183 && kind == 257) || (machine == 258 && kind == 2)) { width = 8; }
+                        if (machine == 243 && (kind == 2 || kind == 18 || kind == 19)) { width = 8; }
                         // 先核对位置再求地址：where 取自对象文件，核对之前相加可能溢出（结构化变异查出）。
                         if (!fits(where, width, targetSize) || targetNobits) { return lkoReject("BadRelocationSite"); }
                         const site = sbase + where;
@@ -496,6 +535,10 @@ export function lkoRelocate(out: Bytes, base: int, absSites: List<int>): int {
                         const sa = wrapAdd(s, addend);
                         if (machine == 183) {
                             if (a64Relocate(out, fileAt, site, kind, sa, absSites) != 0) { return 1; }
+                        } else if (machine == 258) {
+                            if (la64Relocate(out, fileAt, site, kind, sa, absSites) != 0) { return 1; }
+                        } else if (machine == 243) {
+                            if (rv64Relocate(out, fileAt, site, kind, sa, absSites) != 0) { return 1; }
                         } else if (kind == 1) {
                             patch(out, fileAt, sa, 8);
                             listPush(absSites, site);
@@ -522,6 +565,7 @@ export function lkoRelocate(out: Bytes, base: int, absSites: List<int>): int {
         }
         o = o + 1;
     }
+    if (machine == 243) { return rv64ApplyLo12(out); }
     return 0;
 }
 
@@ -563,6 +607,76 @@ function a64Relocate(out: Bytes, fileAt: int, site: int, kind: int, sa: int, abs
     const low = sa & 4095;
     if ((low & ((1 << scale) - 1)) != 0) { return lkoReject("MisalignedPageOffset"); }
     patch(out, fileAt, (insn & ~(4095 << 10)) | ((low >>> scale) << 10), 4);
+    return 0;
+}
+
+// 龙芯的 RELA（LoongArch ELF psABI）：sa = S+A，site = P。指令的操作码位保留，只改立即数位；范围与对齐
+// 不合即拒绝（不截断）。PCALA_HI20 的“页”固定 4 KiB（与系统页长无关），加 0x800 抵消 LO12 在 addi.d／读写里的符号扩展。
+function la64Relocate(out: Bytes, fileAt: int, site: int, kind: int, sa: int, absSites: List<int>): int {
+    if (kind == 2) { patch(out, fileAt, sa, 8); listPush(absSites, site); return 0; }
+    if (kind == 99) {
+        const v = wrapSub(sa, site);
+        if (v < -2147483648 || v > 2147483647) { return lkoReject("RelativeRelocationOutOfRange"); }
+        patch(out, fileAt, v, 4); return 0;
+    }
+    const insn = word32(out, fileAt);
+    if (kind == 66) {
+        const v = wrapSub(sa, site);
+        if (v % 4 != 0 || v < -134217728 || v > 134217724) { return lkoReject("BranchRelocationOutOfRange"); }
+        const w = (v / 4) & 67108863;
+        patch(out, fileAt, (insn & 4227858432) | ((w & 65535) << 10) | (w >>> 16), 4); return 0;
+    }
+    if (kind == 71) {
+        const pages = wrapSub(wrapAdd(sa, 2048) & -4096, site & -4096) / 4096;
+        if (pages < -524288 || pages > 524287) { return lkoReject("PageRelocationOutOfRange"); }
+        patch(out, fileAt, (insn & ~(1048575 << 5)) | ((pages & 1048575) << 5), 4); return 0;
+    }
+    if (kind == 72) {
+        patch(out, fileAt, (insn & ~(4095 << 10)) | ((sa & 4095) << 10), 4); return 0;
+    }
+    return lkoReject("UnsupportedRelocation:" + toStr(kind));
+}
+
+// RISC-V 的 RELA（RISC-V ELF psABI）：sa = S+A，site = P。指令的操作码位保留，只改立即数位；范围不合即
+// 拒绝（不截断）。HI20 取 (v+0x800)>>12，LO12 取低 12 位（按符号）；CALL／CALL_PLT 同时改 auipc 与后一条 jalr。PCREL_LO12 的 S
+// 是所配 auipc 的地址：先记下，等全部 HI20 都算过再应用（rv64ApplyLo12）。
+function rv64Relocate(out: Bytes, fileAt: int, site: int, kind: int, sa: int, absSites: List<int>): int {
+    if (kind == 2) { patch(out, fileAt, sa, 8); listPush(absSites, site); return 0; }
+    if (kind == 57) {
+        const v = wrapSub(sa, site);
+        if (v < -2147483648 || v > 2147483647) { return lkoReject("RelativeRelocationOutOfRange"); }
+        patch(out, fileAt, v, 4); return 0;
+    }
+    if (kind == 24 || kind == 25) {
+        listPush(rvLoAt, fileAt); listPush(rvLoKind, kind); listPush(rvLoLabel, sa); return 0;
+    }
+    const insn = word32(out, fileAt);
+    if (kind == 18 || kind == 19 || kind == 23) {
+        const v = wrapSub(sa, site);
+        if (v < -2147485696 || v > 2147481599) { return lkoReject("PcrelRelocationOutOfRange"); }
+        patch(out, fileAt, (insn & 4095) | ((((v + 2048) >> 12) & 1048575) << 12), 4);
+        if (kind == 23) { mapSet(rvHi, toStr(site), v); return 0; }
+        const next = word32(out, fileAt + 4);
+        patch(out, fileAt + 4, (next & 1048575) | ((v & 4095) << 20), 4);
+        return 0;
+    }
+    return lkoReject("UnsupportedRelocation:" + toStr(kind));
+}
+function rv64ApplyLo12(out: Bytes): int {
+    let k = 0;
+    while (k < listLen(rvLoAt)) {
+        const fileAt = listGet(rvLoAt, k) catch 0;
+        const label = listGet(rvLoLabel, k) catch 0;
+        if (!mapHas(rvHi, toStr(label))) { return lkoReject("UnpairedPcrelLo12"); }
+        const lo = (mapGet(rvHi, toStr(label)) catch 0) & 4095;
+        const insn = word32(out, fileAt);
+        if ((listGet(rvLoKind, k) catch 0) == 24) {
+            patch(out, fileAt, (insn & 1048575) | (lo << 20), 4);
+        } else {
+            patch(out, fileAt, (insn & 33550463) | ((lo >>> 5) << 25) | ((lo & 31) << 7), 4);
+        }
+        k = k + 1;
+    }
     return 0;
 }
 

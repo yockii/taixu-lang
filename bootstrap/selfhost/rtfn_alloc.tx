@@ -1,12 +1,13 @@
-// rtfn 的寄存器分配（docs/design/v052-rtfn-regalloc-v0.1-20261024.md §八）：rtEnd 发射之前，对记录下的接口调用求活跃性，把未取址的
-// 局部分到池中的易失寄存器（x86 r8 r9 r10；A64 x0..x8、x13 x14 x15），结果写进 f.homes（每个局部一项，−1 为栈槽）；跨调用
-// 仍活的，在该调用两侧存取自己的槽（RtCall.saves）。写池中寄存器的降低（写入表，设计 §八-2）：x86 调用的实参与间接目标 r10、
+// rtfn 的寄存器分配：rtEnd 发射之前，对记录下的接口调用求活跃性，把未取址的
+// 局部分到池中的易失寄存器（x86 r8 r9 r10；A64 x0..x8、x13 x14 x15；龙芯 a0..a7、t4 t5 t6；RISC-V a0..a7、t4），结果写进 f.homes（每个局部一项，−1 为栈槽）；跨调用
+// 仍活的，在该调用两侧存取自己的槽（RtCall.saves）。写池中寄存器的降低（写入表）：x86 调用的实参与间接目标 r10、
 // C 调用、系统调用、双返回值与比较交换（先写 r8）；A64 调用与 C 调用的实参（x0 起）、返回值；其余只写临时寄存器（x86 rax rcx rdx r11，
 // A64 x9..x12 x16 x17 与浮点）。按 E（读完操作数前写的）与 C（调用本身破坏的）记在 earlyOf／lateOf；漏项时 rtfnGuardWrite 报 RegAllocClobber。
 import { RtOp, RtFn, RtCall, OP_LOCAL, rtfnFail, rtfnCall } from "./rtfn_base";
 import { K_LOAD_REG, K_STORE_REG, K_SET, K_OP, K_SHIFT, K_DIVMOD, K_LOAD, K_ADDR_OF, K_LABEL, K_JUMP, K_IF, K_IF32 } from "./rtfn_base";
 import { K_CALL, K_CALL_C, K_F64_TO_F32, K_F32_TO_F64, K_SYSCALL, K_FOP, K_FIF, K_INT_TO_F64, K_LOAD_ACQ } from "./rtfn_base";
 import { K_ATOMIC_ADD, K_ATOMIC_CAS, K_ATOMIC_XCHG, K_RET, K_RET2, K_RET_VOID, K_TRAP } from "./rtfn_base";
+import { ISA_A64, ISA_LA64, ISA_RV64 } from "./target";
 
 // ---------------------------------------------------------------- 位集（每个局部一位，64 位一字）
 
@@ -56,7 +57,7 @@ function usesOf(f: Ref<RtFn>, c: Ref<RtCall>): List<int> {
         if (indirect(c.s2)) { useName(f, out, strSub(c.s2, 1, len(c.s2) - 1)); }
         return out;
     }
-    if (k == K_CALL_C) { for (x in c.args) { useOp(f, out, x); } useName(f, out, c.s3); return out; }
+    if (k == K_CALL_C) { for (x in c.args) { useOp(f, out, x); } useName(f, out, c.s3); useName(f, out, listGet(c.ex, 4) catch ""); return out; }
     if (k == K_SYSCALL) { for (x in c.args) { useOp(f, out, x); } return out; }
     // 其余接口的操作数都在 o1..o3（未用的是立即数）。
     useOp(f, out, c.o1); useOp(f, out, c.o2); useOp(f, out, c.o3);
@@ -71,6 +72,7 @@ function defsOf(f: Ref<RtFn>, c: Ref<RtCall>): List<int> {
         || k == K_F64_TO_F32 || k == K_F32_TO_F64 || k == K_FOP || k == K_INT_TO_F64 || k == K_LOAD_ACQ
         || k == K_ATOMIC_ADD || k == K_ATOMIC_CAS || k == K_ATOMIC_XCHG) { useName(f, out, c.s1); }
     if (k == K_DIVMOD || k == K_CALL_C) { useName(f, out, c.s1); useName(f, out, c.s2); }
+    if (k == K_CALL_C) { let e = 0; while (e < 4) { useName(f, out, listGet(c.ex, e) catch ""); e = e + 1; } }
     return out;
 }
 
@@ -102,12 +104,37 @@ function succsOf(f: Ref<RtFn>, i: int): List<int> {
 
 const X86_POOL_MASK: int = 1792; // r8 r9 r10
 const A64_POOL_MASK: int = 57855; // x0..x8 x13 x14 x15
-function poolMask(f: Ref<RtFn>): int { if (f.a64) { return A64_POOL_MASK; } return X86_POOL_MASK; }
+const LA64_POOL_MASK: int = 462832; // a0..a7（r4..r11）t4 t5 t6（r16..r18）
+const RV64_POOL_MASK: int = 537132032; // a0..a7（x10..x17）t4（x29）
+function poolMask(f: Ref<RtFn>): int {
+    if (f.isa == ISA_A64) { return A64_POOL_MASK; }
+    if (f.isa == ISA_LA64) { return LA64_POOL_MASK; }
+    if (f.isa == ISA_RV64) { return RV64_POOL_MASK; }
+    return X86_POOL_MASK;
+}
 
 /// E(c)：降低在读完操作数之前写的池中寄存器。
 function earlyOf(f: Ref<RtFn>, c: Ref<RtCall>): int {
     const k = c.k;
-    if (f.a64) {
+    if (f.isa == ISA_LA64) {
+        // 龙芯同 A64：栈上实参经 t0，间接目标进 t7，再依次写 a0..a7；C 调用的整数实参从严按 a0..a7 全写；双返回值先写 a1 再写 a0；
+        // 系统调用从严按池全写（t4..t6 也被内核改写）。
+        if (k == K_CALL) { let n = listLen(c.args); if (n > 8) { n = 8; } return ((1 << n) - 1) << 4; }
+        if (k == K_CALL_C) { return 4080; }
+        if (k == K_RET2) { return 48; }
+        if (k == K_SYSCALL) { return LA64_POOL_MASK; }
+        return 0;
+    }
+    if (f.isa == ISA_RV64) {
+        // RISC-V 同龙芯：栈上实参经 t0，间接目标进 t5，再依次写 a0..a7；C 调用的整数实参从严按 a0..a7 全写；双返回值先写 a1 再写 a0；
+        // 系统调用从严按池全写（内核其实只改 a0）。
+        if (k == K_CALL) { let n = listLen(c.args); if (n > 8) { n = 8; } return ((1 << n) - 1) << 10; }
+        if (k == K_CALL_C) { return 261120; }
+        if (k == K_RET2) { return 3072; }
+        if (k == K_SYSCALL) { return RV64_POOL_MASK; }
+        return 0;
+    }
+    if (f.isa == ISA_A64) {
         // 调用：栈上实参经 x9，间接目标进 x16，再依次写 x0..x7；C 调用的整数实参从严按 x0..x7 全写；双返回值先写 x1 再写 x0
         // （单返回值只一条 mov 后即返回，不算）；A64 没有裸系统调用，从严按池全写。
         if (k == K_CALL) { let n = listLen(c.args); if (n > 8) { n = 8; } return (1 << n) - 1; }
@@ -134,13 +161,15 @@ function earlyOf(f: Ref<RtFn>, c: Ref<RtCall>): int {
 /// C(c)：c 本身破坏的池中寄存器（调用破坏全部易失；x86 的 syscall 指令只破坏 rcx r11 与 rax，不在池中）。
 function lateOf(f: Ref<RtFn>, c: Ref<RtCall>): int {
     const k = c.k;
-    if (k == K_CALL || k == K_CALL_C || (f.a64 && k == K_SYSCALL)) { return poolMask(f); }
+    if (k == K_CALL || k == K_CALL_C || ((f.isa == ISA_A64 || f.isa == ISA_LA64 || f.isa == ISA_RV64) && k == K_SYSCALL)) { return poolMask(f); }
     return 0;
 }
 
 // rtLoadReg／rtStoreReg 点名的寄存器若在池中，其位（A64 经 x86 号 9..11 → x13..x15 的映射）。
 function namedMask(f: Ref<RtFn>, r: int): int {
-    if (!f.a64) { if (r >= 8 && r <= 10) { return 1 << r; } return 0; }
+    if (f.isa == ISA_LA64) { if (r >= 9 && r <= 11) { return 1 << (r + 7); } return 0; }
+    if (f.isa == ISA_RV64) { if (r == 9) { return 1 << 29; } return 0; }
+    if (f.isa != ISA_A64) { if (r >= 8 && r <= 10) { return 1 << r; } return 0; }
     if (r >= 9 && r <= 11) { return 1 << (r + 4); }
     return 0;
 }
@@ -300,7 +329,9 @@ export function rtfnAllocate(f: Ref<RtFn>): void {
 // 第 k 个参数的入参寄存器（A64 x0..x7；x86 rcx rdx r8 r9）；不是参数或在栈上为 −1。
 function argReg(f: Ref<RtFn>, k: int): int {
     if (k >= f.nparams) { return -1; }
-    if (f.a64) { if (k < 8) { return k; } return -1; }
+    if (f.isa == ISA_A64) { if (k < 8) { return k; } return -1; }
+    if (f.isa == ISA_LA64) { if (k < 8) { return 4 + k; } return -1; }
+    if (f.isa == ISA_RV64) { if (k < 8) { return 10 + k; } return -1; }
     if (k == 0) { return 1; }
     if (k == 1) { return 2; }
     if (k == 2) { return 8; }

@@ -1,28 +1,83 @@
-// 外部函数的目标检查（D3 v0.35，docs/design/v052-macos-m0b-language-rules-v0.1-20261023.md §四-1）：语义分析在外部函数
+// 外部函数的目标检查（D3 v0.35）：语义分析在外部函数
 // 第一次被调用时检查（检查模式与构建同一判定），构建尾部的 ffiPrepare 用同一文案兜底。只查被调用的：声明而不调用无害
 // （Go 引用当前 GOOS 下不存在的符号才报错，Zig 惰性分析只在被引用时检查）。
-import { tLinux, tMacos, tWindows } from "./target";
+import { targetArch, tLinux, tMacos, tWindows } from "./target";
 import { macInstallNameOk } from "./macos_symbols";
+import { syscallKernel, syscallName, syscallNumber, syscallReplacement, syscallWithheldWhy } from "./syscall_names";
 
-/// 被调用的外部函数在目标 t 上的问题（空串＝没有）：mode 1＝from "库"（库名 lib）、2＝from syscall；wide＝签名里有 wstr。
+/// 被调用的外部函数在目标 t 上的问题（空串＝没有）：mode 1＝from "库"（库名 lib）、2＝from syscall 数字、3＝from syscall "名字"
+/// （D3 v0.47）；wide＝签名里有 wstr（含 Ref<外部结构体> 参数的 wstr 字段）。
 export function ffiTargetMessage(mode: int, name: string, lib: string, wide: bool, t: int): string {
-    if (mode == 2 && !tLinux(t)) {
+    if ((mode == 2 || mode == 3) && !tLinux(t)) {
         if (tMacos(t)) {
             return "外部函数 " + name + " 声明为 from syscall，只能用于 Linux 目标（macOS 不提供稳定的系统调用接口：实现放进 _macos 或 _unix 文件，经 from \"libSystem\" 声明）";
         }
         return "外部函数 " + name + " 声明为 from syscall，只能用于 Linux 目标（Windows 实现请放在 _windows 文件里经 from \"库\" 声明）";
     }
-    if (mode == 1 && wide && !tWindows(t)) {
+    if (mode != 0 && wide && !tWindows(t)) {
         return "外部函数 " + name + "：wstr（UTF-16）只用于 Windows 目标；Linux、macOS 的 C 字符串请用 string（UTF-8）";
     }
-    // macOS 适配 M2 设计 F1：交叉链接不读目标平台的库文件，库名须是 dylib 的安装名。
+    // 交叉链接不读目标平台的库文件，库名须是 dylib 的安装名。
     if (mode == 1 && tMacos(t) && !macInstallNameOk(lib)) {
         return "外部函数 " + name + " 来自 \"" + lib + "\"：macOS 上库名须写 dylib 的安装名（/ 开头的绝对路径，或 @executable_path/、@loader_path/ 开头），libSystem 可简写为 \"libSystem\"";
     }
     return "";
 }
 
-// D3 v0.36 C 变参（docs/design/v052-ffi-string-variadic-v0.1-20261024.md §三-3）：常见 C 变参函数的定参个数。只对系统 C 库
+/// 模块显示名 display（如 `./lib/x_linux_aarch64`，不带扩展名；带 `.tx` 的也认）是否为目标 t 的架构专用 Linux 文件（按目标
+/// 选文件的第一档 x_linux_<架构>）。
+export function ffiArchFile(display: string, t: int): bool {
+    const b = bytesFromStr(display);
+    let n = len(display);
+    if (n >= 3 && (bytesToStr(bytesSlice(b, n - 3, 3)) catch "") == ".tx") { n = n - 3; }
+    const suffix = "_linux_" + targetArch(t);
+    if (n < len(suffix)) { return false; }
+    return (bytesToStr(bytesSlice(b, n - len(suffix), len(suffix))) catch "") == suffix;
+}
+
+/// from syscall 在 Linux 目标上选定的号码：nr＝号码（不可用为 -1），msg＝不可用的原因。
+export struct SyscallPick {
+    nr: int,
+    msg: string,
+}
+
+/// D3 v0.47：被调用的 from syscall 在 Linux 目标 t 上的号码。mode 2＝数字：按 x86_64 的号解释，只在 x86_64 目标、
+/// 或声明写在该目标架构的 _linux_<架构> 文件里（archFile）时可用——同一个号在别的架构上是另一个系统调用（41 在 x86_64 是 socket、
+/// 在 aarch64 是 pivot_root），编给别的架构会静默调错；mode 3＝名字：按目标架构查内核号表，没有即报出并给替代调用。
+export function ffiSyscallPick(mode: int, fname: string, sys: string, nr: int, t: int, archFile: bool): Ref<SyscallPick> {
+    const arch = targetArch(t);
+    const table = "（Linux " + syscallKernel() + " 的号表）";
+    if (mode == 2) {
+        if (arch == "x86_64" || archFile) { return new SyscallPick { nr: nr, msg: "" }; }
+        const x = syscallName("x86_64", nr);
+        let msg = "外部函数 " + fname + " 声明为 from syscall " + toStr(nr) + "：数字按 x86_64 的系统调用号解释";
+        if (len(x) > 0) {
+            msg = msg + "（x86_64 上是 " + x + "），不能用于 " + arch + " 目标——改写为 from syscall \"" + x + "\"，或把这条声明放进 _linux_" + arch + " 文件里写该架构的号";
+            const there = syscallName(arch, nr);
+            if (len(there) > 0) { msg = msg + "（同一个号在 " + arch + " 上是 " + there + "）"; }
+        } else {
+            msg = msg + "（x86_64 上没有这个号），不能用于 " + arch + " 目标——把这条声明放进 _linux_" + arch + " 文件里写该架构的号";
+        }
+        return new SyscallPick { nr: -1, msg: msg };
+    }
+    const n = syscallNumber(arch, sys);
+    if (n >= 0) { return new SyscallPick { nr: n, msg: "" }; }
+    let msg = "外部函数 " + fname + " 声明为 from syscall \"" + sys + "\"：";
+    if (syscallNumber("x86_64", sys) < 0 && syscallNumber("aarch64", sys) < 0 && syscallNumber("loongarch64", sys) < 0 && syscallNumber("riscv64", sys) < 0) {
+        return new SyscallPick { nr: -1, msg: msg + "不是 Linux 的系统调用名" + table };
+    }
+    const why = syscallWithheldWhy(arch, sys);
+    if (len(why) > 0) {
+        msg = msg + arch + " 上不提供这个系统调用（" + why + "）";
+    } else {
+        msg = msg + arch + " 上没有这个系统调用" + table;
+    }
+    const alt = syscallReplacement(arch, sys);
+    if (len(alt) > 0) { msg = msg + "，改用 \"" + alt + "\""; }
+    return new SyscallPick { nr: -1, msg: msg };
+}
+
+// D3 v0.36 C 变参：常见 C 变参函数的定参个数。只对系统 C 库
 // 的声明核对（同名的自家库函数不受影响）；不在表里的由声明者负责。语义阶段核对，三个宿主一致。
 function lowerAscii(s: string): string {
     const b = bytesFromStr(s);

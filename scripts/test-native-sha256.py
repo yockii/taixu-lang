@@ -1,5 +1,5 @@
 """Native SHA-256 vs hashlib: published vectors, every padding boundary through 300 bytes,
-and binary inputs up to 1 MiB (round 6 step 6d-4a). The probe hashes all files in one process,
+and binary inputs up to 1 MiB (round 6 step). The probe hashes all files in one process,
 so its reusable constants and each invocation's state are checked together. Inputs must stay unchanged.
 """
 import argparse
@@ -22,7 +22,7 @@ def main():
     a = ap.parse_args()
     work = a.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
-    build = subprocess.run([str(a.compiler.resolve()), 'build', 'bootstrap/selfhost/sha256-probe.tx',
+    build = subprocess.run([str(a.compiler.resolve()), 'build', 'bootstrap/selfhost/sha256-probe.tx', '--toolchain',
                             '--out', str(work / 'probe')], cwd=ROOT, capture_output=True, timeout=180)
     if build.returncode:
         print(build.stderr.decode('utf-8', 'replace'))

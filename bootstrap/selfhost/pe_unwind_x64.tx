@@ -1,0 +1,169 @@
+// x86_64-windows 的展开信息（PE 规范化 P3，设计稿 docs/design/v052-pe-x64-normalize-v0.1-20261103.md 第三节）：每个带帧事件的函数
+// 一份 UNWIND_INFO（版本 1，无异常处理例程、无链），由函数目录的帧事件与该函数的机器码生成——序言里每个事件所在的指令逐条解码、与
+// 事件核对（压入的寄存器、设帧指针、分配的字节）；各尾声逐条核对是 x64 展开器靠向前扫描能认出的形状（add rsp, n；pop…；ret，
+// 微软《x64 prolog and epilog》），v1 不为尾声写码。对不上或遇到不认识的指令即拒绝，不写出可能错的展开信息。
+// 指令与展开码（微软《x64 exception handling》）：push r → UWOP_PUSH_NONVOL；mov rbp, rsp → UWOP_SET_FPREG（头里帧寄存器 rbp、偏移
+// 0）；sub rsp, n → n 不超过 128 时 UWOP_ALLOC_SMALL，不超过 512 KiB − 8 时 UWOP_ALLOC_LARGE（一槽 n/8），再大用两槽 32 位 n；栈探测组
+// mov eax, n；call __tx_chkstk；sub rsp, rax 按 n 记一次分配，码偏移取组末。展开码按序言指令的逆序排列，码偏移为该指令（组）结束处
+// 相对函数起点的字节数，序言不得超过 255 字节；槽数补成偶数（补的槽不计入 CountOfCodes）。函数长度不受限，不分片。
+// 回调外壳在序言之后另存的 xmm6–15 不在函数目录里，也不在展开信息里（同 aarch64 的 d8–d15）：回溯只需 RSP 与 RIP。
+import { NativeFunction, NativeFrameEvent, NativeEpilogue } from "./native_function_data";
+
+export struct X64Unwind { ok: bool, error: string, xdata: Bytes }
+// 解码出的一条（或一组）指令：种类（push、pop、set-frame、alloc、release、ret）、寄存器、字节数与长度；不认识的长度为 0。
+struct Insn { kind: string, reg: int, bytes: int, size: int }
+
+const UWOP_PUSH_NONVOL: int = 0;
+const UWOP_ALLOC_LARGE: int = 1;
+const UWOP_ALLOC_SMALL: int = 2;
+const UWOP_SET_FPREG: int = 3;
+const RBP: int = 5;
+
+function at(code: Bytes, i: int): int { return bytesGet(code, i) catch -1; }
+function u32(code: Bytes, i: int): int {
+    return (bytesGet(code, i) catch 0) | ((bytesGet(code, i + 1) catch 0) << 8) | ((bytesGet(code, i + 2) catch 0) << 16) | ((bytesGet(code, i + 3) catch 0) << 24);
+}
+function noInts(): List<int> { return listNew(); }
+function none(): Ref<Insn> { return new Insn { kind: "", reg: -1, bytes: 0, size: 0 }; }
+function insn(kind: string, reg: int, bytes: int, size: int): Ref<Insn> { return new Insn { kind: kind, reg: reg, bytes: bytes, size: size }; }
+
+// sub／add rsp, imm（REX.W 83 /5 ib、81 /5 id；83 /0、81 /0）：立即数须为非负。
+function rspImm(code: Bytes, i: int, ext: int, kind: string): Ref<Insn> {
+    if (at(code, i) != 0x48) { return none(); }
+    const op = at(code, i + 1);
+    if (op == 0x83 && at(code, i + 2) == (0xC4 | (ext << 3))) {
+        const v = at(code, i + 3);
+        if (v < 0 || v >= 128) { return none(); }
+        return insn(kind, 4, v, 4);
+    }
+    if (op == 0x81 && at(code, i + 2) == (0xC4 | (ext << 3))) {
+        const v = u32(code, i + 3);
+        if (v >= 2147483648) { return none(); }
+        return insn(kind, 4, v, 7);
+    }
+    return none();
+}
+
+// 序言里的一条（或探测组）：push r、mov rbp, rsp、sub rsp, n、mov eax, n；call rel32；sub rsp, rax。
+function decodePrologue(code: Bytes, i: int): Ref<Insn> {
+    const b = at(code, i);
+    if (b >= 0x50 && b <= 0x57) { return insn("push", b - 0x50, 8, 1); }
+    if (b == 0x41 && at(code, i + 1) >= 0x50 && at(code, i + 1) <= 0x57) { return insn("push", at(code, i + 1) - 0x50 + 8, 8, 2); }
+    if (b == 0x48 && ((at(code, i + 1) == 0x89 && at(code, i + 2) == 0xE5) || (at(code, i + 1) == 0x8B && at(code, i + 2) == 0xEC))) { return insn("set-frame", RBP, 0, 3); }
+    // 栈探测组：mov eax, imm32（B8 id）或 mov rax, imm32（48 C7 C0 id）；call rel32（E8）；sub rsp, rax（48 29 C4 或 48 2B E0）。
+    let probe = -1;
+    let n = 0;
+    if (b == 0xB8) { probe = u32(code, i + 1); n = 5; }
+    if (b == 0x48 && at(code, i + 1) == 0xC7 && at(code, i + 2) == 0xC0) { probe = u32(code, i + 3); n = 7; }
+    if (probe >= 0 && probe < 2147483648 && at(code, i + n) == 0xE8) {
+        const s = i + n + 5;
+        if (at(code, s) == 0x48 && ((at(code, s + 1) == 0x29 && at(code, s + 2) == 0xC4) || (at(code, s + 1) == 0x2B && at(code, s + 2) == 0xE0))) {
+            return insn("alloc", 4, probe, n + 8);
+        }
+        return none();
+    }
+    return rspImm(code, i, 5, "alloc");
+}
+
+// 尾声里的一条：add rsp, n、pop r、ret。
+function decodeEpilogue(code: Bytes, i: int): Ref<Insn> {
+    const b = at(code, i);
+    if (b >= 0x58 && b <= 0x5F) { return insn("pop", b - 0x58, 8, 1); }
+    if (b == 0x41 && at(code, i + 1) >= 0x58 && at(code, i + 1) <= 0x5F) { return insn("pop", at(code, i + 1) - 0x58 + 8, 8, 2); }
+    if (b == 0xC3) { return insn("ret", -1, 8, 1); }
+    return rspImm(code, i, 0, "release");
+}
+
+function failed(out: Ref<X64Unwind>, error: string): Ref<X64Unwind> { out.ok = false; out.error = error; out.xdata = bytesNew(0); return out; }
+
+/// f 的 UNWIND_INFO（与位置无关，不含 RVA）；code 为 f 所在输入节的内容，f 的偏移以它为准。没有帧事件的函数（叶函数、边界）不该
+/// 调用：由调用方略去，系统按叶函数处理。
+export function x64Unwind(f: Ref<NativeFunction>, code: Bytes): Ref<X64Unwind> {
+    const out = new X64Unwind { ok: false, error: "", xdata: bytesNew(0) };
+    if (f.stackModel != "fixed-call" || listLen(f.events) == 0) { return failed(out, "UnwindNoFrame"); }
+    if (f.begin < 0 || f.end <= f.begin || f.end > bytesLen(code) || f.prologueEnd < f.begin || f.prologueEnd > f.end) { return failed(out, "UnwindBadFunctionRange"); }
+    if (f.prologueEnd - f.begin > 255) { return failed(out, "UnwindPrologueTooLong"); }
+    // 序言：事件首尾相接、各对应一条指令（探测组为一组），按执行次序收成码（每个码：偏移、操作、信息与附加槽）。
+    const ops: List<List<int>> = listNew();
+    let frameReg = 0;
+    const pushed: List<int> = listNew();
+    let allocation = 0;
+    let cursor = f.begin;
+    let epilogueEvents = 0;
+    for (e in f.events) {
+        if (e.before >= f.prologueEnd) { epilogueEvents = epilogueEvents + 1; continue; }
+        if (e.before != cursor) { return failed(out, "UnwindPrologueGap"); }
+        const d = decodePrologue(code, e.before);
+        if (d.size == 0 || e.before + d.size != e.after) { return failed(out, "UnwindUnknownPrologueInstruction:" + toStr(e.before - f.begin)); }
+        const offset = e.after - f.begin;
+        const slot: List<int> = listNew();
+        if (e.kind == "push-nonvolatile") {
+            if (d.kind != "push" || d.reg != e.reg || e.bytes != 8) { return failed(out, "UnwindPushMismatch"); }
+            listPush(slot, offset); listPush(slot, UWOP_PUSH_NONVOL | (e.reg << 4));
+            listPush(pushed, e.reg);
+        } else if (e.kind == "set-frame-pointer") {
+            if (d.kind != "set-frame" || e.reg != RBP || e.bytes != 0 || frameReg != 0) { return failed(out, "UnwindFrameMismatch"); }
+            listPush(slot, offset); listPush(slot, UWOP_SET_FPREG);
+            frameReg = RBP;
+        } else if (e.kind == "allocate-stack") {
+            const n = e.bytes;
+            if (d.kind != "alloc" || d.bytes != n || n <= 0 || n % 8 != 0 || allocation != 0) { return failed(out, "UnwindAllocMismatch"); }
+            listPush(slot, offset);
+            if (n <= 128) { listPush(slot, UWOP_ALLOC_SMALL | (((n - 8) / 8) << 4)); }
+            else if (n <= 524280) { listPush(slot, UWOP_ALLOC_LARGE); listPush(slot, n / 8); }
+            else { listPush(slot, UWOP_ALLOC_LARGE | (1 << 4)); listPush(slot, n & 65535); listPush(slot, n >>> 16); }
+            allocation = n;
+        } else { return failed(out, "UnwindUnexpectedPrologueEvent:" + e.kind); }
+        listPush(ops, slot);
+        cursor = e.after;
+    }
+    if (cursor != f.prologueEnd) { return failed(out, "UnwindPrologueGap"); }
+    // 尾声：add rsp, 分配（有分配时）、按压入的逆序 pop、ret，正好铺满尾声范围；中间不许有别的指令。不返回的函数（致命错误出口）
+    // 没有尾声，展开信息只描述序言。
+    for (ep in f.epilogues) {
+        let i = ep.begin;
+        if (allocation > 0) {
+            const d = decodeEpilogue(code, i);
+            if (d.kind != "release" || d.bytes != allocation) { return failed(out, "UnwindEpilogueRelease:" + toStr(ep.begin - f.begin)); }
+            i = i + d.size;
+        }
+        let k = listLen(pushed) - 1;
+        while (k >= 0) {
+            const d = decodeEpilogue(code, i);
+            if (d.kind != "pop" || d.reg != (listGet(pushed, k) catch -1)) { return failed(out, "UnwindEpiloguePop:" + toStr(ep.begin - f.begin)); }
+            i = i + d.size;
+            k = k - 1;
+        }
+        const r = decodeEpilogue(code, i);
+        if (r.kind != "ret" || i + r.size != ep.end) { return failed(out, "UnwindEpilogueReturn:" + toStr(ep.begin - f.begin)); }
+    }
+    if (epilogueEvents == 0 && listLen(f.epilogues) > 0) { return failed(out, "UnwindEpilogueWithoutEvents"); }
+    // 写出：头（版本 1、无标志；序言长；码槽数；帧寄存器与偏移 0），码按序言的逆序，补成偶数槽。
+    let slots = 0;
+    for (s in ops) { slots = slots + listLen(s) - 1; }
+    if (slots > 255) { return failed(out, "UnwindTooManyCodes"); }
+    const x = bytesNew(0);
+    bytesPush(x, 1);
+    bytesPush(x, f.prologueEnd - f.begin);
+    bytesPush(x, slots);
+    bytesPush(x, frameReg);
+    let j = listLen(ops) - 1;
+    while (j >= 0) {
+        const s: List<int> = listGet(ops, j) catch noInts();
+        const offset = listGet(s, 0) catch 0;
+        bytesPush(x, offset);
+        bytesPush(x, listGet(s, 1) catch 0);
+        let m = 2;
+        while (m < listLen(s)) {
+            const v = listGet(s, m) catch 0;
+            bytesPush(x, v & 255);
+            bytesPush(x, (v >>> 8) & 255);
+            m = m + 1;
+        }
+        j = j - 1;
+    }
+    if (slots % 2 == 1) { bytesPush(x, 0); bytesPush(x, 0); }
+    out.ok = true;
+    out.xdata = x;
+    return out;
+}

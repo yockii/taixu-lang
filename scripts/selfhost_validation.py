@@ -11,32 +11,6 @@ import sys
 ROOT = Path(__file__).resolve().parent.parent
 
 
-
-def require_zig_runnable_tree(gate):
-    """Stop gates that run the current compiler or kernel generator on the frozen Zig seed.
-
-    The Zig seed is frozen at D3 v0.17. Once bootstrap/STAGE0 is pinned, the current
-    compiler sources use later features, so the seed's VM and `aot --frontend=zig`
-    can no longer run or compile them. Such gates run in a checkout of the stage0
-    commit; current-tree products come from scripts/nrt-bootstrap.py.
-    """
-    if (ROOT / 'bootstrap' / 'STAGE0').exists():
-        raise SystemExit(gate + ': the frozen Zig seed (D3 v0.17) cannot run the current compiler sources. '
-                         'Run this gate in a worktree of the commit in bootstrap/STAGE0, or use the '
-                         'products of scripts/nrt-bootstrap.py.')
-
-
-def require_shim_host(gate):
-    """Stop gates that build with the native compiler's removed --shim Zig host path.
-
-    M7 removed `--shim` (and `--object`) from the self-hosted compiler: native products
-    always link the NRT kernel. Gates measuring the old Zig-host products run in a
-    checkout of the commit in bootstrap/STAGE0, whose compiler still has that path.
-    """
-    if (ROOT / 'bootstrap' / 'STAGE0').exists():
-        raise SystemExit(gate + ': the current compiler has no --shim Zig host path (removed in M7). '
-                         'Run this gate in a checkout of the commit in bootstrap/STAGE0.')
-
 def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 

@@ -1,0 +1,161 @@
+// 两个 PE32+ 写出器（x86_64-windows 的 link_pe.tx、aarch64-windows 的 link_pe_objects.tx）共用的头部约定与映像收尾——
+// x86_64-windows PE 规范化 P1（设计稿 docs/design/v052-pe-x64-normalize-v0.1-20261103.md 第三节、第六节）：
+// - 链接器版本：工具链版本的主、次号（如实写太虚自己的版本，不仿 MSVC）。
+// - TimeDateStamp：内容哈希——时间戳、校验和两字段为零时，整个文件按 8 字节小端字推进 FNV-1a（64 位的初值与乘数、环绕乘），每步
+//   把高 32 位异或进低位；末尾不足 8 字节的补零成一个字，最后并入文件长度，取低 32 位。同 lld /Brepro 的思路：非零、随内容变、
+//   逐字节可复现。不用 SHA-256：太虚写的 SHA-256 约 3 MB/s，编译器自身（约 59 MB）要 20 秒，本算法同量级文件 0.5 秒。
+// - CheckSum：同 imagehlp 的 CheckSumMappedFile——整个文件的 16 位小端字做反码累加（校验和字段按零计），折成 16 位后加文件长度。
+//   这里每次读 8 字节、按两个 32 位字相加，最后再折：2^16 ≡ 1（mod 0xFFFF），和为零当且仅当全为零，结果与逐字累加相同。
+//   在时间戳之后算。
+// DllCharacteristics、基址、栈与堆的保留与提交由两个写出器各自定（ARM64 不能关 ASLR）。
+import { TOOLCHAIN_VERSION } from "./toolchain";
+
+const FNV_OFFSET: int = -3750763034362895579; // 0xcbf29ce484222325
+const FNV_PRIME: int = 1099511628211; // 0x100000001b3
+const LOW32: int = 4294967295;
+
+// 工具链版本“主.次.修订[-预发布]”的第 index 段（0 主、1 次），不是数字或超过一字节时得 0。
+function versionPart(index: int): int {
+    let part = 0;
+    let value = 0;
+    let digits = 0;
+    let i = 0;
+    while (i < len(TOOLCHAIN_VERSION)) {
+        const c = byteAt(TOOLCHAIN_VERSION, i) catch 0;
+        if (c == 46) {
+            if (part == index) { break; }
+            part = part + 1;
+            value = 0;
+            digits = 0;
+        } else if (c >= 48 && c <= 57) {
+            value = value * 10 + (c - 48);
+            digits = digits + 1;
+            if (value > 255) { return 0; }
+        } else {
+            break;
+        }
+        i = i + 1;
+    }
+    if (part != index || digits == 0) { return 0; }
+    return value;
+}
+
+export function peLinkerMajor(): int { return versionPart(0); }
+export function peLinkerMinor(): int { return versionPart(1); }
+
+function u32At(b: Bytes, at: int): int {
+    return (bytesGet(b, at) catch 0) | ((bytesGet(b, at + 1) catch 0) << 8) | ((bytesGet(b, at + 2) catch 0) << 16) | ((bytesGet(b, at + 3) catch 0) << 24);
+}
+
+function push(b: Bytes, value: int, width: int): void {
+    let i = 0;
+    while (i < width) { bytesPush(b, (value >>> (i * 8)) & 255); i = i + 1; }
+}
+
+function put32(b: Bytes, at: int, value: int): void {
+    let i = 0;
+    while (i < 4) { bytesSet(b, at + i, (value >>> (i * 8)) & 255); i = i + 1; }
+}
+
+export function peContentHash(b: Bytes): int {
+    const n = bytesLen(b);
+    let h = FNV_OFFSET;
+    let i = 0;
+    while (i + 8 <= n) {
+        h = imul(h ^ (bytesGetLE<int>(b, i) catch 0), FNV_PRIME);
+        h = h ^ (h >>> 32);
+        i = i + 8;
+    }
+    if (i < n) {
+        let w = 0;
+        let k = 0;
+        while (i + k < n) { w = w | ((bytesGet(b, i + k) catch 0) << (8 * k)); k = k + 1; }
+        h = imul(h ^ w, FNV_PRIME);
+        h = h ^ (h >>> 32);
+    }
+    h = imul(h ^ n, FNV_PRIME);
+    h = h ^ (h >>> 32);
+    return h & LOW32;
+}
+
+export function peChecksum(b: Bytes): int {
+    const n = bytesLen(b);
+    let s = 0;
+    let i = 0;
+    while (i + 8 <= n) {
+        const v = bytesGetLE<int>(b, i) catch 0;
+        s = s + (v & LOW32) + (v >>> 32);
+        i = i + 8;
+    }
+    while (i < n) {
+        let w = bytesGet(b, i) catch 0;
+        if ((i & 1) == 1) { w = w << 8; }
+        s = s + w;
+        i = i + 1;
+    }
+    while ((s >>> 16) != 0) { s = (s & 65535) + (s >>> 16); }
+    return s + n;
+}
+
+// 自底向上归并排序（基址重定位的 RVA）。
+function sortInts(xs: List<int>): List<int> {
+    let src: List<int> = listNew();
+    for (x in xs) { listPush(src, x); }
+    const n = listLen(src);
+    let width = 1;
+    while (width < n) {
+        const dst: List<int> = listNew();
+        let lo = 0;
+        while (lo < n) {
+            let i = lo;
+            let mid = lo + width;
+            if (mid > n) { mid = n; }
+            let j = mid;
+            let hi = lo + 2 * width;
+            if (hi > n) { hi = n; }
+            while (i < mid || j < hi) {
+                if (j >= hi || (i < mid && (listGet(src, i) catch 0) <= (listGet(src, j) catch 0))) { listPush(dst, listGet(src, i) catch 0); i = i + 1; }
+                else { listPush(dst, listGet(src, j) catch 0); j = j + 1; }
+            }
+            lo = hi;
+        }
+        src = dst;
+        width = width * 2;
+    }
+    return src;
+}
+
+// 基址重定位节（.reloc）的内容：每个 RVA 一条 IMAGE_REL_BASED_DIR64（类型 10），按 4 KiB 页分块，块头为页 RVA 与块长，块长补齐
+// 到 4 字节（补一条 IMAGE_REL_BASED_ABSOLUTE）。同一 RVA 出现两次即错——加载器会把那 8 字节加两遍偏移——得 1，reloc 不完整。
+export function peBaseRelocations(rvas: List<int>, reloc: Bytes): int {
+    const sorted = sortInts(rvas);
+    let i = 0;
+    while (i < listLen(sorted)) {
+        const page = (listGet(sorted, i) catch 0) & -4096;
+        let j = i;
+        while (j < listLen(sorted) && ((listGet(sorted, j) catch 0) & -4096) == page) {
+            if (j > i && (listGet(sorted, j) catch 0) == (listGet(sorted, j - 1) catch 0)) { return 1; }
+            j = j + 1;
+        }
+        let entries = j - i;
+        if (entries % 2 == 1) { entries = entries + 1; }
+        push(reloc, page, 4);
+        push(reloc, 8 + 2 * entries, 4);
+        let e = i;
+        while (e < j) { push(reloc, (10 << 12) | ((listGet(sorted, e) catch 0) & 4095), 2); e = e + 1; }
+        if (entries != j - i) { push(reloc, 0, 2); }
+        i = j;
+    }
+    return 0;
+}
+
+// 映像写完后调用：两字段先清零，填时间戳，再按填好时间戳的文件算校验和。
+export function peFinish(b: Bytes): void {
+    const pe = u32At(b, 60);
+    const stampAt = pe + 8;
+    const sumAt = pe + 24 + 64;
+    put32(b, stampAt, 0);
+    put32(b, sumAt, 0);
+    put32(b, stampAt, peContentHash(b));
+    put32(b, sumAt, peChecksum(b));
+}

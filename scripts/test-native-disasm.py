@@ -1,6 +1,6 @@
 """Native source assembly listing: source positions, CLI failures, and machine-code/fixup round trips.
 
-aarch64-macos（macOS 适配 M4 设计 A11）没有文本汇编器可回环：探针逐行对照映像（每条指令行就是代码节里依次的一个字，
+aarch64-macos没有文本汇编器可回环：探针逐行对照映像（每条指令行就是代码节里依次的一个字，
 改写成标号、符号的操作数核对跳转距离与修补）。"""
 import argparse
 import json
@@ -61,10 +61,15 @@ def main():
 
         (work / 'lib.tx').write_text('export function plus(x: int): int {\n    return x + 1;\n}\n', encoding='utf-8')
         (work / 'main.tx').write_text('import { plus } from "./lib";\n\nfunction main(args: []string): int {\n    const x = plus(2);\n    print(toStr(x));\n    return x;\n}\n', encoding='utf-8')
-        native_ops = {'windows': {'push', 'mov', 'call', 'ret'}, 'linux': {'push', 'mov', 'call', 'ret'}, 'aarch64-macos': {'stp', 'ldp', 'bl', 'ret'}}
-        for target in ('windows', 'linux', 'aarch64-macos'):
-            triple = target if '-' in target else 'x86_64-' + target
-            cmd = [compiler, 'disasm', '--target=' + target, '--format=json', 'main.tx']
+        # 目标写三元组：不带架构的 linux、windows 在 arm64 宿主上取 aarch64-linux、aarch64-windows。
+        x86_ops, a64_ops, la64_ops = {'push', 'mov', 'call', 'ret'}, {'stp', 'ldp', 'bl', 'ret'}, {'addi.d', 'st.d', 'ld.d', 'bl', 'jirl'}
+        rv64_ops = {'addi', 'sd', 'ld', 'auipc', 'jalr'}
+        native_ops = {'windows': x86_ops, 'x86_64-linux': x86_ops, 'aarch64-linux': a64_ops, 'loongarch64-linux': la64_ops,
+                      'riscv64-linux': rv64_ops, 'aarch64-macos': a64_ops}
+        for target in ('windows', 'x86_64-linux', 'aarch64-linux', 'loongarch64-linux', 'riscv64-linux', 'aarch64-macos'):
+            triple = 'x86_64-windows' if target == 'windows' else target
+            a64 = target.startswith('aarch64-'); la64 = target == 'loongarch64-linux'; rv64 = target == 'riscv64-linux'
+            cmd = [compiler, 'disasm', '--target=' + triple, '--format=json', 'main.tx']
             p = run(cmd, work)
             check('json:' + target, p.returncode == 0 and not p.stderr, p.stderr)
             if p.returncode:
@@ -86,12 +91,14 @@ def main():
                   and any(r['op'] == '.label' and r['kind'] == 'label' for r in rows), rows[:1])
             again = run(cmd, work)
             check('deterministic:' + target, again.stdout == p.stdout and again.returncode == 0, again.stderr)
-            plain = run([compiler, 'disasm', '--target=' + target, 'main.tx'], work)
+            plain = run([compiler, 'disasm', '--target=' + triple, 'main.tx'], work)
             check('text:' + target, plain.returncode == 0 and b'function main' in plain.stdout and b'function plus' in plain.stdout
-                  and (b'bl ' if target == 'aarch64-macos' else b'call') in plain.stdout and b'f_' in plain.stdout, plain.stderr)
-            library = run([compiler, 'disasm', '--target=' + target, '--format=json', 'lib.tx'], work)
+                  and (b'bl ' if a64 or la64 else b'auipc ra' if rv64 else b'call') in plain.stdout and b'f_' in plain.stdout, plain.stderr)
+            library = run([compiler, 'disasm', '--target=' + triple, '--format=json', 'lib.tx'], work)
             check('no-main:' + target, library.returncode == 0 and any(f['name'] == 'plus' for f in json.loads(library.stdout)['functions']), library.stderr)
-            probe_run = run([probe, 'main.tx', 'aarch64' if target == 'aarch64-macos' else target], work)
+            if la64 or rv64:
+                continue  # 往返探针只认 x86 与 aarch64；龙芯、RISC-V 的编码与反汇编往返由门步 la64-encodings、rv64-encodings 核对。
+            probe_run = run([probe, 'main.tx', 'aarch64' if a64 else 'linux' if target == 'x86_64-linux' else target], work)
             check('roundtrip:fixture-' + target, probe_run.returncode == 0, probe_run.stderr)
 
         for args in ([], ['--format=yaml', 'main.tx'], ['main.tx', 'lib.tx'], ['--target=other', 'main.tx']):

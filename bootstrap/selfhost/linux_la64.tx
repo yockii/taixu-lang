@@ -1,0 +1,105 @@
+// loongarch64-linux 的手写入口与原语：语义同 linux_a64.tx，
+// 只有这几处要在栈切换、线程指针上直接用机器指令，其余例程都经 rtfn 发出。
+// - 线程指针：$tp（r2，通用寄存器，用户态直接写）。TLS 是 Variant I、线程控制块长 0（glibc 的 TLS_TCB_SIZE 0、lld 与 RISC-V 同
+//   一算法）：可执行文件的 TLS 块就在线程指针处，槽在 tp+0。动态产物由加载器设好线程指针；静态产物进程起始时为 0，_start 指向
+//   __tx_tls_static（8 字节的槽）。
+// - clone 的实参次序同 x86_64（龙芯不选 CLONE_BACKWARDS）：(flags, stack, ptid, ctid, tls)，原样发出。
+// - 不读 auxv 的 CPU 特性：基线 LA64 v1.00，没有按特性分支的原子（页堆检测的页长另行从 auxv 取，kernel_alloc_check）。
+// - statx 的空路径（运行时把 fstat／newfstatat 改写成 statx，rtfn.tx 的 genericLinuxSyscall）取 .rodata 的 __tx_la64_empty。
+// 系统调用号是 loongarch64 的号（Linux v7.3 的号表，syscall_names.tx 取）；syscall 改写 t0..t8。私有约定：实参 a0..a7，t7 可随意改写。
+import { StructuredBuffer, asBufferLabel, asBufferBoundaryBegin, asBufferFunctionEnd, asBufferSection, asBufferQuad } from "./assemble";
+import { la64Emit, la64B, la64Bz, la64AddrOf, la64SymAccess, la64MovImm } from "./la64_asm";
+import { la64R3, la64Si12, la64Shift, la64Code, la64Jirl } from "./la64_encode";
+import { LA64_OR, LA64_ADD_D, LA64_ADDI_D, LA64_SLLI_D, LA64_LD_D, LA64_ST_D, LA64_SYSCALL, LA64_BREAK, LA64_BEQZ, LA64_BNEZ } from "./la64_encode";
+import { syscallNumber } from "./syscall_names";
+
+const MODULE: string = "bootstrap/selfhost/linux_la64.tx";
+/// 线程指针到本线程 TLS 槽的偏移（Variant I、线程控制块长 0）。
+export const LINUX_LA64_TLS_SLOT: int = 0;
+const ZERO: int = 0;
+const RA: int = 1;
+const TP: int = 2;
+const SP: int = 3;
+const A0: int = 4;
+const A1: int = 5;
+const A2: int = 6;
+const A7: int = 11;
+const T0: int = 12;
+const T7: int = 19;
+const FP: int = 22;
+
+function nr(name: string): int { return syscallNumber("loongarch64", name); }
+function syscall(b: Ref<StructuredBuffer>, name: string): void {
+    la64MovImm(b, A7, nr(name));
+    la64Emit(b, la64Code(LA64_SYSCALL, 0), "syscall");
+}
+function mov(b: Ref<StructuredBuffer>, rd: int, rj: int): void { la64Emit(b, la64R3(LA64_OR, rd, rj, ZERO), "move"); }
+function ret(b: Ref<StructuredBuffer>): void { la64Emit(b, la64Jirl(ZERO, RA, 0), "ret"); }
+function trap(b: Ref<StructuredBuffer>): void { la64Emit(b, la64Code(LA64_BREAK, 1), "break 1"); }
+
+/// 进程入口：sp → argc、argv[]、0、envp[]、0、auxv（sp 由内核按 16 字节对齐）。记下 envp，静态产物设好线程指针，以 a0＝argc、
+/// a1＝argv 调 __tx_native_entry（私有约定与 LP64D 的整数实参一致），以它的结果 exit_group。a0、a1 在调用前不动，临时用 a2、t0、t7。
+export function linuxLa64Start(b: Ref<StructuredBuffer>): void {
+    asBufferBoundaryBegin(b, MODULE, "_start", "process-entry");
+    asBufferLabel(b, "_start", 1);
+    // 帧链到此为止：fp＝0、ra＝0。
+    mov(b, FP, ZERO);
+    mov(b, RA, ZERO);
+    la64Emit(b, la64Si12(LA64_LD_D, A0, SP, 0), "ld.d a0, [sp]");
+    la64Emit(b, la64Si12(LA64_ADDI_D, A1, SP, 8), "addi.d a1, sp, 8");
+    // envp = argv + (argc + 1) * 8。
+    la64Emit(b, la64Shift(LA64_SLLI_D, T0, A0, 3, 64), "slli.d t0, a0, 3");
+    la64Emit(b, la64R3(LA64_ADD_D, A2, A1, T0), "add.d a2, a1, t0");
+    la64Emit(b, la64Si12(LA64_ADDI_D, A2, A2, 8), "addi.d a2, a2, 8");
+    la64SymAccess(b, LA64_ST_D, A2, T7, "__tx_nrt_envp", 0);
+    la64Bz(b, LA64_BNEZ, TP, "__tx_start_tls_ready");
+    la64AddrOf(b, TP, "__tx_tls_static", 0);
+    asBufferLabel(b, "__tx_start_tls_ready", 1);
+    la64B(b, 1, "__tx_native_entry");
+    syscall(b, "exit_group");
+    trap(b);
+    asBufferFunctionEnd(b);
+}
+
+/// .rodata 里 statx 用的空路径 __tx_la64_empty（8 个零字节）。
+export function linuxLa64Rodata(b: Ref<StructuredBuffer>): void {
+    asBufferSection(b, 1, 1);
+    asBufferLabel(b, "__tx_la64_empty", 1);
+    asBufferQuad(b, 0, 1);
+    asBufferSection(b, 0, 1);
+}
+
+/// __tx_tls_tb_get() → 本线程的线程块（外来线程为 0）；__tx_tls_tb_set(tb)。只写 a0。
+export function linuxLa64TlsLeaves(b: Ref<StructuredBuffer>): void {
+    asBufferLabel(b, "__tx_tls_tb_get", 1);
+    la64Emit(b, la64Si12(LA64_LD_D, A0, TP, LINUX_LA64_TLS_SLOT), "ld.d a0, [tp]");
+    ret(b);
+    asBufferLabel(b, "__tx_tls_tb_set", 1);
+    la64Emit(b, la64Si12(LA64_ST_D, A0, TP, LINUX_LA64_TLS_SLOT), "st.d a0, [tp]");
+    ret(b);
+}
+
+/// __tx_thread_clone(flags, top, ptid, ctid, tls) → 子线程号或 −errno（父线程）。实参次序与龙芯的 clone 相同，原样发出。子线程在
+/// 新栈上从 syscall 之后继续：[sp]＝记录（父线程预先写好），以 a0＝记录调用 __tx_thread_main，它以 exit 结束、不返回。
+/// __tx_thread_unmap_exit(base, size)：归还自己正在用的栈后立即以 exit 结束本线程——munmap 之后只用寄存器、不再碰栈。
+export function linuxLa64ThreadStubs(b: Ref<StructuredBuffer>): void {
+    asBufferBoundaryBegin(b, MODULE, "__tx_thread_clone", "stack-transition");
+    asBufferLabel(b, "__tx_thread_clone", 1);
+    syscall(b, "clone");
+    la64Bz(b, LA64_BEQZ, A0, "__tx_thread_clone_child");
+    ret(b);
+    asBufferLabel(b, "__tx_thread_clone_child", 1);
+    mov(b, FP, ZERO);
+    mov(b, RA, ZERO);
+    la64Emit(b, la64Si12(LA64_LD_D, A0, SP, 0), "ld.d a0, [sp]");
+    la64B(b, 1, "__tx_thread_main");
+    trap(b);
+    asBufferFunctionEnd(b);
+    asBufferBoundaryBegin(b, MODULE, "__tx_thread_unmap_exit", "stack-disposal");
+    asBufferLabel(b, "__tx_thread_unmap_exit", 1);
+    syscall(b, "munmap");
+    la64MovImm(b, A0, 0);
+    syscall(b, "exit");
+    trap(b);
+    asBufferFunctionEnd(b);
+}

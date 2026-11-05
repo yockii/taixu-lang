@@ -15,6 +15,18 @@ import tempfile
 ROOT=Path(__file__).resolve().parent
 
 
+def native_compiler(value):
+    """--compiler，缺省取 TAIXU_NATIVE 或 PATH 上的 taixu；须是原生太虚编译器。"""
+    candidate=value or os.environ.get('TAIXU_NATIVE') or shutil.which('taixu')
+    if not candidate:
+        raise ValueError('请给出 --compiler <原生 taixu>')
+    compiler=Path(candidate).resolve()
+    p=subprocess.run([compiler,'capabilities','--format=json'],capture_output=True,timeout=30,check=True)
+    if json.loads(p.stdout).get('capabilities',{}).get('compiler')!='native-tx':
+        raise ValueError('所选编译器不是原生太虚：'+str(compiler))
+    return compiler
+
+
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--compiler',type=Path)
@@ -23,10 +35,7 @@ def main():
     ap.add_argument('--report',type=Path)
     a=ap.parse_args()
     core=a.core.resolve()
-    spec=importlib.util.spec_from_file_location('stdlib_native_build',core/'scripts/build.py')
-    build=importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(build)
-    compiler=build.native_compiler(a.compiler)
+    compiler=native_compiler(a.compiler)
     env={**os.environ,'PYTHONUTF8':'1','TAIXU_STDLIB':str(ROOT/'src')}
     rows=[]
     temp_root=ROOT/'.tmp'
@@ -61,6 +70,10 @@ def main():
         check('fmt',[compiler,'fmt','--check',ROOT/'src',ROOT/'tests'])
         for source in sorted((ROOT/'tests').glob('*.tx')):
             if source.name.startswith('aot-'):
+                continue
+            # 名字以 -linux.tx 结尾的用例直接用 Linux 系统调用，只在 Linux 宿主上跑。
+            if source.name.endswith('-linux.tx') and not sys.platform.startswith('linux'):
+                print('SKIP',source.name,'（只在 Linux 宿主上跑）',flush=True)
                 continue
             # -toolchain.tx 结尾的用例用到工具链内建（runProcess 等），按工具链构建（test 与 run 都是）。
             tc=['--toolchain'] if source.name.endswith('-toolchain.tx') else []

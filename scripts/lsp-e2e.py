@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""原生 `taixu lsp` 的无头会话门（第 6 轮 6d-2 起；设计 docs/design/v052-round6-lsp-mcp-v0.1-20261019.md §三-11、§四-1、§六）。
+"""原生 `taixu lsp` 的无头会话门（§四-1、§六）。
 
-TOOL-47 时这个脚本对着 Zig CLI 的 LSP；6d 起改为原生版，按步骤扩项（6d-0 的 Zig 基准转录见 scripts/lsp-baseline.py）。
-6d-2 的各组：
+检查按步骤扩项。
+各组：
   lifecycle  initialize 之前、再次 initialize、坏 JSON、非对象、缺 method、带 id 的 $/、未知方法、串 id、shutdown 之后、退出码 0/1/3、
              --stdio 重复与 --toolchain；
   encoding   缺省 utf-16、宣告 utf-8 时选 utf-8，中文行的列；
@@ -12,16 +12,16 @@ TOOL-47 时这个脚本对着 Zig CLI 的 LSP；6d 起改为原生版，按步�
   diag       分文件发布、依赖改动后重查、修好后清空、覆盖层、未保存的新文件、导入失败、关闭后、防抖、范围终点；
   format     只替换首尾相同行之间的一段（无尾换行、只改中间一行，编辑应用后与格式化结果相同）、无变化、词法错误、未打开；
   symbols    各种声明的种类、名字位置与范围，utf-16 下的中文列；
-  refs       （6d-3a2，§四-3）definition（捕获、跨文件、字段、方法糖、内建、名字末尾的光标、中文列、for-in、泛型体）、
+  refs       （§四-3）definition（捕获、跨文件、字段、方法糖、内建、名字末尾的光标、中文列、for-in、泛型体）、
              references（struct 的导入名、类型标注补面、字面量、声明，includeDeclaration）、rename（局部、跨文件、方法糖
              的前缀改写与拒绝、struct 连类型标注、模板插值、标准库、遮蔽、坏新名与缺 newName），变更后立即请求按新文本作答；
-  tokens     （6d-3a3，§四-4）legend、记号逐个对照（补面、中文串之后的 utf-16 列）、变更后立即请求、未打开的文档、
+  tokens     （§四-4）legend、记号逐个对照（补面、中文串之后的 utf-16 列）、变更后立即请求、未打开的文档、
              refreshSupport 时的 refresh 与对其响应的静默收下；
-  hover      （6d-3b1，§四-5）各类声明的说明、泛型照写与随实例不同的注明、导入名、prelude、内建与遮蔽内建的用户函数、
+  hover      （§四-5）各类声明的说明、泛型照写与随实例不同的注明、导入名、prelude、内建与遮蔽内建的用户函数、
              名字末尾、关键字与注释为 null、变更后立即请求、plaintext 偏好。
-  sig        （6d-3b2，§四-5）宣告的触发字符、各个实参位置、嵌套与 ) 之后、函数名上为 null、方法糖不含接收者、变体构造、
+  sig        （§四-5）宣告的触发字符、各个实参位置、嵌套与 ) 之后、函数名上为 null、方法糖不含接收者、变体构造、
              函数类型的绑定、串里的逗号、隔着型参的内建（utf-16 偏移）、导入的函数、未闭合的 (、分组括号；
-  complete   （6d-3b2，§四-5）局部按位置与块、形参、顶层声明与导入名、遮蔽内建、内建与 --toolchain、prelude 的导出、
+  complete   （§四-5）局部按位置与块、形参、顶层声明与导入名、遮蔽内建、内建与 --toolchain、prelude 的导出、
              类型名、None 与关键字，注释、串与 . 之后为空表。
 用法（仓根执行）：python scripts/lsp-e2e.py --compiler <原生 taixu> [--only 组,组]
 """
@@ -482,7 +482,7 @@ def g_format(compiler, work):
         s.open(u, messy)
         r = s.request('textDocument/formatting', {'textDocument': {'uri': u}, 'options': {'tabSize': 4, 'insertSpaces': True}})
         edits = (r or {}).get('result')
-        # 首行相同、最后一行无尾换行而不同：替换第 1 行起到文末（改正 Zig 版重复最后一行）。
+        # 首行相同、最后一行无尾换行而不同：替换第 1 行起到文末（不重复最后一行）。
         ok = isinstance(edits, list) and len(edits) == 1 and edits[0]['range'] == {'start': {'line': 1, 'character': 0}, 'end': {'line': 2, 'character': 1}}
         check('format: 无尾换行时只替换变化的行段、终点为文末', ok, edits)
         check('format: 应用编辑后与格式化结果相同', isinstance(edits, list) and apply_edits(messy, edits, 'utf-16') == clean, edits)
@@ -556,7 +556,7 @@ def g_symbols(compiler, work):
 
 
 REFS_A = '''import { Point, Pair, LIMIT, makePoint, pick } from "./b";
-import { mapNew } from "std/map_set";
+import { newBuilder } from "std/bytes";
 
 function pointSum(p: Point): int {
     return p.x + p.y;
@@ -580,7 +580,7 @@ function main(args: []string): int {
     let total = p.sum() + apply(outer, base) + LIMIT + sumPair(Pair { a: 1, b: 2 });
     const count = pick(1, 2) + pick(3, 4);
     print(`n=${count}`);
-    const m = mapNew();
+    const m = newBuilder();
     for (k in args) {
         total = total + len(k);
     }
@@ -608,6 +608,15 @@ export function makePoint(x: int, y: int): Point {
 export function pick<T>(a: T, b: T): T {
     const c = a;
     return c;
+}
+'''
+
+# import { a as b }：本地名是本模块的声明（D3 v0.51 §6.1-6）。
+REFS_C = '''import { LIMIT as CAP, makePoint as mk } from "./b";
+
+function main(args: []string): int {
+    const p = mk(1, 2);
+    return CAP + p.x;
 }
 '''
 
@@ -702,7 +711,7 @@ def g_refs(compiler, work):
         r = req('textDocument/rename', ua, pos_of(REFS_A, 'const count', 'utf-16', 6), newName='amount')
         err = (r or {}).get('error', {})
         check('refs: rename 遇同名模板插值即拒绝', err.get('code') == -32803 and '模板' in err.get('message', ''), r)
-        r = req('textDocument/rename', ua, pos_of(REFS_A, 'mapNew()', 'utf-16'), newName='makeMap')
+        r = req('textDocument/rename', ua, pos_of(REFS_A, 'newBuilder()', 'utf-16'), newName='makeBuilder')
         err = (r or {}).get('error', {})
         check('refs: rename 标准库里的声明即拒绝', err.get('code') == -32803 and '标准库' in err.get('message', ''), r)
         r = req('textDocument/rename', ua, pos_of(REFS_A, '(a: int)', 'utf-16', 1), newName='b')
@@ -713,6 +722,26 @@ def g_refs(compiler, work):
             check('refs: rename 新名 %r 拒绝（-32803）' % bad, r and r.get('error', {}).get('code') == -32803, r)
         r = s.request('textDocument/rename', {'textDocument': {'uri': ua}, 'position': pos_of(REFS_A, 'const base', 'utf-16', 6)})
         check('refs: rename 缺 newName 回 -32602', r and r.get('error', {}).get('code') == -32602, r)
+
+        # import { a as b }：改名只动本模块；改被导入的声明只动说明符里的原名，本地名与其用处不变。
+        c = d / 'c.tx'
+        c.write_text(REFS_C, encoding='utf-8', newline='\n')
+        uc = uri_of(c)
+        s.open(uc, REFS_C)
+        r = req('textDocument/definition', uc, pos_of(REFS_C, 'CAP +', 'utf-16'))
+        check('refs: definition 导入改名的本地名到说明符', r and r.get('result') == {'uri': uc, 'range': rng(REFS_C, 'CAP', 3)}, r)
+        r = req('textDocument/rename', uc, pos_of(REFS_C, 'CAP +', 'utf-16'), newName='CEIL')
+        ch = (r or {}).get('result', {}).get('changes', {})
+        check('refs: rename 导入改名的本地名只改本模块', set(ch) == {uc} and apply_edits(REFS_C, ch[uc], 'utf-16') == REFS_C.replace('CAP', 'CEIL'), r)
+        r = req('textDocument/rename', uc, pos_of(REFS_C, 'mk(1', 'utf-16'), newName='build')
+        ch = (r or {}).get('result', {}).get('changes', {})
+        check('refs: rename 改名导入的函数本地名（不当方法糖）', set(ch) == {uc} and apply_edits(REFS_C, ch[uc], 'utf-16') == REFS_C.replace('mk', 'build'), r)
+        r = req('textDocument/rename', ub, pos_of(REFS_B, 'const LIMIT', 'utf-16', 6), newName='BOUND')
+        ch = (r or {}).get('result', {}).get('changes', {})
+        check('refs: rename 被改名导入的声明只改说明符里的原名',
+              apply_edits(REFS_C, ch.get(uc, []), 'utf-16') == REFS_C.replace('LIMIT as', 'BOUND as')
+              and apply_edits(REFS_B, ch.get(ub, []), 'utf-16') == REFS_B.replace('LIMIT', 'BOUND'), r)
+        s.close(uc)
 
         # 改动后立即请求：位置随新文本。
         new_a = '// 新加一行\n' + REFS_A
@@ -774,7 +803,7 @@ def g_tokens(compiler, work):
     try:
         r = s.init()
         caps = (r or {}).get('result', {}).get('capabilities', {})
-        check('tokens: legend 逐字同 Zig 版、只有 full', caps.get('semanticTokensProvider') == {'legend': LEGEND, 'full': True}, caps.get('semanticTokensProvider'))
+        check('tokens: legend 冻结、只有 full', caps.get('semanticTokensProvider') == {'legend': LEGEND, 'full': True}, caps.get('semanticTokensProvider'))
         s.open(u, TOKS)
         r = s.request('textDocument/semanticTokens/full', {'textDocument': {'uri': u}})
         got = decode(((r or {}).get('result') or {}).get('data', []))

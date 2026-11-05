@@ -1,0 +1,389 @@
+// aarch64-windows 的 PE32+ 可执行文件写出（～4）：输入同 ELF、Mach-O 的写出器——我们自己的 ELF64 可重定位目标
+// 文件（内核＋程序），读入、放置、符号解析、拷节与重定位由 link_objects.tx 完成；本文件只管 PE 的布局与写出（x86_64-windows 照旧
+// 由 link_pe.tx 链接 COFF 内核与当场汇编的程序映像）：
+// - 节：.text（代码组＋合成的导入桩）、.rdata（只读组＋导入区：IAT、导入名表、描述符、提示名表、DLL 名）、.data（数据组，bss 在
+//   文件内容之后只占虚拟地址）、.reloc（基址重定位）。节对齐与文件对齐都取 4 KiB，前三节的文件偏移即 RVA（link_objects 要求文件
+//   偏移与虚拟地址只差常数）；.reloc 的文件内容接在 .data 的文件内容之后。
+// - 映像：基址 0x140000000；DllCharacteristics 0x8160（HIGH_ENTROPY_VA、DYNAMIC_BASE、NX_COMPAT、TERMINAL_SERVER_AWARE；ARM64 不能
+//   关 ASLR，映像须带 .reloc）；系统与子系统版本 6.0、栈与堆的保留与提交同 link_pe.tx 的 x86_64 PE（同 Go、lld 的参照产物）；
+//   链接器版本、时间戳（内容哈希）与校验和由 pe_image.tx 统一填（PE 规范化 P1）。
+// - 导入：引用而无人定义的符号即导入（lkoUndefinedExternal）：`__imp_<名>` 是 IAT 槽；裸名（rtfn 直呼的 kernel32 函数等）合成
+//   12 字节桩 adrp x16／ldr x16, [x16, #lo12]／br x16（同 lld 的 importThunkARM64），取同名的 IAT 槽。一个名字只占一个槽。DLL 归类
+//   同 link_pe.tx（lkDllOf：driver 登记的 FFI 库优先，其余按名表，缺省 kernel32），DLL 与各 DLL 内的项按首次出现的次序。IAT 与导入
+//   名表的项是提示名项的 RVA（加载器改写 IAT），不带基址重定位。同 link_pe.tx 的两道检查：`__imp_<名>` 的名字若有对象定义
+//   即拒绝（FfiImportShadowed：桩会悄悄调到本地实现）；太虚自带的运行时算法名（lkOwnedRuntime）作裸名引用而无人提供、又不是
+//   外部函数声明的导入，也拒绝（UnresolvedRuntimeSymbol：不能当成 kernel32 的导入，否则到加载时才失败）。
+// - 基址重定位：R_AARCH64_ABS64 的每处（lkoRelocate 收进 absSites）一条 DIR64，按 4 KiB 页分块、块长补齐到 4 字节；只许落在映像
+//   有文件内容的范围里。内核的 IMAGE_TLS_DIRECTORY64（__tx_tls_directory）进数据目录 9，它的四个 VA 随上一条出 DIR64。
+// - 展开信息（B18）：带帧事件的函数各一份 .xdata（pe_unwind_a64.tx；超过 1 MiB 的函数每个分片一份），接在 .rdata 的导入区
+//   之后；.pdata 单独一节（函数或分片起点 RVA＋.xdata 的 RVA，按地址升序、互不重叠），在 .data 与 .reloc 之间，进数据目录 3。
+//   帧事件的来源：程序函数由驱动给出（汇编时收集），其余对象读各自的函数目录（.txfn，内核总带）；没有目录的对象、没有帧事件的
+//   函数（叶函数、边界）不出，系统按叶函数处理。
+import { rawNameOf } from "./binary_name";
+import { linkMapSymbolsEnabled, linkMapEnabled, linkMapDone, linkMapSynthetic } from "./link_map_data";
+import { LKO_IMAGE_LIMIT, lkoObjectMachine, lkoReject, lkoFailure, lkoAlignUp, lkoLookup, lkoSectionNamed, lkoSectionAddress, lkoSectionBytes, lkoAddress, lkoAddGlobal, lkoGlobalKind, lkoUndefinedExternal, lkoUndefinedWithPrefix, lkoBegin, lkoPlace, lkoGroupSize, lkoGroupAlign, lkoSetGroupBase, lkoDefineGlobals, lkoCacheSymbols, lkoCopySections, lkoRelocate, lkoCollectMap } from "./link_objects";
+import { lkDllOf, lkOwnedRuntime } from "./link_pe";
+import { NativeFunctionImage } from "./native_function_data";
+import { nativeObjectFunctions } from "./native_function_object";
+import { a64Unwind } from "./pe_unwind_a64";
+import { peLinkerMajor, peLinkerMinor, peFinish, peBaseRelocations } from "./pe_image";
+import { T_ARM64_WINDOWS } from "./target";
+
+const BASE: int = 0x140000000;
+const PAGE: int = 4096;
+const HEADERS: int = 4096;
+const IMPORT_PREFIX: string = "__imp_";
+const STUB_BYTES: int = 12;
+const ELF_AARCH64: int = 183;
+const MACHINE_ARM64: int = 0xAA64;
+const DLL_CHARACTERISTICS: int = 0x8160;
+// 同 link_pe.tx：栈保留 8 MiB、提交 64 KiB，堆保留 1 MiB、提交 4 KiB。
+const STACK_RESERVE: int = 0x800000;
+const STACK_COMMIT: int = 0x10000;
+const HEAP_RESERVE: int = 0x100000;
+const HEAP_COMMIT: int = 0x1000;
+
+let out: Bytes = bytesNew(0);
+// 一个函数的展开信息：所在对象与输入节、节内起止、.xdata 及其在 .xdata 区里的偏移、链接后的 RVA。
+struct UnwindRow { object: int, section: int, begin: int, end: int, xdata: Bytes, at: int, rva: int }
+
+function reject(message: string): int {
+    lkoReject(message);
+    out = bytesNew(0);
+    return 1;
+}
+function failed(): int {
+    out = bytesNew(0);
+    return 1;
+}
+
+function le(b: Bytes, value: int, width: int): void {
+    let i = 0;
+    while (i < width) { bytesPush(b, (value >>> (i * 8)) & 255); i = i + 1; }
+}
+function put(at: int, value: int, width: int): void {
+    let i = 0;
+    while (i < width) { bytesSet(out, at + i, (value >>> (i * 8)) & 255); i = i + 1; }
+}
+function text(b: Bytes, s: string): void {
+    let i = 0;
+    while (i < len(s)) { bytesPush(b, byteAt(s, i) catch 0); i = i + 1; }
+}
+function putText(at: int, s: string): void {
+    let i = 0;
+    while (i < len(s)) { bytesSet(out, at + i, byteAt(s, i) catch 0); i = i + 1; }
+}
+function padTo(b: Bytes, alignment: int): void {
+    while (bytesLen(b) % alignment != 0) { bytesPush(b, 0); }
+}
+function maxInt(a: int, b: int): int { if (a > b) { return a; } return b; }
+
+function indexOf(xs: List<string>, s: string): int {
+    let i = 0;
+    while (i < listLen(xs)) { if ((listGet(xs, i) catch "") == s) { return i; } i = i + 1; }
+    return -1;
+}
+
+function sectionHeader(h: Bytes, name: string, virtualSize: int, rva: int, rawSize: int, rawAt: int, characteristics: int): void {
+    text(h, name);
+    let i = len(name);
+    while (i < 8) { bytesPush(h, 0); i = i + 1; }
+    le(h, virtualSize, 4); le(h, rva, 4); le(h, rawSize, 4); le(h, rawAt, 4);
+    le(h, 0, 4); le(h, 0, 4); le(h, 0, 2); le(h, 0, 2); le(h, characteristics, 4);
+}
+
+// 按 RVA 升序的稳定归并排序（.pdata）。
+function sortRows(xs: List<Ref<UnwindRow>>): List<Ref<UnwindRow>> {
+    let src = xs; const n = listLen(xs); let width = 1;
+    const missing = new UnwindRow { object: -1, section: -1, begin: 0, end: 0, xdata: bytesNew(0), at: 0, rva: 0 };
+    while (width < n) {
+        const dst: List<Ref<UnwindRow>> = listNew(); let lo = 0;
+        while (lo < n) {
+            let i = lo; let mid = lo + width; if (mid > n) { mid = n; }
+            let j = mid; let hi = lo + 2 * width; if (hi > n) { hi = n; }
+            while (i < mid || j < hi) {
+                if (j >= hi || (i < mid && (listGet(src, i) catch missing).rva <= (listGet(src, j) catch missing).rva)) { listPush(dst, listGet(src, i) catch missing); i = i + 1; }
+                else { listPush(dst, listGet(src, j) catch missing); j = j + 1; }
+            }
+            lo = hi;
+        }
+        src = dst; width = width * 2;
+    }
+    return src;
+}
+
+// 各对象带帧事件的函数的 .xdata（放置之后、定址之前：.xdata 与位置无关，大小先定下来才能排 .rdata）。program 为程序对象（最后一个
+// 输入）的函数，偏移以其 .text 为准；其余对象读 .txfn。失败返回原因。
+function collectUnwind(objects: List<Bytes>, program: Ref<NativeFunctionImage>, rows: List<Ref<UnwindRow>>): string {
+    const n = listLen(objects);
+    let o = 0;
+    while (o < n) {
+        let image = program;
+        let section = -1;
+        if (o == n - 1 && program.ok) { section = lkoSectionNamed(o, ".text"); }
+        else if (o < n - 1) {
+            const meta = nativeObjectFunctions(listGet(objects, o) catch bytesNew(0), T_ARM64_WINDOWS);
+            if (!meta.image.ok) { return "UnwindMetadata:" + meta.image.error; }
+            if (meta.present) { image = meta.image; section = meta.inputSection; }
+        }
+        if (section > 0 && lkoSectionAddress(o, section) >= 0) {
+            const code = lkoSectionBytes(o, section);
+            for (f in image.functions) {
+                if (f.stackModel != "fixed-call" || listLen(f.events) == 0) { continue; }
+                const u = a64Unwind(f, code);
+                if (!u.ok) { return "Unwind:" + f.linkName + ":" + u.error; }
+                for (x in u.fragments) {
+                    listPush(rows, new UnwindRow { object: o, section: section, begin: f.begin + x.offset, end: f.begin + x.offset + x.length, xdata: x.xdata, at: 0, rva: 0 });
+                }
+            }
+        }
+        o = o + 1;
+    }
+    return "";
+}
+
+/// 链接成 PE32+ 可执行文件；entry 为 AddressOfEntryPoint 指向的符号（内核的 __tx_entry），guiSubsystem 为 1 时子系统写 GUI；program
+/// 为程序对象（最后一个输入）的函数目录（驱动在汇编时收集，展开信息由此生成；ok 为假时程序函数不出展开信息）。
+export function linkPeObjects(objects: List<Bytes>, entry: string, guiSubsystem: int, program: Ref<NativeFunctionImage>): int {
+    out = bytesNew(0);
+    if (listLen(objects) == 0 || lkoObjectMachine(listGet(objects, 0) catch bytesNew(0)) != ELF_AARCH64) { return reject("PeObjectsNotAarch64"); }
+    if (lkoBegin(objects, "aarch64-windows") != 0) { return failed(); }
+    if (lkoPlace() != 0) { return failed(); }
+    const unwind: List<Ref<UnwindRow>> = listNew();
+    const unwindError = collectUnwind(objects, program, unwind);
+    if (len(unwindError) > 0) { return reject(unwindError); }
+    let xdataSize = 0;
+    for (row in unwind) { row.at = xdataSize; xdataSize = xdataSize + bytesLen(row.xdata); }
+    // 导入：名字（IAT 槽的次序待定）与要合成桩的裸名。
+    const names: List<string> = listNew();
+    const stubs: List<string> = listNew();
+    const ffi: List<string> = listNew();
+    for (s in lkoUndefinedWithPrefix(IMPORT_PREFIX)) { listPush(ffi, strSub(s, len(IMPORT_PREFIX), len(s) - len(IMPORT_PREFIX))); }
+    for (s in lkoUndefinedExternal()) {
+        let name = s;
+        if (strIndexOf(s, IMPORT_PREFIX) == 0) {
+            name = strSub(s, len(IMPORT_PREFIX), len(s) - len(IMPORT_PREFIX));
+            if (len(name) == 0) { return reject("BadImportName:" + s); }
+        } else {
+            if (lkOwnedRuntime(s) && indexOf(ffi, s) < 0) { return reject("UnresolvedRuntimeSymbol: " + s); }
+            listPush(stubs, s);
+        }
+        if (indexOf(names, name) < 0) { listPush(names, name); }
+    }
+    const ni = listLen(names);
+    const dlls: List<string> = listNew();
+    const dllOf: List<int> = listNew();
+    for (n in names) {
+        const dll = lkDllOf(n);
+        let k = indexOf(dlls, dll);
+        if (k < 0) { listPush(dlls, dll); k = listLen(dlls) - 1; }
+        listPush(dllOf, k);
+    }
+    const nd = listLen(dlls);
+    // IAT：各 DLL 一段（项按导入的首次出现次序，以 0 结尾）；slotOf 为各导入在 IAT 里的字节偏移，order 为 IAT 的逐项（−1 为结尾项）。
+    const slotOf: List<int> = listNew();
+    let q = 0;
+    while (q < ni) { listPush(slotOf, 0); q = q + 1; }
+    const order: List<int> = listNew();
+    const firstOf: List<int> = listNew();
+    let iat = 0;
+    let d = 0;
+    while (d < nd) {
+        listPush(firstOf, iat);
+        q = 0;
+        while (q < ni) {
+            if ((listGet(dllOf, q) catch -1) == d) { listSet(slotOf, q, iat); listPush(order, q); iat = iat + 8; }
+            q = q + 1;
+        }
+        listPush(order, -1);
+        iat = iat + 8;
+        d = d + 1;
+    }
+    const iatSize = iat;
+    // 提示名表（2 字节提示 0、名字、NUL，补齐到偶数）与 DLL 名（以 NUL 结尾）。
+    const hintAt: List<int> = listNew();
+    let hints = 0;
+    for (n in names) { listPush(hintAt, hints); hints = hints + lkoAlignUp(2 + len(n) + 1, 2); }
+    const dllNameAt: List<int> = listNew();
+    let dllNames = 0;
+    for (x in dlls) { listPush(dllNameAt, dllNames); dllNames = dllNames + len(x) + 1; }
+    // 导入区内的相对位置：IAT、导入名表（同 IAT 的形状）、描述符（nd＋1 个，各 20 字节）、提示名表、DLL 名。
+    const iltRel = iatSize;
+    const descRel = iltRel + iatSize;
+    const hintRel = lkoAlignUp(descRel + 20 * (nd + 1), 8);
+    const dllRel = hintRel + hints;
+    const importSize = dllRel + dllNames;
+    // 布局（RVA）。
+    const textOff = lkoAlignUp(HEADERS, lkoGroupAlign(0));
+    const stubOff = lkoAlignUp(textOff + lkoGroupSize(0), 4);
+    const textEnd = stubOff + STUB_BYTES * listLen(stubs);
+    const rdOff = lkoAlignUp(textEnd, PAGE);
+    const constOff = lkoAlignUp(rdOff, lkoGroupAlign(1));
+    const constEnd = constOff + lkoGroupSize(1);
+    const importOff = lkoAlignUp(constEnd, 8);
+    const xdataOff = lkoAlignUp(importOff + importSize, 4);
+    const rdEnd = xdataOff + xdataSize;
+    const dataOff = lkoAlignUp(rdEnd, PAGE);
+    const dataGroupOff = lkoAlignUp(dataOff, lkoGroupAlign(2));
+    const dataEnd = dataGroupOff + lkoGroupSize(2);
+    const bssOff = lkoAlignUp(dataEnd, lkoGroupAlign(3));
+    const bssEnd = bssOff + lkoGroupSize(3);
+    const pdataSize = 8 * listLen(unwind);
+    const pdataRva = lkoAlignUp(maxInt(bssEnd, dataOff + 1), PAGE);
+    let relocRva = pdataRva;
+    if (pdataSize > 0) { relocRva = lkoAlignUp(pdataRva + pdataSize, PAGE); }
+    if (relocRva > LKO_IMAGE_LIMIT) { return reject("ImageTooLarge"); }
+    lkoSetGroupBase(0, BASE + textOff); lkoSetGroupBase(1, BASE + constOff);
+    lkoSetGroupBase(2, BASE + dataGroupOff); lkoSetGroupBase(3, BASE + bssOff);
+    if (lkoDefineGlobals() != 0) { return failed(); }
+    for (n in ffi) { if (lkoLookup(n) >= 0) { return reject("FfiImportShadowed: " + n); } }
+    // 合成符号：IAT 槽与导入桩。
+    q = 0;
+    while (q < ni) {
+        const slot = IMPORT_PREFIX + (listGet(names, q) catch "");
+        const va = BASE + importOff + (listGet(slotOf, q) catch 0);
+        if (lkoLookup(slot) >= 0) { return reject("DuplicateSymbol:" + slot); }
+        lkoAddGlobal(slot, va);
+        if (linkMapSymbolsEnabled()) { linkMapSynthetic(rawNameOf(slot), "iat-slot", 1, va); }
+        q = q + 1;
+    }
+    let k = 0;
+    while (k < listLen(stubs)) {
+        const nm = listGet(stubs, k) catch "";
+        const va = BASE + stubOff + STUB_BYTES * k;
+        if (lkoLookup(nm) >= 0) { return reject("DuplicateSymbol:" + nm); }
+        lkoAddGlobal(nm, va);
+        if (linkMapSymbolsEnabled()) { linkMapSynthetic(rawNameOf(nm), "import-stub", 0, va); }
+        k = k + 1;
+    }
+    lkoCacheSymbols();
+    const entryIndex = lkoLookup(entry);
+    if (entryIndex < 0) { return reject("MissingEntry:" + entry); }
+    const entryAddress = lkoAddress(entryIndex);
+    if (lkoGlobalKind(entryIndex) != 0 || entryAddress < BASE + textOff || entryAddress >= BASE + textEnd) { return reject("EntryNotInText:" + entry); }
+    const tlsIndex = lkoLookup("__tx_tls_directory");
+    let tlsRva = 0;
+    if (tlsIndex >= 0) { tlsRva = lkoAddress(tlsIndex) - BASE; }
+    // 文件内容：头、.text、.rdata、.data（文件偏移即 RVA）；.reloc 随后接上。
+    const dataRawSize = lkoAlignUp(dataEnd - dataOff, PAGE);
+    bytesAppend(out, bytesNew(dataOff + dataRawSize));
+    lkoCopySections(out, BASE);
+    // 导入桩：adrp x16 取槽所在页（页差放 immlo、immhi），ldr x16 的偏移按 8 缩放，br x16。
+    k = 0;
+    while (k < listLen(stubs)) {
+        const at = stubOff + STUB_BYTES * k;
+        const slot = BASE + importOff + (listGet(slotOf, indexOf(names, listGet(stubs, k) catch "")) catch 0);
+        const pages = ((slot >>> 12) - ((BASE + at) >>> 12)) & 2097151;
+        put(at, 0x90000010 | ((pages & 3) << 29) | ((pages >>> 2) << 5), 4);
+        put(at + 4, 0xF9400210 | (((slot & 4095) / 8) << 10), 4);
+        put(at + 8, 0xD61F0200, 4);
+        k = k + 1;
+    }
+    // 导入区：IAT 与导入名表、描述符、提示名表、DLL 名。
+    let pos = 0;
+    for (ix in order) {
+        let v = 0;
+        if (ix >= 0) { v = importOff + hintRel + (listGet(hintAt, ix) catch 0); }
+        put(importOff + pos, v, 8);
+        put(importOff + iltRel + pos, v, 8);
+        pos = pos + 8;
+    }
+    d = 0;
+    while (d < nd) {
+        const at = importOff + descRel + 20 * d;
+        const first = listGet(firstOf, d) catch 0;
+        put(at, importOff + iltRel + first, 4);
+        put(at + 12, importOff + dllRel + (listGet(dllNameAt, d) catch 0), 4);
+        put(at + 16, importOff + first, 4);
+        putText(importOff + dllRel + (listGet(dllNameAt, d) catch 0), listGet(dlls, d) catch "");
+        d = d + 1;
+    }
+    q = 0;
+    while (q < ni) {
+        putText(importOff + hintRel + (listGet(hintAt, q) catch 0) + 2, listGet(names, q) catch "");
+        q = q + 1;
+    }
+    // .xdata 与 .pdata：各函数的 RVA 由放置定下，按 RVA 排序后须落在 .text 里、互不重叠。
+    for (row in unwind) {
+        let i = 0;
+        while (i < bytesLen(row.xdata)) { bytesSet(out, xdataOff + row.at + i, bytesGet(row.xdata, i) catch 0); i = i + 1; }
+        row.rva = lkoSectionAddress(row.object, row.section) + row.begin - BASE;
+    }
+    const pdata = bytesNew(0);
+    let previousEnd = textOff;
+    for (row in sortRows(unwind)) {
+        const size = row.end - row.begin;
+        if (row.rva < previousEnd || row.rva + size > textEnd) { return reject("UnwindFunctionOutsideText"); }
+        le(pdata, row.rva, 4); le(pdata, xdataOff + row.at, 4);
+        previousEnd = row.rva + size;
+    }
+    const absSites: List<int> = listNew();
+    if (lkoRelocate(out, BASE, absSites) != 0) { return failed(); }
+    // 基址重定位：每处一条 DIR64（pe_image.tx 按页分块，同 x86_64）。
+    const rvas: List<int> = listNew();
+    for (site in absSites) {
+        const rva = site - BASE;
+        if (rva < textOff || rva + 8 > dataEnd || (rva >= textEnd && rva < rdOff) || (rva >= rdEnd && rva < dataOff)) { return reject("AbsoluteRelocationOutsideImage"); }
+        listPush(rvas, rva);
+    }
+    const reloc = bytesNew(0);
+    if (peBaseRelocations(rvas, reloc) != 0) { return reject("DuplicateBaseRelocation"); }
+    const relocSize = bytesLen(reloc);
+    if (relocSize == 0) { return reject("NoBaseRelocations"); }
+    const pdataRaw = bytesLen(out);
+    bytesAppend(out, pdata);
+    padTo(out, PAGE);
+    const relocRaw = bytesLen(out);
+    bytesAppend(out, reloc);
+    padTo(out, PAGE);
+    const sizeOfImage = relocRva + lkoAlignUp(relocSize, PAGE);
+    // 头：DOS 头（MZ，e_lfanew＝64，不带 DOS 桩）、PE 签名、COFF 头、PE32+ 可选头、节头（有展开信息时五个）。
+    const h = bytesNew(0);
+    text(h, "MZ");
+    while (bytesLen(h) < 60) { bytesPush(h, 0); }
+    le(h, 64, 4);
+    text(h, "PE"); le(h, 0, 2);
+    let sections = 4;
+    if (pdataSize > 0) { sections = 5; }
+    const pdataRawSize = lkoAlignUp(pdataSize, PAGE);
+    le(h, MACHINE_ARM64, 2); le(h, sections, 2); le(h, 0, 4); le(h, 0, 4); le(h, 0, 4); le(h, 240, 2); le(h, 0x22, 2);
+    le(h, 0x20B, 2); bytesPush(h, peLinkerMajor()); bytesPush(h, peLinkerMinor());
+    const textRaw = lkoAlignUp(textEnd - textOff, PAGE);
+    const rdRaw = lkoAlignUp(rdEnd - rdOff, PAGE);
+    le(h, textRaw, 4); le(h, rdRaw + dataRawSize + pdataRawSize + lkoAlignUp(relocSize, PAGE), 4); le(h, 0, 4);
+    le(h, entryAddress - BASE, 4); le(h, textOff, 4);
+    le(h, BASE, 8); le(h, PAGE, 4); le(h, PAGE, 4);
+    le(h, 6, 2); le(h, 0, 2); le(h, 0, 2); le(h, 0, 2); le(h, 6, 2); le(h, 0, 2); le(h, 0, 4);
+    le(h, sizeOfImage, 4); le(h, HEADERS, 4); le(h, 0, 4);
+    let subsystem = 3;
+    if (guiSubsystem == 1) { subsystem = 2; }
+    le(h, subsystem, 2); le(h, DLL_CHARACTERISTICS, 2);
+    le(h, STACK_RESERVE, 8); le(h, STACK_COMMIT, 8); le(h, HEAP_RESERVE, 8); le(h, HEAP_COMMIT, 8);
+    le(h, 0, 4); le(h, 16, 4);
+    let dir = 0;
+    while (dir < 16) {
+        if (dir == 1) { le(h, importOff + descRel, 4); le(h, 20 * (nd + 1), 4); }
+        else if (dir == 3 && pdataSize > 0) { le(h, pdataRva, 4); le(h, pdataSize, 4); }
+        else if (dir == 5) { le(h, relocRva, 4); le(h, relocSize, 4); }
+        else if (dir == 9 && tlsIndex >= 0) { le(h, tlsRva, 4); le(h, 40, 4); }
+        else if (dir == 12) { le(h, importOff, 4); le(h, iatSize, 4); }
+        else { le(h, 0, 4); le(h, 0, 4); }
+        dir = dir + 1;
+    }
+    sectionHeader(h, ".text", textEnd - textOff, textOff, textRaw, textOff, 0x60000020);
+    sectionHeader(h, ".rdata", rdEnd - rdOff, rdOff, rdRaw, rdOff, 0x40000040);
+    let dataAt = 0;
+    if (dataRawSize > 0) { dataAt = dataOff; }
+    sectionHeader(h, ".data", maxInt(bssEnd, dataOff + 1) - dataOff, dataOff, dataRawSize, dataAt, 0xC0000040);
+    if (pdataSize > 0) { sectionHeader(h, ".pdata", pdataSize, pdataRva, pdataRawSize, pdataRaw, 0x40000040); }
+    sectionHeader(h, ".reloc", relocSize, relocRva, lkoAlignUp(relocSize, PAGE), relocRaw, 0x42000040);
+    if (bytesLen(h) > HEADERS) { return reject("HeaderTooLarge"); }
+    let i = 0;
+    while (i < bytesLen(h)) { bytesSet(out, i, bytesGet(h, i) catch 0); i = i + 1; }
+    peFinish(out);
+    if (linkMapEnabled()) { lkoCollectMap(BASE, entryAddress); linkMapDone(); }
+    return 0;
+}
+
+export function peObjectsBytes(): Bytes { return out; }
+export function peObjectsError(): string { return lkoFailure(); }

@@ -1,4 +1,4 @@
-"""NRT bring-up differential: build e2e cases with --runtime=native (no Zig host) and compare.
+"""NRT bring-up differential: build e2e cases with --runtime=native and compare.
 
 Expected behavior comes from the declarative e2e companions (tests/README.md):
 `.out` = exit 0 and byte-identical stdout; `.err` = first line `exit=N`, the
@@ -12,13 +12,13 @@ target-only case (FFI against one platform's libraries or syscalls); it is skipp
 by name, on the other target. A `<case>.buildflags` companion lists extra build
 options, one per line (e.g. `--static`).
 
-`--leak-check` builds every case with that option (exit-time leak check, TOOL-84 step 1):
+`--leak-check` builds every case with that option (exit-time leak check, step 1):
 results must match as before and no run may print a leak report (`[runtime:leak]`)
 unless the case's own expectation names it (cases that leak on purpose). A `<case>.leakok`
 companion (one line: why the program keeps objects alive on purpose, e.g. intentional
 cycles) keeps that case out of the leak-check build.
 
-`--target macos` (macOS adaptation M1, docs/design/v052-macos-m1-macho-v0.1-20261024.md E10) cross-builds every case
+`--target macos` (macOS adaptation M1, E10) cross-builds every case
 as an x86_64 Mach-O and runs the products in one batch on the macOS test host over ssh (`--remote <ssh host>`, default
 $TAIXU_MACOS_HOST; on a macOS host the default is `local`, which runs them on this machine; scripts/macos_remote.py), each in
 its own case directory as locally. Features the macOS target still
@@ -27,13 +27,30 @@ rejects at build time say "macOS 目标暂不支持" and count as PENDING (none 
 silicon) test host; what the A64 target still rejects ("aarch64-macos 暂不支持": foreign functions until M4d, --debug and
 tool builtins until M4e) counts as PENDING.
 
+`--target aarch64-linux` (multi-arch A2, B10) builds arm64 ELF products and
+runs them natively on an aarch64 Linux host, otherwise through user-mode QEMU (`--qemu <path>`, default
+$TAIXU_QEMU_AARCH64; on a Windows host the path is inside WSL and the products run as `wsl.exe -e <qemu> <product>`).
+Under user-mode QEMU a product that runs another arm64 program (procSpawn of itself) needs binfmt_misc on the host;
+such failures are reported as usual, not hidden. `<case>.x86_64` / `<case>.aarch64` / `<case>.loongarch64` / `<case>.riscv64` companions
+mark architecture-only cases (skipped by name on the other architectures), alongside the operating-system markers.
+
+`--target loongarch64-linux` (multi-arch A4e, design B16 decision 13) does the same for LoongArch64 ELF products: natively
+on a loongarch64 Linux host, otherwise through `--qemu` (default $TAIXU_QEMU_LOONGARCH64). `--target riscv64-linux`
+(multi-arch A5e, design B17) likewise for RV64GC hosts, otherwise through `--qemu` (default $TAIXU_QEMU_RISCV64).
+
+`--target aarch64-windows` (multi-arch A6, design B18) builds ARM64 PE products; every product (with or without
+--build-only) first passes the independent checker scripts/pe_arm64_check.py (headers, imports, base relocations, TLS,
+unwind data), a rejected image counts as BUILD_FAIL. They run natively on a Windows ARM64 host, otherwise in one batch on
+the Windows ARM64 test machine over ssh (`--winarm <ssh arguments>`, default $TAIXU_WINARM_HOST; scripts/windows_remote.py),
+or use --build-only.
+
 `--build-only` builds every case and checks only the build outcome (a product, or the expected compile-time
 rejection): successful builds count as BUILT and are not run. The gate uses it for the arm64 products on hosts that
 cannot run them. Every Mach-O product (both architectures, with or without --build-only) first passes the
 independent checker scripts/macho_check.py; a rejected image counts as BUILD_FAIL.
 
 `--debug` builds every case as an instrumented debug build (round 6 step 6c,
-docs/design/v052-round6-debug-v0.1-20261018.md): run without a debug session the
+): run without a debug session the
 checkpoints are inert, so every result must match exactly as in a normal build (the
 semantic-transparency gate). Cases whose `.buildflags` ask for `--leak-check` are
 skipped by name (the two options are exclusive).
@@ -50,6 +67,7 @@ import sys
 import tempfile
 
 import macho_check
+import pe_arm64_check
 
 ROOT = Path(__file__).resolve().parent.parent
 KERNEL_FLAGS = ['--with-move', '--with-alloc', '--with-rc', '--with-str', '--with-strb', '--with-zero',
@@ -76,8 +94,8 @@ def cases(selected):
     if selected:
         return [Path(s).resolve() for s in selected]
     found = []
-    # tests/nrt-cases: language features newer than the frozen Zig seed (D3 v0.18+);
-    # the Zig e2e harness does not scan this directory.
+    # tests/nrt-cases: language features from D3 v0.18 on;
+    # scanned together with tests/cases and examples.
     for d in (ROOT / 'tests/cases', ROOT / 'tests/nrt-cases', ROOT / 'examples'):
         for tx in sorted(d.glob('*.tx')):
             if tx.with_suffix('.out').exists() or tx.with_suffix('.err').exists():
@@ -96,9 +114,12 @@ def local_imports(tx, seen):
         local_imports(target if target.suffix == '.tx' else target.with_suffix('.tx'), seen)
 
 
-def skip_reason(tx, target):
+def skip_reason(tx, target, arch):
     for only in ('windows', 'linux', 'macos'):
         if tx.with_suffix('.' + only).exists() and target != only:
+            return 'target-only:' + only
+    for only in ('x86_64', 'aarch64', 'loongarch64', 'riscv64'):
+        if tx.with_suffix('.' + only).exists() and arch != only:
             return 'target-only:' + only
     if tx.with_suffix('.runflags').exists():
         return 'runflags'
@@ -148,12 +169,28 @@ def main():
     ap.add_argument('--kernel', type=Path, help='Prebuilt NRT kernel object')
     ap.add_argument('--work', type=Path)
     ap.add_argument('--report', type=Path)
-    # 缺省为宿主自己的目标：macOS 宿主按处理器取 aarch64-macos 或 macos（x86_64），此前一律取 linux，门在 Mac 上编出 ELF 去跑。
-    host = 'windows' if os.name == 'nt' else (('aarch64-macos' if platform.machine() == 'arm64' else 'macos') if sys.platform == 'darwin' else 'linux')
-    ap.add_argument('--target', choices=['windows', 'linux', 'macos', 'aarch64-macos'], default=host,
-                    help='linux on a Windows host runs the ELF products through wsl.exe; macos runs them on --remote over ssh')
+    # 缺省为宿主自己的目标：macOS 宿主按处理器取 aarch64-macos 或 macos（x86_64），此前一律取 linux，门在 Mac 上编出 ELF 去跑；
+    # Linux 宿主同样按处理器取 aarch64-linux 或 linux（x86_64）。
+    arm_host = platform.machine() in ('arm64', 'aarch64')
+    la_host = platform.machine() == 'loongarch64'
+    rv_host = platform.machine() == 'riscv64'
+    host = ('aarch64-windows' if platform.machine().upper() == 'ARM64' else 'windows') if os.name == 'nt' else (('aarch64-macos' if arm_host else 'macos') if sys.platform == 'darwin' else
+                                              ('aarch64-linux' if arm_host else ('loongarch64-linux' if la_host else
+                                                                                 ('riscv64-linux' if rv_host else 'linux'))))
+    ap.add_argument('--target', choices=['windows', 'aarch64-windows', 'linux', 'macos', 'aarch64-macos', 'aarch64-linux', 'loongarch64-linux', 'riscv64-linux'],
+                    default=host,
+                    help='linux on a Windows host runs the ELF products through wsl.exe; macos runs them on --remote over ssh; '
+                         'aarch64-windows runs them natively on a Windows ARM64 host; '
+                         'aarch64-linux, loongarch64-linux and riscv64-linux run them natively on a host of that architecture, otherwise '
+                         'through --qemu')
+    ap.add_argument('--qemu', default='',
+                    help='qemu-user binary for --target aarch64-linux / loongarch64-linux / riscv64-linux off that architecture '
+                         '(inside WSL on a Windows host); default $TAIXU_QEMU_AARCH64 / $TAIXU_QEMU_LOONGARCH64 / $TAIXU_QEMU_RISCV64')
     ap.add_argument('--remote', default='local' if sys.platform == 'darwin' else os.environ.get('TAIXU_MACOS_HOST', ''),
                     help='ssh host of the macOS test machine (--target macos); local runs on this Mac (the default there)')
+    ap.add_argument('--winarm', default=os.environ.get('TAIXU_WINARM_HOST', ''),
+                    help='ssh arguments of the Windows ARM64 test machine (--target aarch64-windows off such a host), '
+                         'e.g. "-J <跳板机> -p 2222 -i <key> tx@127.0.0.1"')
     ap.add_argument('--leak-check', action='store_true', help='build every case with --leak-check; a leak report fails the case')
     ap.add_argument('--debug', action='store_true', help='build every case with --debug (instrumented); results must not change')
     ap.add_argument('--build-flag', action='append', default=[], help='extra build flag for every case (repeatable), e.g. --codegen=portable')
@@ -164,14 +201,34 @@ def main():
         raise SystemExit('--debug and --leak-check are exclusive')
     if args.target == 'windows' and os.name != 'nt':
         raise SystemExit('Windows PE products need a Windows host')
+    a64_win = args.target == 'aarch64-windows'
+    native_win = a64_win and os.name == 'nt' and platform.machine().upper() == 'ARM64'
+    if a64_win and not args.build_only and not native_win and not args.winarm:
+        raise SystemExit('running aarch64-windows products needs a Windows ARM64 host, --winarm <ssh arguments> '
+                         '(or TAIXU_WINARM_HOST), or --build-only')
     if args.target in ('macos', 'aarch64-macos') and not args.build_only and not args.remote:
         raise SystemExit('running macOS products from this host needs --remote <ssh host> (or TAIXU_MACOS_HOST)')
-    linux = args.target == 'linux'
+    a64_linux = args.target == 'aarch64-linux'
+    la64_linux = args.target == 'loongarch64-linux'
+    rv64_linux = args.target == 'riscv64-linux'
+    # x86_64 以外的 Linux：产物在同架构宿主上直接跑，否则经 qemu-user。
+    cross_linux = a64_linux or la64_linux or rv64_linux
+    linux = args.target == 'linux' or cross_linux
     a64 = args.target == 'aarch64-macos'
     macos = args.target == 'macos' or a64
-    # 目标专属用例（<case>.windows／.linux／.macos）按操作系统挑选，两种 macOS 架构共用 .macos。
-    os_name = 'macos' if macos else args.target
+    # 目标专属用例（<case>.windows／.linux／.macos）按操作系统挑选，两种 macOS 架构共用 .macos；.x86_64／.aarch64／.loongarch64／.riscv64
+    # 按架构挑选。
+    os_name = 'macos' if macos else ('linux' if linux else 'windows')
+    arch = 'aarch64' if (a64 or a64_linux or a64_win) else ('loongarch64' if la64_linux else ('riscv64' if rv64_linux else 'x86_64'))
     via_wsl = linux and os.name == 'nt'
+    on_linux = sys.platform.startswith('linux')
+    native_cross = on_linux and ((a64_linux and platform.machine() in ('aarch64', 'arm64')) or (la64_linux and platform.machine() == 'loongarch64')
+                                 or (rv64_linux and platform.machine() == 'riscv64'))
+    qemu_env = 'TAIXU_QEMU_AARCH64' if a64_linux else ('TAIXU_QEMU_LOONGARCH64' if la64_linux else 'TAIXU_QEMU_RISCV64')
+    if not args.qemu:
+        args.qemu = os.environ.get(qemu_env, '') if cross_linux else ''
+    if cross_linux and not native_cross and not args.build_only and not args.qemu:
+        raise SystemExit('running %s products off that architecture needs --qemu <qemu-user> (or %s)' % (args.target, qemu_env))
     work = (args.work or Path(tempfile.mkdtemp(prefix='taixu-nrt-'))).resolve()
     work.mkdir(parents=True, exist_ok=True)
     env = {k: v for k, v in os.environ.items() if not k.upper().startswith('TAIXU_') or k.upper() in ('TAIXU_STDLIB', 'TAIXU_GUI_ROOT')}
@@ -182,17 +239,18 @@ def main():
     rows = []
     counts = {}
     remote = []  # macOS：(row, exp, product, argv)，循环后在测试机上一批运行
+    remote_win = []  # aarch64-windows（不在 ARM64 宿主上）：同上，送 Windows ARM64 测试机
     for tx in cases(args.cases):
         name = str(tx.relative_to(ROOT)).replace('\\', '/')
         row = {'case': name}
-        reason = skip_reason(tx, os_name)
+        reason = skip_reason(tx, os_name, arch)
         if reason:
             row['status'] = 'SKIP'; row['reason'] = reason
         else:
             exp = expected(tx)
             outdir = work / tx.stem
             outdir.mkdir(exist_ok=True)
-            target_flag = ['--target=linux'] if linux else (['--target=aarch64-macos'] if a64 else (['--target=macos'] if macos else []))
+            target_flag = ['--target=' + args.target] if cross_linux or a64_win else (['--target=linux'] if linux else (['--target=aarch64-macos'] if a64 else (['--target=macos'] if macos else [])))
             link = ['--link-object', kernel] if kernel is not None else []
             # A `<case>.toolchain` companion builds the case as a toolchain program
             # (D3 v0.21 toolchain-only system builtins).
@@ -216,6 +274,10 @@ def main():
                 # A compile-time rejection is the expected behavior of many .err cases.
                 text = out + err
                 if macos and ('macOS 目标暂不支持' in text.decode('utf-8', 'replace') or 'aarch64-macos 暂不支持' in text.decode('utf-8', 'replace')):
+                    row['status'] = 'PENDING'; row['detail'] = text.decode('utf-8', 'replace').strip()[-200:]
+                elif (la64_linux and 'loongarch64-linux 暂不支持' in text.decode('utf-8', 'replace')) or \
+                        (rv64_linux and 'riscv64-linux 暂不支持' in text.decode('utf-8', 'replace')):
+                    # 随后一批补齐的部分（龙芯 A4f、RISC-V A5f：外部函数回调、按值结构体）。
                     row['status'] = 'PENDING'; row['detail'] = text.decode('utf-8', 'replace').strip()[-200:]
                 elif exp['kind'] == 'err' and exp['exit'] == 1:
                     # The diagnostic must carry the expected text too, not only the exit code.
@@ -242,6 +304,15 @@ def main():
                         rows.append(row)
                         report_row(row)
                         continue
+                if a64_win:
+                    # 每个 ARM64 PE 产物先过独立核对器（头、导入、基址重定位、TLS、展开信息），不合格记构建失败、不运行。
+                    errors, _ = pe_arm64_check.check(str(exe))
+                    if errors:
+                        row['status'] = 'BUILD_FAIL'; row['detail'] = 'pe_arm64_check: ' + '; '.join(errors[:3])
+                        counts[row['status']] = counts.get(row['status'], 0) + 1
+                        rows.append(row)
+                        report_row(row)
+                        continue
                 if args.build_only:
                     row['status'] = 'BUILT'
                     counts[row['status']] = counts.get(row['status'], 0) + 1
@@ -252,9 +323,16 @@ def main():
                     remote.append((row, exp, exe, extra))
                     rows.append(row)
                     continue
+                if a64_win and not native_win:
+                    remote_win.append((row, exp, exe, extra))
+                    rows.append(row)
+                    continue
                 launch = [exe]
+                qemu = [args.qemu] if cross_linux and not native_cross else []
                 if via_wsl:
-                    launch = ['wsl.exe', '-e', os.path.relpath(exe, tx.parent).replace(os.sep, '/')]
+                    launch = ['wsl.exe', '-e', *qemu, os.path.relpath(exe, tx.parent).replace(os.sep, '/')]
+                elif qemu:
+                    launch = [*qemu, exe]
                 try:
                     code, out, err = run([*launch, *extra], cwd=tx.parent, timeout=120, env=env)
                 except subprocess.TimeoutExpired:
@@ -272,6 +350,18 @@ def main():
                                            Path(r['case']).parent.name)
                                           for r, _, exe, extra in remote], timeout=120, trees=trees)
         for row, exp, _, _ in remote:
+            code, out, err = results.get(row['case'], (-2, b'', b'REMOTE_MISSING'))
+            judge(row, exp, code, out, err, args.leak_check)
+            counts[row['status']] = counts.get(row['status'], 0) + 1
+            report_row(row)
+    if remote_win:
+        # 同 macOS：用例目录整棵带过去，产物在各自的用例目录里运行；getEnv 的正例夹具一并带过去。
+        from windows_remote import run_batch as run_win_batch
+        trees = {Path(r['case']).parent.name: ROOT / Path(r['case']).parent for r, _, _, _ in remote_win}
+        results = run_win_batch(args.winarm, [(r['case'], exe, extra, {'TAIXU_SYS_PROC_FIXTURE': fixture_env({})['TAIXU_SYS_PROC_FIXTURE']},
+                                               Path(r['case']).parent.name)
+                                              for r, _, exe, extra in remote_win], timeout=120, trees=trees)
+        for row, exp, _, _ in remote_win:
             code, out, err = results.get(row['case'], (-2, b'', b'REMOTE_MISSING'))
             judge(row, exp, code, out, err, args.leak_check)
             counts[row['status']] = counts.get(row['status'], 0) + 1

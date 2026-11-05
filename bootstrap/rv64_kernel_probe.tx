@@ -1,0 +1,298 @@
+// RISC-V 内核例程探针：手写一个最小的程序映像（__tx_nrt_image 只有一个入口函数，没有模块与
+// 字符串常量），与生成的 kernel-linux-riscv64.o 链接成静态 ELF。在 RISC-V Linux（或 qemu-riscv64）上运行时走完整的启动链路：
+// _start（envp、静态 TLS）→ __tx_native_entry（主线程区域、线程块、槽表、运行时函数表、入口窗口）→ 入口函数 → __tx_entry_finish
+// （任务泵、等线程、结果槽）→ __tx_nrt_exit。入口函数用 rtfn 写，逐项核对内核例程：各档大小的分配、对齐、realloc 保留内容与
+// 释放（小块、大块缓存、直接映射三条路），一千个小块的分配与回收，memmove 前向与后向重叠、memcpy、memset，字符串取得与拼接
+// （槽表、对象、拼接例程），全部相符时写出 “rv64 kernel ok” 并经结果槽以 0 退出；第 k 项不符经结果槽以 k 退出。
+// 同一入口另与页堆版内核链接（运行时从 auxv 取页长）。第三个映像让 memcpy 的目标为空指针：须经致命锁写出诊断、以 134 退出。
+// 用法：rv64_kernel_probe <内核 .o> <页堆版内核 .o> <输出目录>。
+import { RtFn, RtOp, L, I, A } from "./selfhost/rtfn_base";
+import { rtBegin, rtFailed, rtEnd, rtSet, rtOp, rtShift, rtLoad, rtStore, rtLabel, rtJump, rtIf, rtCall1, rtCall2, rtCall3, rtCall4, rtCall6, rtRetVoid, rtSyscall, rtRdataBytes } from "./selfhost/rtfn";
+import { StructuredBuffer, asBufferSection, asBufferAlign, asBufferLabel, asBufferQuad, asBufferAddress, asStructuredBegin, asFailedAs, asLastErrAs } from "./selfhost/assemble";
+import { asBufferNewRv64, rv64BufferSubmit } from "./selfhost/rv64_asm";
+import { elfWriteObject, elfObjectOk, elfObjectBytes, elfObjectError } from "./selfhost/emit_elf_object";
+import { linkElfObjects, elfObjectsBytes, elfObjectsError, elfDynReset } from "./selfhost/link_elf_objects";
+import { NRT_IMAGE_MAGIC, NRT_IMAGE_VERSION } from "./selfhost/nrt";
+import { BI_TABLE_LEN } from "./selfhost/builtin_names";
+
+const MODULE: string = "bootstrap/rv64_kernel_probe.tx";
+const MESSAGE: string = "rv64 kernel ok\n";
+const TAG_INT: int = 1;
+const TAG_STR: int = 6;
+// 入口函数的寄存器窗口：0 结果、1..3 字符串拼接。
+const REGS: int = 8;
+let failures: List<string> = listNew();
+let serial: int = 0;
+
+function done(f: Ref<RtFn>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// 下一项的编号（退出码）。
+function next(): int { serial = serial + 1; return serial; }
+
+// 结果槽 = {int, k} 并返回：进程以 k 退出。
+function quit(f: Ref<RtFn>, k: int): void {
+    rtStore(f, L("win"), 0, I(TAG_INT), 8);
+    rtStore(f, L("win"), 8, I(k), 8);
+    rtRetVoid(f);
+}
+
+// x cc y 不成立即以下一项的编号退出。
+function want(f: Ref<RtFn>, x: Ref<RtOp>, cc: string, y: Ref<RtOp>): void {
+    const k = next();
+    rtIf(f, x, cc, y, "ok" + toStr(k));
+    quit(f, k);
+    rtLabel(f, "ok" + toStr(k));
+}
+
+// p[at] 这一字节须为 v（局部 x、q 作临时）。
+function wantByte(f: Ref<RtFn>, p: string, at: int, v: int): void {
+    rtOp(f, "q", L(p), "add", I(at));
+    rtLoad(f, "x", L("q"), 0, 1);
+    want(f, L("x"), "eq", I(v));
+}
+
+// buf[i] = i（i < 256）。
+function fill(f: Ref<RtFn>, tag: string): void {
+    rtSet(f, "i", I(0));
+    rtLabel(f, tag);
+    rtOp(f, "q", L("buf"), "add", L("i"));
+    rtStore(f, L("q"), 0, L("i"), 1);
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtIf(f, L("i"), "lt", I(256), tag);
+}
+
+// 一档大小：分配（非空、8 字节对齐）、memset 首尾、realloc 到两倍后内容仍在、释放。
+function sizeCase(f: Ref<RtFn>, n: int): void {
+    const v = (n * 7 + 3) & 255;
+    rtCall2(f, "p", "__tx_native_mem_alloc", I(n), I(8));
+    want(f, L("p"), "ne", I(0));
+    rtOp(f, "x", L("p"), "and", I(7));
+    want(f, L("x"), "eq", I(0));
+    rtCall3(f, "", "memset", L("p"), I(v), I(n));
+    wantByte(f, "p", 0, v);
+    wantByte(f, "p", n - 1, v);
+    rtCall4(f, "r", "__tx_native_mem_realloc", L("p"), I(n), I(2 * n), I(8));
+    want(f, L("r"), "ne", I(0));
+    wantByte(f, "r", 0, v);
+    wantByte(f, "r", n - 1, v);
+    rtCall1(f, "", "__tx_native_mem_free", L("r"));
+}
+
+// 一千个 16..72 字节的小块：各记自己的序号，全部分配完再逐个核对、释放。
+function manyBlocks(f: Ref<RtFn>): void {
+    rtCall2(f, "blk", "__tx_native_mem_alloc", I(8000), I(8));
+    want(f, L("blk"), "ne", I(0));
+    const bad = next();
+    rtSet(f, "i", I(0));
+    rtLabel(f, "mk");
+    rtIf(f, L("i"), "ge", I(1000), "mkdone");
+    rtOp(f, "n", L("i"), "and", I(7));
+    rtShift(f, "n", L("n"), "shl", 3);
+    rtOp(f, "n", L("n"), "add", I(16));
+    rtCall2(f, "p", "__tx_native_mem_alloc", L("n"), I(8));
+    rtIf(f, L("p"), "eq", I(0), "many_bad");
+    rtStore(f, L("p"), 0, L("i"), 8);
+    rtShift(f, "x", L("i"), "shl", 3);
+    rtOp(f, "x", L("blk"), "add", L("x"));
+    rtStore(f, L("x"), 0, L("p"), 8);
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "mk");
+    rtLabel(f, "mkdone");
+    rtSet(f, "i", I(0));
+    rtLabel(f, "vf");
+    rtIf(f, L("i"), "ge", I(1000), "vfdone");
+    rtShift(f, "x", L("i"), "shl", 3);
+    rtOp(f, "x", L("blk"), "add", L("x"));
+    rtLoad(f, "p", L("x"), 0, 8);
+    rtLoad(f, "y", L("p"), 0, 8);
+    rtIf(f, L("y"), "ne", L("i"), "many_bad");
+    rtCall1(f, "", "__tx_native_mem_free", L("p"));
+    rtOp(f, "i", L("i"), "add", I(1));
+    rtJump(f, "vf");
+    rtLabel(f, "many_bad");
+    quit(f, bad);
+    rtLabel(f, "vfdone");
+    rtCall1(f, "", "__tx_native_mem_free", L("blk"));
+}
+
+// memmove 的前向、后向重叠，memcpy 与 memset（200、100、64 字节走 8 字节块，余数逐字节）。
+function copies(f: Ref<RtFn>): void {
+    rtCall2(f, "buf", "__tx_native_mem_alloc", I(256), I(8));
+    want(f, L("buf"), "ne", I(0));
+    fill(f, "fill1");
+    rtOp(f, "p", L("buf"), "add", I(1));
+    rtCall3(f, "", "memmove", L("p"), L("buf"), I(200));
+    wantByte(f, "buf", 0, 0);
+    wantByte(f, "buf", 1, 0);
+    wantByte(f, "buf", 100, 99);
+    wantByte(f, "buf", 200, 199);
+    wantByte(f, "buf", 201, 201);
+    fill(f, "fill2");
+    rtOp(f, "p", L("buf"), "add", I(5));
+    rtCall3(f, "", "memmove", L("buf"), L("p"), I(100));
+    wantByte(f, "buf", 0, 5);
+    wantByte(f, "buf", 99, 104);
+    wantByte(f, "buf", 100, 100);
+    fill(f, "fill3");
+    rtOp(f, "p", L("buf"), "add", I(128));
+    rtCall3(f, "", "memcpy", L("p"), L("buf"), I(64));
+    wantByte(f, "buf", 128, 0);
+    wantByte(f, "buf", 191, 63);
+    wantByte(f, "buf", 192, 192);
+    rtOp(f, "p", L("buf"), "add", I(3));
+    rtCall3(f, "", "memset", L("p"), I(90), I(2));
+    wantByte(f, "buf", 2, 2);
+    wantByte(f, "buf", 3, 90);
+    wantByte(f, "buf", 4, 90);
+    wantByte(f, "buf", 5, 5);
+    rtCall1(f, "", "__tx_native_mem_free", L("buf"));
+}
+
+// 新字符串（交出原生块）：局部 dst = 字符串号。
+function newStr(f: Ref<RtFn>, dst: string, s: string): void {
+    rtCall2(f, "p", "__tx_native_mem_alloc", I(len(s)), I(1));
+    want(f, L("p"), "ne", I(0));
+    let i = 0;
+    while (i < len(s)) {
+        rtStore(f, L("p"), i, I(byteAt(s, i) catch 0), 1);
+        i = i + 1;
+    }
+    rtCall3(f, dst, "__tx_store_new_str_take", L("p"), I(len(s)), I(0));
+}
+
+// 窗口 1、2 放两个字符串，__tx_str_concat 拼进窗口 3，核对长度与字节，三个槽都放手。
+function strings(f: Ref<RtFn>): void {
+    newStr(f, "x", "abcde");
+    rtStore(f, L("win"), 16, I(TAG_STR), 8);
+    rtStore(f, L("win"), 24, L("x"), 8);
+    newStr(f, "x", "xyz");
+    rtStore(f, L("win"), 32, I(TAG_STR), 8);
+    rtStore(f, L("win"), 40, L("x"), 8);
+    rtCall6(f, "", "__tx_str_concat", L("win"), I(0), I(0), I(3), I(1), I(2));
+    rtLoad(f, "x", L("win"), 48, 8);
+    want(f, L("x"), "eq", I(TAG_STR));
+    rtLoad(f, "y", L("win"), 56, 8);
+    rtOp(f, "y", L("y"), "and", I(4294967295));
+    rtCall1(f, "n", "__tx_store_str_len", L("y"));
+    want(f, L("n"), "eq", I(8));
+    rtCall1(f, "r", "__tx_store_str_ptr", L("y"));
+    wantByte(f, "r", 0, 97);
+    wantByte(f, "r", 4, 101);
+    wantByte(f, "r", 5, 120);
+    wantByte(f, "r", 7, 122);
+    let s = 1;
+    while (s <= 3) {
+        rtOp(f, "p", L("win"), "add", I(16 * s));
+        rtCall1(f, "", "__tx_release", L("p"));
+        rtStore(f, L("p"), 0, I(4), 8);
+        rtStore(f, L("p"), 8, I(0), 8);
+        s = s + 1;
+    }
+}
+
+// 入口函数（私有约定：第一个实参是窗口）。
+function entryFn(b: Ref<StructuredBuffer>): void {
+    serial = 0;
+    const f = rtBegin(b, "rv64k_main", "win", "p q r n i x y buf blk", 6, MODULE);
+    for (n in sizes()) { sizeCase(f, n); }
+    manyBlocks(f);
+    copies(f);
+    strings(f);
+    const w: List<Ref<RtOp>> = listNew(); listPush(w, I(1)); listPush(w, A("rv64k_msg")); listPush(w, I(len(MESSAGE)));
+    rtSyscall(f, "", 1, w);
+    rtStore(f, L("win"), 0, I(TAG_INT), 8);
+    rtStore(f, L("win"), 8, I(0), 8);
+    rtRetVoid(f);
+    done(f);
+}
+
+function sizes(): List<int> {
+    const out: List<int> = listNew();
+    listPush(out, 1); listPush(out, 7); listPush(out, 8); listPush(out, 17); listPush(out, 100); listPush(out, 256);
+    listPush(out, 4095); listPush(out, 4096); listPush(out, 5000); listPush(out, 65536); listPush(out, 300000); listPush(out, 3000000);
+    return out;
+}
+
+// 致命路径：memcpy(0, 消息, 1) → 跨度检查失败 → __tx_native_memory_span_panic（致命锁、stderr、134）。
+function panicFn(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "rv64k_main", "win", "x", 3, MODULE);
+    rtCall3(f, "", "memcpy", I(0), A("rv64k_msg"), I(1));
+    rtStore(f, L("win"), 0, I(TAG_INT), 8);
+    rtStore(f, L("win"), 8, I(3), 8);
+    rtRetVoid(f);
+    done(f);
+}
+
+// 程序映像：一个函数（入口 0），没有模块、字符串常量、测试块与发送表；内建表全空。
+function image(b: Ref<StructuredBuffer>): void {
+    rtRdataBytes(b, "rv64k_msg", MESSAGE);
+    asBufferSection(b, 1, 1);
+    asBufferAlign(b, 3, 1);
+    asBufferLabel(b, "__tx_nrt_image", 1);
+    asBufferQuad(b, NRT_IMAGE_MAGIC, 1);
+    asBufferQuad(b, NRT_IMAGE_VERSION, 1);
+    asBufferQuad(b, 1, 1);
+    asBufferQuad(b, 0, 1);
+    asBufferQuad(b, 0, 1);
+    asBufferQuad(b, 0, 1);
+    asBufferAddress(b, "rv64k_funcs", 1);
+    asBufferAddress(b, "rv64k_none", 1);
+    asBufferAddress(b, "rv64k_none", 1);
+    asBufferQuad(b, 0, 1);
+    asBufferAddress(b, "rv64k_none", 1);
+    asBufferQuad(b, 0, 1);
+    asBufferAddress(b, "rv64k_none", 1);
+    // 函数表一行：寄存器数、模块、参数个数、行表（0 项）、常量表（0 项）、代码长。
+    asBufferLabel(b, "rv64k_funcs", 1);
+    asBufferQuad(b, REGS, 1);
+    let k = 0;
+    while (k < 7) { asBufferQuad(b, 0, 1); k = k + 1; }
+    asBufferLabel(b, "rv64k_none", 1);
+    asBufferQuad(b, 0, 1);
+    asBufferLabel(b, "__tx_fn_table_data", 1);
+    asBufferAddress(b, "rv64k_main", 1);
+    asBufferLabel(b, "__tx_bi_table", 1);
+    k = 0;
+    while (k < BI_TABLE_LEN) { asBufferQuad(b, 0, 1); k = k + 1; }
+    asBufferSection(b, 0, 1);
+}
+
+function link(b: Ref<StructuredBuffer>, kernel: Bytes, path: string): int {
+    asStructuredBegin();
+    rv64BufferSubmit(b);
+    if (asFailedAs() != 0) { eprint("asm: " + asLastErrAs()); return 65; }
+    const exports: List<string> = listNew(); listPush(exports, "__tx_nrt_image"); listPush(exports, "__tx_fn_table_data"); listPush(exports, "__tx_bi_table");
+    const r = elfWriteObject(exports);
+    if (elfObjectOk(r) != 1) { eprint("elf: " + elfObjectError(r)); return 66; }
+    const objects: List<Bytes> = listNew(); listPush(objects, kernel); listPush(objects, elfObjectBytes(r));
+    elfDynReset();
+    if (linkElfObjects(objects, "_start") != 0) { eprint("link: " + elfObjectsError()); return 67; }
+    writeFileBytes(path, elfObjectsBytes()) catch (e) { eprint(e.message); return 68; };
+    return 0;
+}
+
+function build(kernel: Bytes, panic: bool, path: string): int {
+    const b = asBufferNewRv64();
+    asBufferSection(b, 0, 1);
+    if (panic) { panicFn(b); } else { entryFn(b); }
+    image(b);
+    if (listLen(failures) > 0) { eprint("rtfn: " + (listGet(failures, 0) catch "")); return 69; }
+    return link(b, kernel, path);
+}
+
+function main(args: []string): int {
+    if (len(args) < 3) { eprint("usage: rv64_kernel_probe <kernel.o> <kernel-heapcheck.o> <outdir>"); return 64; }
+    const kernel = readFileBytes(args[0]) catch (e) { eprint(e.message); return 64; };
+    const heap = readFileBytes(args[1]) catch (e) { eprint(e.message); return 64; };
+    let c = build(kernel, false, args[2] + "/kernel_ok");
+    if (c != 0) { return c; }
+    c = build(heap, false, args[2] + "/kernel_heapcheck_ok");
+    if (c != 0) { return c; }
+    c = build(kernel, true, args[2] + "/kernel_panic");
+    if (c != 0) { return c; }
+    print("PASS_RV64_KERNEL " + toStr(serial));
+    return 0;
+}

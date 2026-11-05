@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""分析节（SEB1 ANA1）的门（第 6 轮 6d-3a1；设计 docs/design/v052-round6-lsp-mcp-v0.1-20261019.md §四-2）。
+"""分析节（SEB1 ANA1）的门。
 
 经隐藏开发命令 `taixu dev-check --analysis`、`--analysis-check` 调用原生编译器，三组检查：
 

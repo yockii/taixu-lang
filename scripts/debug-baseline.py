@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""调试协议基准转录（第 6 轮 6c-0；设计 docs/design/v052-round6-debug-v0.1-20261018.md §五）。
+"""调试协议基准转录。
 
-趁 Zig VM 还在，用 Zig CLI 录下三条调试链路的转录，作为原生调试构建（6c-2 起）的对照基准：
-  - proto：`taixu run --debug <程序>` 的 NDJSON 协议（D15）；
+用归档的 VM 实现录下三条调试链路的转录，作为原生调试构建的对照基准：
+  - proto：`taixu run --debug <程序>` 的 NDJSON 协议；
   - dap：`taixu dap` 的 DAP 会话（Content-Length 帧）；
   - mcp：`taixu mcp` 的 `debug_*` 工具（JSON-RPC 行协议）。
 
 用例清单是 tests/debug/cases.json，程序在 tests/debug/ 下，转录写到 tests/debug/vm/<用例>.<种类>。
 转录一行一条：`> ` 为发出的命令或请求，`< ` 为收到的事件或应答，`= ` 为本脚本的记录（退出码、超时）。
 proto 进程没发终结事件（exited、trapped、compile_failed）就以非零码退出时，退出码记为 `abnormal`
-（Zig 的 panic 在 Windows 上退出码为 3，在 Linux 上是 SIGABRT，两边不同）。
+（该实现 panic 时在 Windows 上退出码为 3，在 Linux 上是 SIGABRT，两边不同）。
 
 规范化（只为让转录可重放、跨机器一致，不改协议内容）：
   - 字符串里的 tests/debug 绝对路径换成 `<dir>`，其后的路径分隔符统一为 `/`；
@@ -20,8 +20,8 @@ proto 进程没发终结事件（exited、trapped、compile_failed）就以非�
   - DAP 每一步先记应答、再按到达顺序记事件；步骤结束前等 150 ms 无新消息。
 
 用法（仓根执行）：
-  python scripts/debug-baseline.py --taixu zig-out/bin/taixu.exe record   # 重写全部转录
-  python scripts/debug-baseline.py --taixu zig-out/bin/taixu.exe check    # 重录并与已存转录逐字节比较
+  python scripts/debug-baseline.py --taixu <归档实现的 taixu> record   # 重写全部转录
+  python scripts/debug-baseline.py --taixu <归档实现的 taixu> check    # 重录并与已存转录逐字节比较
 可加 `--only 名字[,名字]`。check 有任何不一致时退出码 1。
 """
 
@@ -280,7 +280,7 @@ def run_proto(taixu, case, norm):
                     break
                 send({'cmd': 'inspect', 'frame': idx, 'slot': slot})
         elif op == 'inspect_named':
-            # Native sessions only (round 6 step 6c-4c): the slots of the frame that carry a variable name.
+            # Native sessions only (round 6 step): the slots of the frame that carry a variable name.
             frames = state['frames'] or []
             idx = item['frame']
             slots = frames[idx]['slots'] if 0 <= idx < len(frames) else []
@@ -451,7 +451,7 @@ RUNNERS = {'proto': run_proto, 'dap': run_dap, 'mcp': run_mcp}
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    ap.add_argument('--taixu', required=True, help='Zig CLI（zig-out/bin/taixu(.exe)）')
+    ap.add_argument('--taixu', required=True, help='录制用的归档实现的 taixu')
     ap.add_argument('--only', default='', help='逗号分隔的用例名')
     ap.add_argument('mode', choices=('record', 'check'))
     a = ap.parse_args()

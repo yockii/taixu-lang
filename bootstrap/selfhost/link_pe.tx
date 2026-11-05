@@ -1,5 +1,5 @@
-// link_pe.tx —— Windows PE 直发链接器的 .tx 承接（V0.50-S5-① 批 D 后半；BOOT-47；
-// D102 §一——src/tools/aot/direct_link.zig buildExeAssembled/emitPe 的同构移植）。
+// link_pe.tx —— Windows PE 直发链接器的 .tx 实现
+// （不经外部链接器）。
 //
 // 职责：AsmImage（经 assemble.tx 导出访问器）＋shim blob COFF（readFile 字节）
 // → gc-sections 裁剪 → 宿主三节布局 → 导入面（IBN/ILT/IAT/DLL 名/描述符）→
@@ -15,6 +15,11 @@ import { asImgText, asImgRdata, asImgData, asImgBssSize, asImgAlignPow, asFailed
 
 import { BinaryName, rawName, rawNameOf, rawNameEmpty, rawNameNone, rawNameSize, rawNameByte, rawNamePrefix, rawNameEqual, rawNameLess, rawNameText, rawNameTextHash, rawNameEqualText } from "./binary_name";
 import { linkMapSymbolsEnabled, linkMapAddPlacement, linkMapEnabled, linkMapBegin, linkMapFail, linkMapDone, linkMapLayout, linkMapAddSection, linkMapRow, linkMapInput, linkMapAdd, linkMapSynthetic } from "./link_map_data";
+import { peLinkerMajor, peLinkerMinor, peFinish, peBaseRelocations } from "./pe_image";
+import { NativeFunctionImage, NativeFunction } from "./native_function_data";
+import { nativeObjectFunctions } from "./native_function_object";
+import { x64Unwind } from "./pe_unwind_x64";
+import { T_X64_WINDOWS } from "./target";
 
 function dec(v: int): string {
     return toStr(v);
@@ -24,10 +29,17 @@ function dec(v: int): string {
 // §0 常量（direct_link §2 同构）
 // ============================================================================
 
-const IMAGE_BASE: int = 0x400000;
+// 首选基址 0x140000000（同 Go、Rust、Zig、gcc 与 aarch64-windows）；带 .reloc，加载器按 ASLR 另选基址时逐处改写绝对地址。
+// 代码一律 RIP 相对寻址、不出 32 位绝对地址（ADDR32／ADDR32NB 拒绝），基址在 4 GiB 以上无截断。
+const IMAGE_BASE: int = 0x140000000;
 const SEC_ALIGN: int = 0x1000;
 const FILE_ALIGN: int = 0x200;
 const STACK_RESERVE: int = 0x800000;
+// 堆提交 4 KiB（同 Go、Rust、Zig、gcc 的参照产物）。
+const HEAP_COMMIT: int = 0x1000;
+// HIGH_ENTROPY_VA（0x20）｜DYNAMIC_BASE（0x40，ASLR）｜NX_COMPAT（0x100，DEP：运行时申请的内存一律 PAGE_READWRITE，代码只在映像
+// .text 里）｜TERMINAL_SERVER_AWARE（0x8000）——同 Go、Rust、Zig 与 aarch64-windows。
+const DLL_CHARACTERISTICS: int = 0x8160;
 const HEADERS_OFF: int = 0x400;
 // 映像（含虚拟尾部）上限：代码一律用 32 位相对重定位（small code model），超过 2 GiB 即够不着。
 const IMAGE_LIMIT: int = 2147483648;
@@ -276,7 +288,7 @@ function parseCoff(data: Bytes, originObject: int): Ref<CoffObj> {
             listSet(isAux, i + k, 1);
             k = k + 1;
         }
-        i = i + 1 + numaux; // zig `: (i += 1)` 基线步进＋numaux——漏 1 即死循环
+        i = i + 1 + numaux; // 基线步进 1＋numaux——漏 1 即死循环
     }
     i = 0;
     while (i < nsyms) {
@@ -301,7 +313,7 @@ function parseCoff(data: Bytes, originObject: int): Ref<CoffObj> {
             nameSpan = coffShortName(data, e);
         }
         if (!nameSpan.ok) { lkFail("BadImage"); return obj; }
-        // secno＝i16 两字节（zig readInt(i16)）——4 字节误读把 storage_class/
+        // secno＝i16 两字节——4 字节误读把 storage_class/
         // numaux 拼进高位，secno 全错（gc/宇宙注册双失败）。
         let secno = rdU16(data, e + 12);
         if (secno >= 32768) { secno = secno - 65536; }
@@ -464,6 +476,12 @@ export function lkClearImportDlls(): void {
     while (listLen(dllOverDlls) > 0) { listRemoveAt(dllOverDlls, listLen(dllOverDlls) - 1); }
 }
 
+/// 导入符号所属的 DLL（同下面 dllOfL：driver 登记的 FFI 库优先，其余按名表，缺省 kernel32）；aarch64-windows 的写出器
+/// （link_pe_objects.tx）用。
+export function lkDllOf(name: string): string { return dllOfL(rawNameOf(name)); }
+/// 太虚自带的运行时算法名（OWNED_RUNTIME_SYMBOLS）：不是 DLL 的导入，没有提供者即链接失败（同下面的 UnresolvedRuntimeSymbol）。
+export function lkOwnedRuntime(name: string): bool { return exactInList(rawNameOf(name), OWNED_RUNTIME_SYMBOLS) == 1; }
+
 function dllOfL(name: Ref<BinaryName>): string {
     let ov = 0;
     while (ov < listLen(dllOverNames)) {
@@ -545,8 +563,8 @@ const uniNames: List<string> = listNew();
 const uniVa: List<int> = listNew();
 
 // COFF 外部定义名（EXTERNAL/2）→首次定义的符号下标；先到先得。STATIC(3)
-// 局部定义不登记——跨对象查名只认外部定义（作用域修复见
-// docs/design/v052-coff-symbol-scope-20261009.md）。
+// 局部定义不登记——跨对象查名只认外部定义。
+// 作用域修复的经过另有文档。
 const SI_BUCKETS: int = 65536;
 const siHead: List<int> = listNew();
 const siKeys: List<Ref<BinaryName>> = listNew();
@@ -643,12 +661,45 @@ let exeBytes: Bytes = bytesNew(0);
 // linkExe：装配态（assembleText 已跑）＋shim blob 字节 → PE 字节写入 exeBytes。
 // 返回 0 成功；非 0＝结构化失败（lkMissing 携带）。
 export function linkExe(shimObj: Bytes, guiSubsystem: int): int {
-    return linkExeObjects(shimObj, guiSubsystem, listNew());
+    return linkExeObjects(shimObj, guiSubsystem, listNew(), new NativeFunctionImage { ok: false, error: "", isa: "", functions: listNew() });
+}
+
+// 一个函数的展开信息：在合成 .text 里的起止偏移、UNWIND_INFO 及其在 .rdata 里的偏移。
+struct UnwindRow { begin: int, end: int, xdata: Bytes, at: int }
+
+// 按起点升序的稳定归并排序（.pdata）。
+function sortUnwind(xs: List<Ref<UnwindRow>>): List<Ref<UnwindRow>> {
+    let src = xs; const n = listLen(xs); let width = 1;
+    const missing = new UnwindRow { begin: 0, end: 0, xdata: bytesNew(0), at: 0 };
+    while (width < n) {
+        const dst: List<Ref<UnwindRow>> = listNew(); let lo = 0;
+        while (lo < n) {
+            let i = lo; let mid = lo + width; if (mid > n) { mid = n; }
+            let j = mid; let hi = lo + 2 * width; if (hi > n) { hi = n; }
+            while (i < mid || j < hi) {
+                if (j >= hi || (i < mid && (listGet(src, i) catch missing).begin <= (listGet(src, j) catch missing).begin)) { listPush(dst, listGet(src, i) catch missing); i = i + 1; }
+                else { listPush(dst, listGet(src, j) catch missing); j = j + 1; }
+            }
+            lo = hi;
+        }
+        src = dst; width = width * 2;
+    }
+    return src;
+}
+
+// 有帧事件、按平台约定调用的函数才有展开信息；叶函数与边界由系统按叶函数处理。
+function unwindRow(rows: List<Ref<UnwindRow>>, f: Ref<NativeFunction>, code: Bytes, base: int): string {
+    if (f.stackModel != "fixed-call" || listLen(f.events) == 0) { return ""; }
+    const u = x64Unwind(f, code);
+    if (!u.ok) { return "Unwind:" + f.linkName + ":" + u.error; }
+    listPush(rows, new UnwindRow { begin: base + f.begin, end: base + f.end, xdata: u.xdata, at: 0 });
+    return "";
 }
 
 // 外部静态对象是冻结执行宿主的字节输入，不参与编译算法代算。
 // 将各对象的节/符号索引重基后交给同一可达性和重定位管线。
-export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: List<Bytes>): int {
+// program：程序函数的目录（驱动在汇编时收集，偏移以程序 .text 为准；ok 为假时程序函数不出展开信息）。
+export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: List<Bytes>, program: Ref<NativeFunctionImage>): int {
     linkMapBegin("x86_64-windows");
     lk_failed = 0;
     lk_missing = "";
@@ -698,8 +749,8 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
     listPush(coffs, co);
 
     // 只登记正节号 EXTERNAL(2) 定义：COFF STATIC(3) 局部符号仅由所在对象的
-    // 重定位符号索引/节号解析，不进跨对象查名（作用域修复
-    // docs/design/v052-coff-symbol-scope-20261009.md）；辅助项/未定义同名项
+    // 重定位符号索引/节号解析，不进跨对象查名（作用域修复）；
+    // 辅助项/未定义同名项
     // 不得遮蔽后面的定义。
     const runtimeProviders: List<Ref<BinaryName>> = listNew();
     let symbolIndex = 0;
@@ -723,15 +774,7 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
         sectionIndex = sectionIndex + 1;
     }
 
-    // 入口桩存在性（assemble 符号面——单次线性扫，非热点面）。
-    let hasEntry = 0;
-    let hi2 = 0;
-    const hn2 = asSymCountL();
-    while (hi2 < hn2) {
-        if (asSymNameL(hi2) == "__tx_entry") { hasEntry = 1; break; }
-        hi2 = hi2 + 1;
-    }
-    if (hasEntry == 0) { lkFail("__tx_entry (MissingEntryStub)"); return 1; }
+    // 进程入口 __tx_entry 由内核提供（PE 规范化 P3，原先是程序映像里的入口桩）；定址时查不到即失败。
 
     // —— blob 载荷节收集 ——
     const allSecs: List<Ref<BlobSec>> = listNew();
@@ -774,7 +817,7 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
         }
         si2 = si2 + 1;
     }
-    const reachSecs: List<Ref<BlobSec>> = listNew(); // BFS 弹出序＝zig reach_secs（节合并序的决定面——COFF 序过滤会整体错位 rel32）
+    const reachSecs: List<Ref<BlobSec>> = listNew(); // BFS 弹出序＝节合并序（COFF 序过滤会整体错位 rel32）
     while (listLen(queue) > 0) {
         const cur = listGet(queue, listLen(queue) - 1) catch 0;
         listRemoveAt(queue, listLen(queue) - 1);
@@ -1014,7 +1057,7 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
     const ndll = listLen(dllNames);
     const extDll: List<int> = listNew();
     const extIdxInDll: List<int> = listNew();
-    const counts: List<int> = listNew(); // 每 DLL 独立计数（zig counts 数组同构——
+    const counts: List<int> = listNew(); // 每 DLL 独立计数（单独数组——
     // 预填进 extIdxInDll 会把下标整体错位 ndll）
     z = 0;
     while (z < ndll) { listPush(counts, 0); z = z + 1; }
@@ -1090,6 +1133,45 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
         z = 0;
         while (z < 40) { bytesPush(rdata, 0); z = z + 1; }
     }
+    // 展开信息（PE 规范化 P3）：程序函数（偏移以合成 .text 的开头为准）与各对象 .txfn 里带帧事件的函数各一份 UNWIND_INFO（与位置
+    // 无关）；.pdata、.xdata 各成一节，接在 .data 之后（同 gcc、Go），展开信息的有无不挪动代码与数据的布局。对象的节被裁掉时它的
+    // 函数不出。
+    const unwind: List<Ref<UnwindRow>> = listNew();
+    if (program.ok) {
+        for (f in program.functions) {
+            const problem = unwindRow(unwind, f, text, 0);
+            if (len(problem) > 0) { lkFail(problem); return 1; }
+        }
+    }
+    let uo = 0;
+    while (uo <= listLen(objectBytes)) {
+        let objectData = shimObj;
+        if (uo > 0) { objectData = listGet(objectBytes, uo - 1) catch bytesNew(0); }
+        const meta = nativeObjectFunctions(objectData, T_X64_WINDOWS);
+        if (!meta.image.ok) { lkFail("UnwindMetadata:" + meta.image.error); return 1; }
+        if (meta.present) {
+            let m = 0;
+            while (m < listLen(co.sections)) {
+                const cs = listGet(co.sections, m) catch dummyCoffSection();
+                if (cs.originObject == uo && cs.originIndex == meta.inputSection) { break; }
+                m = m + 1;
+            }
+            const reach = listGet(reachByCoff, m) catch -1;
+            if (reach >= 0) {
+                const bs = listGet(reachSecs, reach) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
+                const cs = listGet(co.sections, m) catch dummyCoffSection();
+                if (bs.kind != 0) { lkFail("UnwindMetadataNotCode"); return 1; }
+                const code = bytesSlice(cs.rawSource, cs.rawAt, cs.byteCount);
+                for (f in meta.image.functions) {
+                    const problem = unwindRow(unwind, f, code, bs.off);
+                    if (len(problem) > 0) { lkFail(problem); return 1; }
+                }
+            }
+        }
+        uo = uo + 1;
+    }
+    const xdata: Bytes = bytesNew(0);
+    for (row in unwind) { row.at = bytesLen(xdata); bytesAppend(xdata, row.xdata); }
 
     // 虚拟尾部：先是对象的 .bss（按组内顺序与各自对齐），再是程序自己的 BSS。映像总长以 2 GiB 为界——代码一律用
     // 32 位相对重定位（small code model），超出即够不着；尺寸字段都是 32 位，累加不会溢出。
@@ -1120,6 +1202,8 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
     const textVa = imageBase + textRva;
     const rdataVa = imageBase + rdataRva;
     const dataVa = imageBase + dataRva;
+    // 写了绝对地址（VA）的位置（RVA），每处一条基址重定位：程序映像的 addr64 回填、内核 COFF 的 ADDR64、__imp_ 槽、自建 TLS 目录的四个 VA。
+    const absRvas: List<int> = listNew();
     z = 0;
     while (z < nfn) {
         listSet(ibnRva, z, rdataRva + (listGet(ibnOff, z) catch 0));
@@ -1200,6 +1284,7 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
             writeI32At(buf, fxAt, v);
         } else { // addr64
             writeI64At(buf, fxAt, target + fxAddend);
+            listPush(absRvas, siteVa - imageBase);
         }
         fi = fi + 1;
     }
@@ -1259,6 +1344,7 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
             } else if (r.typ == 1) { // ADDR64
                 const init = readI64At(buf, bs.off + r.va);
                 writeI64At(buf, bs.off + r.va, wrapAdd(init, tva));
+                listPush(absRvas, siteVa - imageBase);
             } else if (r.typ == 11) { // SECREL32
                 if (symSecrelOff < 0 || tlsMin < 0) { lkFail("UnsupportedReloc"); return 1; }
                 const v = symSecrelOff - tlsMin;
@@ -1293,6 +1379,7 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
         if (tva < 0) { tva = uniGetSpan(rawNamePrefix(nm, "__thunk_")); }
         if (tva < 0) { lkFail(rawNameText(nm)); return 1; }
         writeI64At(data, listGet(impOffs, z) catch 0, tva);
+        listPush(absRvas, dataRva + (listGet(impOffs, z) catch 0));
         z = z + 1;
     }
 
@@ -1345,12 +1432,13 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
         writeI64At(rdata, o + 8, dataVa + tlsMax);
         writeI64At(rdata, o + 16, dataVa + tlsIndexOff);
         writeI64At(rdata, o + 24, rdataVa + tlsCbOff);
+        listPush(absRvas, rdataRva + o); listPush(absRvas, rdataRva + o + 8); listPush(absRvas, rdataRva + o + 16); listPush(absRvas, rdataRva + o + 24);
         writeU32At(rdata, o + 32, 0);
         writeU32At(rdata, o + 36, 0);
         tlsRva = rdataRva + tlsDirOff;
     }
-    // NRT 内核自带 IMAGE_TLS_DIRECTORY64（符号 __tx_tls_directory；模板、索引槽与回调表都在内核里，
-    // 线程设计 §十二）：只把数据目录 9 指向它。
+    // NRT 内核自带 IMAGE_TLS_DIRECTORY64（符号 __tx_tls_directory；模板、索引槽与回调表都在内核里）：
+    // 只把数据目录 9 指向它。
     if (tlsRva == 0) {
         const tlsDirVa = uniGet("__tx_tls_directory");
         if (tlsDirVa >= 0) { tlsRva = tlsDirVa - imageBase; }
@@ -1360,7 +1448,30 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
     const entryVa = uniGet("__tx_entry");
     if (entryVa < 0) { lkFail("__tx_entry"); return 1; }
     const entryRva = entryVa - imageBase;
-    const imageSize = dataRva + alignUpL(dataVirtualSize, sectionAlignment);
+    // 基址重定位（.reloc，接在 .data 之后；没有 .data 时接在 .rdata 之后）：绝对地址只许落在有文件内容的字节上——bss 没有初值可改写。
+    for (rva in absRvas) {
+        const inText = rva >= textRva && rva + 8 <= textRva + bytesLen(text);
+        const inRdata = rva >= rdataRva && rva + 8 <= rdataRva + bytesLen(rdata);
+        const inData = rva >= dataRva && rva + 8 <= dataRva + bytesLen(data);
+        if (!inText && !inRdata && !inData) { lkFail("AbsoluteRelocationOutsideImage"); return 1; }
+    }
+    const reloc: Bytes = bytesNew(0);
+    if (peBaseRelocations(absRvas, reloc) != 0) { lkFail("DuplicateBaseRelocation"); return 1; }
+    // .pdata（RUNTIME_FUNCTION：起点、终点、UNWIND_INFO 的 RVA，按起点升序、互不重叠、都在 .text 里）、.xdata 依次接在 .data 之后、
+    // .reloc 之前。
+    const pdataRva = dataRva + alignUpL(dataVirtualSize, sectionAlignment);
+    const xdataRva = pdataRva + alignUpL(12 * listLen(unwind), sectionAlignment);
+    const pdata: Bytes = bytesNew(0);
+    let previousEnd = 0;
+    for (row in sortUnwind(unwind)) {
+        if (row.begin < previousEnd || row.end <= row.begin || row.end > bytesLen(text)) { lkFail("UnwindFunctionOutsideText"); return 1; }
+        w32L(pdata, textRva + row.begin);
+        w32L(pdata, textRva + row.end);
+        w32L(pdata, xdataRva + row.at);
+        previousEnd = row.end;
+    }
+    const relocRva = xdataRva + alignUpL(bytesLen(xdata), sectionAlignment);
+    const imageSize = relocRva + alignUpL(bytesLen(reloc), sectionAlignment);
     if (dataVirtualSize > 4294967295 || imageSize > 4294967295) { lkFail("ProgramStorageImageOverflow"); return 1; }
     if (imageSize > IMAGE_LIMIT) { lkFail("ImageTooLarge"); return 1; }
 
@@ -1386,7 +1497,9 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
     bytesPush(hdr, 80); bytesPush(hdr, 69); bytesPush(hdr, 0); bytesPush(hdr, 0); // PE\0\0
     w16L(hdr, 0x8664);
     let sectionCount = 2;
-    if (dataVirtualSize > 0) { sectionCount = 3; }
+    if (dataVirtualSize > 0) { sectionCount = sectionCount + 1; }
+    if (bytesLen(pdata) > 0) { sectionCount = sectionCount + 2; }
+    if (bytesLen(reloc) > 0) { sectionCount = sectionCount + 1; }
     w16L(hdr, sectionCount);
     w32L(hdr, 0);
     w32L(hdr, 0);
@@ -1394,33 +1507,35 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
     w16L(hdr, 240);
     w16L(hdr, 0x0022);
     w16L(hdr, 0x20B);
-    bytesPush(hdr, 0);
-    bytesPush(hdr, 0);
-    w32L(hdr, bytesLen(text) + bytesLen(rdata) + bytesLen(data));
+    // 链接器版本、各类节的大小合计按常规工具链填实值（PE 规范化 P1，pe_image.tx）：SizeOfCode／SizeOfInitializedData 是代码节／
+    // 已初始化数据节的文件大小（按文件对齐）之和；bss 在 .data 的文件内容之后、不单列一节，SizeOfUninitializedData 为 0（同 lld、MSVC）。
+    bytesPush(hdr, peLinkerMajor());
+    bytesPush(hdr, peLinkerMinor());
+    w32L(hdr, alignUpL(bytesLen(text), FILE_ALIGN));
+    w32L(hdr, alignUpL(bytesLen(rdata), FILE_ALIGN) + alignUpL(bytesLen(data), FILE_ALIGN) + alignUpL(bytesLen(pdata), FILE_ALIGN) + alignUpL(bytesLen(xdata), FILE_ALIGN) + alignUpL(bytesLen(reloc), FILE_ALIGN));
     w32L(hdr, 0);
-    w32L(hdr, dataVirtualSize - bytesLen(data));
     w32L(hdr, entryRva);
     w32L(hdr, textRva);
     w64L(hdr, imageBase);
     w32L(hdr, sectionAlignment);
     w32L(hdr, FILE_ALIGN);
-    w16L(hdr, 6);
+    w16L(hdr, 6); // 系统版本 6.0
     w16L(hdr, 0);
-    w16L(hdr, 6);
+    w16L(hdr, 0); // 映像版本 0.0（程序自己的版本号，常规工具链缺省为 0）
     w16L(hdr, 0);
-    w32L(hdr, 6); // Win32VersionValue＝6（硬发现③）
-    bytesPush(hdr, 0); bytesPush(hdr, 0); bytesPush(hdr, 0); bytesPush(hdr, 0);
+    w32L(hdr, 6); // 子系统版本 6.0（硬发现③）
+    bytesPush(hdr, 0); bytesPush(hdr, 0); bytesPush(hdr, 0); bytesPush(hdr, 0); // Win32VersionValue
     w32L(hdr, imageSize); // SizeOfImage@56（硬发现②）
     w32L(hdr, HEADERS_OFF);
-    w32L(hdr, 0);
+    w32L(hdr, 0); // CheckSum：peFinish 填
     let subsystem = 3;
     if (guiSubsystem == 1) { subsystem = 2; }
     w16L(hdr, subsystem);
-    w16L(hdr, 0);
+    w16L(hdr, DLL_CHARACTERISTICS);
     w64L(hdr, STACK_RESERVE);
     w64L(hdr, 0x10000);
     w64L(hdr, 0x100000);
-    w64L(hdr, 0);
+    w64L(hdr, HEAP_COMMIT);
     w32L(hdr, 0);
     w32L(hdr, 16);
     let d2 = 0;
@@ -1428,6 +1543,12 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
         if (d2 == 1) {
             w32L(hdr, rdataRva + descOff);
             w32L(hdr, (ndll + 1) * 20);
+        } else if (d2 == 3 && bytesLen(pdata) > 0) {
+            w32L(hdr, pdataRva);
+            w32L(hdr, bytesLen(pdata));
+        } else if (d2 == 5 && bytesLen(reloc) > 0) {
+            w32L(hdr, relocRva);
+            w32L(hdr, bytesLen(reloc));
         } else if (d2 == 9 && tlsRva != 0) {
             w32L(hdr, tlsRva);
             w32L(hdr, 40);
@@ -1445,6 +1566,14 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
         if (bytesLen(data) > 0) { dataRawAt = HEADERS_OFF + alignUpL(bytesLen(text), FILE_ALIGN) + alignUpL(bytesLen(rdata), FILE_ALIGN); }
         secHdr(hdr, ".data\0\0\0", dataVirtualSize, dataRva, alignUpL(bytesLen(data), FILE_ALIGN), dataRawAt, 0xC0000040);
     }
+    const pdataRawAt = HEADERS_OFF + alignUpL(bytesLen(text), FILE_ALIGN) + alignUpL(bytesLen(rdata), FILE_ALIGN) + alignUpL(bytesLen(data), FILE_ALIGN);
+    const xdataRawAt = pdataRawAt + alignUpL(bytesLen(pdata), FILE_ALIGN);
+    if (bytesLen(pdata) > 0) {
+        secHdr(hdr, ".pdata\0\0", bytesLen(pdata), pdataRva, alignUpL(bytesLen(pdata), FILE_ALIGN), pdataRawAt, 0x40000040);
+        secHdr(hdr, ".xdata\0\0", bytesLen(xdata), xdataRva, alignUpL(bytesLen(xdata), FILE_ALIGN), xdataRawAt, 0x40000040);
+    }
+    const relocRawAt = xdataRawAt + alignUpL(bytesLen(xdata), FILE_ALIGN);
+    if (bytesLen(reloc) > 0) { secHdr(hdr, ".reloc\0\0", bytesLen(reloc), relocRva, alignUpL(bytesLen(reloc), FILE_ALIGN), relocRawAt, 0x42000040); }
 
     // 落位。
     bytesAppend(exeBytes, hdr);
@@ -1454,7 +1583,14 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
     bytesAppend(exeBytes, rdata);
     padTo(exeBytes, HEADERS_OFF + alignUpL(bytesLen(text), FILE_ALIGN) + alignUpL(bytesLen(rdata), FILE_ALIGN));
     bytesAppend(exeBytes, data);
-    padTo(exeBytes, HEADERS_OFF + alignUpL(bytesLen(text), FILE_ALIGN) + alignUpL(bytesLen(rdata), FILE_ALIGN) + alignUpL(bytesLen(data), FILE_ALIGN));
+    padTo(exeBytes, pdataRawAt);
+    bytesAppend(exeBytes, pdata);
+    padTo(exeBytes, xdataRawAt);
+    bytesAppend(exeBytes, xdata);
+    padTo(exeBytes, relocRawAt);
+    bytesAppend(exeBytes, reloc);
+    padTo(exeBytes, relocRawAt + alignUpL(bytesLen(reloc), FILE_ALIGN));
+    peFinish(exeBytes);
     if (linkMapEnabled()) { collectPeMap(co, reachByCoff, reachSecs, textVa, rdataVa, dataVa, programBssOff); linkMapDone(); }
     return 0;
 }

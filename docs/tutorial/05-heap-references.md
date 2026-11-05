@@ -30,10 +30,10 @@ v = new Counter { hits: 55 };                      // 旧目标最后一个强�
 
 操作走内建函数：`listNew/listPush/listPop/listGet/listSet/listLen/
 listInsert/listRemoveAt`；也可用方法写法（`xs.push(v)` 等价于
-`listPush(xs, v)`）。`listGet`/`listPop` 越界或空表得 `None`，`listSet`/
-`listInsert`/`listRemoveAt` 越界即运行期错误。元素可以是标量、`string`、
+`listPush(xs, v)`）。`listGet`/`listPop`/`listSet`/`listInsert`/`listRemoveAt`
+越界（空表）即运行期错误；可能越界时用 `listTryGet`/`listTryPop`，越界或空表得 `None`。元素可以是标量、`string`、
 struct/enum（存取都按值拷贝）、`Ref`/`Weak`/`List`、函数值、`Future` 等；
-`T?`、`T | Error` 不能直接作元素。迭代顺序恒等于插入顺序——可预期、可在
+`T?` 可以作元素，`T | Error` 不能直接作元素。迭代顺序恒等于插入顺序——可预期、可在
 测试中断言。
 
 实跑输出（05 样例）：

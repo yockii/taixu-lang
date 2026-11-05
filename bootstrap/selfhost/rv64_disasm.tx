@@ -1,0 +1,254 @@
+// RISC-V RV64G 指令表与反汇编：一个 32 位指令字译成一行文本。
+// - 指令表是本子集的唯一清单：助记符、操作码（引用 rv64_encode 的常量）、格式、操作数的寄存器类别与尾部文本（舍入方式 rtz）。
+//   编码表的生成（scripts/rv64_encodings.tx）、核对探针与反汇编都从这里取指令，操作码只在 rv64_encode 写一处。
+// - 文本与 tests/rv64/encodings.txt 的汇编列逐字相同：寄存器写 psABI 的角色名（a0、t0、s0、fa0），立即数写十进制，读写写
+//   偏移(基址)，跳转目标写相对本条指令的 .+N／.-N（GNU as 把裸数字当绝对地址，两家对 . 的写法一致）；fence 写 iorw 字母；
+//   不写别名（fsgnj.d 两源相同也照写，不写 fmv.d）。
+// - 严格：按固定位认出指令、取出字段，再交给同一个编码函数重编，须与原字逐位相同才出文本；认不出的字一律得 .inst 0x%08x，不猜。
+import { RV64_F_R, RV64_F_R2, RV64_F_I, RV64_F_LOAD, RV64_F_S, RV64_F_B, RV64_F_U, RV64_F_J, RV64_F_SH6, RV64_F_SH5, RV64_F_AMO, RV64_F_LR, RV64_F_FENCE, RV64_F_NONE } from "./rv64_encode";
+import { rv64R, rv64R2, rv64I, rv64S, rv64B, rv64U, rv64J, rv64Shift, rv64Amo, rv64Lr, rv64Fence } from "./rv64_encode";
+import { RV64_ADD, RV64_SUB, RV64_SLL, RV64_SLT, RV64_SLTU, RV64_XOR, RV64_SRL, RV64_SRA, RV64_OR, RV64_AND } from "./rv64_encode";
+import { RV64_MUL, RV64_MULH, RV64_MULHSU, RV64_MULHU, RV64_DIV, RV64_DIVU, RV64_REM, RV64_REMU } from "./rv64_encode";
+import { RV64_ADDW, RV64_SUBW, RV64_SLLW, RV64_SRLW, RV64_SRAW, RV64_MULW, RV64_DIVW, RV64_DIVUW, RV64_REMW, RV64_REMUW } from "./rv64_encode";
+import { RV64_ADDI, RV64_SLTI, RV64_SLTIU, RV64_XORI, RV64_ORI, RV64_ANDI, RV64_SLLI, RV64_SRLI, RV64_SRAI } from "./rv64_encode";
+import { RV64_ADDIW, RV64_SLLIW, RV64_SRLIW, RV64_SRAIW } from "./rv64_encode";
+import { RV64_LB, RV64_LH, RV64_LW, RV64_LD, RV64_LBU, RV64_LHU, RV64_LWU, RV64_FLW, RV64_FLD, RV64_SB, RV64_SH, RV64_SW, RV64_SD, RV64_FSW, RV64_FSD } from "./rv64_encode";
+import { RV64_BEQ, RV64_BNE, RV64_BLT, RV64_BGE, RV64_BLTU, RV64_BGEU, RV64_JALR, RV64_JAL, RV64_LUI, RV64_AUIPC } from "./rv64_encode";
+import { RV64_ECALL, RV64_EBREAK, RV64_FENCE, RV64_AQ, RV64_RL, RV64_LR_W, RV64_LR_D, RV64_SC_W, RV64_SC_D, RV64_AMOSWAP_W, RV64_AMOSWAP_D, RV64_AMOADD_W, RV64_AMOADD_D } from "./rv64_encode";
+import { RV64_FADD_D, RV64_FSUB_D, RV64_FMUL_D, RV64_FDIV_D, RV64_FSQRT_D, RV64_FSGNJ_D, RV64_FSGNJN_D, RV64_FSGNJX_D, RV64_FMIN_D, RV64_FMAX_D } from "./rv64_encode";
+import { RV64_FCVT_S_D, RV64_FCVT_D_S, RV64_FEQ_D, RV64_FLT_D, RV64_FLE_D, RV64_FCVT_L_D, RV64_FCVT_D_L } from "./rv64_encode";
+import { RV64_FMV_X_D, RV64_FMV_D_X, RV64_FMV_X_W, RV64_FMV_W_X, RV64_FCLASS_D } from "./rv64_encode";
+
+export struct Rv64Inst {
+    name: string,
+    op: int,
+    fmt: int,
+    // 操作数的寄存器类别，按文本次序：g 通用、f 浮点（只列寄存器操作数）。
+    cls: string,
+    // 操作数之后的固定文本（fcvt.l.d 的 ", rtz"），一般为空。
+    tail: string,
+}
+
+let table: List<Ref<Rv64Inst>> = listNew();
+
+function add(name: string, op: int, fmt: int, cls: string): void { listPush(table, new Rv64Inst { name: name, op: op, fmt: fmt, cls: cls, tail: "" }); }
+function addTail(name: string, op: int, fmt: int, cls: string, tail: string): void { listPush(table, new Rv64Inst { name: name, op: op, fmt: fmt, cls: cls, tail: tail }); }
+// 原子的四种序：无、.aq、.rl、.aqrl。
+function addOrdered(name: string, op: int, fmt: int, cls: string): void {
+    add(name, op, fmt, cls);
+    add(name + ".aq", op | RV64_AQ, fmt, cls);
+    add(name + ".rl", op | RV64_RL, fmt, cls);
+    add(name + ".aqrl", op | RV64_AQ | RV64_RL, fmt, cls);
+}
+
+function build(): void {
+    if (listLen(table) > 0) { return; }
+    add("add", RV64_ADD, RV64_F_R, "ggg"); add("sub", RV64_SUB, RV64_F_R, "ggg");
+    add("sll", RV64_SLL, RV64_F_R, "ggg"); add("slt", RV64_SLT, RV64_F_R, "ggg"); add("sltu", RV64_SLTU, RV64_F_R, "ggg");
+    add("xor", RV64_XOR, RV64_F_R, "ggg"); add("srl", RV64_SRL, RV64_F_R, "ggg"); add("sra", RV64_SRA, RV64_F_R, "ggg");
+    add("or", RV64_OR, RV64_F_R, "ggg"); add("and", RV64_AND, RV64_F_R, "ggg");
+    add("mul", RV64_MUL, RV64_F_R, "ggg"); add("mulh", RV64_MULH, RV64_F_R, "ggg"); add("mulhsu", RV64_MULHSU, RV64_F_R, "ggg");
+    add("mulhu", RV64_MULHU, RV64_F_R, "ggg"); add("div", RV64_DIV, RV64_F_R, "ggg"); add("divu", RV64_DIVU, RV64_F_R, "ggg");
+    add("rem", RV64_REM, RV64_F_R, "ggg"); add("remu", RV64_REMU, RV64_F_R, "ggg");
+    add("addw", RV64_ADDW, RV64_F_R, "ggg"); add("subw", RV64_SUBW, RV64_F_R, "ggg"); add("sllw", RV64_SLLW, RV64_F_R, "ggg");
+    add("srlw", RV64_SRLW, RV64_F_R, "ggg"); add("sraw", RV64_SRAW, RV64_F_R, "ggg"); add("mulw", RV64_MULW, RV64_F_R, "ggg");
+    add("divw", RV64_DIVW, RV64_F_R, "ggg"); add("divuw", RV64_DIVUW, RV64_F_R, "ggg"); add("remw", RV64_REMW, RV64_F_R, "ggg");
+    add("remuw", RV64_REMUW, RV64_F_R, "ggg");
+    add("addi", RV64_ADDI, RV64_F_I, "gg"); add("slti", RV64_SLTI, RV64_F_I, "gg"); add("sltiu", RV64_SLTIU, RV64_F_I, "gg");
+    add("xori", RV64_XORI, RV64_F_I, "gg"); add("ori", RV64_ORI, RV64_F_I, "gg"); add("andi", RV64_ANDI, RV64_F_I, "gg");
+    add("addiw", RV64_ADDIW, RV64_F_I, "gg");
+    add("slli", RV64_SLLI, RV64_F_SH6, "gg"); add("srli", RV64_SRLI, RV64_F_SH6, "gg"); add("srai", RV64_SRAI, RV64_F_SH6, "gg");
+    add("slliw", RV64_SLLIW, RV64_F_SH5, "gg"); add("srliw", RV64_SRLIW, RV64_F_SH5, "gg"); add("sraiw", RV64_SRAIW, RV64_F_SH5, "gg");
+    add("lb", RV64_LB, RV64_F_LOAD, "gg"); add("lh", RV64_LH, RV64_F_LOAD, "gg"); add("lw", RV64_LW, RV64_F_LOAD, "gg");
+    add("ld", RV64_LD, RV64_F_LOAD, "gg"); add("lbu", RV64_LBU, RV64_F_LOAD, "gg"); add("lhu", RV64_LHU, RV64_F_LOAD, "gg");
+    add("lwu", RV64_LWU, RV64_F_LOAD, "gg"); add("flw", RV64_FLW, RV64_F_LOAD, "fg"); add("fld", RV64_FLD, RV64_F_LOAD, "fg");
+    add("jalr", RV64_JALR, RV64_F_LOAD, "gg");
+    add("sb", RV64_SB, RV64_F_S, "gg"); add("sh", RV64_SH, RV64_F_S, "gg"); add("sw", RV64_SW, RV64_F_S, "gg");
+    add("sd", RV64_SD, RV64_F_S, "gg"); add("fsw", RV64_FSW, RV64_F_S, "fg"); add("fsd", RV64_FSD, RV64_F_S, "fg");
+    add("beq", RV64_BEQ, RV64_F_B, "gg"); add("bne", RV64_BNE, RV64_F_B, "gg"); add("blt", RV64_BLT, RV64_F_B, "gg");
+    add("bge", RV64_BGE, RV64_F_B, "gg"); add("bltu", RV64_BLTU, RV64_F_B, "gg"); add("bgeu", RV64_BGEU, RV64_F_B, "gg");
+    add("jal", RV64_JAL, RV64_F_J, "g"); add("lui", RV64_LUI, RV64_F_U, "g"); add("auipc", RV64_AUIPC, RV64_F_U, "g");
+    add("ecall", RV64_ECALL, RV64_F_NONE, ""); add("ebreak", RV64_EBREAK, RV64_F_NONE, ""); add("fence", RV64_FENCE, RV64_F_FENCE, "");
+    addOrdered("lr.w", RV64_LR_W, RV64_F_LR, "gg"); addOrdered("lr.d", RV64_LR_D, RV64_F_LR, "gg");
+    addOrdered("sc.w", RV64_SC_W, RV64_F_AMO, "ggg"); addOrdered("sc.d", RV64_SC_D, RV64_F_AMO, "ggg");
+    addOrdered("amoswap.w", RV64_AMOSWAP_W, RV64_F_AMO, "ggg"); addOrdered("amoswap.d", RV64_AMOSWAP_D, RV64_F_AMO, "ggg");
+    addOrdered("amoadd.w", RV64_AMOADD_W, RV64_F_AMO, "ggg"); addOrdered("amoadd.d", RV64_AMOADD_D, RV64_F_AMO, "ggg");
+    add("fadd.d", RV64_FADD_D, RV64_F_R, "fff"); add("fsub.d", RV64_FSUB_D, RV64_F_R, "fff");
+    add("fmul.d", RV64_FMUL_D, RV64_F_R, "fff"); add("fdiv.d", RV64_FDIV_D, RV64_F_R, "fff");
+    add("fsgnj.d", RV64_FSGNJ_D, RV64_F_R, "fff"); add("fsgnjn.d", RV64_FSGNJN_D, RV64_F_R, "fff"); add("fsgnjx.d", RV64_FSGNJX_D, RV64_F_R, "fff");
+    add("fmin.d", RV64_FMIN_D, RV64_F_R, "fff"); add("fmax.d", RV64_FMAX_D, RV64_F_R, "fff");
+    add("feq.d", RV64_FEQ_D, RV64_F_R, "gff"); add("flt.d", RV64_FLT_D, RV64_F_R, "gff"); add("fle.d", RV64_FLE_D, RV64_F_R, "gff");
+    add("fsqrt.d", RV64_FSQRT_D, RV64_F_R2, "ff"); add("fcvt.s.d", RV64_FCVT_S_D, RV64_F_R2, "ff"); add("fcvt.d.s", RV64_FCVT_D_S, RV64_F_R2, "ff");
+    addTail("fcvt.l.d", RV64_FCVT_L_D, RV64_F_R2, "gf", ", rtz"); add("fcvt.d.l", RV64_FCVT_D_L, RV64_F_R2, "fg");
+    add("fmv.x.d", RV64_FMV_X_D, RV64_F_R2, "gf"); add("fmv.d.x", RV64_FMV_D_X, RV64_F_R2, "fg");
+    add("fmv.x.w", RV64_FMV_X_W, RV64_F_R2, "gf"); add("fmv.w.x", RV64_FMV_W_X, RV64_F_R2, "fg");
+    add("fclass.d", RV64_FCLASS_D, RV64_F_R2, "gf");
+}
+
+/// 指令表：条数与第 i 条的各项（编码表生成与探针用）。
+export function rv64InstCount(): int { build(); return listLen(table); }
+export function rv64Inst(i: int): Ref<Rv64Inst> { build(); return listGet(table, i) catch new Rv64Inst { name: "", op: 0, fmt: 0, cls: "", tail: "" }; }
+/// 按助记符找指令，找不到得 −1。
+export function rv64InstFind(name: string): int {
+    build();
+    let i = 0;
+    for (e in table) { if (e.name == name) { return i; } i = i + 1; }
+    return -1;
+}
+
+/// 各格式中不属于操作数字段的位（与操作码一起认指令）。
+export function rv64FixedMask(fmt: int): int {
+    if (fmt == RV64_F_R || fmt == RV64_F_SH5 || fmt == RV64_F_AMO) { return 0xfe00707f; }
+    if (fmt == RV64_F_R2 || fmt == RV64_F_LR) { return 0xfff0707f; }
+    if (fmt == RV64_F_SH6) { return 0xfc00707f; }
+    if (fmt == RV64_F_U || fmt == RV64_F_J) { return 0x7f; }
+    if (fmt == RV64_F_FENCE) { return 0xf00fffff; }
+    if (fmt == RV64_F_NONE) { return 0xffffffff; }
+    return 0x707f; // I、LOAD、S、B
+}
+
+/// 按文本次序的字段编码第 i 条指令（字段个数与格式不符得 −1）。字段次序：R rd rs1 rs2；R2 rd rs1；I rd rs1 imm；LOAD rd imm rs1；
+/// S rs2 imm rs1；B rs1 rs2 偏移；U rd imm；J rd 偏移；SH6／SH5 rd rs1 shamt；AMO rd rs2 rs1；LR rd rs1；FENCE pred succ；NONE 无。
+export function rv64EncodeFields(i: int, fs: List<int>): int {
+    const e = rv64Inst(i);
+    const n = listLen(fs);
+    const a = listGet(fs, 0) catch 0;
+    const b = listGet(fs, 1) catch 0;
+    const c = listGet(fs, 2) catch 0;
+    const fmt = e.fmt;
+    if (fmt == RV64_F_R && n == 3) { return rv64R(e.op, a, b, c); }
+    if (fmt == RV64_F_R2 && n == 2) { return rv64R2(e.op, a, b); }
+    if (fmt == RV64_F_I && n == 3) { return rv64I(e.op, a, b, c); }
+    if (fmt == RV64_F_LOAD && n == 3) { return rv64I(e.op, a, c, b); }
+    if (fmt == RV64_F_S && n == 3) { return rv64S(e.op, a, c, b); }
+    if (fmt == RV64_F_B && n == 3) { return rv64B(e.op, a, b, c); }
+    if (fmt == RV64_F_U && n == 2) { return rv64U(e.op, a, b); }
+    if (fmt == RV64_F_J && n == 2) { return rv64J(a, b); }
+    if (fmt == RV64_F_SH6 && n == 3) { return rv64Shift(e.op, a, b, c, 64); }
+    if (fmt == RV64_F_SH5 && n == 3) { return rv64Shift(e.op, a, b, c, 32); }
+    if (fmt == RV64_F_AMO && n == 3) { return rv64Amo(e.op, a, b, c); }
+    if (fmt == RV64_F_LR && n == 2) { return rv64Lr(e.op, a, b); }
+    if (fmt == RV64_F_FENCE && n == 2) { return rv64Fence(a, b); }
+    if (fmt == RV64_F_NONE && n == 0) { return e.op; }
+    return -1;
+}
+
+function bits(w: int, lo: int, n: int): int { return (w >>> lo) & ((1 << n) - 1); }
+function sext(v: int, n: int): int { return (v << (64 - n)) >> (64 - n); }
+
+/// 从指令字按格式取出文本次序的字段（rv64EncodeFields 的逆）。
+function fields(fmt: int, w: int): List<int> {
+    const rd = bits(w, 7, 5);
+    const rs1 = bits(w, 15, 5);
+    const rs2 = bits(w, 20, 5);
+    const immI = sext(bits(w, 20, 12), 12);
+    let out: List<int> = listNew();
+    if (fmt == RV64_F_R || fmt == RV64_F_AMO) {
+        listPush(out, rd);
+        if (fmt == RV64_F_R) { listPush(out, rs1); listPush(out, rs2); } else { listPush(out, rs2); listPush(out, rs1); }
+        return out;
+    }
+    if (fmt == RV64_F_R2 || fmt == RV64_F_LR) { listPush(out, rd); listPush(out, rs1); return out; }
+    if (fmt == RV64_F_I) { listPush(out, rd); listPush(out, rs1); listPush(out, immI); return out; }
+    if (fmt == RV64_F_LOAD) { listPush(out, rd); listPush(out, immI); listPush(out, rs1); return out; }
+    if (fmt == RV64_F_S) { listPush(out, rs2); listPush(out, sext((bits(w, 25, 7) << 5) | bits(w, 7, 5), 12)); listPush(out, rs1); return out; }
+    if (fmt == RV64_F_B) {
+        const v = (bits(w, 31, 1) << 12) | (bits(w, 7, 1) << 11) | (bits(w, 25, 6) << 5) | (bits(w, 8, 4) << 1);
+        listPush(out, rs1); listPush(out, rs2); listPush(out, sext(v, 13));
+        return out;
+    }
+    if (fmt == RV64_F_U) { listPush(out, rd); listPush(out, bits(w, 12, 20)); return out; }
+    if (fmt == RV64_F_J) {
+        const v = (bits(w, 31, 1) << 20) | (bits(w, 12, 8) << 12) | (bits(w, 20, 1) << 11) | (bits(w, 21, 10) << 1);
+        listPush(out, rd); listPush(out, sext(v, 21));
+        return out;
+    }
+    if (fmt == RV64_F_SH6) { listPush(out, rd); listPush(out, rs1); listPush(out, bits(w, 20, 6)); return out; }
+    if (fmt == RV64_F_SH5) { listPush(out, rd); listPush(out, rs1); listPush(out, bits(w, 20, 5)); return out; }
+    if (fmt == RV64_F_FENCE) { listPush(out, bits(w, 24, 4)); listPush(out, bits(w, 20, 4)); return out; }
+    return out;
+}
+
+const GPR: List<string> = strSplit("zero ra sp gp tp t0 t1 t2 s0 s1 a0 a1 a2 a3 a4 a5 a6 a7 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 t3 t4 t5 t6", " ");
+const FPR: List<string> = strSplit("ft0 ft1 ft2 ft3 ft4 ft5 ft6 ft7 fs0 fs1 fa0 fa1 fa2 fa3 fa4 fa5 fa6 fa7 fs2 fs3 fs4 fs5 fs6 fs7 fs8 fs9 fs10 fs11 ft8 ft9 ft10 ft11", " ");
+
+/// 寄存器名：g 通用（a0 等）、f 浮点（fa0 等）。
+export function rv64RegName(cls: string, n: int): string {
+    if (cls == "f") { return listGet(FPR, n) catch "?"; }
+    return listGet(GPR, n) catch "?";
+}
+function clsAt(cls: string, k: int): string {
+    if (k < len(cls)) { return strSub(cls, k, 1); }
+    return "g";
+}
+function rel(off: int): string {
+    if (off < 0) { return ".-" + toStr(-off); }
+    return ".+" + toStr(off);
+}
+// fence 的 iorw 字母。
+function iorw(v: int): string {
+    let s = "";
+    if ((v & 8) != 0) { s = s + "i"; }
+    if ((v & 4) != 0) { s = s + "o"; }
+    if ((v & 2) != 0) { s = s + "r"; }
+    if ((v & 1) != 0) { s = s + "w"; }
+    return s;
+}
+
+/// 第 i 条指令按文本次序的字段写成一行汇编（与编码表的汇编列同一写法）。
+export function rv64FormatFields(i: int, fs: List<int>): string {
+    const e = rv64Inst(i);
+    const a = listGet(fs, 0) catch 0;
+    const b = listGet(fs, 1) catch 0;
+    const c = listGet(fs, 2) catch 0;
+    const r0 = clsAt(e.cls, 0);
+    const r1 = clsAt(e.cls, 1);
+    const r2 = clsAt(e.cls, 2);
+    const fmt = e.fmt;
+    let s = e.name;
+    if (fmt == RV64_F_R) { s = s + " " + rv64RegName(r0, a) + ", " + rv64RegName(r1, b) + ", " + rv64RegName(r2, c); }
+    if (fmt == RV64_F_R2) { s = s + " " + rv64RegName(r0, a) + ", " + rv64RegName(r1, b); }
+    if (fmt == RV64_F_I || fmt == RV64_F_SH6 || fmt == RV64_F_SH5) { s = s + " " + rv64RegName(r0, a) + ", " + rv64RegName(r1, b) + ", " + toStr(c); }
+    if (fmt == RV64_F_LOAD || fmt == RV64_F_S) { s = s + " " + rv64RegName(r0, a) + ", " + toStr(b) + "(" + rv64RegName(r1, c) + ")"; }
+    if (fmt == RV64_F_B) { s = s + " " + rv64RegName(r0, a) + ", " + rv64RegName(r1, b) + ", " + rel(c); }
+    if (fmt == RV64_F_U) { s = s + " " + rv64RegName(r0, a) + ", " + toStr(b); }
+    if (fmt == RV64_F_J) { s = s + " " + rv64RegName(r0, a) + ", " + rel(b); }
+    if (fmt == RV64_F_AMO) { s = s + " " + rv64RegName(r0, a) + ", " + rv64RegName(r1, b) + ", (" + rv64RegName(r2, c) + ")"; }
+    if (fmt == RV64_F_LR) { s = s + " " + rv64RegName(r0, a) + ", (" + rv64RegName(r1, b) + ")"; }
+    if (fmt == RV64_F_FENCE) { s = s + " " + iorw(a) + ", " + iorw(b); }
+    return s + e.tail;
+}
+
+const HEX: string = "0123456789abcdef";
+function hex(v: int, width: int): string {
+    let s = "";
+    let x = v;
+    while (x != 0 || len(s) < width) {
+        s = strSub(HEX, x & 15, 1) + s;
+        x = x >>> 4;
+    }
+    return s;
+}
+
+/// 认出指令字是表中哪一条（字段重编须逐位相同），认不出得 −1。
+export function rv64Decode(word: int): int {
+    build();
+    const w = word & 0xffffffff;
+    let i = 0;
+    for (e in table) {
+        if ((w & rv64FixedMask(e.fmt)) == e.op) {
+            if (rv64EncodeFields(i, fields(e.fmt, w)) == w) { return i; }
+            return -1;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// 反汇编一个指令字（只看低 32 位）：子集内得一行汇编文本，否则得 .inst 0x%08x。
+export function rv64Disasm(word: int): string {
+    const w = word & 0xffffffff;
+    const i = rv64Decode(w);
+    if (i < 0) { return ".inst 0x" + hex(w, 8); }
+    return rv64FormatFields(i, fields(rv64Inst(i).fmt, w));
+}

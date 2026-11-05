@@ -1,0 +1,285 @@
+// 龙芯 LA64 编码表的生成与核对：从 bootstrap/selfhost/la64_disasm.tx 的指令表逐条按格式生成字段
+// （寄存器按类别轮换，立即数取边界与几个中间值），由反汇编器的写法写成汇编文本，交两家独立汇编器——GNU as
+// （Ubuntu 的 binutils-loongarch64-linux-gnu）与 LLVM（clang -target loongarch64-linux-musl）——汇编，从目标文件的 .text 取出编码，
+// 两家须逐字相同才写表。负例（编码函数必须拒绝的字段）不经汇编器，单列在表尾。表的核对见 scripts/test_la64_encodings.tx。
+// 用法（Linux 宿主，在本仓根）：
+//   taixu run --toolchain scripts/la64_encodings.tx --gnu "<GNU as 命令>" --llvm "<LLVM 汇编命令>" [--check] [--work <目录>]
+// 两个命令后面由本脚本接上 `<输入.s> -o <输出.o>`；--check 时不写表，与已入库的 tests/la64/encodings.txt 逐字节比对。
+import { words, mkdirs, join, readBytes } from "./build_lib";
+import { capture } from "./test_lib";
+import { la64InstCount, la64Inst, la64EncodeFields, la64FormatFields } from "../bootstrap/selfhost/la64_disasm";
+import { LA64_F_2R, LA64_F_3R, LA64_F_UI5, LA64_F_UI6, LA64_F_SI12, LA64_F_UI12, LA64_F_SI14, LA64_F_SI20, LA64_F_BSTR, LA64_F_CODE } from "../bootstrap/selfhost/la64_encode";
+import { LA64_F_JIRL, LA64_F_B16, LA64_F_B21, LA64_F_BC21, LA64_F_B26, LA64_F_AM, LA64_F_FCMP, LA64_F_CF2GR, LA64_F_FSEL } from "../bootstrap/selfhost/la64_encode";
+
+const TABLE: string = "tests/la64/encodings.txt";
+
+/// 空格分开的十进制整数（可带负号）。
+function nums(s: string): List<int> {
+    let out: List<int> = listNew();
+    for (w in words(s)) {
+        let v = 0;
+        let i = 0;
+        let neg = false;
+        if ((byteAt(w, 0) catch 0) == 45) { neg = true; i = 1; }
+        while (i < len(w)) { v = v * 10 + ((byteAt(w, i) catch 48) - 48); i = i + 1; }
+        if (neg) { v = -v; }
+        listPush(out, v);
+    }
+    return out;
+}
+/// b 的 at 处是以 0 结尾的字符串 s。
+function nameIs(b: Bytes, at: int, s: string): bool {
+    let i = 0;
+    while (i < len(s)) {
+        if (((bytesGetLE<u8>(b, at + i) ?? 255) as int) != (byteAt(s, i) catch -1)) { return false; }
+        i = i + 1;
+    }
+    return ((bytesGetLE<u8>(b, at + len(s)) ?? 1) as int) == 0;
+}
+function gprs(): List<int> { return nums("0 1 2 3 4 5 11 12 20 21 22 23 31"); }
+function fprs(): List<int> { return nums("0 1 7 8 23 24 31"); }
+function fccs(): List<int> { return nums("0 1 7"); }
+
+function regsOf(cls: string): List<int> {
+    if (cls == "f") { return fprs(); }
+    if (cls == "c") { return fccs(); }
+    return gprs();
+}
+function at(xs: List<int>, k: int): int { return listGet(xs, k % listLen(xs)) catch 0; }
+
+/// 各格式的立即数取值（BSTR 为 msbd、lsbd 成对，按 2k、2k+1 存）。没有立即数的格式得空表。
+function imms(fmt: int): List<int> {
+    if (fmt == LA64_F_UI5) { return nums("0 1 15 16 31"); }
+    if (fmt == LA64_F_UI6) { return nums("0 1 31 32 63"); }
+    if (fmt == LA64_F_SI12) { return nums("-2048 -1 0 1 100 2047"); }
+    if (fmt == LA64_F_UI12) { return nums("0 1 2048 4095"); }
+    if (fmt == LA64_F_SI14) { return nums("-32768 -4 0 4 32764"); }
+    if (fmt == LA64_F_SI20) { return nums("-524288 -1 0 1 524287"); }
+    if (fmt == LA64_F_BSTR) { return nums("0 0 31 0 63 0 63 63 47 16"); }
+    if (fmt == LA64_F_CODE) { return nums("0 1 7 16 20 1792 32767"); }
+    if (fmt == LA64_F_JIRL || fmt == LA64_F_B16) { return nums("-131072 -4 0 4 131068"); }
+    if (fmt == LA64_F_B21 || fmt == LA64_F_BC21) { return nums("-4194304 -4 0 4 4194300"); }
+    if (fmt == LA64_F_B26) { return nums("-134217728 -4 0 4 134217724"); }
+    return nums("");
+}
+
+/// 第 i 条指令的正例字段（文本次序）：寄存器第 p 个按类别表轮换（错开 4p 位），立即数逐个取；行数取两者较多的。
+function positives(i: int): List<List<int>> {
+    const e = la64Inst(i);
+    const ncls = len(e.cls);
+    const im = imms(e.fmt);
+    let pairs = 1;
+    if (e.fmt == LA64_F_BSTR) { pairs = 2; }
+    const nimm = listLen(im) / pairs;
+    let nreg = 0;
+    let p = 0;
+    while (p < ncls) {
+        const n = listLen(regsOf(strSub(e.cls, p, 1)));
+        if (n > nreg) { nreg = n; }
+        p = p + 1;
+    }
+    let rows = nreg;
+    if (nimm > rows) { rows = nimm; }
+    if (rows == 0) { rows = 1; }
+    let out: List<List<int>> = listNew();
+    let k = 0;
+    while (k < rows) {
+        let fs: List<int> = listNew();
+        p = 0;
+        while (p < ncls) {
+            listPush(fs, at(regsOf(strSub(e.cls, p, 1)), k + 4 * p));
+            p = p + 1;
+        }
+        if (nimm > 0) {
+            const j = k % nimm;
+            listPush(fs, listGet(im, j * pairs) catch 0);
+            if (pairs == 2) { listPush(fs, listGet(im, j * pairs + 1) catch 0); }
+        }
+        // 格式里立即数不在最后的：FCMP 等没有立即数；B16 是 rj rd 偏移、JIRL 是 rd rj 偏移，次序已对。
+        listPush(out, fs);
+        k = k + 1;
+    }
+    return out;
+}
+
+/// 第 i 条指令的负例字段：寄存器号越界，立即数越界或不对齐，AM 的 rd 与 rj／rk 同号。
+function negatives(i: int): List<List<int>> {
+    const e = la64Inst(i);
+    const empty: List<int> = listNew();
+    const good = listGet(positives(i), 1) catch empty;
+    let out: List<List<int>> = listNew();
+    const ncls = len(e.cls);
+    if (ncls > 0) {
+        let fs: List<int> = listNew();
+        for (v in good) { listPush(fs, v); }
+        listSet(fs, 0, 32);
+        listPush(out, fs);
+    }
+    let bad: List<int> = nums("");
+    if (e.fmt == LA64_F_UI5) { bad = nums("32 -1"); }
+    if (e.fmt == LA64_F_UI6) { bad = nums("64 -1"); }
+    if (e.fmt == LA64_F_SI12) { bad = nums("2048 -2049"); }
+    if (e.fmt == LA64_F_UI12) { bad = nums("4096 -1"); }
+    if (e.fmt == LA64_F_SI14) { bad = nums("32768 -32772 2"); }
+    if (e.fmt == LA64_F_SI20) { bad = nums("524288 -524289"); }
+    if (e.fmt == LA64_F_CODE) { bad = nums("32768 -1"); }
+    if (e.fmt == LA64_F_JIRL || e.fmt == LA64_F_B16) { bad = nums("131072 -131076 2"); }
+    if (e.fmt == LA64_F_B21 || e.fmt == LA64_F_BC21) { bad = nums("4194304 -4194308 6"); }
+    if (e.fmt == LA64_F_B26) { bad = nums("134217728 -134217732 2"); }
+    for (b in bad) {
+        let fs: List<int> = listNew();
+        let k = 0;
+        for (v in good) {
+            if (k == listLen(good) - 1) { listPush(fs, b); } else { listPush(fs, v); }
+            k = k + 1;
+        }
+        listPush(out, fs);
+    }
+    if (e.fmt == LA64_F_BSTR) { listPush(out, nums("4 5 0 1")); listPush(out, nums("4 5 64 0")); }
+    if (e.fmt == LA64_F_AM) { listPush(out, nums("4 5 4")); listPush(out, nums("4 4 6")); }
+    if (e.fmt == LA64_F_FCMP) { listPush(out, nums("8 1 2")); }
+    if (e.fmt == LA64_F_CF2GR) { listPush(out, nums("4 8")); }
+    if (e.fmt == LA64_F_FSEL) { listPush(out, nums("0 1 2 8")); }
+    if (e.fmt == LA64_F_BC21) { listPush(out, nums("8 4")); }
+    return out;
+}
+
+function fieldText(fs: List<int>): string {
+    let s = "";
+    for (v in fs) { s = s + " " + toStr(v); }
+    return s;
+}
+
+const HEX: string = "0123456789abcdef";
+function hex8(v: int): string {
+    let s = "";
+    let x = v;
+    while (len(s) < 8) {
+        s = strSub(HEX, x & 15, 1) + s;
+        x = x >>> 4;
+    }
+    return s;
+}
+
+/// ELF64 小端目标文件里 .text 节的全部 32 位字。
+function textWords(path: string): List<int> | Error {
+    const b = readBytes(path)?;
+    const shoff = bytesGetLE<int>(b, 40) ?? 0;
+    const shentsize = (bytesGetLE<u16>(b, 58) ?? 0) as int;
+    const shnum = (bytesGetLE<u16>(b, 60) ?? 0) as int;
+    const shstrndx = (bytesGetLE<u16>(b, 62) ?? 0) as int;
+    if (shoff <= 0 || shentsize != 64 || shnum == 0) { return err(path + " 不是 ELF64 目标文件"); }
+    const strOff = bytesGetLE<int>(b, shoff + shstrndx * 64 + 24) ?? 0;
+    let k = 0;
+    while (k < shnum) {
+        const h = shoff + k * 64;
+        const nameAt = strOff + ((bytesGetLE<u32>(b, h) ?? 0) as int);
+        if (nameIs(b, nameAt, ".text")) {
+            const off = bytesGetLE<int>(b, h + 24) ?? 0;
+            const size = bytesGetLE<int>(b, h + 32) ?? 0;
+            let out: List<int> = listNew();
+            let q = 0;
+            while (q + 4 <= size) {
+                listPush(out, (bytesGetLE<u32>(b, off + q) ?? 0) as int);
+                q = q + 4;
+            }
+            return out;
+        }
+        k = k + 1;
+    }
+    return err(path + " 没有 .text 节");
+}
+
+/// 用命令 cmd（空格分开，后接 `<src> -o <obj>`）汇编，取出 .text 的字。
+function assemble(cmd: string, src: string, obj: string): List<int> | Error {
+    const argv = words(cmd);
+    if (listLen(argv) == 0) { return err("汇编命令为空"); }
+    let args: List<string> = listNew();
+    let k = 1;
+    while (k < listLen(argv)) { listPush(args, listGet(argv, k) catch ""); k = k + 1; }
+    listPush(args, src); listPush(args, "-o"); listPush(args, obj);
+    const r = capture(listGet(argv, 0) catch "", args, ".", 300000000000, 1048576)?;
+    if (r.code != 0) { return err(cmd + " 失败（" + toStr(r.code) + "）：" + r.err); }
+    return textWords(obj);
+}
+
+function run(args: []string): int | Error {
+    let gnu = "";
+    let llvm = "";
+    let check = false;
+    let work = "work/la64-encodings";
+    let i = 0;
+    while (i < len(args)) {
+        const a = args[i];
+        if (a == "--gnu" && i + 1 < len(args)) {
+            gnu = args[i + 1];
+            i = i + 2;
+        } else if (a == "--llvm" && i + 1 < len(args)) {
+            llvm = args[i + 1];
+            i = i + 2;
+        } else if (a == "--work" && i + 1 < len(args)) {
+            work = args[i + 1];
+            i = i + 2;
+        } else if (a == "--check") {
+            check = true;
+            i = i + 1;
+        } else {
+            return err("不认识的参数 " + a);
+        }
+    }
+    if (len(gnu) == 0 || len(llvm) == 0) { return err("须给 --gnu 与 --llvm 两个汇编命令"); }
+    if (!mkdirs(work)) { return err("建不了 " + work); }
+    // 正例：每行一条指令；汇编文本按行写进 .s。
+    let rows: List<string> = listNew();
+    let asm = "  .text\n";
+    let negs = "";
+    const n = la64InstCount();
+    let ii = 0;
+    while (ii < n) {
+        const e = la64Inst(ii);
+        for (fs in positives(ii)) {
+            if (la64EncodeFields(ii, fs) < 0) { return err("正例被编码函数拒绝：" + e.name + fieldText(fs)); }
+            const text = la64FormatFields(ii, fs);
+            listPush(rows, e.name + fieldText(fs) + " | " + text);
+            asm = asm + "  " + text + "\n";
+        }
+        for (fs in negatives(ii)) { negs = negs + "! " + e.name + fieldText(fs) + "\n"; }
+        ii = ii + 1;
+    }
+    const src = join(work, "la64.s");
+    writeFile(src, asm)?;
+    const g = assemble(gnu, src, join(work, "gnu.o"))?;
+    const l = assemble(llvm, src, join(work, "llvm.o"))?;
+    if (listLen(g) != listLen(rows) || listLen(l) != listLen(rows)) {
+        return err("条数不符：表 " + toStr(listLen(rows)) + "，GNU " + toStr(listLen(g)) + "，LLVM " + toStr(listLen(l)));
+    }
+    let table = "# 龙芯 LA64 编码表：scripts/la64_encodings.tx 生成（独立汇编器：GNU as 与 LLVM（clang），两者须一致）。\n";
+    table = table + "# 正例：助记符 字段… | 汇编 | 编码（十六进制）；负例以 ! 开头，编码函数须返回 -1。\n";
+    let k = 0;
+    while (k < listLen(rows)) {
+        const gw = listGet(g, k) catch -1;
+        const lw = listGet(l, k) catch -1;
+        const row = listGet(rows, k) catch "";
+        if (gw != lw) { return err("两家汇编器不一致：" + row + "（GNU " + hex8(gw) + "，LLVM " + hex8(lw) + "）"); }
+        table = table + row + " | " + hex8(gw) + "\n";
+        k = k + 1;
+    }
+    table = table + negs;
+    if (check) {
+        const have = readFile(TABLE) catch "";
+        if (have != table) { print("FAIL 与已入库的 " + TABLE + " 不同"); return 1; }
+        print("PASS " + TABLE + " 与两家汇编器重新生成的一致（" + toStr(listLen(rows)) + " 条）");
+        return 0;
+    }
+    mkdirs("tests/la64");
+    writeFile(TABLE, table)?;
+    print("写出 " + TABLE + "：正例 " + toStr(listLen(rows)) + "，两家汇编器一致");
+    return 0;
+}
+
+function main(args: []string): int {
+    return run(args) catch (e) {
+        eprint("la64_encodings: " + e.message);
+        return 1;
+    };
+}

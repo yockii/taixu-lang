@@ -94,7 +94,8 @@ taixu build app.tx --target=linux --out dist     # 交叉编译到另一平台
 `--target` 可取 `windows`、`linux`、`macos`（按本机架构）或三元组
 `x86_64-windows`、`x86_64-linux`、`x86_64-macos`、`aarch64-macos`——任一
 平台都能为其余三个平台编译。其他常用选项：`--strip`（Linux、macOS 产物
-不带函数符号）、`--leak-check`、`--debug`（调试构建）。
+不带函数符号）、`--leak-check`、`--debug`（调试构建）、`--subsystem=windows`
+（Windows GUI 程序，启动不带控制台）。
 
 ## 发布你的程序
 

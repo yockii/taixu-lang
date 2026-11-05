@@ -1,4 +1,4 @@
-"""门脚本用的进程探查（类 Unix 宿主）：Linux 读 /proc，macOS 经 ps／pgrep（macOS 适配 M3 设计 G11）。
+"""门脚本用的进程探查（类 Unix 宿主）：Linux 读 /proc，macOS 经 ps／pgrep。
 
 记录为 (pid, 启动标记)：启动标记取不到即视为已不在；同号进程启动标记不同即为 PID 复用，不算原进程。僵尸仍占着 PID，
 启动标记照样取得到——“已回收”以 PID 消失为准，不能把终止当作回收。

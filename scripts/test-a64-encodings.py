@@ -1,4 +1,4 @@
-"""A64 编码表双向核对（macOS 适配 M4 设计 A2、A11）：拿 tests/a64/encodings.txt（独立汇编器生成，见
+"""A64 编码表双向核对：拿 tests/a64/encodings.txt（独立汇编器生成，见
 scripts/a64-encodings.py）逐条核对——bootstrap/a64_encode_probe.tx 核编码函数（文本 → 字节，负例须被拒绝），
 bootstrap/a64_disasm_probe.tx 核反汇编器（字节 → 文本；另有固定例，子集外的字须得 .inst；再拿随机字段经编码函数
 编出的字，须都译得出）。"""

@@ -3,7 +3,7 @@
 // text/rodata/data/bss by flags, laid out like link_elf.tx (headers page, then
 // one PT_LOAD per group), symbols resolved globally, RELA applied
 // (R_X86_64_64/PC32/PLT32/32/32S). Static unless the driver registers shared
-// libraries (D3 v0.23 FFI `from "库"`, docs/design/v052-ffi-platform-v0.1-20261015.md
+// libraries (D3 v0.23 FFI `from "库"`
 // §五-4): then the image also gets PT_INTERP, PT_DYNAMIC, DT_NEEDED, a symbol
 // table of the imported functions and one GOT slot per import (`__imp_<名>`,
 // R_X86_64_GLOB_DAT, bound at load time: DF_BIND_NOW). The entry stays the
@@ -11,16 +11,36 @@
 // 读入、放置、符号解析、拷节与重定位在公共核心 link_objects.tx（与 Mach-O 写出器共用）；本文件只管 ELF 的布局、头与动态段。
 // 函数符号（v052-image-symbols）：可装载内容之后追加 .symtab、.strtab、.shstrtab 与节头表（不在任何 PT_LOAD 里）；
 // --strip 时不写，e_shnum 为 0。
+// aarch64：对象的 e_machine 为 183 时按 aarch64 写——重定位由公共核心的 a64Relocate 应用；段按 64 KiB 对齐
+// （aarch64 的 Linux 内核页可能是 4、16 或 64 KiB，权限不同的段不得共处一页，同 lld 的 max-page-size 与 Go 的 arm64 链接器），
+// 解释器 /lib/ld-linux-aarch64.so.1，GOT 槽的重定位为 R_AARCH64_GLOB_DAT（1025）。TLS 是 Variant I：可执行文件的 TLS 块在
+// 线程指针＋16（16 字节的线程控制块之后），PT_TLS 的对齐不超过 16 时加载器与内核约定都如此。
+// loongarch64：e_machine 258 按龙芯写——重定位由 la64Relocate 应用；段同样按 64 KiB 对齐（内核页缺省
+// 16 KiB，也有 4、64 KiB）；e_flags 0x43（LP64D＋OBJABI v1）；解释器 /lib64/ld-linux-loongarch-lp64d.so.1；龙芯没有 GLOB_DAT，GOT 槽
+// 用 R_LARCH_64（2）。TLS 是 Variant I、线程控制块长 0：可执行文件的 TLS 块就在线程指针处。
+// riscv64：e_machine 243 按 RISC-V 写——重定位由 rv64Relocate 应用；段按 4 KiB 对齐（RISC-V Linux 只有
+// 4 KiB 基本页，GNU ld 与 lld 缺省如此）；e_flags 0x4（LP64D）；解释器 /lib/ld-linux-riscv64-lp64d.so.1；没有 GLOB_DAT，GOT 槽用
+// R_RISCV_64（2）。TLS 同龙芯（Variant I、线程控制块长 0）。
 
 import { PTHREAD_HOOKS } from "./thread_block_abi";
 import { rawNameOf } from "./binary_name";
 import { linkMapSymbolsEnabled, linkMapEnabled, linkMapDone, linkMapSynthetic } from "./link_map_data";
 import { ImageSymbol, linkSymbolsCollect, linkSymbolsStripped } from "./link_symbols";
-import { LKO_IMAGE_LIMIT, lkoReject, lkoFailure, lkoAlignUp, lkoLookup, lkoAddress, lkoAddGlobal, lkoGlobalCount, lkoGlobalName, lkoGlobalKind, lkoBegin, lkoPlace, lkoGroupSize, lkoGroupAlign, lkoSetGroupSize, lkoSetGroupAlign, lkoSetGroupBase, lkoDefineGlobals, lkoCacheSymbols, lkoCopySections, lkoRelocate, lkoCollectMap } from "./link_objects";
+import { LKO_IMAGE_LIMIT, lkoObjectMachine, lkoReject, lkoFailure, lkoAlignUp, lkoLookup, lkoAddress, lkoAddGlobal, lkoGlobalCount, lkoGlobalName, lkoGlobalKind, lkoBegin, lkoPlace, lkoGroupSize, lkoGroupAlign, lkoSetGroupSize, lkoSetGroupAlign, lkoSetGroupBase, lkoDefineGlobals, lkoCacheSymbols, lkoCopySections, lkoRelocate, lkoCollectMap } from "./link_objects";
 
 const BASE: int = 4194304;
-const PAGE: int = 4096;
-const INTERP: string = "/lib64/ld-linux-x86-64.so.2";
+const PAGE_X64: int = 4096;
+const PAGE_A64: int = 65536;
+const INTERP_X64: string = "/lib64/ld-linux-x86-64.so.2";
+const INTERP_A64: string = "/lib/ld-linux-aarch64.so.1";
+const GLOB_DAT_X64: int = 6;
+const GLOB_DAT_A64: int = 1025;
+const PAGE_LA64: int = 65536;
+const INTERP_LA64: string = "/lib64/ld-linux-loongarch-lp64d.so.1";
+const GLOB_DAT_LA64: int = 2;
+const PAGE_RV64: int = 4096;
+const INTERP_RV64: string = "/lib/ld-linux-riscv64-lp64d.so.1";
+const GLOB_DAT_RV64: int = 2;
 
 let out: Bytes = bytesNew(0);
 struct Shdr { name: string, kind: int, flags: int, off: int, size: int, link: int, info: int, align: int, entsize: int }
@@ -94,7 +114,13 @@ function segment(kind: int, flags: int, off: int, fileSize: int, memSize: int, a
 /// Link objects into a static executable; `entry` names the process entry symbol.
 export function linkElfObjects(objects: List<Bytes>, entry: string): int {
     out = bytesNew(0);
-    if (lkoBegin(objects, "x86_64-linux") != 0) { return failed(); }
+    let firstMachine = -1;
+    if (listLen(objects) > 0) { firstMachine = lkoObjectMachine(listGet(objects, 0) catch bytesNew(0)); }
+    let mapTarget = "x86_64-linux"; let machineId = 62; let page = PAGE_X64; let interp = INTERP_X64; let globDat = GLOB_DAT_X64; let flags = 0;
+    if (firstMachine == 183) { mapTarget = "aarch64-linux"; machineId = 183; page = PAGE_A64; interp = INTERP_A64; globDat = GLOB_DAT_A64; }
+    if (firstMachine == 258) { mapTarget = "loongarch64-linux"; machineId = 258; page = PAGE_LA64; interp = INTERP_LA64; globDat = GLOB_DAT_LA64; flags = 67; }
+    if (firstMachine == 243) { mapTarget = "riscv64-linux"; machineId = 243; page = PAGE_RV64; interp = INTERP_RV64; globDat = GLOB_DAT_RV64; flags = 4; }
+    if (lkoBegin(objects, mapTarget) != 0) { return failed(); }
     if (lkoPlace() != 0) { return failed(); }
     const roSize = lkoGroupSize(1); const dataSize = lkoGroupSize(2);
     // Dynamic structures: .interp .hash .dynsym .dynstr .rela.dyn after rodata,
@@ -133,7 +159,7 @@ export function linkElfObjects(objects: List<Bytes>, entry: string): int {
         if (lkoGroupAlign(2) < 8) { lkoSetGroupAlign(2, 8); }
         roBlock = lkoAlignUp(lkoGroupSize(1), 8);
         interpAt = roBlock;
-        hashAt = lkoAlignUp(interpAt + len(INTERP) + 1, 8);
+        hashAt = lkoAlignUp(interpAt + len(interp) + 1, 8);
         symtabAt = lkoAlignUp(hashAt + 4 * (3 + nsym), 8);
         strtabAt = symtabAt + 24 * nsym;
         relaAt = lkoAlignUp(strtabAt + bytesLen(strtab), 8);
@@ -142,9 +168,9 @@ export function linkElfObjects(objects: List<Bytes>, entry: string): int {
         gotAt = dynamicAt + 16 * ndyn;
         lkoSetGroupSize(2, gotAt + 8 * listLen(dynImports));
     }
-    const textOff = lkoAlignUp(PAGE, lkoGroupAlign(0));
-    const roOff = lkoAlignUp(textOff + lkoGroupSize(0), PAGE);
-    const dataOff = lkoAlignUp(roOff + lkoGroupSize(1), PAGE);
+    const textOff = lkoAlignUp(page, lkoGroupAlign(0));
+    const roOff = lkoAlignUp(textOff + lkoGroupSize(0), page);
+    const dataOff = lkoAlignUp(roOff + lkoGroupSize(1), page);
     const bssOff = lkoAlignUp(dataOff + lkoGroupSize(2), lkoGroupAlign(3));
     if (bssOff + lkoGroupSize(3) > LKO_IMAGE_LIMIT) { return reject("ImageTooLarge"); }
     lkoSetGroupBase(0, BASE + textOff); lkoSetGroupBase(1, BASE + roOff);
@@ -181,17 +207,17 @@ export function linkElfObjects(objects: List<Bytes>, entry: string): int {
     const headerSize = 64 + 56 * phnum;
     emit(127, 1); emit(69, 1); emit(76, 1); emit(70, 1);
     emit(2, 1); emit(1, 1); emit(1, 1); emit(0, 1); emit(0, 8);
-    emit(2, 2); emit(62, 2); emit(1, 4); emit(entryAddress, 8);
-    emit(64, 8); emit(0, 8); emit(0, 4);
+    emit(2, 2); emit(machineId, 2); emit(1, 4); emit(entryAddress, 8);
+    emit(64, 8); emit(0, 8); emit(flags, 4);
     emit(64, 2); emit(56, 2); emit(phnum, 2); emit(0, 2); emit(0, 2); emit(0, 2);
     if (dynamic) {
         segment(6, 4, 64, 56 * phnum, 56 * phnum, 8);
-        segment(3, 4, roOff + interpAt, len(INTERP) + 1, len(INTERP) + 1, 1);
+        segment(3, 4, roOff + interpAt, len(interp) + 1, len(interp) + 1, 1);
     }
-    segment(1, 4, 0, headerSize, headerSize, PAGE);
-    segment(1, 5, textOff, lkoGroupSize(0), lkoGroupSize(0), PAGE);
-    segment(1, 4, roOff, lkoGroupSize(1), lkoGroupSize(1), PAGE);
-    segment(1, 6, dataOff, lkoGroupSize(2), bssOff - dataOff + lkoGroupSize(3), PAGE);
+    segment(1, 4, 0, headerSize, headerSize, page);
+    segment(1, 5, textOff, lkoGroupSize(0), lkoGroupSize(0), page);
+    segment(1, 4, roOff, lkoGroupSize(1), lkoGroupSize(1), page);
+    segment(1, 6, dataOff, lkoGroupSize(2), bssOff - dataOff + lkoGroupSize(3), page);
     if (dynamic) { segment(2, 6, dataOff + dynamicAt, 16 * ndyn, 16 * ndyn, 8); }
     if (tlsIndex >= 0) { segment(7, 4, tlsAt, 8, 8, 8); }
     emit(1685382481, 4); emit(6, 4); emit(0, 8); emit(0, 8);
@@ -204,7 +230,7 @@ export function linkElfObjects(objects: List<Bytes>, entry: string): int {
         const dd = dataOff;
         // .interp
         let c = 0;
-        while (c < len(INTERP)) { bytesSet(out, ro + interpAt + c, byteAt(INTERP, c) catch 0); c = c + 1; }
+        while (c < len(interp)) { bytesSet(out, ro + interpAt + c, byteAt(interp, c) catch 0); c = c + 1; }
         // .hash: one bucket, every chain empty (an executable exports nothing).
         patch(ro + hashAt, 1, 4); patch(ro + hashAt + 4, nsym, 4);
         // .dynsym: [0] null; imports and hook targets are global functions, undefined.
@@ -217,13 +243,13 @@ export function linkElfObjects(objects: List<Bytes>, entry: string): int {
         }
         c = 0;
         while (c < bytesLen(strtab)) { bytesSet(out, ro + strtabAt + c, bytesGet(strtab, c) catch 0); c = c + 1; }
-        // .rela.dyn: R_X86_64_GLOB_DAT per GOT slot, then per hook slot.
+        // .rela.dyn: GLOB_DAT（R_X86_64_GLOB_DAT／R_AARCH64_GLOB_DAT）per GOT slot, then per hook slot.
         let r = 0;
         q = 0;
         while (q < listLen(dynImports)) {
             const at = ro + relaAt + 24 * r;
             patch(at, BASE + dd + gotAt + 8 * q, 8);
-            patch(at + 8, ((dynSymIndex(dynSyms, listGet(dynImports, q) catch "") + 1) << 32) | 6, 8);
+            patch(at + 8, ((dynSymIndex(dynSyms, listGet(dynImports, q) catch "") + 1) << 32) | globDat, 8);
             r = r + 1;
             q = q + 1;
         }
@@ -233,10 +259,13 @@ export function linkElfObjects(objects: List<Bytes>, entry: string): int {
             if (slot < 0) { return reject("MissingSymbol:" + (listGet(dynHookSlots, q) catch "")); }
             const at = ro + relaAt + 24 * r;
             patch(at, lkoAddress(slot), 8);
-            patch(at + 8, ((dynSymIndex(dynSyms, listGet(dynHookSyms, q) catch "") + 1) << 32) | 6, 8);
+            patch(at + 8, ((dynSymIndex(dynSyms, listGet(dynHookSyms, q) catch "") + 1) << 32) | globDat, 8);
             r = r + 1;
             q = q + 1;
         }
+        // RISC-V 的内核在 .data 里有 __tx_dynamic_image：动态产物置 1，_start 据此不改加载器设好的线程指针。
+        const dynFlag = lkoLookup("__tx_dynamic_image");
+        if (dynFlag >= 0) { patch(lkoAddress(dynFlag) - BASE, 1, 8); }
         // .dynamic
         let dp = dd + dynamicAt;
         q = 0;
@@ -269,7 +298,7 @@ export function linkElfObjects(objects: List<Bytes>, entry: string): int {
         addSection(secs, ".rodata", 1, 2, roOff, roSize, lkoGroupAlign(1), 0);
         let dynstr = 0;
         if (dynamic) {
-            addSection(secs, ".interp", 1, 2, roOff + interpAt, len(INTERP) + 1, 1, 0);
+            addSection(secs, ".interp", 1, 2, roOff + interpAt, len(interp) + 1, 1, 0);
             const hash = addSection(secs, ".hash", 5, 2, roOff + hashAt, 4 * (3 + nsym), 8, 4);
             const dynsym = addSection(secs, ".dynsym", 11, 2, roOff + symtabAt, 24 * nsym, 8, 24);
             dynstr = addSection(secs, ".dynstr", 3, 2, roOff + strtabAt, bytesLen(strtab), 1, 0);

@@ -1,4 +1,4 @@
-// NRT 的 Shared 与 Atomic（线程第 4c 步，docs/design/v052-threads-v0.1-20261015.md §二十一、§二十四）。
+// NRT 的 Shared 与 Atomic（线程第 4c 步，§二十四）。
 //
 // 共享块：sharedNew(v) 用发送方的共享模式（nrt_send.tx 模式 1）把 v 可达的对象图编成进程级的块，块头 @64 是原子
 // 引用数，最后一份放手时归还块（块里内嵌的共享块引用随之放手）。
@@ -15,11 +15,12 @@
 //
 // 归零（nrt.tx 的 __tx_rc_zero_cascade 分派）：句柄摘缓存、放掉缓存的根与块计数；借用载荷的对象放掉块计数（载荷
 // 属于块，不归还）；本线程的 Atomic 归还值单元。线程结束时仍活着的句柄与借用对象由 __tx_thread_drop_live 放掉块计数。
-import { Operand, StructuredBuffer, asBufferLabel, asBufferInstruction, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem } from "./assemble";
+import { Operand, StructuredBuffer, asBufferLabel, asBufferInstruction, asBufferFunctionEnd, asManualBegin, asManualLeaf, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem } from "./assemble";
 import { RtFn, L, I, A } from "./rtfn_base";
 import { rtBegin, rtSet, rtOp, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtCall5, rtLoadAcq, rtAtomicXchg, rtAtomicCas, rtRet, rtRetVoid } from "./rtfn";
 import { check, arity, argTag, trapText, trapAt, ARITY } from "./nrt_base";
 import { TB_SHARED_CACHE } from "./thread_block_abi";
+import { ISA_X86_64 } from "./target";
 
 const TAG_INT: int = 1;
 const TAG_BOOL: int = 3;
@@ -43,9 +44,9 @@ function r64(n: int): Ref<Operand> { return asStructuredReg(0, n); }
 function r32(n: int): Ref<Operand> { return asStructuredReg(1, n); }
 function none(): Ref<Operand> { return asStructuredMissing(); }
 
-// A64（macOS 适配 M4 设计 A7）：交换与比较交换用 rtfn（SWPAL、CASAL；与 LDAR／STLR 合起来顺序一致，同 x86 的加锁指令
+// A64：交换与比较交换用 rtfn（SWPAL、CASAL；与 LDAR／STLR 合起来顺序一致，同 x86 的加锁指令
 // 对这些单元的效果）。
-function atomicsA64(b: Ref<StructuredBuffer>): void {
+function atomicsRtfn(b: Ref<StructuredBuffer>): void {
     let f = rtBegin(b, "__tx_atomic_xchg", "p v", "old", 0, "bootstrap/selfhost/nrt_shared.tx");
     rtAtomicXchg(f, "old", L("p"), 0, L("v"));
     rtRet(f, L("old")); check(f);
@@ -60,14 +61,16 @@ function atomicsA64(b: Ref<StructuredBuffer>): void {
 
 /// Shared 与 Atomic 的内核例程。
 export function emitNrtShared(b: Ref<StructuredBuffer>): void {
-    if (b.a64) { atomicsA64(b); emitHandles(b); emitBuiltins(b); return; }
+    if (b.isa != ISA_X86_64) { atomicsRtfn(b); emitHandles(b); emitBuiltins(b); return; }
+    // x86 上两个都是手写叶函数（登记为 runtime-manual，PE 规范化 P3）。
     // __tx_atomic_xchg(p, v) → 旧值（xchg 带内存操作数即加锁，全屏障）。
-    asBufferLabel(b, "__tx_atomic_xchg", 1);
+    asManualBegin(b, "bootstrap/selfhost/nrt_shared.tx", "__tx_atomic_xchg"); asManualLeaf(b);
     ins(b, "mov", 2, r64(0), r64(2));
     ins(b, "xchg", 2, asStructuredMem(2, 1, -1, 0, 0, 0, ""), r64(0));
     ins(b, "ret", 0, none(), none());
+    asBufferFunctionEnd(b);
     // __tx_atomic_cas(p, expect, new) → 1 成功、0 失败（lock cmpxchg，全屏障；比较值在 rax）。
-    asBufferLabel(b, "__tx_atomic_cas", 1);
+    asManualBegin(b, "bootstrap/selfhost/nrt_shared.tx", "__tx_atomic_cas"); asManualLeaf(b);
     ins(b, "mov", 2, r64(0), r64(2));
     ins(b, "lockcmpxchg", 2, asStructuredMem(2, 1, -1, 0, 0, 0, ""), r64(8));
     ins(b, "mov", 2, r32(0), asStructuredImm(1));
@@ -75,12 +78,13 @@ export function emitNrtShared(b: Ref<StructuredBuffer>): void {
     ins(b, "xor", 2, r32(0), r32(0));
     asBufferLabel(b, "__tx_atomic_cas_out", 1);
     ins(b, "ret", 0, none(), none());
+    asBufferFunctionEnd(b);
     emitHandles(b);
     emitBuiltins(b);
 }
 
 function emitHandles(b: Ref<StructuredBuffer>): void {
-    // 块计数（64 位，块头 @64）的饱和（容量评估 §五-5 的裁决）：lock xadd 之后看旧值，越过 2^62 即写回饱和值
+    // 块计数（64 位，块头 @64）的饱和（容量评估 §五-5）：lock xadd 之后看旧值，越过 2^62 即写回饱和值
     // 0xC000000000000000、永不归还；并发线程要凑齐 2^61 次同时越线才可能回绕。
     // __tx_shared_inc(blk, n)：块计数加 n。
     let f = rtBegin(b, "__tx_shared_inc", "blk n", "x old", 2, "bootstrap/selfhost/nrt_shared.tx");

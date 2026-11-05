@@ -1,0 +1,439 @@
+// 龙芯汇编层：龙芯代码写进 asBufferNewLa64 建的
+// StructuredBuffer（数据、标号、节切换照常用 asBuffer*），提交时做跨度定长再写进当前汇编映像。结构同 a64_asm.tx。
+// - 指令字由 la64_encode 的纯函数编好再交进来；本层只管标号、跳转、符号修补与合法化。编码函数拒绝的指令（-1）记成失败条目，
+//   提交时报出。
+// - 缓冲内跳转（目标标号定义在本缓冲的代码节里）：先按短形式排，beq 类（±128 KiB）、beqz／bnez 与 bceqz／bcnez（±4 MiB）越界的
+//   换成“取反条件跳过下一条＋b 目标”，重算偏移直到不再变化（只会由短变长，一定收敛）。
+// - 目标不在本缓冲的 b／bl 交给修补（R_LARCH_B26，±128 MiB，不出跳板）；条件跳转只许跳到本缓冲里的标号。
+// - 符号地址：pcalau12i＋addi.d（PCALA_HI20＋PCALA_LO12），读写 pcalau12i＋ld／st 的 LO12。不发 R_LARCH_RELAX。
+// - t8（r20）留给本层的合法化（大常数加法、大偏移读写），不分配给值；t7（r19）留给上层（宏层自用与间接目标）。
+import { StructuredBuffer, StructuredEntry, asBufferNew, asStructuredImm, asStructuredSection, asStructuredLabel, asStructuredAlign, asStructuredByte, asStructuredQuad, asStructuredAddress, asStructuredZero, asStructuredAddressAddend } from "./assemble";
+import { asLa64Word, asA64Here, asImgIsa, asSetIsa, asFailWith, asFailedAs, FIX_LA64_B26, FIX_LA64_PCALA_HI20, FIX_LA64_PCALA_LO12, asListingActive, asListingA64 } from "./assemble";
+import { nativeFunctionsActive, nativeFunctionsIsa, nativeFunctionBegin, nativeFunctionOwnedBegin, nativeFunctionBoundaryBegin, nativeFunctionEnd, nativeFunctionPrologueEnd, nativeFunctionEpilogueStart, nativeFunctionEvent } from "./native_function_data";
+import { la64R3, la64Si12, la64Ui12, la64Si14, la64Si20, la64B16, la64B21, la64Bc21, la64B26 } from "./la64_encode";
+import { LA64_ADD_D, LA64_SUB_D, LA64_ADDI_D, LA64_ORI, LA64_LU12I_W, LA64_LU32I_D, LA64_LU52I_D, LA64_PCALAU12I, LA64_B, LA64_BL } from "./la64_encode";
+import { LA64_BEQ, LA64_BNE, LA64_BLT, LA64_BGE, LA64_BLTU, LA64_BGEU, LA64_BEQZ, LA64_BNEZ, LA64_BCEQZ, LA64_BCNEZ } from "./la64_encode";
+import { LA64_LD_B, LA64_LD_H, LA64_LD_W, LA64_LD_D, LA64_ST_B, LA64_ST_H, LA64_ST_W, LA64_ST_D, LA64_LD_BU, LA64_LD_HU, LA64_LD_WU } from "./la64_encode";
+import { LA64_FLD_S, LA64_FST_S, LA64_FLD_D, LA64_FST_D, LA64_LDX_B, LA64_LDX_H, LA64_LDX_W, LA64_LDX_D, LA64_STX_B, LA64_STX_H, LA64_STX_W, LA64_STX_D } from "./la64_encode";
+import { LA64_LDX_BU, LA64_LDX_HU, LA64_LDX_WU, LA64_FLDX_S, LA64_FLDX_D, LA64_FSTX_S, LA64_FSTX_D, LA64_LDPTR_W, LA64_STPTR_W, LA64_LDPTR_D, LA64_STPTR_D } from "./la64_encode";
+import { la64Disasm } from "./la64_disasm";
+import { ISA_LA64 } from "./target";
+
+const K_WORD: int = 30;
+const K_FIX: int = 31;
+const K_BRANCH: int = 32;
+const K_B16: int = 33;
+const K_B21: int = 34;
+const K_BC21: int = 35;
+const K_FAIL: int = 36;
+const K_FRAME: int = 37;
+
+export const LA64_ZERO_REG: int = 0;
+export const LA64_SP_REG: int = 3;
+/// 本层合法化用的临时寄存器 t8（r20）。
+export const LA64_TMP: int = 20;
+
+/// 龙芯代码的缓冲：数据与标号条目同 asBufferNew，指令只能经本模块写入。
+export function asBufferNewLa64(): Ref<StructuredBuffer> {
+    const b = asBufferNew();
+    b.isa = ISA_LA64;
+    return b;
+}
+
+function add(buf: Ref<StructuredBuffer>, kind: int, nops: int, value: int, name: string, addend: int): void {
+    const m = buf.missing;
+    let a = m;
+    if (addend != 0) { a = asStructuredImm(addend); }
+    listPush(buf.entries, new StructuredEntry { kind: kind, mnemonic: "", nops: nops, a: a, b: m, c: m, value: value, name: name, line: buf.line });
+}
+function fail(buf: Ref<StructuredBuffer>, why: string): void { add(buf, K_FAIL, 0, 0, why, 0); }
+
+/// 帧事件（函数目录）：描述从 first 号条目（发射前记下的条目数）起到此为止的指令，不占字节；提交时按两端偏移记进目录。
+/// 一组指令的几个事件依次跟在后面（序言的 addi.d sp／st.d ra／st.d fp 记“压入 ra、压入 fp”）。
+export function la64Frame(buf: Ref<StructuredBuffer>, first: int, kind: string, reg: int, bytes: int): void {
+    if (!nativeFunctionsActive()) { return; }
+    const m = buf.missing;
+    listPush(buf.entries, new StructuredEntry { kind: K_FRAME, mnemonic: "", nops: listLen(buf.entries) - first, a: asStructuredImm(bytes),
+            b: asStructuredImm(reg), c: m, value: 0, name: kind, line: buf.line });
+}
+/// 一条编好的指令；word 为 -1（编码函数拒绝）时记失败并说明是哪条。
+export function la64Emit(buf: Ref<StructuredBuffer>, word: int, what: string): void {
+    if (buf.isa != ISA_LA64) { fail(buf, "NotLa64Buffer"); return; }
+    if (word < 0) { fail(buf, "UnencodableInstruction:" + what); return; }
+    add(buf, K_WORD, 0, word, "", 0);
+}
+/// sp -= bytes（序言的分配）：2048 以内一条 addi.d，否则字节数进 t8 再一条 sub.d；事件覆盖整段（只有最后一条动 sp）。
+export function la64FrameAlloc(buf: Ref<StructuredBuffer>, bytes: int): void {
+    if (bytes < 0 || bytes % 16 != 0) { fail(buf, "BadFrameAllocation"); return; }
+    if (bytes == 0) { return; }
+    const first = listLen(buf.entries);
+    if (bytes <= 2048) {
+        la64Emit(buf, la64Si12(LA64_ADDI_D, LA64_SP_REG, LA64_SP_REG, -bytes), "addi.d sp");
+    } else {
+        la64MovImm(buf, LA64_TMP, bytes);
+        la64Emit(buf, la64R3(LA64_SUB_D, LA64_SP_REG, LA64_SP_REG, LA64_TMP), "sub.d sp");
+    }
+    la64Frame(buf, first, "allocate-stack", LA64_SP_REG, bytes);
+}
+/// b（link＝0）／bl（link＝1）到标号或符号。
+export function la64B(buf: Ref<StructuredBuffer>, link: int, target: string): void {
+    if (len(target) == 0 || (link != 0 && link != 1)) { fail(buf, "BadBranch"); return; }
+    add(buf, K_BRANCH, link, 0, target, 0);
+}
+/// beq／bne／blt／bge／bltu／bgeu rj, rd 到本缓冲的标号。
+export function la64BCond(buf: Ref<StructuredBuffer>, op: int, rj: int, rd: int, target: string): void {
+    if (invert(op) < 0 || la64B16(op, rj, rd, 0) < 0 || len(target) == 0) { fail(buf, "BadBranch"); return; }
+    add(buf, K_B16, rj * 32 + rd, op, target, 0);
+}
+/// beqz／bnez rj 到本缓冲的标号。
+export function la64Bz(buf: Ref<StructuredBuffer>, op: int, rj: int, target: string): void {
+    if ((op != LA64_BEQZ && op != LA64_BNEZ) || la64B21(op, rj, 0) < 0 || len(target) == 0) { fail(buf, "BadBranch"); return; }
+    add(buf, K_B21, rj, op, target, 0);
+}
+/// bceqz／bcnez cj（条件标志）到本缓冲的标号。
+export function la64Bc(buf: Ref<StructuredBuffer>, op: int, cj: int, target: string): void {
+    if ((op != LA64_BCEQZ && op != LA64_BCNEZ) || la64Bc21(op, cj, 0) < 0 || len(target) == 0) { fail(buf, "BadBranch"); return; }
+    add(buf, K_BC21, cj, op, target, 0);
+}
+/// 条件跳转取反（beq↔bne、blt↔bge、bltu↔bgeu、beqz↔bnez、bceqz↔bcnez）；不是条件跳转得 -1。
+function invert(op: int): int {
+    if (op == LA64_BEQ) { return LA64_BNE; }
+    if (op == LA64_BNE) { return LA64_BEQ; }
+    if (op == LA64_BLT) { return LA64_BGE; }
+    if (op == LA64_BGE) { return LA64_BLT; }
+    if (op == LA64_BLTU) { return LA64_BGEU; }
+    if (op == LA64_BGEU) { return LA64_BLTU; }
+    if (op == LA64_BEQZ) { return LA64_BNEZ; }
+    if (op == LA64_BNEZ) { return LA64_BEQZ; }
+    if (op == LA64_BCEQZ) { return LA64_BCNEZ; }
+    if (op == LA64_BCNEZ) { return LA64_BCEQZ; }
+    return -1;
+}
+
+function fixWord(buf: Ref<StructuredBuffer>, word: int, kind: int, symbol: string, addend: int, what: string): void {
+    if (word < 0) { fail(buf, "UnencodableInstruction:" + what); return; }
+    if (len(symbol) == 0) { fail(buf, "BadSymbol"); return; }
+    add(buf, K_FIX, kind, word, symbol, addend);
+}
+/// rd = 符号地址＋addend（pcalau12i＋addi.d）。
+export function la64AddrOf(buf: Ref<StructuredBuffer>, rd: int, symbol: string, addend: int): void {
+    fixWord(buf, la64Si20(LA64_PCALAU12I, rd, 0), FIX_LA64_PCALA_HI20, symbol, addend, "pcalau12i");
+    fixWord(buf, la64Si12(LA64_ADDI_D, rd, rd, 0), FIX_LA64_PCALA_LO12, symbol, addend, "addi.d");
+}
+/// 读写符号处的数据：op 为 12 位偏移形的读写（ld.*／st.*／fld.*／fst.*），地址的页经 tmp。
+export function la64SymAccess(buf: Ref<StructuredBuffer>, op: int, rt: int, tmp: int, symbol: string, addend: int): void {
+    if (indexed(op) < 0) { fail(buf, "BadMemoryOp"); return; }
+    fixWord(buf, la64Si20(LA64_PCALAU12I, tmp, 0), FIX_LA64_PCALA_HI20, symbol, addend, "pcalau12i");
+    fixWord(buf, la64Si12(op, rt, tmp, 0), FIX_LA64_PCALA_LO12, symbol, addend, "ldst");
+}
+
+function sext(v: int, n: int): int { return (v << (64 - n)) >> (64 - n); }
+
+/// 64 位常数进 rd，按位段取最短序列（至多 4 条，同 Go 的 loong64 汇编器）：12 位有符号用 addi.d、12 位无符号用 ori；低 52 位
+/// 为 0 的一条 lu52i.d；其余先 lu12i.w（＋ori）得低 32 位（符号扩展），不等再 lu32i.d 定 51:32、lu52i.d 定 63:52。
+export function la64MovImm(buf: Ref<StructuredBuffer>, rd: int, value: int): void {
+    if (value >= -2048 && value <= 2047) { la64Emit(buf, la64Si12(LA64_ADDI_D, rd, 0, value), "addi.d"); return; }
+    if (value >= 0 && value <= 4095) { la64Emit(buf, la64Ui12(LA64_ORI, rd, 0, value), "ori"); return; }
+    if ((value & 4503599627370495) == 0) { la64Emit(buf, la64Si12(LA64_LU52I_D, rd, 0, sext(value >>> 52, 12)), "lu52i.d"); return; }
+    const lo12 = value & 4095;
+    const hi20 = (value >>> 12) & 1048575;
+    let cur = 0;
+    if (hi20 == 0) {
+        la64Emit(buf, la64Ui12(LA64_ORI, rd, 0, lo12), "ori");
+        cur = lo12;
+    } else {
+        la64Emit(buf, la64Si20(LA64_LU12I_W, rd, sext(hi20, 20)), "lu12i.w");
+        cur = sext(hi20 << 12, 32);
+        if (lo12 != 0) { la64Emit(buf, la64Ui12(LA64_ORI, rd, rd, lo12), "ori"); cur = cur | lo12; }
+    }
+    if (cur == value) { return; }
+    const s52 = sext(value, 52);
+    if (cur != s52) { la64Emit(buf, la64Si20(LA64_LU32I_D, rd, sext((value >>> 32) & 1048575, 20)), "lu32i.d"); cur = s52; }
+    if (cur != value) { la64Emit(buf, la64Si12(LA64_LU52I_D, rd, rd, sext(value >>> 52, 12)), "lu52i.d"); }
+}
+
+/// rd = rj + imm（可为负）：12 位有符号以内一条 addi.d，否则 imm 进 t8 再 add.d；rj 不得是 t8。
+export function la64AddImm(buf: Ref<StructuredBuffer>, rd: int, rj: int, imm: int): void {
+    if (imm >= -2048 && imm <= 2047) { la64Emit(buf, la64Si12(LA64_ADDI_D, rd, rj, imm), "addi.d"); return; }
+    if (rj == LA64_TMP) { fail(buf, "La64TmpClash"); return; }
+    la64MovImm(buf, LA64_TMP, imm);
+    la64Emit(buf, la64R3(LA64_ADD_D, rd, rj, LA64_TMP), "add.d");
+}
+
+// 12 位偏移形的读写 → 变址形（ldx／stx），不是读写得 -1。
+function indexed(op: int): int {
+    if (op == LA64_LD_B) { return LA64_LDX_B; }
+    if (op == LA64_LD_H) { return LA64_LDX_H; }
+    if (op == LA64_LD_W) { return LA64_LDX_W; }
+    if (op == LA64_LD_D) { return LA64_LDX_D; }
+    if (op == LA64_ST_B) { return LA64_STX_B; }
+    if (op == LA64_ST_H) { return LA64_STX_H; }
+    if (op == LA64_ST_W) { return LA64_STX_W; }
+    if (op == LA64_ST_D) { return LA64_STX_D; }
+    if (op == LA64_LD_BU) { return LA64_LDX_BU; }
+    if (op == LA64_LD_HU) { return LA64_LDX_HU; }
+    if (op == LA64_LD_WU) { return LA64_LDX_WU; }
+    if (op == LA64_FLD_S) { return LA64_FLDX_S; }
+    if (op == LA64_FLD_D) { return LA64_FLDX_D; }
+    if (op == LA64_FST_S) { return LA64_FSTX_S; }
+    if (op == LA64_FST_D) { return LA64_FSTX_D; }
+    return -1;
+}
+// 有 14 位（×4）偏移形的读写 → ldptr／stptr，没有得 -1。
+function pointerForm(op: int): int {
+    if (op == LA64_LD_W) { return LA64_LDPTR_W; }
+    if (op == LA64_ST_W) { return LA64_STPTR_W; }
+    if (op == LA64_LD_D) { return LA64_LDPTR_D; }
+    if (op == LA64_ST_D) { return LA64_STPTR_D; }
+    return -1;
+}
+function isIntStore(op: int): bool { return op == LA64_ST_B || op == LA64_ST_H || op == LA64_ST_W || op == LA64_ST_D; }
+
+/// [base + off] 的读写，op 为 12 位偏移形：偏移在 −2048..2047 一条；4 的倍数且在 ±32 KiB 的 ld.w／ld.d／st.w／st.d 用 ldptr／stptr；
+/// 否则偏移进 t8 走变址形。base 不得是 t8；整数写的数据寄存器也不得是 t8（会被偏移盖掉）。
+export function la64Mem(buf: Ref<StructuredBuffer>, op: int, rt: int, base: int, off: int): void {
+    const x = indexed(op);
+    if (x < 0) { fail(buf, "BadMemoryOp"); return; }
+    if (off >= -2048 && off <= 2047) { la64Emit(buf, la64Si12(op, rt, base, off), "ldst"); return; }
+    const p = pointerForm(op);
+    if (p >= 0 && off % 4 == 0 && off >= -32768 && off <= 32764) { la64Emit(buf, la64Si14(p, rt, base, off), "ldst ptr"); return; }
+    if (base == LA64_TMP || (isIntStore(op) && rt == LA64_TMP)) { fail(buf, "La64TmpClash"); return; }
+    la64MovImm(buf, LA64_TMP, off);
+    la64Emit(buf, la64R3(x, rt, base, LA64_TMP), "ldst x");
+}
+
+// ---------------------------------------------------------------------------
+// 提交
+// ---------------------------------------------------------------------------
+
+function entryAt(buf: Ref<StructuredBuffer>, i: int): Ref<StructuredEntry> { return listGet(buf.entries, i) catch buf.invalid; }
+function isCond(kind: int): bool { return kind == K_B16 || kind == K_B21 || kind == K_BC21; }
+function shortRange(kind: int): int {
+    if (kind == K_B16) { return 131072; }
+    return 4194304;
+}
+
+// 代码节里各条目的绝对偏移（非代码节的条目为 -1），末尾多一项为代码节终点。起点是映像代码节的当前长度。
+function textOffsets(buf: Ref<StructuredBuffer>, long: List<int>, start: int): List<int> {
+    const at: List<int> = listNew();
+    let pos = start;
+    let sec = 0;
+    let i = 0;
+    while (i < listLen(buf.entries)) {
+        const e = entryAt(buf, i);
+        if (e.kind == 1) { sec = e.value; }
+        if (sec != 0) {
+            listPush(at, -1);
+        } else {
+            if (e.kind == 3 && e.value < 32) {
+                const al = 1 << e.value;
+                pos = pos + (al - pos % al) % al;
+            }
+            listPush(at, pos);
+            if (e.kind >= K_WORD && e.kind <= K_BC21) {
+                pos = pos + 4;
+                if ((listGet(long, i) catch 0) == 1) { pos = pos + 4; }
+            }
+        }
+        i = i + 1;
+    }
+    listPush(at, pos);
+    return at;
+}
+
+/// 缓冲里 x86 指令条目所在的标号（去重，按出现次序）：龙芯内核生成时据此一次报出全部未移植的手写例程。
+export function la64BufferX86Sites(buf: Ref<StructuredBuffer>): List<string> {
+    const out: List<string> = listNew();
+    let last = "(缓冲开头)";
+    let i = 0;
+    while (i < listLen(buf.entries)) {
+        const e = entryAt(buf, i);
+        if (e.kind == 2) { last = e.name; }
+        if (e.kind == 0 || e.kind == 13) {
+            let seen = false;
+            for (x in out) { if (x == last) { seen = true; } }
+            if (!seen) { listPush(out, last); }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// 函数清单（disasm 与 profile compile）：每写出一个字记一行，la64Disasm 的文本拆成助记符与操作数。target 非空时改写最后一个
+// 操作数：本缓冲内的跳转与 b／bl 写目标；pcalau12i 写 %pc_hi20(符号)，addi.d 与读写的页内 12 位写 %pc_lo12(符号)。
+function listWord(fn: int, line: int, word: int, fix: int, target: string): void {
+    const t = la64Disasm(word);
+    let sp = 0;
+    while (sp < len(t) && (byteAt(t, sp) catch 0) != 32) { sp = sp + 1; }
+    const ops: List<string> = listNew();
+    let from = sp + 1;
+    let i = sp + 1;
+    while (i < len(t)) {
+        if ((byteAt(t, i) catch 0) == 44) {
+            listPush(ops, strSub(t, from, i - from));
+            from = i + 2;
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    if (from < len(t)) { listPush(ops, strSub(t, from, len(t) - from)); }
+    const n = listLen(ops);
+    if (len(target) > 0 && n > 0) {
+        let last = target;
+        if (fix == FIX_LA64_PCALA_HI20) { last = "%pc_hi20(" + target + ")"; }
+        if (fix == FIX_LA64_PCALA_LO12) { last = "%pc_lo12(" + target + ")"; }
+        listSet(ops, n - 1, last);
+    }
+    asListingA64(fn, 0, strSub(t, 0, sp), ops, line);
+}
+function symText(sym: string, addend: int): string {
+    if (addend > 0) { return sym + "+" + toStr(addend); }
+    if (addend < 0) { return sym + "-" + toStr(-addend); }
+    return sym;
+}
+
+/// 提交龙芯缓冲：在 asStructuredBegin 之后调用（映像随之标为龙芯）。失败记在映像上（asFailedAs／asLastErrAs）。
+export function la64BufferSubmit(buf: Ref<StructuredBuffer>): void {
+    if (asFailedAs() != 0) { return; }
+    if (buf.isa != ISA_LA64) { asFailWith("NotLa64Buffer", 1); return; }
+    if (asImgIsa() != ISA_LA64) {
+        if (asA64Here() != 0) { asFailWith("MixedArchitectureImage", 1); return; }
+        asSetIsa(ISA_LA64);
+    }
+    nativeFunctionsIsa("loongarch64");
+    asStructuredSection(0);
+    // 代码节里的标号 → 条目号；同时报出缓冲里记下的失败。
+    const labels: Map<string, int> = mapNew();
+    let sec = 0;
+    let i = 0;
+    while (i < listLen(buf.entries)) {
+        const e = entryAt(buf, i);
+        if (e.kind == K_FAIL) { asFailWith(e.name, i + 1); return; }
+        if (e.kind == 1) { sec = e.value; }
+        if (e.kind == 2 && sec == 0) { mapSet(labels, e.name, i); }
+        if (e.kind == 0 || e.kind == 13) { asFailWith("X86InstructionInLa64Buffer:" + (listGet(la64BufferX86Sites(buf), 0) catch ""), i + 1); return; }
+        i = i + 1;
+    }
+    const long: List<int> = listNew();
+    i = 0;
+    while (i < listLen(buf.entries)) { listPush(long, 0); i = i + 1; }
+    const start = asA64Here();
+    let changed = true;
+    while (changed) {
+        changed = false;
+        const at = textOffsets(buf, long, start);
+        i = 0;
+        while (i < listLen(buf.entries)) {
+            const e = entryAt(buf, i);
+            if (isCond(e.kind) && (listGet(long, i) catch 0) == 0) {
+                if (!mapHas(labels, e.name)) { asFailWith("ConditionalBranchTargetNotLocal:" + e.name, i + 1); return; }
+                const d = (listGet(at, mapGet(labels, e.name) catch 0) catch 0) - (listGet(at, i) catch 0);
+                const r = shortRange(e.kind);
+                if (d < -r || d >= r) { listSet(long, i, 1); changed = true; }
+            }
+            i = i + 1;
+        }
+    }
+    const at = textOffsets(buf, long, start);
+    const listing = asListingActive() && buf.listFn >= 0;
+    const fn = buf.listFn;
+    sec = 0;
+    i = 0;
+    while (i < listLen(buf.entries)) {
+        if (asFailedAs() != 0) { return; }
+        const e = entryAt(buf, i);
+        const line = i + 1;
+        if (e.kind == 1) {
+            asStructuredSection(e.value);
+            sec = e.value;
+        } else if (e.kind == 2) {
+            asStructuredLabel(e.name);
+            if (listing && sec == 0) { asListingA64(fn, 2, e.name, listNew(), e.line); }
+        } else if (e.kind == 3) {
+            asStructuredAlign(e.value);
+        } else if (e.kind == 4) {
+            asStructuredByte(e.value);
+        } else if (e.kind == 5) {
+            asStructuredQuad(e.value);
+        } else if (e.kind == 6) {
+            asStructuredAddress(e.name);
+        } else if (e.kind == 7) {
+            asStructuredZero(e.value);
+        } else if (e.kind == 8) {
+            asStructuredAddressAddend(e.name, e.value);
+        } else if (e.kind == 9 || e.kind == 14) {
+            if (sec != 0) { asFailWith("FunctionOutsideText", line); return; }
+            if (e.kind == 14) { nativeFunctionBoundaryBegin(e.mnemonic, e.name, e.b.label, asA64Here()); } else { nativeFunctionOwnedBegin(e.mnemonic, e.name, e.a.label, asA64Here()); }
+        } else if (e.kind == 10) {
+            nativeFunctionEnd(asA64Here());
+        } else if (e.kind == 11) {
+            nativeFunctionPrologueEnd(asA64Here());
+        } else if (e.kind == 12) {
+            nativeFunctionEpilogueStart(asA64Here());
+        } else if (e.kind == K_FRAME) {
+            if (sec != 0 || e.nops < 1 || i < e.nops) { asFailWith("BadFrameEntry", line); return; }
+            nativeFunctionEvent(listGet(at, i - e.nops) catch -1, asA64Here(), e.name, e.b.imm, e.a.imm);
+        } else if (e.kind == 15) {
+            if (sec != 0) { asFailWith("FunctionOutsideText", line); return; }
+            nativeFunctionBegin(e.value, e.name, asA64Here());
+        } else if (e.kind >= K_WORD && e.kind <= K_BC21) {
+            if (sec != 0) { asFailWith("InstructionOutsideText", line); return; }
+            const here = listGet(at, i) catch 0;
+            if (asA64Here() != here) { asFailWith("La64LayoutMismatch", line); return; }
+            const local = mapHas(labels, e.name);
+            let d = 0;
+            if (local) { d = (listGet(at, mapGet(labels, e.name) catch 0) catch 0) - here; }
+            if (e.kind == K_WORD) {
+                asLa64Word(e.value, -1, "", 0);
+                if (listing) { listWord(fn, e.line, e.value, -1, ""); }
+            } else if (e.kind == K_FIX) {
+                asLa64Word(e.value, e.nops, e.name, e.a.imm);
+                if (listing) { listWord(fn, e.line, e.value, e.nops, symText(e.name, e.a.imm)); }
+            } else if (e.kind == K_BRANCH) {
+                let op = LA64_B;
+                if (e.nops == 1) { op = LA64_BL; }
+                if (local) {
+                    const w = la64B26(op, d);
+                    if (w < 0) { asFailWith("BranchOutOfRange:" + e.name, line); return; }
+                    asLa64Word(w, -1, "", 0);
+                    if (listing) { listWord(fn, e.line, w, -1, e.name); }
+                } else {
+                    asLa64Word(la64B26(op, 0), FIX_LA64_B26, e.name, 0);
+                    if (listing) { listWord(fn, e.line, la64B26(op, 0), FIX_LA64_B26, e.name); }
+                }
+            } else {
+                const long1 = (listGet(long, i) catch 0) == 1;
+                let op = e.value;
+                let off = d;
+                // 长形式：取反的短跳转跳过下一条（偏移 8），下一条 b 到目标（距离按 b 自己的位置算）。
+                if (long1) { op = invert(e.value); off = 8; }
+                let w = -1;
+                if (e.kind == K_B16) {
+                    w = la64B16(op, e.nops / 32, e.nops % 32, off);
+                } else if (e.kind == K_B21) {
+                    w = la64B21(op, e.nops, off);
+                } else {
+                    w = la64Bc21(op, e.nops, off);
+                }
+                if (w < 0) { asFailWith("BranchOutOfRange:" + e.name, line); return; }
+                asLa64Word(w, -1, "", 0);
+                if (listing) {
+                    let shown = e.name;
+                    if (long1) { shown = ""; }
+                    listWord(fn, e.line, w, -1, shown);
+                }
+                if (long1) {
+                    const far = la64B26(LA64_B, d - 4);
+                    if (far < 0) { asFailWith("BranchOutOfRange:" + e.name, line); return; }
+                    asLa64Word(far, -1, "", 0);
+                    if (listing) { listWord(fn, e.line, far, -1, e.name); }
+                }
+            }
+        } else {
+            asFailWith("BadInstruction", line);
+            return;
+        }
+        i = i + 1;
+    }
+    if (asFailedAs() == 0 && sec == 0 && asA64Here() != (listGet(at, listLen(buf.entries)) catch -1)) { asFailWith("La64LayoutMismatch", listLen(buf.entries)); }
+}

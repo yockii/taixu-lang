@@ -1,10 +1,11 @@
-// NRT 原生异步运行时（去 Zig 第 4 轮第 3 步；docs/design/v052-native-run-test-async-v0.1-20261014.md §四）：
-// 任务表、FIFO 就绪队、Future（Obj72 future 类，布局与 Zig FuturePayload 相同）、
-// 定时器、调度泵与四个任务内建。语义逐项对照 src/vm/interp/interp.zig 的任务运行时：
-// 惰性入队、同步栈排空后进入泵、单帧挂起（值槽整块移入快照，恢复后重新执行挂起点）、
-// 取消即清理、taskAwaitAny 插入序裁决、定时器 deadline 升序且同刻按登记序、死锁与
-// “退出时仍有未决任务”两种 trap。行为变化：2026-10-14 裁决的“只剩定时器时等待到期”（VM 同修）；
-// D3 v0.38 起 await 与 future 共享结果（VM 把结果移给第一个 await，再 await 得 None，违背 T | Error 的类型）。
+// NRT 原生异步运行时：
+// 任务表、FIFO 就绪队、Future（Obj72 future 类）、
+// 定时器、调度泵与四个任务内建。语义要点：
+// 惰性入队、单帧挂起（值槽整块移入快照，恢复后重新执行挂起点）、取消即清理、taskAwaitAny 插入序裁决、
+// 定时器 deadline 升序且同刻按登记序、死锁 trap。行为变化：“只剩定时器时等待到期”（VM 同修）；
+// D3 v0.38 起 await 与 future 共享结果（VM 把结果移给第一个 await，再 await 得 None，违背 T | Error 的类型）；
+// D3 v0.53 起调度泵只在同步入口（main、test 块、threadSpawn 实参里的箭头）的 await／taskAwaitAny 里就地运行，
+// 入口返回即取消全部未完成的任务（原先 main 返回后泵跑完剩余任务，退出时仍有未决任务 trap）。
 //
 // 只有任务的基帧能挂起：生成代码把 rbx（窗口基址）传进来，与任务窗口不符时按
 // “await 执行于无任务上下文”报错（async 着色经函数值擦除后在任务内同步调用）。
@@ -15,7 +16,7 @@ import { ARITY, check, text, memcpyName, fatal, trapText, trapAt, arity, argTag,
 import { tRawSyscall, tUnix } from "./target";
 import { uxSys, uxClock } from "./unix_sys";
 
-export const NRT_ASYNC_EXPORTS: string = "__tx_task_spawn __tx_task_await __tx_task_bad_resume __tx_task_pump __tx_task_discard_tests __tx_task_pending __tx_bi_task_cancel __tx_bi_task_cancelled __tx_bi_task_await_any __tx_bi_sleep_ms";
+export const NRT_ASYNC_EXPORTS: string = "__tx_task_spawn __tx_task_await __tx_task_bad_resume __tx_task_cancel_all __tx_task_pending __tx_bi_task_cancel __tx_bi_task_cancelled __tx_bi_task_await_any __tx_bi_sleep_ms";
 
 // 任务记录（96 字节，按任务号索引；表增长会搬动，跨调用一律按号重取）：
 // state@0（0 排队 1 运行 2 挂起 3 完成 4 已取消）cancel@8 fn@16 future@24
@@ -384,12 +385,22 @@ function emitTaskCore(b: Ref<StructuredBuffer>): void {
     rtLoad(f, "st", L("o"), FUT_STATE, 4);
     rtIf(f, L("st"), "eq", I(1), "done");
     rtIf(f, L("st"), "eq", I(2), "cancelled");
-    rtIf(f, G("__tx_task_cur"), "eq", I(0), "notask");
+    rtIf(f, G("__tx_task_cur"), "eq", I(0), "entry");
     rtIf(f, L("win"), "ne", G("__tx_task_win"), "notask");
     rtSet(f, "e", G("__tx_task_cur")); rtOp(f, "e", L("e"), "sub", I(1));
     rtCall2(f, "", "__tx_task_observe", L("h"), L("e"));
     rtCall3(f, "", "__tx_task_suspend", L("win"), L("fn"), L("pc"));
     rtRet(f, I(1));
+    // 同步入口（D3 v0.53：main、test 块、threadSpawn 实参里的箭头——帧就开在入口窗口）：就地运行调度泵直到 future
+    // 终结。擦除着色后同步调用的 async 函数帧在入口之上，仍按无任务上下文 trap。
+    rtLabel(f, "entry");
+    rtIf(f, L("win"), "ne", G("__tx_nrt_entry_win"), "notask");
+    rtCall3(f, "", "__tx_task_step", L("win"), L("fn"), L("pc"));
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("h"));
+    rtLoad(f, "st", L("o"), FUT_STATE, 4);
+    rtIf(f, L("st"), "eq", I(1), "done");
+    rtIf(f, L("st"), "eq", I(2), "cancelled");
+    rtJump(f, "entry");
     rtLabel(f, "done");
     // 结果与 future 共享（D3 v0.38 §6.12-2）：槽得一份引用，future 留着自己那份，再 await 得同一结果；future 释放时
     // 经载荷视图连带释放结果。先 retain 再写槽：槽 A 原来放的正是这个 future，写槽可能放掉它的最后一个引用。
@@ -460,9 +471,14 @@ function emitTaskCore(b: Ref<StructuredBuffer>): void {
     rtIf(f, L("p"), "eq", I(0), "resolve");
     rtLoad(f, "x", L("t"), 80, 8); rtShift(f, "x", L("x"), "shl", 4); rtOp(f, "x", L("x"), "add", G("__tx_rt_table_ptr"));
     rtLoad(f, "fp", L("x"), 0, 8); rtLoad(f, "reg", L("x"), 8, 4);
-    rtOp(f, "x", L("cfn"), "and", I(4294967295)); rtShift(f, "x", L("x"), "shl", 4); rtOp(f, "x", L("x"), "add", G("__tx_rt_table_ptr"));
+    // 开窗处：取消者帧（cwin，函数 cfn）之上；cfn 为 NO_OWNER 时 cwin 即开窗处（入口返回时的 __tx_task_cancel_all）。
+    rtSet(f, "lw", L("cwin"));
+    rtOp(f, "x", L("cfn"), "and", I(4294967295));
+    rtIf(f, L("x"), "eq", I(NO_OWNER), "lwset");
+    rtShift(f, "x", L("x"), "shl", 4); rtOp(f, "x", L("x"), "add", G("__tx_rt_table_ptr"));
     rtLoad(f, "x", L("x"), 8, 4); rtShift(f, "x", L("x"), "shl", 4);
     rtOp(f, "lw", L("cwin"), "add", L("x"));
+    rtLabel(f, "lwset");
     rtShift(f, "x", L("reg"), "shl", 4); rtOp(f, "x", L("x"), "add", L("lw"));
     rtIf(f, L("x"), "ule", G("__tx_stack_limit"), "room");
     rtCall1(f, "x", "__tx_stack_more", L("x"));
@@ -507,7 +523,7 @@ function emitTaskCore(b: Ref<StructuredBuffer>): void {
     rtLoad(f, "e", L("t"), 80, 8); rtShift(f, "e", L("e"), "shl", 4); rtOp(f, "e", L("e"), "add", G("__tx_rt_table_ptr"));
     rtLoad(f, "fp", L("e"), 0, 8); rtLoad(f, "reg", L("e"), 8, 4);
     rtSet(f, "win", G("__tx_task_win"));
-    // 快照移回之前先确保窗口所在的值槽栈已提交（2d，线程设计 §十七）。
+    // 快照移回之前先确保窗口所在的值槽栈已提交（2d）。
     rtShift(f, "sz", L("reg"), "shl", 4); rtOp(f, "sz", L("sz"), "add", L("win"));
     rtCall1(f, "", "__tx_stack_ensure", L("sz"));
     rtLoad(f, "snap", L("t"), 64, 8);
@@ -636,45 +652,34 @@ function emitTimers(b: Ref<StructuredBuffer>): void {
 }
 
 function emitPump(b: Ref<StructuredBuffer>): void {
-    // 同步 test 不启动泵：没有已运行/挂起帧，只取消未启动的任务并放开定时器。
-    // 就绪队只有任务号，先清空再逐记录取消，避免逐个摘队造成二次方清理。
-    let f = rtBegin(b, "__tx_task_discard_tests", "", "p n i t s", 4, "bootstrap/selfhost/nrt_async.tx");
+    // __tx_task_cancel_all(lw)：入口（main、test 块、线程函数）返回时取消全部未完成的任务（D3 v0.53）：按任务表序
+    // 逐个取消，挂起中的先在 lw 处开窗按后进先出执行已登记的 defer（§6.12-6）；取消过程中新建的任务同样取消，直到一遍下来没有
+    // 可取消的；然后排空定时器。lw 在入口结果槽之后，结果原样留给调用方。每遍先清空就绪队（其中的任务本遍都会取消），免得
+    // 逐个摘队造成二次方清理。
+    let f = rtBegin(b, "__tx_task_cancel_all", "lw", "p n i t s more", 5, "bootstrap/selfhost/nrt_async.tx");
+    rtLabel(f, "pass");
+    rtSet(f, "more", I(0));
     rtSet(f, "p", A("__tx_task_rq")); rtStore(f, L("p"), 8, I(0), 8);
     rtSet(f, "p", A("__tx_task_tab")); rtLoad(f, "n", L("p"), 8, 8);
     rtSet(f, "i", I(0));
     rtLabel(f, "each");
-    rtIf(f, L("i"), "ge", L("n"), "timers");
+    rtIf(f, L("i"), "ge", L("n"), "check");
     rtCall1(f, "t", "__tx_task_at", L("i")); rtLoad(f, "s", L("t"), 0, 8);
-    rtIf(f, L("s"), "ne", I(ST_QUEUED), "next");
-    // 首启前 saved 必为零；取消只释放输入，不读取调用方函数或运行 defer。
-    rtCall4(f, "", "__tx_task_cancel", L("i"), I(0), I(0), I(0));
+    rtIf(f, L("s"), "eq", I(ST_QUEUED), "cancel");
+    rtIf(f, L("s"), "ne", I(ST_SUSPENDED), "next");
+    rtLabel(f, "cancel");
+    rtCall4(f, "", "__tx_task_cancel", L("i"), L("lw"), I(NO_OWNER), I(0));
+    rtSet(f, "more", I(1));
     rtLabel(f, "next");
     rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "each");
-    rtLabel(f, "timers");
+    rtLabel(f, "check");
+    rtIf(f, L("more"), "ne", I(0), "pass");
     rtCall0(f, "", "__tx_task_drain");
     rtRetVoid(f); check(f);
 
-    // __tx_task_pump()：main 返回后的调度泵。每轮先收割到期定时器，再按开队时的
-    // 就绪队快照依次运行（轮内被取消摘队者跳过）；就绪队空而仍有未决任务时，有
-    // 定时器就睡到最早到期再继续，没有就是死锁（trap 4014）。无任务程序零迭代。
-    f = rtBegin(b, "__tx_task_pump", "", "p n i tid t x idx k", 5, "bootstrap/selfhost/nrt_async.tx");
-    rtSet(f, "p", A("__tx_task_tab")); rtLoad(f, "n", L("p"), 8, 8);
-    rtSet(f, "p", A("__tx_task_tm")); rtLoad(f, "x", L("p"), 8, 8);
-    rtOp(f, "x", L("x"), "or", L("n"));
-    rtIf(f, L("x"), "eq", I(0), "out");
-    rtSet(f, "x", G("__tx_nrt_entry_win")); rtOp(f, "x", L("x"), "add", I(16)); rtSetGlobal(f, "__tx_task_win", L("x"));
-    rtLabel(f, "round");
-    rtCall0(f, "", "__tx_task_recycle");
-    rtCall0(f, "", "__tx_task_harvest");
+    // __tx_task_round()：跑一轮——按开轮时的就绪队快照依次运行（轮内被取消摘队者跳过）。
+    f = rtBegin(b, "__tx_task_round", "", "p n i tid t x idx k", 5, "bootstrap/selfhost/nrt_async.tx");
     rtSet(f, "p", A("__tx_task_rq")); rtLoad(f, "n", L("p"), 8, 8);
-    rtIf(f, L("n"), "ne", I(0), "snapshot");
-    rtSet(f, "p", A("__tx_task_tm")); rtLoad(f, "x", L("p"), 8, 8);
-    rtIf(f, L("x"), "eq", I(0), "finish");
-    rtCall0(f, "x", "__tx_task_pending");
-    rtIf(f, L("x"), "eq", I(0), "finish");
-    rtCall0(f, "", "__tx_task_wait");
-    rtJump(f, "round");
-    rtLabel(f, "snapshot");
     rtSet(f, "p", A("__tx_task_round")); rtStore(f, L("p"), 8, I(0), 8);
     rtSet(f, "i", I(0));
     rtLabel(f, "copy");
@@ -686,7 +691,7 @@ function emitPump(b: Ref<StructuredBuffer>): void {
     rtLabel(f, "run");
     rtSet(f, "i", I(0));
     rtLabel(f, "each");
-    rtIf(f, L("i"), "ge", L("n"), "round");
+    rtIf(f, L("i"), "ge", L("n"), "out");
     rtSet(f, "p", A("__tx_task_round")); rtLoad(f, "p", L("p"), 0, 8); rtShift(f, "x", L("i"), "shl", 3); rtOp(f, "p", L("p"), "add", L("x"));
     rtLoad(f, "tid", L("p"), 0, 8);
     rtCall1(f, "t", "__tx_task_at", L("tid"));
@@ -705,14 +710,30 @@ function emitPump(b: Ref<StructuredBuffer>): void {
     rtCall1(f, "", "__tx_task_run", L("tid"));
     rtLabel(f, "next");
     rtOp(f, "i", L("i"), "add", I(1)); rtJump(f, "each");
-    rtLabel(f, "finish");
+    rtLabel(f, "out"); rtRetVoid(f); check(f);
+
+    // __tx_task_step(win, fn, pc)：同步入口里等待的一步（D3 v0.53）。任务窗口开在入口帧（win，函数 fn）之上；先收割到期
+    // 定时器，收割到了就返回由调用方重查；否则就绪队非空就跑一轮；都没有时有定时器就睡到最早到期，没有就是死锁（trap 4014，
+    // 位置是这条 await）——所等的再也完成不了。入口帧不能被调用，泵不会重入。
+    f = rtBegin(b, "__tx_task_step", "win fn pc", "x k0 k1 p n", 5, "bootstrap/selfhost/nrt_async.tx");
+    rtOp(f, "x", L("fn"), "and", I(4294967295)); rtShift(f, "x", L("x"), "shl", 4); rtOp(f, "x", L("x"), "add", G("__tx_rt_table_ptr"));
+    rtLoad(f, "x", L("x"), 8, 4); rtShift(f, "x", L("x"), "shl", 4); rtOp(f, "x", L("x"), "add", L("win"));
+    rtSetGlobal(f, "__tx_task_win", L("x"));
+    rtCall0(f, "", "__tx_task_recycle");
+    rtSet(f, "p", A("__tx_task_tm")); rtLoad(f, "k0", L("p"), 8, 8);
     rtCall0(f, "", "__tx_task_harvest");
-    rtCall0(f, "", "__tx_task_drain");
-    rtCall0(f, "x", "__tx_task_pending");
-    rtIf(f, L("x"), "ne", I(0), "deadlock");
+    rtSet(f, "p", A("__tx_task_tm")); rtLoad(f, "k1", L("p"), 8, 8);
+    rtIf(f, L("k1"), "ne", L("k0"), "out");
+    rtSet(f, "p", A("__tx_task_rq")); rtLoad(f, "n", L("p"), 8, 8);
+    rtIf(f, L("n"), "eq", I(0), "idle");
+    rtCall0(f, "", "__tx_task_round");
+    rtJump(f, "out");
+    rtLabel(f, "idle");
+    rtIf(f, L("k1"), "eq", I(0), "deadlock");
+    rtCall0(f, "", "__tx_task_wait");
     rtLabel(f, "out"); rtRetVoid(f);
     rtLabel(f, "deadlock");
-    rtCallList(f, "", "__tx_trap", trapArgs(A(text(b, DEADLOCK)), len(DEADLOCK)));
+    rtCallList(f, "", "__tx_trap", trapArgs(L("fn"), L("pc"), A(text(b, DEADLOCK)), len(DEADLOCK)));
     rtRetVoid(f); check(f);
 
     // 恢复分派找不到挂起点：内核与生成代码不一致。
@@ -721,9 +742,9 @@ function emitPump(b: Ref<StructuredBuffer>): void {
     rtRetVoid(f); check(f);
 }
 
-function trapArgs(msg: Ref<RtOp>, n: int): List<Ref<RtOp>> {
+function trapArgs(fn: Ref<RtOp>, pc: Ref<RtOp>, msg: Ref<RtOp>, n: int): List<Ref<RtOp>> {
     const xs: List<Ref<RtOp>> = listNew();
-    listPush(xs, I(0)); listPush(xs, I(0)); listPush(xs, I(4014)); listPush(xs, msg); listPush(xs, I(n));
+    listPush(xs, fn); listPush(xs, pc); listPush(xs, I(4014)); listPush(xs, msg); listPush(xs, I(n));
     return xs;
 }
 
@@ -766,6 +787,7 @@ function emitBuiltins(b: Ref<StructuredBuffer>): void {
     arity(b, f, 1);
     argTag(f, 0, "s", "t", 15, "notlist");
     rtLoad(f, "h", L("s"), 8, 4);
+    rtLabel(f, "top");
     rtCall1(f, "o", "__tx_native_object_address_v1", L("h"));
     rtLoad(f, "n", L("o"), 40, 8);
     rtIf(f, L("n"), "eq", I(0), "empty");
@@ -787,7 +809,7 @@ function emitBuiltins(b: Ref<StructuredBuffer>): void {
     rtCall3(f, "e", "__tx_nrt_str_copy", A(text(b, emptyMsg)), I(len(emptyMsg)), I(2));
     rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(5), L("e")); rtRetVoid(f);
     rtLabel(f, "pending");
-    rtIf(f, G("__tx_task_cur"), "eq", I(0), "notask");
+    rtIf(f, G("__tx_task_cur"), "eq", I(0), "entry");
     rtIf(f, L("win"), "ne", G("__tx_task_win"), "notask");
     rtSet(f, "c", G("__tx_task_cur")); rtOp(f, "c", L("c"), "sub", I(1));
     rtSet(f, "i", I(0));
@@ -802,10 +824,15 @@ function emitBuiltins(b: Ref<StructuredBuffer>): void {
     rtCall3(f, "", "__tx_task_suspend", L("win"), L("fn"), L("pc"));
     rtSetGlobal(f, "__tx_task_susp", I(1));
     rtRetVoid(f);
+    // 同步入口里（同 await，D3 v0.53）：就地跑泵一步后重扫（列表可能被任务改动，长度一并重取）。
+    rtLabel(f, "entry");
+    rtIf(f, L("win"), "ne", G("__tx_nrt_entry_win"), "notask");
+    rtCall3(f, "", "__tx_task_step", L("win"), L("fn"), L("pc"));
+    rtJump(f, "top");
     rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
     trapAt(b, f, "notlist", 4010, "taskAwaitAny 的实参不是 List");
     trapAt(b, f, "notfut", 4010, "taskAwaitAny 元素须为 Future");
-    trapAt(b, f, "notask", 4010, "taskAwaitAny 挂起等待只能在 async 任务内（同步上下文无暂停点）");
+    trapAt(b, f, "notask", 4010, "taskAwaitAny 等待只能在 async 函数、main、test 块或 threadSpawn 实参里的箭头内（同步上下文无暂停点）");
     rtRetVoid(f); check(f);
 
     // sleepMs(ms): Future<void>——登记定时器（deadline＝单调钟＋ms，饱和不回绕；

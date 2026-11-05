@@ -1,0 +1,454 @@
+// RISC-V 汇编层：RISC-V 代码写进 asBufferNewRv64 建的
+// StructuredBuffer（数据、标号、节切换照常用 asBuffer*），提交时做跨度定长再写进当前汇编映像。结构同 la64_asm.tx。
+// - 指令字由 rv64_encode 的纯函数编好再交进来；本层只管标号、跳转、符号修补与合法化。编码函数拒绝的指令（-1）记成失败条目，
+//   提交时报出。
+// - 缓冲内条件跳转（目标标号定义在本缓冲的代码节里）：先按短形式排（±4 KiB），越界的换成“取反条件跳过下一条＋jal x0”（±1 MiB），
+//   再越界换成“取反条件＋auipc t6＋jalr x0”，重算偏移直到不再变化（只会变长，一定收敛）。无条件跳转 jal x0，越界换 auipc t6＋jalr x0。
+// - 调用一律 auipc ra＋jalr ra：目标在本缓冲的就地算出，不在的交修补（R_RISCV_CALL_PLT，±2 GiB，不出跳板）；跳到本缓冲以外的
+//   符号同为 auipc t6＋jalr x0（CALL_PLT）。条件跳转只许跳到本缓冲里的标号。
+// - 符号地址：auipc＋addi（PCREL_HI20＋PCREL_LO12_I），读写 auipc＋读写的 LO12（_I／_S）。LO12 的符号是所配 auipc 处的局部标号
+//   __tx_pcrel_<代码节偏移>（提交时在 auipc 前定义，偏移在映像里唯一、两次生成相同）。不发 R_RISCV_RELAX，不出压缩指令。
+// - t6（x31）留给本层的合法化（大常数加法、大偏移读写、远跳），不分配给值；t5（x30）留给上层（宏层自用与间接目标）。
+import { StructuredBuffer, StructuredEntry, asBufferNew, asStructuredImm, asStructuredSection, asStructuredLabel, asStructuredAlign, asStructuredByte, asStructuredQuad, asStructuredAddress, asStructuredZero, asStructuredAddressAddend } from "./assemble";
+import { asRv64Word, asA64Here, asImgIsa, asSetIsa, asFailWith, asFailedAs, FIX_RV64_CALL, FIX_RV64_PCREL_HI20, FIX_RV64_PCREL_LO12_I, FIX_RV64_PCREL_LO12_S, asListingActive, asListingA64 } from "./assemble";
+import { nativeFunctionsActive, nativeFunctionsIsa, nativeFunctionBegin, nativeFunctionOwnedBegin, nativeFunctionBoundaryBegin, nativeFunctionEnd, nativeFunctionPrologueEnd, nativeFunctionEpilogueStart, nativeFunctionEvent } from "./native_function_data";
+import { rv64R, rv64I, rv64S, rv64B, rv64U, rv64J, rv64Shift } from "./rv64_encode";
+import { RV64_ADD, RV64_SUB, RV64_ADDI, RV64_ADDIW, RV64_SLLI, RV64_LUI, RV64_AUIPC, RV64_JALR } from "./rv64_encode";
+import { RV64_BEQ, RV64_BNE, RV64_BLT, RV64_BGE, RV64_BLTU, RV64_BGEU } from "./rv64_encode";
+import { RV64_LB, RV64_LH, RV64_LW, RV64_LD, RV64_LBU, RV64_LHU, RV64_LWU, RV64_FLW, RV64_FLD, RV64_SB, RV64_SH, RV64_SW, RV64_SD, RV64_FSW, RV64_FSD } from "./rv64_encode";
+import { rv64Disasm } from "./rv64_disasm";
+import { ISA_RV64 } from "./target";
+
+const K_WORD: int = 30;
+const K_FIX: int = 31;
+const K_CALL: int = 32;
+const K_B: int = 33;
+const K_FAIL: int = 36;
+const K_FRAME: int = 37;
+
+export const RV64_ZERO_REG: int = 0;
+export const RV64_RA_REG: int = 1;
+export const RV64_SP_REG: int = 2;
+/// 本层合法化用的临时寄存器 t6（x31）。
+export const RV64_TMP: int = 31;
+
+/// RISC-V 代码的缓冲：数据与标号条目同 asBufferNew，指令只能经本模块写入。
+export function asBufferNewRv64(): Ref<StructuredBuffer> {
+    const b = asBufferNew();
+    b.isa = ISA_RV64;
+    return b;
+}
+
+function add(buf: Ref<StructuredBuffer>, kind: int, nops: int, value: int, name: string, addend: int): void {
+    const m = buf.missing;
+    let a = m;
+    if (addend != 0) { a = asStructuredImm(addend); }
+    listPush(buf.entries, new StructuredEntry { kind: kind, mnemonic: "", nops: nops, a: a, b: m, c: m, value: value, name: name, line: buf.line });
+}
+function fail(buf: Ref<StructuredBuffer>, why: string): void { add(buf, K_FAIL, 0, 0, why, 0); }
+
+/// 帧事件（函数目录）：描述从 first 号条目（发射前记下的条目数）起到此为止的指令，不占字节；提交时按两端偏移记进目录。
+/// 一组指令的几个事件依次跟在后面（序言的 addi sp／sd ra／sd s0 记“压入 ra、压入 s0”）。
+export function rv64Frame(buf: Ref<StructuredBuffer>, first: int, kind: string, reg: int, bytes: int): void {
+    if (!nativeFunctionsActive()) { return; }
+    const m = buf.missing;
+    listPush(buf.entries, new StructuredEntry { kind: K_FRAME, mnemonic: "", nops: listLen(buf.entries) - first, a: asStructuredImm(bytes),
+            b: asStructuredImm(reg), c: m, value: 0, name: kind, line: buf.line });
+}
+/// 一条编好的指令；word 为 -1（编码函数拒绝）时记失败并说明是哪条。
+export function rv64Emit(buf: Ref<StructuredBuffer>, word: int, what: string): void {
+    if (buf.isa != ISA_RV64) { fail(buf, "NotRv64Buffer"); return; }
+    if (word < 0) { fail(buf, "UnencodableInstruction:" + what); return; }
+    add(buf, K_WORD, 0, word, "", 0);
+}
+/// sp -= bytes（序言的分配）：2048 以内一条 addi，否则字节数进 t6 再一条 sub；事件覆盖整段（只有最后一条动 sp）。
+export function rv64FrameAlloc(buf: Ref<StructuredBuffer>, bytes: int): void {
+    if (bytes < 0 || bytes % 16 != 0) { fail(buf, "BadFrameAllocation"); return; }
+    if (bytes == 0) { return; }
+    const first = listLen(buf.entries);
+    if (bytes <= 2048) {
+        rv64Emit(buf, rv64I(RV64_ADDI, RV64_SP_REG, RV64_SP_REG, -bytes), "addi sp");
+    } else {
+        rv64MovImm(buf, RV64_TMP, bytes);
+        rv64Emit(buf, rv64R(RV64_SUB, RV64_SP_REG, RV64_SP_REG, RV64_TMP), "sub sp");
+    }
+    rv64Frame(buf, first, "allocate-stack", RV64_SP_REG, bytes);
+}
+/// 跳转（link＝0）或调用（link＝1）到标号或符号。
+export function rv64Br(buf: Ref<StructuredBuffer>, link: int, target: string): void {
+    if (len(target) == 0 || (link != 0 && link != 1)) { fail(buf, "BadBranch"); return; }
+    add(buf, K_CALL, link, 0, target, 0);
+}
+/// beq／bne／blt／bge／bltu／bgeu rs1, rs2 到本缓冲的标号。
+export function rv64BCond(buf: Ref<StructuredBuffer>, op: int, rs1: int, rs2: int, target: string): void {
+    if (invert(op) < 0 || rv64B(op, rs1, rs2, 0) < 0 || len(target) == 0) { fail(buf, "BadBranch"); return; }
+    add(buf, K_B, rs1 * 32 + rs2, op, target, 0);
+}
+/// 条件跳转取反（beq↔bne、blt↔bge、bltu↔bgeu）；不是条件跳转得 -1。
+function invert(op: int): int {
+    if (op == RV64_BEQ) { return RV64_BNE; }
+    if (op == RV64_BNE) { return RV64_BEQ; }
+    if (op == RV64_BLT) { return RV64_BGE; }
+    if (op == RV64_BGE) { return RV64_BLT; }
+    if (op == RV64_BLTU) { return RV64_BGEU; }
+    if (op == RV64_BGEU) { return RV64_BLTU; }
+    return -1;
+}
+
+function fixWord(buf: Ref<StructuredBuffer>, word: int, kind: int, symbol: string, addend: int, what: string): void {
+    if (word < 0) { fail(buf, "UnencodableInstruction:" + what); return; }
+    if (len(symbol) == 0) { fail(buf, "BadSymbol"); return; }
+    add(buf, K_FIX, kind, word, symbol, addend);
+}
+/// rd = 符号地址＋addend（auipc＋addi）。
+export function rv64AddrOf(buf: Ref<StructuredBuffer>, rd: int, symbol: string, addend: int): void {
+    fixWord(buf, rv64U(RV64_AUIPC, rd, 0), FIX_RV64_PCREL_HI20, symbol, addend, "auipc");
+    fixWord(buf, rv64I(RV64_ADDI, rd, rd, 0), FIX_RV64_PCREL_LO12_I, symbol, 0, "addi");
+}
+/// 读写符号处的数据：op 为读（rt 为结果）或写（rt 为数据），地址的高位经 tmp。
+export function rv64SymAccess(buf: Ref<StructuredBuffer>, op: int, rt: int, tmp: int, symbol: string, addend: int): void {
+    if (!isLoad(op) && !isStore(op)) { fail(buf, "BadMemoryOp"); return; }
+    fixWord(buf, rv64U(RV64_AUIPC, tmp, 0), FIX_RV64_PCREL_HI20, symbol, addend, "auipc");
+    if (isLoad(op)) { fixWord(buf, rv64I(op, rt, tmp, 0), FIX_RV64_PCREL_LO12_I, symbol, 0, "load"); }
+    else { fixWord(buf, rv64S(op, rt, tmp, 0), FIX_RV64_PCREL_LO12_S, symbol, 0, "store"); }
+}
+
+function sext(v: int, n: int): int { return (v << (64 - n)) >> (64 - n); }
+
+/// 64 位常数进 rd，照 LLVM 的递归序列（RISCVMatInt）：32 位有符号以内 lui（高 20 位）＋addiw（低 12 位，带符号扩展）；更宽的
+/// 拿掉低 12 位（按符号取）后去掉末尾的 0，先构造剩下的高位，再 slli 移回、addi 补低 12 位。至多 8 条，不读内存。
+export function rv64MovImm(buf: Ref<StructuredBuffer>, rd: int, value: int): void {
+    if (value >= -2147483648 && value <= 2147483647) {
+        const lo = sext(value & 4095, 12);
+        const hi = ((value - lo) >>> 12) & 1048575;
+        if (hi != 0) {
+            rv64Emit(buf, rv64U(RV64_LUI, rd, hi), "lui");
+            if (lo != 0) { rv64Emit(buf, rv64I(RV64_ADDIW, rd, rd, lo), "addiw"); }
+        } else {
+            rv64Emit(buf, rv64I(RV64_ADDI, rd, 0, lo), "addi");
+        }
+        return;
+    }
+    const lo = sext(value & 4095, 12);
+    // (value − lo) >> 12，不经可能溢出的减法：低 12 位按符号取时向上进 1。高位到 2^51 时由移位在机器上回绕，结果仍对。
+    let hi = (value >> 12) + (((value & 4095) + 2048) >> 12);
+    let shift = 12;
+    while ((hi & 1) == 0) { hi = hi >> 1; shift = shift + 1; }
+    rv64MovImm(buf, rd, hi);
+    rv64Emit(buf, rv64Shift(RV64_SLLI, rd, rd, shift, 64), "slli");
+    if (lo != 0) { rv64Emit(buf, rv64I(RV64_ADDI, rd, rd, lo), "addi"); }
+}
+
+/// rd = rs + imm（可为负）：12 位有符号以内一条 addi，否则 imm 进 t6 再 add；rs 不得是 t6。
+export function rv64AddImm(buf: Ref<StructuredBuffer>, rd: int, rs: int, imm: int): void {
+    if (imm >= -2048 && imm <= 2047) { rv64Emit(buf, rv64I(RV64_ADDI, rd, rs, imm), "addi"); return; }
+    if (rs == RV64_TMP) { fail(buf, "Rv64TmpClash"); return; }
+    rv64MovImm(buf, RV64_TMP, imm);
+    rv64Emit(buf, rv64R(RV64_ADD, rd, rs, RV64_TMP), "add");
+}
+
+function isLoad(op: int): bool {
+    return op == RV64_LB || op == RV64_LH || op == RV64_LW || op == RV64_LD || op == RV64_LBU || op == RV64_LHU || op == RV64_LWU || op == RV64_FLW || op == RV64_FLD;
+}
+function isStore(op: int): bool { return op == RV64_SB || op == RV64_SH || op == RV64_SW || op == RV64_SD || op == RV64_FSW || op == RV64_FSD; }
+function isIntStore(op: int): bool { return op == RV64_SB || op == RV64_SH || op == RV64_SW || op == RV64_SD; }
+
+/// [base + off] 的读写：偏移在 −2048..2047 一条；否则 t6 = base + off 再以偏移 0 读写。base 不得是 t6；整数写的数据寄存器也不得是
+/// t6（会被地址盖掉）。
+export function rv64Mem(buf: Ref<StructuredBuffer>, op: int, rt: int, base: int, off: int): void {
+    if (!isLoad(op) && !isStore(op)) { fail(buf, "BadMemoryOp"); return; }
+    let b = base;
+    let o = off;
+    if (off < -2048 || off > 2047) {
+        if (base == RV64_TMP || (isIntStore(op) && rt == RV64_TMP)) { fail(buf, "Rv64TmpClash"); return; }
+        rv64MovImm(buf, RV64_TMP, off);
+        rv64Emit(buf, rv64R(RV64_ADD, RV64_TMP, base, RV64_TMP), "add");
+        b = RV64_TMP;
+        o = 0;
+    }
+    if (isLoad(op)) { rv64Emit(buf, rv64I(op, rt, b, o), "load"); } else { rv64Emit(buf, rv64S(op, rt, b, o), "store"); }
+}
+
+// ---------------------------------------------------------------------------
+// 提交
+// ---------------------------------------------------------------------------
+
+function entryAt(buf: Ref<StructuredBuffer>, i: int): Ref<StructuredEntry> { return listGet(buf.entries, i) catch buf.invalid; }
+function inRange(d: int, lo: int, hi: int): bool { return d >= lo && d <= hi; }
+
+// 条目占的字节：普通字与修补字 4；调用 8；跳转按长短级（0 短、1 中、2 长）。
+function size(e: Ref<StructuredEntry>, level: int, local: bool): int {
+    if (e.kind == K_WORD || e.kind == K_FIX) { return 4; }
+    if (e.kind == K_CALL) {
+        if (e.nops == 1 || !local || level > 0) { return 8; }
+        return 4;
+    }
+    if (e.kind == K_B) { return 4 + 4 * level; }
+    return 0;
+}
+
+// 代码节里各条目的绝对偏移（非代码节的条目为 -1），末尾多一项为代码节终点。起点是映像代码节的当前长度。
+function textOffsets(buf: Ref<StructuredBuffer>, levels: List<int>, labels: Map<string, int>, start: int): List<int> {
+    const at: List<int> = listNew();
+    let pos = start;
+    let sec = 0;
+    let i = 0;
+    while (i < listLen(buf.entries)) {
+        const e = entryAt(buf, i);
+        if (e.kind == 1) { sec = e.value; }
+        if (sec != 0) {
+            listPush(at, -1);
+        } else {
+            if (e.kind == 3 && e.value < 32) {
+                const al = 1 << e.value;
+                pos = pos + (al - pos % al) % al;
+            }
+            listPush(at, pos);
+            if (e.kind >= K_WORD && e.kind <= K_B) { pos = pos + size(e, listGet(levels, i) catch 0, mapHas(labels, e.name)); }
+        }
+        i = i + 1;
+    }
+    listPush(at, pos);
+    return at;
+}
+
+/// 缓冲里 x86 指令条目所在的标号（去重，按出现次序）：RISC-V 内核生成时据此一次报出全部未移植的手写例程。
+export function rv64BufferX86Sites(buf: Ref<StructuredBuffer>): List<string> {
+    const out: List<string> = listNew();
+    let last = "(缓冲开头)";
+    let i = 0;
+    while (i < listLen(buf.entries)) {
+        const e = entryAt(buf, i);
+        if (e.kind == 2) { last = e.name; }
+        if (e.kind == 0 || e.kind == 13) {
+            let seen = false;
+            for (x in out) { if (x == last) { seen = true; } }
+            if (!seen) { listPush(out, last); }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// 函数清单（disasm 与 profile compile）：每写出一个字记一行，rv64Disasm 的文本拆成助记符与操作数。target 非空时改写最后一个
+// 操作数：跳转写目标；auipc 写 %pcrel_hi(符号)，addi 与读写的 12 位写 %pcrel_lo(符号)（读写的偏移(基址)只换偏移）。
+function listWord(fn: int, line: int, word: int, fix: int, target: string): void {
+    const t = rv64Disasm(word);
+    let sp = 0;
+    while (sp < len(t) && (byteAt(t, sp) catch 0) != 32) { sp = sp + 1; }
+    const ops: List<string> = listNew();
+    let from = sp + 1;
+    let i = sp + 1;
+    while (i < len(t)) {
+        if ((byteAt(t, i) catch 0) == 44) {
+            listPush(ops, strSub(t, from, i - from));
+            from = i + 2;
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    if (from < len(t)) { listPush(ops, strSub(t, from, len(t) - from)); }
+    const n = listLen(ops);
+    if (len(target) > 0 && n > 0) {
+        let last = target;
+        if (fix == FIX_RV64_PCREL_HI20) { last = "%pcrel_hi(" + target + ")"; }
+        if (fix == FIX_RV64_PCREL_LO12_I || fix == FIX_RV64_PCREL_LO12_S) {
+            const old = listGet(ops, n - 1) catch "";
+            let p = 0;
+            while (p < len(old) && (byteAt(old, p) catch 0) != 40) { p = p + 1; }
+            last = "%pcrel_lo(" + target + ")" + strSub(old, p, len(old) - p);
+        }
+        listSet(ops, n - 1, last);
+    }
+    asListingA64(fn, 0, strSub(t, 0, sp), ops, line);
+}
+function symText(sym: string, addend: int): string {
+    if (addend > 0) { return sym + "+" + toStr(addend); }
+    if (addend < 0) { return sym + "-" + toStr(-addend); }
+    return sym;
+}
+// auipc＋jalr 的一对偏移（hi 为 auipc 的 20 位，lo 为 jalr／addi 的 12 位），d 须在 ±2 GiB 内；越界得 hi＝-1。
+function pairHi(d: int): int {
+    if (d < -2147485696 || d > 2147481599) { return -1; }
+    return ((d + 2048) >> 12) & 1048575;
+}
+function pairLo(d: int): int { return sext(d & 4095, 12); }
+function pcrelLabel(at: int): string { return "__tx_pcrel_" + toStr(at); }
+
+/// 提交 RISC-V 缓冲：在 asStructuredBegin 之后调用（映像随之标为 RISC-V）。失败记在映像上（asFailedAs／asLastErrAs）。
+export function rv64BufferSubmit(buf: Ref<StructuredBuffer>): void {
+    if (asFailedAs() != 0) { return; }
+    if (buf.isa != ISA_RV64) { asFailWith("NotRv64Buffer", 1); return; }
+    if (asImgIsa() != ISA_RV64) {
+        if (asA64Here() != 0) { asFailWith("MixedArchitectureImage", 1); return; }
+        asSetIsa(ISA_RV64);
+    }
+    nativeFunctionsIsa("riscv64");
+    asStructuredSection(0);
+    // 代码节里的标号 → 条目号；同时报出缓冲里记下的失败。
+    const labels: Map<string, int> = mapNew();
+    let sec = 0;
+    let i = 0;
+    while (i < listLen(buf.entries)) {
+        const e = entryAt(buf, i);
+        if (e.kind == K_FAIL) { asFailWith(e.name, i + 1); return; }
+        if (e.kind == 1) { sec = e.value; }
+        if (e.kind == 2 && sec == 0) { mapSet(labels, e.name, i); }
+        if (e.kind == 0 || e.kind == 13) { asFailWith("X86InstructionInRv64Buffer:" + (listGet(rv64BufferX86Sites(buf), 0) catch ""), i + 1); return; }
+        i = i + 1;
+    }
+    const levels: List<int> = listNew();
+    i = 0;
+    while (i < listLen(buf.entries)) { listPush(levels, 0); i = i + 1; }
+    const start = asA64Here();
+    let changed = true;
+    while (changed) {
+        changed = false;
+        const at = textOffsets(buf, levels, labels, start);
+        i = 0;
+        while (i < listLen(buf.entries)) {
+            const e = entryAt(buf, i);
+            const lv = listGet(levels, i) catch 0;
+            const local = mapHas(labels, e.name);
+            if (e.kind == K_B && !local) { asFailWith("ConditionalBranchTargetNotLocal:" + e.name, i + 1); return; }
+            if ((e.kind == K_B && lv < 2) || (e.kind == K_CALL && e.nops == 0 && local && lv == 0)) {
+                const d = (listGet(at, mapGet(labels, e.name) catch 0) catch 0) - (listGet(at, i) catch 0);
+                let grow = false;
+                if (e.kind == K_B && lv == 0) { grow = !inRange(d, -4096, 4094); }
+                // 中形式的 jal 在跳转之后 4 字节处，距离按它自己的位置算。
+                if (e.kind == K_B && lv == 1) { grow = !inRange(d - 4, -1048576, 1048574); }
+                if (e.kind == K_CALL) { grow = !inRange(d, -1048576, 1048574); }
+                if (grow) { listSet(levels, i, lv + 1); changed = true; }
+            }
+            i = i + 1;
+        }
+    }
+    const at = textOffsets(buf, levels, labels, start);
+    const listing = asListingActive() && buf.listFn >= 0;
+    const fn = buf.listFn;
+    let lastHi = -1;
+    let lastHiSym = "";
+    sec = 0;
+    i = 0;
+    while (i < listLen(buf.entries)) {
+        if (asFailedAs() != 0) { return; }
+        const e = entryAt(buf, i);
+        const line = i + 1;
+        if (e.kind == 1) {
+            asStructuredSection(e.value);
+            sec = e.value;
+        } else if (e.kind == 2) {
+            asStructuredLabel(e.name);
+            if (listing && sec == 0) { asListingA64(fn, 2, e.name, listNew(), e.line); }
+        } else if (e.kind == 3) {
+            asStructuredAlign(e.value);
+        } else if (e.kind == 4) {
+            asStructuredByte(e.value);
+        } else if (e.kind == 5) {
+            asStructuredQuad(e.value);
+        } else if (e.kind == 6) {
+            asStructuredAddress(e.name);
+        } else if (e.kind == 7) {
+            asStructuredZero(e.value);
+        } else if (e.kind == 8) {
+            asStructuredAddressAddend(e.name, e.value);
+        } else if (e.kind == 9 || e.kind == 14) {
+            if (sec != 0) { asFailWith("FunctionOutsideText", line); return; }
+            if (e.kind == 14) { nativeFunctionBoundaryBegin(e.mnemonic, e.name, e.b.label, asA64Here()); } else { nativeFunctionOwnedBegin(e.mnemonic, e.name, e.a.label, asA64Here()); }
+        } else if (e.kind == 10) {
+            nativeFunctionEnd(asA64Here());
+        } else if (e.kind == 11) {
+            nativeFunctionPrologueEnd(asA64Here());
+        } else if (e.kind == 12) {
+            nativeFunctionEpilogueStart(asA64Here());
+        } else if (e.kind == K_FRAME) {
+            if (sec != 0 || e.nops < 1 || i < e.nops) { asFailWith("BadFrameEntry", line); return; }
+            nativeFunctionEvent(listGet(at, i - e.nops) catch -1, asA64Here(), e.name, e.b.imm, e.a.imm);
+        } else if (e.kind == 15) {
+            if (sec != 0) { asFailWith("FunctionOutsideText", line); return; }
+            nativeFunctionBegin(e.value, e.name, asA64Here());
+        } else if (e.kind >= K_WORD && e.kind <= K_B) {
+            if (sec != 0) { asFailWith("InstructionOutsideText", line); return; }
+            const here = listGet(at, i) catch 0;
+            if (asA64Here() != here) { asFailWith("Rv64LayoutMismatch", line); return; }
+            const local = mapHas(labels, e.name);
+            let d = 0;
+            if (local) { d = (listGet(at, mapGet(labels, e.name) catch 0) catch 0) - here; }
+            const lv = listGet(levels, i) catch 0;
+            if (e.kind == K_WORD) {
+                asRv64Word(e.value, -1, "", 0);
+                if (listing) { listWord(fn, e.line, e.value, -1, ""); }
+            } else if (e.kind == K_FIX) {
+                if (e.nops == FIX_RV64_PCREL_HI20) {
+                    // LO12 指向这里：先定义 auipc 处的局部标号。
+                    asStructuredLabel(pcrelLabel(here));
+                    asRv64Word(e.value, e.nops, e.name, e.a.imm);
+                    if (listing) { listWord(fn, e.line, e.value, e.nops, symText(e.name, e.a.imm)); }
+                    lastHi = here;
+                    lastHiSym = symText(e.name, e.a.imm);
+                } else {
+                    if (lastHi != here - 4 || e.a.imm != 0) { asFailWith("UnpairedPcrelLo12", line); return; }
+                    asRv64Word(e.value, e.nops, pcrelLabel(lastHi), 0);
+                    if (listing) { listWord(fn, e.line, e.value, e.nops, lastHiSym); }
+                }
+            } else if (e.kind == K_CALL) {
+                let rd = RV64_ZERO_REG;
+                let via = RV64_TMP;
+                if (e.nops == 1) { rd = RV64_RA_REG; via = RV64_RA_REG; }
+                if (local && e.nops == 0 && lv == 0) {
+                    const w = rv64J(RV64_ZERO_REG, d);
+                    if (w < 0) { asFailWith("BranchOutOfRange:" + e.name, line); return; }
+                    asRv64Word(w, -1, "", 0);
+                    if (listing) { listWord(fn, e.line, w, -1, e.name); }
+                } else if (local) {
+                    const hi = pairHi(d);
+                    if (hi < 0) { asFailWith("BranchOutOfRange:" + e.name, line); return; }
+                    const w1 = rv64U(RV64_AUIPC, via, hi);
+                    const w2 = rv64I(RV64_JALR, rd, via, pairLo(d));
+                    asRv64Word(w1, -1, "", 0);
+                    asRv64Word(w2, -1, "", 0);
+                    if (listing) { listWord(fn, e.line, w1, -1, ""); listWord(fn, e.line, w2, -1, e.name); }
+                } else {
+                    const w1 = rv64U(RV64_AUIPC, via, 0);
+                    const w2 = rv64I(RV64_JALR, rd, via, 0);
+                    asRv64Word(w1, FIX_RV64_CALL, e.name, 0);
+                    asRv64Word(w2, -1, "", 0);
+                    if (listing) { listWord(fn, e.line, w1, FIX_RV64_CALL, e.name); listWord(fn, e.line, w2, -1, ""); }
+                }
+            } else {
+                const rs1 = e.nops / 32;
+                const rs2 = e.nops % 32;
+                if (lv == 0) {
+                    const w = rv64B(e.value, rs1, rs2, d);
+                    if (w < 0) { asFailWith("BranchOutOfRange:" + e.name, line); return; }
+                    asRv64Word(w, -1, "", 0);
+                    if (listing) { listWord(fn, e.line, w, -1, e.name); }
+                } else {
+                    // 中、长形式：取反的短跳转跳过后面一两条，下一条 jal（或 auipc＋jalr）到目标（距离按它自己的位置算）。
+                    const skip = rv64B(invert(e.value), rs1, rs2, 4 + 4 * lv);
+                    asRv64Word(skip, -1, "", 0);
+                    if (listing) { listWord(fn, e.line, skip, -1, ""); }
+                    if (lv == 1) {
+                        const far = rv64J(RV64_ZERO_REG, d - 4);
+                        if (far < 0) { asFailWith("BranchOutOfRange:" + e.name, line); return; }
+                        asRv64Word(far, -1, "", 0);
+                        if (listing) { listWord(fn, e.line, far, -1, e.name); }
+                    } else {
+                        const hi = pairHi(d - 4);
+                        if (hi < 0) { asFailWith("BranchOutOfRange:" + e.name, line); return; }
+                        const w1 = rv64U(RV64_AUIPC, RV64_TMP, hi);
+                        const w2 = rv64I(RV64_JALR, RV64_ZERO_REG, RV64_TMP, pairLo(d - 4));
+                        asRv64Word(w1, -1, "", 0);
+                        asRv64Word(w2, -1, "", 0);
+                        if (listing) { listWord(fn, e.line, w1, -1, ""); listWord(fn, e.line, w2, -1, e.name); }
+                    }
+                }
+            }
+        } else {
+            asFailWith("BadInstruction", line);
+            return;
+        }
+        i = i + 1;
+    }
+    if (asFailedAs() == 0 && sec == 0 && asA64Here() != (listGet(at, listLen(buf.entries)) catch -1)) { asFailWith("Rv64LayoutMismatch", listLen(buf.entries)); }
+}

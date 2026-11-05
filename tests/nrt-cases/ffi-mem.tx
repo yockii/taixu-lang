@@ -1,0 +1,122 @@
+// D3 v0.48 外部内存区：自己分配的一页作外部内存（data/ffimem_page_<系统>.tx）——写读往返、读进已有的 Bytes、UTF-8／UTF-16
+// 读到 NUL 与读到区尾（代理对、孤立代理与非法字节换 U+FFFD，区尾的单个字节忽略）、空区、创建时的核验（地址为 0、不可访问的页、
+// 已归还的页、要求可写而页只读）、提前结束（重复结束无效果）、出口弹栈（创建区的函数反复调用、循环里建区后 return、经 ? 提前返回，
+// 不弹就会超过同时存活的 64 个而 trap）、结束的区在栈顶时随即弹出（循环里建了就结束）。
+import { pageAlloc, pageProtect, pageFree, writableChecked } from "./data/ffimem_page";
+
+// 外部内存区只许在声明了 from 外部函数的模块里创建（§6.8-22）。本用例的平台调用在 data/ffimem_page_<系统>.tx，这里声明一个不调用的
+// 外部函数充当平台层（只声明不调用的外部函数不检查目标、不导入）。
+declare function GetTickCount64(): u64 from "kernel32";
+
+function bytesOf(xs: []int): Bytes {
+    const out = bytesNew(0);
+    for (x in xs) { bytesPush(out, x); }
+    return out;
+}
+
+function show(b: Bytes): string {
+    let s = "";
+    let i = 0;
+    while (i < bytesLen(b)) {
+        if (i > 0) { s = s + " "; }
+        s = s + toStr(bytesGet(b, i) catch -1);
+        i = i + 1;
+    }
+    return s;
+}
+
+// 创建的结果：成功即结束区、得 "ok"；失败时消息含 want 得 "rejected"。
+function probe(addr: int, size: int, writable: bool, want: string): string {
+    const m = ffiMem(addr, size, writable) catch (e) {
+        if (strFind(e.message, want) > 0) { return "rejected"; }
+        return "other: " + e.message;
+    };
+    ffiMemEnd(m);
+    return "ok";
+}
+
+// 每次调用建一个区、读第一个字节；返回即弹栈。
+function firstByte(p: int): int {
+    const m = ffiMem(p, 1, false) catch (e) { return -1; };
+    return bytesGet(ffiMemRead(m, 0, 1), 0) catch -1;
+}
+
+// 循环里建区（不结束）后 return：出口弹掉本帧的全部区。
+function scan(p: int, stop: int): int {
+    let i = 0;
+    while (i <= stop) {
+        const m = ffiMem(p + i, 1, false) catch (e) { return -1; };
+        if (i == stop) { return bytesGet(ffiMemRead(m, 0, 1), 0) catch -1; }
+        i = i + 1;
+    }
+    return -2;
+}
+
+// 建区后经 ? 提前返回，同样弹栈。
+function failLate(p: int): int | Error {
+    const m = ffiMem(p, 4, false)?;
+    const bad = ffiMem(0, 4, false)?;
+    return bytesLen(ffiMemRead(m, 0, 4)) + bytesLen(ffiMemRead(bad, 0, 0));
+}
+
+function lateMessage(p: int): string {
+    const n = failLate(p) catch (e) { return e.message; };
+    return toStr(n);
+}
+
+function main(args: []string): int {
+    const p = pageAlloc();
+    if (p == 0) { print("pageAlloc failed"); return 1; }
+    const m = ffiMem(p, 64, true) catch (e) { print("create: " + e.message); return 1; };
+    ffiMemWrite(m, 0, bytesFromStr("Taixu"));
+    ffiMemWrite(m, 5, bytesNew(1));
+    print("read [" + (bytesToStr(ffiMemRead(m, 0, 5)) catch "?") + "] utf8 [" + ffiMemUtf8(m, 0) + "]");
+    ffiMemWrite(m, 61, bytesFromStr("abc"));
+    print("utf8 to end [" + ffiMemUtf8(m, 61) + "] at end [" + ffiMemUtf8(m, 64) + "]");
+    // UTF-16LE：太 虚 U+1F600（代理对 0xD83D、0xDE00）NUL。
+    ffiMemWrite(m, 16, bytesOf([42, 89, 90, 134, 61, 216, 0, 222, 0, 0]));
+    print("utf16 [" + ffiMemUtf16(m, 16) + "]");
+    // 孤立的高代理接 'A'、孤立的低代理；7 字节的区读三个码元，第 7 个字节忽略。
+    ffiMemWrite(m, 32, bytesOf([0, 216, 65, 0, 0, 220, 66]));
+    const tail = ffiMem(p + 32, 7, false) catch (e) { print("tail: " + e.message); return 1; };
+    print("utf16 bad [" + ffiMemUtf16(tail, 0) + "]");
+    ffiMemWrite(m, 40, bytesOf([104, 255, 105, 0]));
+    print("utf8 bad [" + ffiMemUtf8(m, 40) + "]");
+    const dst = bytesFromStr("--------");
+    ffiMemReadInto(m, 1, dst, 2, 3);
+    print("read into [" + (bytesToStr(dst) catch "?") + "] bytes " + show(ffiMemRead(m, 16, 4)));
+
+    const empty = ffiMem(0, 0, false) catch (e) { print("empty: " + e.message); return 1; };
+    print("empty [" + ffiMemUtf8(empty, 0) + "] " + toStr(bytesLen(ffiMemRead(empty, 0, 0))));
+
+    print("null " + probe(0, 8, false, "地址为 0"));
+    const q = pageAlloc();
+    pageProtect(q, 0);
+    print("noaccess " + probe(q + 8, 16, false, "未映射或不可读"));
+    pageProtect(q, 1);
+    print("readonly read " + probe(q, 16, false, "-"));
+    print("readonly writable as documented " + toStr((probe(q, 16, true, "不可写") == "rejected") == writableChecked()));
+    const r = pageAlloc();
+    pageFree(r);
+    print("freed " + probe(r, 16, false, "未映射或不可读"));
+
+    ffiMemEnd(tail);
+    ffiMemEnd(tail);
+    print("end twice ok");
+    let sum = 0;
+    let k = 0;
+    while (k < 200) {
+        sum = sum + firstByte(p);
+        const t = ffiMem(p, 2, false) catch (e) { print("loop: " + e.message); return 1; };
+        ffiMemEnd(t);
+        k = k + 1;
+    }
+    let late = 0;
+    k = 0;
+    while (k < 70) {
+        if (lateMessage(p) == "ffiMem：地址为 0") { late = late + 1; }
+        k = k + 1;
+    }
+    print("calls " + toStr(sum) + " scan " + toStr(scan(p, 40) + scan(p, 40)) + " late " + toStr(late));
+    return 0;
+}

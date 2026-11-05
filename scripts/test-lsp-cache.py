@@ -116,7 +116,7 @@ def main():
               'stderr': stderr, 'failures': failures, 'status': 'FAIL' if failures else 'PASS',
               'median_hot_ns': statistics.median(hot) if hot else None,
               'p95_hot_ns': hot[max(0, (len(hot) * 95 + 99) // 100 - 1)] if hot else None,
-              'note': 'LSP response measurements; D102 and compiler regression timing use separate formal windows.'}
+              'note': 'LSP response measurements; compiler regression timing uses separate formal windows.'}
     (work / 'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8', newline='\n')
     for failure in failures:
         print('FAIL', failure)

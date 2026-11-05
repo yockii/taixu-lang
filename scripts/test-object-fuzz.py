@@ -1,4 +1,4 @@
-"""对象与函数元数据的结构化 fuzz（安全审查攻关第 3 项，docs/design/v052-object-fuzz-v0.1-20261025.md）。
+"""对象与函数元数据的结构化 fuzz（安全审查攻关第 3 项）。
 
 以独立构造的 ELF64／COFF 夹具（test-native-link-map.py）和编译器写出的带 .txfn 的对象（runtime_function_probe）为种子，按
 固定种子做结构感知变异，每例一个新的受限进程（Windows 作业对象：进程数、提交内存、关闭即杀；Linux：RLIMIT_AS、RLIMIT_CPU、
@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import random
 import re
 import shutil
@@ -290,15 +291,17 @@ def main():
         check('oracle: ' + label, outcome(*args)[0] == want, outcome(*args))
 
     # 探针：标准内核（--leak-check）与页堆内核。页堆内核由本树的内核生成器生成。
-    # 生成器在本宿主上跑：Linux 显式给目标，Windows 与 macOS 取宿主缺省（同 test-heap-check；macOS 上给 linux 得 ELF，执行即 ENOEXEC）。
-    tflag = ['--target=linux'] if not WINDOWS and sys.platform != 'darwin' else []
-    code, text = sh(compiler, 'build', 'bootstrap/runtime_memory_gen.tx', '--runtime=native', *tflag, '--out', work / 'gen')
+    # 生成器在本宿主上跑：Linux 显式给宿主架构的目标，Windows 与 macOS 取宿主缺省（同 test-heap-check；macOS 上给
+    # linux 得 ELF，执行即 ENOEXEC）。
+    linux_host = 'aarch64-linux' if platform.machine() in ('aarch64', 'arm64') else 'x86_64-linux'
+    tflag = ['--target=' + linux_host] if not WINDOWS and sys.platform != 'darwin' else []
+    code, text = sh(compiler, 'build', 'bootstrap/runtime_memory_gen.tx', '--toolchain', '--runtime=native', *tflag, '--out', work / 'gen')
     if not check('kernel generator build', code == 0, text):
         return finish(work, rows, bad)
     gen = work / 'gen' / ('runtime_memory_gen' + EXE)
-    # 页堆探针按本宿主构建：Apple silicon 的 macOS 上内核与探针都取 aarch64-macos（同 test-heap-check）。
-    host = 'x86_64-windows' if WINDOWS else ('aarch64-macos' if sys.platform == 'darwin' else 'x86_64-linux')
-    host_flag = ['--target=aarch64-macos'] if sys.platform == 'darwin' else []
+    # 页堆探针按本宿主构建：Apple silicon 的 macOS 上内核与探针都取 aarch64-macos，aarch64 Linux 上取 aarch64-linux（同 test-heap-check）。
+    host = 'x86_64-windows' if WINDOWS else ('aarch64-macos' if sys.platform == 'darwin' else linux_host)
+    host_flag = ['--target=aarch64-macos'] if sys.platform == 'darwin' else tflag
     kernels = {}
     for name, target, extra in [('heapcheck', host, ['--generic=heapcheck']), ('windows', 'x86_64-windows', []), ('linux', 'x86_64-linux', [])]:
         k = work / ('kernel-%s.o' % name)
@@ -445,7 +448,10 @@ def main():
             obj.write_bytes(data)
             out = runs / tag
             mapping = runs / (tag + '.json')
-            code, so, se, note = limited([compiler, 'build', basic, '--target=' + target, '--out', out, '--link-object', kernels[target],
+            # 夹具对象是 x86_64 的（runtime_function_probe 写出）：写明三元组，arm64 宿主上不带架构的 linux、windows 取
+            # aarch64-linux、aarch64-windows。
+            triple = {'linux': 'x86_64-linux', 'windows': 'x86_64-windows'}.get(target, target)
+            code, so, se, note = limited([compiler, 'build', basic, '--target=' + triple, '--out', out, '--link-object', kernels[target],
                                           '--link-object', obj, '--map', mapping, '--map-format=json'], runs, tag, timeout=120, processes=4)
             product = out / ('basic.exe' if target == 'windows' else 'basic')
             if note or code not in (0, 1):

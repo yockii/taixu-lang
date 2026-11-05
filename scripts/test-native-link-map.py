@@ -457,17 +457,18 @@ def main():
         # 固定种子的结构化变异在 scripts/test-object-fuzz.py（安全审查攻关第 3 项：受限进程、字段组合、页堆探针、函数元数据）。
 
     source = work/'映射.tx'; source.write_text('export function main(args: []string): int { print("map"); return 0; }\n', encoding='utf8', newline='\n')
-    # macOS 两个目标在任何宿主上交叉构建，映射对照实际 Mach-O 头。
-    for target in ['windows', 'linux', 'x86_64-macos', 'aarch64-macos']:
-        triple = target if target.endswith('-macos') else 'x86_64-'+target
+    # 四种 Linux 与两种 macOS 在任何宿主上交叉构建，映射对照实际 ELF／Mach-O 头。目标写三元组：不带架构的 linux 在 arm64
+    # 宿主上取 aarch64-linux，windows 同理取 aarch64-windows（A6）；loongarch64-linux 自riscv64-linux 自 A5f 起出映射。
+    for target in ['windows', 'x86_64-linux', 'aarch64-linux', 'loongarch64-linux', 'riscv64-linux', 'x86_64-macos', 'aarch64-macos']:
+        triple = 'x86_64-windows' if target == 'windows' else target
         ffi = work/('ffi-'+target+'.tx')
-        ffi.write_text('declare function strlen(s: string): usize from '+json.dumps({'windows': 'ucrtbase', 'linux': 'libc.so.6'}.get(target, 'libSystem'))
+        ffi.write_text('declare function strlen(s: string): usize from '+json.dumps('ucrtbase' if target == 'windows' else 'libc.so.6' if target.endswith('-linux') else 'libSystem')
                        +';\nexport function main(args: []string): int { print(toStr(strlen("abc"))); return 0; }\n', encoding='utf8', newline='\n')
         for flavor, entry, flags in [('normal', source, []), ('debug', ROOT/'tests/debug/basic.tx', ['--debug']),
                                       ('leak', source, ['--leak-check']), ('ffi', ffi, []),
                                       ('thread', ROOT/'tests/nrt-cases/thread-basic.tx', [])]:
             dest = work/(target+'-'+flavor); mapping = work/(target+'-'+flavor+'.json')
-            args = ['build', entry, '--target='+target, '--out', dest, *flags]
+            args = ['build', entry, '--target='+triple, '--out', dest, *flags]
             p = run(*args, '--map', mapping, '--map-format=json', '--map-scope=all')
             check('CLI map:'+target+':'+flavor, p.returncode == 0 and mapping.is_file(), p.stderr)
             if p.returncode: continue
@@ -479,9 +480,9 @@ def main():
             if target != 'windows':
                 # 产物函数符号（v052-image-symbols）对照映射的函数表与 --strip 产物。
                 bare = work/(target+'-'+flavor+'-strip')
-                s = run('build', entry, '--target='+target, '--out', bare, *flags, '--strip')
+                s = run('build', entry, '--target='+triple, '--out', bare, *flags, '--strip')
                 stripped = (bare/product.name).read_bytes() if s.returncode == 0 else b''
-                symbols_ok = (elf_symbol_check if target == 'linux' else macho_symbol_check)(image, stripped, doc['map']['functions'])
+                symbols_ok = (elf_symbol_check if target.endswith('-linux') else macho_symbol_check)(image, stripped, doc['map']['functions'])
                 check('image symbols:'+target+':'+flavor, symbols_ok[0], symbols_ok[1])
             if target.endswith('-macos'):
                 base, entry_va, sections = image_layout(image); x = doc['map']

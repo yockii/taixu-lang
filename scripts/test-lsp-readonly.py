@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""原生 LSP 只读的源码层检查（第 6 轮 6d-2；设计 docs/design/v052-round6-lsp-mcp-v0.1-20261019.md §三-9、§四-1）。
+"""原生 LSP 只读的源码层检查（§四-1）。
 
-LSP 的代码路径不运行程序、不起进程、不访问网络、不写文件（用户裁决 §十一-6）。从 bootstrap/selfhost/lsp.tx 的
+LSP 的代码路径不运行程序、不起进程、不访问网络、不写文件。从 bootstrap/selfhost/lsp.tx 的
 lspServe 出发，沿 import 收集可达模块，在这些模块里按名字求闭包：函数体里出现的任何与某个函数同名的标识符都算
 可达（不只是调用——函数可以当作值传递；同名即算，宁多勿漏），闭包里任何函数调用了下列内建即失败：procSpawn、
 procWrite、procKill、runProcess、writeFile、writeFileBytes、writeExecutable、removeFile、makeDir。stdoutWrite
@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ENTRY = ROOT / 'bootstrap' / 'selfhost' / 'lsp.tx'
 FORBIDDEN = ('procSpawnLimited', 'procSpawn', 'procWrite', 'procTryWrite', 'procKill', 'runProcess', 'writeFile', 'writeFileBytes',
              'writeExecutable', 'removeFile', 'makeDir', 'setEnv')
-# LSP 自己的模块：lsp*.tx 按前缀全认（6d-3a3 起；此前的固定名单漏了后加的 lsp_refs.tx、lsp_tokens.tx），
+# LSP 自己的模块：lsp*.tx 按前缀全认（此前的固定名单漏了后加的 lsp_refs.tx、lsp_tokens.tx），
 # 另加分帧、检查诊断与分析索引。
 OWN_EXTRA = ('frame_io.tx', 'check_diag.tx', 'check_model.tx', 'check_graph.tx', 'source_cache.tx', 'ana_index.tx')
 

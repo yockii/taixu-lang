@@ -1,12 +1,17 @@
-// 公开仓导出（docs/design/v052-public-release-v0.1-20261026.md §二）：按清单 release/export.txt，从本仓与 taixu-stdlib 的
+// 公开仓导出（§六）：按清单 release/export.txt，从本仓与 taixu-stdlib 的
 // 已提交内容（git archive，不读工作树）生成公开仓 taixu-lang 的树——同 Copybara 的白名单加确定性变换。标准库整体放到 stdlib/；
-// 指向未导出文件的 Markdown 链接改为纯文本；另生成前端冻结测试的历史输入 tests/frozen/pinned-bootstrap.tar。
-// 目标目录整体替换（只保留 .git），不提交、不推送；自检不过即以 1 退出。
+// 指向未导出文件的 Markdown 链接改为纯文本；按清单的擦除规则改写注释与 Markdown 正文（不增删行、不动注释之前的代码与字符串），
+// 按字节进了编译器、被门逐字节比对或按 SHA-256 冻结的文件（清单 keep）原样导出。最后按清单查泄漏（擦除与只查的全部模式、
+// forbid 的本机痕迹）、超大文件与规范版本。
+// 目标目录整体替换（只保留 .git），不提交、不推送；自检不过即以 1 退出。擦除的字样都写在不导出的清单里，本文件不含它们。
 // 用法（在本仓根运行）：taixu run --toolchain scripts/export.tx --out <目录> [--stdlib <taixu-stdlib 仓>] [--commit <提交>]
-//   [--stdlib-commit <提交>] [--manifest <清单>]
+//   [--stdlib-commit <提交>] [--manifest <清单>] [--report <文件>]
+// --report 写出逐行的改写（- 原行、+ 新行）与每处泄漏，供审阅；格式同擦除引擎的参照实现。
 import { absolute, byteSub, deleteTree, dirOf, findInPath, join, kindOf, list1, mkdirs, nat, nothing, paxPath, plus, readBytes, runIn, safeRel,
     startsWith, tarField, tarOctal, trimLine } from "./build_lib";
 import { osRealPath, osWriteFile } from "./build_os";
+import { Rules, allowedHit, endsWith, firstTable, isDigit, keptPath, newRules, plusB, restOf, scrubLine } from "./export_match";
+import { Report, leaksIn, scrubFile } from "./export_scrub";
 
 // 单个文件的上限（GitHub 对 50 MB 以上告警；公开仓不该有这么大的文件）。
 const MAX_FILE: int = 10485760;
@@ -18,6 +23,7 @@ struct Opts {
     commit: string,
     stdlibCommit: string,
     manifest: string,
+    report: string,
 }
 
 struct Rule {
@@ -27,20 +33,14 @@ struct Rule {
     to: string,
 }
 
-struct Report {
-    files: int,
-    executables: List<string>,
-    rewritten: int,
-    problems: List<string>,
-}
-
 function usage(): int {
-    eprint("用法：taixu run --toolchain scripts/export.tx --out <目录> [--stdlib <taixu-stdlib 仓>] [--commit <提交>] [--stdlib-commit <提交>] [--manifest <清单>]");
+    eprint("用法：taixu run --toolchain scripts/export.tx --out <目录> [--stdlib <taixu-stdlib 仓>] [--commit <提交>] [--stdlib-commit <提交>] [--manifest <清单>] [--report <文件>]");
     return 64;
 }
 
 function parseOpts(args: []string): Ref<Opts> | Error {
-    const o = new Opts { root: osRealPath(currentDir() catch "."), out: "", stdlib: "", commit: "HEAD", stdlibCommit: "HEAD", manifest: "release/export.txt" };
+    const o = new Opts { root: osRealPath(currentDir() catch "."), out: "", stdlib: "", commit: "HEAD", stdlibCommit: "HEAD", manifest: "release/export.txt",
+        report: "" };
     let i = 0;
     while (i < len(args)) {
         if (i + 1 >= len(args)) {
@@ -58,6 +58,8 @@ function parseOpts(args: []string): Ref<Opts> | Error {
             o.stdlibCommit = v;
         } else if (a == "--manifest") {
             o.manifest = v;
+        } else if (a == "--report") {
+            o.report = absolute(v);
         } else {
             return err("不认识的选项：" + a);
         }
@@ -75,9 +77,11 @@ function parseOpts(args: []string): Ref<Opts> | Error {
     return o;
 }
 
-// 清单：逐行“<源> include|exclude <路径>”或“<源> map <源路径> <目的路径>”，另有“forbid <字样>”（不得出现在公开内容里的
-// 本机痕迹：开发机与测试机的路径、用户名、主机名；写在不导出的清单里，导出器源码自己不含它们）；# 起注释。
-function parseManifest(text: string): List<Ref<Rule>> | Error {
+// 清单：逐行“<源> include|exclude <路径>”或“<源> map <源路径> <目的路径>”；“forbid <字样>”（不得出现在公开内容里的
+// 本机痕迹：开发机与测试机的路径、用户名、主机名）；“latest <前缀>”（导出的那一版须是本提交里最新的）；擦除与泄漏检查的
+// 各行见清单 §六 的说明（scrub、leak、except、particle、lead、missing、replace、strip、keep、allow）。# 起注释。
+// 这些字样写在不导出的清单里，导出器源码自己不含它们。
+function parseManifest(text: string, sr: Ref<Rules>): List<Ref<Rule>> | Error {
     const out: List<Ref<Rule>> = listNew();
     let n = 0;
     for (raw in strSplit(text, "\n")) {
@@ -93,17 +97,23 @@ function parseManifest(text: string): List<Ref<Rule>> | Error {
             }
         }
         const src = listGet(w, 0) catch "";
-        if (src == "forbid") {
+        if (src == "forbid" || src == "latest") {
             if (listLen(w) != 2) {
                 return err("清单第 " + toStr(n) + " 行看不懂：" + line);
             }
-            listPush(out, new Rule { source: "forbid", verb: "forbid", path: listGet(w, 1) catch "", to: "" });
+            listPush(out, new Rule { source: src, verb: src, path: listGet(w, 1) catch "", to: "" });
+            continue;
+        }
+        if (src != "core" && src != "stdlib") {
+            const ok = scrubLine(src, restOf(line, src), sr) catch (e) {
+                return err("清单第 " + toStr(n) + " 行：" + e.message);
+            };
             continue;
         }
         const verb = listGet(w, 1) catch "";
         const path = listGet(w, 2) catch "";
         const want = if_(verb == "map", 4, 3);
-        if ((src != "core" && src != "stdlib") || (verb != "include" && verb != "exclude" && verb != "map") || listLen(w) != want || !safeRel(path)) {
+        if ((verb != "include" && verb != "exclude" && verb != "map") || listLen(w) != want || !safeRel(path)) {
             return err("清单第 " + toStr(n) + " 行看不懂：" + line);
         }
         const to = listGet(w, 3) catch "";
@@ -292,18 +302,18 @@ function normRel(p: string): string {
 }
 
 function relDir(rel: string): string {
-    let cut = -1;
+    let cut0 = -1;
     let k = 0;
     while (k < len(rel)) {
         if ((byteAt(rel, k) ?? 0) == 47) {
-            cut = k;
+            cut0 = k;
         }
         k = k + 1;
     }
-    if (cut < 0) {
+    if (cut0 < 0) {
         return "";
     }
-    return byteSub(rel, 0, cut);
+    return byteSub(rel, 0, cut0);
 }
 
 // 链接目标是否留着：外链、页内锚点留；仓内路径在导出树里存在才留。
@@ -403,21 +413,73 @@ function rewriteFile(out: string, rel: string, text: string, rep: Ref<Report>): 
     return bytesToStr(res) catch text;
 }
 
-function endsWith(s: string, suffix: string): bool {
-    return len(s) >= len(suffix) && byteSub(s, len(s) - len(suffix), len(suffix)) == suffix;
+function skipped(rel: string): bool {
+    return endsWith(rel, ".tar") || endsWith(rel, ".o") || endsWith(rel, ".obj") || endsWith(rel, ".exe");
 }
 
-// 变换与自检：改写 Markdown 链接；查本机痕迹与超大文件。
-function finish(out: string, rep: Ref<Report>, forbid: List<string>): void {
+// 变换与自检：改写 Markdown 链接、擦除注释与正文；查泄漏、本机痕迹与超大文件。
+function finish(out: string, rep: Ref<Report>, forbid: List<string>, sr: Ref<Rules>): void {
     const files: List<string> = listNew();
     walk(out, "", files);
+    // 1. 链接与擦除
+    for (rel in files) {
+        if (skipped(rel)) {
+            continue;
+        }
+        if (keptPath(sr, rel)) {
+            // 原样导出的 Markdown 不改链接，但指向未导出文件的链接要报出来（清单可写“allow <路径> 死链”放行）。
+            if (endsWith(rel, ".md")) {
+                const probe = new Report { files: 0, executables: listNew(), rewritten: 0, problems: listNew(), scrubbedFiles: 0, scrubbedLines: 0,
+                    leaks: 0, allowed: 0, log: bytesNew(0), leakLog: bytesNew(0) };
+                const kept = bytesToStr(readBytes(join(out, rel)) catch bytesNew(0)) catch "";
+                const unused = rewriteFile(out, rel, kept, probe);
+                if (probe.rewritten > 0) {
+                    if (allowedHit(sr, rel, bytesFromStr("死链"))) {
+                        rep.allowed = rep.allowed + probe.rewritten;
+                    } else {
+                        listPush(rep.problems, rel + " 里有 " + toStr(probe.rewritten) + " 处链接指向未导出的文件（原样导出的文件不改链接）");
+                    }
+                }
+            }
+            continue;
+        }
+        const p = join(out, rel);
+        const b = readBytes(p) catch bytesNew(0);
+        const text = bytesToStr(b) catch "";
+        if (len(text) == 0) {
+            continue;
+        }
+        let cur = b;
+        if (endsWith(rel, ".md")) {
+            const fixed = rewriteFile(out, rel, text, rep);
+            if (fixed != text) {
+                cur = bytesFromStr(fixed);
+            }
+        }
+        const mark = bytesLen(rep.log);
+        bytesAppend(rep.log, bytesFromStr("== " + rel + "\n"));
+        const before = rep.scrubbedLines;
+        const nw = scrubFile(sr, rel, cur, out, rep);
+        if (rep.scrubbedLines == before) {
+            rep.log = bytesSlice(rep.log, 0, mark);
+        } else {
+            rep.scrubbedFiles = rep.scrubbedFiles + 1;
+        }
+        if (!bytesEqual(nw, b) && !osWriteFile(p, nw, false)) {
+            listPush(rep.problems, "写不了：" + rel);
+        }
+    }
+    // 2. 自检
+    sr.scrubTab = firstTable(sr, sr.scrub);
+    const pats = plusB(sr.scrub, sr.leak);
+    sr.leakTab = firstTable(sr, pats);
     for (rel in files) {
         const p = join(out, rel);
         const b = readBytes(p) catch bytesNew(0);
         if (bytesLen(b) > MAX_FILE) {
             listPush(rep.problems, "文件超过 10 MB：" + rel);
         }
-        if (endsWith(rel, ".tar") || endsWith(rel, ".o") || endsWith(rel, ".obj")) {
+        if (skipped(rel)) {
             continue;
         }
         const text = bytesToStr(b) catch "";
@@ -429,13 +491,71 @@ function finish(out: string, rep: Ref<Report>, forbid: List<string>): void {
                 listPush(rep.problems, "含本机痕迹 " + needle + "：" + rel);
             }
         }
-        if (endsWith(rel, ".md")) {
-            const fixed = rewriteFile(out, rel, text, rep);
-            if (fixed != text && !osWriteFile(p, bytesFromStr(fixed), false)) {
-                listPush(rep.problems, "写不了：" + rel);
-            }
+        leaksIn(sr, pats, rel, b, out, rep);
+    }
+    if (rep.leaks > 50) {
+        listPush(rep.problems, "另有 " + toStr(rep.leaks - 50) + " 处泄漏（见 --report）");
+    }
+}
+
+// 规范一类按版本命名的文件：本提交里前缀为 prefix 的最新一版须在 include 里。
+function checkLatest(gitExe: string, root: string, commit: string, prefix: string, rules: List<Ref<Rule>>, work: string): void | Error {
+    const dir = relDir(prefix);
+    const base = byteSub(prefix, len(dir) + 1, len(prefix) - len(dir) - 1);
+    const listing = git(gitExe, root, plus(plus(list1("ls-tree"), list1("--name-only")), plus(list1(commit), list1(dir + "/"))), work) catch (e) {
+        return e;
+    };
+    let best = "";
+    let bestMaj = -1;
+    let bestMin = -1;
+    for (raw in strSplit(bytesToStr(listing) catch "", "\n")) {
+        const name = trimLine(raw);
+        if (!startsWith(name, dir + "/" + base) || !endsWith(name, ".md")) {
+            continue;
+        }
+        const nameBase = byteSub(name, len(dir) + 1, len(name) - len(dir) - 1);
+        const ver = byteSub(nameBase, len(base), len(nameBase) - len(base) - 3);
+        const parts = strSplit(ver, ".");
+        if (listLen(parts) != 2) {
+            continue;
+        }
+        const ma = digitsOf(listGet(parts, 0) catch "");
+        const mi = digitsOf(listGet(parts, 1) catch "");
+        if (ma < 0 || mi < 0) {
+            continue;
+        }
+        if (ma > bestMaj || (ma == bestMaj && mi > bestMin)) {
+            bestMaj = ma;
+            bestMin = mi;
+            best = name;
         }
     }
+    if (len(best) == 0) {
+        return err("latest 没有命中：" + prefix);
+    }
+    for (r in rules) {
+        if (r.source == "core" && r.verb == "include" && r.path == best) {
+            return nothing();
+        }
+    }
+    return err("清单导出的不是最新一版：本提交里最新的是 " + best);
+}
+
+function digitsOf(s: string): int {
+    if (len(s) == 0) {
+        return -1;
+    }
+    let v = 0;
+    let i = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) ?? 0;
+        if (!isDigit(c)) {
+            return -1;
+        }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    return v;
 }
 
 function run(args: []string): int | Error {
@@ -452,14 +572,16 @@ function run(args: []string): int | Error {
     const text = bytesToStr(raw) catch (e) {
         return err("清单不是 UTF-8：" + o.manifest);
     };
-    const rules = parseManifest(text) catch (e) {
+    const sr = newRules();
+    const rules = parseManifest(text, sr) catch (e) {
         return e;
     };
     const work = o.root;
     clearOut(o.out) catch (e) {
         return e;
     };
-    const rep = new Report { files: 0, executables: listNew(), rewritten: 0, problems: listNew() };
+    const rep = new Report { files: 0, executables: listNew(), rewritten: 0, problems: listNew(), scrubbedFiles: 0, scrubbedLines: 0,
+        leaks: 0, allowed: 0, log: bytesNew(0), leakLog: bytesNew(0) };
     for (src in strSplit("core stdlib", " ")) {
         let repo = o.root;
         let commit = o.commit;
@@ -501,16 +623,12 @@ function run(args: []string): int | Error {
             }
         }
     }
-    // 前端冻结测试的历史输入：ZIG_SEED 提交的 bootstrap/（公开仓取不到那段历史，§二-5）。
-    const pinRaw = readBytes(join(o.out, "bootstrap/ZIG_SEED")) catch (e) {
-        return e;
-    };
-    const pin = trimLine(bytesToStr(pinRaw) catch "");
-    const pinned = git(gitExe, o.root, plus(plus(list1("archive"), list1("--format=tar")), plus(list1(pin), list1("bootstrap"))), work) catch (e) {
-        return e;
-    };
-    if (!mkdirs(join(o.out, "tests/frozen")) || !osWriteFile(join(o.out, "tests/frozen/pinned-bootstrap.tar"), pinned, false)) {
-        return err("写不了 tests/frozen/pinned-bootstrap.tar");
+    for (r in rules) {
+        if (r.verb == "latest") {
+            checkLatest(gitExe, o.root, o.commit, r.path, rules, work) catch (e) {
+                listPush(rep.problems, e.message);
+            };
+        }
     }
     const forbid: List<string> = listNew();
     for (r in rules) {
@@ -521,9 +639,23 @@ function run(args: []string): int | Error {
     if (listLen(forbid) == 0) {
         return err("清单里没有 forbid 行（本机痕迹检查不能为空）");
     }
-    finish(o.out, rep, forbid);
+    if (listLen(sr.scrub) == 0) {
+        return err("清单里没有 scrub 行（泄漏检查不能为空）");
+    }
+    sr.scrubTab = firstTable(sr, sr.scrub);
+    finish(o.out, rep, forbid, sr);
+    if (len(o.report) > 0) {
+        const all = bytesSlice(rep.log, 0, bytesLen(rep.log));
+        bytesAppend(all, bytesFromStr("\n#### 泄漏\n"));
+        bytesAppend(all, rep.leakLog);
+        if (!osWriteFile(o.report, all, false)) {
+            listPush(rep.problems, "写不了报告：" + o.report);
+        }
+    }
     print("导出：" + toStr(rep.files) + " 个文件 → " + o.out);
     print("改为纯文本的仓内链接：" + toStr(rep.rewritten) + " 处");
+    print("擦除：" + toStr(rep.scrubbedFiles) + " 个文件、" + toStr(rep.scrubbedLines) + " 行");
+    print("泄漏：" + toStr(rep.leaks) + " 处（清单 allow 放行 " + toStr(rep.allowed) + " 处）");
     for (x in rep.executables) {
         print("可执行：" + x);
     }

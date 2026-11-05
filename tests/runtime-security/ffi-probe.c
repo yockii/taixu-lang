@@ -5,8 +5,8 @@
 #else
 #define API __attribute__((visibility("default")))
 #endif
-/* 回调前后被调方保存的向量寄存器：Windows xmm6–15（xmm-windows.S），Apple arm64 d8–d15（simd-arm64.S）。 */
-#if defined(_WIN32) || (defined(__APPLE__) && defined(__aarch64__))
+/* 回调前后被调方保存的向量寄存器：Windows xmm6–15（xmm-windows.S），arm64（Apple、Linux）d8–d15（simd-arm64.S）。 */
+#if defined(_WIN32) || defined(__aarch64__)
 extern int xmm_check(void (*cb)(void));
 extern void xmm_noop(void);
 extern void xmm_bad(void);

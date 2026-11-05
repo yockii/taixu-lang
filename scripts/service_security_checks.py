@@ -12,25 +12,26 @@ import time
 import proc_probe
 
 ROOT = Path(__file__).resolve().parent.parent
-# Linux：子进程 setsid、关掉标准流后常驻；父进程打印子进程 PID 后退出。
-DAEMON = '''declare function lxFork(): int from syscall 57;
-declare function lxSetsid(): int from syscall 112;
-declare function lxClose(fd: int): int from syscall 3;
-declare function lxPause(): int from syscall 34;
+# Linux：子进程 setsid、关掉标准流后常驻；父进程打印子进程 PID 后退出。名字形态（D3 v0.47）：fork、pause 只在 x86_64 上有号，
+# 改用两种架构都有的 clone(SIGCHLD, 0, 0, 0, 0)（末两个实参的次序差异在全零时无关）与 ppoll(NULL, 0, NULL, NULL, 8)。
+DAEMON = '''declare function lxClone(flags: int, stack: int, ptid: int, ctid: int, tls: int): int from syscall "clone";
+declare function lxSetsid(): int from syscall "setsid";
+declare function lxClose(fd: int): int from syscall "close";
+declare function lxPpoll(fds: int, n: int, timeout: int, mask: int, size: int): int from syscall "ppoll";
 export function main(args: []string): int {
-    const pid = lxFork();
+    const pid = lxClone(17, 0, 0, 0, 0);
     if (pid == 0) {
         lxSetsid();
         lxClose(0);
         lxClose(1);
         lxClose(2);
-        while (true) { lxPause(); }
+        while (true) { lxPpoll(0, 0, 0, 0, 8); }
     }
     print(toStr(pid));
     return 0;
 }
 '''
-# macOS：同上，经 libSystem（M3 设计 G9：父进程退出后守护进程过继给 launchd，服务凭回收 cookie 找回）。
+# macOS：同上，经 libSystem（M3：父进程退出后守护进程过继给 launchd，服务凭回收 cookie 找回）。
 DAEMON_MACOS = '''declare function fork(): i32 from "libSystem";
 declare function setsid(): i32 from "libSystem";
 declare function close(fd: i32): i32 from "libSystem";
@@ -212,8 +213,8 @@ def service_security_checks(compiler, work, check):
     finally:
         check('service:default-close', m.finish() == 0 and not m.bad, m.err)
     check('service:default-product-cleanup', not list(products.iterdir()), list(products.iterdir()))
-    # 信任根经链接给出（类 Unix 为符号链接，Windows 为目录联接；macOS 的 /tmp、/var 即如此）：启动时解析为真实路径一次（用户裁决
-    # 2026-10-26），roots 报真实根、root_aliases 报写法与真实根；按写法与按真实路径都能编译，根之下的链接照样拒绝。
+    # 信任根经链接给出（类 Unix 为符号链接，Windows 为目录联接；macOS 的 /tmp、/var 即如此）：启动时解析为真实路径一次（自
+    # 2026-10-26 起），roots 报真实根、root_aliases 报写法与真实根；按写法与按真实路径都能编译，根之下的链接照样拒绝。
     alias = work / 'workspace-alias'
     if not os.path.lexists(alias):
         if os.name == 'nt':
@@ -431,7 +432,7 @@ def host_share_dir():
 
 
 def host_share_checks(compiler, work, check, mcp, good):
-    """主机共享挂载作服务根（docs/design/v052-host-share-roots-v0.1-20261023.md §五-2、§五-3）。"""
+    """主机共享挂载作服务根。"""
     plain = work / 'workspace'
     policy, code, err = discover_policy(compiler, plain, ('--workspace', str(plain), '--allow-mount-type', '9p'))
     if os.name == 'nt':

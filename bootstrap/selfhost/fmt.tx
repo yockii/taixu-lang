@@ -1,19 +1,17 @@
-// 编译器工具 `taixu fmt` 的太虚实现（去 Zig 第 4 轮第 4 步；docs/design/
+// 编译器工具 `taixu fmt` 的太虚实现（docs/design/
 // v052-native-run-test-async-v0.1-20261014.md §八）。原生编译器 bootstrap/taixu.tx
-// 的 fmt 子命令与镜像入口 bootstrap/fmtmirror.tx 共用本件。
+// 的 fmt 子命令使用本件。
 //
-// 名称消歧：本件是编译器工具（src/tools/fmt.zig 的移植），不是 taixu-stdlib 的
-// std/fmt。规则本体＝D2 §9／D9 保守格式化器：行内规范化、嵌套缩进重算、分号补齐，
-// 不重排换行结构，幂等是不变式。对 Zig fmt 能处理的输入逐字节一致（含 2026-10-13
-// 起的容器栈：struct/enum 声明体与字段记录 `{ x: 1 }` 内不补分号，闭合后恢复）。
-// 唯一的扩展：lexer.tx 把 defer、interface 认作关键字（Zig 词法当标识符），二者
+// 名称消歧：本件是编译器工具，不是 taixu-stdlib 的
+// std/fmt。规则本体＝保守格式化器：行内规范化、嵌套缩进重算、分号补齐，
+// 不重排换行结构，幂等是不变式。行为由 tests/fmt-native*.json 冻结（含
+// 容器栈：struct/enum 声明体与字段记录 `{ x: 1 }` 内不补分号，闭合后恢复）。
+// lexer.tx 把 defer、interface 认作关键字，二者
 // 也算语句开头——上一行漏分号时同样补齐。
 //
-// 输出流与 Zig CLI 相同：缺省单文件的格式化文本与 --write 摘要走 stdout，其余诊断
-// 走 stderr；退出码 0/1/64。--format=json 同 Zig CLI：stdout 一行
-// {"files":[{path,ok,formatted,msg}],"summary":{total,needs_format,failed}}，不出其余文本（第 6 轮 6a）。
-//
-// 本件须留在 v0.17 子集内：fmtmirror 仍经 Zig VM 的两条前端运行（fmtmirror-probe）。
+// 输出流：缺省单文件的格式化文本与 --write 摘要走 stdout，其余诊断
+// 走 stderr；退出码 0/1/64。--format=json：stdout 一行
+// {"files":[{path,ok,formatted,msg}],"summary":{total,needs_format,failed}}，不出其余文本。
 
 import { jsonStart } from "./toolchain";
 import {
@@ -26,11 +24,12 @@ import {
     K_DOT, K_COMMA, K_SEMI, K_COLON, K_LPAREN, K_RPAREN,
     K_LBRACE, K_RBRACE, K_LBRACKET, K_RBRACKET, K_COMMENT,
     K_PIPE, K_ASSIGN, K_FATARROW, K_STAR,
+    K_PLUS, K_SLASH, K_PERCENT, K_AMP, K_CARET, K_NEW, K_SWITCH,
 } from "../lexer";
 import { filePath } from "./file_path";
 import { jsonQuote } from "./json_text";
 
-// token 物化：四平行列表（K_EOF 不入表，与 Zig 同形）。
+// token 物化：四平行列表（K_EOF 不入表）。
 struct Toks {
     kinds: List<int>,
     texts: List<string>,
@@ -38,7 +37,7 @@ struct Toks {
     cols: List<int>,
 }
 
-// 格式化器状态（Zig Fmt 同构；prevKind=-1＝无前 token）。
+// 格式化器状态（prevKind=-1＝无前 token）。
 struct Fmt {
     toks: Ref<Toks>,
     parts: List<string>, // 已冲刷的输出分段（末尾两两合并成整串）
@@ -47,37 +46,41 @@ struct Fmt {
     angles: List<bool>, // 逐 token：是泛型尖括号（类型实参的 `<`、`>`）吗——markAngles 预先算好
     forIn: List<bool>, // 逐 token：是 for 头里的上下文关键字 in 吗
     coalesce: List<int>, // 逐 token：`??` 合并运算的第一个 `?` 为 1、第二个为 2，其余 0
+    tern: List<int>, // 逐 token：三元的 `?` 为 1、与它配对的 `:` 为 2，其余 0（markTernary，D3 v0.50）
     prevLine: int,
     prevCol: int, // 上一 token 起始列（移位邻接复原判据）
     prevKind: int,
     prevText: string,
     prevPrevEnd: bool, // 上上个 token 是否表达式结尾（一元 minus 判据）
-    prevClose: bool, // 上个 token 是 `??` 的第二个 `?`（不是表达式结尾：`a ?? -1` 的负号是一元的）
+    prevClose: bool, // 上个 token 是 `??` 的第二个 `?` 或三元的 `?`／`:`（不是表达式结尾：`a ?? -1`、`c ? -1 : 1` 的负号是一元的）
     lineExprEnd: bool, // 当前行最后 token（非注释）是否表达式结尾（分号补齐判据）
     items: List<bool>, // 容器栈：true＝表达式/字段容器，false＝语句块
     itemsN: int, // 容器栈有效深度（items 只增不缩，按 itemsN 复用）
 }
 
-// formatSource 结果：词法错误拒绝格式化（不静默处理坏输入），msg 为首条诊断。
+// formatSource 结果：词法错误与零空白相邻的 `++`／`--` 拒绝格式化（不静默处理坏输入），msg 为首条诊断，
+// why 为拒绝的类别（--check 的跳过说明）。
 export struct FmtRes {
     rejected: bool,
     text: string,
     msg: string,
+    why: string,
 }
 
-// 单文件结果（Zig FmtFileOutcome 同构）。
+// 单文件结果。
 struct FileRes {
-    ok: bool, // false＝读取失败或词法拒绝
+    ok: bool, // false＝读取失败或词元层拒绝
     changed: bool,
     msg: string,
-    lexInvalid: bool, // 词法非法（1xxx 诊断）——非格式面（--check 跳过不计数）
+    tokInvalid: bool, // 词元层非法（1xxx 词法诊断，或零空白相邻的 ++／--）——非格式面（--check 跳过不计数）
+    why: string, // tokInvalid 时拒绝的类别
     text: string, // ok 时格式化文本
 }
 
 const fmtPartLimit: int = 256;
 
 export function formatSource(src: string): Ref<FmtRes> {
-    const r: Ref<FmtRes> = new FmtRes { rejected: false, text: "", msg: "" };
+    const r: Ref<FmtRes> = new FmtRes { rejected: false, text: "", msg: "", why: "" };
     const toks: Ref<Toks> = new Toks { kinds: listNew(), texts: listNew(), lines: listNew(), cols: listNew() };
     const out: Ref<Out> = new Out { lines: "", errors: "", failed: false, coded: true };
     const c: Ref<Cur> = new Cur { pos: 0, line: 1, col: 1 };
@@ -94,6 +97,16 @@ export function formatSource(src: string): Ref<FmtRes> {
     if (out.failed) {
         r.rejected = true;
         r.msg = firstErrMsg(out.errors);
+        r.why = "词法非法";
+        return r;
+    }
+    // 太虚没有 `++`／`--`（D3 v0.49 §8）：源中零空白相邻的两个 `+` 或两个 `-` 编译门报 2001，这里同样拒绝——
+    // 按一元／双目排版会静默改写坏输入（`i++` 排成 `i + +`）。
+    const inc: string = incDecMsg(toks);
+    if (len(inc) > 0) {
+        r.rejected = true;
+        r.msg = inc;
+        r.why = "没有 ++／--";
         return r;
     }
     const f: Ref<Fmt> = new Fmt {
@@ -104,6 +117,7 @@ export function formatSource(src: string): Ref<FmtRes> {
         angles: listNew(),
         forIn: listNew(),
         coalesce: listNew(),
+        tern: listNew(),
         prevLine: 0,
         prevCol: 0,
         prevKind: -1,
@@ -115,11 +129,32 @@ export function formatSource(src: string): Ref<FmtRes> {
         itemsN: 0,
     };
     markAngles(f);
+    markTernary(f);
     emitAll(f);
     // 文件以单换行结尾（幂等：fmt 产物不再多行）。
     listPush(f.parts, f.cur + "\n");
     r.text = joinParts(f.parts);
     return r;
+}
+
+// 第一处零空白相邻的 `++`／`--` 的诊断文案（同解析器）；没有时为空串。
+function incDecMsg(toks: Ref<Toks>): string {
+    const n: int = listLen(toks.kinds);
+    let i: int = 1;
+    while (i < n) {
+        const k: int = (listGet(toks.kinds, i) catch -1);
+        if ((k == K_PLUS || k == K_MINUS) && (listGet(toks.kinds, i - 1) catch -1) == k
+            && (listGet(toks.lines, i - 1) catch 0) == (listGet(toks.lines, i) catch -1)
+            && (listGet(toks.cols, i - 1) catch 0) + 1 == (listGet(toks.cols, i) catch -1)) {
+            const at: string = "第 " + toStr((listGet(toks.lines, i - 1) catch 0)) + " 行：";
+            if (k == K_PLUS) {
+                return at + "太虚没有 ++：写 i += 1";
+            }
+            return at + "太虚没有 --：写 i -= 1（两次取负写 -(-x)）";
+        }
+        i = i + 1; // 编译器源码须能由种子编译（种子没有复合赋值）
+    }
+    return "";
 }
 
 // 分段两两合并（复制总量 n·log n；逐段追加到一个长串是 n²）。
@@ -179,7 +214,7 @@ function firstErrMsg(errors: string): string {
 }
 
 // ============================================================================
-// 发射核心（Zig emitAll/emitOne 逐步同构——语句顺序即判据顺序，勿重排）
+// 发射核心（emitAll/emitOne——语句顺序即判据顺序，勿重排）
 // ============================================================================
 
 function kindAt(f: Ref<Fmt>, i: int): int {
@@ -294,7 +329,7 @@ function emitOne(f: Ref<Fmt>, i: int, curStmtStart: bool, isItems: bool): void {
         }
     }
 
-    // string/template/char：Tok.text 即原始切片（＝Zig Token.raw），逐字还原。
+    // string/template/char：Tok.text 即原始切片，逐字还原。
     appendStr(f, tText);
 
     if (tKind == K_LBRACE || tKind == K_LPAREN || tKind == K_LBRACKET) {
@@ -317,13 +352,13 @@ function emitOne(f: Ref<Fmt>, i: int, curStmtStart: bool, isItems: bool): void {
     if (f.prevKind != -1) {
         f.prevPrevEnd = isExprEnd(f.prevKind) && !f.prevClose;
     }
-    f.prevClose = coalAt(f, i) == 2;
+    f.prevClose = coalAt(f, i) == 2 || ternAt(f, i) != 0;
     f.prevLine = tLine;
     f.prevCol = tCol;
     f.prevKind = tKind;
     f.prevText = tText;
     if (tKind != K_COMMENT) {
-        f.lineExprEnd = isExprEnd(tKind) && coalAt(f, i) == 0; // 注释不改变行尾形态；`??` 之后表达式未完
+        f.lineExprEnd = isExprEnd(tKind) && coalAt(f, i) == 0 && ternAt(f, i) == 0; // 注释不改变行尾形态；`??`、三元的 `?` 之后表达式未完
     }
 }
 
@@ -353,22 +388,30 @@ function markAngles(f: Ref<Fmt>): void {
     i = 1;
     while (i < n) {
         const k: int = kindAt(f, i);
-        // `??`：后缀位置的 `?` 之后紧跟（穿透注释）另一个 `?`，同解析器的双 `?` 前瞻；自左向右成对。
+        // `??`：后缀位置的 `?` 之后紧跟（穿透注释）另一个 `?`，同解析器的双 `?` 前瞻；自左向右成对。两个 `?` 不相邻且第二个是
+        // 三元的 `?`（`x? ? a : b`，解析器给“条件须加括号”的诊断）时不成对，照传播与三元排版，不并成 `??`。
         if (k == K_QUESTION && coalAt(f, i) == 0) {
             const q: int = nextCode(f, i + 1);
-            if (kindAt(f, q) == K_QUESTION) {
+            if (kindAt(f, q) == K_QUESTION && !(!tokAdjacent(f, i, q) && ternaryAt(f, q))) {
                 listSet(f.coalesce, i, 1);
                 listSet(f.coalesce, q, 2);
             }
         }
         if (k == K_FOR) {
-            // for (x in …)：K_FOR K_LPAREN K_IDENT K_IDENT("in")（in 是上下文关键字，词法上是标识符）。
+            // for (x in …)：K_FOR K_LPAREN K_IDENT K_IDENT("in")（in 是上下文关键字，词法上是标识符）；
+            // 双变量 for (i, x in …) 多一个 K_COMMA K_IDENT。
             const a: int = nextCode(f, i + 1);
             const b: int = nextCode(f, a + 1);
             const c: int = nextCode(f, b + 1);
             if (kindAt(f, a) == K_LPAREN && kindAt(f, b) == K_IDENT && kindAt(f, c) == K_IDENT
                 && (listGet(f.toks.texts, c) catch "") == "in") {
                 listSet(f.forIn, c, true);
+            }
+            const d: int = nextCode(f, c + 1);
+            const e: int = nextCode(f, d + 1);
+            if (kindAt(f, a) == K_LPAREN && kindAt(f, b) == K_IDENT && kindAt(f, c) == K_COMMA && kindAt(f, d) == K_IDENT
+                && kindAt(f, e) == K_IDENT && (listGet(f.toks.texts, e) catch "") == "in") {
+                listSet(f.forIn, e, true);
             }
         }
         if (k == K_LT && kindAt(f, i - 1) == K_IDENT && !shiftPair(f, i)) {
@@ -435,6 +478,112 @@ function coalAt(f: Ref<Fmt>, i: int): int {
     return (listGet(f.coalesce, i) catch 0);
 }
 
+// i、j 两个记号在源中零空白相邻（同行且 j 紧接 i；i 为单字节记号）。
+function tokAdjacent(f: Ref<Fmt>, i: int, j: int): bool {
+    return (listGet(f.toks.lines, j) catch -1) == (listGet(f.toks.lines, i) catch -2)
+    && (listGet(f.toks.cols, j) catch -1) == (listGet(f.toks.cols, i) catch -2) + 1;
+}
+
+function ternAt(f: Ref<Fmt>, i: int): int {
+    return (listGet(f.tern, i) catch 0);
+}
+
+// 三元的认定（D3 v0.50 语法注记 8，同解析器 ternaryAheadAt）：单个 `?`（不是 `??`、`?.`）之后的记号能开始表达式，且从那里
+// 向后在同一层先遇到 `:`——不先遇到 `,` `;` `=`、本层的闭括号、语句开头的关键字或文件尾。类型里的 `?` 之后是 `,` `)` `>`
+// `=` `=>`，返回类型 `): T? {` 经函数体之后遇到下一条声明的关键字，都不会认错。配对：按括号层记下待配对的三元 `?`，同层
+// 遇到 `:` 即与最近的一个配对（嵌套 a ? b ? c : d : e 由内向外）；其余的 `:`（类型标注、字段）在别的层或没有待配对的 `?`。
+function markTernary(f: Ref<Fmt>): void {
+    const n: int = listLen(f.toks.kinds);
+    let i: int = 0;
+    while (i < n) {
+        listPush(f.tern, 0);
+        i = i + 1;
+    }
+    const pend: List<int> = listNew();
+    const opens: List<int> = listNew(); // 未闭的开括号下标
+    let depth: int = 0;
+    let prevCode: int = -1; // 上一个非注释记号
+    let closedOpen: int = -1; // 上一个闭括号配对的开括号
+    i = 0;
+    while (i < n) {
+        const k: int = kindAt(f, i);
+        if (k == K_LPAREN || k == K_LBRACKET || k == K_LBRACE) {
+            depth = depth + 1;
+            listPush(opens, i);
+        } else if (k == K_RPAREN || k == K_RBRACKET || k == K_RBRACE) {
+            depth = depth - 1;
+            closedOpen = -1;
+            if (listLen(opens) > 0) {
+                closedOpen = listGet(opens, listLen(opens) - 1) catch -1;
+                listRemoveAt(opens, listLen(opens) - 1);
+            }
+            while (listLen(pend) > 0 && (listGet(pend, listLen(pend) - 1) catch 0) > depth) {
+                listRemoveAt(pend, listLen(pend) - 1);
+            }
+        } else if (k == K_QUESTION && coalAt(f, i) == 0 && ternaryAt(f, i)) {
+            listSet(f.tern, i, 1);
+            listPush(pend, depth);
+        } else if (k == K_COLON && listLen(pend) > 0 && (listGet(pend, listLen(pend) - 1) catch -1) == depth
+            && !(prevCode >= 0 && kindAt(f, prevCode) == K_RPAREN && arrowHeadAt(f, closedOpen))) {
+            // 箭头函数的返回类型冒号 `(k: int): int =>` 在同一层，不是三元的 `:`。
+            listSet(f.tern, i, 2);
+            listRemoveAt(pend, listLen(pend) - 1);
+        }
+        if (k != K_COMMENT) {
+            prevCode = i;
+        }
+        i = i + 1;
+    }
+}
+
+// o 处的 `(` 开始箭头头：其后是 `)`，或 `标识符 :`（同解析器 isArrowHeadAt）。
+function arrowHeadAt(f: Ref<Fmt>, o: int): bool {
+    if (o < 0 || kindAt(f, o) != K_LPAREN) {
+        return false;
+    }
+    const a: int = nextCode(f, o + 1);
+    if (kindAt(f, a) == K_RPAREN) {
+        return true;
+    }
+    return kindAt(f, a) == K_IDENT && kindAt(f, nextCode(f, a + 1)) == K_COLON;
+}
+
+function ternaryAt(f: Ref<Fmt>, q: int): bool {
+    const n: int = listLen(f.toks.kinds);
+    const a: int = nextCode(f, q + 1);
+    if (a >= n) {
+        return false;
+    }
+    const k1: int = kindAt(f, a);
+    if (!(k1 == K_IDENT || k1 == K_INT || k1 == K_CHAR || k1 == K_FLOAT || k1 == K_STR || k1 == K_TEMPLATE
+            || k1 == K_TRUE || k1 == K_FALSE || k1 == K_NEW || k1 == K_SWITCH || k1 == K_LPAREN || k1 == K_LBRACE
+            || k1 == K_LBRACKET || k1 == K_MINUS || k1 == K_BANG || k1 == K_TILDE)) {
+        return false;
+    }
+    let depth: int = 0;
+    let j: int = a;
+    while (j < n) {
+        const k: int = kindAt(f, j);
+        if (k == K_LPAREN || k == K_LBRACKET || k == K_LBRACE) {
+            depth = depth + 1;
+        } else if (k == K_RPAREN || k == K_RBRACKET || k == K_RBRACE) {
+            if (depth == 0) {
+                return false;
+            }
+            depth = depth - 1;
+        } else if (depth == 0) {
+            if (k == K_COLON) {
+                return true;
+            }
+            if (k == K_COMMA || k == K_SEMI || k == K_ASSIGN || startsStatement(k)) {
+                return false;
+            }
+        }
+        j = nextCode(f, j + 1);
+    }
+    return false;
+}
+
 // 行内前缀空白：false＝紧贴，true＝一空格（默认）。i 为当前 token 的下标（前一 token 为 i − 1）。
 function inlineSpace(f: Ref<Fmt>, i: int, curKind: int, curLine: int, curCol: int): bool {
     const prev: int = f.prevKind;
@@ -449,6 +598,10 @@ function inlineSpace(f: Ref<Fmt>, i: int, curKind: int, curLine: int, curCol: in
     if (coalAt(f, i - 1) == 2) {
         return true;
     }
+    // 三元（D3 v0.50）：`?` 与配对的 `:` 两侧各一空格 `c ? a : b`（之后的一空格走默认规则）。
+    if (ternAt(f, i) != 0) {
+        return true;
+    }
     if ((prev == K_LT || prev == K_GT) && angleAt(f, i - 1)) {
         // 开尖括号之后紧贴（`List<int>`）；收尖括号之后的调用紧贴（`listNew<int>()`），其余照常。
         if (prev == K_LT || curKind == K_LPAREN) {
@@ -457,6 +610,9 @@ function inlineSpace(f: Ref<Fmt>, i: int, curKind: int, curLine: int, curCol: in
     }
     if (curKind == K_DOT && prev == K_COMMA) {
         return true; // D3 v0.36 外部函数的变参参数 `, ...名: 类型`：逗号后一空格，三个点紧贴参数名
+    }
+    if (curKind == K_DOT && prev == K_LBRACE) {
+        return true; // D3 v0.51 struct 更新表达式 `{ ...t, f: v }`：开花括号后一空格，三个点紧贴展开源
     }
     if (curKind == K_STAR && prev == K_FUNCTION) {
         return false; // 生成器 `function* 名`（D3 v0.22 §6.20，同 JS／TS 的常见排版）：星号紧贴 function，其后一空格
@@ -480,6 +636,11 @@ function inlineSpace(f: Ref<Fmt>, i: int, curKind: int, curLine: int, curCol: in
         }
         return true; // 比较运算（泛型的开尖括号已在上面紧贴）
     }
+    if (curKind == K_ASSIGN && f.prevLine == curLine && f.prevCol + 1 == curCol
+        && (prev == K_PLUS || prev == K_MINUS || prev == K_STAR || prev == K_SLASH || prev == K_PERCENT
+            || prev == K_AMP || prev == K_PIPE || prev == K_CARET)) {
+        return false; // 复合赋值 `+=` 等（D3 v0.49）：源中零空白相邻的运算符与 `=` 紧贴
+    }
     if (prev == K_LPAREN || prev == K_LBRACKET || prev == K_DOT || prev == K_BANG) {
         return false;
     }
@@ -489,12 +650,15 @@ function inlineSpace(f: Ref<Fmt>, i: int, curKind: int, curLine: int, curCol: in
     if (prev == K_LBRACE) {
         return true; // `{ x: 1 }`：开括号后一空格
     }
+    if (prev == K_MINUS && curKind == K_MINUS) {
+        return true; // `- -x`：两个负号之间保留空格，不并成 `--`（D3 v0.49 §8；零空白相邻的已在 formatSource 拒绝）
+    }
     if (prev == K_MINUS) {
         return f.prevPrevEnd; // 一元负号紧贴（前一非表达式结尾）
     }
     if (prev == K_IDENT) {
-        // for 头的 `in` 后接数组字面量：`for (x in [1, 2])`，不是下标（in 词法上是标识符）。
-        if (curKind == K_LBRACKET && (listGet(f.forIn, i - 1) catch false)) {
+        // for 头的 `in` 后接数组字面量或括号：`for (x in [1, 2])`、`for (x in (a ?? b).f)`，不是下标或调用（in 词法上是标识符）。
+        if ((curKind == K_LBRACKET || curKind == K_LPAREN) && (listGet(f.forIn, i - 1) catch false)) {
             return true;
         }
         // `and`/`or` 双目运算符空格不紧贴；`f(...)`/`a[i]` 紧贴。
@@ -524,7 +688,7 @@ function startsStatement(k: int): bool {
 }
 
 // ============================================================================
-// CLI（Zig cmdFmt 同构）
+// CLI
 // ============================================================================
 
 function endsWithTx(s: string): bool {
@@ -560,7 +724,7 @@ function collectTxFiles(root: string, out: List<string>, fails: List<string>): v
 }
 
 function fmtFile(p: string, write: bool): Ref<FileRes> {
-    const r: Ref<FileRes> = new FileRes { ok: false, changed: false, msg: "", lexInvalid: false, text: "" };
+    const r: Ref<FileRes> = new FileRes { ok: false, changed: false, msg: "", tokInvalid: false, why: "", text: "" };
     const src: string = readFile(filePath(p)) catch (e) {
         r.msg = e.message;
         return r;
@@ -568,7 +732,8 @@ function fmtFile(p: string, write: bool): Ref<FileRes> {
     const fr: Ref<FmtRes> = formatSource(src);
     if (fr.rejected) {
         r.msg = fr.msg;
-        r.lexInvalid = true; // 词法码全表 1xxx＝恒 lex_invalid
+        r.why = fr.why;
+        r.tokInvalid = true; // 词法码全表 1xxx＝恒 lex_invalid；++／-- 同属词元层
         return r;
     }
     r.ok = true;
@@ -648,8 +813,8 @@ export function fmtCommand(args: List<string>): int {
     while (k < total) {
         const r: Ref<FileRes> = fmtFile((listGet(files, k) catch ""), write);
         listPush(res, r);
-        if (!r.ok && !r.lexInvalid) {
-            failed = failed + 1; // 词法非法＝非格式面（编译门已拒），跳过不计数
+        if (!r.ok && !r.tokInvalid) {
+            failed = failed + 1; // 词元层非法＝非格式面（编译门已拒），跳过不计数
         }
         if (r.changed) {
             changedTotal = changedTotal + 1;
@@ -681,8 +846,8 @@ export function fmtCommand(args: List<string>): int {
         while (k < total) {
             const p: string = (listGet(files, k) catch "");
             const r: Ref<FileRes> = (listGet(res, k) catch emptyRes());
-            if (!r.ok && r.lexInvalid) {
-                eprint(p + ": 跳过（词法非法——非格式面，编译门已拒）");
+            if (!r.ok && r.tokInvalid) {
+                eprint(p + ": 跳过（" + r.why + "——非格式面，编译门已拒）");
             } else if (!r.ok) {
                 eprint(p + ": 无法格式化（" + r.msg + "）");
             } else if (r.changed) {
@@ -721,7 +886,7 @@ export function fmtCommand(args: List<string>): int {
         return 1;
     }
     if (check && needFormat > 0) {
-        return 1; // 检查未通过（D9 §3）
+        return 1; // 检查未通过
     }
     return 0;
 }
@@ -734,5 +899,5 @@ function boolText(b: bool): string {
 }
 
 function emptyRes(): Ref<FileRes> {
-    return new FileRes { ok: false, changed: false, msg: "", lexInvalid: false, text: "" };
+    return new FileRes { ok: false, changed: false, msg: "", tokInvalid: false, why: "", text: "" };
 }

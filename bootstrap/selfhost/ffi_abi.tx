@@ -1,0 +1,296 @@
+// 外部结构体按值传与返回：按目标的 C 调用约定给出
+// 每个实参的传法与返回的取法。语义分析（第一次调用时的目标检查）与调用桩共用，纯函数。
+// 布局行同 ProgramContext.ffiLay：[struct 池序＋1, 大小, 对齐, 字段数, (偏移, 种类, 元素数, 附加)×字段数]；封送种类码见
+// semamirror FfiX（21＝外部结构体按值，附加＝布局序）。
+import { tWin64, tSysV, tA64, tIsa, ISA_LA64, ISA_RV64, targetName } from "./target";
+
+/// 一次外部调用的传法。args 每个声明实参一组片段 (来源, 偏移, 类别)×n：来源 0 原值（非按值结构体的实参，类别由桩照旧
+/// 决定）、1 从缓冲取 8 字节、2 从缓冲取 4 字节、3 缓冲地址；类别同 rtCallC（0 整数、1 float、6 f32、8 栈上原样 8 字节）。
+/// hidden：返回缓冲地址作隐藏的第一个实参（Win64 的 RCX、SysV 的 RDI）；x8：arm64 经 X8 间接返回。
+/// ret 返回片段 (寄存器, 偏移, 宽度)×n：寄存器 0、1 为第一、第二个整数返回寄存器（RAX、RDX／X0、X1），2..5 为第一～第四个
+/// 浮点返回寄存器（XMM0、XMM1）。err 非空＝这次调用的形态暂不支持（第三节第 5 条）。
+export struct FfiAbiPlan {
+    err: string,
+    args: List<List<int>>,
+    hidden: bool,
+    x8: bool,
+    ret: List<int>,
+}
+
+function layRow(lay: List<List<int>>, li: int): List<int> {
+    const empty: List<int> = listNew();
+    return listGet(lay, li) catch empty;
+}
+
+export function ffiAbiSize(lay: List<List<int>>, li: int): int { return listGet(layRow(lay, li), 1) catch 0; }
+
+function width(k: int): int {
+    if (k == 1 || k == 4) { return 1; }
+    if (k == 2 || k == 5) { return 2; }
+    if (k == 3 || k == 6 || k == 10) { return 4; }
+    return 8;
+}
+
+function isFloat(k: int): bool { return k == 10 || k == 12; }
+
+/// 叶子标量展平：(偏移, 种类)×n；嵌套外部结构体与定长数组逐元素展开，串、Bytes 与回调字段（指针）按 int 计。
+function leaves(lay: List<List<int>>, li: int, base: int, out: List<int>): void {
+    const row = layRow(lay, li);
+    const nf = listGet(row, 3) catch 0;
+    let j = 0;
+    while (j < nf) {
+        const off = base + (listGet(row, 4 + j * 4) catch 0);
+        let k = listGet(row, 5 + j * 4) catch 0;
+        const cnt = listGet(row, 6 + j * 4) catch 1;
+        if (k == 19) {
+            leaves(lay, listGet(row, 7 + j * 4) catch 0, off, out);
+        } else {
+            if (k == 14 || k == 15 || k == 16 || k == 20) { k = 11; }
+            let e = 0;
+            while (e < cnt) {
+                listPush(out, off + e * width(k));
+                listPush(out, k);
+                e = e + 1;
+            }
+        }
+        j = j + 1;
+    }
+}
+
+/// 同构浮点聚合（AAPCS64 HFA）：叶子全是同一种浮点、1～4 个时得该种类（10 f32、12 float），否则 0。
+function hfaKind(lv: List<int>): int {
+    const n = listLen(lv) / 2;
+    if (n < 1 || n > 4) { return 0; }
+    const k0 = listGet(lv, 1) catch 0;
+    if (!isFloat(k0)) { return 0; }
+    let i = 1;
+    while (i < n) {
+        if ((listGet(lv, i * 2 + 1) catch 0) != k0) { return 0; }
+        i = i + 1;
+    }
+    return k0;
+}
+
+/// SysV 不大于 16 字节聚合的八字节分类：每个八字节 0 INTEGER、1 SSE（八字节里有任一非浮点叶子即 INTEGER）。
+function sysvClasses(lv: List<int>, size: int): List<int> {
+    const out: List<int> = listNew();
+    const n = (size + 7) / 8;
+    let e = 0;
+    while (e < n) {
+        let c = 1;
+        let i = 0;
+        while (i < listLen(lv) / 2) {
+            const off = listGet(lv, i * 2) catch 0;
+            if (off >= e * 8 && off < e * 8 + 8 && !isFloat(listGet(lv, i * 2 + 1) catch 0)) { c = 0; }
+            i = i + 1;
+        }
+        listPush(out, c);
+        e = e + 1;
+    }
+    return out;
+}
+
+/// LP64D 的目标：龙芯与 RISC-V（两家 psABI 的标量与结构体分类相同，B17）。
+function lp64d(t: int): bool { return tIsa(t) == ISA_LA64 || tIsa(t) == ISA_RV64; }
+/// LP64D 的浮点约定（龙芯、RISC-V 的 psABI）：展平后一个或两个叶子、至少一个是浮点时得浮点叶子数（1 或 2），否则 0（按整数约定）。
+function lpFloats(lv: List<int>): int {
+    const n = listLen(lv) / 2;
+    if (n < 1 || n > 2) { return 0; }
+    let nf = 0;
+    let i = 0;
+    while (i < n) {
+        if (isFloat(listGet(lv, i * 2 + 1) catch 0)) { nf = nf + 1; }
+        i = i + 1;
+    }
+    return nf;
+}
+
+function piece(out: List<int>, src: int, off: int, cls: int): void {
+    listPush(out, src);
+    listPush(out, off);
+    listPush(out, cls);
+}
+
+function retPiece(out: List<int>, reg: int, off: int, w: int): void {
+    listPush(out, reg);
+    listPush(out, off);
+    listPush(out, w);
+}
+
+function pow2Small(size: int): bool { return size == 1 || size == 2 || size == 4 || size == 8; }
+
+/// pk、pa：参数的封送种类与附加；nfix：定参个数（其后为 C 变参，不会是按值结构体）；rk、ra：返回的种类与附加；t：目标。
+export function ffiAbiPlan(lay: List<List<int>>, pk: List<int>, pa: List<int>, nfix: int, rk: int, ra: int, t: int): Ref<FfiAbiPlan> {
+    const plan = new FfiAbiPlan { err: "", args: listNew(), hidden: false, x8: false, ret: listNew() };
+    // 返回。
+    if (rk == 21) {
+        const size = ffiAbiSize(lay, ra);
+        const lv: List<int> = listNew();
+        leaves(lay, ra, 0, lv);
+        if (tWin64(t)) {
+            if (pow2Small(size)) { retPiece(plan.ret, 0, 0, 8); } else { plan.hidden = true; }
+        } else if (tSysV(t)) {
+            if (size > 16) {
+                plan.hidden = true;
+            } else {
+                const cs = sysvClasses(lv, size);
+                let ni = 0;
+                let nf = 0;
+                let e = 0;
+                while (e < listLen(cs)) {
+                    if ((listGet(cs, e) catch 0) == 0) { retPiece(plan.ret, ni, e * 8, 8); ni = ni + 1; }
+                    else { retPiece(plan.ret, 2 + nf, e * 8, 8); nf = nf + 1; }
+                    e = e + 1;
+                }
+            }
+        } else if (tA64(t)) {
+            const hk = hfaKind(lv);
+            if (hk > 0) {
+                const w = width(hk);
+                let m = 0;
+                while (m < listLen(lv) / 2) { retPiece(plan.ret, 2 + m, m * w, w); m = m + 1; }
+            } else if (size <= 16) {
+                retPiece(plan.ret, 0, 0, 8);
+                if (size > 8) { retPiece(plan.ret, 1, 8, 8); }
+            } else {
+                plan.x8 = true;
+            }
+        } else if (lp64d(t)) {
+            // LP64D：不大于 16 字节时，浮点约定的叶子按序放 fa0、fa1（整数叶子放 a0），否则整数约定放 a0、a1；更大的由调用方分配、
+            // 地址作隐含的第一个实参（a0）。
+            const lf = lpFloats(lv);
+            if (size > 16) {
+                plan.hidden = true;
+            } else if (lf > 0) {
+                let fr = 0;
+                let m = 0;
+                while (m < listLen(lv) / 2) {
+                    const k = listGet(lv, m * 2 + 1) catch 0;
+                    const off = listGet(lv, m * 2) catch 0;
+                    if (isFloat(k)) { retPiece(plan.ret, 2 + fr, off, width(k)); fr = fr + 1; } else { retPiece(plan.ret, 0, off, width(k)); }
+                    m = m + 1;
+                }
+            } else {
+                retPiece(plan.ret, 0, 0, 8);
+                if (size > 8) { retPiece(plan.ret, 1, 8, 8); }
+            }
+        }
+    }
+    // 参数：按序模拟寄存器分配（只计定参；变参不会是按值结构体，排在定参之后，不影响结构体的去向）。
+    let ni = 0;
+    let nf = 0;
+    if (plan.hidden) { ni = 1; }
+    let i = 0;
+    while (i < listLen(pk)) {
+        const k = listGet(pk, i) catch 0;
+        const pieces: List<int> = listNew();
+        if (k != 21) {
+            piece(pieces, 0, 0, 0);
+            if (i < nfix) {
+                if (isFloat(k) && (nf < 8 || !lp64d(t))) { nf = nf + 1; } else { ni = ni + 1; }
+            }
+            listPush(plan.args, pieces);
+            i = i + 1;
+            continue;
+        }
+        const li = listGet(pa, i) catch 0;
+        const size = ffiAbiSize(lay, li);
+        const lv: List<int> = listNew();
+        leaves(lay, li, 0, lv);
+        if (tWin64(t)) {
+            if (pow2Small(size)) { piece(pieces, 1, 0, 0); } else { piece(pieces, 3, 0, 0); }
+        } else if (tSysV(t)) {
+            if (size > 16) {
+                let e = 0;
+                while (e < (size + 7) / 8) { piece(pieces, 1, e * 8, 8); e = e + 1; }
+            } else {
+                const cs = sysvClasses(lv, size);
+                let ints = 0;
+                let sses = 0;
+                for (c in cs) { if (c == 0) { ints = ints + 1; } else { sses = sses + 1; } }
+                if (ni + ints > 6 || nf + sses > 8) {
+                    if (len(plan.err) == 0) {
+                        plan.err = "第 " + toStr(i + 1) + " 个参数（外部结构体按值）在 " + targetName(t) + " 上放不进剩余的寄存器、要整体经栈传，这一形态暂不支持";
+                    }
+                }
+                let e = 0;
+                while (e < listLen(cs)) {
+                    piece(pieces, 1, e * 8, listGet(cs, e) catch 0);
+                    e = e + 1;
+                }
+                ni = ni + ints;
+                nf = nf + sses;
+            }
+        } else if (tA64(t)) {
+            const hk = hfaKind(lv);
+            if (hk > 0) {
+                const n = listLen(lv) / 2;
+                if (nf + n > 8 && len(plan.err) == 0) {
+                    plan.err = "第 " + toStr(i + 1) + " 个参数（外部结构体按值，同构浮点聚合）在 " + targetName(t) + " 上放不进剩余的浮点寄存器、要经栈传，这一形态暂不支持";
+                }
+                let m = 0;
+                while (m < n) {
+                    if (hk == 10) { piece(pieces, 2, m * 4, 6); } else { piece(pieces, 1, m * 8, 1); }
+                    m = m + 1;
+                }
+                nf = nf + n;
+            } else if (size <= 16) {
+                const words = (size + 7) / 8;
+                if (ni + words > 8 && len(plan.err) == 0) {
+                    plan.err = "第 " + toStr(i + 1) + " 个参数（外部结构体按值）在 " + targetName(t) + " 上放不进剩余的整数寄存器、要经栈传，这一形态暂不支持";
+                }
+                let e = 0;
+                while (e < words) { piece(pieces, 1, e * 8, 0); e = e + 1; }
+                ni = ni + words;
+            } else {
+                piece(pieces, 3, 0, 0);
+                ni = ni + 1;
+            }
+        } else if (lp64d(t)) {
+            // LP64D：不大于 16 字节时，浮点约定（一个或两个叶子、至少一个浮点）要的浮点与整数寄存器都够才用，叶子按序各进一个
+            // 寄存器（f32 取 4 字节；整数叶子 8 字节整取，32 位的取 4 字节并符号扩展（类别 3），更窄的取 4 字节、缓冲清零故高位为 0）；否则按整数约定逐 8 字节进整数寄存器。要经栈传的（含浮点约定
+            // 放不下而改按整数约定的）同 A64 暂不支持；更大的传地址。
+            const lf = lpFloats(lv);
+            const n = listLen(lv) / 2;
+            if (size > 16) {
+                piece(pieces, 3, 0, 0);
+                ni = ni + 1;
+            } else if (lf > 0) {
+                if ((nf + lf > 8 || ni + n - lf > 8) && len(plan.err) == 0) {
+                    plan.err = "第 " + toStr(i + 1) + " 个参数（外部结构体按值，浮点约定）在 " + targetName(t) + " 上放不进剩余的浮点寄存器、要改按整数约定或经栈传，这一形态暂不支持";
+                }
+                let m = 0;
+                while (m < n) {
+                    const k = listGet(lv, m * 2 + 1) catch 0;
+                    const off = listGet(lv, m * 2) catch 0;
+                    if (k == 10) { piece(pieces, 2, off, 6); }
+                    else if (k == 12) { piece(pieces, 1, off, 1); }
+                    else if (width(k) == 8) { piece(pieces, 1, off, 0); }
+                    else if (width(k) == 4) { piece(pieces, 2, off, 3); }
+                    else { piece(pieces, 2, off, 0); }
+                    m = m + 1;
+                }
+                nf = nf + lf;
+                ni = ni + n - lf;
+            } else {
+                const words = (size + 7) / 8;
+                if (ni + words > 8 && len(plan.err) == 0) {
+                    plan.err = "第 " + toStr(i + 1) + " 个参数（外部结构体按值）在 " + targetName(t) + " 上放不进剩余的整数寄存器、要经栈传，这一形态暂不支持";
+                }
+                let e = 0;
+                while (e < words) { piece(pieces, 1, e * 8, 0); e = e + 1; }
+                ni = ni + words;
+            }
+        }
+        listPush(plan.args, pieces);
+        i = i + 1;
+    }
+    return plan;
+}
+
+/// 有没有按值结构体（参数或返回）；没有的调用桩与以前逐字节相同。
+export function ffiAbiByValue(pk: List<int>, rk: int): bool {
+    if (rk == 21) { return true; }
+    for (k in pk) { if (k == 21) { return true; } }
+    return false;
+}

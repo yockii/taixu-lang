@@ -1,4 +1,4 @@
-/* Test-only page heap (security review item 2, docs/design/v052-heap-check-v0.1-20261024.md): this driver links the
+/* Test-only page heap (security review item 2): this driver links the
    kernel generated with --generic=heapcheck and calls the three allocator routines directly (through the thunks below).
    "ok" exercises the allocator (every size class up to 3 pages, alignment, realloc, NULL and refused arguments); every
    other argument is a positive control that must be caught: ledger and canary reports end through __tx_trap (code 4012, message
@@ -24,6 +24,16 @@
 #define SYM(name) "_" name
 #else
 #define SYM(name) name
+#endif
+
+#if defined(__aarch64__) && defined(__linux__)
+/* aarch64 Linux links the page-heap-only object as on macOS: the A64 object writer resolves calls inside an object at
+   assembly time, so weakening the kernel's __tx_trap would not redirect the kernel's own calls to it. The page heap reads
+   what the product's _start records: envp (to find AT_PAGESZ in the auxiliary vector) and the LSE flag; main sets both. */
+#include <sys/auxv.h>
+extern char **environ;
+uint64_t __tx_nrt_envp;
+uint64_t __tx_a64_lse;
 #endif
 
 /* Image and tables the generated program normally provides: an empty image makes a trap report "<unknown>:0:0". */
@@ -118,6 +128,10 @@ static void ok(void) {
 
 int main(int argc, char **argv) {
     const char *control = argc > 1 ? argv[1] : "ok";
+#if defined(__aarch64__) && defined(__linux__)
+    __tx_nrt_envp = (uint64_t)(uintptr_t)environ;
+    __tx_a64_lse = (getauxval(AT_HWCAP) & HWCAP_ATOMICS) != 0;
+#endif
     if (strcmp(control, "ok") == 0) { ok(); return 0; }
     unsigned char *p = hc_alloc(20, 16);  /* 12 bytes of slack before the guard page */
     require(p != NULL, "control allocation");

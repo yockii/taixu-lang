@@ -1,4 +1,4 @@
-"""可移植渲染器的对照（macOS 适配 M4 设计 A9 修订）：同一编译器把语料各编两遍——缺省渲染器（emitmirror）与
+"""可移植渲染器的对照：同一编译器把语料各编两遍——缺省渲染器（emitmirror）与
 --codegen=portable（arm64 后端用的同一份渲染逻辑，此处落地为 x86_64）——各跑一遍（scripts/test-nrt-products.py），可选再跑
 --leak-check 与 --debug 两种；每个用例的结果须相同（通过、失败、跳过、编译期拒绝一一对应）。
 

@@ -1,4 +1,4 @@
-"""测试专用页堆的正负控制（安全审查攻关第 2 项，docs/design/v052-heap-check-v0.1-20261024.md 五、六）。由给定编译器编出内核生成器，
+"""测试专用页堆的正负控制（安全审查攻关第 2 项，五、六）。由给定编译器编出内核生成器，
 生成本宿主目标的页堆内核（--generic=heapcheck），分四部分检查：
 
   driver   C 驱动（tests/runtime-security/heap-check.c）直接链接页堆内核：分配器本身（ok）与九个正控制——重复释放、非法释放、
@@ -15,9 +15,10 @@
 
   python scripts/test-heap-check.py --compiler <taixu> --work <dir> [--leak-check] [--debug] [--standard-normal <json>] [part…]
 
-宿主为 Windows、Linux（x86_64）或 Apple silicon 的 macOS（产物为 aarch64-macos）。macOS 没有 GNU objcopy，内核又是交给太虚链接器
+宿主为 Windows、Linux（x86_64 或 aarch64，产物随宿主架构）或 Apple silicon 的 macOS（产物为 aarch64-macos）。macOS 没有 GNU objcopy，内核又是交给太虚链接器
 的 ELF 对象：驱动与变异体改链只含页堆的 Mach-O 目标文件（bootstrap/native_heap_check_probe.tx，不含 __tx_trap，libSystem 调用由
-驱动定义），arm64 原生与 x86_64（Rosetta）各跑一遍。
+驱动定义），arm64 原生与 x86_64（Rosetta）各跑一遍。aarch64 Linux 同样改链只含页堆的 ELF 目标文件：A64 写出器把对象内的调用在
+汇编时解析（内核对 __tx_trap 的调用没有重定位），objcopy 弱化改不到它们；envp 与 LSE 标志由驱动设好。
 C 编译器取 TAIXU_TEST_CC，否则 PATH 上的 cc／gcc／clang；objcopy（Windows、Linux）取 TAIXU_TEST_OBJCOPY，否则 C 编译器旁边或
 PATH 上的。缺工具即失败，不记通过。
 """
@@ -25,6 +26,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import platform
 import shutil
 import subprocess
 import sys
@@ -39,13 +41,17 @@ products = import_module('test-nrt-products')
 WINDOWS = os.name == 'nt'
 MACOS = sys.platform == 'darwin'
 EXE = '.exe' if WINDOWS else ''
-TARGET = 'x86_64-windows' if WINDOWS else ('aarch64-macos' if MACOS else 'x86_64-linux')
-PRODUCTS_TARGET = 'windows' if WINDOWS else ('aarch64-macos' if MACOS else 'linux')
+# Linux 产物按宿主架构：驱动由宿主的 C 编译器编、在宿主上跑，内核须同架构，系统 objcopy 也只认宿主的格式。
+A64_LINUX = sys.platform.startswith('linux') and platform.machine() in ('aarch64', 'arm64')
+TARGET = 'x86_64-windows' if WINDOWS else ('aarch64-macos' if MACOS else ('aarch64-linux' if A64_LINUX else 'x86_64-linux'))
+PRODUCTS_TARGET = 'windows' if WINDOWS else ('aarch64-macos' if MACOS else ('aarch64-linux' if A64_LINUX else 'linux'))
 KERNEL = 'kernel.obj' if WINDOWS else ('kernel-macos-aarch64.o' if MACOS else 'kernel-linux.o')
 # macOS 上访问不可访问页多报 SIGBUS。
 ACCESS_VIOLATION = (3221225477,) if WINDOWS else ((-11, -10) if MACOS else (-11,))
 # macOS 驱动的两种架构：(目标三元组, cc 的架构参数, 名字后缀)。
 MACOS_ARCHES = (('aarch64-macos', [], '-aarch64'), ('x86_64-macos', ['-arch', 'x86_64'], '-x86_64'))
+# 驱动与变异体改链只含页堆的目标文件的宿主及其架构（见文首）；None 为链整个检测内核、经 objcopy 弱化。
+PROBE_ARCHES = MACOS_ARCHES if MACOS else ((('aarch64-linux', [], ''),) if A64_LINUX else None)
 
 # 页堆模式下按清单跳过的语料用例（设计 三-6）：每项写明为何不跑，不静默放宽。
 SKIP = {
@@ -69,7 +75,7 @@ MUTANTS = {
     'guard': ('guard-write', [
         ('rtCall4(f, "x", "VirtualAlloc", L("base"), L("total"), I(MEM_COMMIT), I(PAGE_RW));',
          'rtCall4(f, "x", "VirtualAlloc", L("base"), L("maplen"), I(MEM_COMMIT), I(PAGE_RW));'),
-        ('uxSys(f, t, "", 10, ops3(L("x"), I(page), I(0)));', 'uxSys(f, t, "", 10, ops3(L("x"), I(page), I(3)));'),
+        ('uxSys(f, t, "", 10, ops3(L("x"), page, I(0)));', 'uxSys(f, t, "", 10, ops3(L("x"), page, I(3)));'),
     ]),
     'quarantine': ('use-after-free', [
         ('rtCall3(f, "", "VirtualFree", L("base"), L("total"), I(MEM_DECOMMIT));', ''),
@@ -131,8 +137,8 @@ def main():
     objcopy = tool('TAIXU_TEST_OBJCOPY', ['objcopy', 'llvm-objcopy'], near=shutil.which(cc) if cc else None)
 
     def generator(src_root, out):
-        tflag = ['--target=linux'] if not WINDOWS and not MACOS else []
-        rc, o, e = sh([compiler, 'build', 'bootstrap/runtime_memory_gen.tx', '--runtime=native', *tflag, '--out', out], cwd=src_root)
+        tflag = ['--target=' + TARGET] if not WINDOWS and not MACOS else []
+        rc, o, e = sh([compiler, 'build', 'bootstrap/runtime_memory_gen.tx', '--toolchain', '--runtime=native', *tflag, '--out', out], cwd=src_root)
         if not check('generator build ' + out.name, rc == 0, o + e):
             return None
         return out / ('runtime_memory_gen' + EXE)
@@ -143,13 +149,13 @@ def main():
         return out if check('kernel ' + str(out.relative_to(work)), rc == 0 and out.is_file(), o + e) else None
 
     def probes(src_root, out):
-        """macOS：由 src_root 的源码编出页堆探针生成器，为两种架构各出一个 Mach-O 目标文件 → [(对象, cc 架构参数, 后缀)]。"""
+        """macOS、aarch64 Linux：由 src_root 的源码编出页堆探针生成器，为 PROBE_ARCHES 各出一个目标文件 → [(对象, cc 架构参数, 后缀)]。"""
         out.mkdir(parents=True, exist_ok=True)  # build --out 只建最后一层
         rc, o, e = sh([compiler, 'build', 'bootstrap/native_heap_check_probe.tx', '--toolchain', '--out', out / 'probe-gen'], cwd=src_root)
         if not check('probe generator build ' + str(out.relative_to(work)), rc == 0, o + e):
             return []
         objs = []
-        for triple, archflags, tag in MACOS_ARCHES:
+        for triple, archflags, tag in PROBE_ARCHES:
             obj = out / ('heap-check' + tag + '.o')
             rc, o, e = sh([out / 'probe-gen' / 'native_heap_check_probe', '--target', triple, obj])
             if check('probe ' + str(obj.relative_to(work)), rc == 0 and obj.is_file(), o + e):
@@ -157,7 +163,7 @@ def main():
         return objs
 
     def driver(kobj, name, archflags=()):
-        if MACOS:
+        if PROBE_ARCHES:
             # 探针对象不含 __tx_trap，无须弱化。
             if not check('tools: C compiler', cc, 'cc=None'):
                 return None
@@ -195,7 +201,7 @@ def main():
         return finish(work, rows, bad)
 
     if 'driver' in parts:
-        for kobj, archflags, tag in (probes(ROOT, work / 'probe') if MACOS else [(heap, [], '')]):
+        for kobj, archflags, tag in (probes(ROOT, work / 'probe') if PROBE_ARCHES else [(heap, [], '')]):
             exe = driver(kobj, 'heap-check' + tag, archflags)
             if exe:
                 control(exe, 'ok', 'pass', 'driver%s: allocator' % tag)
@@ -250,7 +256,7 @@ def main():
             if not anchored:
                 continue
             module.write_text(text, encoding='utf-8', newline='\n')
-            if MACOS:
+            if PROBE_ARCHES:
                 objs = probes(tree, tree / 'probe')
             else:
                 mgen = generator(tree, tree / 'gen')

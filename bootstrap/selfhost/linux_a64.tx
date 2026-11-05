@@ -1,0 +1,113 @@
+// aarch64-linux 的手写入口与原语：语义同 nrt.tx 的
+// emitLinuxStart、nrt_thread.tx 的 tlsLeavesX86（ELF 分支）与 nrt_spawn.tx 的 __tx_thread_clone／__tx_thread_unmap_exit，
+// 只有这几处要在栈切换、线程指针上直接用机器指令，其余例程都经 rtfn 发出。
+// - 线程指针：TPIDR_EL0（用户态可读写，不像 x86_64 要 arch_prctl）。TLS 是 Variant I：线程指针指向 16 字节的线程控制块
+//   （[0] 为 dtv，[8] 保留），可执行文件的 TLS 块紧随其后——槽在 tp+16（PT_TLS 的对齐不超过 16 时，glibc、musl 与内核约定
+//   都如此）。动态产物由加载器设好线程指针；静态产物进程起始时为 0，_start 指向 __tx_tls_static（16 字节控制块＋槽）。
+// - clone 的实参次序：aarch64 是 (flags, stack, ptid, tls, ctid)，x86_64 是 (flags, stack, ptid, ctid, tls)。
+// - CPU 特性：_start 从 auxv 的 AT_HWCAP 取 HWCAP_ATOMICS（LSE），记进 __tx_a64_lse（rtfn_a64 的原子操作据此分支）。
+//   动态产物同样从这里进入（加载器把原始的栈原样交给 e_entry），线程都在之后创建，读到的标志一致。
+// 系统调用号是 aarch64 的号（Linux v7.3 的号表，syscall_names.tx 取）。私有约定：实参 x0..x7，x16／x17 可随意改写。
+import { StructuredBuffer, asBufferLabel, asBufferBoundaryBegin, asBufferFunctionEnd } from "./assemble";
+import { a64Emit, a64B, a64BCond, a64Cbz, a64Tbz, a64AddrOf, a64SymAccess, a64MovImm, a64Mem } from "./a64_asm";
+import { a64AddSubImm, a64AddSubShifted, a64LogicalShifted, a64BranchReg, a64Svc, a64Brk, a64Mrs, a64Msr, A64_TPIDR_EL0 } from "./a64_encode";
+import { syscallNumber } from "./syscall_names";
+
+const MODULE: string = "bootstrap/selfhost/linux_a64.tx";
+/// 线程指针到本线程 TLS 槽的偏移（Variant I：16 字节的线程控制块之后）。
+export const LINUX_A64_TLS_SLOT: int = 16;
+// auxv 的类型：AT_NULL 0、AT_HWCAP 16；HWCAP_ATOMICS 是 AT_HWCAP 的第 8 位（arm64 的 uapi hwcap.h）。
+const AT_HWCAP: int = 16;
+const HWCAP_ATOMICS_BIT: int = 8;
+
+function nr(name: string): int { return syscallNumber("aarch64", name); }
+function svc(b: Ref<StructuredBuffer>, name: string): void {
+    a64MovImm(b, 8, nr(name));
+    a64Emit(b, a64Svc(0), "svc #0");
+}
+function mov(b: Ref<StructuredBuffer>, rd: int, rn: int): void { a64Emit(b, a64LogicalShifted(1, 1, 0, rd, 31, rn, 0, 0), "mov"); }
+function ret(b: Ref<StructuredBuffer>): void { a64Emit(b, a64BranchReg(2, 30), "ret"); }
+
+/// 进程入口：sp → argc、argv[]、0、envp[]、0、auxv（(类型, 值) 对，类型 0 结束；sp 由内核按 16 字节对齐）。记下 envp 与
+/// LSE 标志，静态产物设好线程指针，以 x0＝argc、x1＝argv 调 __tx_native_entry（私有约定与 AAPCS64 的整数实参一致），以它的
+/// 结果 exit_group。x0、x1 全程不动，临时用 x3..x5 与 x16。
+export function linuxA64Start(b: Ref<StructuredBuffer>): void {
+    asBufferBoundaryBegin(b, MODULE, "_start", "process-entry");
+    asBufferLabel(b, "_start", 1);
+    // 帧链到此为止：fp＝0、lr＝0。
+    a64MovImm(b, 29, 0);
+    a64MovImm(b, 30, 0);
+    a64Mem(b, 3, 1, 0, 31, 0);
+    a64Emit(b, a64AddSubImm(1, 0, 0, 1, 31, 8, 0), "add x1, sp, #8");
+    // envp = argv + (argc + 1) * 8。
+    a64Emit(b, a64AddSubShifted(1, 0, 0, 2, 1, 0, 0, 3), "add x2, x1, x0, lsl #3");
+    a64Emit(b, a64AddSubImm(1, 0, 0, 2, 2, 8, 0), "add x2, x2, #8");
+    a64SymAccess(b, 3, 0, 0, 2, 16, "__tx_nrt_envp", 0);
+    // 跳过 envp（到结尾的 0 之后），逐对看 auxv。
+    mov(b, 3, 2);
+    asBufferLabel(b, "__tx_start_env", 1);
+    a64Mem(b, 3, 1, 4, 3, 0);
+    a64Emit(b, a64AddSubImm(1, 0, 0, 3, 3, 8, 0), "add x3, x3, #8");
+    a64Cbz(b, 1, 1, 4, "__tx_start_env");
+    asBufferLabel(b, "__tx_start_aux", 1);
+    a64Mem(b, 3, 1, 4, 3, 0);
+    a64Cbz(b, 1, 0, 4, "__tx_start_aux_done");
+    a64Mem(b, 3, 1, 5, 3, 8);
+    a64Emit(b, a64AddSubImm(1, 0, 0, 3, 3, 16, 0), "add x3, x3, #16");
+    a64Emit(b, a64AddSubImm(1, 1, 1, 31, 4, AT_HWCAP, 0), "cmp x4, #AT_HWCAP");
+    a64BCond(b, 1, "__tx_start_aux");
+    a64Tbz(b, 0, 5, HWCAP_ATOMICS_BIT, "__tx_start_aux_done");
+    a64MovImm(b, 4, 1);
+    a64SymAccess(b, 3, 0, 0, 4, 16, "__tx_a64_lse", 0);
+    asBufferLabel(b, "__tx_start_aux_done", 1);
+    a64Emit(b, a64Mrs(16, A64_TPIDR_EL0), "mrs x16, tpidr_el0");
+    a64Cbz(b, 1, 1, 16, "__tx_start_tls_ready");
+    a64AddrOf(b, 16, "__tx_tls_static", 0);
+    a64Emit(b, a64Msr(A64_TPIDR_EL0, 16), "msr tpidr_el0, x16");
+    asBufferLabel(b, "__tx_start_tls_ready", 1);
+    a64B(b, 1, "__tx_native_entry");
+    svc(b, "exit_group");
+    a64Emit(b, a64Brk(1), "brk #1");
+    asBufferFunctionEnd(b);
+}
+
+/// __tx_tls_tb_get() → 本线程的线程块（外来线程为 0）；__tx_tls_tb_set(tb)。只写 x0 与 x16。
+export function linuxA64TlsLeaves(b: Ref<StructuredBuffer>): void {
+    asBufferLabel(b, "__tx_tls_tb_get", 1);
+    a64Emit(b, a64Mrs(16, A64_TPIDR_EL0), "mrs x16, tpidr_el0");
+    a64Mem(b, 3, 1, 0, 16, LINUX_A64_TLS_SLOT);
+    ret(b);
+    asBufferLabel(b, "__tx_tls_tb_set", 1);
+    a64Emit(b, a64Mrs(16, A64_TPIDR_EL0), "mrs x16, tpidr_el0");
+    a64Mem(b, 3, 0, 0, 16, LINUX_A64_TLS_SLOT);
+    ret(b);
+}
+
+/// __tx_thread_clone(flags, top, ptid, ctid, tls) → 子线程号或 −errno（父线程）。实参按 x86_64 的次序收（调用方共用），
+/// 发给内核时换成 aarch64 的次序。子线程在新栈上从 svc 之后继续：[sp]＝记录（父线程预先写好），以 x0＝记录调用
+/// __tx_thread_main，它以 exit 结束、不返回。__tx_thread_unmap_exit(base, size)：归还自己正在用的栈后立即以 exit 结束
+/// 本线程——munmap 之后只用寄存器、不再碰栈。
+export function linuxA64ThreadStubs(b: Ref<StructuredBuffer>): void {
+    asBufferBoundaryBegin(b, MODULE, "__tx_thread_clone", "stack-transition");
+    asBufferLabel(b, "__tx_thread_clone", 1);
+    mov(b, 16, 3);
+    mov(b, 3, 4);
+    mov(b, 4, 16);
+    svc(b, "clone");
+    a64Cbz(b, 1, 0, 0, "__tx_thread_clone_child");
+    ret(b);
+    asBufferLabel(b, "__tx_thread_clone_child", 1);
+    a64MovImm(b, 29, 0);
+    a64MovImm(b, 30, 0);
+    a64Mem(b, 3, 1, 0, 31, 0);
+    a64B(b, 1, "__tx_thread_main");
+    a64Emit(b, a64Brk(1), "brk #1");
+    asBufferFunctionEnd(b);
+    asBufferBoundaryBegin(b, MODULE, "__tx_thread_unmap_exit", "stack-disposal");
+    asBufferLabel(b, "__tx_thread_unmap_exit", 1);
+    svc(b, "munmap");
+    a64MovImm(b, 0, 0);
+    svc(b, "exit");
+    a64Emit(b, a64Brk(1), "brk #1");
+    asBufferFunctionEnd(b);
+}

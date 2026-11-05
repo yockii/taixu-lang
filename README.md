@@ -83,7 +83,7 @@ test "greet" {
 ## 文档
 
 - [教程](docs/tutorial/README.md)：从安装到异步、模块与工具链，每章附可运行的样例。
-- [语言规范](docs/design/D3-s1-language-spec-v0.42.md)（D3 v0.42）与[语法速览](docs/design/D3-s1-syntax-tour-v0.1.tx)。
+- [语言规范](docs/design/D3-s1-language-spec-v0.53.md)（D3 v0.53）与[语法速览](docs/design/D3-s1-syntax-tour-v0.1.tx)。
 - 给 AI 的[语言指南](docs/ai/llm-guide-s1.md)与可分发的 [skill 包](skill/taixu/SKILL.md)；工具链的[兼容变更](docs/ai/toolchain-changes.md)。
 - 工具：[编译画像](docs/tools/compiler-profile.md)、[链接映射](docs/tools/link-map.md)。
 - 安全：LSP／MCP 的[信任与资源边界](docs/design/v052-tool-security-boundaries-v0.3-20261023.md)、
@@ -110,8 +110,8 @@ taixu run --toolchain scripts/build.tx --compiler /path/to/taixu --out work/bin
 taixu run --toolchain scripts/gate.tx --compiler /path/to/taixu
 ```
 
-门的部分步骤需要 Python 3.12+ 与一个 C 编译器（独立的运行时安全校验用；可用环境变量 `TAIXU_TEST_CC` 指定），在 Windows、
-Linux 与 Apple 芯片的 macOS 上运行。标准库位于 `stdlib/`，门会自动使用它。
+构建只需要种子 `taixu`。门的多数步骤目前仍由 Python 3.12+ 驱动（正逐步改用太虚写），另需一个 C 编译器（独立的运行时
+安全校验用；可用环境变量 `TAIXU_TEST_CC` 指定）；门在 Windows、Linux 与 Apple 芯片的 macOS 上运行。标准库位于 `stdlib/`，门会自动使用它。
 
 ## 许可证
 

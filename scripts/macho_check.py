@@ -1,9 +1,9 @@
-"""独立的 Mach-O 可执行文件校验器（macOS 适配 M1 设计 E10，docs/design/v052-macos-m1-macho-v0.1-20261024.md）。
+"""独立的 Mach-O 可执行文件校验器。
 
 不依赖编译器的任何代码，按 Mach-O 格式逐项核对太虚产出的 x86_64 与 arm64 可执行文件：头与 load commands 的尺寸与
 对齐，段的范围、对齐与保护（W^X、__TEXT 不可写），节落在段内，LC_MAIN 落在 __text 内，rebase／bind 指令逐条解码后
 每个目标都落在可写段里，符号表、间接符号表与 __got 的绑定一一对应，function starts 单调且在 __text 内，
-代码签名逐页重算 SHA-256。arm64（macOS 适配 M4 设计 A3）另逐字解码 __text：B／BL／B.cond／CBZ／TBZ 的目标在 __text 内，
+代码签名逐页重算 SHA-256。arm64另逐字解码 __text：B／BL／B.cond／CBZ／TBZ 的目标在 __text 内，
 每条 ADRP 紧跟用同一寄存器的 ADD 或无符号偏移的取存，合成的地址落在某个节里；经 __got 的只有 64 位 LDR，取存不写只读段
 （__DATA_CONST 带 SG_READ_ONLY，dyld 修补后改为只读）。这一条依赖写出端不在 __text 里放数据。
 

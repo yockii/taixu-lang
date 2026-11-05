@@ -1,4 +1,4 @@
-"""doc/init 的原生 CLI 行为检查；输出基线来自 6d-6 已验证编译器。"""
+"""doc/init 的原生 CLI 行为检查；输出基线来自已验证编译器。"""
 import json
 from pathlib import Path
 import subprocess
@@ -55,7 +55,7 @@ def tool_rows(compiler):
         p = call(compiler, ['init', 'p1'], project)
         rows.append(('init:no-overwrite', p.returncode == 0 and personal.read_bytes()==b'// user content\n', p.stderr.decode('utf-8','replace')))
         before = {f.relative_to(project): f.read_bytes() for f in project.rglob('*') if f.is_file()}
-        for args in [['--template=desktop','desktop-project'], ['--template=gui','gui-project'], ['gui','project'],
+        for args in [['--template=desktop','desktop-project'], ['desktop','project'],
                      ['bad/name'], ['--template=nope','p5'], ['a','b','c'], ['--help'], ['-x'], ['console','-p7']]:
             p = call(compiler, ['init', *args], project)
             after = {f.relative_to(project): f.read_bytes() for f in project.rglob('*') if f.is_file()}

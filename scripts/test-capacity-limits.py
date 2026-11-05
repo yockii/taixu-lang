@@ -1,4 +1,4 @@
-"""容量与编码上限门（docs/design/v052-capacity-limits-review-v0.1-20261016.md）：超出上限的程序必须得到诊断，
+"""容量与编码上限门：超出上限的程序必须得到诊断，
 不得静默生成错误代码；上限之内（含越过旧上限）的程序须正确运行。源码现场生成（不入库，体积大）。
 
 原生链（TXC v6；C3a 之后）：
@@ -17,7 +17,7 @@
 - 异步任务（C4d）：一个任务先后启动并等待 200 万个任务（每个先 sleepMs(0) 再返回），结果须正确、峰值常驻内存
   不超过 64 MiB（任务记录回收；原先记录只增不减。本机 Windows 峰值约 227 MiB → 约 7 MiB，与 hello 相当；Linux
   约 221 MiB → 约 7 MiB）。
-历史 Zig v4 上限检查已随对应实现退场；当前门只检查原生链。
+当前门只检查原生链（TXC v6）的上限。
 """
 import argparse
 import os
@@ -134,7 +134,8 @@ def params_src(n):
 
 def externs_src(n, host):
     if host == 'linux':
-        decls = [f'declare function x{i}(): i32 from syscall 39;' for i in range(n)]
+        # 名字形态（D3 v0.47）按目标架构查号：同一份源码在 x86_64 与 aarch64 宿主上都成立。
+        decls = [f'declare function x{i}(): i32 from syscall "getpid";' for i in range(n)]
         call = f'x{n - 1}() > 0'
     elif host == 'macos':
         # macOS 不提供稳定的系统调用接口（D3 §6.8-7）：经 libSystem；只声明不调用的不链接（§6.8-9）。
@@ -204,7 +205,7 @@ def task_churn_src(n):
             'async function driver(n: int): int {\n    let s = 0;\n    let i = 0;\n    while (i < n) {\n'
             '        const v = await worker(i) catch -1;\n        s = s + v;\n        i = i + 1;\n    }\n'
             '    print(toStr(s));\n    return s;\n}\n\n'
-            f'export function main(args: []string): int {{\n    const d = driver({n});\n    return 0;\n}}\n')
+            f'export function main(args: []string): int {{\n    const d = await driver({n}) catch -1;\n    return 0;\n}}\n')
 
 
 def gen_deep_src():

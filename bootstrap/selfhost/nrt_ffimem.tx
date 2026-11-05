@@ -1,0 +1,540 @@
+// 外部内存区（D3 v0.48 §6.8-22）：区栈、创建时的地址核验、按区的
+// 大小查界的读写与读串、提前结束与函数出口弹栈。六个产物目标共用这一份 rtfn，只有核验按系统分三支。
+// 区栈在线程块的 TB_FFIMEM 处：8 字节的深度（0..FFIMEM_SLOTS）、8 字节保留，之后每槽 32 字节 {起点, 大小, 主人字段, 代号}。
+// FfiMem 的值是标签 1 的标量，载荷 ＝ 代号 × 64 ＋ 槽号；每次压栈与结束都把槽的代号加一，经旧值（区已结束、槽已复用）访问时
+// 代号对不上即 trap 4025。主人字段是创建者的帧窗口（callbi 的 win，16 字节对齐）或上可写（1）与已结束（2）两位。体内调了 ffiMem／ffiMemOf 的
+// 函数在各出口（延迟块之后）调 __tx_bi_ffi_mem_leave，弹出栈顶主人为本帧的槽（含已结束的空洞）：被调者先于调用者返回，
+// 栈顶即本帧的区；async 函数与生成器不许创建区（3033），挂起不会打乱这个次序。区栈不占太虚堆，不进泄漏与页堆检查的账。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, RtOp, L, I, A, G } from "./rtfn_base";
+import { rtBegin, rtSet, rtOp, rtShift, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtIf32, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtCall5, rtCallList, rtRet, rtRetVoid } from "./rtfn";
+import { ARITY, check, text, trapText, trapAt, arity, argTag, nrtTarget, memcpyName, frozenGuard } from "./nrt_base";
+import { tKernel32, tLinux, tMacos } from "./target";
+import { uxSys, uxMac } from "./unix_sys";
+import { leakStamp } from "./nrt_leak";
+import { memmoveName } from "./nrt_bytes";
+import { emitUtf8Copy } from "./nrt_ffi";
+import { TB_FFIMEM, FFIMEM_SLOTS } from "./thread_block_abi";
+
+// __tx_ffimem_slot、__tx_ffimem_span 另供程序映像里按布局的读写例程调用（K4c，ffi_stubs.tx 的 ffiMemEmitRoutines）。
+export const NRT_FFIMEM_EXPORTS: string = "__tx_bi_ffi_mem __tx_bi_ffi_mem_read __tx_bi_ffi_mem_read_into __tx_bi_ffi_mem_write __tx_bi_ffi_mem_utf16 __tx_bi_ffi_mem_utf8 __tx_bi_ffi_mem_end __tx_bi_ffi_mem_leave __tx_ffimem_slot __tx_ffimem_span";
+
+const MODULE: string = "bootstrap/selfhost/nrt_ffimem.tx";
+const TAG_INT: int = 1;
+const TAG_BOOL: int = 3;
+const TAG_ERR: int = 5;
+const TAG_STR: int = 6;
+const TAG_BYTES: int = 17;
+const DEAD: string = "外部内存区已结束（创建它的函数已返回，或已 ffiMemEnd）";
+// 拼诊断的局部：buf 指向 m0 起的 192 字节，dp 指向 d0 起的 32 字节数字缓冲（rtfn 的局部按声明顺序相邻）。
+const MSG_LOCALS: string = "buf pos dp dn ds m0 m1 m2 m3 m4 m5 m6 m7 m8 m9 m10 m11 m12 m13 m14 m15 m16 m17 m18 m19 m20 m21 m22 m23 d0 d1 d2 d3";
+
+function msgBegin(f: Ref<RtFn>): void {
+    rtAddrOf(f, "buf", "m0");
+    rtSet(f, "pos", I(0));
+    rtAddrOf(f, "dp", "d0");
+}
+
+function msgText(b: Ref<StructuredBuffer>, f: Ref<RtFn>, value: string): void {
+    rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), A(text(b, value)), I(len(value)));
+}
+
+function msgNum(f: Ref<RtFn>, v: string, base: int): void {
+    rtCall3(f, "dn", "__tx_nrt_digits", L(v), I(base), L("dp"));
+    rtOp(f, "ds", L("dp"), "add", I(32));
+    rtOp(f, "ds", L("ds"), "sub", L("dn"));
+    rtCall4(f, "pos", "__tx_nrt_put", L("buf"), L("pos"), L("ds"), L("dn"));
+}
+
+function args4(a: Ref<RtOp>, c: Ref<RtOp>, d: Ref<RtOp>, e: Ref<RtOp>): List<Ref<RtOp>> {
+    const xs: List<Ref<RtOp>> = listNew();
+    listPush(xs, a); listPush(xs, c); listPush(xs, d); listPush(xs, e);
+    return xs;
+}
+
+function args6(a: Ref<RtOp>, c: Ref<RtOp>, d: Ref<RtOp>, e: Ref<RtOp>, g: Ref<RtOp>, h: Ref<RtOp>): List<Ref<RtOp>> {
+    const xs = args4(a, c, d, e);
+    listPush(xs, g); listPush(xs, h);
+    return xs;
+}
+
+// 区栈的起点（线程块里）进 rs。
+function stackBase(f: Ref<RtFn>, rs: string): void {
+    rtSet(f, rs, A("__tx_nrt_tb"));
+    rtOp(f, rs, L(rs), "add", I(TB_FFIMEM));
+}
+
+// 第 idx 号槽的地址进 s（idx 是局部名）。
+function slotAt(f: Ref<RtFn>, s: string, rs: string, idx: string): void {
+    rtShift(f, s, L(idx), "shl", 5);
+    rtOp(f, s, L(s), "add", L(rs));
+    rtOp(f, s, L(s), "add", I(16));
+}
+
+// 实参 k 的整数载荷进 dst（标签不是 int 跳 type）。
+function intArg(f: Ref<RtFn>, k: int, dst: string): void {
+    argTag(f, k, "x", "t", TAG_INT, "type");
+    rtLoad(f, dst, L("x"), 8, 8);
+}
+
+export function emitNrtFfiMem(b: Ref<StructuredBuffer>): void {
+    emitHelpers(b);
+    emitCheck(b);
+    emitCreate(b);
+    emitAccess(b);
+    emitStrings(b);
+    emitLifetime(b);
+}
+
+function emitHelpers(b: Ref<StructuredBuffer>): void {
+    // __tx_ffimem_slot(fn, pc, v) → 槽地址：槽号在深度之内且代号相符，否则 trap 4025（区已结束或槽已复用）。
+    let f = rtBegin(b, "__tx_ffimem_slot", "fn pc v", "rs d i g s", 5, MODULE);
+    stackBase(f, "rs");
+    rtLoad(f, "d", L("rs"), 0, 8);
+    rtOp(f, "i", L("v"), "and", I(FFIMEM_SLOTS - 1));
+    rtIf(f, L("i"), "uge", L("d"), "dead");
+    rtShift(f, "g", L("v"), "shr", 6);
+    slotAt(f, "s", "rs", "i");
+    rtLoad(f, "i", L("s"), 24, 8);
+    rtIf(f, L("i"), "ne", L("g"), "dead");
+    rtRet(f, L("s"));
+    trapAt(b, f, "dead", 4025, DEAD);
+    rtRet(f, I(0)); check(f);
+
+    // __tx_ffimem_span(fn, pc, s, off, n) → 起点＋off：0 ≤ off、0 ≤ n、off ≤ 大小 − n（大小与 n 都非负，减法不溢出），
+    // 否则 trap 4025，诊断写出区的大小与请求的范围。
+    f = rtBegin(b, "__tx_ffimem_span", "fn pc s off n", "z q " + MSG_LOCALS, 5, MODULE);
+    rtLoad(f, "z", L("s"), 8, 8);
+    rtIf(f, L("off"), "lt", I(0), "oob");
+    rtIf(f, L("n"), "lt", I(0), "oob");
+    rtOp(f, "q", L("z"), "sub", L("n"));
+    rtIf(f, L("off"), "gt", L("q"), "oob");
+    rtLoad(f, "q", L("s"), 0, 8);
+    rtOp(f, "q", L("q"), "add", L("off"));
+    rtRet(f, L("q"));
+    rtLabel(f, "oob");
+    msgBegin(f);
+    msgText(b, f, "外部内存区越界：区大小 ");
+    msgNum(f, "z", 10);
+    msgText(b, f, " 字节，访问偏移 ");
+    msgNum(f, "off", 10);
+    msgText(b, f, " 起的 ");
+    msgNum(f, "n", 10);
+    msgText(b, f, " 字节");
+    rtCall5(f, "", "__tx_trap", L("fn"), L("pc"), I(4025), L("buf"), L("pos"));
+    rtRet(f, I(0)); check(f);
+
+    // __tx_ffi_utf8_to_str(p, m)：同 __tx_ffi_cstr_to_str，读到 NUL 或 m 个字节为止（ffiMemUtf8）。
+    emitUtf8Copy(b, "__tx_ffi_utf8_to_str", true);
+
+    // __tx_ffi_utf16_to_str(p, m) → 新 string：读到 NUL 码元或 m 个码元为止；码元逐字节按小端拼（区内偏移不要求对齐，龙芯、
+    // RISC-V 上同样成立），代理对合成一个码点，孤立的代理换成 U+FFFD（只消耗该码元）。每个码元至多 3 字节，代理对两码元 4 字节。
+    f = rtBegin(b, "__tx_ffi_utf16_to_str", "p m", "n c d q o j u e s", 4, MODULE);
+    rtSet(f, "n", I(0));
+    rtIf(f, L("p"), "eq", I(0), "empty");
+    rtLabel(f, "len");
+    rtIf(f, L("n"), "uge", L("m"), "sized");
+    rtShift(f, "c", L("n"), "shl", 1); rtOp(f, "c", L("c"), "add", L("p"));
+    rtLoad(f, "d", L("c"), 0, 1); rtLoad(f, "c", L("c"), 1, 1);
+    rtShift(f, "c", L("c"), "shl", 8); rtOp(f, "c", L("c"), "or", L("d"));
+    rtIf(f, L("c"), "eq", I(0), "sized");
+    rtOp(f, "n", L("n"), "add", I(1)); rtJump(f, "len");
+    rtLabel(f, "sized");
+    rtIf(f, L("n"), "eq", I(0), "empty");
+    rtOp(f, "c", L("n"), "imul", I(3));
+    rtCall2(f, "q", "__tx_native_mem_alloc", L("c"), I(1));
+    rtIf(f, L("q"), "eq", I(0), "oom");
+    rtSet(f, "o", L("q"));
+    rtSet(f, "j", I(0));
+    rtLabel(f, "unit");
+    rtIf(f, L("j"), "uge", L("n"), "done");
+    rtShift(f, "c", L("j"), "shl", 1); rtOp(f, "c", L("c"), "add", L("p"));
+    rtLoad(f, "d", L("c"), 0, 1); rtLoad(f, "u", L("c"), 1, 1);
+    rtShift(f, "u", L("u"), "shl", 8); rtOp(f, "u", L("u"), "or", L("d"));
+    rtOp(f, "j", L("j"), "add", I(1));
+    rtIf(f, L("u"), "lt", I(128), "one");
+    rtIf(f, L("u"), "lt", I(2048), "two");
+    rtIf(f, L("u"), "lt", I(55296), "three");
+    rtIf(f, L("u"), "gt", I(57343), "three");
+    rtIf(f, L("u"), "gt", I(56319), "bad");
+    // 高代理：下一码元须是低代理。
+    rtIf(f, L("j"), "uge", L("n"), "bad");
+    rtShift(f, "c", L("j"), "shl", 1); rtOp(f, "c", L("c"), "add", L("p"));
+    rtLoad(f, "d", L("c"), 0, 1); rtLoad(f, "e", L("c"), 1, 1);
+    rtShift(f, "e", L("e"), "shl", 8); rtOp(f, "e", L("e"), "or", L("d"));
+    rtIf(f, L("e"), "lt", I(56320), "bad");
+    rtIf(f, L("e"), "gt", I(57343), "bad");
+    rtOp(f, "j", L("j"), "add", I(1));
+    rtOp(f, "u", L("u"), "sub", I(55296)); rtShift(f, "u", L("u"), "shl", 10);
+    rtOp(f, "e", L("e"), "sub", I(56320)); rtOp(f, "u", L("u"), "add", L("e")); rtOp(f, "u", L("u"), "add", I(65536));
+    rtShift(f, "c", L("u"), "shr", 18); rtOp(f, "c", L("c"), "or", I(240)); rtStore(f, L("o"), 0, L("c"), 1);
+    rtShift(f, "c", L("u"), "shr", 12); rtOp(f, "c", L("c"), "and", I(63)); rtOp(f, "c", L("c"), "or", I(128)); rtStore(f, L("o"), 1, L("c"), 1);
+    rtShift(f, "c", L("u"), "shr", 6); rtOp(f, "c", L("c"), "and", I(63)); rtOp(f, "c", L("c"), "or", I(128)); rtStore(f, L("o"), 2, L("c"), 1);
+    rtOp(f, "c", L("u"), "and", I(63)); rtOp(f, "c", L("c"), "or", I(128)); rtStore(f, L("o"), 3, L("c"), 1);
+    rtOp(f, "o", L("o"), "add", I(4)); rtJump(f, "unit");
+    rtLabel(f, "one");
+    rtStore(f, L("o"), 0, L("u"), 1);
+    rtOp(f, "o", L("o"), "add", I(1)); rtJump(f, "unit");
+    rtLabel(f, "two");
+    rtShift(f, "c", L("u"), "shr", 6); rtOp(f, "c", L("c"), "or", I(192)); rtStore(f, L("o"), 0, L("c"), 1);
+    rtOp(f, "c", L("u"), "and", I(63)); rtOp(f, "c", L("c"), "or", I(128)); rtStore(f, L("o"), 1, L("c"), 1);
+    rtOp(f, "o", L("o"), "add", I(2)); rtJump(f, "unit");
+    rtLabel(f, "three");
+    rtShift(f, "c", L("u"), "shr", 12); rtOp(f, "c", L("c"), "or", I(224)); rtStore(f, L("o"), 0, L("c"), 1);
+    rtShift(f, "c", L("u"), "shr", 6); rtOp(f, "c", L("c"), "and", I(63)); rtOp(f, "c", L("c"), "or", I(128)); rtStore(f, L("o"), 1, L("c"), 1);
+    rtOp(f, "c", L("u"), "and", I(63)); rtOp(f, "c", L("c"), "or", I(128)); rtStore(f, L("o"), 2, L("c"), 1);
+    rtOp(f, "o", L("o"), "add", I(3)); rtJump(f, "unit");
+    rtLabel(f, "bad");
+    rtStore(f, L("o"), 0, I(239), 1); rtStore(f, L("o"), 1, I(191), 1); rtStore(f, L("o"), 2, I(189), 1);
+    rtOp(f, "o", L("o"), "add", I(3)); rtJump(f, "unit");
+    rtLabel(f, "done");
+    rtOp(f, "j", L("o"), "sub", L("q"));
+    rtCall3(f, "s", "__tx_nrt_str_copy", L("q"), L("j"), I(1));
+    rtCall1(f, "", "__tx_native_mem_free", L("q"));
+    rtRet(f, L("s"));
+    rtLabel(f, "empty");
+    rtCall3(f, "s", "__tx_nrt_str_copy", L("p"), I(0), I(1));
+    rtRet(f, L("s"));
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRet(f, I(0)); check(f);
+}
+
+// __tx_ffimem_check(p, n, w) → 0 可用、1 有未映射或不可读的部分、2 要求可写而有不可写的部分。调用方保证 n > 0、p ≠ 0、
+// p＋n 不回绕。
+function emitCheck(b: Ref<StructuredBuffer>): void {
+    const t = nrtTarget();
+    if (tKernel32(t)) {
+        // Windows：按 VirtualQuery 给的区一段段走（MEMORY_BASIC_INFORMATION 48 字节：BaseAddress@0、RegionSize@24、State@32、
+        // Protect@36）。须 MEM_COMMIT；PAGE_NOACCESS、PAGE_GUARD 不可读；可读的是 READONLY、READWRITE、WRITECOPY 及其 EXECUTE 版
+        // （0xEE），可写的是 READWRITE、WRITECOPY 及其 EXECUTE 版（0xCC）。返回 0（地址在用户空间之外等）即不可读。
+        const f = rtBegin(b, "__tx_ffimem_check", "p n w", "e r q base rsz st pr mp m0 m1 m2 m3 m4 m5", 3, MODULE);
+        rtOp(f, "e", L("p"), "add", L("n"));
+        rtAddrOf(f, "mp", "m0");
+        rtLabel(f, "loop");
+        rtIf(f, L("p"), "uge", L("e"), "ok");
+        rtCall3(f, "r", "VirtualQuery", L("p"), L("mp"), I(48));
+        rtIf(f, L("r"), "eq", I(0), "bad");
+        rtLoad(f, "base", L("mp"), 0, 8);
+        rtLoad(f, "rsz", L("mp"), 24, 8);
+        rtLoad(f, "st", L("mp"), 32, 4);
+        rtLoad(f, "pr", L("mp"), 36, 4);
+        rtIf(f, L("st"), "ne", I(4096), "bad");
+        rtOp(f, "q", L("pr"), "and", I(257));
+        rtIf(f, L("q"), "ne", I(0), "bad");
+        rtOp(f, "q", L("pr"), "and", I(238));
+        rtIf(f, L("q"), "eq", I(0), "bad");
+        rtIf(f, L("w"), "eq", I(0), "next");
+        rtOp(f, "q", L("pr"), "and", I(204));
+        rtIf(f, L("q"), "eq", I(0), "ro");
+        rtLabel(f, "next");
+        // 下一段从本区之后开始；区长为 0 或回绕时不再前进，按不可读处理。
+        rtOp(f, "q", L("base"), "add", L("rsz"));
+        rtIf(f, L("q"), "ule", L("p"), "bad");
+        rtSet(f, "p", L("q"));
+        rtJump(f, "loop");
+        rtLabel(f, "ok"); rtRet(f, I(0));
+        rtLabel(f, "bad"); rtRet(f, I(1));
+        rtLabel(f, "ro"); rtRet(f, I(2)); check(f);
+        return;
+    }
+    if (tLinux(t)) {
+        // Linux：每个 4 KiB 页一次 rt_sigprocmask(99, 页, NULL, 8)——内核先把 set 拷进来（不可读得 EFAULT）再判 how（得 EINVAL），
+        // 信号屏蔽不变；名字形态的系统调用，五个 Linux 目标通用。按 4 KiB 步进在 16 KiB、64 KiB 页的内核上同样正确（只是多探几次）。
+        // 可写区只核验可读（/proc/self/maps 在沙箱里可能读不到），w 不用。
+        const f = rtBegin(b, "__tx_ffimem_check", "p n w", "e r", 4, MODULE);
+        rtOp(f, "e", L("p"), "add", L("n"));
+        rtOp(f, "p", L("p"), "and", I(-4096));
+        rtLabel(f, "loop");
+        rtIf(f, L("p"), "uge", L("e"), "ok");
+        uxSys(f, t, "r", 14, args4(I(99), L("p"), I(0), I(8)));
+        rtIf(f, L("r"), "ne", I(-22), "bad");
+        rtOp(f, "p", L("p"), "add", I(4096));
+        rtJump(f, "loop");
+        rtLabel(f, "ok"); rtRet(f, I(0));
+        rtLabel(f, "bad"); rtRet(f, I(1)); check(f);
+        return;
+    }
+    if (tMacos(t)) {
+        // macOS：mach_vm_region_recurse 取含 p 的区（子映射如 dyld 共享缓存再往下一层取，得到实际的保护位）；区从 p 之上开始即 p
+        // 落在空隙里。vm_region_submap_info_64（按 4 字节紧排，19 个 natural_t）：protection@0、is_submap@48。VM_PROT_READ 1、
+        // VM_PROT_WRITE 2。x86_64 的蹦床只收 6 个实参，所以不用 7 个实参的 mach_vm_region。任务端口取 libSystem 的数据符号
+        // mach_task_self_（经导入槽）。
+        const f = rtBegin(b, "__tx_ffimem_check", "p n w", "e r task ra rs dp cnt aa sa da ia ca pr i0 i1 i2 i3 i4 i5 i6 i7 i8 i9", 6, MODULE);
+        rtOp(f, "e", L("p"), "add", L("n"));
+        rtSet(f, "task", G("__imp_mach_task_self_"));
+        rtLoad(f, "task", L("task"), 0, 4);
+        rtAddrOf(f, "aa", "ra"); rtAddrOf(f, "sa", "rs"); rtAddrOf(f, "da", "dp"); rtAddrOf(f, "ia", "i0"); rtAddrOf(f, "ca", "cnt");
+        rtLabel(f, "loop");
+        rtIf(f, L("p"), "uge", L("e"), "ok");
+        rtSet(f, "dp", I(0));
+        rtLabel(f, "query");
+        rtSet(f, "ra", L("p"));
+        rtSet(f, "rs", I(0));
+        rtSet(f, "cnt", I(19));
+        uxMac(f, "r", "mach_vm_region_recurse", args6(L("task"), L("aa"), L("sa"), L("da"), L("ia"), L("ca")));
+        rtIf32(f, L("r"), "ne", I(0), "bad");
+        rtIf(f, L("ra"), "ugt", L("p"), "bad");
+        rtLoad(f, "pr", L("ia"), 48, 4);
+        rtIf(f, L("pr"), "eq", I(0), "leaf");
+        rtLoad(f, "pr", L("da"), 0, 4);
+        rtOp(f, "dp", L("pr"), "add", I(1));
+        rtJump(f, "query");
+        rtLabel(f, "leaf");
+        rtLoad(f, "pr", L("ia"), 0, 4);
+        rtOp(f, "r", L("pr"), "and", I(1));
+        rtIf(f, L("r"), "eq", I(0), "bad");
+        rtIf(f, L("w"), "eq", I(0), "next");
+        rtOp(f, "r", L("pr"), "and", I(2));
+        rtIf(f, L("r"), "eq", I(0), "ro");
+        rtLabel(f, "next");
+        rtOp(f, "r", L("ra"), "add", L("rs"));
+        rtIf(f, L("r"), "ule", L("p"), "bad");
+        rtSet(f, "p", L("r"));
+        rtJump(f, "loop");
+        rtLabel(f, "ok"); rtRet(f, I(0));
+        rtLabel(f, "bad"); rtRet(f, I(1));
+        rtLabel(f, "ro"); rtRet(f, I(2)); check(f);
+        return;
+    }
+}
+
+// ffiMem(address, size, writable): FfiMem | Error。负大小 trap 4025；大小为 0 得空区（不核验）；地址为 0、地址加大小回绕、
+// 核验不过得 Error（消息带地址与大小）；同时存活的区已满 trap 4025。
+function emitCreate(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "__tx_bi_ffi_mem", "win fn pc a nargs", "x t addr size w st e rs d s g " + MSG_LOCALS, 5, MODULE);
+    arity(b, f, 3);
+    intArg(f, 0, "addr");
+    intArg(f, 1, "size");
+    argTag(f, 2, "x", "t", TAG_BOOL, "type");
+    rtLoad(f, "w", L("x"), 8, 8);
+    rtOp(f, "w", L("w"), "and", I(1));
+    rtIf(f, L("size"), "lt", I(0), "neg");
+    rtIf(f, L("size"), "eq", I(0), "push");
+    rtIf(f, L("addr"), "eq", I(0), "null");
+    rtOp(f, "e", L("addr"), "add", L("size"));
+    rtIf(f, L("e"), "ule", L("addr"), "wrap");
+    rtCall3(f, "st", "__tx_ffimem_check", L("addr"), L("size"), L("w"));
+    rtIf(f, L("st"), "eq", I(1), "unreadable");
+    rtIf(f, L("st"), "ne", I(0), "readonly");
+    rtLabel(f, "push");
+    stackBase(f, "rs");
+    rtLoad(f, "d", L("rs"), 0, 8);
+    rtIf(f, L("d"), "uge", I(FFIMEM_SLOTS), "full");
+    slotAt(f, "s", "rs", "d");
+    rtLoad(f, "g", L("s"), 24, 8);
+    rtOp(f, "g", L("g"), "add", I(1));
+    rtStore(f, L("s"), 24, L("g"), 8);
+    rtStore(f, L("s"), 0, L("addr"), 8);
+    rtStore(f, L("s"), 8, L("size"), 8);
+    rtOp(f, "e", L("win"), "or", L("w"));
+    rtStore(f, L("s"), 16, L("e"), 8);
+    rtShift(f, "g", L("g"), "shl", 6);
+    rtOp(f, "g", L("g"), "or", L("d"));
+    rtOp(f, "d", L("d"), "add", I(1));
+    rtStore(f, L("rs"), 0, L("d"), 8);
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_INT), L("g"));
+    rtRetVoid(f);
+    // 失败得 Error：消息拼在局部缓冲里，再拷成错误对象。
+    rtLabel(f, "null");
+    msgBegin(f);
+    msgText(b, f, "ffiMem：地址为 0");
+    rtJump(f, "fail");
+    rtLabel(f, "wrap");
+    msgBegin(f);
+    msgText(b, f, "ffiMem：地址 0x");
+    msgNum(f, "addr", 16);
+    msgText(b, f, " 加大小 ");
+    msgNum(f, "size", 10);
+    msgText(b, f, " 越过地址空间的末端");
+    rtJump(f, "fail");
+    rtLabel(f, "unreadable");
+    msgBegin(f);
+    msgText(b, f, "ffiMem：地址 0x");
+    msgNum(f, "addr", 16);
+    msgText(b, f, " 起的 ");
+    msgNum(f, "size", 10);
+    msgText(b, f, " 字节里有未映射或不可读的内存");
+    rtJump(f, "fail");
+    rtLabel(f, "readonly");
+    msgBegin(f);
+    msgText(b, f, "ffiMem：地址 0x");
+    msgNum(f, "addr", 16);
+    msgText(b, f, " 起的 ");
+    msgNum(f, "size", 10);
+    msgText(b, f, " 字节里有不可写的内存（要求可写）");
+    rtLabel(f, "fail");
+    rtCall3(f, "e", "__tx_nrt_str_copy", L("buf"), L("pos"), I(2));
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_ERR), L("e"));
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "ffiMem 的实参须为 (int, int, bool)");
+    trapAt(b, f, "neg", 4025, "ffiMem 的大小为负");
+    trapAt(b, f, "full", 4025, "同一线程同时存活的外部内存区超过 64 个");
+    rtRetVoid(f); check(f);
+}
+
+function emitAccess(b: Ref<StructuredBuffer>): void {
+    // ffiMemRead(m, offset, n): Bytes——拷成新的 Bytes。
+    let f = rtBegin(b, "__tx_bi_ffi_mem_read", "win fn pc a nargs", "x t v off n s p q", 5, MODULE);
+    arity(b, f, 3);
+    intArg(f, 0, "v");
+    intArg(f, 1, "off");
+    intArg(f, 2, "n");
+    rtCall3(f, "s", "__tx_ffimem_slot", L("fn"), L("pc"), L("v"));
+    rtCall5(f, "p", "__tx_ffimem_span", L("fn"), L("pc"), L("s"), L("off"), L("n"));
+    rtSet(f, "q", I(0));
+    rtIf(f, L("n"), "eq", I(0), "make");
+    rtCall2(f, "q", "__tx_native_mem_alloc", L("n"), I(1));
+    rtIf(f, L("q"), "eq", I(0), "oom");
+    rtCall3(f, "", memcpyName(), L("q"), L("p"), L("n"));
+    rtLabel(f, "make");
+    rtCall2(f, "q", "__tx_nrt_u8_take", L("q"), L("n"));
+    leakStamp(f, "q", "stamped");
+    rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_BYTES), L("q"));
+    rtRetVoid(f);
+    rtLabel(f, "oom"); rtCall0(f, "", "__tx_native_object_oom_v1"); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "ffiMemRead 的实参须为 (FfiMem, int, int)");
+    rtRetVoid(f); check(f);
+
+    // ffiMemReadInto(m, offset, dst, dstOffset, n)：区一侧越界 trap 4025；dst 冻结 trap 4022、dst 一侧越界 trap 4002（同 bytesCopy）。
+    // C 交来的地址可能落在太虚自己的缓冲里（先前交给 C 的 Bytes），拷贝按 memmove。
+    f = rtBegin(b, "__tx_bi_ffi_mem_read_into", "win fn pc a nargs", "x t y v off j n s p o q", 5, MODULE);
+    arity(b, f, 5);
+    intArg(f, 0, "v");
+    intArg(f, 1, "off");
+    argTag(f, 2, "y", "t", TAG_BYTES, "type");
+    frozenGuard(f, "y", "t", "frozen");
+    intArg(f, 3, "j");
+    intArg(f, 4, "n");
+    rtCall3(f, "s", "__tx_ffimem_slot", L("fn"), L("pc"), L("v"));
+    rtCall5(f, "p", "__tx_ffimem_span", L("fn"), L("pc"), L("s"), L("off"), L("n"));
+    rtLoad(f, "o", L("y"), 8, 4);
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("o"));
+    rtIf(f, L("j"), "lt", I(0), "boob");
+    rtLoad(f, "q", L("o"), 40, 8); rtOp(f, "q", L("q"), "sub", L("n"));
+    rtIf(f, L("j"), "gt", L("q"), "boob");
+    rtIf(f, L("n"), "eq", I(0), "done");
+    rtLoad(f, "q", L("o"), 32, 8); rtOp(f, "q", L("q"), "add", L("j"));
+    rtCall3(f, "", memmoveName(), L("q"), L("p"), L("n"));
+    rtLabel(f, "done"); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "ffiMemReadInto 的实参须为 (FfiMem, int, Bytes, int, int)");
+    trapAt(b, f, "boob", 4002, "ffiMemReadInto 的目标区间越界（位置为负，或超出 dst 的长度）");
+    trapAt(b, f, "frozen", 4022, "ffiMemReadInto 写入了冻结的 Bytes（来自 Shared，深度不可变）");
+    rtRetVoid(f); check(f);
+
+    // ffiMemWrite(m, offset, src)：只读区 trap 4025；越界 trap 4025。
+    f = rtBegin(b, "__tx_bi_ffi_mem_write", "win fn pc a nargs", "x t y v off n s p o q", 5, MODULE);
+    arity(b, f, 3);
+    intArg(f, 0, "v");
+    intArg(f, 1, "off");
+    argTag(f, 2, "y", "t", TAG_BYTES, "type");
+    rtCall3(f, "s", "__tx_ffimem_slot", L("fn"), L("pc"), L("v"));
+    rtLoad(f, "q", L("s"), 16, 8); rtOp(f, "q", L("q"), "and", I(1));
+    rtIf(f, L("q"), "eq", I(0), "ro");
+    rtLoad(f, "o", L("y"), 8, 4);
+    rtCall1(f, "o", "__tx_native_object_address_v1", L("o"));
+    rtLoad(f, "n", L("o"), 40, 8);
+    rtCall5(f, "p", "__tx_ffimem_span", L("fn"), L("pc"), L("s"), L("off"), L("n"));
+    rtIf(f, L("n"), "eq", I(0), "done");
+    rtLoad(f, "q", L("o"), 32, 8);
+    rtCall3(f, "", memmoveName(), L("p"), L("q"), L("n"));
+    rtLabel(f, "done"); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "ffiMemWrite 的实参须为 (FfiMem, int, Bytes)");
+    trapAt(b, f, "ro", 4025, "写入只读的外部内存区（创建时 writable 为 false）");
+    rtRetVoid(f); check(f);
+}
+
+function emitStrings(b: Ref<StructuredBuffer>): void {
+    // ffiMemUtf8(m, offset)／ffiMemUtf16(m, offset): string——从 offset（0..区大小）读到 NUL 或区尾；UTF-16 按两字节的码元读，
+    // 区尾的单个字节忽略。
+    let k = 0;
+    while (k < 2) {
+        const wide = k == 1;
+        let name = "__tx_bi_ffi_mem_utf8";
+        let typeText = "ffiMemUtf8 的实参须为 (FfiMem, int)";
+        if (wide) { name = "__tx_bi_ffi_mem_utf16"; typeText = "ffiMemUtf16 的实参须为 (FfiMem, int)"; }
+        const f = rtBegin(b, name, "win fn pc a nargs", "x t v off s p n q", 5, MODULE);
+        arity(b, f, 2);
+        intArg(f, 0, "v");
+        intArg(f, 1, "off");
+        rtCall3(f, "s", "__tx_ffimem_slot", L("fn"), L("pc"), L("v"));
+        rtCall5(f, "p", "__tx_ffimem_span", L("fn"), L("pc"), L("s"), L("off"), I(0));
+        rtLoad(f, "n", L("s"), 8, 8);
+        rtOp(f, "n", L("n"), "sub", L("off"));
+        if (wide) {
+            rtShift(f, "n", L("n"), "shr", 1);
+            rtCall2(f, "q", "__tx_ffi_utf16_to_str", L("p"), L("n"));
+        } else {
+            rtCall2(f, "q", "__tx_ffi_utf8_to_str", L("p"), L("n"));
+        }
+        rtCall4(f, "", "__tx_nrt_set_new", L("win"), L("a"), I(TAG_STR), L("q"));
+        rtRetVoid(f);
+        rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+        trapAt(b, f, "type", 4010, typeText);
+        rtRetVoid(f); check(f);
+        k = k + 1;
+    }
+}
+
+function emitLifetime(b: Ref<StructuredBuffer>): void {
+    // ffiMemEnd(m)：代号加一（m 与它的副本此后都失效）并记“已结束”（主人字段的第 1 位）；从栈顶起连着的已结束槽随即弹出，循环里
+    // 建了就结束不会占满区栈（上限只计存活的区）；不在栈顶的留作空洞，等它上面的区结束或创建者的出口弹出。区已结束时无效果
+    // （D3 §6.8-22）。
+    let f = rtBegin(b, "__tx_bi_ffi_mem_end", "win fn pc a nargs", "x t v rs d i g s o", 5, MODULE);
+    arity(b, f, 1);
+    intArg(f, 0, "v");
+    stackBase(f, "rs");
+    rtLoad(f, "d", L("rs"), 0, 8);
+    rtOp(f, "i", L("v"), "and", I(FFIMEM_SLOTS - 1));
+    rtIf(f, L("i"), "uge", L("d"), "done");
+    rtShift(f, "g", L("v"), "shr", 6);
+    slotAt(f, "s", "rs", "i");
+    rtLoad(f, "i", L("s"), 24, 8);
+    rtIf(f, L("i"), "ne", L("g"), "done");
+    rtOp(f, "g", L("g"), "add", I(1));
+    rtStore(f, L("s"), 24, L("g"), 8);
+    rtLoad(f, "o", L("s"), 16, 8);
+    rtOp(f, "o", L("o"), "or", I(2));
+    rtStore(f, L("s"), 16, L("o"), 8);
+    rtLabel(f, "pop");
+    rtIf(f, L("d"), "eq", I(0), "store");
+    rtOp(f, "i", L("d"), "sub", I(1));
+    slotAt(f, "s", "rs", "i");
+    rtLoad(f, "o", L("s"), 16, 8);
+    rtOp(f, "o", L("o"), "and", I(2));
+    rtIf(f, L("o"), "eq", I(0), "store");
+    rtSet(f, "d", L("i"));
+    rtJump(f, "pop");
+    rtLabel(f, "store");
+    rtStore(f, L("rs"), 0, L("d"), 8);
+    rtLabel(f, "done"); rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    trapAt(b, f, "type", 4010, "ffiMemEnd 的实参不是 FfiMem");
+    rtRetVoid(f); check(f);
+
+    // 函数出口（代码生成在体内调了 ffiMem／ffiMemOf 的函数的各出口发出，不带实参、不写槽）：弹出栈顶主人为本帧窗口的槽，
+    // 弹出的槽代号加一。
+    f = rtBegin(b, "__tx_bi_ffi_mem_leave", "win fn pc a nargs", "rs d i s o g", 5, MODULE);
+    arity(b, f, 0);
+    stackBase(f, "rs");
+    rtLoad(f, "d", L("rs"), 0, 8);
+    rtLabel(f, "loop");
+    rtIf(f, L("d"), "eq", I(0), "done");
+    rtOp(f, "i", L("d"), "sub", I(1));
+    slotAt(f, "s", "rs", "i");
+    rtLoad(f, "o", L("s"), 16, 8);
+    rtOp(f, "o", L("o"), "and", I(-16));
+    rtIf(f, L("o"), "ne", L("win"), "done");
+    rtLoad(f, "g", L("s"), 24, 8);
+    rtOp(f, "g", L("g"), "add", I(1));
+    rtStore(f, L("s"), 24, L("g"), 8);
+    rtSet(f, "d", L("i"));
+    rtJump(f, "loop");
+    rtLabel(f, "done");
+    rtStore(f, L("rs"), 0, L("d"), 8);
+    rtRetVoid(f);
+    rtLabel(f, "arity"); trapText(b, f, 4010, ARITY);
+    rtRetVoid(f); check(f);
+}

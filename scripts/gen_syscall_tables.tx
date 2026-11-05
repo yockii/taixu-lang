@@ -1,0 +1,196 @@
+// 生成 bootstrap/selfhost/syscall_tables.tx：Linux 各架构的系统调用名与号（`from syscall "名字"`，多架构设计
+// B2、B3）。输入是内核源码树里的号表，按内核自己的取舍规则选行：
+//   x86_64：arch/x86/entry/syscalls/syscall_64.tbl，ABI 取 common 与 64（不取 x32）；
+//   aarch64、loongarch64、riscv64：scripts/syscall.tbl（arm64 的 arch/arm64/tools/syscall_64.tbl 是指向它的链接），ABI 取 common、64
+//   与 arch/<架构>/kernel/Makefile.syscalls 里 `syscall_abis_64 +=` 追加的（同 scripts/Makefile.asm-headers 的缺省加各架构覆盖）。
+// 没有入口函数的行（内核删掉、只保留编号的调用，进入即 ENOSYS）不收：写这些名字在编译期就报目标上没有。
+// 用法（在本仓根运行）：taixu run --toolchain scripts/gen_syscall_tables.tx --kernel <内核源码根> --tag <内核版本标签>
+//   [--out <输出文件>]（缺省 bootstrap/selfhost/syscall_tables.tx）
+import { byteSub, startsWith } from "./build_lib";
+
+struct Arch {
+    name: string,
+    table: string,
+    makefile: string,
+    fn: string,
+}
+
+function isSpace(c: int): bool {
+    return c == 32 || c == 9 || c == 13;
+}
+
+/// 按空格与制表符切分，不产空片。
+function fields(line: string): List<string> {
+    const out: List<string> = listNew();
+    let i: int = 0;
+    let start: int = -1;
+    while (i <= len(line)) {
+        let c: int = 32;
+        if (i < len(line)) {
+            c = byteAt(line, i) catch 32;
+        }
+        if (isSpace(c)) {
+            if (start >= 0) {
+                listPush(out, byteSub(line, start, i - start));
+                start = -1;
+            }
+        } else if (start < 0) {
+            start = i;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// 十进制非负整数；不是得 -1。
+function decimal(s: string): int {
+    if (len(s) == 0) {
+        return -1;
+    }
+    let v: int = 0;
+    let i: int = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) catch 0;
+        if (c < 48 || c > 57) {
+            return -1;
+        }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Makefile.syscalls 里 `syscall_abis_64 +=` 追加的 ABI 名（可能有多行）。
+function extraAbis(makefile: string): List<string> | Error {
+    const out: List<string> = listNew();
+    const text = readFile(makefile)?;
+    for (line in strSplit(text, "\n")) {
+        const f = fields(line);
+        if (listLen(f) >= 2 && (listGet(f, 0) catch "") == "syscall_abis_64" && (listGet(f, 1) catch "") == "+=") {
+            let k: int = 2;
+            while (k < listLen(f)) {
+                listPush(out, listGet(f, k) catch "");
+                k = k + 1;
+            }
+        }
+    }
+    return out;
+}
+
+function contains(xs: List<string>, s: string): bool {
+    for (x in xs) {
+        if (x == s) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// 一个架构的“名字 号码”项（按号表原序，即号码升序）；名字重复报错。
+function rows(a: Ref<Arch>, root: string): List<string> | Error {
+    const abis: List<string> = listNew();
+    listPush(abis, "common");
+    listPush(abis, "64");
+    if (len(a.makefile) > 0) {
+        for (x in extraAbis(root + "/" + a.makefile)?) {
+            listPush(abis, x);
+        }
+    }
+    const out: List<string> = listNew();
+    const seen: List<string> = listNew();
+    const text = readFile(root + "/" + a.table)?;
+    for (line in strSplit(text, "\n")) {
+        const f = fields(line);
+        if (listLen(f) == 0 || startsWith(listGet(f, 0) catch "", "#")) {
+            continue;
+        }
+        if (listLen(f) < 3) {
+            return err(a.table + "：看不懂的行 " + line);
+        }
+        const nr = decimal(listGet(f, 0) catch "");
+        if (nr < 0) {
+            return err(a.table + "：号码不是十进制数 " + line);
+        }
+        if (!contains(abis, listGet(f, 1) catch "")) {
+            continue;
+        }
+        if (listLen(f) < 4) {
+            continue;
+        }
+        const name = listGet(f, 2) catch "";
+        if (contains(seen, name)) {
+            return err(a.name + "：名字重复 " + name);
+        }
+        listPush(seen, name);
+        listPush(out, name + " " + toStr(nr));
+    }
+    return out;
+}
+
+/// 一个架构的数据函数：返回“名字 号码 名字 号码 …”，每行十二项。
+function render(a: Ref<Arch>, items: List<string>): string {
+    let s: string = "/// " + a.name + "：" + toStr(listLen(items)) + " 个系统调用，号码升序。\n";
+    s = s + "export function " + a.fn + "(): string {\n    return \"";
+    let i: int = 0;
+    while (i < listLen(items)) {
+        if (i > 0) {
+            if (i % 12 == 0) {
+                s = s + " \" +\n    \"";
+            } else {
+                s = s + " ";
+            }
+        }
+        s = s + (listGet(items, i) catch "");
+        i = i + 1;
+    }
+    return s + "\";\n}\n";
+}
+
+function run(args: []string): int | Error {
+    let root: string = "";
+    let tag: string = "";
+    let out: string = "bootstrap/selfhost/syscall_tables.tx";
+    let i: int = 0;
+    while (i < len(args)) {
+        const a = args[i];
+        if (a == "--kernel" && i + 1 < len(args)) {
+            root = args[i + 1];
+            i = i + 2;
+        } else if (a == "--tag" && i + 1 < len(args)) {
+            tag = args[i + 1];
+            i = i + 2;
+        } else if (a == "--out" && i + 1 < len(args)) {
+            out = args[i + 1];
+            i = i + 2;
+        } else {
+            return err("不认识的参数 " + a);
+        }
+    }
+    if (len(root) == 0 || len(tag) == 0) {
+        return err("要 --kernel <内核源码根> 与 --tag <内核版本标签>");
+    }
+    const arches: List<Ref<Arch>> = listNew();
+    listPush(arches, new Arch { name: "x86_64", table: "arch/x86/entry/syscalls/syscall_64.tbl", makefile: "", fn: "syscallTableX86_64" });
+    listPush(arches, new Arch { name: "aarch64", table: "scripts/syscall.tbl", makefile: "arch/arm64/kernel/Makefile.syscalls", fn: "syscallTableAarch64" });
+    listPush(arches, new Arch { name: "loongarch64", table: "scripts/syscall.tbl", makefile: "arch/loongarch/kernel/Makefile.syscalls", fn: "syscallTableLoongarch64" });
+    listPush(arches, new Arch { name: "riscv64", table: "scripts/syscall.tbl", makefile: "arch/riscv/kernel/Makefile.syscalls", fn: "syscallTableRiscv64" });
+    let s: string = "// 本文件由 scripts/gen_syscall_tables.tx 生成，勿手改。来源：Linux " + tag + " 的 scripts/syscall.tbl、\n";
+    s = s + "// arch/x86/entry/syscalls/syscall_64.tbl 与 arch/<架构>/kernel/Makefile.syscalls（各架构启用的可选 ABI）。没有入口函数的\n";
+    s = s + "// 行不收。查表与替代提示见 syscall_names.tx。\n";
+    s = s + "export const SYSCALL_KERNEL: string = \"" + tag + "\";\n";
+    for (a in arches) {
+        const items = rows(a, root)?;
+        s = s + "\n" + render(a, items);
+        print(a.name + " " + toStr(listLen(items)));
+    }
+    writeFile(out, s)?;
+    print("写出 " + out);
+    return 0;
+}
+
+function main(args: []string): int {
+    return run(args) catch (e) {
+        eprint("gen_syscall_tables: " + e.message);
+        return 1;
+    };
+}

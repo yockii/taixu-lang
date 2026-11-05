@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Debug-build stub gate (round 6 step 6c-2, docs/design/v052-round6-debug-v0.1-20261018.md §三-5, §四-4).
+"""Debug-build stub gate (round 6 step §四-4).
 
 Builds programs under tests/debug with `taixu build --debug`, starts each product with a private control
 channel (two pipes handed over through TAIXU_DEBUG_CHANNEL=<read>,<write>; Windows handle values or Linux
 file descriptors) and drives the stub with its binary protocol:
   product -> client: HELLO 1, STOP 2, TIMEOUT 3, FRAMES reply 4, READ reply 5
   client -> product: ARM 10 (fn, pc, value), RUN 11 (mode 0 continue/1 into/2 over/3 out, deadline ms),
-                     FRAMES 12, READ 13 (address, length), PAUSE 14 (while running; round 6 step 6c-5a)
+                     FRAMES 12, READ 13 (address, length), PAUSE 14 (while running; round 6 step)
 Every frame is a u32 little-endian length, a u8 opcode and u64 little-endian fields.
 
 The client knows no names: it reads the program image (`__tx_nrt_image`, address from HELLO) through READ to
@@ -16,12 +16,12 @@ sequence (reason, line, depth), the program's stdout and exit code; others check
 through READ, a READ of an invalid address (0 bytes, the product keeps running), the continue deadline
 (TIMEOUT, exit 3), a closed channel (exit 3) and that threads other than main never stop.
 
-Round 6 step 6c-3 adds two checks: a toolchain program (tests/debug/native/ctl-driver.tx, built with
+Round 6 step adds two checks: a toolchain program (tests/debug/native/ctl-driver.tx, built with
 --toolchain) drives a debug product through procSpawn's control channel (HELLO, RUN into, STOP, RUN continue,
 exit code and stdout); and a TAIXU_DEBUG_CHANNEL naming handles or descriptors that are not pipes leaves the
 product running as without a channel.
 
-Round 6 step 6c-5a (HELLO version 2): the stub looks at the channel every 8192 new-line events while running, so an
+Round 6 step (HELLO version 2): the stub looks at the channel every 8192 new-line events while running, so an
 ARM sent while the product runs takes effect at once and PAUSE stops it (reason 3). The live check arms a line in
 an endless loop after RUN, pauses after the next RUN, sends a stale PAUSE while stopped (ignored) and ends with a
 deadline.
@@ -337,7 +337,7 @@ def sc_async(build):
     arm(s, image, 'async.tx', 11)
     got = stops(s, image, [CONTINUE, CONTINUE, CONTINUE])
     code, out, _ = s.finish()
-    want = [(BREAKPOINT, 3, 1), (BREAKPOINT, 11, 1), 'exit']
+    want = [(BREAKPOINT, 3, 2), (BREAKPOINT, 11, 2), 'exit']  # D3 v0.53：任务在 main 的 await 里运行，栈底多一层 main
     return [('async', got == want and code == 0 and out == 'spawned\njob 15\ngot 15\n', 'got=%r exit=%r out=%r' % (got, code, out))]
 
 

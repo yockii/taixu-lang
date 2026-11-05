@@ -15,11 +15,11 @@ description: 太虚（Taixu）语言开发规范与上手指南。在创建、�
 
 **安装**：将本目录（`skill/taixu/`）复制到你的 Agent 技能目录（ZCode：`~/.zcode/skills/`；Claude Code：`.claude/skills/`；其它 Agent 按其技能机制注册）。
 
-> 工具链版本 0.3.0-beta.1（首次公测）。当前规范 D3 v0.42；命令以 `taixu capabilities` 为准。
+> 工具链版本 0.3.0-beta.1（首次公测）。当前规范 D3 v0.53；命令以 `taixu capabilities` 为准。
 
-> 开始生成代码前查询 taixu capabilities --format=json，核对 toolchain_version、diagnostic_version 与 schemas；version_gate 只是内部关口。遇到版本差异，用 taixu changes --format=json 查看迁移示例；applicability=unavailable 表示尚无自动修复。当前不提供 edition/API 版本门。
+> 开始生成代码前查询 taixu capabilities --format=json，核对 toolchain_version、diagnostic_version 与 schemas。遇到版本差异，用 taixu changes --format=json 查看迁移示例；applicability=unavailable 表示尚无自动修复。当前不提供 edition/API 版本门。
 
-**v0.31 现行边界（2026-10-21）**：编译器、运行时和 CLI 全部由太虚原生实现，直接生成原生可执行文件。模块级 `declare function` 必须有 `from "库"` 或 `from syscall 编号`；无 `from` 的宿主 extern 报 3033，即使未调用也报错。接口内的方法签名不是宿主 extern，不受影响。带 `from` 的既有 FFI、类型和 ABI 不变。GUI 引擎外移后的空窗已由用户在 2026-10-18 接受，当前不提供 desktop/gui 模板或内置 GUI 宿主。原生 `build/run/test`、格式化、调试、DAP、LSP、MCP 与源码汇编清单保留；`build --bytecode` 报用法错误 64。
+**v0.31 现行边界（2026-10-21）**：编译器、运行时和 CLI 全部由太虚原生实现，直接生成原生可执行文件。模块级 `declare function` 必须有 `from "库"` 或 `from syscall 编号`；无 `from` 的宿主 extern 报 3033，即使未调用也报错。接口内的方法签名不是宿主 extern，不受影响。带 `from` 的既有 FFI、类型和 ABI 不变。GUI 由外部库 taixu-gui 提供（2026-10-26 起按原生引擎设计分期补齐），核心不内置 GUI 宿主；`taixu init gui` 生成用它的模板。原生 `build/run/test`、格式化、调试、DAP、LSP、MCP 与源码汇编清单保留；`build --bytecode` 报用法错误 64。
 
 
 ## 1. 一句话定位
@@ -35,7 +35,7 @@ TS 的皮（function / let / const / import / 花括号）、静态类型朴实�
 5. 堆分配只有 `new`，类型写 `Ref<T>`；`p.x` 自动解引用；
 6. `T?`（缺失，值 `None`）与 `T | Error`（故障，`err("msg")`）**是两个类型、不隐式互转**，跨通道用 `catch` 显式桥接；
 7. `int`（64 位）与 `float`（f64）不隐式转换，用 `as`；v0.23 的定宽类型（`i32`、`u8`…）只往无损方向自动扩宽，收窄用 `as`（越界 trap）；v0.26 起定宽算术越界即 trap（环绕要显式写 `wrapAdd` 等）——计数、下标、累加一律用 `int`；
-8. **失败值不得丢弃**：`readFile(p);` 裸写是编译错误，必须 `?` / `catch` / 绑定 / 传参；
+8. **失败值不得丢弃**：`readFile(p);` 裸写是编译错误，必须 `?` / `catch` / 绑定 / 传参；Future 同样不得丢弃（v0.53），发后即忘写 `detach job();`；
 9. `const` 对值类型**深层冻结**；唯一例外 `Ref`：const 只锁重绑，对象字段可改（同 TS const object）；
 10. 对象字面量 `{ x: 1 }` 需上下文类型（`const p: Point = { x: 1 }`），无上下文写 `Point { x: 1 }`。
 
@@ -69,10 +69,90 @@ function loadSource(path: string): string | Error {
 //   risky() catch 0            → T          （默认值）
 //   opt()    catch None        → T?         （缺失降级）
 //   opt()    catch err("...")  → T | Error  （缺失升级）
-// catch (e) { ... } 块：非 void 语境必须经 return/panic 发散（块没有隐式返回值）
+// catch (e) { ... } 块：非 void 语境必须离开——return／panic，或在循环里 break／continue（块没有隐式返回值）
 ```
 
 **禁止**：`try` / `throw` / 语句式 `catch`；`?` 结果标注为 `T?`；跨通道隐式转换。
+
+**v0.49：复合赋值、`void | Error` 的成功出口、catch 块里 continue／break、switch 臂合成**：
+
+```text
+let total = 0;
+for (line in lines) {
+    const n: int = parse(line) catch (e) {   // 坏行跳过：catch 块在循环里可以 continue／break
+        continue;
+    };
+    total += n;                              // 复合赋值 += -= *= /= %= &= |= ^=；没有 ++／--
+}
+function save(p: string, s: string): void | Error {
+    writeFile(p, s)?;
+}                                            // void | Error：走到末尾或 return; 即成功
+function asText(j: J): string | Error {
+    return switch (j) {                      // 臂按期望类型检查；无期望类型时 string 臂＋err 臂合成 string | Error
+        case S(s) => s,
+        else => err("不是串"),
+    };
+}
+```
+
+**v0.53：main 里直接 await、入口返回即取消任务、`detach`、句柄归一、std/task 泛型**：
+
+```text
+function main(args: []string): int {
+    const f = fetch(1);                      // 调用即排队，f: Future<int>（async 函数写 T 或 T | Error 都得 Future<T>）
+    const v = await f catch -1;              // main 体内直接 await：未完成时就地跑调度泵（v0.52 及以前 3024）
+    detach log("done");                      // 发后即忘写 detach；裸写 log("done"); 报 3005（丢弃 Future）
+    return 0;                                // 返回即取消仍未完成的任务（挂起中的先执行已登记的 defer）
+}
+test "能 await" { const v = await fetch(2) catch 0; assert(v > 0, "v"); }   // test 块同 main
+const t = threadSpawn((): int | Error => await work());   // 只有直接写在实参里的箭头能 await；t: Thread<int>
+// main 不能调用、取值、导入，不能写 async function main（3010／3008）；嵌套的普通箭头不继承外层的 await 资格（3024）
+// main 返回即结束进程，未 join 的线程随之终止——要线程跑完就 threadJoin；无人 await 的失败任务静默
+// std/task、std/pool 泛型：taskGroupNew<int>()、timeout<T>(f, ms)；std/map_set 退役：Map／Set 用 prelude，objToMap 在 std/json
+```
+
+**v0.52：字符串的整数位置一律按字节、for-in 逐字符、码点字面量、字符串比较**：
+
+```text
+const at = strFind(s, ":");                  // 字节下标，没有得 -1（取代 strByteIndexOf、strIndexOf）
+const key = strSlice(s, 0, at);              // 字节区间 [0, at)；越界或切在字符中间 trap 4002（取代 strByteSub、strSub）
+for (c in "太虚") { ... }                    // 逐字符：c 是码点 int（v0.51 及以前逐字节）
+for (i, c in s) { ... }                      // i 是该字符首字节的字节偏移，可直接交给 strSlice
+if (c == '太') { ... }                       // 字符字面量可为任一单个字符，值为码点（22826）
+if (name < other) { ... }                    // string 按字节字典序（即码点序）比大小；strCompare(a, b) 得 -1／0／1
+import { slice, find, count } from "std/utf8";   // 按“字”数的少数场合：码点版 slice／find／count（O(n)）
+let i = 0; while (i < len(s)) { const b = byteAt(s, i); i += 1; }   // 逐字节
+// strSub／strIndexOf／strByteSub／strByteIndexOf 已移除：报 3001，诊断给逐字等价的改写
+// std/text：padStart／padEnd／truncate 按显示列宽（汉字 2 列），displayWidth(s)；按字节的是 …Bytes 版
+```
+
+**v0.51：越界即 trap、`List<T?>`、struct 更新、双变量 for-in、`range`、List 字面量、导入改名**：
+
+```text
+const x = listGet(xs, i);                  // 越界 trap 4002（同 listSet）；可能越界用 listTryGet(xs, i) ?? 默认值
+const c = byteTryAt(src, pos) ?? 0;        // 扫到串尾的循环用 Try 版；byteAt 越界 trap
+const top = listPop(stack);                // 空表 trap；可能为空用 listTryPop(stack)
+const slots: List<int?> = [1, None, 3];    // 元素可为 T?；期望 List<T> 时数组字面量构造 List
+if (mapHas(m, k)) { const v = mapAt(m, k); }   // Map<K, V?>：mapGet 定向拒绝，用 mapHas＋mapAt（缺键 trap）
+const done = { ...todo, done: true };      // struct 更新：展开写在最前，其余字段从 todo 拷贝
+for (i, name in names) { ... }             // List／数组／切片：（下标, 元素）
+for (i in range(n)) { ... }                // range(n)／range(a, b)：计数循环、不分配，只用于 for-in
+import { truncate as cut } from "std/text";    // 导入改名
+let t = listGet(todos, i); t.done = true;  // ✗ 3036：t 是拷贝、写完再没读——改完 listSet(todos, i, t)，或存 Ref<Todo>
+```
+
+**v0.50：None 收窄、三元 `c ? a : b`、可选链 `a?.b`**：
+
+```text
+function city(u: Ref<User>?): string {
+    if (u == None) { return "-"; }           // 之后 u 收窄为 Ref<User>（只对 const 局部与参数；let、字段不收窄）
+    return u.name + (u.addr?.city ?? "");    // ?. 可选链：addr 为 None 时整条为 None，结果 string?
+}
+const label = score >= 60 ? "及格" : "不及格";   // 三元：最低一层、右结合；两支合成同 switch 臂
+const n = x != None ? x * 2 : 0;               // 三元两支同 if 收窄
+const v = c ? x? : 0;                          // then 支以传播结尾照常；条件以 ? 结尾要加括号 (x?) ? a : b
+const f = (listTryGet(xs, 0)?).name;           // “传播后取字段”写 (x?).f——x?.f 已是可选链
+```
 
 **v0.19：defer 与结构化错误**：
 
@@ -285,7 +365,7 @@ const seen: Set<u32> = setNew();          // 定宽整数可作 Map/Set 的键
 | `List<T>`（`listNew` 产生） | `Array` 动态序列 | 句柄共享、按同一性比较；操作仅六内建（无索引语法；方法**书写语法** v0.6 可用，见 §4.1 指南）；越界读 `None`、写 trap |
 | `Gen<T>`（v0.22，`function*` 调用产生） | Generator 对象 | 句柄共享（同一进度）；不可 `==`；取完、关闭或丢弃时释放持有的值 |
 | 句柄（v0.23，`declare type H;`） | 不透明指针 | 只能比较与传回外部函数；`handleBits(h)`／`handleFromBits<H>(v)` 取或造数值；`H?` 的 `None` 即空指针 |
-| 外部结构体（v0.23，`declare struct`） | C struct | 值类型（拷贝、按字段比较）；只以 `Ref<S>` 传给外部函数，调用前拷入、调用后拷回 |
+| 外部结构体（v0.23，`declare struct`） | C struct | 值类型（拷贝、按字段比较）；以 `Ref<S>` 传给外部函数（调用前拷入、调用后拷回），或按值传与返回（v0.45，按目标 C 调用约定）；字段可放回调与 `string`/`wstr`（v0.43，只写给 C、不拷回）与 `Bytes`（v0.46，C 端可写的缓冲） |
 | `Shared<T>`（v0.25，`sharedNew` 产生） | （无对应；近似 `Object.freeze` 后跨 Worker 共享） | 句柄可发送；`sharedGet` 取出的对象图深度不可变（写入 trap 4022）；值类型的根交拷贝 |
 | `Atomic<int>`（v0.25，`atomicNew` 产生） | `Atomics` 作用于 `SharedArrayBuffer` | 只经五个内建读写（seqcst）；只能放进 `sharedNew` 跨线程 |
 
@@ -297,7 +377,7 @@ const seen: Set<u32> = setNew();          // 定宽整数可作 Map/Set 的键
 
 ## 6. S1 没有的东西（不要生成）
 
-`?.`（分期）、字符串索引、类/继承/`this`/重载/`implements`（v0.20 起 `interface` 与接口值的动态分派可用）、`is`、动态类型、嵌套模板串、string 码点迭代。**`??`/解构声明（v0.12 可用）**：`a ?? b`≡`a catch b`；`const (a, b) = listExpr;` 元素型 `T?`。**用户泛型（v0.13 可用——单态化）**：`function id<T>(x: T): T`／`struct Pair<A, B>`；型参三通道（实参推断/期望型/显式 `f<int>(…)`）；每型参组合一实例（v0.24：实例化嵌套 ≤256 层、单实例类型规模 ≤2^20，不限总数；容量上限见 D3 附录 A）；enum 泛型/泛型闭包/where 不在面。替代方案：动态序列→`List<T>` 六内建（元素面含函数类型，v0.7）；Map/Set→v0.20 起编译器自带 prelude 的 `Map<K, V>`/`Set<T>`（直接用；标准库 `std/map_set` 仍可显式导入）。**位运算（v0.14 可用）**：`& | ^ ~ << >> >>>` 恒 int 操作数（float/bool 拒绝；v0.26 起也可为定宽整数，见 §4 的 v0.26 段）；移位计数 0..63 界外运行期 trap（非 JS 掩码；定宽整数为 0..宽度−1）；`>>`＝算术右移、`>>>`＝逻辑右移；`imul(a, b)` 64 位环绕乘（与 `*` 溢出 trap 分立）；优先级 `+ -` > 移位 > 比较 > `&` > `^` > `|` > `&&`。**字符字面量（v0.15 可用——LANG-16）**：'a' ＝ int 码点（97）——byteAt(s, i) == 'a' 即字节比较；转义集 '\n '\t '\r '\\ '\' '\0'；空/多字符/多字节/\u{...}（评估位）结构化拒绝（诊断 1005）。**闭包与函数类型（v0.7 可用）**：唯一箭头形式 `(a: T): R => 体`（参数/返回必须显式）；捕获＝值快照、闭包体内被捕获名只读（赋值即编译错误）；句柄共享要可变状态持 `Ref`；函数类型 `(T,…) => R` 可入标注位/struct 字段/List 元素；`obj.field(args)` 直调 fn 类型字段；函数值不可 `==`。**v0.6 语法糖（可用）**：方法语法 `nums.push(v)`≡`listPush(nums, v)`（约定名→同名用户函数→错误，解析序冻结）；for-in `for (x in it)`（List/字符串字节序/数组/切片/Map 键值——插入序红线）；插值 `` `n=${x}` ``≡`"n=" + toStr(x)`（`toStr` 面扩 string 恒等；D3 v0.11 增 Error 可读化；不支持嵌套模板、转义 `` ` `` 与 `\$`）。**异步与任务运行时（v0.8 可用）**：`async function f(): T` 声明写成功侧 T，调用即 spawn 得 `Future<T>`；`await` 仅在 async 函数/async 箭头体内（普通函数/main 内＝编译错误 3024），操作数须 `Future<T>`（3025），产出 `T | Error` 接 `?`/`catch`；调度＝确定性 FIFO 泵（main 同步体后跑任务，无微任务）；`taskCancel(fut)` 未决任务立即清理、await 得 `err("task cancelled")`、`taskCancelled()` 协作旗标、`taskAwaitAny(list)` 插入序裁决；main 返回后仍有未决任务→trap 退出码 3（必须 join 或显式取消）；`Future` 不可 `==`、不可嵌套；**定时器与库层超时（v0.9 可用）**：`sleepMs(ms): Future<void>`——到期泵置 done，deadline 升序/同刻登记序；`await sleepMs(0)`＝下一轮到期；负值＝err future（"sleep ms < 0"）；断言面只用 0ms/不到期两确定形态；`timeout(f, ms)`（std/task，单态 Future<int>）失败者取消→`err("timeout")`；`taskGroupCancel(tg)` 登记序传播、cancel 后 drain 必达零 pending。**语言核心回补（D3 v0.10 起可用）**：`listRemoveAt(l, i)`/`listInsert(l, i, v)` 补 List 删除/插入（越界 trap；`i==len` 即尾加）；`strSub(s, from, count)`/`strIndexOf(s, needle)`/`strSplit(s, sep)` 走**码元语义**（Unicode 码点计 units——CJK 安全；for-in 字符串仍字节序不变）；错误消息读取＝`e.message` 字段访问（catch 绑定值——错误打印写作 `print(e.message)`；D3 v0.11 起 `toStr(err)` ⇒ `"Error: <message>"`）。**定宽与 FFI 排除（v0.23）**：~~定宽值的算术与位运算~~（v0.26 已有）、`u3` 一类任意位宽、`i128`/`u128`、原始指针 `Ptr<T>` 与 `unsafe`、按值传递结构体、联合与位域、调用处任意个数的 C 变参（变参须在声明里写成 `...名: 类型`）、闭包作回调、懒装载动态库。**线程内排除（v0.25）**：`Mutex`、条件变量、通道、线程池、并行 map/reduce（以后的标准库）；原子内存序参数；除 `Atomic<int>` 以外的共享可变状态。**定宽排除（v0.26）**：`float`/`f32` 的 `%`、饱和运算、SIMD 向量类型、`f16`/`bf16`。
+字符串索引、类/继承/`this`/重载/`implements`（v0.20 起 `interface` 与接口值的动态分派可用）、`is`、动态类型、嵌套模板串。**`??`/解构声明（v0.12 可用）**：`a ?? b`≡`a catch b`；`const (a, b) = listExpr;` 元素型 `T?`。**用户泛型（v0.13 可用——单态化）**：`function id<T>(x: T): T`／`struct Pair<A, B>`；型参三通道（实参推断/期望型/显式 `f<int>(…)`）；每型参组合一实例（v0.24：实例化嵌套 ≤256 层、单实例类型规模 ≤2^20，不限总数；容量上限见 D3 附录 A）；enum 泛型/泛型闭包/where 不在面。替代方案：动态序列→`List<T>` 六内建（元素面含函数类型，v0.7）；Map/Set→v0.20 起编译器自带 prelude 的 `Map<K, V>`/`Set<T>`（直接用；原 `std/map_set` 于 v0.53 退役）。**位运算（v0.14 可用）**：`& | ^ ~ << >> >>>` 恒 int 操作数（float/bool 拒绝；v0.26 起也可为定宽整数，见 §4 的 v0.26 段）；移位计数 0..63 界外运行期 trap（非 JS 掩码；定宽整数为 0..宽度−1）；`>>`＝算术右移、`>>>`＝逻辑右移；`imul(a, b)` 64 位环绕乘（与 `*` 溢出 trap 分立）；优先级 `+ -` > 移位 > 比较 > `&` > `^` > `|` > `&&`。**字符字面量（v0.15 可用）**：'a' ＝ int 码点（97）——byteAt(s, i) == 'a' 即字节比较；转义集 '\n '\t '\r '\\ '\' '\0'；空/多字符/\u{...}（评估位）结构化拒绝（诊断 1005）；v0.52 起可为任一单个字符（'太'＝22826）。**闭包与函数类型（v0.7 可用）**：唯一箭头形式 `(a: T): R => 体`（参数/返回必须显式）；捕获＝值快照、闭包体内被捕获名只读（赋值即编译错误）；句柄共享要可变状态持 `Ref`；函数类型 `(T,…) => R` 可入标注位/struct 字段/List 元素；`obj.field(args)` 直调 fn 类型字段；函数值不可 `==`。**v0.6 语法糖（可用）**：方法语法 `nums.push(v)`≡`listPush(nums, v)`（约定名→同名用户函数→错误，解析序冻结）；for-in `for (x in it)`（List/字符串逐字符码点（v0.52；此前字节序）/数组/切片/Map 键值——插入序红线）；插值 `` `n=${x}` ``≡`"n=" + toStr(x)`（`toStr` 面扩 string 恒等；D3 v0.11 增 Error 可读化；不支持嵌套模板、转义 `` ` `` 与 `\$`）。**异步与任务运行时（v0.8 可用）**：`async function f(): T` 声明写成功侧 T，调用即 spawn 得 `Future<T>`；`await` 仅在 async 函数/async 箭头体内（普通函数/main 内＝编译错误 3024），操作数须 `Future<T>`（3025），产出 `T | Error` 接 `?`/`catch`；调度＝确定性 FIFO 泵（main 同步体后跑任务，无微任务）；`taskCancel(fut)` 未决任务立即清理、await 得 `err("task cancelled")`、`taskCancelled()` 协作旗标、`taskAwaitAny(list)` 插入序裁决；main 返回后仍有未决任务→trap 退出码 3（必须 join 或显式取消）；`Future` 不可 `==`、不可嵌套；**定时器与库层超时（v0.9 可用）**：`sleepMs(ms): Future<void>`——到期泵置 done，deadline 升序/同刻登记序；`await sleepMs(0)`＝下一轮到期；负值＝err future（"sleep ms < 0"）；断言面只用 0ms/不到期两确定形态；`timeout(f, ms)`（std/task，单态 Future<int>）失败者取消→`err("timeout")`；`taskGroupCancel(tg)` 登记序传播、cancel 后 drain 必达零 pending。**语言核心回补（D3 v0.10 起可用）**：`listRemoveAt(l, i)`/`listInsert(l, i, v)` 补 List 删除/插入（越界 trap；`i==len` 即尾加）；`strSplit(s, sep)`（v0.10 的码点面 `strSub`／`strIndexOf` 已于 v0.52 移除，改 `strSlice`／`strFind`（按字节）或 `std/utf8` 的 `slice`／`find`（按码点））；错误消息读取＝`e.message` 字段访问（catch 绑定值——错误打印写作 `print(e.message)`；D3 v0.11 起 `toStr(err)` ⇒ `"Error: <message>"`）。**定宽与 FFI 排除（v0.23）**：~~定宽值的算术与位运算~~（v0.26 已有）、`u3` 一类任意位宽、`i128`/`u128`、原始指针 `Ptr<T>` 与 `unsafe`、按值传递结构体、联合与位域、调用处任意个数的 C 变参（变参须在声明里写成 `...名: 类型`）、闭包作回调、懒装载动态库。**线程内排除（v0.25）**：`Mutex`、条件变量、通道、线程池、并行 map/reduce（以后的标准库）；原子内存序参数；除 `Atomic<int>` 以外的共享可变状态。**定宽排除（v0.26）**：`float`/`f32` 的 `%`、饱和运算、SIMD 向量类型、`f16`/`bf16`。
 
 ## 7. 常见生成错误自检清单
 
@@ -311,17 +391,22 @@ const seen: Set<u32> = setNew();          // 定宽整数可作 Map/Set 的键
 8. switch 漏变体且无 `else` → 穷尽检查会拒绝；
 9. switch 臂里写语句块 → 臂只能是表达式，复杂逻辑拆辅助函数；
 10. 忘分号、忘 `export`（默认模块私有）；
-11. 写了 `?.`/逗号表达式 → 判空 / 拆语句（`??` 可用，同 `catch` 默认值）；
+11. 写了逗号表达式 → 拆语句（`??`、`?.`、三元 `c ? a : b` 都可用）；
 12. 联合写成 `T | 非 Error` → 只有 `T | Error` 合法；
 13. 模板串段内再写反引号/`${` → 转义或拆段；
 14. 线程之间共享可变的东西（全局变量、同一个 `Ref`/`List`）→ 线程只拿到深拷贝，改动对方看不到；只读大数据用 `sharedNew`/`sharedGet`，计数一类的可变状态放 `Atomic<int>`；从 `sharedGet` 取出的对象不能写（trap 4022）；
 15. 在 `u8`/`u32` 等定宽值上写哈希、校验和、随机数，默认算术越界会 trap 4004 → 要环绕的地方写 `wrapAdd`/`wrapSub`/`wrapMul`；对无符号值取负 → `wrapSub<T>(0, x)`；计数与累加改用 `int`。
+16. （v0.49）写 `i++`／`++i`／`--i` → 太虚没有自增自减，写 `i += 1`／`i -= 1`；返回 `void | Error` 的函数写 `return done();` 之类的绕法 → 直接 `return;` 或走到末尾；为“跳过这一行”把循环体拆成函数 → catch 块里直接 `continue`。
+17. （v0.50）判过 `None` 还写 `x ?? 0`／`catch panic("不可达")` 取值 → `const` 与参数在判过的区域里已是 `T`，直接用（`let` 不收窄，能 `const` 就 `const`）；为条件取值先声明 `let` 再 `if` 赋值 → 写三元 `c ? a : b`；`x?.f` 表示可选链（`None` 则整条得 `None`），要“传播后取字段”写 `(x?).f`；三元的条件以后缀 `?` 结尾 → 加括号 `(x?) ? a : b`。
+18. （v0.51）对 `listGet`／`listPop`／`byteAt` 的结果写 `?? 默认值`／`catch`／`?` → v0.51 起它们越界（空表）即 trap、直接得到元素：可能越界改用 `listTryGet`／`listTryPop`／`byteTryAt`，确定在界内就去掉默认值；`let t = listGet(xs, i); t.f = v;` 之后不写回 → 3036（`t` 是拷贝），改完 `listSet(xs, i, t)` 或改存 `Ref<T>`；只为计数的循环写 `for (i in range(n))`；要下标又要元素写 `for (i, x in xs)`。
+19. （v0.52）写 `strSub`／`strIndexOf`／`strByteSub`／`strByteIndexOf` → 已移除（3001）：按字节用 `strSlice(s, 起点, 终点)`（终点不含，不是长度）／`strFind`，按“字”用 `std/utf8` 的 `slice`／`find`；把 `for (c in s)` 的 `c` 当字节 → v0.52 起是码点，逐字节写 `while`＋`byteAt`；拿 `std/text` 的 `padEnd` 对齐协议字段 → 它按显示列宽，按字节用 `padEndBytes`。
 
 ## 7.1 TS 边界速查（类 TS 非 TS，边界显式）
 
 | TS 肌肉记忆 | 太虚事实 | 编译器反应 |
 |---|---|---|
 | `1 == "1"` | 跨类型 `==` 不存在 | 3002 `不能比较 int 与 string` |
+| `i++`、`--i` | 没有自增自减；`+=` 等复合赋值可用（v0.49） | 2001 `太虚没有 ++：写 i += 1` |
 | `if (list)` | 无 truthiness，条件必须 bool | 3014 `if 条件必须是 bool` |
 | `let x = null` | 只有 `None`，且仅 `T?` 上下文 | 3001 `未定义符号 'null'` |
 | `"n=" + 1` | 无隐式拼接：`` `n=${1}` `` 或 `toStr` | 3002 `算术须为同种数值或 string 拼接` |
@@ -329,13 +414,21 @@ const seen: Set<u32> = setNew();          // 定宽整数可作 Map/Set 的键
 | 嵌套模板串 | 仅单层插值；段内一个表达式 | 1003 `插值段内不支持嵌套模板串` |
 | `(1, 2)` | 无逗号表达式 | 2002 `期望 ')'，遇到 ','` |
 | `a ?? b` | v0.12 起有：与 `a catch b` 同义，None 与 Error 都换成右侧的值 | 无（合法） |
-| `a?.b` | 无 `?.`；`T?` 判空后直用 | 3006 `传播 None，但当前函数不返回 T?` |
+| `a?.b` | v0.50 起有：`a` 须为 `T?`，`None` 时整条链得 `None`，结果 `U?`；“传播后取字段”写 `(a?).b` | 无（合法）；对 `T \| Error` 报 3006 |
+| `c ? a : b` | v0.50 起有：最低一层、右结合；条件以后缀 `?` 结尾须加括号 | 无（合法） |
+| `{ ...t, done: true }` | v0.51 起有：struct 更新表达式，展开写在最前、须同一 struct 的值；其余字段从 `t` 拷贝 | 无（合法） |
+| `for (const [i, x] of xs.entries())` | `for (i, x in xs)`（v0.51，List／数组／切片） | 无（合法） |
+| `for (let i = 0; i < n; i++)` | `for (i in range(n))`（v0.51，不分配）；或 `for (let i = 0; i < n; i += 1)` | `i++` 报 2001 |
+| `import { a as b }` | v0.51 起有；不能借 `as` 导入 `main` | 无（合法） |
+| `s.slice(a, b)`／`s.indexOf(t)` | `strSlice(s, a, b)`／`strFind(s, t)`：按字节（v0.52）；按“字”用 `std/utf8` 的 `slice`／`find` | 无（合法）；`strSub`／`strIndexOf` 报 3001 |
+| `for (const ch of s)` | `for (c in s)`：v0.52 起 `c` 为码点 `int`，`utf8Encode(c)` 转回 string；要位置写 `for (i, c in s)`（字节偏移） | 无（合法） |
+| `a < b`（字符串） | v0.52 起有：按 UTF-8 字节字典序（即码点序；JS 按 UTF-16 码元比，增补平面字符的次序不同）；`strCompare(a, b)` 得 -1／0／1 | 无（合法） |
 | `@dec` / `async function*` / `: any` / `implements` | 均不在面（v0.20 起 `interface` 可用，实现关系是结构化的；v0.22 起普通生成器 `function*` 可用，见 §4） | 1001/2002/3001/通用语法错 |
 | `it.next().done` | `genNext(g)`／`g.next()` 得 `T?`，取完为 `None`；没有 `{ value, done }` | 3015 `对 int? 取字段 'done'` |
 | `int \| string` | 联合唯一合法形态 `T \| Error` | 3020 `联合类型右侧必须是 Error` |
-| 保留字全局禁用 | `declare`/`in`/`async`/`await` 为上下文关键字，其余场合可作标识符；`yield` 只在生成器体内是关键字（v0.22）；`from`/`syscall`/`type` 只在外部声明里有意义、`i8`…`f32` 与 `i`/`u`＋数字在类型位置保留（v0.23） | 表随语言版本冻结升版 |
+| 保留字全局禁用 | `declare`/`in`/`async`/`await`/`detach`（v0.53，语句开头后随标识符）为上下文关键字，其余场合可作标识符；`yield` 只在生成器体内是关键字（v0.22）；`from`/`syscall`/`type` 只在外部声明里有意义、`i8`…`f32` 与 `i`/`u`＋数字在类型位置保留（v0.23） | 表随语言版本冻结升版 |
 | 函数不是值 | **是值**：箭头单一形式，参数/返回显式（`(int) => int`）；捕获＝值快照、闭包内只读 | 随 D3 v0.7 生效 |
-| async 隐式排队 | **显式着色**：`async/await`；`await` 仅 async 体内；调度序＝FIFO 启动序，无微任务 | 已生效（D3 v0.8） |
+| async 隐式排队 | **显式着色**：`async/await`；`await` 在 async 体与 main、test 块、threadSpawn 实参箭头内（v0.53）；调度序＝FIFO 启动序，无微任务；悬空的 Future 报 3005，发后即忘写 `detach` | 已生效（D3 v0.8） |
 
 每行都有自动化负例锁定（`tests/cases/guard-*` 用例）。
 
@@ -357,12 +450,19 @@ const seen: Set<u32> = setNew();          // 定宽整数可作 Map/Set 的键
 | `unref` | `(Ref<T>) T` | 从堆引用取值拷贝 |
 | `weak` | `(Ref<T>) Weak<T>` | 构造弱引用（不拥有目标） |
 | `deref` | `(Weak<T>) T?` | 目标存活得值拷贝、已死得 `None` |
-| `byteAt` | `(string, int) int?` | **自举层**：源码逐字节访问（越界 `None`） |
+| `byteAt` | `(string, int) int` | 逐字节访问；v0.51 起越界 trap 4002 |
+| `byteTryAt` | `(string, int) int?` | 逐字节访问，越界得 `None`（v0.51） |
 | `utf8Encode` | `(int) string \| Error` | **自举层**：码点→UTF-8 串（非法码点 `Error`） |
+| `strSlice`/`strFind` | `(string, int, int) string`／`(string, string) int` | 按字节（v0.52）：`strSlice(s, from, to)` 取 `[from, to)`（越界、`to < from` 或切在字符中间 trap 4002）、`strFind` 找字节下标（缺席 `-1`）。字符串的整数位置与长度一律按字节（`len`、`byteAt`、这两个，与 `Bytes` 同一单位）；按“字”用 `std/utf8` 的 `slice`／`find`／`count` |
+| `strCompare` | `(string, string) int` | 按字节字典序（即码点序）：-1／0／1；`string` 可直接 `< <= > >=`（v0.52） |
+| `strSub`/`strIndexOf`/`strByteSub`/`strByteIndexOf` | — | **v0.52 移除**：报 3001 并给改写；种子换代前的 `--toolchain` 构建照收 |
 | `listNew` | `listNew<T>(): List<T>` | 空表；`T` 经期望类型推断（`let l: List<int> = listNew();`），无期望编译错误 |
 | `listPush` | `(List<T>, T) void` | 尾追加 |
-| `listPop` | `(List<T>) T?` | 尾弹出（空表 `None`） |
-| `listGet` | `(List<T>, int) T?` | 索引读（越界 `None`） |
+| `listPop` | `(List<T>) T` | 尾弹出；v0.51 起空表 trap 4002 |
+| `listTryPop` | `(List<T>) T?` | 尾弹出，空表得 `None`（v0.51；元素可空的 List 报 3002） |
+| `listGet` | `(List<T>, int) T` | 索引读；v0.51 起越界 trap 4002 |
+| `listTryGet` | `(List<T>, int) T?` | 索引读，越界得 `None`（v0.51；元素可空的 List 报 3002） |
+| `range` | `(int[, int]) for-in` | 只作 for-in 的迭代对象：`range(n)` 即 0..n-1、`range(a, b)` 即 a..b-1，不分配（v0.51） |
 | `listSet` | `(List<T>, int, T) void` | 索引写（越界 trap） |
 | `listLen` | `(List<T>) int` | 长度 |
 | `taskCancel` | `(Future<T>) void` | 协作式取消（未决任务立即清理；已完成空操作） |
@@ -395,7 +495,7 @@ const seen: Set<u32> = setNew();          // 定宽整数可作 Map/Set 的键
 
 ## 8.1 外部函数（declare function；D3 v0.36）
 
-模块级外部函数必须写 `declare function 名(参数: 类型): 类型 from "库";` 或 `from syscall 编号;`。无 `from` 的旧宿主声明报 3033；不要生成 GUI 宿主函数或 desktop/gui 模板。接口内方法签名保持原样。
+模块级外部函数必须写 `declare function 名(参数: 类型): 类型 from "库";` 或 `from syscall "名字";`（数字形态是 x86_64 的号，只在 x86_64 或 `_linux_<架构>` 文件里写）。无 `from` 的旧宿主声明报 3033；不要生成 GUI 宿主函数（GUI 用外部库 taixu-gui，窗口程序从 `taixu init gui` 的模板起步）。接口内方法签名保持原样。
 
 **v0.23：FFI 外部函数（带 `from`；原生编译器）**——给标准库与平台层写绑定用，应用代码用标准库：
 
@@ -415,8 +515,8 @@ export function unixSeconds(): int {
 
 // clock_linux.tx
 declare struct Timespec { sec: int, nsec: int }
-declare function getpid(): i32 from syscall 39;                        // 直接系统调用：产物静态、无 libc
-declare function clock_gettime(clock: i32, ts: Ref<Timespec>): i32 from syscall 228;  // 失败返回 -errno
+declare function getpid(): i32 from syscall "getpid";                  // 直接系统调用：按目标架构查号表，产物静态、无 libc
+declare function clock_gettime(clock: i32, ts: Ref<Timespec>): i32 from syscall "clock_gettime";  // 失败返回 -errno
 
 export function pid(): int { return getpid(); }
 export function unixSeconds(): int {
@@ -427,18 +527,19 @@ export function unixSeconds(): int {
 ```
 
 规则：
-1. `from "库"`（Windows DLL 名可省 `.dll`；Linux 写 `"libc.so.6"` 等全名；macOS 写 dylib 安装名，如 `"/usr/lib/libz.1.dylib"`，libSystem 简写 `"libSystem"`，其他写法报 3033）或 Linux 的 `from syscall 编号`（macOS 上报 3033）；带 `from` 的外部函数只在本模块可见、不可 `export`——平台差异包进本模块的导出函数，放在 `x_windows.tx`／`x_linux.tx` 按目标文件里（`from "./x"` 导入时原生编译器按 `--target` 选用，兄弟文件导出面必须一致）。
-2. 签名只用封送类型：定宽数值与 `int`/`float`、`bool`、`string`（即 UTF-8、NUL 结尾的 C 串）/`wstr`（UTF-16，仅 Windows 的 W 系 API）、`Bytes`（只作参数：输出缓冲）、`declare type` 句柄与 `H?`（`None` 即空指针）、`Ref<外部结构体>`（拷入拷出）、回调函数类型；返回另可 `void`。没有 `cstr`（v0.36 并入 `string`，写了报 3033）；`List`、可选、失败联合、按值结构体都不行。Win32 `BOOL` 写 `i32`。
+1. `from "库"`（Windows DLL 名可省 `.dll`；Linux 写 `"libc.so.6"` 等全名；macOS 写 dylib 安装名，如 `"/usr/lib/libz.1.dylib"`，libSystem 简写 `"libSystem"`，其他写法报 3033）或 Linux 的 `from syscall "openat"`（v0.47：按目标架构查内核号表，目标上没有的报 3033 并给替代，如 `poll` 改 `ppoll`；写数字 `from syscall 257` 是 x86_64 的号，别的架构上只许写在 `x_linux_<架构>.tx` 里——跨架构一律写名字；macOS 上报 3033）；带 `from` 的外部函数只在本模块可见、不可 `export`——平台差异包进本模块的导出函数，放在 `x_windows.tx`／`x_linux.tx` 按目标文件里（`from "./x"` 导入时原生编译器按 `--target` 选用，兄弟文件导出面必须一致）。
+2. 签名只用封送类型：定宽数值与 `int`/`float`、`bool`、`string`（即 UTF-8、NUL 结尾的 C 串）/`wstr`（UTF-16，仅 Windows 的 W 系 API）、`Bytes`（只作参数：输出缓冲）、`declare type` 句柄与 `H?`（`None` 即空指针）、`Ref<外部结构体>`（拷入拷出）、外部结构体本身（v0.45 按值传与返回：按目标 C 调用约定，参数不拷回；按值返回的不能含 `string`/`wstr`/回调字段；`from syscall`、变参与回调签名里不收；寄存器用尽要改走栈的调用暂报 3033）、回调函数类型；返回另可 `void`。没有 `cstr`（v0.36 并入 `string`，写了报 3033）；`List`、可选、失败联合都不行。Win32 `BOOL` 写 `i32`。
 3. 实参按一般规则检查：`int` 变量传给 `i32` 形参要 `as i32`；字面量自动取型。
 4. 句柄只能比较与传回外部函数；要数值或哨兵（`INVALID_HANDLE_VALUE`）用 `handleBits(h)`／`handleFromBits<H>(-1)`。
 5. `string`/`wstr` 实参含 NUL 字节即 trap 4019；返回空指针得 `""`；`Bytes` 数据区只在调用期间有效，C 端不得保留任何指针。冻结的 `Bytes`（从 `sharedGet` 取出的）交给 C 之前即 trap 4022，C 接口只读也一样，先 `bytesSlice` 拷出一份再传；调用期间回调经该 `Bytes`（或它的 `List<u8>` 别名）改变长度（push、append、insert、pop、removeAt）即 trap 4024，与容量无关——借用期内只做原地读写，要增减长度就改用独立缓冲或等调用返回；长度为 0 的 `Bytes` 的指针不可解引用、也不保证是空指针（新建的空 `Bytes` 是哨兵地址 1），C 端一律以长度为准。
-6. 回调实参只能是顶层非泛型函数名、签名与形参逐一相同；只在外部调用期间、本线程上被调用（否则 trap 4020）。
+6. 回调实参只能是顶层非泛型函数名、签名与形参逐一相同；只在外部调用期间、本线程上被调用（否则 trap 4020）。外部结构体的字段（v0.43）也可以是回调函数类型（值同样只能是顶层函数名，字面量与字段赋值都查）与 `string`/`wstr`（调用期间的临时 C 串）——这三种只由太虚写给 C，调用后不拷回；`Bytes` 字段（v0.46）是数据区指针，同 `Bytes` 参数（调用期间有效、C 端可写，长度另放字段，冻结的 trap 4022、借用期间改长度 trap 4024），如 `declare struct IOVEC { base: Bytes, len: usize }`；含这些指针字段的结构体不能按值返回；用不到的指针字段（如可为空的串）声明成 `usize` 写 0。例：`declare struct WNDCLASSEXW { …, lpfnWndProc: (HWND, u32, usize, isize) => isize, …, lpszClassName: wstr, … }`。
 7. 错误码：库函数调用后读 `ffiLastError()`（GetLastError／errno）；`from syscall` 的返回值本身就是 `-errno`。
 8. C 变参函数（v0.36）：变参位置写成带 `...` 的参数，排在全部定参之后——`declare function openat(fd: i32, path: string, flags: i32, ...mode: u32): i32 from "libSystem";`、`declare function fcntl(fd: i32, cmd: i32, ...arg: int): i32 from "libc.so.6";`。定参个数必须同 C 原型：`open`／`openat`／`fcntl`／`ioctl`／`snprintf` 等常见变参函数写成全定参报 3033（Apple arm64 上变参经栈传，写错会读到垃圾）。窄整数、`bool`、`f32` 不用手写转换（编译器按 C 规则提升）；`from syscall` 与回调不能用变参。
 9. Linux 调用了 `from "库"` 的产物动态链接 glibc（构建报告会写明；`--static` 要求静态）；只用 `from syscall` 的保持静态。macOS 产物总经 libSystem 动态链接；x86_64 上从 libSystem 导入的 `stat`、`readdir` 等按 Apple 头文件改名链接（`$INODE64` 版），结构按 64 位 inode 布局声明。只声明不调用的外部函数不检查、不链接。
+10. 外部内存区（v0.48）：C 交来的地址（`lParam`、`GlobalLock` 的结果等）不要声明 `memcpy` 去拷——`const m = ffiMem(addr, size, writable)?`（或 `ffiMemOf<S>(addr, writable)?`）建区，再用 `ffiMemRead`／`ffiMemWrite`／`ffiMemGet<S>`／`ffiMemSet<S>`／`ffiMemUtf16`／`ffiMemUtf8` 读写：创建时核验地址（未映射、不可读或要求可写而不可写得 `Error`），之后按区的大小查界（越界、写只读区 trap 4025），区在本函数返回时结束。`FfiMem` 只作局部变量与参数，只能在声明了 `from` 外部函数的模块、非 async 函数里创建；区的大小写对、C 端让地址失效前不再读写，仍是调用方的责任。
 
 - 入口：`function main(args: []string): int`（args 不含程序名、逐项为命令行原文；参数不是合法 UTF-8 时进程以退出码 64 拒绝启动，v0.41；`std/os` 的 `args()` 与它逐项相同；v0.19 起也可返回 `int | Error`，失败时 stderr 输出 `toStr(e)`、退出码 1）；测试块 `test "名称" { ... }` 由 `taixu test` 运行（原生 `taixu test` 每个 test 块一个进程）；
-- CLI：`taixu run <file.tx> [程序参数...]` / `taixu build <file.tx> --out <目录>` / `taixu test <file.tx>` / `taixu fmt [--write|--check] <file.tx|目录>`；退出码 `0` 成功 / `1` 编译失败 / `2` 测试失败 / `3` 运行时错误 / `64` 用法错误；`--format=json` 输出带 `schema` 字段的结构化结果，供自动修复消费：诊断写到 stderr，形如 `{"schema":"diag/1","diags":[{"severity":"error","code":3002,"msg":"…","module":"main.tx","line":3,"col":5}]}`（编译诊断与运行期 trap 同一 schema）；`taixu test` 的结果写到 stdout，形如 `{"schema":"tests/1","tests":[…],"summary":{"total":1,"pass":1,"fail":0}}`；支持的 schema 以 `taixu capabilities --format=json` 的 `schemas` 为准。
+- CLI：`taixu run <file.tx> [程序参数...]` / `taixu build <file.tx> --out <目录>`（Windows GUI 程序加 `--subsystem=windows`） / `taixu test <file.tx>` / `taixu fmt [--write|--check] <file.tx|目录>`；退出码 `0` 成功 / `1` 编译失败 / `2` 测试失败 / `3` 运行时错误 / `64` 用法错误；`--format=json` 输出带 `schema` 字段的结构化结果，供自动修复消费：诊断写到 stderr，形如 `{"schema":"diag/1","diags":[{"severity":"error","code":3002,"msg":"…","module":"main.tx","line":3,"col":5}]}`（编译诊断与运行期 trap 同一 schema）；`taixu test` 的结果写到 stdout，形如 `{"schema":"tests/1","tests":[…],"summary":{"total":1,"pass":1,"fail":0}}`；支持的 schema 以 `taixu capabilities --format=json` 的 `schemas` 为准。
 - 堆检查（原生 `taixu build`/`run`/`test` 的 `--heap-check`）：链接检测内核——页堆（每块独立映射与保护页：越界写、释放后使用、重复与非法释放）加对象号隔离（释放的对象号先入隔离环、不立即复用，此间的过度释放落在计数为 0 的号码上）；查出即以 4012（`[runtime:corrupt_code]`，消息以 `heapcheck:` 开头或为“引用计数下溢”）终止、退出码 3。很慢、耗内存，只供调试与测试；可与 `--leak-check`、`--debug` 同用，与 `--link-object` 互斥。安全代码不会越界或过度释放，它查的是运行时缺陷与不安全的外部函数用法。
 - 泄漏检查（原生 `taixu build`/`run`/`test` 的 `--leak-check`）：查引用计数成环。程序正常退出时（trap 不查）放开模块级变量后扫描仍存活的对象，有则向 stderr 按种类与分配位置汇总报告（运行期码 4023 `leak`，不是 trap），进程退出码改为 23；`taixu test --leak-check` 下留下环的 test 块判失败。报告形如：
   ```text
@@ -450,9 +551,9 @@ export function unixSeconds(): int {
 
 ## 9. 完整示例
 
-`examples/syntax-tour.tx`——约 300 行覆盖 S1 全部语法特性，作为少样本参考优先阅读。D3 v0.12：`a ?? b`＝`catch 默认值`同构糖（None/Error 均合并）；`const (a, b) = listExpr;` 解构（元素型 `T?` 越界→None）；`?.` 不在 S1（定向诊断）。
+`examples/syntax-tour.tx`——约 300 行覆盖 S1 全部语法特性，作为少样本参考优先阅读。D3 v0.12：`a ?? b`＝`catch 默认值`同构糖（None/Error 均合并）；`const (a, b) = listExpr;` 解构（元素型 `T?` 越界→None）；v0.50：`a?.b` 可选链、三元 `c ? a : b`、`const`／参数判过 `None` 即收窄。
 
-太虚目前尚未发布；不为旧开发快照保留语义、命令、输出或诊断编号的向后兼容层。根据当前 capabilities、规范与 schema 生成代码；变更记录用于开发追踪，正式发布前再确定冻结基线。
+太虚处于公测阶段（beta），不为旧开发快照保留语义、命令、输出或诊断编号的向后兼容层。根据当前 capabilities、规范与 schema 生成代码；变更记录用于开发追踪，正式版发布前再确定冻结基线。
 
 ## 维护说明
 

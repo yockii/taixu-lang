@@ -1,0 +1,111 @@
+// aarch64-windows 写出链路（gate.tx 的 a64-windows-image 步）：编出
+// bootstrap/a64w_image_probe.tx，由它手写两个 aarch64 目标文件（不带内核与运行时）并经 link_pe_objects 链接成 ARM64 的 PE32+ 可执行
+// 文件。任何宿主上都核对文件头（MZ、PE 签名、机器号 0xAA64、可执行且未剥离重定位、可选头 0x20B、DYNAMIC_BASE｜NX_COMPAT｜
+// HIGH_ENTROPY_VA、基址重定位目录非空、入口在可执行节里）与两次生成逐字节相同；Windows ARM64 宿主上运行，核对三行输出与退出码 0
+// （IAT 槽与导入桩调 kernel32、长形式跳转、跨对象调用与 .data 读写、经基址重定位的绝对地址）。别的宿主上运行一项记 SKIP，不记通过
+// （逐项的独立核对：python scripts/pe_arm64_check.py --no-unwind <映像>；在测试机上运行：python scripts/windows_remote.py <映像>）。
+// 运行：taixu run --toolchain scripts/test_a64w_image.tx --compiler <taixu> --work <目录> [--root <仓库>]
+import { absolute, exeName, join, list1, mkdirs, plus, step, readBytes, words } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { capture, check, summary, tallyNew } from "./test_lib";
+
+const EXPECTED: string = "a64w image: write ok\na64w image: relax ok\na64w image: call/data ok\n";
+
+function u(b: Bytes, at: int, n: int): int {
+    let v = 0;
+    let k = n - 1;
+    while (k >= 0) {
+        v = (v << 8) | ((bytesGetLE<u8>(b, at + k) ?? 0) as int);
+        k = k - 1;
+    }
+    return v;
+}
+
+// 入口须落在某个可执行（IMAGE_SCN_MEM_EXECUTE）节的虚拟范围里。
+function entryInCode(img: Bytes, pe: int): bool {
+    const opt = pe + 24;
+    const entry = u(img, opt + 16, 4);
+    const nsec = u(img, pe + 6, 2);
+    const sh = opt + u(img, pe + 20, 2);
+    let k = 0;
+    while (k < nsec) {
+        const s = sh + 40 * k;
+        const va = u(img, s + 12, 4);
+        if ((u(img, s + 36, 4) & 536870912) != 0 && entry >= va && entry < va + u(img, s + 8, 4)) { return true; }
+        k = k + 1;
+    }
+    return false;
+}
+
+function run(args: []string): int | Error {
+    let compiler = "";
+    let work = "";
+    let root = "";
+    let i: int = 0;
+    while (i < len(args)) {
+        const a = args[i];
+        if (i + 1 >= len(args)) {
+            return err("缺少取值或未知参数：" + a);
+        }
+        const v = args[i + 1];
+        if (a == "--compiler") {
+            compiler = v;
+        } else if (a == "--work") {
+            work = v;
+        } else if (a == "--root") {
+            root = v;
+        } else {
+            return err("未知参数：" + a);
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0 || len(work) == 0) {
+        return err("用法：taixu run --toolchain scripts/test_a64w_image.tx --compiler <taixu> --work <目录> [--root <仓库>]");
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = osRealPath(absolute(root));
+    compiler = osRealPath(absolute(compiler));
+    if (!mkdirs(absolute(work))) {
+        return err("建不了工作目录：" + work);
+    }
+    const dir = osRealPath(absolute(work));
+    const t = tallyNew();
+    step(compiler, plus(plus(list1("build"), list1("bootstrap/a64w_image_probe.tx")), plus(list1("--toolchain"), plus(list1("--out"), list1(join(dir, "probe"))))), root)?;
+    const probe = join(join(dir, "probe"), exeName("a64w_image_probe"));
+    const first = join(dir, "a64wimg.exe");
+    const second = join(dir, "a64wimg2.exe");
+    const r1 = capture(probe, list1(first), root, 300000000000, 65536)?;
+    const r2 = capture(probe, list1(second), root, 300000000000, 65536)?;
+    const ws = words(r1.out);
+    check(t, "build", r1.code == 0 && r2.code == 0 && (listGet(ws, 0) catch "") == "PASS_A64W_IMAGE", r1.out + r1.err + r2.err);
+    const img = readBytes(first) catch bytesNew(0);
+    const img2 = readBytes(second) catch bytesNew(0);
+    check(t, "deterministic", bytesLen(img) > 0 && bytesEqual(img, img2), "两次生成不同（" + toStr(bytesLen(img)) + "／" + toStr(bytesLen(img2)) + " 字节）");
+    const pe = u(img, 60, 4);
+    const header = bytesLen(img) >= 512 && u(img, 0, 2) == 23117 && pe + 264 <= bytesLen(img) && u(img, pe, 4) == 17744;
+    check(t, "pe-header", header, "没有 MZ 与 PE 签名");
+    if (!header) { return summary(t, "a64-windows-image"); }
+    const chars = u(img, pe + 22, 2);
+    const opt = pe + 24;
+    check(t, "machine", u(img, pe + 4, 2) == 43620 && (chars & 2) != 0 && (chars & 1) == 0 && u(img, opt, 2) == 523,
+        "机器号 " + toStr(u(img, pe + 4, 2)) + "，特征 " + toStr(chars) + "，可选头 " + toStr(u(img, opt, 2)));
+    check(t, "aslr", (u(img, opt + 70, 2) & 352) == 352 && u(img, opt + 108, 4) >= 6 && u(img, opt + 112 + 8 * 5 + 4, 4) > 0,
+        "DllCharacteristics " + toStr(u(img, opt + 70, 2)) + "，或没有基址重定位目录");
+    check(t, "entry", entryInCode(img, pe), "入口 " + toStr(u(img, opt + 16, 4)) + " 不在可执行节里");
+    if (hostTarget() != "windows" || hostArch() != "aarch64") {
+        print("SKIP run：不是 Windows ARM64 宿主");
+        return summary(t, "a64-windows-image");
+    }
+    const r = capture(first, listNew(), dir, 60000000000, 65536)?;
+    check(t, "run", r.code == 0 && r.out == EXPECTED, "退出码 " + toStr(r.code) + "，输出 " + r.out + r.err);
+    return summary(t, "a64-windows-image");
+}
+
+function main(args: []string): int {
+    return run(args) catch (e) {
+        eprint("test_a64w_image: " + e.message);
+        return 1;
+    };
+}

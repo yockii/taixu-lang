@@ -8,7 +8,7 @@
 #else
 #include <sys/mman.h>
 #if defined(__aarch64__)
-/* arm64：内核的私有约定即 AAPCS64，另以 x19 作值槽窗口（macOS 适配 M4 设计 §A2）。 */
+/* arm64：内核的私有约定即 AAPCS64，另以 x19 作值槽窗口。 */
 #define TXABI
 #else
 #define TXABI __attribute__((ms_abi))
@@ -21,6 +21,12 @@
 #define SYM(x) #x
 #endif
 
+#if defined(__aarch64__) && defined(__linux__)
+/* aarch64 Linux：原子例程按 LSE 标志选 LSE 或 LL/SC（产物里由 _start 从 auxv 设）；这里由 main 设，
+   TX_A64_LLSC=1 时强制走 LL/SC，两种形态由同一个驱动核对。 */
+#include <sys/auxv.h>
+uint64_t __tx_a64_lse;
+#endif
 static uint32_t counts[4];
 static uint64_t probes[4];
 static uint64_t scalar;
@@ -71,6 +77,13 @@ int main(int argc, char **argv) {
     const uint64_t value[2] = {5, 0};
     unsigned failed = 0;
     (void)argc; (void)argv;
+#if defined(__aarch64__) && defined(__linux__)
+    {
+        const char *llsc = getenv("TX_A64_LLSC");
+        __tx_a64_lse = (llsc && strcmp(llsc, "1") == 0) ? 0 : (getauxval(AT_HWCAP) & HWCAP_ATOMICS) != 0;
+        printf("atomics %s\n", __tx_a64_lse ? "lse" : "llsc");
+    }
+#endif
 #ifdef RC_NRT
     const size_t region = (size_t)1 << 28;
     void *mapping;

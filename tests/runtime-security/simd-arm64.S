@@ -1,9 +1,25 @@
-// xmm-windows.S 的 Apple arm64 对应：AAPCS64 的被调方保存浮点寄存器是 d8–d15（v8–v15 的低 64 位）。xmm_check(cb) 先存下原值，
-// 装入各不相同的位型后调 cb，回来逐个比对，第 n 个（d8 起）被改写即置位 n，恢复原值后返回位掩码。xmm_bad 改写 d8、d9（得 3）。
+// xmm-windows.S 的 arm64 对应（Apple 与 Linux 共用）：AAPCS64 的被调方保存浮点寄存器是 d8–d15（v8–v15 的低 64 位）。
+// xmm_check(cb) 先存下原值，装入各不相同的位型后调 cb，回来逐个比对，第 n 个（d8 起）被改写即置位 n，恢复原值后返回位掩码。
+// xmm_bad 改写 d8、d9（得 3）。两家只差符号前缀、页内偏移的写法与只读数据节，由下面的宏选（文件经 C 预处理）。
+#ifdef __APPLE__
+#define SYM(x) _##x
+#define FUNC(x)
+#define PAGE(x) x@PAGE
+#define PAGEOFF(x) x@PAGEOFF
+#define CONST_SECTION .section __TEXT,__const
+#else
+#define SYM(x) x
+#define FUNC(x) .type x, %function
+#define PAGE(x) x
+#define PAGEOFF(x) :lo12:x
+#define CONST_SECTION .section .rodata
+.section .note.GNU-stack,"",%progbits
+#endif
 .text
-.globl _xmm_check
+.globl SYM(xmm_check)
+FUNC(SYM(xmm_check))
 .p2align 2
-_xmm_check:
+SYM(xmm_check):
     stp x29, x30, [sp, #-96]!
     mov x29, sp
     stp x19, x20, [sp, #16]
@@ -12,15 +28,15 @@ _xmm_check:
     stp d12, d13, [sp, #64]
     stp d14, d15, [sp, #80]
     mov x19, x0
-    adrp x9, Lpats@PAGE
-    add x9, x9, Lpats@PAGEOFF
+    adrp x9, PAGE(Lpats)
+    add x9, x9, PAGEOFF(Lpats)
     ldp d8, d9, [x9]
     ldp d10, d11, [x9, #16]
     ldp d12, d13, [x9, #32]
     ldp d14, d15, [x9, #48]
     blr x19
-    adrp x9, Lpats@PAGE
-    add x9, x9, Lpats@PAGEOFF
+    adrp x9, PAGE(Lpats)
+    add x9, x9, PAGEOFF(Lpats)
     mov w20, #0
     fmov x10, d8
     ldr x11, [x9]
@@ -71,19 +87,21 @@ _xmm_check:
     ldp x29, x30, [sp], #96
     ret
 
-.globl _xmm_noop
+.globl SYM(xmm_noop)
+FUNC(SYM(xmm_noop))
 .p2align 2
-_xmm_noop:
+SYM(xmm_noop):
     ret
 
-.globl _xmm_bad
+.globl SYM(xmm_bad)
+FUNC(SYM(xmm_bad))
 .p2align 2
-_xmm_bad:
+SYM(xmm_bad):
     movi d8, #0
     movi d9, #0
     ret
 
-.section __TEXT,__const
+CONST_SECTION
 .p2align 3
 Lpats:
     .quad 1311768467283640328, 7383520307672973320, 1311768467283640330, 7383520307672973322

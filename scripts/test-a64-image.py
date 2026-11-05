@@ -1,4 +1,4 @@
-"""A64 写出链路（macOS 适配 M4a，设计 A2、A3）：编出 bootstrap/a64_image_probe.tx，由它手写两个 aarch64 目标文件并链接成
+"""A64 写出链路：编出 bootstrap/a64_image_probe.tx，由它手写两个 aarch64 目标文件并链接成
 Mach-O arm64。任何宿主上都核对文件头与 load command、两次生成逐字节相同；在 Apple Silicon 宿主上另外运行它，核对输出
 （经 __got 调 libSystem、跨度定长后的长跳转、跨对象 bl、.data 里的绝对地址）。"""
 import argparse
@@ -66,7 +66,7 @@ def main():
     for img in outs[0]:
         assert struct.unpack_from('<II', img, 0) == (0xfeedfacf, 0x0100000c)
     print('PASS A64 rtfn images built, deterministic', flush=True)
-    # 生成代码的指令宏 gen_ops 的 A64 落地（M4c，设计 A9 修订）：探针逐项核对宏的各个族。
+    # 生成代码的指令宏 gen_ops 的 A64 落地（M4c）：探针逐项核对宏的各个族。
     run([a.compiler.resolve(), 'build', 'bootstrap/a64_gen_probe.tx', '--toolchain', '--out', work / 'gen-probe'])
     gexe = work / 'gen-probe' / ('a64_gen_probe' + ('.exe' if os.name == 'nt' else ''))
     gens = []
@@ -78,7 +78,7 @@ def main():
     assert gens[0] == gens[1], 'nondeterministic gen image'
     assert struct.unpack_from('<II', gens[0], 0) == (0xfeedfacf, 0x0100000c)
     print('PASS A64 gen image built, deterministic', flush=True)
-    # libSystem 蹦床的 A64 版（M4c，设计 A5）：探针经蹦床建文件、查权限位、设取描述符标志（变参经栈）、核对 −errno。
+    # libSystem 蹦床的 A64 版（M4c）：探针经蹦床建文件、查权限位、设取描述符标志（变参经栈）、核对 −errno。
     run([a.compiler.resolve(), 'build', 'bootstrap/a64_sys_probe.tx', '--toolchain', '--out', work / 'sys-probe'])
     sexe = work / 'sys-probe' / ('a64_sys_probe' + ('.exe' if os.name == 'nt' else ''))
     syss = []

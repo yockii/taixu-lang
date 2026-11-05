@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -234,10 +235,21 @@ def unix_pty(argv, cwd):
             os.close(slave)
 
 
+def native_compiler(value):
+    """--compiler，缺省取 TAIXU_NATIVE 或 PATH 上的 taixu；须是原生太虚编译器。"""
+    candidate = value or os.environ.get('TAIXU_NATIVE') or shutil.which('taixu')
+    if not candidate:
+        raise ValueError('请给出 --compiler <原生 taixu>')
+    compiler = Path(candidate).resolve()
+    p = subprocess.run([compiler, 'capabilities', '--format=json'], capture_output=True, timeout=30, check=True)
+    if json.loads(p.stdout).get('capabilities', {}).get('compiler') != 'native-tx':
+        raise ValueError('所选编译器不是原生太虚：' + str(compiler))
+    return compiler
+
+
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == '--inside':
         return inside(sys.argv[2])
-    from build import native_compiler
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--compiler', type=Path)
     ap.add_argument('--work', type=Path, default=ROOT / 'work/native-console')
@@ -300,7 +312,7 @@ def main():
             check('negative control: raw UTF-8 at CP936 is not valid Unicode output',
                   code == 0 and not errors and info_path.exists() and TEXT not in raw.decode('utf-8'),
                   {'exit': code, 'errors': errors, 'text': raw.decode('utf-8')})
-            # D80's second consumer: Windows PowerShell 5.1 decodes native stdout
+            # 's second consumer: Windows PowerShell 5.1 decodes native stdout
             # in a pipeline. UTF-8 is an explicit session setting, never a change
             # to the native pipe-byte contract or the user's persistent profile.
             powershell = Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'

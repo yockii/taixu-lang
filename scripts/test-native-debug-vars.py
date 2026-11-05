@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Debug-build variable table gate (round 6 step 6c-4a, docs/design/v052-round6-debug-v0.1-20261018.md §四-3, §六).
+"""Debug-build variable table gate (round 6 step §六).
 
 Builds bootstrap/selfhost/dbg-vars-probe.tx with --toolchain, then runs it on a few programs. The probe compiles
 a program as a debug build up to the ProgramContext (no product) and, for every function with variables, lists

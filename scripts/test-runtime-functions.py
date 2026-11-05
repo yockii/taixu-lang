@@ -19,9 +19,16 @@ frames = importlib.util.module_from_spec(spec); spec.loader.exec_module(frames)
 
 def loaded(image):
     """装载的内容：入口与各装载段（ELF 的 PT_LOAD、Mach-O 的生产者四节、PE 的节）的字节；ELF 头的 e_shoff、e_shentsize、
-    e_shnum、e_shstrndx 不算（节头在全部 PT_LOAD 之后）。PE 不带函数符号，仍比整个文件。"""
+    e_shnum、e_shstrndx 不算（节头在全部 PT_LOAD 之后）。PE 比入口与代码、数据三节（.text、.rdata、.data）：函数目录在 x86_64-windows
+    上生成展开信息（PE 规范化 P3），只多出 .pdata、.xdata 两节并随之挪动 .reloc 与头部字段，代码与数据逐字节不变。"""
     if image[:2] == b'MZ':
-        return image
+        pe = struct.unpack_from('<I', image, 60)[0]; opt = pe+24
+        count = struct.unpack_from('<H', image, pe+6)[0]; at = opt+struct.unpack_from('<H', image, pe+20)[0]; rows = []
+        for i in range(count):
+            name = image[at+40*i:at+40*i+8].rstrip(b'\0')
+            memory, rva, file, off = struct.unpack_from('<IIII', image, at+40*i+8)
+            if name in (b'.text', b'.rdata', b'.data'): rows.append((name, rva, memory, bytes(image[off:off+file])))
+        return struct.unpack_from('<I', image, opt+16)[0], rows
     _, entry, layout = frames.layout_tools.image_layout(image)
     body = bytearray(image)
     if image[:4] == b'\x7fELF':
@@ -159,6 +166,9 @@ def main():
             check('independent multi-epilogue bytes and explicit end',len(doc['map']['functions'][0]['epilogues']) == 2
                   and doc['map']['functions'][1]['epilogues'] == [])
             for target, suffix in [('windows','.obj'),('linux','.o')]:
+                # 夹具对象是 x86_64 的：写明三元组（不带架构的 linux、windows 在 arm64 宿主上取 aarch64-linux、aarch64-windows，
+                # ）。
+                triple = {'linux': 'x86_64-linux', 'windows': 'x86_64-windows'}.get(target, target)
                 fixture_data = (fixture/('fixture'+suffix)).read_bytes()
                 fixture_meta, _, rows = metadata(fixture_data,target)
                 compare_rows(rows,doc['map']['functions']); check('independent object codec:'+target,True)
@@ -177,7 +187,7 @@ def main():
                     struct.pack_into({1:'<B',4:'<I',8:'<Q'}[width],corrupted,offset,value)
                     path = work/(target+'-'+name+suffix); path.write_bytes(corrupted)
                     output = work/(target+'-'+name); mapping = work/(target+'-'+name+'.json')
-                    p = run('build',ROOT/'tests/debug/basic.tx','--target='+target,'--out',output,
+                    p = run('build',ROOT/'tests/debug/basic.tx','--target='+triple,'--out',output,
                             '--link-object',ROOT/'bootstrap/nrt-kernel'/('kernel.obj' if target == 'windows' else 'kernel-linux.o'),
                             '--link-object',path,'--map',mapping,'--map-format=json')
                     check('reject boundary object:'+target+':'+name,p.returncode == 1 and not mapping.exists()
@@ -190,22 +200,27 @@ def main():
                     struct.pack_into('<B' if width == 1 else '<Q',corrupted,shell['events'][event_index]['position']+field_offset,value)
                     path = work/(target+'-'+name+suffix); path.write_bytes(corrupted)
                     output = work/(target+'-'+name); mapping = work/(target+'-'+name+'.json')
-                    p = run('build',ROOT/'tests/debug/basic.tx','--target='+target,'--out',output,
+                    p = run('build',ROOT/'tests/debug/basic.tx','--target='+triple,'--out',output,
                             '--link-object',ROOT/'bootstrap/nrt-kernel'/('kernel.obj' if target == 'windows' else 'kernel-linux.o'),
                             '--link-object',path,'--map',mapping,'--map-format=json')
                     check('reject saved-GPR object:'+target+':'+name,p.returncode == 1 and not mapping.exists()
                           and not (output/('basic.exe' if target == 'windows' else 'basic')).exists()
                           and b'BadFrame' in p.stderr,(p.returncode,p.stderr))
 
-    # macOS 的两个内核同为 ELF 目标文件（机器号 62／183），产物交叉构建、只做静态核对。
-    for target, kernel_name in [('windows','kernel.obj'),('linux','kernel-linux.o'),('x86_64-macos','kernel-macos.o'),('aarch64-macos','kernel-macos-aarch64.o')]:
+    # macOS 的两个内核同为 ELF 目标文件（机器号 62／183），产物交叉构建、只做静态核对；aarch64-linux与
+    # loongarch64-linux（机器号 258）、riscv64-linux（机器号 243）同。
+    for target, kernel_name in [('windows','kernel.obj'),('linux','kernel-linux.o'),('aarch64-linux','kernel-linux-aarch64.o'),
+                                ('loongarch64-linux','kernel-linux-loongarch64.o'),('riscv64-linux','kernel-linux-riscv64.o'),
+                                ('x86_64-macos','kernel-macos.o'),('aarch64-macos','kernel-macos-aarch64.o')]:
+        triple = {'linux': 'x86_64-linux', 'windows': 'x86_64-windows'}.get(target, target)
         kernel = ROOT/'bootstrap/nrt-kernel'/kernel_name; data = kernel.read_bytes(); meta, text, rows = metadata(data,target)
         check('kernel has real multi-return functions:'+target,len(rows) > 200 and any(len(r['epilogues']) > 1 for r in rows))
         if target != 'windows':
             check('kernel object machine names the register numbering:'+target,
-                  struct.unpack_from('<H',data,18)[0] == (183 if target == 'aarch64-macos' else 62))
+                  struct.unpack_from('<H',data,18)[0] == (183 if target.startswith('aarch64-') else 258 if target == 'loongarch64-linux'
+                                                          else 243 if target == 'riscv64-linux' else 62))
         dest = work/target; mapping = work/(target+'.json')
-        args = ['build',ROOT/'tests/debug/basic.tx','--target='+target,'--out',dest]
+        args = ['build',ROOT/'tests/debug/basic.tx','--target='+triple,'--out',dest]
         p = run(*args,'--map',mapping,'--map-format=json','--link-object',kernel)
         check('kernel map:'+target,p.returncode == 0,p.stderr)
         if p.returncode: continue
@@ -247,14 +262,14 @@ def main():
         for name, corrupted in variants.items():
             path = work/(target+'-bad-'+name+('.obj' if target == 'windows' else '.o')); path.write_bytes(corrupted)
             failed_map = work/(target+'-bad-'+name+'.json'); bad_dest = work/(target+'-bad-'+name)
-            p = run('build',ROOT/'tests/debug/basic.tx','--target='+target,'--out',bad_dest,'--link-object',path,'--map',failed_map,'--map-format=json')
+            p = run('build',ROOT/'tests/debug/basic.tx','--target='+triple,'--out',bad_dest,'--link-object',path,'--map',failed_map,'--map-format=json')
             check('reject invalid metadata:'+target+':'+name,p.returncode == 1 and not failed_map.exists()
                   and not (bad_dest/('basic'+('.exe' if target == 'windows' else ''))).exists()
                   and expected_errors[name].encode() in p.stderr,(p.returncode,p.stderr))
             if target != 'windows' and name in ('version','text-section','text-size','count','integer-overflow','duplicate-section'):
                 # 产物函数符号（v052-image-symbols）每次构建都读内核目录的名字与起止：结构不合规的目录不带 --map 也拒绝，
                 # 原因同名；代码摘要与帧事实只在 --map 时核对。
-                p = run('build',ROOT/'tests/debug/basic.tx','--target='+target,'--out',bad_dest,'--link-object',path)
+                p = run('build',ROOT/'tests/debug/basic.tx','--target='+triple,'--out',bad_dest,'--link-object',path)
                 check('reject invalid metadata without map:'+target+':'+name,p.returncode == 1
                       and not (bad_dest/'basic').exists() and expected_errors[name].encode() in p.stderr,(p.returncode,p.stderr))
         if built.returncode == 0 and (fixture/'fixture.o').exists() and target in ['windows', 'linux']:

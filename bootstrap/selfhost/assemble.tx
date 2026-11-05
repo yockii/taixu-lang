@@ -1,12 +1,12 @@
-// assemble.tx —— .s 直发汇编器的 .tx 承接（V0.50-S5-① 批 D；BOOT-47；D102 §一
-// ——src/tools/aot/direct_emit.zig Assembler 的同构移植）。
+// assemble.tx —— .s 直发汇编器（.tx 实现，
+// 不经外部汇编器）。
 //
 // 职责：.s 文本（emitmirror 产物）→ AsmImage（text/rdata 两节字节＋符号表＋
 // 修补点）。词表外结构化拒绝（UnsupportedDirective/BadInstruction/BadOperand
 // ——lastLine/lastErrText 诊断面随行）。
 //
-// 锚（批 D）：同一 .s 输入下 text/rdata 节字节＋修补点与 zig Assembler 逐字节
-// 恒等；端到端锚＝链接后 PE 行为恒等（link_pe.tx 批 D 后半）。
+// 锚：同一 .s 输入下 text/rdata 节字节＋修补点逐字节
+// 确定；端到端锚＝链接后 PE 行为恒等（link_pe.tx）。
 //
 // x86-64 编码面＝direct_emit 词表全量（mov/movabs/movzx/
 // lea/cmp/test/alu 族/移位族/GrpFF·F7/setcc/jcc/call/ret/push/pop/SSE 标量·
@@ -14,6 +14,7 @@
 
 import { compileProfileActive, compileProfileInstruction } from "./compile_profile_data";
 import { nativeFunctionsActive, nativeFunctionsReset, nativeFunctionBegin, nativeFunctionOwnedBegin, nativeFunctionBoundaryBegin, nativeFunctionEvent, nativeFunctionPrologueEnd, nativeFunctionEpilogueStart, nativeFunctionEnd } from "./native_function_data";
+import { ISA_X86_64, ISA_A64, ISA_LA64, ISA_RV64 } from "./target";
 
 // ============================================================================
 // §0 常量与结构
@@ -28,13 +29,24 @@ const SEC_BSS: int = 3;
 // 修补 kind：0=rel32 1=addr64。
 const FIX_REL32: int = 0;
 const FIX_ADDR64: int = 0 + 1;
-// A64 映像（macOS 适配 M4 设计 A3）的修补 kind，只经 asA64Word 登记；addr64 在 A64 映像里同样用 1。
+// A64 映像的修补 kind，只经 asA64Word 登记；addr64 在 A64 映像里同样用 1。
 export const FIX_A64_CALL26: int = 2;
 export const FIX_A64_JUMP26: int = 3;
 export const FIX_A64_PAGE21: int = 4;
 export const FIX_A64_ADD_LO12: int = 5;
 // LDST8..LDST128 依次为 6..10（访问宽度 2^0..2^4 字节）。
 export const FIX_A64_LDST8: int = 6;
+// 龙芯映像的修补 kind，只经 asLa64Word 登记：b／bl 的 26 位偏移（R_LARCH_B26）、pcalau12i 的页（PCALA_HI20）、
+// addi.d 与读写的页内 12 位（PCALA_LO12）；addr64 同样用 1。
+export const FIX_LA64_B26: int = 11;
+export const FIX_LA64_PCALA_HI20: int = 12;
+export const FIX_LA64_PCALA_LO12: int = 13;
+// RISC-V 映像的修补 kind，只经 asRv64Word 登记：auipc＋jalr 一对的调用（R_RISCV_CALL_PLT，记在 auipc 上）、
+// auipc 的高 20 位（PCREL_HI20）、addi／读与写的低 12 位（PCREL_LO12_I／_S，符号为所配 auipc 处的标号）；addr64 同样用 1。
+export const FIX_RV64_CALL: int = 14;
+export const FIX_RV64_PCREL_HI20: int = 15;
+export const FIX_RV64_PCREL_LO12_I: int = 16;
+export const FIX_RV64_PCREL_LO12_S: int = 17;
 
 // 寄存器类别：0=r64 1=r32 2=r8 3=xmm 4=ymm。
 const CLS_R64: int = 0;
@@ -49,7 +61,7 @@ const OPD_IMM: int = 1;
 const OPD_MEM: int = 2;
 const OPD_LABEL: int = 3;
 
-// MemSize：0=b 1=d 2=q 3=w（缺省 q；w 只用于 movzx 读与 mov 写，O4 第二步紧凑列表）。
+// MemSize：0=b 1=d 2=q 3=w（缺省 q；w 只用于 movzx 读与 mov 写，紧凑列表）。
 const MSZ_B: int = 0;
 const MSZ_D: int = 1;
 const MSZ_Q: int = 2;
@@ -126,8 +138,8 @@ struct AsmImage {
     // 1 = symbol must reach the linker (global name, or still referenced by a
     // fixup after asResolveLocalFixups); empty until that pass runs.
     symNeeded: List<int>,
-    // 1 = A64 映像（asSetA64）：代码节只经 asA64Word 写入，ELF 写出按 aarch64。
-    a64: int,
+    // 指令集（ISA_*，target.tx）：缺省 x86_64；A64 映像（asSetIsa(ISA_A64)）的代码节只经 asA64Word 写入，ELF 写出按 aarch64。
+    isa: int,
 }
 
 function newAsmImage(): Ref<AsmImage> {
@@ -135,7 +147,7 @@ function newAsmImage(): Ref<AsmImage> {
         text: bytesNew(0), rdata: bytesNew(0), data: bytesNew(0), bssSize: 0, storageUsed: 0, textAlignPow: 4, rdataAlignPow: 4, dataAlignPow: 4, bssAlignPow: 4,
         symNames: listNew(), symSec: listNew(), symOff: listNew(),
         fixSec: listNew(), fixAt: listNew(), fixKind: listNew(), fixSym: listNew(), fixAddend: listNew(),
-        symNeeded: listNew(), a64: 0,
+        symNeeded: listNew(), isa: ISA_X86_64,
     };
 }
 
@@ -1125,7 +1137,7 @@ function asmEncodeOperands(mn: string, nops: int): void {
     if (mn == "neg") { encGrpF7(op0, 3); return; }
     if (mn == "not") { encGrpF7(op0, 2); return; }
     if (mn == "idiv") { encGrpF7(op0, 7); return; }
-    // 定宽数值（O4 第二步）：u64/usize 的乘法看高半、除法与取余用无符号除法（只用于 NRT 运行期例程）。
+    // 定宽数值：u64/usize 的乘法看高半、除法与取余用无符号除法（只用于 NRT 运行期例程）。
     if (mn == "mul") { encGrpF7(op0, 4); return; }
     if (mn == "div") { encGrpF7(op0, 6); return; }
     if (mn == "cqo") { asEmitByte(0x48); asEmitByte(0x99); return; }
@@ -1156,7 +1168,7 @@ function asmEncodeOperands(mn: string, nops: int): void {
     if (mn == "ucomisd") { encSse(op0, op1, 0x2E); return; }
     if (mn == "movq") { encMovq(op0, op1); return; }
     if (mn == "cvtsi2sd") { encCvtsi2sd(op0, op1); return; }
-    // 定宽数值（O4 第一步）：f32 舍入与无符号 64 位转浮点所需的单精度指令，只用于 NRT 转换例程。
+    // 定宽数值：f32 舍入与无符号 64 位转浮点所需的单精度指令，只用于 NRT 转换例程。
     if (mn == "cvtsi2ss") { encCvtsi2ss(op0, op1); return; }
     if (mn == "cvtsd2ss") { encSse(op0, op1, 0x5A); return; }
     if (mn == "cvtss2sd") { encSseF3(op0, op1, 0x5A); return; }
@@ -1865,7 +1877,7 @@ function encSse(dst: Ref<Operand>, src: Ref<Operand>, opc: int): void {
 function encMovq(dst: Ref<Operand>, src: Ref<Operand>): void {
     // xmm 在 ModRM.reg、通用寄存器在 ModRM.rm：REX.R 取 xmm 的扩展位，REX.B 取通用寄存器的扩展位
     //（原形两向都只设 REX.B 且 xmm←r64 取错了操作数——r8..r15、xmm8..15 会编成别的寄存器；
-    // 只用低号寄存器的既有调用字节不变。O4 第一步 f32 转换首次触发）。
+    // 只用低号寄存器的既有调用字节不变。f32 转换首次触发）。
     if (dst.kind == OPD_REG && dst.cls == CLS_R64 && src.kind == OPD_REG && src.cls == CLS_XMM) {
         asEmitByte(0x66);
         asEmitByte(rexByte(1, extBit(src.num), 0, extBit(dst.num)));
@@ -2120,18 +2132,42 @@ export function asStructuredAddressAddend(name: string, addend: int): void {
     asAddFixAt(FIX_ADDR64, name, addend);
     asEmitImm64(0);
 }
-// A64 入口（a64_asm.tx 用）：asStructuredBegin 之后调 asSetA64 标记映像；指令字由 a64_encode 编好，修补 kind 见 FIX_A64_*。
+// A64 入口（a64_asm.tx 用）：asStructuredBegin 之后调 asSetIsa(ISA_A64) 标记映像；指令字由 a64_encode 编好，修补 kind 见 FIX_A64_*。
 // x86 的指令入口在 A64 映像里拒绝，反之亦然。
-export function asSetA64(): void { as_img.a64 = 1; }
-export function asImgA64(): int { return as_img.a64; }
+export function asSetIsa(isa: int): void { as_img.isa = isa; }
+export function asImgIsa(): int { return as_img.isa; }
 export function asA64Here(): int { return asHere(); }
 /// 在代码节当前位置写一条指令字；kind ≥ 0 时先在同一位置登记修补（符号 sym、加数 addend）。
 export function asA64Word(word: int, kind: int, sym: string, addend: int): void {
     if (as_failed == 1) { return; }
-    if (as_img.a64 != 1 || as_cur != SEC_TEXT) { asFail("InstructionOutsideText"); return; }
+    if (as_img.isa != ISA_A64 || as_cur != SEC_TEXT) { asFail("InstructionOutsideText"); return; }
     if (word < 0 || word > 4294967295 || kind > FIX_A64_LDST8 + 4) { asFail("BadOperand"); return; }
     if (kind >= 0) {
         if (kind < FIX_A64_CALL26 || len(sym) == 0) { asFail("BadOperand"); return; }
+        asAddFixAt(kind, sym, addend);
+    }
+    let k = 0;
+    while (k < 4) { asEmitByte((word >>> (k * 8)) & 255); k = k + 1; }
+}
+/// 龙芯：在代码节当前位置写一条指令字；kind ≥ 0 时先在同一位置登记修补（FIX_LA64_*）。x86 与 A64 的入口在龙芯映像里拒绝。
+export function asLa64Word(word: int, kind: int, sym: string, addend: int): void {
+    if (as_failed == 1) { return; }
+    if (as_img.isa != ISA_LA64 || as_cur != SEC_TEXT) { asFail("InstructionOutsideText"); return; }
+    if (word < 0 || word > 4294967295) { asFail("BadOperand"); return; }
+    if (kind >= 0) {
+        if (kind < FIX_LA64_B26 || kind > FIX_LA64_PCALA_LO12 || len(sym) == 0) { asFail("BadOperand"); return; }
+        asAddFixAt(kind, sym, addend);
+    }
+    let k = 0;
+    while (k < 4) { asEmitByte((word >>> (k * 8)) & 255); k = k + 1; }
+}
+/// RISC-V：在代码节当前位置写一条指令字；kind ≥ 0 时先在同一位置登记修补（FIX_RV64_*）。x86、A64 与龙芯的入口在 RISC-V 映像里拒绝。
+export function asRv64Word(word: int, kind: int, sym: string, addend: int): void {
+    if (as_failed == 1) { return; }
+    if (as_img.isa != ISA_RV64 || as_cur != SEC_TEXT) { asFail("InstructionOutsideText"); return; }
+    if (word < 0 || word > 4294967295) { asFail("BadOperand"); return; }
+    if (kind >= 0) {
+        if (kind < FIX_RV64_CALL || kind > FIX_RV64_PCREL_LO12_S || len(sym) == 0) { asFail("BadOperand"); return; }
         asAddFixAt(kind, sym, addend);
     }
     let k = 0;
@@ -2169,7 +2205,7 @@ export function asStructuredInstruction(mn: string, nops: int, a: Ref<Operand>, 
     if (as_failed == 1) { return; }
     as_last_line = line;
     as_last_err = "";
-    if (as_cur != SEC_TEXT || as_img.a64 == 1) { asFail("InstructionOutsideText"); return; }
+    if (as_cur != SEC_TEXT || as_img.isa != ISA_X86_64) { asFail("InstructionOutsideText"); return; }
     if (nops < 0 || nops > 3 || line < 1) { asFail("BadOperand"); return; }
     if ((nops > 0 && a.kind < 0) || (nops > 1 && b.kind < 0) || (nops > 2 && c.kind < 0)) {
         asFail("BadOperand"); return;
@@ -2179,7 +2215,7 @@ export function asStructuredInstruction(mn: string, nops: int, a: Ref<Operand>, 
     if (asRipPending >= 0) { asRipSettle(); }
 }
 // C prototype buffered emission. No instruction text is constructed or parsed.
-// A64 缓冲（asBufferNewA64）另有条目 kind 20..26，由 a64_asm.tx 写入并经 a64BufferSubmit 提交（macOS 适配 M4 设计 A2、A3）。
+// A64 缓冲（asBufferNewA64）另有条目 kind 20..26，由 a64_asm.tx 写入并经 a64BufferSubmit 提交。
 export struct StructuredEntry {
     kind: int, mnemonic: string, nops: int,
     a: Ref<Operand>, b: Ref<Operand>, c: Ref<Operand>,
@@ -2187,21 +2223,35 @@ export struct StructuredEntry {
 }
 // line：A64 条目记下的行号（pc＋2，同 asProducer*；可移植渲染器逐操作设定）；listFn：清单开启时本缓冲所属的函数号（-1 不记）。
 // id 区分缓冲（按缓冲记状态的构造器用，如 rtfn 的记录）。
+// a64Os：A64 缓冲的目标系统（A64_OS_*；0 未定）。rtfn 调 C 函数（rtCallC）所按的调用约定随它——Apple arm64、标准 AAPCS64
+// （Linux）与 Windows ARM64（变参不用浮点寄存器）；原子操作也随它——Apple 的 arm64 都有 LSE，Linux、Windows 上的 CPU 可能是
+// ARMv8.0（没有 LSE），按启动时读到的特性分支；Windows 上不少于 4 KiB 的帧分配先经 __tx_chkstk 逐页触碰（a64FrameAlloc）。
+// 未定的缓冲发不出 C 调用与原子操作（rtfn 记失败）。
 export struct StructuredBuffer {
-    entries: List<Ref<StructuredEntry>>, missing: Ref<Operand>, invalid: Ref<StructuredEntry>, a64: bool, line: int, listFn: int, id: int,
+    entries: List<Ref<StructuredEntry>>, missing: Ref<Operand>, invalid: Ref<StructuredEntry>, isa: int, line: int, listFn: int, id: int,
+    a64Os: int,
 }
+export const A64_OS_APPLE: int = 1;
+export const A64_OS_LINUX: int = 2;
+export const A64_OS_WINDOWS: int = 3;
 let asBufferCount: int = 0;
 export function asBufferNew(): Ref<StructuredBuffer> {
     const missing = emptyOperand();
     const invalid = new StructuredEntry { kind: -1, mnemonic: "", nops: 0,
         a: missing, b: missing, c: missing, value: 0, name: "", line: 0 };
     asBufferCount = asBufferCount + 1;
-    return new StructuredBuffer { entries: listNew(), missing: missing, invalid: invalid, a64: false, line: 1, listFn: -1, id: asBufferCount };
+    return new StructuredBuffer { entries: listNew(), missing: missing, invalid: invalid, isa: ISA_X86_64, line: 1, listFn: -1, id: asBufferCount, a64Os: 0 };
 }
 /// A64 代码的缓冲：数据与标号条目同 asBufferNew，指令只能经 a64_asm.tx 写入。
 export function asBufferNewA64(): Ref<StructuredBuffer> {
     const b = asBufferNew();
-    b.a64 = true;
+    b.isa = ISA_A64;
+    return b;
+}
+/// 同上，并定下目标系统（A64_OS_*，target.tx 的 tA64Os 给出）：内核生成器、驱动与带 C 调用或原子操作的探针用。
+export function asBufferNewA64Os(os: int): Ref<StructuredBuffer> {
+    const b = asBufferNewA64();
+    b.a64Os = os;
     return b;
 }
 /// 让映像失败（A64 提交用；原因与当前行同 asStructured*）。
@@ -2248,8 +2298,26 @@ export function asBufferGeneratedBegin(buf: Ref<StructuredBuffer>, id: int): voi
 export function asBufferFunctionEnd(buf: Ref<StructuredBuffer>): void { asBufferEntry(buf, 10, 0, "", 1); }
 export function asBufferFunctionPrologueEnd(buf: Ref<StructuredBuffer>): void { if (nativeFunctionsActive()) { asBufferEntry(buf, 11, 0, "", 1); } }
 export function asBufferFunctionEpilogueStart(buf: Ref<StructuredBuffer>): void { if (nativeFunctionsActive()) { asBufferEntry(buf, 12, 0, "", 1); } }
+// x86_64-windows 的栈探测（PE 规范化 P3，同 aarch64 的 a64FrameAlloc）：开着时序言里不少于 4096 字节的分配发
+// mov eax, n；call __tx_chkstk；sub rsp, rax（微软 __chkstk 的约定，内核提供），分配事件记在这一组上。驱动按目标、内核生成器按
+// 内核目标设定；别的目标与 aarch64 不用它。
+let asWinProbe: bool = false;
+export function asWindowsProbe(on: bool): void { asWinProbe = on; }
+/// 文本汇编路径（emitmirror 的非原生模式）照同样的条件写出探测组。
+export function asWindowsProbeFor(size: int): bool { return asProbedAlloc(size); }
+function asProbedAlloc(size: int): bool { return asWinProbe && size >= 4096; }
+function asEmitProbedAlloc(size: int, line: int): void {
+    const missing = asStructuredMissing();
+    asStructuredInstruction("mov", 2, asStructuredReg(1, 0), asStructuredImm(size), missing, line);
+    asStructuredInstruction("call", 1, asStructuredTarget("__tx_chkstk"), missing, missing, line);
+    asStructuredInstruction("sub", 2, asStructuredReg(0, 4), asStructuredReg(0, 0), missing, line);
+}
 export function asBufferFrame(buf: Ref<StructuredBuffer>, kind: string, reg: int, size: int): void {
     const missing = buf.missing; let mn = ""; let n = 0; let a = missing; let b = missing;
+    if (kind == "allocate-stack" && reg == 4 && size % 8 == 0 && asProbedAlloc(size)) {
+        asBufferEntry(buf, 16, size, "", 1);
+        return;
+    }
     if (kind == "allocate-stack" || kind == "release-stack") {
         if (reg != 4 || size < 0 || size % 8 != 0) { asFail("BadBufferedFrameOperand"); return; }
         mn = "sub"; if (kind == "release-stack") { mn = "add"; } n = 2; a = asStructuredReg(0, 4); b = asStructuredImm(size);
@@ -2269,6 +2337,23 @@ export function asBufferFrame(buf: Ref<StructuredBuffer>, kind: string, reg: int
         entry.kind = 13; entry.name = kind; entry.value = size;
     }
 }
+// 手写例程（来源 runtime-manual，PE 规范化 P3 第 7 项乙）的登记：asManualBegin 起函数并放入口标号；叶函数（rsp 始终不变）接
+// asManualLeaf，序言为空、出口照常 ret；入口即分配的接 asManualFrame（sub rsp, n 带分配事件），每个出口 asManualReturn（add rsp, n；
+// ret 带尾声事件）；asBufferFunctionEnd 结束。函数之间不共用指令：跳到别的例程只许跳它的入口，且帧状态与入口一致（尾跳）。
+export function asManualBegin(buf: Ref<StructuredBuffer>, module: string, name: string): void {
+    asBufferFunctionBegin(buf, module, name, "runtime-manual");
+    asBufferLabel(buf, name, 1);
+}
+export function asManualLeaf(buf: Ref<StructuredBuffer>): void { asBufferFunctionPrologueEnd(buf); }
+export function asManualFrame(buf: Ref<StructuredBuffer>, bytes: int): void {
+    asBufferFrame(buf, "allocate-stack", 4, bytes);
+    asBufferFunctionPrologueEnd(buf);
+}
+export function asManualReturn(buf: Ref<StructuredBuffer>, bytes: int): void {
+    asBufferFunctionEpilogueStart(buf);
+    asBufferFrame(buf, "release-stack", 4, bytes);
+    asBufferFrame(buf, "return", -1, 8);
+}
 // Append exactly the original source length: self-append is finite, no iteration truncation.
 function asBufferGet(buf: Ref<StructuredBuffer>, index: int): Ref<StructuredEntry> {
     const entry = listGet(buf.entries, index) catch buf.invalid;
@@ -2281,7 +2366,7 @@ export function asBufferAppend(dst: Ref<StructuredBuffer>, src: Ref<StructuredBu
     while (i < n) { listPush(dst.entries, asBufferGet(src, i)); i = i + 1; }
 }
 export function asBufferSubmit(buf: Ref<StructuredBuffer>): void {
-    if (buf.a64) { asFail("A64BufferNeedsA64Submit"); return; }
+    if (buf.isa != ISA_X86_64) { asFail("A64BufferNeedsA64Submit"); return; }
     let i = 0;
     while (i < listLen(buf.entries)) {
         if (as_failed == 1) { return; }
@@ -2314,6 +2399,10 @@ export function asBufferSubmit(buf: Ref<StructuredBuffer>): void {
             if (as_cur != SEC_TEXT) { asFail("FunctionOutsideText"); return; }
             nativeFunctionBegin(entry.value, entry.name, asHere());
         }
+        else if (entry.kind == 16) {
+            const before = asHere(); asEmitProbedAlloc(entry.value, entry.line);
+            if (as_failed == 0) { nativeFunctionEvent(before, asHere(), "allocate-stack", 4, entry.value); }
+        }
         else { asFail("BadInstruction"); return; }
         i = i + 1;
     }
@@ -2335,6 +2424,10 @@ export function asProducerFrame(kind: string, reg: int, size: int, line: int): v
     if (kind == "push-nonvolatile" || kind == "pop-nonvolatile") {
         let mn = "push"; if (kind == "pop-nonvolatile") { mn = "pop"; }
         asProducerInstruction(0, mn, 1, asStructuredReg(0, reg), missing, missing, line);
+    } else if (kind == "allocate-stack" && reg == 4 && asProbedAlloc(size)) {
+        asProducerInstruction(0, "mov", 2, asStructuredReg(1, 0), asStructuredImm(size), missing, line);
+        asProducerInstruction(0, "call", 1, asStructuredTarget("__tx_chkstk"), missing, missing, line);
+        asProducerInstruction(0, "sub", 2, asStructuredReg(0, 4), asStructuredReg(0, 0), missing, line);
     } else if (kind == "allocate-stack" || kind == "release-stack") {
         let mn = "sub"; if (kind == "release-stack") { mn = "add"; }
         asProducerInstruction(0, mn, 2, asStructuredReg(0, 4), asStructuredImm(size), missing, line);
@@ -2527,7 +2620,7 @@ function asStorageQuadText(text: string): void {
     asStructuredAddressAddend(name, addend);
 }
 
-// 原生函数清单（6d-5）：关闭时只在函数提交与序言/尾声处判断；体内编码热循环不变。
+// 原生函数清单：关闭时只在函数提交与序言/尾声处判断；体内编码热循环不变。
 // A64 的行（asListingA64）不带结构化操作数，操作数按反汇编文本放在 ops；x86 的行 ops 为空。
 export struct AsListingRow {
     fnIdx: int, pc: int, kind: int, name: string, nops: int,

@@ -1,0 +1,92 @@
+// aarch64-windows 的手写入口与原语：语义同 driver.tx 的 PE 入口桩、nrt_thread.tx 的 tlsLeavesX86（PE
+// 分支），只有这几处要直接用机器指令，其余例程都经 rtfn 发出。
+// - 入口：PE 的 AddressOfEntryPoint 指向 __tx_entry，它尾跳 __tx_native_entry（Windows 上不带参数；该例程以 ExitProcess 结束、
+//   不返回）。进入时 sp 已 16 字节对齐、lr 指回系统的线程启动例程，不像 x86_64 要先调整 rsp。
+// - 线程局部：PE 隐式 TLS——x18 指向 TEB，TEB＋0x58 为 ThreadLocalStoragePointer（各模块的 TLS 块表），本模块的下标由加载器写进
+//   __tx_tls_index（内核的 IMAGE_TLS_DIRECTORY64 给出它的地址），槽在 TLS 块的 [0]。TPIDR_EL0 在 Windows 上保留，不用。
+// - 栈探测：一次分配不少于 4 KiB 的帧要从高到低逐页触碰（保护页一次性、按需提交）。__tx_chkstk 照微软的约定：x15＝字节数／16，
+//   只读不写、不动 sp，改写 x16、x17 与标志位；调用方随后 sub sp, sp, x15, uxtx #4（a64_asm.tx 的 a64FrameAlloc）。叶函数，不需要
+//   展开信息。同 compiler-rt 的 aarch64 chkstk.S。
+// - 线程入口：CreateThread 以平台约定调用、返回到 kernel32——是普通的被调函数，不是栈的边界（别的目标上是 thread-entry 边界），
+//   带帧事件，展开信息由此生成（B18）。
+// 私有约定：实参 x0..x7，x16／x17 可随意改写；x18 不写。
+import { StructuredBuffer, asBufferLabel, asBufferFunctionBegin, asBufferFunctionPrologueEnd, asBufferFunctionEpilogueStart, asBufferFunctionEnd } from "./assemble";
+import { a64Emit, a64B, a64BCond, a64SymAccess, a64Mem, a64MovImm, a64Frame } from "./a64_asm";
+import { a64AddSubImm, a64Bitfield, a64BranchReg, a64LdStReg, a64LdStUImm, a64LdStPair, a64LdStImm9 } from "./a64_encode";
+
+/// TEB 里 ThreadLocalStoragePointer 的偏移（同 x64；x18 指向 TEB）。
+export const WINDOWS_A64_TEB_TLS: int = 88;
+// 页长与 b.cond 的条件码 GT。
+const PAGE: int = 4096;
+const COND_GT: int = 12;
+
+function ret(b: Ref<StructuredBuffer>): void { a64Emit(b, a64BranchReg(2, 30), "ret"); }
+
+/// 进程入口：尾跳 __tx_native_entry。
+export function windowsA64Start(b: Ref<StructuredBuffer>): void {
+    asBufferLabel(b, "__tx_entry", 1);
+    a64B(b, 0, "__tx_native_entry");
+}
+
+// x16 ← 本线程本模块的 TLS 块：x17＝__tx_tls_index（u32），x16＝[x18＋0x58]，x16＝[x16＋x17×8]。
+function tlsBlock(b: Ref<StructuredBuffer>): void {
+    a64SymAccess(b, 2, 0, 1, 17, 16, "__tx_tls_index", 0);
+    a64Mem(b, 3, 1, 16, 18, WINDOWS_A64_TEB_TLS);
+    a64Emit(b, a64LdStReg(3, 0, 1, 16, 16, 17, 3, 1), "ldr x16, [x16, x17, lsl #3]");
+}
+
+/// __tx_tls_tb_get() → x0＝本线程的线程块（外来线程为 0）；__tx_tls_tb_set(x0)。只写 x16、x17（与 x0）。
+export function windowsA64TlsLeaves(b: Ref<StructuredBuffer>): void {
+    asBufferLabel(b, "__tx_tls_tb_get", 1);
+    tlsBlock(b);
+    a64Mem(b, 3, 1, 0, 16, 0);
+    ret(b);
+    asBufferLabel(b, "__tx_tls_tb_set", 1);
+    tlsBlock(b);
+    a64Mem(b, 3, 0, 0, 16, 0);
+    ret(b);
+}
+
+/// __tx_thread_entry(x0＝记录)：帧同 rtfn（帧记录、设 x29），另压 x19（__tx_thread_main 把它设为本线程的值槽窗口，平台约定要求
+/// 被调方保存），调用 __tx_thread_main（私有约定 x0＝记录），返回 0。返回值在尾声之前写好，尾声只有弹出与 ret（展开码与指令一一
+/// 对应）。来源记 process-thread-entry、栈模型 fixed-call。
+export function windowsA64ThreadEntry(b: Ref<StructuredBuffer>): void {
+    asBufferFunctionBegin(b, "bootstrap/selfhost/windows_a64.tx", "__tx_thread_entry", "process-thread-entry");
+    asBufferLabel(b, "__tx_thread_entry", 1);
+    let first = listLen(b.entries);
+    a64Emit(b, a64LdStPair(2, 0, 0, 29, 30, 31, -16, 3), "stp x29, x30, [sp, #-16]!");
+    a64Frame(b, first, "push-nonvolatile", 30, 8); a64Frame(b, first, "push-nonvolatile", 29, 8);
+    first = listLen(b.entries);
+    a64Emit(b, a64AddSubImm(1, 0, 0, 29, 31, 0, 0), "mov x29, sp");
+    a64Frame(b, first, "set-frame-pointer", 29, 0);
+    first = listLen(b.entries);
+    a64Emit(b, a64LdStImm9(3, 0, 0, 19, 31, -16, 3), "str x19, [sp, #-16]!");
+    a64Frame(b, first, "push-nonvolatile", 19, 16);
+    asBufferFunctionPrologueEnd(b);
+    a64B(b, 1, "__tx_thread_main");
+    a64MovImm(b, 0, 0);
+    asBufferFunctionEpilogueStart(b);
+    first = listLen(b.entries);
+    a64Emit(b, a64LdStImm9(3, 0, 1, 19, 31, 16, 1), "ldr x19, [sp], #16");
+    a64Frame(b, first, "pop-nonvolatile", 19, 16);
+    first = listLen(b.entries);
+    a64Emit(b, a64LdStPair(2, 0, 1, 29, 30, 31, 16, 1), "ldp x29, x30, [sp], #16");
+    a64Frame(b, first, "pop-nonvolatile", 29, 8); a64Frame(b, first, "pop-nonvolatile", 30, 8);
+    first = listLen(b.entries);
+    ret(b);
+    a64Frame(b, first, "return", -1, 0);
+    asBufferFunctionEnd(b);
+}
+
+/// __tx_chkstk：x16＝x15×16（字节数），x17 从 sp 起逐页下移并读一次（ldr xzr），直到减完。
+export function windowsA64Chkstk(b: Ref<StructuredBuffer>): void {
+    asBufferLabel(b, "__tx_chkstk", 1);
+    a64Emit(b, a64Bitfield(1, 2, 16, 15, 60, 59), "lsl x16, x15, #4");
+    a64Emit(b, a64AddSubImm(1, 0, 0, 17, 31, 0, 0), "mov x17, sp");
+    asBufferLabel(b, "__tx_chkstk_page", 1);
+    a64Emit(b, a64AddSubImm(1, 1, 0, 17, 17, PAGE >> 12, 1), "sub x17, x17, #4096");
+    a64Emit(b, a64AddSubImm(1, 1, 1, 16, 16, PAGE >> 12, 1), "subs x16, x16, #4096");
+    a64Emit(b, a64LdStUImm(3, 0, 1, 31, 17, 0), "ldr xzr, [x17]");
+    a64BCond(b, COND_GT, "__tx_chkstk_page");
+    ret(b);
+}

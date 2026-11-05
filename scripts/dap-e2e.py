@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Native `taixu dap` end-to-end check (round 6 step 6c-5b, docs/design/v052-round6-debug-v0.1-20261018.md §四-8, §六).
+"""Native `taixu dap` end-to-end check (round 6 step §六).
 
 Starts `taixu dap` on stdio (Content-Length frames) and drives it like VS Code does:
 - main: configurationDone before launch (remembered), breakpoints before launch (pending, one on a line without

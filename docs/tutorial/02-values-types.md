@@ -24,7 +24,11 @@ isize usize f32`（写 FFI、二进制格式时用；`i64`/`f64` 即 `int`/`floa
 let p: Point = { x: 1, y: 2 };   // 裸对象字面量（期望类型已知，TS 形式）
 const q: Point = p;              // 值语义：整体拷贝
 p.x = 100;                       // 只改 p，q 不受影响
+print(toStr(p.x) + " " + toStr(q.x));   // 100 1
 ```
+
+写了拷贝的字段却再也不读它，多半是以为改到了原处：v0.51 起这是编译错误 3036，要改原处就写回
+（`listSet`／`mapSet`）或改存 `Ref<T>`（05 章）。
 
 没有期望类型时写类型名前缀：`Point { x: 1, y: 2 }`。
 
@@ -52,7 +56,7 @@ const area = switch (s) {
 
 ```text
 ratio=1.5 ok=true
-q.x 不受影响: 1
+p.x=100 q.x 不受影响: 1
 area=12
 ```
 

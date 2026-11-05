@@ -1,0 +1,600 @@
+// 公开仓导出的擦除与泄漏检查（scripts/export.tx 用）：只改注释（// 与 /* */、# 与 Python 模块文档串）和 Markdown 正文，
+// 不增删行、不动注释之前的代码与字符串字面量；删去单元后整理两侧的分隔符、空格与空括号。逐行的改写与每处泄漏记进 Report。
+import { Hit, Rules, allowedHit, anyAt, anyBeforeLo, at, cat, cut, findFrom, findUnit, hasAt, matchPats, missingAt, slice } from "./export_match";
+
+export struct Report {
+    files: int,
+    executables: List<string>,
+    rewritten: int,
+    problems: List<string>,
+    scrubbedFiles: int,
+    scrubbedLines: int,
+    leaks: int,
+    allowed: int,
+    log: Bytes,
+    leakLog: Bytes,
+}
+
+// 删除单元后的串与继续扫描处。
+export struct Cur {
+    t: Bytes,
+    pos: int,
+}
+
+// 删除 t 的 [s, e) 并整理两侧：分隔符、空格、空括号；lo 为可改区域的起点（注释正文开头）。
+export function deleteUnit(r: Ref<Rules>, t: Bytes, s0: int, e0: int, lo: int): Ref<Cur> {
+    const n = bytesLen(t);
+    let s = s0;
+    let e = e0;
+    // 单元后的圈码与助词归入单元
+    let j = e;
+    if (at(t, j) == 32 && anyAt(t, j + 1, r.circled) > 0) {
+        j = j + 1;
+    }
+    let k = j;
+    while (true) {
+        const w = anyAt(t, k, r.circled);
+        if (w == 0) {
+            break;
+        }
+        k = k + w;
+    }
+    if (k > j) {
+        e = k;
+    }
+    for (p in r.particles) {
+        let q = e;
+        if (at(t, q) == 32) {
+            q = q + 1;
+        }
+        if (hasAt(t, q, p)) {
+            e = q + bytesLen(p);
+            break;
+        }
+    }
+    let L = s;
+    while (L > lo && at(t, L - 1) == 32) {
+        L = L - 1;
+    }
+    let R = e;
+    while (R < n && at(t, R) == 32) {
+        R = R + 1;
+    }
+    const atStart = L == lo;
+    const bOpen = anyBeforeLo(t, L, r.opens, lo) > 0;
+    const bSep = anyBeforeLo(t, L, r.seps, lo) > 0;
+    const sep = anyAt(t, R, r.seps);
+    const colon = anyAt(t, R, r.colons);
+    let left = s;
+    let right = R;
+    if (sep > 0 || colon > 0) {
+        if (colon > 0 && !(atStart || bOpen)) {
+            left = L;
+            right = R;
+        } else {
+            right = R + sep + colon;
+            while (right < n && at(t, right) == 32) {
+                right = right + 1;
+            }
+            left = s;
+            if (bOpen || bSep) {
+                left = L;
+            }
+            if (atStart) {
+                left = s;
+            }
+        }
+    } else if (R >= n || anyAt(t, R, r.closes) > 0 || anyAt(t, R, r.endp) > 0) {
+        const ps = anyBeforeLo(t, L, r.seps, lo);
+        if (ps > 0) {
+            left = L - ps;
+            while (left > lo && at(t, left - 1) == 32) {
+                left = left - 1;
+            }
+        } else if (atStart) {
+            left = s;
+        } else {
+            left = L;
+        }
+        right = R;
+    } else {
+        if (atStart || bOpen || bSep) {
+            left = s;
+            right = R;
+        } else if (L < s && R > e && at(t, L - 1) >= 128 && at(t, R) >= 128) {
+            left = L;
+            right = R;
+        } else {
+            left = s;
+            right = R;
+        }
+    }
+    let u = cut(t, left, right);
+    let pos = left;
+    const op = anyBeforeLo(u, pos, r.opens, lo);
+    const cl = anyAt(u, pos, r.closes);
+    if (op > 0 && cl > 0) {
+        let a = pos - op;
+        const b = pos + cl;
+        if (a > lo && at(u, a - 1) == 32 && (b >= bytesLen(u) || at(u, b) == 32 || anyAt(u, b, r.seps) > 0 || anyAt(u, b, r.closes) > 0
+                || anyAt(u, b, r.colons) > 0 || anyAt(u, b, r.endp) > 0)) {
+            a = a - 1;
+        }
+        u = cut(u, a, b);
+        pos = a;
+    }
+    // 开括号或正文开头之后残留的分隔符、冒号
+    let q = pos;
+    while (q > lo && at(u, q - 1) == 32) {
+        q = q - 1;
+    }
+    if (q == lo || anyBeforeLo(u, q, r.opens, lo) > 0) {
+        let rr = pos;
+        while (rr < bytesLen(u) && at(u, rr) == 32) {
+            rr = rr + 1;
+        }
+        let m = anyAt(u, rr, r.seps);
+        if (m == 0) {
+            m = anyAt(u, rr, r.colons);
+        }
+        if (m > 0) {
+            let r2 = rr + m;
+            while (r2 < bytesLen(u) && at(u, r2) == 32) {
+                r2 = r2 + 1;
+            }
+            let keepAt = q;
+            if (q == lo && pos > lo) {
+                keepAt = pos;
+            }
+            u = cut(u, keepAt, r2);
+            pos = keepAt;
+        }
+    }
+    return new Cur { t: u, pos: pos };
+}
+
+// [lo, 末尾) 里 a 换成 b。
+export function replaceAll(t: Bytes, a: Bytes, b: Bytes, lo: int): Bytes {
+    const res = bytesSlice(t, 0, lo);
+    let i = lo;
+    while (true) {
+        const k = findFrom(t, a, i);
+        if (k < 0) {
+            break;
+        }
+        bytesAppend(res, slice(t, i, k));
+        bytesAppend(res, b);
+        i = k + bytesLen(a);
+    }
+    bytesAppend(res, slice(t, i, bytesLen(t)));
+    return res;
+}
+
+// 擦除 t 的 [lo, 末尾)：先字面替换，再逐个删单元。
+export function scrubText(r: Ref<Rules>, t0: Bytes, lo: int, out: string): Bytes {
+    let t = t0;
+    for (p in r.replaces) {
+        if (findFrom(t, p.a, lo) >= 0) {
+            t = replaceAll(t, p.a, p.b, lo);
+        }
+    }
+    const hit = new Hit { end: 0, pat: bytesNew(0) };
+    let pos = lo;
+    while (true) {
+        const s = findUnit(r, t, pos, out, hit);
+        if (s < 0) {
+            break;
+        }
+        const c = deleteUnit(r, t, s, hit.end, lo);
+        t = c.t;
+        pos = c.pos;
+    }
+    return t;
+}
+
+// 改过的行：去掉新产生的行尾空格（原行尾本没有空格时；行尾的 CR 保留）。
+export function finishLine(old: Bytes, nw: Bytes): Bytes {
+    const n = bytesLen(old);
+    if (at(old, n - 1) == 32 || (at(old, n - 1) == 13 && at(old, n - 2) == 32)) {
+        return nw;
+    }
+    let e = bytesLen(nw);
+    const cr = at(nw, e - 1) == 13;
+    if (cr) {
+        e = e - 1;
+    }
+    while (e > 0 && at(nw, e - 1) == 32) {
+        e = e - 1;
+    }
+    const res = bytesSlice(nw, 0, e);
+    if (cr) {
+        bytesPush(res, 13);
+    }
+    return res;
+}
+
+export function lineLog(rep: Ref<Report>, old: Bytes, nw: Bytes, dropped: bool): void {
+    bytesAppend(rep.log, bytesFromStr("- "));
+    bytesAppend(rep.log, old);
+    bytesAppend(rep.log, bytesFromStr("\n+ "));
+    if (dropped) {
+        bytesAppend(rep.log, bytesFromStr("<删去>"));
+    } else {
+        bytesAppend(rep.log, nw);
+    }
+    bytesPush(rep.log, 10);
+    rep.scrubbedLines = rep.scrubbedLines + 1;
+}
+
+export function splitLines(t: Bytes): List<Bytes> {
+    const out: List<Bytes> = listNew();
+    let s = 0;
+    let i = 0;
+    const n = bytesLen(t);
+    while (i < n) {
+        if (at(t, i) == 10) {
+            listPush(out, slice(t, s, i));
+            s = i + 1;
+        }
+        i = i + 1;
+    }
+    listPush(out, slice(t, s, n));
+    return out;
+}
+
+export function joinLines(lines: List<Bytes>): Bytes {
+    const res = bytesNew(0);
+    let first = true;
+    for (l in lines) {
+        if (!first) {
+            bytesPush(res, 10);
+        }
+        bytesAppend(res, l);
+        first = false;
+    }
+    return res;
+}
+
+// 引号串的终点之后（转义按反斜杠跳过）。
+export function skipQuoted(line: Bytes, i: int, q: int): int {
+    let j = i + 1;
+    while (j < bytesLen(line) && at(line, j) != q) {
+        if (at(line, j) == 92) {
+            j = j + 1;
+        }
+        j = j + 1;
+    }
+    return j + 1;
+}
+
+export function onlySpaceAfter(line: Bytes, i: int): bool {
+    let k = i;
+    while (k < bytesLen(line)) {
+        const c = at(line, k);
+        if (c != 32 && c != 9 && c != 13) {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+// // 系的一行：种类 0 无注释；1 行注释（起点为 // 处）；2 块注释从起点到行尾；3 块注释在本行结束（起点为 */ 处）；
+// 4 同一行里闭合、其后再无代码的块注释（起点为正文开头）。块注释是否延续到下一行记在 state[0]。
+export function slashComment(line: Bytes, state: Bytes, where: Ref<Hit>): int {
+    const n = bytesLen(line);
+    if (at(state, 0) == 1) {
+        const k = findFrom(line, bytesFromStr("*/"), 0);
+        if (k < 0) {
+            where.end = 0;
+            return 2;
+        }
+        bytesSet(state, 0, 0);
+        where.end = k;
+        return 3;
+    }
+    let i = 0;
+    while (i < n) {
+        const c = at(line, i);
+        if (c == 34 || c == 39) {
+            i = skipQuoted(line, i, c);
+            continue;
+        }
+        if (c == 96) {
+            const k = findFrom(line, bytesFromStr("`"), i + 1);
+            if (k < 0) {
+                return 0;
+            }
+            i = k + 1;
+            continue;
+        }
+        if (c == 47 && at(line, i + 1) == 47) {
+            where.end = i;
+            return 1;
+        }
+        if (c == 47 && at(line, i + 1) == 42) {
+            const k = findFrom(line, bytesFromStr("*/"), i + 2);
+            if (k < 0) {
+                bytesSet(state, 0, 1);
+                where.end = i + 2;
+                return 2;
+            }
+            if (onlySpaceAfter(line, k + 2)) {
+                where.end = i + 2;
+                return 4;
+            }
+            i = k + 2;
+            continue;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+export function scrubSlash(r: Ref<Rules>, text: Bytes, out: string, rep: Ref<Report>): Bytes {
+    const lines = splitLines(text);
+    const res: List<Bytes> = listNew();
+    const state = bytesNew(1);
+    const where = new Hit { end: 0, pat: bytesNew(0) };
+    for (line in lines) {
+        const kind = slashComment(line, state, where);
+        let nw = line;
+        const a = where.end;
+        if (kind == 1) {
+            let lo = a + 2;
+            if (at(line, lo) == 47) {
+                lo = lo + 1;
+            }
+            nw = scrubText(r, line, lo, out);
+        } else if (kind == 2) {
+            nw = scrubText(r, line, a, out);
+        } else if (kind == 3) {
+            nw = cat(scrubText(r, slice(line, 0, a), 0, out), slice(line, a, bytesLen(line)));
+        } else if (kind == 4) {
+            const k = findFrom(line, bytesFromStr("*/"), a);
+            nw = cat(scrubText(r, slice(line, 0, k), a, out), slice(line, k, bytesLen(line)));
+        }
+        if (!bytesEqual(nw, line)) {
+            nw = finishLine(line, nw);
+            lineLog(rep, line, nw, false);
+        }
+        listPush(res, nw);
+    }
+    return joinLines(res);
+}
+
+export function hashComment(line: Bytes): int {
+    let i = 0;
+    while (i < bytesLen(line)) {
+        const c = at(line, i);
+        if (c == 34 || c == 39) {
+            i = skipQuoted(line, i, c);
+            continue;
+        }
+        if (c == 35) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+export function stripWs(t: Bytes): Bytes {
+    let a = 0;
+    let b = bytesLen(t);
+    while (a < b && (at(t, a) == 32 || (at(t, a) >= 9 && at(t, a) <= 13))) {
+        a = a + 1;
+    }
+    while (b > a && (at(t, b - 1) == 32 || (at(t, b - 1) >= 9 && at(t, b - 1) <= 13))) {
+        b = b - 1;
+    }
+    return slice(t, a, b);
+}
+
+// # 注释；.py 另含模块文档串（文件开头、只隔着 # 行与空行的第一个三引号串）。
+export function scrubHash(r: Ref<Rules>, text: Bytes, out: string, py: bool, rep: Ref<Report>): Bytes {
+    const lines = splitLines(text);
+    const res: List<Bytes> = listNew();
+    const tq = bytesFromStr("\"\"\"");
+    let state = 3;
+    if (py) {
+        state = 0;
+    }
+    for (line in lines) {
+        let nw = line;
+        const st = stripWs(line);
+        if (state == 1) {
+            const k = findFrom(line, tq, 0);
+            if (k >= 0) {
+                nw = cat(scrubText(r, slice(line, 0, k), 0, out), slice(line, k, bytesLen(line)));
+                state = 3;
+            } else {
+                nw = scrubText(r, line, 0, out);
+            }
+        } else if (state == 0 && hasAt(st, 0, tq)) {
+            const j = findFrom(line, tq, 0);
+            const k = findFrom(line, tq, j + 3);
+            if (k >= 0) {
+                nw = cat(cat(slice(line, 0, j + 3), scrubText(r, slice(line, j + 3, k), 0, out)), slice(line, k, bytesLen(line)));
+                state = 3;
+            } else {
+                nw = cat(slice(line, 0, j + 3), scrubText(r, slice(line, j + 3, bytesLen(line)), 0, out));
+                state = 1;
+            }
+        } else {
+            if (state == 0 && bytesLen(st) > 0 && at(st, 0) != 35) {
+                state = 3;
+            }
+            const h = hashComment(line);
+            if (h >= 0) {
+                nw = scrubText(r, line, h + 1, out);
+            }
+        }
+        if (!bytesEqual(nw, line)) {
+            nw = finishLine(line, nw);
+            lineLog(rep, line, nw, false);
+        }
+        listPush(res, nw);
+    }
+    return joinLines(res);
+}
+
+// Markdown：strip 两标记之间（含标记行）整段略去，其余各行整行擦除。
+export function scrubMd(r: Ref<Rules>, text: Bytes, out: string, rep: Ref<Report>): Bytes {
+    const lines = splitLines(text);
+    const res: List<Bytes> = listNew();
+    let until = bytesNew(0);
+    let skipping = false;
+    for (line in lines) {
+        if (skipping) {
+            lineLog(rep, line, line, true);
+            if (findFrom(line, until, 0) >= 0) {
+                skipping = false;
+            }
+            continue;
+        }
+        let hitAt = -1;
+        for (p in r.strips) {
+            const k = findFrom(line, p.a, 0);
+            if (k >= 0) {
+                hitAt = k + bytesLen(p.a);
+                until = p.b;
+                break;
+            }
+        }
+        if (hitAt >= 0) {
+            lineLog(rep, line, line, true);
+            if (findFrom(line, until, hitAt) < 0) {
+                skipping = true;
+            }
+            continue;
+        }
+        let nw = scrubText(r, line, 0, out);
+        if (!bytesEqual(nw, line)) {
+            nw = finishLine(line, nw);
+            lineLog(rep, line, nw, false);
+        }
+        listPush(res, nw);
+    }
+    return joinLines(res);
+}
+
+export function extOf(rel: string): string {
+    const b = bytesFromStr(rel);
+    let k = bytesLen(b) - 1;
+    while (k >= 0 && at(b, k) != 47) {
+        if (at(b, k) == 46) {
+            if (k > 0 && at(b, k - 1) != 47) {
+                return bytesToStr(slice(b, k, bytesLen(b))) catch "";
+            }
+            return "";
+        }
+        k = k - 1;
+    }
+    return "";
+}
+
+export function baseName(rel: string): string {
+    const b = bytesFromStr(rel);
+    let k = bytesLen(b);
+    while (k > 0 && at(b, k - 1) != 47) {
+        k = k - 1;
+    }
+    return bytesToStr(slice(b, k, bytesLen(b))) catch "";
+}
+
+// 文件的注释写法：md、slash（// 与 /* */）、py（# 与模块文档串）、hash（#），其余不改。
+export function kindOfFile(rel: string): string {
+    const ext = extOf(rel);
+    if (ext == ".md") {
+        return "md";
+    }
+    for (x in strSplit(".tx .js .mjs .java .c .h .go .rs .ts .cs", " ")) {
+        if (ext == x) {
+            return "slash";
+        }
+    }
+    if (ext == ".py") {
+        return "py";
+    }
+    for (x in strSplit(".sh .toml .yml .yaml .ps1", " ")) {
+        if (ext == x) {
+            return "hash";
+        }
+    }
+    const base = baseName(rel);
+    if (base == ".gitattributes" || base == ".gitignore") {
+        return "hash";
+    }
+    return "";
+}
+
+export function scrubFile(r: Ref<Rules>, rel: string, text: Bytes, out: string, rep: Ref<Report>): Bytes {
+    const k = kindOfFile(rel);
+    if (k == "md") {
+        return scrubMd(r, text, out, rep);
+    }
+    if (k == "slash") {
+        return scrubSlash(r, text, out, rep);
+    }
+    if (k == "py") {
+        return scrubHash(r, text, out, true, rep);
+    }
+    if (k == "hash") {
+        return scrubHash(r, text, out, false, rep);
+    }
+    return text;
+}
+
+export function leaksIn(r: Ref<Rules>, pats: List<Bytes>, rel: string, text: Bytes, out: string, rep: Ref<Report>): void {
+    const hit = new Hit { end: 0, pat: bytesNew(0) };
+    let ln = 0;
+    for (line in splitLines(text)) {
+        ln = ln + 1;
+        const n = bytesLen(line);
+        let i = 0;
+        while (i < n) {
+            if (at(r.leakTab, at(line, i)) != 1) {
+                i = i + 1;
+                continue;
+            }
+            let s = missingAt(r, line, i, out, hit);
+            let e = -1;
+            if (s >= 0) {
+                e = hit.end;
+            } else {
+                s = i;
+                e = matchPats(r, pats, line, i, hit);
+            }
+            if (e > s) {
+                if (allowedHit(r, rel, hit.pat)) {
+                    rep.allowed = rep.allowed + 1;
+                } else {
+                    rep.leaks = rep.leaks + 1;
+                    bytesAppend(rep.leakLog, bytesFromStr(rel + ":" + toStr(ln) + " ["));
+                    bytesAppend(rep.leakLog, hit.pat);
+                    bytesAppend(rep.leakLog, bytesFromStr("] "));
+                    bytesAppend(rep.leakLog, slice(line, s, e));
+                    bytesAppend(rep.leakLog, bytesFromStr(" | "));
+                    const st = stripWs(line);
+                    let m = bytesLen(st);
+                    if (m > 300) {
+                        m = 300;
+                    }
+                    bytesAppend(rep.leakLog, bytesSlice(st, 0, m));
+                    bytesPush(rep.leakLog, 10);
+                    if (rep.leaks <= 50) {
+                        listPush(rep.problems, "泄漏 " + rel + ":" + toStr(ln) + " " + (bytesToStr(slice(line, s, e)) catch "?"));
+                    }
+                }
+                if (e > i) {
+                    i = e;
+                } else {
+                    i = i + 1;
+                }
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+}

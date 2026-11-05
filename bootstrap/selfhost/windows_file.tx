@@ -1,0 +1,212 @@
+// Windows 的文件原语（rtfn 写）：语义与导出名同 runtime_memory_gen.tx 的手写版 fileMapErr、fileWidePath、
+// fileReadPrim、fileWritePrim——__tx_file_maperr、__tx_file_wpath（FFI 的 wstr、进程与工具链内建也用）、__tx_native_file_read、
+// __tx_native_file_write 与 __tx_native_file_write_exec。--generic=file 的 Windows 内核用它（x86_64 的检测与可移植内核、A6 起的
+// aarch64）；x86_64 Windows 的缺省内核仍发手写版。
+// 原语 (路径指针, 路径长, 出参指针或数据, 出参指针或数据长) → 状态（0 成功、1 无效实参、2 内存不足、3 无此文件、4 拒绝访问、
+// 5 读写错误，即 nrt_sys.tx 的 STATUS_NAMES）。路径转 UTF-16（含 NUL 或为空即无效实参）；读：CreateFileW 只读打开、GetFileSizeEx
+// 取长度、一次分配、ReadFile 按块读满（每块至多 1 GiB，长度参数是 DWORD），读到 0 字节（文件变短）为读写错误；写：CREATE_ALWAYS
+// 打开、WriteFile 按块写完，写出 0 字节为读写错误。Windows 没有可执行位，writeExecutable 同写。
+// 与手写版的差别：
+// - BOOL、DWORD 与 int 结果一律按低 32 位判（ARM64 上 w0 返回时 x0 的高 32 位不定；手写版 test eax, eax 同义）。
+// - __tx_file_maperr 的实参在第一个参数位（手写版 eax 进 eax 出，只供本组原语调用）。
+// - 读打开成功后的出错路径（取长度失败、分配失败、读失败）也释放路径的宽串缓冲（手写版漏了，泄漏一块）。
+// - 写失败先取 GetLastError 再关句柄（手写版先关后取，取到的可能是关闭留下的值）。
+// - __tx_native_file_write_exec 是调用 __tx_native_file_write 的外壳（手写版两个标号同址；rtfn 没有尾跳）。
+import { StructuredBuffer } from "./assemble";
+import { RtFn, RtOp, L, I } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtSet, rtOp, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtCall0, rtCall1, rtCall2, rtCall4, rtCallList, rtRet } from "./rtfn";
+
+const MODULE: string = "bootstrap/selfhost/windows_file.tx";
+const M32: int = 4294967295;
+const CP_UTF8: int = 65001;
+const GENERIC_READ: int = 2147483648;
+const GENERIC_WRITE: int = 1073741824;
+const FILE_SHARE_READ: int = 1;
+const CREATE_ALWAYS: int = 2;
+const OPEN_EXISTING: int = 3;
+const FILE_ATTRIBUTE_NORMAL: int = 128;
+const CHUNK: int = 1073741824;
+
+function done(f: Ref<RtFn>, failures: List<string>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+function args7(a: Ref<RtOp>, b: Ref<RtOp>, c: Ref<RtOp>, d: Ref<RtOp>, e: Ref<RtOp>, g: Ref<RtOp>, h: Ref<RtOp>): List<Ref<RtOp>> {
+    const xs: List<Ref<RtOp>> = listNew();
+    listPush(xs, a); listPush(xs, b); listPush(xs, c); listPush(xs, d); listPush(xs, e); listPush(xs, g); listPush(xs, h);
+    return xs;
+}
+
+// __tx_file_maperr(e)：GetLastError → 状态：2、3 无此文件，5 拒绝访问，87、123 无效实参，其余读写错误。
+function mapErrFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_file_maperr", "e", "", 0, MODULE);
+    rtOp(f, "e", L("e"), "and", I(M32));
+    rtIf(f, L("e"), "eq", I(2), "enoent");
+    rtIf(f, L("e"), "eq", I(3), "enoent");
+    rtIf(f, L("e"), "eq", I(5), "eacces");
+    rtIf(f, L("e"), "eq", I(87), "einval");
+    rtIf(f, L("e"), "eq", I(123), "einval");
+    rtRet(f, I(5));
+    rtLabel(f, "enoent"); rtRet(f, I(3));
+    rtLabel(f, "eacces"); rtRet(f, I(4));
+    rtLabel(f, "einval"); rtRet(f, I(1));
+    done(f, failures);
+}
+
+// __tx_file_wpath(p, n)：UTF-8 → NUL 结尾的 UTF-16，缓冲为原生分配（容量 n*2+2，UTF-8 每字节至多一个 code unit），调用方释放；
+// 空路径、含 NUL、分配或转换失败得 0。
+function widePathFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_file_wpath", "p n", "w x r c", 6, MODULE);
+    rtIf(f, L("n"), "eq", I(0), "null");
+    rtSet(f, "x", I(0));
+    rtLabel(f, "scan");
+    rtOp(f, "r", L("p"), "add", L("x"));
+    rtLoad(f, "c", L("r"), 0, 1);
+    rtIf(f, L("c"), "eq", I(0), "null");
+    rtOp(f, "x", L("x"), "add", I(1));
+    rtIf(f, L("x"), "ult", L("n"), "scan");
+    rtOp(f, "x", L("n"), "add", L("n"));
+    rtOp(f, "x", L("x"), "add", I(2));
+    rtCall2(f, "w", "__tx_native_mem_alloc", L("x"), I(1));
+    rtIf(f, L("w"), "eq", I(0), "null");
+    rtOp(f, "x", L("n"), "add", I(1));
+    const cv: List<Ref<RtOp>> = listNew();
+    listPush(cv, I(CP_UTF8)); listPush(cv, I(0)); listPush(cv, L("p")); listPush(cv, L("n")); listPush(cv, L("w")); listPush(cv, L("x"));
+    rtCallList(f, "r", "MultiByteToWideChar", cv);
+    rtOp(f, "r", L("r"), "and", I(M32));
+    rtIf(f, L("r"), "eq", I(0), "failfree");
+    // 转换不补 NUL：w[r] = 0（缓冲来自未清零的原生分配）。
+    rtOp(f, "x", L("r"), "add", L("r"));
+    rtOp(f, "x", L("x"), "add", L("w"));
+    rtStore(f, L("x"), 0, I(0), 2);
+    rtRet(f, L("w"));
+    rtLabel(f, "failfree");
+    rtCall1(f, "", "__tx_native_mem_free", L("w"));
+    rtLabel(f, "null");
+    rtRet(f, I(0));
+    done(f, failures);
+}
+
+// __tx_native_file_read(pp, pn, out_ptr*, out_len*)：成功时 *out_ptr＝缓冲（长度为 0 时也是一次分配，同手写版）、*out_len＝长度；
+// 出错时出参不动。局部：w 宽串路径、h 句柄、sz 长度（GetFileSizeEx 写入，取址）、buf 缓冲、tot 已读、got 本块读到（ReadFile 写入
+// DWORD，取址）、st 状态。
+function readFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_file_read", "pp pn d dn", "w h sz buf tot got st r x c", 7, MODULE);
+    rtSet(f, "buf", I(0));
+    rtCall2(f, "w", "__tx_file_wpath", L("pp"), L("pn"));
+    rtIf(f, L("w"), "eq", I(0), "einval");
+    rtCallList(f, "h", "CreateFileW", args7(L("w"), I(GENERIC_READ), I(FILE_SHARE_READ), I(0), I(OPEN_EXISTING), I(FILE_ATTRIBUTE_NORMAL), I(0)));
+    rtIf(f, L("h"), "eq", I(-1), "openfail");
+    rtSet(f, "sz", I(0));
+    rtAddrOf(f, "x", "sz");
+    rtCall2(f, "r", "GetFileSizeEx", L("h"), L("x"));
+    rtOp(f, "r", L("r"), "and", I(M32));
+    rtSet(f, "st", I(5));
+    rtIf(f, L("r"), "eq", I(0), "close");
+    rtCall2(f, "buf", "__tx_native_mem_alloc", L("sz"), I(1));
+    rtSet(f, "st", I(2));
+    rtIf(f, L("buf"), "eq", I(0), "close");
+    rtSet(f, "st", I(5));
+    rtSet(f, "tot", I(0));
+    rtLabel(f, "loop");
+    rtOp(f, "c", L("sz"), "sub", L("tot"));
+    rtIf(f, L("c"), "eq", I(0), "full");
+    rtIf(f, L("c"), "ule", I(CHUNK), "chunk");
+    rtSet(f, "c", I(CHUNK));
+    rtLabel(f, "chunk");
+    rtSet(f, "got", I(0));
+    rtAddrOf(f, "x", "got");
+    rtOp(f, "r", L("buf"), "add", L("tot"));
+    const rd: List<Ref<RtOp>> = listNew();
+    listPush(rd, L("h")); listPush(rd, L("r")); listPush(rd, L("c")); listPush(rd, L("x")); listPush(rd, I(0));
+    rtCallList(f, "r", "ReadFile", rd);
+    rtOp(f, "r", L("r"), "and", I(M32));
+    rtIf(f, L("r"), "eq", I(0), "close");
+    rtOp(f, "r", L("got"), "and", I(M32));
+    rtIf(f, L("r"), "eq", I(0), "close");
+    rtOp(f, "tot", L("tot"), "add", L("r"));
+    rtJump(f, "loop");
+    rtLabel(f, "full");
+    rtCall1(f, "", "CloseHandle", L("h"));
+    rtStore(f, L("d"), 0, L("buf"), 8);
+    rtStore(f, L("dn"), 0, L("sz"), 8);
+    rtCall1(f, "", "__tx_native_mem_free", L("w"));
+    rtRet(f, I(0));
+    // 打开之后的出错：释放缓冲（未分配为 0）、关句柄、释放路径，返回 st。
+    rtLabel(f, "close");
+    rtCall1(f, "", "__tx_native_mem_free", L("buf"));
+    rtCall1(f, "", "CloseHandle", L("h"));
+    rtCall1(f, "", "__tx_native_mem_free", L("w"));
+    rtRet(f, L("st"));
+    rtLabel(f, "openfail");
+    rtCall0(f, "r", "GetLastError");
+    rtCall1(f, "st", "__tx_file_maperr", L("r"));
+    rtCall1(f, "", "__tx_native_mem_free", L("w"));
+    rtRet(f, L("st"));
+    rtLabel(f, "einval");
+    rtRet(f, I(1));
+    done(f, failures);
+}
+
+// __tx_native_file_write(pp, pn, data, dlen)：局部同读（put 本块写出，WriteFile 写入 DWORD，取址）。
+function writeFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_file_write", "pp pn d dn", "w h tot put st r x c", 7, MODULE);
+    rtCall2(f, "w", "__tx_file_wpath", L("pp"), L("pn"));
+    rtIf(f, L("w"), "eq", I(0), "einval");
+    rtCallList(f, "h", "CreateFileW", args7(L("w"), I(GENERIC_WRITE), I(0), I(0), I(CREATE_ALWAYS), I(FILE_ATTRIBUTE_NORMAL), I(0)));
+    rtIf(f, L("h"), "eq", I(-1), "openfail");
+    rtSet(f, "tot", I(0));
+    rtLabel(f, "loop");
+    rtOp(f, "c", L("dn"), "sub", L("tot"));
+    rtIf(f, L("c"), "eq", I(0), "full");
+    rtIf(f, L("c"), "ule", I(CHUNK), "chunk");
+    rtSet(f, "c", I(CHUNK));
+    rtLabel(f, "chunk");
+    rtSet(f, "put", I(0));
+    rtAddrOf(f, "x", "put");
+    rtOp(f, "r", L("d"), "add", L("tot"));
+    const wr: List<Ref<RtOp>> = listNew();
+    listPush(wr, L("h")); listPush(wr, L("r")); listPush(wr, L("c")); listPush(wr, L("x")); listPush(wr, I(0));
+    rtCallList(f, "r", "WriteFile", wr);
+    rtOp(f, "r", L("r"), "and", I(M32));
+    rtIf(f, L("r"), "eq", I(0), "wfail");
+    rtOp(f, "r", L("put"), "and", I(M32));
+    rtIf(f, L("r"), "eq", I(0), "wfail");
+    rtOp(f, "tot", L("tot"), "add", L("r"));
+    rtJump(f, "loop");
+    rtLabel(f, "full");
+    rtCall1(f, "", "CloseHandle", L("h"));
+    rtCall1(f, "", "__tx_native_mem_free", L("w"));
+    rtRet(f, I(0));
+    rtLabel(f, "wfail");
+    rtCall0(f, "r", "GetLastError");
+    rtCall1(f, "st", "__tx_file_maperr", L("r"));
+    rtCall1(f, "", "CloseHandle", L("h"));
+    rtCall1(f, "", "__tx_native_mem_free", L("w"));
+    rtRet(f, L("st"));
+    rtLabel(f, "openfail");
+    rtCall0(f, "r", "GetLastError");
+    rtCall1(f, "st", "__tx_file_maperr", L("r"));
+    rtCall1(f, "", "__tx_native_mem_free", L("w"));
+    rtRet(f, L("st"));
+    rtLabel(f, "einval");
+    rtRet(f, I(1));
+    done(f, failures);
+}
+
+function writeExecFn(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    const f = rtBegin(b, "__tx_native_file_write_exec", "pp pn d dn", "r", 4, MODULE);
+    rtCall4(f, "r", "__tx_native_file_write", L("pp"), L("pn"), L("d"), L("dn"));
+    rtRet(f, L("r"));
+    done(f, failures);
+}
+
+/// 发出 Windows 的四个文件原语与 __tx_file_maperr；失败说明加进 failures。
+export function windowsFileEmit(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    mapErrFn(b, failures);
+    widePathFn(b, failures);
+    readFn(b, failures);
+    writeFn(b, failures);
+    writeExecFn(b, failures);
+}

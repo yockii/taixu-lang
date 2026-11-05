@@ -67,7 +67,7 @@ def security_checks(compiler, work, check):
                 row = run(exe, [exe, 'invalid'], fixture + '-invalid-' + mode)
                 check('security:invalid-budget:' + mode,
                       row['exit'] == 3 and ('procSpawnLimited' if fixture == 'process-budget' else 'procTryWrite') in row['stderr'], row)
-    # 标准输出读端已关闭（macOS 适配 M3 设计 G5）：stdoutWrite 得 −1；之后的 print 在 Unix 上按 SIGPIPE 结束（macOS 的
+    # 标准输出读端已关闭：stdoutWrite 得 −1；之后的 print 在 Unix 上按 SIGPIPE 结束（macOS 的
     # 工具链例程装过空处理函数也一样），父进程交下 SIG_IGN 时继续执行；Windows 没有 SIGPIPE，继续执行。
     out = work / 'print-pipe'
     p = subprocess.run([str(compiler), 'build', str(ROOT / 'tests/tool-security/print-pipe.tx'), '--toolchain',
@@ -140,7 +140,7 @@ def security_checks(compiler, work, check):
         if p.returncode == 0:
             pidfile = work / 'wait-nopeek.pid'
             pidfile.unlink(missing_ok=True)
-            p = subprocess.run([sys.executable, str(ROOT / 'scripts/run-without-syscall.py'), '247', '--',
+            p = subprocess.run([sys.executable, str(ROOT / 'scripts/run-without-syscall.py'), 'waitid', '--',
                                 str(out / 'wait-nopeek'), str(pidfile)], cwd=ROOT, capture_output=True, timeout=60)
             text = pidfile.read_text().strip() if pidfile.exists() else ''
             pid = int(text) if text.isdigit() else 0

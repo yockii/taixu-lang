@@ -4,8 +4,8 @@
 
 ## 一、缺陷
 
-- fmt 是纯词法的保守格式化器（D2 §9／D9），只在 `Ref`、`Weak`、`List` 之后把 `<` 认作类型尖括号，且开括号之后没有紧贴规则：
-  全仓通行的 `List< int>`、`Ref< Node>` 是这个缺陷的产物（代码注释的本意是 `Ref<T>` 收口紧贴，Zig 时代的 fmt 同样如此）。
+- fmt 是纯词法的保守格式化器，只在 `Ref`、`Weak`、`List` 之后把 `<` 认作类型尖括号，且开括号之后没有紧贴规则：
+  全仓通行的 `List< int>`、`Ref< Node>` 是这个缺陷的产物（代码注释的本意是 `Ref<T>` 收口紧贴，早期的 fmt 同样如此）。
 - 其余泛型被当成比较运算排开：`Map< string, int>` 排成 `Map < string, int >`，`Future<int>` 在形参与返回类型顶层排成
   `Future < int >`，显式类型实参的调用 `wrapTo<i32>(x)` 排成 `wrapTo < i32 > (x)`，泛型结构体声明 `struct Box<T>` 排成
   `struct Box < T >`——同一种东西三种写法。

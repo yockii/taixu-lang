@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""JSON parser differential gate (round 6 step 6c-4a, docs/design/v052-round6-debug-v0.1-20261018.md §六).
+"""JSON parser differential gate (round 6 step).
 
-bootstrap/selfhost/json_parse.tx follows Zig std.json's defaults (the VM debug protocol parses commands with
+bootstrap/selfhost/json_parse.tx is a strict parser (the debug protocol parses commands with
 it): duplicate keys, trailing content, invalid UTF-8 in strings, raw control characters and lone \\u surrogates
 are errors; a number is an integer when it has no . e E, is not -0 and fits i64, otherwise its text is kept.
 
@@ -228,7 +228,7 @@ def main():
     work.mkdir(parents=True, exist_ok=True)
     out = work / 'probe'
     shutil.rmtree(out, ignore_errors=True)
-    p = subprocess.run([str(compiler), 'build', 'bootstrap/selfhost/json-probe.tx', '--out', str(out)],
+    p = subprocess.run([str(compiler), 'build', 'bootstrap/selfhost/json-probe.tx', '--toolchain', '--out', str(out)],
                        cwd=str(ROOT), capture_output=True, timeout=1200)
     probe = out / ('json-probe.exe' if WIN else 'json-probe')
     if p.returncode != 0 or not probe.exists():

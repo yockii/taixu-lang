@@ -1,0 +1,115 @@
+// riscv64-linux 的手写入口与原语：语义同 linux_la64.tx，
+// 只有这几处要在栈切换、线程指针上直接用机器指令，其余例程都经 rtfn 发出。
+// - 线程指针：tp（x4，通用寄存器，用户态直接写）。TLS 是 Variant I、线程控制块长 0（glibc 的 TLS_TCB_SIZE 0，同龙芯）：可执行文件
+//   的 TLS 块就在线程指针处，槽在 tp+0。
+// - **静态产物无条件设 tp**：RISC-V 内核在 exec 时不清寄存器（没有 ELF_PLAT_INIT），tp 是 execve 调用方遗留的值，不能像龙芯那样
+//   “为 0 才设”。动态产物由加载器设好线程指针，链接器把 .data 里的 __tx_dynamic_image 置 1，_start 见 1 就不动 tp（读 auxv 的
+//   AT_BASE 判不了 `ld.so ./产物` 这种启动）。
+// - clone 选 CLONE_BACKWARDS：内核的次序是 (flags, stack, ptid, tls, ctid)，调用方按 x86_64 的次序 (flags, stack, ptid, ctid, tls)
+//   给，桩里交换后两个（同 aarch64）。
+// - 不读 auxv 的 CPU 特性：基线 RV64G，没有按特性分支的原子（页堆检测的页长另行从 auxv 取，kernel_alloc_check）。
+// 系统调用号是 riscv64 的号（Linux v7.3 的号表，syscall_names.tx 取）；ecall 只改 a0。私有约定：实参 a0..a7，t5 可随意改写。
+import { StructuredBuffer, asBufferLabel, asBufferBoundaryBegin, asBufferFunctionEnd, asBufferSection, asBufferAlign, asBufferQuad } from "./assemble";
+import { rv64Emit, rv64Br, rv64BCond, rv64AddrOf, rv64SymAccess, rv64MovImm } from "./rv64_asm";
+import { rv64R, rv64I, rv64S, rv64Shift } from "./rv64_encode";
+import { RV64_ADD, RV64_ADDI, RV64_SLLI, RV64_LD, RV64_SD, RV64_ECALL, RV64_EBREAK, RV64_JALR, RV64_BEQ, RV64_BNE } from "./rv64_encode";
+import { syscallNumber } from "./syscall_names";
+
+const MODULE: string = "bootstrap/selfhost/linux_rv64.tx";
+/// 线程指针到本线程 TLS 槽的偏移（Variant I、线程控制块长 0）。
+export const LINUX_RV64_TLS_SLOT: int = 0;
+const ZERO: int = 0;
+const RA: int = 1;
+const SP: int = 2;
+const TP: int = 4;
+const T0: int = 5;
+const FP: int = 8;
+const A0: int = 10;
+const A1: int = 11;
+const A2: int = 12;
+const A3: int = 13;
+const A4: int = 14;
+const A7: int = 17;
+const T5: int = 30;
+
+function nr(name: string): int { return syscallNumber("riscv64", name); }
+function syscall(b: Ref<StructuredBuffer>, name: string): void {
+    rv64MovImm(b, A7, nr(name));
+    rv64Emit(b, RV64_ECALL, "ecall");
+}
+function mov(b: Ref<StructuredBuffer>, rd: int, rs: int): void { rv64Emit(b, rv64I(RV64_ADDI, rd, rs, 0), "mv"); }
+function ret(b: Ref<StructuredBuffer>): void { rv64Emit(b, rv64I(RV64_JALR, ZERO, RA, 0), "ret"); }
+function trap(b: Ref<StructuredBuffer>): void { rv64Emit(b, RV64_EBREAK, "ebreak"); }
+
+/// 进程入口：sp → argc、argv[]、0、envp[]、0、auxv（sp 由内核按 16 字节对齐）。记下 envp，静态产物设好线程指针，以 a0＝argc、
+/// a1＝argv 调 __tx_native_entry（私有约定与 LP64D 的整数实参一致），以它的结果 exit_group。a0、a1 在调用前不动，临时用 a2、t0、t5。
+export function linuxRv64Start(b: Ref<StructuredBuffer>): void {
+    asBufferBoundaryBegin(b, MODULE, "_start", "process-entry");
+    asBufferLabel(b, "_start", 1);
+    // 帧链到此为止：s0＝0、ra＝0。
+    mov(b, FP, ZERO);
+    mov(b, RA, ZERO);
+    rv64Emit(b, rv64I(RV64_LD, A0, SP, 0), "ld a0, 0(sp)");
+    rv64Emit(b, rv64I(RV64_ADDI, A1, SP, 8), "addi a1, sp, 8");
+    // envp = argv + (argc + 1) * 8。
+    rv64Emit(b, rv64Shift(RV64_SLLI, T0, A0, 3, 64), "slli t0, a0, 3");
+    rv64Emit(b, rv64R(RV64_ADD, A2, A1, T0), "add a2, a1, t0");
+    rv64Emit(b, rv64I(RV64_ADDI, A2, A2, 8), "addi a2, a2, 8");
+    rv64SymAccess(b, RV64_SD, A2, T5, "__tx_nrt_envp", 0);
+    rv64SymAccess(b, RV64_LD, T0, T0, "__tx_dynamic_image", 0);
+    rv64BCond(b, RV64_BNE, T0, ZERO, "__tx_start_tls_ready");
+    rv64AddrOf(b, TP, "__tx_tls_static", 0);
+    asBufferLabel(b, "__tx_start_tls_ready", 1);
+    rv64Br(b, 1, "__tx_native_entry");
+    syscall(b, "exit_group");
+    trap(b);
+    asBufferFunctionEnd(b);
+}
+
+/// .data 里的 __tx_dynamic_image（8 字节，缺省 0；链接器在动态产物里置 1）。
+export function linuxRv64Data(b: Ref<StructuredBuffer>): void {
+    asBufferSection(b, 2, 1);
+    asBufferAlign(b, 3, 1);
+    asBufferLabel(b, "__tx_dynamic_image", 1);
+    asBufferQuad(b, 0, 1);
+    asBufferSection(b, 0, 1);
+}
+
+/// __tx_tls_tb_get() → 本线程的线程块（外来线程为 0）；__tx_tls_tb_set(tb)。只写 a0。
+export function linuxRv64TlsLeaves(b: Ref<StructuredBuffer>): void {
+    asBufferLabel(b, "__tx_tls_tb_get", 1);
+    rv64Emit(b, rv64I(RV64_LD, A0, TP, LINUX_RV64_TLS_SLOT), "ld a0, 0(tp)");
+    ret(b);
+    asBufferLabel(b, "__tx_tls_tb_set", 1);
+    rv64Emit(b, rv64S(RV64_SD, A0, TP, LINUX_RV64_TLS_SLOT), "sd a0, 0(tp)");
+    ret(b);
+}
+
+/// __tx_thread_clone(flags, top, ptid, ctid, tls) → 子线程号或 −errno（父线程）。实参按 x86_64 的次序收（调用方共用），发给内核时
+/// 换成 CLONE_BACKWARDS 的次序（交换 a3、a4）。子线程在新栈上从 ecall 之后继续：[sp]＝记录（父线程预先写好），以 a0＝记录调用
+/// __tx_thread_main，它以 exit 结束、不返回。__tx_thread_unmap_exit(base, size)：归还自己正在用的栈后立即以 exit 结束本线程——
+/// munmap 之后只用寄存器、不再碰栈。
+export function linuxRv64ThreadStubs(b: Ref<StructuredBuffer>): void {
+    asBufferBoundaryBegin(b, MODULE, "__tx_thread_clone", "stack-transition");
+    asBufferLabel(b, "__tx_thread_clone", 1);
+    mov(b, T5, A3);
+    mov(b, A3, A4);
+    mov(b, A4, T5);
+    syscall(b, "clone");
+    rv64BCond(b, RV64_BEQ, A0, ZERO, "__tx_thread_clone_child");
+    ret(b);
+    asBufferLabel(b, "__tx_thread_clone_child", 1);
+    mov(b, FP, ZERO);
+    mov(b, RA, ZERO);
+    rv64Emit(b, rv64I(RV64_LD, A0, SP, 0), "ld a0, 0(sp)");
+    rv64Br(b, 1, "__tx_thread_main");
+    trap(b);
+    asBufferFunctionEnd(b);
+    asBufferBoundaryBegin(b, MODULE, "__tx_thread_unmap_exit", "stack-disposal");
+    asBufferLabel(b, "__tx_thread_unmap_exit", 1);
+    syscall(b, "munmap");
+    rv64MovImm(b, A0, 0);
+    syscall(b, "exit");
+    trap(b);
+    asBufferFunctionEnd(b);
+}

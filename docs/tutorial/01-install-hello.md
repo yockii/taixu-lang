@@ -77,7 +77,8 @@ hello from hello
 `taixu init` 只生成一个文件 `hello/main.tx`，项目怎么分目录由你决定；
 也可以写成 `taixu init console hello`。另有库模板
 `taixu init mylib --template=library`，生成 `mylib/src/mylib.tx` 与冒烟测试
-`mylib/tests/smoke.tx`。目录里已有同名文件时 `init` 不覆盖。
+`mylib/tests/smoke.tx`；窗口程序的模板 `taixu init gui mytool` 见第 10 章。
+目录里已有同名文件时 `init` 不覆盖。
 
 `taixu run` 先把程序编译成本机可执行文件（放在临时目录）再运行，退出码
 原样转发；写在文件名之后的参数传给程序的 `main`。

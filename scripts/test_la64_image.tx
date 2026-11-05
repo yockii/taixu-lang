@@ -1,0 +1,147 @@
+// 龙芯写出链路（gate.tx 的 la64-image 步）：编出 bootstrap/la64_image_probe.tx，由它手写两个
+// loongarch64 目标文件并链接成静态 ELF。任何宿主上都核对文件头（ELF64 小端、可执行、e_machine 258、e_flags 0x43、入口在
+// 代码段）与两次生成逐字节相同；龙芯 Linux 宿主上直接运行、别处有环境变量 TAIXU_QEMU_LOONGARCH64（qemu-loongarch64 的路径）时
+// 经它运行，核对五行输出与退出码 0（syscall、长跳转、常数合成、浮点比较、跨对象 bl 与 .data 里的绝对地址）。两者都没有时
+// 运行一项记 SKIP，不记通过。另编出 bootstrap/la64_rtfn_probe.tx（A4d）：rtfn 原语逐项核对与除零须被终止；bootstrap/la64_kernel_probe.tx
+// （A4d）：与构建生成的 kernel-linux-loongarch64.o 及页堆版链接，走完整启动链路核对内核例程，另一映像走致命路径。同样有运行条件才运行。
+// 运行：taixu run --toolchain scripts/test_la64_image.tx --compiler <taixu> --work <目录> [--root <仓库>]
+import { absolute, exeName, join, list1, mkdirs, plus, step, readBytes, words } from "./build_lib";
+import { osRealPath, osWriteFile } from "./build_os";
+import { Outcome, capture, check, summary, tallyNew } from "./test_lib";
+
+const EXPECTED: string = "la64 image: write ok\nla64 image: relax ok\nla64 image: consts ok\nla64 image: float ok\nla64 image: call/data ok\n";
+
+function u(b: Bytes, at: int, n: int): int {
+    let v = 0;
+    let k = n - 1;
+    while (k >= 0) {
+        v = (v << 8) | ((bytesGetLE<u8>(b, at + k) ?? 0) as int);
+        k = k - 1;
+    }
+    return v;
+}
+
+// 运行用的副本另写成新文件（可执行位只在新建时设得上；qemu-user 对没有执行位的文件直接以 1 退出、不报错）。龙芯 Linux 宿主直接跑，
+// 否则经 qemu（TAIXU_QEMU_LOONGARCH64）。
+function runCopy(dir: string, name: string, img: Bytes, qemu: string): Ref<Outcome> | Error {
+    const runnable = join(dir, name + ".run");
+    removeFile(runnable) catch (e) {};
+    if (!osWriteFile(runnable, img, true)) { return err("写不了 " + runnable); }
+    if (len(qemu) == 0) { return capture(runnable, listNew(), dir, 60000000000, 65536); }
+    return capture(qemu, list1(runnable), dir, 60000000000, 65536);
+}
+function trimEnd(s: string): string {
+    let n = len(s);
+    while (n > 0 && ((byteAt(s, n - 1) catch 0) == 10 || (byteAt(s, n - 1) catch 0) == 13)) { n = n - 1; }
+    return strSub(s, 0, n);
+}
+
+function run(args: []string): int | Error {
+    let compiler = "";
+    let work = "";
+    let root = "";
+    let i: int = 0;
+    while (i < len(args)) {
+        const a = args[i];
+        if (i + 1 >= len(args)) {
+            return err("缺少取值或未知参数：" + a);
+        }
+        const v = args[i + 1];
+        if (a == "--compiler") {
+            compiler = v;
+        } else if (a == "--work") {
+            work = v;
+        } else if (a == "--root") {
+            root = v;
+        } else {
+            return err("未知参数：" + a);
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0 || len(work) == 0) {
+        return err("用法：taixu run --toolchain scripts/test_la64_image.tx --compiler <taixu> --work <目录> [--root <仓库>]");
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = osRealPath(absolute(root));
+    compiler = osRealPath(absolute(compiler));
+    if (!mkdirs(absolute(work))) {
+        return err("建不了工作目录：" + work);
+    }
+    const dir = osRealPath(absolute(work));
+    const t = tallyNew();
+    step(compiler, plus(plus(list1("build"), list1("bootstrap/la64_image_probe.tx")), plus(list1("--toolchain"), plus(list1("--out"), list1(join(dir, "probe"))))), root)?;
+    const probe = join(join(dir, "probe"), exeName("la64_image_probe"));
+    const first = join(dir, "la64img");
+    const second = join(dir, "la64img2");
+    const r1 = capture(probe, list1(first), root, 300000000000, 65536)?;
+    const r2 = capture(probe, list1(second), root, 300000000000, 65536)?;
+    const ws = words(r1.out);
+    check(t, "build", r1.code == 0 && r2.code == 0 && (listGet(ws, 0) catch "") == "PASS_LA64_IMAGE", r1.out + r1.err + r2.err);
+    const img = readBytes(first) catch bytesNew(0);
+    const img2 = readBytes(second) catch bytesNew(0);
+    check(t, "deterministic", bytesLen(img) > 0 && bytesEqual(img, img2), "两次生成不同（" + toStr(bytesLen(img)) + "／" + toStr(bytesLen(img2)) + " 字节）");
+    const header = bytesLen(img) >= 64 && u(img, 0, 4) == 1179403647 && u(img, 4, 1) == 2 && u(img, 5, 1) == 1 && u(img, 16, 2) == 2;
+    check(t, "elf-header", header, "不是 ELF64 小端可执行文件");
+    check(t, "machine", u(img, 18, 2) == 258 && u(img, 48, 4) == 67, "e_machine " + toStr(u(img, 18, 2)) + "，e_flags " + toStr(u(img, 48, 4)));
+    // 入口须落在某个可执行的 PT_LOAD 里。
+    const entry = u(img, 24, 8);
+    const phoff = u(img, 32, 8);
+    const phnum = u(img, 56, 2);
+    let inText = false;
+    let k = 0;
+    while (k < phnum) {
+        const p = phoff + k * 56;
+        if (u(img, p, 4) == 1 && (u(img, p + 4, 4) & 1) == 1 && entry >= u(img, p + 16, 8) && entry < u(img, p + 16, 8) + u(img, p + 40, 8)) { inText = true; }
+        if (u(img, p, 4) == 1 && u(img, p + 48, 8) != 65536) { check(t, "segment-align", false, "PT_LOAD 对齐 " + toStr(u(img, p + 48, 8)) + "，应为 65536"); }
+        k = k + 1;
+    }
+    check(t, "entry", inText, "入口 " + toStr(entry) + " 不在可执行段里");
+    const native = hostTarget() == "linux" && hostArch() == "loongarch64";
+    const qemu = getEnv("TAIXU_QEMU_LOONGARCH64") ?? "";
+    const canRun = native || len(qemu) > 0;
+    if (!canRun) { print("SKIP run：不是龙芯 Linux 宿主，也没有设 TAIXU_QEMU_LOONGARCH64"); }
+    if (canRun) {
+        const r = runCopy(dir, "la64img", img, qemu)?;
+        check(t, "run", r.code == 0 && r.out == EXPECTED, "退出码 " + toStr(r.code) + "，输出 " + r.out + r.err);
+    }
+    // rtfn 的龙芯底层（A4d）：探针写出两个映像——逐项核对 rtfn 原语的 rtfn_ok 与除零的 rtfn_divzero。
+    step(compiler, plus(plus(list1("build"), list1("bootstrap/la64_rtfn_probe.tx")), plus(list1("--toolchain"), plus(list1("--out"), list1(join(dir, "rtfnprobe"))))), root)?;
+    const rtfnDir = join(dir, "rtfn");
+    if (!mkdirs(rtfnDir)) { return err("建不了 " + rtfnDir); }
+    const rp = capture(join(join(dir, "rtfnprobe"), exeName("la64_rtfn_probe")), list1(rtfnDir), root, 300000000000, 65536)?;
+    check(t, "rtfn-build", rp.code == 0 && trimEnd(rp.out) == "PASS_LA64_RTFN", rp.out + rp.err);
+    if (canRun && rp.code == 0) {
+        const ok = runCopy(dir, "rtfn_ok", readBytes(join(rtfnDir, "rtfn_ok"))?, qemu)?;
+        check(t, "rtfn-run", ok.code == 0 && ok.out == "la64 rtfn ok\n", "退出码 " + toStr(ok.code) + "（第几项不符），输出 " + ok.out + ok.err);
+        // 除零须被 break 7 终止：真内核转 SIGFPE，qemu-user 8.2.2 对一切 break 都给 SIGTRAP；没被终止时会以商（不定值）正常退出。
+        const dz = runCopy(dir, "rtfn_divzero", readBytes(join(rtfnDir, "rtfn_divzero"))?, qemu)?;
+        check(t, "rtfn-divzero", dz.code != 0 && dz.code != 7 && len(dz.out) == 0, "退出码 " + toStr(dz.code) + "，输出 " + dz.out);
+    }
+    // 生成的内核（A4d）：探针手写最小程序映像，与构建生成的两份龙芯内核链接，走完整启动链路并核对内核例程；第三个映像走致命路径。
+    step(compiler, plus(plus(list1("build"), list1("bootstrap/la64_kernel_probe.tx")), plus(list1("--toolchain"), plus(list1("--out"), list1(join(dir, "kernelprobe"))))), root)?;
+    const kernelDir = join(dir, "kernel");
+    if (!mkdirs(kernelDir)) { return err("建不了 " + kernelDir); }
+    const kernels = join(root, "bootstrap/nrt-kernel");
+    const kargs = plus(plus(list1(join(kernels, "kernel-linux-loongarch64.o")), list1(join(kernels, "kernel-linux-loongarch64-heapcheck.o"))), list1(kernelDir));
+    const kp = capture(join(join(dir, "kernelprobe"), exeName("la64_kernel_probe")), kargs, root, 300000000000, 65536)?;
+    check(t, "kernel-build", kp.code == 0 && strIndexOf(kp.out, "PASS_LA64_KERNEL") == 0, kp.out + kp.err);
+    if (canRun && kp.code == 0) {
+        const k1 = runCopy(dir, "kernel_ok", readBytes(join(kernelDir, "kernel_ok"))?, qemu)?;
+        check(t, "kernel-run", k1.code == 0 && k1.out == "la64 kernel ok\n", "退出码 " + toStr(k1.code) + "（第几项不符），输出 " + k1.out + k1.err);
+        const k2 = runCopy(dir, "kernel_heapcheck_ok", readBytes(join(kernelDir, "kernel_heapcheck_ok"))?, qemu)?;
+        check(t, "kernel-heapcheck-run", k2.code == 0 && k2.out == "la64 kernel ok\n", "退出码 " + toStr(k2.code) + "，输出 " + k2.out + k2.err);
+        // memcpy 的目标为空：跨度检查经致命锁写出诊断，以 134 退出。
+        const k3 = runCopy(dir, "kernel_panic", readBytes(join(kernelDir, "kernel_panic"))?, qemu)?;
+        check(t, "kernel-panic", k3.code == 134 && len(k3.out) == 0 && k3.err == "reached unreachable code\n", "退出码 " + toStr(k3.code) + "，输出 " + k3.out + k3.err);
+    }
+    return summary(t, "la64-image");
+}
+
+function main(args: []string): int {
+    return run(args) catch (e) {
+        eprint("test_la64_image: " + e.message);
+        return 1;
+    };
+}

@@ -1,0 +1,346 @@
+// aarch64-windows 的展开信息：每个带帧事件的函数一份完整形式的 .xdata（不用压缩的 .pdata 形式），由函数目录
+// 的帧事件与该函数的机器码生成——序言、尾声的每条指令解码成一个展开码，同时与这条指令所在范围的帧事件核对（压入／弹出的寄存器与
+// 字节、分配的字节、设帧指针、释放、返回）；对不上或遇到不认识的指令即拒绝，不写出可能错的展开信息。编码见微软的 ARM64 异常处理页，
+// 布局与 LLVM（MC 由 .seh_* 生成）相同，可逐字节对照：
+// - 序言的展开码按指令的逆序排列、以 end 结尾；尾声的按执行次序，ret 即 end。
+// - 尾声的码与前面写出的某个尾声相同即共用；否则若等于序言码在某条指令处起的后缀，起点指进序言码；再否则接在后面。
+// - 只有一个尾声且它在函数末尾时，起点放进头里（E＝1）：共用序言码的起点不超过 31 且序言码不超过 124 字节，或接在序言码后、序言码
+//   不超过 31 字节且两者合计不超过 124 字节；否则逐个写尾声范围（偏移与起点）。
+// - 码字节补齐到 4 字节（补 nop，0xE3）；尾声数（或 E＝1 时的起点）超过 31、码超过 124 字节时用扩展头。
+// - 函数长只有 18 位（以 4 字节计）：超过 1 MiB 的函数分片，每片一份 .pdata／.xdata（见 a64Unwind）。
+// 指令与展开码：stp x29, x30, [sp, #-n]! → save_fplr_x；stp x19, x20, [sp, #-n]!（n 不超过 248）→ save_r19r20_x，其余相邻成对 →
+// save_regp_x；str xR, [sp, #-n]! → save_reg_x；尾声里对应的 ldp／ldr 后变址同码；mov x29, sp → set_fp；尾声 mov sp, x29 → set_fp，
+// sub sp, x29, #n → add_fp；sub sp, sp, #n（序言）／add sp, sp, #n（尾声）→ alloc_s／m／l；栈探测（a64_asm.tx 的 a64FrameAlloc）的
+// mov／movk x15 与 bl __tx_chkstk 各一个 nop，sub sp, sp, x15, uxtx #4 按 x15×16 记分配；ret → end。
+// 函数目录只描述通用寄存器：回调外壳在序言之后另存的 d8–d15 不在展开信息里（同 x86 外壳的 xmm6–15 不在目录里）。
+import { NativeFunction, NativeFrameEvent, NativeEpilogue } from "./native_function_data";
+
+// 一个分片：相对函数起点的偏移、长度与 .xdata；函数不超过上限时只有一片。
+export struct A64UnwindFragment { offset: int, length: int, xdata: Bytes }
+export struct A64Unwind { ok: bool, error: string, fragments: List<Ref<A64UnwindFragment>> }
+struct Encoded { error: string, xdata: Bytes }
+// 一条指令：展开码字节、对照用的帧事实（"种类:寄存器:字节"；释放只记 "release-stack:31"，字节数由函数目录的校验对上分配）、
+// 执行后 x15 的已知值（栈探测的字节数／16，未知为 −1）。
+struct Decoded { error: string, codes: List<int>, facts: List<string>, x15: int }
+
+const END: int = 0xE4;
+const END_C: int = 0xE5;
+const NOP: int = 0xE3;
+const SET_FP: int = 0xE1;
+const ADD_FP: int = 0xE2;
+// 18 位的函数长与尾声偏移（以 4 字节计）、10 位的尾声起点；分片的长度上限（字节，同 LLVM）。
+const MAX_WORDS: int = 262143;
+const MAX_START: int = 1023;
+const SEG_LIMIT: int = 0xFFFFC;
+
+function noInts(): List<int> { return listNew(); }
+function word(code: Bytes, at: int): int {
+    return (bytesGet(code, at) catch 0) | ((bytesGet(code, at + 1) catch 0) << 8) | ((bytesGet(code, at + 2) catch 0) << 16) | ((bytesGet(code, at + 3) catch 0) << 24);
+}
+function signed(v: int, bits: int): int { if (v >= (1 << (bits - 1))) { return v - (1 << bits); } return v; }
+function fact(kind: string, reg: int, bytes: int): string { return kind + ":" + toStr(reg) + ":" + toStr(bytes); }
+
+// alloc_s（不到 512）、alloc_m（不到 32 KiB）、alloc_l（不到 256 MiB），单位 16 字节。
+function alloc(codes: List<int>, n: int): string {
+    if (n <= 0 || n % 16 != 0) { return "UnwindBadAllocation"; }
+    const x = n / 16;
+    if (x < 32) { listPush(codes, x); return ""; }
+    if (x < 2048) { listPush(codes, 0xC0 | (x >>> 8)); listPush(codes, x & 255); return ""; }
+    if (x < 16777216) { listPush(codes, 0xE0); listPush(codes, (x >>> 16) & 255); listPush(codes, (x >>> 8) & 255); listPush(codes, x & 255); return ""; }
+    return "UnwindAllocationTooLarge";
+}
+// 成对的写回存取（序言 stp 前变址、尾声 ldp 后变址），n 为 sp 的变化量。
+function pair(codes: List<int>, rt: int, rt2: int, n: int): string {
+    if (n <= 0 || n % 8 != 0) { return "UnwindBadPairOffset"; }
+    if (rt == 29 && rt2 == 30) {
+        if (n / 8 - 1 > 63) { return "UnwindBadPairOffset"; }
+        listPush(codes, 0x80 | (n / 8 - 1)); return "";
+    }
+    if (rt == 19 && rt2 == 20 && n <= 248) { listPush(codes, 0x20 | (n / 8)); return ""; }
+    if (rt >= 19 && rt <= 27 && rt2 == rt + 1 && n / 8 - 1 <= 63) {
+        const x = rt - 19;
+        listPush(codes, 0xCC | (x >>> 2)); listPush(codes, ((x & 3) << 6) | (n / 8 - 1)); return "";
+    }
+    return "UnwindUnsupportedPair";
+}
+// 单个寄存器的写回存取（序言 str 前变址、尾声 ldr 后变址）。
+function single(codes: List<int>, rt: int, n: int): string {
+    if (rt < 19 || rt > 28 || n <= 0 || n % 8 != 0 || n > 256) { return "UnwindUnsupportedSave"; }
+    const x = rt - 19;
+    listPush(codes, 0xD4 | (x >>> 3)); listPush(codes, ((x & 7) << 5) | (n / 8 - 1)); return "";
+}
+
+function decode(w: int, prolog: bool, x15: int): Ref<Decoded> {
+    const d = new Decoded { error: "", codes: listNew(), facts: listNew(), x15: x15 };
+    const rt = w & 31;
+    const rt2 = (w >>> 10) & 31;
+    if (prolog && (w & 0xFFC003E0) == 0xA98003E0) {
+        const n = -signed((w >>> 15) & 127, 7) * 8;
+        d.error = pair(d.codes, rt, rt2, n);
+        listPush(d.facts, fact("push-nonvolatile", rt2, n / 2)); listPush(d.facts, fact("push-nonvolatile", rt, n / 2));
+    } else if (!prolog && (w & 0xFFC003E0) == 0xA8C003E0) {
+        const n = signed((w >>> 15) & 127, 7) * 8;
+        d.error = pair(d.codes, rt, rt2, n);
+        listPush(d.facts, fact("pop-nonvolatile", rt, n / 2)); listPush(d.facts, fact("pop-nonvolatile", rt2, n / 2));
+    } else if (prolog && (w & 0xFFE00FE0) == 0xF8000FE0) {
+        const n = -signed((w >>> 12) & 511, 9);
+        d.error = single(d.codes, rt, n); listPush(d.facts, fact("push-nonvolatile", rt, n));
+    } else if (!prolog && (w & 0xFFE00FE0) == 0xF84007E0) {
+        const n = signed((w >>> 12) & 511, 9);
+        d.error = single(d.codes, rt, n); listPush(d.facts, fact("pop-nonvolatile", rt, n));
+    } else if (prolog && w == 0x910003FD) {
+        listPush(d.codes, SET_FP); listPush(d.facts, fact("set-frame-pointer", 29, 0));
+    } else if (!prolog && w == 0x910003BF) {
+        listPush(d.codes, SET_FP); listPush(d.facts, "release-stack:31");
+    } else if (!prolog && (w & 0xFFC003FF) == 0xD10003BF) {
+        const k = (w >>> 10) & 4095;
+        if (k % 8 != 0 || k / 8 > 255) { d.error = "UnwindBadFrameOffset"; }
+        listPush(d.codes, ADD_FP); listPush(d.codes, k / 8); listPush(d.facts, "release-stack:31");
+    } else if ((prolog && (w & 0xFF8003FF) == 0xD10003FF) || (!prolog && (w & 0xFF8003FF) == 0x910003FF)) {
+        const n = ((w >>> 10) & 4095) << (12 * ((w >>> 22) & 1));
+        d.error = alloc(d.codes, n);
+        if (prolog) { listPush(d.facts, fact("allocate-stack", 31, n)); } else { listPush(d.facts, "release-stack:31"); }
+    } else if (prolog && (w & 0xFF80001F) == 0xD280000F) {
+        listPush(d.codes, NOP); d.x15 = ((w >>> 5) & 65535) << (16 * ((w >>> 21) & 3));
+    } else if (prolog && x15 >= 0 && (w & 0xFF80001F) == 0xF280000F) {
+        const s = 16 * ((w >>> 21) & 3);
+        listPush(d.codes, NOP); d.x15 = x15 - (x15 & (65535 << s)) + (((w >>> 5) & 65535) << s);
+    } else if (prolog && (w & 0xFC000000) == 0x94000000) {
+        listPush(d.codes, NOP);
+    } else if (prolog && x15 > 0 && w == 0xCB2F73FF) {
+        d.error = alloc(d.codes, x15 * 16); listPush(d.facts, fact("allocate-stack", 31, x15 * 16));
+    } else if (!prolog && w == 0xD65F03C0) {
+        listPush(d.codes, END); listPush(d.facts, fact("return", -1, 0));
+    } else {
+        d.error = "UnwindUnsupportedInstruction:" + toStr(w);
+    }
+    return d;
+}
+
+function sameFacts(a: List<string>, b: List<string>): bool {
+    if (listLen(a) != listLen(b)) { return false; }
+    const used: List<bool> = listNew();
+    for (x in b) { listPush(used, false); }
+    for (x in a) {
+        let hit = false; let k = 0;
+        while (k < listLen(b)) {
+            if (!(listGet(used, k) catch true) && (listGet(b, k) catch "") == x) { listSet(used, k, true); hit = true; break; }
+            k = k + 1;
+        }
+        if (!hit) { return false; }
+    }
+    return true;
+}
+function sameInts(a: List<int>, b: List<int>): bool {
+    if (listLen(a) != listLen(b)) { return false; }
+    let k = 0;
+    while (k < listLen(a)) { if ((listGet(a, k) catch -1) != (listGet(b, k) catch -2)) { return false; } k = k + 1; }
+    return true;
+}
+function le(b: Bytes, value: int, width: int): void {
+    let i = 0;
+    while (i < width) { bytesPush(b, (value >>> (i * 8)) & 255); i = i + 1; }
+}
+function failed(out: Ref<A64Unwind>, why: string, at: int): Ref<A64Unwind> { out.error = why + "@" + toStr(at); return out; }
+
+// 一个分片的 .xdata。prolog 为序言码（逆序、末尾 end），bounds 为其中各条指令的码的起点；seqs、offsets、counts 为各尾声的码、相对
+// 函数起点的偏移、指令数；eps 为落在本片里的尾声的下标。没有序言的分片码以 end_c 开头、后接序言码（幻影序言，从片里展开用），
+// 既无序言又无尾声时 E＝1、起点指向 end_c（微软 ARM64 异常处理页“Function fragments”“Large functions”，LLVM 同）。
+function encode(prolog: List<int>, bounds: List<int>, seqs: List<List<int>>, offsets: List<int>, counts: List<int>,
+    segOffset: int, segLength: int, hasProlog: bool, eps: List<int>): Ref<Encoded> {
+    const out = new Encoded { error: "", xdata: bytesNew(0) };
+    const codes: List<int> = listNew();
+    let lead = 0;
+    if (!hasProlog) { listPush(codes, END_C); lead = 1; }
+    for (c in prolog) { listPush(codes, c); }
+    const prologBytes = listLen(prolog);
+    // 尾声的起点：同本片前面写出的尾声、序言码在某条指令处起的后缀、接在后面。
+    const starts: List<int> = listNew();
+    const shared: List<bool> = listNew();
+    const added: List<int> = listNew();
+    let k = 0;
+    while (k < listLen(eps)) {
+        const seq = listGet(seqs, listGet(eps, k) catch -1) catch noInts();
+        let start = -1;
+        let inProlog = false;
+        for (a in added) {
+            if (sameInts(listGet(seqs, listGet(eps, a) catch -1) catch noInts(), seq)) { start = listGet(starts, a) catch -1; break; }
+        }
+        const tail = prologBytes - listLen(seq);
+        if (start < 0 && tail >= 0) {
+            let same = false;
+            for (b in bounds) { if (b == tail) { same = true; break; } }
+            let i = 0;
+            while (same && i < listLen(seq)) { if ((listGet(prolog, tail + i) catch -1) != (listGet(seq, i) catch -2)) { same = false; } i = i + 1; }
+            if (same) { start = lead + tail; inProlog = true; }
+        }
+        if (start < 0) {
+            start = listLen(codes);
+            for (c in seq) { listPush(codes, c); }
+            listPush(added, k);
+        }
+        listPush(starts, start); listPush(shared, inProlog);
+        k = k + 1;
+    }
+    // 单尾声在片末：起点进头（E＝1）；门槛按不含 end_c 的序言码计（同 LLVM）。
+    let packed = -1;
+    if (listLen(eps) == 1) {
+        const q = listGet(eps, 0) catch -1;
+        const start = listGet(starts, 0) catch -1;
+        const seqBytes = listLen(listGet(seqs, q) catch noInts());
+        if (segOffset + segLength - (listGet(offsets, q) catch -1) == 4 * (listGet(counts, q) catch 0)) {
+            if (listGet(shared, 0) catch false) { if (start - lead <= 31 && prologBytes <= 124) { packed = start; } }
+            else if (prologBytes <= 31 && prologBytes + seqBytes <= 124) { packed = start; }
+        }
+    }
+    if (!hasProlog && listLen(eps) == 0) { packed = 0; }
+    const codeBytes = listLen(codes);
+    const words = (codeBytes + 3) / 4;
+    let count = listLen(eps);
+    if (packed >= 0) { count = packed; }
+    const extended = count > 31 || codeBytes > 124;
+    if (words > 255 || count > 65535) { out.error = "UnwindCodesTooLarge"; return out; }
+    let head = segLength / 4;
+    if (packed >= 0) { head = head | (1 << 21); }
+    if (!extended) { head = head | (count << 22) | (words << 27); }
+    le(out.xdata, head, 4);
+    if (extended) { le(out.xdata, (words << 16) | count, 4); }
+    if (packed < 0) {
+        k = 0;
+        while (k < listLen(eps)) {
+            const start = listGet(starts, k) catch -1;
+            const offset = ((listGet(offsets, listGet(eps, k) catch -1) catch -1) - segOffset) / 4;
+            if (start < 0 || start > MAX_START || offset < 0 || offset > MAX_WORDS) { out.error = "UnwindEpilogScopeTooLarge"; return out; }
+            le(out.xdata, offset | (start << 22), 4);
+            k = k + 1;
+        }
+    }
+    for (c in codes) { bytesPush(out.xdata, c); }
+    while (bytesLen(out.xdata) % 4 != 0) { bytesPush(out.xdata, NOP); }
+    return out;
+}
+
+/// f 的展开信息：一个或几个分片（超过 1 MiB 的函数按 LLVM 的切法分片，每片不超过 0xFFFFC 字节、不切开尾声），各带与位置无关的
+/// .xdata（没有异常处理例程，不含 RVA）；code 为 f 所在输入节的内容，f 的偏移以它为准。没有帧事件的函数（叶函数、边界）不该调用：
+/// 由调用方略去，系统按叶函数处理。
+export function a64Unwind(f: Ref<NativeFunction>, code: Bytes): Ref<A64Unwind> {
+    const out = new A64Unwind { ok: false, error: "", fragments: listNew() };
+    const length = f.end - f.begin;
+    if (f.stackModel != "fixed-call" || listLen(f.events) == 0) { return failed(out, "UnwindNoFrame", 0); }
+    if (f.begin < 0 || f.begin % 4 != 0 || length <= 0 || length % 4 != 0 || f.end > bytesLen(code)) { return failed(out, "UnwindBadFunctionRange", 0); }
+    // 逐组解码（同一指令范围的事件为一组）并核对；序言的组从函数开头首尾相接到序言末，各尾声的组从尾声起点首尾相接到它的末尾。
+    const prolog: List<List<int>> = listNew();
+    const seqs: List<List<int>> = listNew();
+    const missing = new NativeFrameEvent { before: -1, after: -1, kind: "", reg: -1, bytes: 0 };
+    const noRange = new NativeEpilogue { begin: -1, end: -1 };
+    let cursor = f.begin;
+    let ep = -1;
+    let epEnd = -1;
+    let epCursor = -1;
+    let i = 0;
+    const n = listLen(f.events);
+    while (i < n) {
+        const e = listGet(f.events, i) catch missing;
+        let j = i + 1;
+        while (j < n && (listGet(f.events, j) catch e).before == e.before && (listGet(f.events, j) catch e).after == e.after) { j = j + 1; }
+        const pro = e.before < f.prologueEnd;
+        if (pro) {
+            if (e.before != cursor || e.after > f.prologueEnd) { return failed(out, "UnwindPrologGap", e.before - f.begin); }
+            cursor = e.after;
+        } else {
+            if (ep < 0 || e.before >= epEnd) {
+                if (ep >= 0 && epCursor != epEnd) { return failed(out, "UnwindEpilogGap", epCursor - f.begin); }
+                ep = ep + 1;
+                if (ep >= listLen(f.epilogues)) { return failed(out, "UnwindFrameOutsideEpilog", e.before - f.begin); }
+                const range = listGet(f.epilogues, ep) catch noRange;
+                epCursor = range.begin; epEnd = range.end;
+                listPush(seqs, listNew());
+            }
+            if (e.before != epCursor || e.after > epEnd) { return failed(out, "UnwindEpilogGap", e.before - f.begin); }
+            epCursor = e.after;
+        }
+        const facts: List<string> = listNew();
+        let x15 = -1;
+        let at = e.before;
+        while (at < e.after) {
+            const d = decode(word(code, at), pro, x15);
+            if (len(d.error) > 0) { return failed(out, d.error, at - f.begin); }
+            x15 = d.x15;
+            for (s in d.facts) { listPush(facts, s); }
+            if (pro) { listPush(prolog, d.codes); }
+            else {
+                const seq = listGet(seqs, listLen(seqs) - 1) catch noInts();
+                for (c in d.codes) { listPush(seq, c); }
+            }
+            at = at + 4;
+        }
+        const expect: List<string> = listNew();
+        let k = i;
+        while (k < j) {
+            const ev = listGet(f.events, k) catch e;
+            if (ev.kind == "release-stack") { listPush(expect, "release-stack:31"); } else { listPush(expect, fact(ev.kind, ev.reg, ev.bytes)); }
+            k = k + 1;
+        }
+        if (!sameFacts(facts, expect)) { return failed(out, "UnwindFrameEventMismatch", e.before - f.begin); }
+        i = j;
+    }
+    if (cursor != f.prologueEnd) { return failed(out, "UnwindPrologGap", cursor - f.begin); }
+    if (ep + 1 != listLen(f.epilogues) || (ep >= 0 && epCursor != epEnd)) { return failed(out, "UnwindEpilogGap", epCursor - f.begin); }
+    // 序言码：逐条指令逆序，记下每条指令的码在数组里的起点（尾声只在这些位置共用），末尾 end。
+    const codes: List<int> = listNew();
+    const bounds: List<int> = listNew();
+    let p = listLen(prolog) - 1;
+    while (p >= 0) {
+        listPush(bounds, listLen(codes));
+        for (c in listGet(prolog, p) catch noInts()) { listPush(codes, c); }
+        p = p - 1;
+    }
+    listPush(bounds, listLen(codes));
+    listPush(codes, END);
+    // 各尾声相对函数起点的偏移、指令数（每条指令一个码）与最后一条指令（ret）的偏移；尾声须以 ret（end）结尾。
+    const offsets: List<int> = listNew();
+    const counts: List<int> = listNew();
+    const lasts: List<int> = listNew();
+    let q = 0;
+    while (q < listLen(seqs)) {
+        const seq = listGet(seqs, q) catch noInts();
+        const range = listGet(f.epilogues, q) catch noRange;
+        if (listLen(seq) == 0 || (listGet(seq, listLen(seq) - 1) catch 0) != END) { return failed(out, "UnwindEpilogWithoutReturn", range.begin - f.begin); }
+        listPush(offsets, range.begin - f.begin); listPush(counts, (range.end - range.begin) / 4); listPush(lasts, range.end - 4 - f.begin);
+        q = q + 1;
+    }
+    // 分片（同 LLVM 的 ARM64FindSegmentsInFunction）：超过上限时从前往后切，片末落在某个尾声当中就把片末退到该尾声起点。
+    const segOffsets: List<int> = listNew();
+    const segLengths: List<int> = listNew();
+    const segEps: List<List<int>> = listNew();
+    let segOffset = 0;
+    let e2 = 0;
+    const ne = listLen(seqs);
+    let remaining = length;
+    while (remaining > SEG_LIMIT) {
+        let segLength = SEG_LIMIT;
+        const segEnd = segOffset + segLength;
+        const inSeg: List<int> = listNew();
+        while (e2 < ne && (listGet(lasts, e2) catch 0) < segEnd) { listPush(inSeg, e2); e2 = e2 + 1; }
+        if (e2 < ne && (listGet(offsets, e2) catch 0) <= segEnd) { segLength = (listGet(offsets, e2) catch 0) - segOffset; }
+        if (segLength <= 0) { return failed(out, "UnwindEmptyFragment", segOffset); }
+        listPush(segOffsets, segOffset); listPush(segLengths, segLength); listPush(segEps, inSeg);
+        segOffset = segOffset + segLength;
+        remaining = remaining - segLength;
+    }
+    const rest: List<int> = listNew();
+    while (e2 < ne) { listPush(rest, e2); e2 = e2 + 1; }
+    listPush(segOffsets, segOffset); listPush(segLengths, length - segOffset); listPush(segEps, rest);
+    if ((listGet(segLengths, 0) catch 0) < f.prologueEnd - f.begin) { return failed(out, "UnwindPrologAcrossFragments", 0); }
+    let s = 0;
+    while (s < listLen(segOffsets)) {
+        const off = listGet(segOffsets, s) catch 0;
+        const len2 = listGet(segLengths, s) catch 0;
+        const x = encode(codes, bounds, seqs, offsets, counts, off, len2, s == 0, listGet(segEps, s) catch noInts());
+        if (len(x.error) > 0) { return failed(out, x.error, off); }
+        listPush(out.fragments, new A64UnwindFragment { offset: off, length: len2, xdata: x.xdata });
+        s = s + 1;
+    }
+    out.ok = true;
+    return out;
+}

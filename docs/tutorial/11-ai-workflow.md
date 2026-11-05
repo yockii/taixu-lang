@@ -63,7 +63,7 @@ Agent 面对陌生环境的第一步：`capabilities` 探测、`doc` 取 API 面
   给 Agent，它即可学会太虚；
 - 面向大模型的完整语言生成指南 [llm-guide-s1.md](../ai/llm-guide-s1.md)、
   可分发的 [Skill 包](../../skill/taixu/SKILL.md)、工具链
-  [兼容变更](../ai/toolchain-changes.md)与[语言规范](../design/D3-s1-language-spec-v0.42.md)
+  [兼容变更](../ai/toolchain-changes.md)与语言规范
   ——需要更深的规范细节时取用。
 
 ## 最小 Agent 会话（示例剧本）

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""LSP 内建表的门（第 6 轮 6d-3b1；设计 docs/design/v052-round6-lsp-mcp-v0.1-20261019.md §四-5）。
+"""LSP 内建表的门。
 
 bootstrap/selfhost/lsp_builtins.tx 是 hover、signatureHelp、completion 用的内建表。本门是纯源码检查：
 1. 表里每一条的签名等于 D3（docs/design/ 下版本号最大的 D3-s1-language-spec-v*.md）§7 内建表同名行的签名，
@@ -8,7 +8,8 @@ bootstrap/selfhost/lsp_builtins.tx 是 hover、signatureHelp、completion 用的
 2. 表的名字集合等于 D3 §7 的名字集合，也等于 semamirror 的 builtinOf 认的、用户能写的名字（不含 `#` 开头与
    `__rt` 开头的内部内建）——三者任何一处增删都须同步；
 3. 表里“仅 --toolchain”的标记与 builtinOf 的号段一致（35 writeExecutable、50..56、79 hostArch、86 setEnv、3584..3599，同 semamirror 的
-   checkSysBuiltin、checkToolBuiltin 与 35 号的检查）。
+   checkSysBuiltin、checkToolBuiltin 与 35 号的检查；D3 v0.52 起 26 strSub、27 strIndexOf、87 strByteSub、88 strByteIndexOf 只在种子
+   换代前的 --toolchain 构建里收，同 semamirror 的 strOldNameDiag）。
 
 用法（仓根执行）：python scripts/test-lsp-builtins.py
 """
@@ -84,7 +85,7 @@ def builtin_ids(text):
 
 
 def is_toolchain(bid):
-    return bid == 35 or 50 <= bid <= 56 or bid == 79 or bid == 86 or 3584 <= bid <= 3615
+    return bid in (26, 27, 35, 79, 86, 87, 88) or 50 <= bid <= 56 or 3584 <= bid <= 3615
 
 
 def table_rows(text):

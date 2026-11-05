@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Native debug session gate (round 6 step 6c-4b, docs/design/v052-round6-debug-v0.1-20261018.md §六).
+"""Native debug session gate (round 6 step).
 
 Runs every proto case of tests/debug/cases.json against the native `taixu run --debug` with the same driver
 that recorded the VM transcripts (scripts/debug-baseline.py run_proto), then checks two things:
@@ -22,13 +22,13 @@ that recorded the VM transcripts (scripts/debug-baseline.py run_proto), then che
 inspect replies for the native named slots that are not none are compared node by node with the VM's reply for
 the same slot (section 五 differences allowed by name).
 
-DAP cases (round 6 step 6c-5b): the `dap` cases of tests/debug/cases.json run against the native `taixu dap`; the
+DAP cases (round 6 step): the `dap` cases of tests/debug/cases.json run against the native `taixu dap`; the
 transcript is compared with tests/debug/native/dap/<case>.dap (normalized as above) and with the VM transcript for
 the program's stdout text, the exit code (when both report one) and where the first stop lands (function and line);
 everything else differs
-by design (docs/design/v052-round6-debug-v0.1-20261018.md §四-8, §五).
+by design (§五).
 
-MCP cases (round 6 step 6c-6): the `mcp` cases of tests/debug/cases.json run against the native `taixu mcp`; the
+MCP cases (round 6 step): the `mcp` cases of tests/debug/cases.json run against the native `taixu mcp`; the
 transcript is compared with tests/debug/native/mcp/<case>.mcp (normalized as above) and with the VM transcript:
 initialize's result apart from the added serverInfo.version; the sequence of replies other than stopped (consecutive
 equal ones merged): JSON-RPC error messages, `ok:false` texts, the reply event names and debug_start's start event;
@@ -57,7 +57,7 @@ dbl = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(dbl)
 
 OBJ = re.compile(r'#\d+')
-# 有意差别（调试实施设计 §五）：VM 报的错、原生改正后的回执。
+# 有意差别：VM 报的错、原生改正后的回执。
 ALLOWED_ERRORS = {
     'multi-bp': {'未知模块（见 ready 事件的 modules 清单）'},
 }
@@ -66,6 +66,9 @@ NATIVE_ONLY_ERRORS = {
 }
 # VM 进程 panic（没有终结事件）、原生照常收尾的用例。
 VM_PANICS = {'errors-negative-line'}
+# D3 v0.53：任务在同步入口（main）的 await 里就地运行，原生的任务帧之下多一层入口帧（栈底的 main，停点深度＋1）；
+# VM 冻结于 v0.17，任务在 main 返回后由调度泵运行。对照时去掉这一层再比。
+ENTRY_AWAIT = {'async-bp'}
 
 
 def same_brief(native, vm):
@@ -95,7 +98,7 @@ def norm_native(text):
     for line in text.splitlines():
         if line.startswith('< '):
             msg = json.loads(line[2:])
-            # TOOL-98: product versions evolve independently of debug behavior.
+            # product versions evolve independently of debug behavior.
             # Actual CLI/LSP/MCP agreement is checked by test-toolchain-contract.
             result = msg.get('result', {}) if isinstance(msg, dict) else {}
             if isinstance(result, dict) and 'protocolVersion' in result:
@@ -201,8 +204,8 @@ def inspect_pairs(text):
 
 
 def same_node(n, v, path, issues):
-    """An inspect node agrees with the VM's, allowing the differences listed in docs/design/v052-round6-debug-v0.1-20261018.md
-    section 五 (object numbers, the VM's broken UTF-8 tail, type and variant names the VM lacks for enums made by `new`,
+    """An inspect node agrees with the VM's, allowing the documented intentional differences
+    (object numbers, the VM's broken UTF-8 tail, type and variant names the VM lacks for enums made by `new`,
     the kind name, payload and cause native gives error enum values)."""
     if n.get('tag') != v.get('tag') or n.get('name') != v.get('name'):
         issues.append('%s: tag/name %r/%r vs VM %r/%r' % (path, n.get('tag'), n.get('name'), v.get('tag'), v.get('name')))
@@ -280,7 +283,7 @@ def mcp_kind(reply):
     if 'error' in reply:
         return ('error', reply['error'].get('message'))
     if 'result' in reply:
-        # 6d-4a: the same tool-argument validation text now travels in an isError result.
+        # the same tool-argument validation text now travels in an isError result.
         # Golden comparison checks the actual new shape; this VM cross-check compares only its message.
         r = reply['result']
         content = r.get('content', []) if isinstance(r, dict) else []
@@ -389,6 +392,8 @@ def cross_check(case, nat, vm, issues):
     if not continue_only:
         return
     sn, sv = merged_stops(nat), merged_stops(vm)
+    if case['name'] in ENTRY_AWAIT:
+        sn = [(f, ln, dp - 1) for f, ln, dp in sn]
     if sn != sv:
         issues.append('stops differ: %r vs %r' % (sn, sv))
         return
@@ -396,6 +401,8 @@ def cross_check(case, nat, vm, issues):
     fv = frames_by_stop(vm)
     for k in sorted(set(fn_) & set(fv)):
         a, b = fn_[k], fv[k]
+        if case['name'] in ENTRY_AWAIT and a and a[0]['fn'] == 'main':
+            a = a[1:]
         if [f['fn'] for f in a] != [f['fn'] for f in b]:
             issues.append('stack shape differs: %r vs %r' % ([f['fn'] for f in a], [f['fn'] for f in b]))
             continue

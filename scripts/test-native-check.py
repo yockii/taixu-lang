@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""LSP 检查入口 drvCheck 的门（第 6 轮 6d-1；设计 docs/design/v052-round6-lsp-mcp-v0.1-20261019.md §三-6）。
+"""LSP 检查入口 drvCheck 的门。
 
 经隐藏开发命令 `taixu dev-check` 调用原生编译器的 drvCheck，三组检查：
 
@@ -16,12 +16,15 @@
    （常驻进程里的状态复位，如 semamirror 的 smStSize）。
 3. scenario：覆盖层（打开文档未保存的内容、未保存的新文件）、导入失败继续、embedBytes（存在、目录、
    超过 64 MiB）的专用用例，断言诊断的码、模块路径与行列，embedBytes 各例另断言消息里的原因并与 build 的
-   文本对照；另按主机查非普通文件（设计 §三-6 补定）：Linux 上在系统临时目录建 FIFO 与指向 /dev/zero 的
+   文本对照；另按主机查非普通文件（补定）：Linux 上在系统临时目录建 FIFO 与指向 /dev/zero 的
    符号链接，Windows 上查 data/NUL（设备），检查与 build 都须在 60 s 内结束并报 not a regular file。
-4. target（D3 v0.35，macOS 适配 M0b）：按目标选文件的四档（x_<os>_<arch>、x_<os>、x_unix、x）在 windows、linux 与只用于
+4. target（D3 v0.35）：按目标选文件的四档（x_<os>_<arch>、x_<os>、x_unix、x）在 windows、linux 与只用于
    分析的 macOS（x86_64、aarch64）上各选到期望的文件；同组兄弟的导出面比对覆盖新后缀与覆盖层；被调用的 from syscall
    在 windows、macOS 上于检查时即报 3033（文案按目标），linux 无诊断；导入写法与磁盘不一致（文件名、目录名）在任何
-   宿主上报同一条 3008，只差大小写的目标文件不被选中；产物命令拒绝 macOS 目标（退出码 64）。
+   宿主上报同一条 3008，只差大小写的目标文件不被选中；产物命令拒绝 macOS 目标（退出码 64）。D3 v0.47：
+   aarch64、loongarch64、riscv64 Linux 上，from syscall 的数字（x86_64 的号）写在普通文件里报 3033、写在该架构的
+   _linux_<架构> 文件里通过；名字形态按各架构的内核号表查，目标上没有的报 3033 并给替代调用；aarch64-linux（
+   出产物）、loongarch64-linux（A4e 起）、riscv64-linux（A5e 起）与 linux 一样构建报同一条、无诊断时构建成功。
 
 用法（仓根执行）：
   python scripts/test-native-check.py --compiler <原生 taixu> [--target windows|linux] [--work 目录] [--only corpus,resident,scenario,target]
@@ -115,6 +118,11 @@ def judge(build_rc, build_err, check_text):
     if len(b) < len(c) and c[:len(b)] == b and any(('error 3008:' in l) or ('error 3009:' in l) or ('无有效恢复 AST' in l) for l in b):
         return 'CONTINUE', ''
     return 'FAIL', 'build=%r check=%r' % (b[:6], c[:6])
+
+
+# 只用于分析的目标（A1）：dev-check 可用，产物命令拒绝。aarch64-linux 自 A2、loongarch64-linux 自 A4e、
+# riscv64-linux 自 A5e 起出产物；aarch64-windows 自 A6b 起经这一档接入、A6c 起出产物（B18），现在没有。
+ANALYSIS_ONLY = ()
 
 
 def check_cmd(compiler, target, flags, entries, overlays=()):
@@ -249,7 +257,7 @@ def scenarios(compiler, targets, work, report):
         ('embed-none', 'emb-none.tx', [], lambda g: g == [(3102, 'emb-none.tx', 2, 15)]),
         ('embed-after-sema-error', 'emb-sema.tx', [], lambda g: g == [(3002, 'emb-sema.tx', 2, 5), (3102, 'emb-sema.tx', 3, 15)]),
     ]
-    # The reason inside the 3102 message (LSP 与 MCP 实施设计 §三-6 补定).
+    # The reason inside the 3102 message (补定).
     reasons = {
         'embed-big': 'embedBytes 文件超过 64MB：data/big.bin',
         'embed-dir': '（not a regular file: ',
@@ -321,6 +329,21 @@ def target_scenarios(compiler, work, report):
     write(root / 'case-variant.tx', 'import { which } from "./lib3/v";\n\nexport function main(args: []string): int {\n    return which();\n}\n')
     write(root / 'sys.tx', 'declare function getpid(): i32 from syscall 39;\ndeclare function unused(fd: i32): i32 from syscall 3;\n\n'
           'export function main(args: []string): int {\n    return getpid() as int;\n}\n')
+    # D3 v0.47：名字形态；数字写在架构专用文件里（aarch64 的 getpid 是 172）；目标上没有的名字与根本不是系统调用的名字。
+    main_of = 'export function main(args: []string): int {\n    return %s;\n}\n'
+    write(root / 'sysn.tx', 'declare function getpid(): i32 from syscall "getpid";\ndeclare function close(fd: i32): i32 from syscall "close";\n\n'
+          + main_of % 'getpid() as int + close(-1) as int')
+    write(root / 'lib/sysa_linux_aarch64.tx', 'declare function pid(): i32 from syscall 172;\n\nexport function getpid(): int {\n    return pid() as int;\n}\n')
+    write(root / 'lib/sysa.tx', 'export function getpid(): int {\n    return 0;\n}\n')
+    write(root / 'sysa.tx', 'import { getpid } from "./lib/sysa";\n\n' + main_of % 'getpid()')
+    write(root / 'sysp.tx', 'declare function poll(fds: Bytes, n: usize, ms: i32): i32 from syscall "poll";\n\n'
+          + main_of % 'poll(bytesNew(0), 0, 0) as int')
+    write(root / 'sysr.tx', 'declare function renameat(a: i32, b: string, c: i32, d: string): i32 from syscall "renameat";\n\n'
+          + main_of % 'renameat(-100, "a", -100, "b") as int')
+    write(root / 'sysu.tx', 'declare function nope(): i32 from syscall "nosuchcall";\n\n' + main_of % 'nope() as int')
+    # 号表里有、但龙芯不提供的 fstat（最低内核 5.19 上没有），提示 statx；别的架构照常。
+    write(root / 'sysf.tx', 'declare function fstat(fd: i32, st: Bytes): i32 from syscall "fstat";\n\n'
+          + main_of % 'fstat(0, bytesNew(256)) as int')
 
     def p(name):
         return str(root / name)
@@ -331,20 +354,48 @@ def target_scenarios(compiler, work, report):
     win_hint, mac_hint = '（Windows 实现请放在 _windows 文件里', '（macOS 不提供稳定的系统调用接口'
     # (target, name, entry, overlays, predicate, text that must appear, text that must not)
     cases = [
-        ('windows', 'pick-os-arch', 'sel.tx', [], picked('pick_windows_x86_64'), '', ''),
+        # 写三元组：arm64 宿主上不带架构的 windows 取 aarch64-windows（A6），那里另有一行。
+        ('x86_64-windows', 'pick-os-arch', 'sel.tx', [], picked('pick_windows_x86_64'), '', ''),
         ('linux', 'pick-os', 'sel.tx', [], picked('pick_linux'), '', ''),
         ('x86_64-macos', 'pick-os-x86_64', 'sel.tx', [], picked('pick_macos'), '', ''),
         ('aarch64-macos', 'pick-os-aarch64', 'sel.tx', [], picked('pick_macos'), '', ''),
+        # aarch64-windows：不取 x86_64 的 _windows_x86_64，也不按 unix 选（B18）。
+        ('aarch64-windows', 'pick-os-aarch64-windows', 'sel.tx', [], picked('pick'), '', ''),
         ('windows', 'pick-base', 'sel2.tx', [], picked('pick2'), '', ''),
         ('linux', 'pick-unix', 'sel2.tx', [], picked('pick2_unix'), '', ''),
         ('macos', 'pick-unix-macos', 'sel2.tx', [], picked('pick2_unix'), '', ''),
+        ('aarch64-windows', 'pick-base-aarch64-windows', 'sel2.tx', [], picked('pick2'), '', ''),
         ('windows', 'siblings-same', 'sib.tx', [], lambda g: g == [], '', ''),
         ('windows', 'siblings-overlay', 'sib.tx', [(p('lib/vs_unix.tx'), root / 'ov/vs_unix.txt')],
          lambda g: g == [(3033, 'sib.tx', 1, 1)], "vs_unix.tx 导出 'g'，vs.tx 没有", ''),
         ('linux', 'siblings-new-suffix', 'sib2.tx', [], lambda g: g == [(3033, 'sib2.tx', 1, 1)], 'vs2_macos_aarch64.tx 中为', ''),
         ('windows', 'syscall-windows', 'sys.tx', [], lambda g: g == [(3033, 'sys.tx', 1, 18)], win_hint, 'unused'),
+        ('aarch64-windows', 'syscall-windows-aarch64', 'sys.tx', [], lambda g: g == [(3033, 'sys.tx', 1, 18)], win_hint, 'unused'),
         ('macos', 'syscall-macos', 'sys.tx', [], lambda g: g == [(3033, 'sys.tx', 1, 18)], mac_hint, 'unused'),
-        ('linux', 'syscall-linux', 'sys.tx', [], lambda g: g == [], '', ''),
+        # 数字形态是 x86_64 的号：写明三元组（不带架构的 linux 在 arm64 宿主上取 aarch64-linux）。
+        ('x86_64-linux', 'syscall-linux', 'sys.tx', [], lambda g: g == [], '', ''),
+        ('linux', 'syscall-name-linux', 'sysn.tx', [], lambda g: g == [], '', ''),
+        ('aarch64-linux', 'syscall-name-aarch64', 'sysn.tx', [], lambda g: g == [], '', ''),
+        ('riscv64-linux', 'syscall-name-riscv64', 'sysn.tx', [], lambda g: g == [], '', ''),
+        ('aarch64-linux', 'syscall-number-aarch64', 'sys.tx', [], lambda g: g == [(3033, 'sys.tx', 1, 18)],
+         '数字按 x86_64 的系统调用号解释（x86_64 上是 getpid），不能用于 aarch64 目标', 'unused'),
+        ('loongarch64-linux', 'syscall-number-loongarch64', 'sys.tx', [], lambda g: g == [(3033, 'sys.tx', 1, 18)],
+         '改写为 from syscall "getpid"', 'unused'),
+        ('aarch64-linux', 'syscall-archfile-aarch64', 'sysa.tx', [], lambda g: g == [], '', ''),
+        ('x86_64-linux', 'syscall-name-poll-x86_64', 'sysp.tx', [], lambda g: g == [], '', ''),
+        ('aarch64-linux', 'syscall-name-poll-aarch64', 'sysp.tx', [], lambda g: g == [(3033, 'sysp.tx', 1, 18)],
+         'aarch64 上没有这个系统调用（Linux v7.3 的号表），改用 "ppoll"', ''),
+        ('aarch64-linux', 'syscall-name-renameat-aarch64', 'sysr.tx', [], lambda g: g == [], '', ''),
+        ('loongarch64-linux', 'syscall-name-renameat-loongarch64', 'sysr.tx', [], lambda g: g == [(3033, 'sysr.tx', 1, 18)],
+         'loongarch64 上没有这个系统调用（Linux v7.3 的号表），改用 "renameat2"', ''),
+        ('loongarch64-linux', 'syscall-name-fstat-loongarch64', 'sysf.tx', [], lambda g: g == [(3033, 'sysf.tx', 1, 18)],
+         'loongarch64 上不提供这个系统调用（内核 6.11 才补回，龙芯的最低内核 5.19 上没有；glibc、musl、Go 在龙芯上都只用 statx），改用 "statx"', ''),
+        ('aarch64-linux', 'syscall-name-fstat-aarch64', 'sysf.tx', [], lambda g: g == [], '', ''),
+        ('riscv64-linux', 'syscall-name-fstat-riscv64', 'sysf.tx', [], lambda g: g == [], '', ''),
+        ('riscv64-linux', 'syscall-name-unknown', 'sysu.tx', [], lambda g: g == [(3033, 'sysu.tx', 1, 18)],
+         '声明为 from syscall "nosuchcall"：不是 Linux 的系统调用名', ''),
+        ('linux', 'syscall-name-unknown-x86_64', 'sysu.tx', [], lambda g: g == [(3033, 'sysu.tx', 1, 18)],
+         '不是 Linux 的系统调用名', ''),
         ('windows', 'case-exact', 'case-ok.tx', [], lambda g: g == [], '', ''),
         ('windows', 'case-file', 'case-file.tx', [], lambda g: g == [(3008, 'case-file.tx', 1, 1), (3001, 'case-file.tx', 4, 12)], "'case.tx' 在磁盘上为 'Case.tx'", ''),
         ('linux', 'case-dir', 'case-dir.tx', [], lambda g: g == [(3008, 'case-dir.tx', 1, 1), (3001, 'case-dir.tx', 4, 12)], "'Lib2' 在磁盘上为 'lib2'", ''),
@@ -361,10 +412,15 @@ def target_scenarios(compiler, work, report):
             text = block['text'] or ''
             ok = consistent(block) and pred(got) and must in text and (not must_not or must_not not in text)
             detail = '' if ok else 'got %r %r' % (got, text[-300:])
-        if ok and name.startswith('syscall'):
+        if ok and name.startswith('syscall') and target in ANALYSIS_ONLY:
+            # 只用于分析的目标：产物命令以 64 拒绝并说明（D3 v0.47）。
+            brc, _, berr = run([compiler, 'build', p(entry), '--target=' + target, '--out', work / 'target-out' / name], cwd=root)
+            ok = brc == 64 and '目前只用于分析' in berr
+            detail = '' if ok else 'build: exit %d %r' % (brc, berr[-300:])
+        elif ok and name.startswith('syscall'):
             # 构建报同一条（语义分析阶段即停，不再到构建尾部）。
             brc, _, berr = run([compiler, 'build', p(entry), '--target=' + target, '--out', work / 'target-out' / name], cwd=root)
-            ok = judge(brc, berr, text)[0] == 'PASS' if target != 'linux' else brc == 0
+            ok = judge(brc, berr, text)[0] == 'PASS' if not (target.endswith('linux') and not got) else brc == 0
             detail = '' if ok else 'vs build: exit %d %r' % (brc, berr[-300:])
         status = 'PASS' if ok else 'FAIL'
         bad += not ok
@@ -376,7 +432,7 @@ def target_scenarios(compiler, work, report):
 
 
 def macos_products(compiler, root, work, report):
-    """x86_64-macos 产物（docs/design/v052-macos-m1-macho-v0.1-20261024.md、v052-macos-m2-runtime-v0.1-20261024.md）：交叉构建、
+    """x86_64-macos 产物：交叉构建、
     独立校验器（含篡改负例；外部函数产物带第二个 dylib、按库序号绑定）、两次构建逐字节相同；工具链与插桩构建（M3）；aarch64-macos 构建得 Mach-O arm64（M4），
     尚无 A64 指令清单的命令、尚未支持的形态与写错的库名按文案拒绝。目标一律写三元组（不带架构的 macos 按宿主架构取）。在测试机上运行见 test-nrt-products.py --target macos。"""
     write(root / 'mac-ffi.tx', 'declare function getpid(): i32 from "libSystem";\ndeclare function zlibVersion(): string from "/usr/lib/libz.1.dylib";\n\n'
@@ -443,7 +499,7 @@ def macos_products(compiler, root, work, report):
             rc, o, err = run([sys.executable, str(ROOT / 'scripts' / 'macho_check.py'), str(dest / exe)], cwd=ROOT)
             ok = rc == 0 and 'arch=arm64' in o
         row('aarch64-' + case + '-macho-check', ok, 'exit %d %r' % (rc, (o + err)[-300:]))
-    # A64 的原生指令清单与编译画像（设计 A11；清单与代码逐字对照在 test-native-disasm）。
+    # A64 的原生指令清单与编译画像（清单与代码逐字对照在 test-native-disasm）。
     rc, o, err = run([compiler, 'disasm', root / 'sib.tx', '--target=aarch64-macos'], cwd=root)
     row('disasm-aarch64', rc == 0 and 'function main' in o and 'stp x29, x30, [sp, #-16]!' in o and 'ret x30' in o
         and '.inst' not in o, 'exit %d %r' % (rc, (o + err)[-300:]))

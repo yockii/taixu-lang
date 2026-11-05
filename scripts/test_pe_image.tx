@@ -1,0 +1,553 @@
+// PE32+ 映像的头部约定（x86_64-windows PE 规范化，设计稿 docs/design/v052-pe-x64-normalize-v0.1-20261103.md；gate.tx 的
+// pe-image 步）：任何宿主上交叉编出 x86_64-windows 的 hello、调试基准 basic 与 aarch64-windows 的 hello，各编两次须逐字节相同，
+// 逐个读产物核对（不经编译器的代码，按 PE 格式与设计稿第六节）：
+// - 链接器版本＝工具链版本的主、次号（取自 capabilities 的 toolchain_version）；映像版本 0.0；堆提交 4 KiB；
+// - SizeOfCode／SizeOfInitializedData／SizeOfUninitializedData 等于节表里代码节／已初始化数据节／未初始化数据节的文件大小之和；
+// - 首选基址 0x140000000；DllCharacteristics 含 HIGH_ENTROPY_VA｜DYNAMIC_BASE｜NX_COMPAT｜TERMINAL_SERVER_AWARE，COFF 头不带
+//   RELOCS_STRIPPED、带 LARGE_ADDRESS_AWARE（P2）；
+// - 基址重定位（数据目录 5）：逐块解开——块的页 RVA 按 4 KiB 对齐、块长 8＋2n 且为 4 的倍数，类型只有 DIR64（10），ABSOLUTE（0）只作
+//   块末补齐；每处落在某节有文件内容的字节上、不重复，所存的 8 字节值指向映像内；TLS 目录（数据目录 9）的四个 VA 都有重定位；
+//   反查完整性：非代码、非可丢弃节的文件内容里，任一偏移上的 8 字节值若落在映像内，该处须有重定位（代码节不查——指令字节常凑成
+//   这种值，而代码只用 RIP 相对寻址）；
+// - TimeDateStamp＝内容哈希：时间戳、校验和两字段置零后，整个文件按 8 字节小端字推进 FNV-1a（64 位初值与乘数、环绕乘），每步把
+//   高 32 位异或进低位，末尾不足 8 字节的补零成一字，最后并入文件长度，取低 32 位；
+// - CheckSum：逐个 16 位小端字反码累加（校验和字段按零计），折成 16 位再加文件长度（imagehlp 的 CheckSumMappedFile；写法有意与
+//   pe_image.tx 的 8 字节累加不同，两边互证）。
+// - x86_64 的展开信息（数据目录 3，P3）：.pdata 每项 12 字节，按起点升序、互不重叠、都在 .text 里；UNWIND_INFO 4 字节对齐、版本 1、
+//   无标志、序言不超过函数长；展开码逐个解开（PUSH_NONVOL、ALLOC_SMALL／LARGE、SET_FPREG），按码偏移升序逐条对照从函数起点解码的
+//   序言指令（push、mov rbp, rsp、sub rsp, n、探测组 mov eax, n；call；sub rsp, rax），帧寄存器与 SET_FPREG 相符；程序函数的序言
+//   特征（push rbp；mov rbp, rsp；push rbx；push r14；push r15）在 .text 里的每一处都是某个 .pdata 函数的起点。
+// - 函数目录覆盖（P3 第 7 项，内核手写例程全部登记）：x86_64 样例的第一次构建带 --map（与第二次不带的逐字节相同），.text 里不在
+//   任何函数范围内的字节只许是填充（int3、nop、零）与导入跳板（jmp [rip+x]）。
+// x86_64 Windows 宿主上再运行 hello（DEP 生效），核对输出与退出码；运行 tests/pe/backtrace-windows.tx（经 FFI 调
+// RtlCaptureStackBackTrace），按 --map 把各帧对到函数，核对系统展开器逐帧回溯：外部函数桩、capture、deep 四层、main、
+// __tx_native_entry、__tx_entry，之后只剩映像外的系统帧（至少一帧）。别的宿主上记 SKIP，不记通过。
+// 运行：taixu run --toolchain scripts/test_pe_image.tx --compiler <taixu> --work <目录> [--root <仓库>]
+import { absolute, exeName, join, list1, mkdirs, plus, step, readBytes } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { Tally, capture, check, summary, tallyNew } from "./test_lib";
+import { JsonValue, JSON_ARR, JSON_STR, jsonNew, jsonParse, jsonGet } from "../bootstrap/selfhost/json_parse";
+
+const FNV_OFFSET: int = -3750763034362895579; // 0xcbf29ce484222325
+const FNV_PRIME: int = 1099511628211; // 0x100000001b3
+const NX_COMPAT: int = 0x100;
+const DYNAMIC_BASE: int = 0x40;
+const HIGH_ENTROPY_VA: int = 0x20;
+const IMAGE_BASE: int = 0x140000000;
+const TERMINAL_SERVER_AWARE: int = 0x8000;
+
+struct Sample { src: string, stem: string, target: string, machine: int }
+
+function u(b: Bytes, at: int, n: int): int {
+    let v = 0;
+    let k = n - 1;
+    while (k >= 0) {
+        v = (v << 8) | ((bytesGetLE<u8>(b, at + k) ?? 0) as int);
+        k = k - 1;
+    }
+    return v;
+}
+
+function zero4(b: Bytes, at: int): void {
+    let k = 0;
+    while (k < 4) { bytesSet(b, at + k, 0); k = k + 1; }
+}
+
+function contentHash(img: Bytes, pe: int): int {
+    const b = bytesSlice(img, 0, bytesLen(img));
+    zero4(b, pe + 8);
+    zero4(b, pe + 24 + 64);
+    const n = bytesLen(b);
+    let h = FNV_OFFSET;
+    let i = 0;
+    while (i + 8 <= n) {
+        h = imul(h ^ (bytesGetLE<int>(b, i) ?? 0), FNV_PRIME);
+        h = h ^ (h >>> 32);
+        i = i + 8;
+    }
+    if (i < n) {
+        let w = 0;
+        let k = 0;
+        while (i + k < n) { w = w | (u(b, i + k, 1) << (8 * k)); k = k + 1; }
+        h = imul(h ^ w, FNV_PRIME);
+        h = h ^ (h >>> 32);
+    }
+    h = imul(h ^ n, FNV_PRIME);
+    h = h ^ (h >>> 32);
+    return h & 4294967295;
+}
+
+function checksum(img: Bytes, pe: int): int {
+    const at = pe + 24 + 64;
+    const n = bytesLen(img);
+    let s = 0;
+    let i = 0;
+    while (i < n) {
+        let w = u(img, i, 1);
+        if (i + 1 < n) { w = w | (u(img, i + 1, 1) << 8); }
+        if (i >= at && i < at + 4) { w = 0; }
+        s = s + w;
+        s = (s & 65535) + (s >>> 16);
+        i = i + 2;
+    }
+    s = (s & 65535) + (s >>> 16);
+    return s + n;
+}
+
+// 节表里带 flag（0x20 代码、0x40 已初始化数据、0x80 未初始化数据）的节的 SizeOfRawData 之和。
+function rawSum(img: Bytes, pe: int, flag: int): int {
+    const nsec = u(img, pe + 6, 2);
+    const sh = pe + 24 + u(img, pe + 20, 2);
+    let total = 0;
+    let k = 0;
+    while (k < nsec) {
+        const s = sh + 40 * k;
+        if ((u(img, s + 36, 4) & flag) != 0) { total = total + u(img, s + 16, 4); }
+        k = k + 1;
+    }
+    return total;
+}
+
+// "主.次.修订[-预发布]" 的第 index 段。
+function versionPart(v: string, index: int): int {
+    const parts = strSplit(v, ".");
+    const s = listGet(parts, index) catch "";
+    let value = 0;
+    let i = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) catch 0;
+        if (c < 48 || c > 57) { break; }
+        value = value * 10 + (c - 48);
+        i = i + 1;
+    }
+    return value;
+}
+
+function headerChecks(t: Ref<Tally>, name: string, img: Bytes, machine: int, major: int, minor: int): void {
+    const pe = u(img, 60, 4);
+    const ok = bytesLen(img) >= 512 && u(img, 0, 2) == 23117 && pe + 264 <= bytesLen(img) && u(img, pe, 4) == 17744;
+    check(t, name + ":pe-header", ok && u(img, pe + 4, 2) == machine && u(img, pe + 24, 2) == 523,
+        "没有 MZ／PE 签名，或机器号 " + toStr(u(img, pe + 4, 2)) + " 不是 " + toStr(machine));
+    if (!ok) { return; }
+    const opt = pe + 24;
+    check(t, name + ":linker-version", u(img, opt + 2, 1) == major && u(img, opt + 3, 1) == minor,
+        "链接器版本 " + toStr(u(img, opt + 2, 1)) + "." + toStr(u(img, opt + 3, 1)) + "，工具链 " + toStr(major) + "." + toStr(minor));
+    check(t, name + ":section-sizes", u(img, opt + 4, 4) == rawSum(img, pe, 32) && u(img, opt + 8, 4) == rawSum(img, pe, 64)
+        && u(img, opt + 12, 4) == rawSum(img, pe, 128),
+        "SizeOfCode／InitializedData／UninitializedData " + toStr(u(img, opt + 4, 4)) + "／" + toStr(u(img, opt + 8, 4)) + "／"
+        + toStr(u(img, opt + 12, 4)) + "，节表合计 " + toStr(rawSum(img, pe, 32)) + "／" + toStr(rawSum(img, pe, 64)) + "／"
+        + toStr(rawSum(img, pe, 128)));
+    check(t, name + ":versions", u(img, opt + 44, 4) == 0 && u(img, opt + 96, 8) == 4096,
+        "映像版本 " + toStr(u(img, opt + 44, 2)) + "." + toStr(u(img, opt + 46, 2)) + "，堆提交 " + toStr(u(img, opt + 96, 8)));
+    const dllch = u(img, opt + 70, 2);
+    check(t, name + ":dep", (dllch & (NX_COMPAT | TERMINAL_SERVER_AWARE)) == (NX_COMPAT | TERMINAL_SERVER_AWARE),
+        "DllCharacteristics " + toStr(dllch));
+    const fileChars = u(img, pe + 22, 2);
+    check(t, name + ":aslr", u(img, opt + 24, 8) == IMAGE_BASE && (dllch & (DYNAMIC_BASE | HIGH_ENTROPY_VA)) == (DYNAMIC_BASE | HIGH_ENTROPY_VA)
+        && (fileChars & 1) == 0 && (fileChars & 32) != 0,
+        "基址 " + toStr(u(img, opt + 24, 8)) + "，DllCharacteristics " + toStr(dllch) + "，COFF 特征 " + toStr(fileChars));
+    relocChecks(t, name, img, pe);
+    if (machine == 34404) { unwindChecks(t, name, img, pe); }
+    const stamp = u(img, pe + 8, 4);
+    const wantStamp = contentHash(img, pe);
+    check(t, name + ":timestamp", stamp == wantStamp, "TimeDateStamp " + toStr(stamp) + "，内容哈希 " + toStr(wantStamp));
+    const sum = u(img, opt + 64, 4);
+    const wantSum = checksum(img, pe);
+    check(t, name + ":checksum", sum == wantSum, "CheckSum " + toStr(sum) + "，复算 " + toStr(wantSum));
+}
+
+// 文件偏移 off 起的 n 字节是否整个落在某节的文件内容里；是则得该节下标，否则 -1。按 RVA 找节同理（byRva）。
+function sectionOf(img: Bytes, pe: int, at: int, n: int, byRva: bool): int {
+    const nsec = u(img, pe + 6, 2);
+    const sh = pe + 24 + u(img, pe + 20, 2);
+    let k = 0;
+    while (k < nsec) {
+        const s = sh + 40 * k;
+        const vsize = u(img, s + 8, 4);
+        const raw = u(img, s + 16, 4);
+        let filled = raw;
+        if (vsize < filled) { filled = vsize; }
+        let start = u(img, s + 20, 4);
+        if (byRva) { start = u(img, s + 12, 4); }
+        if (filled > 0 && at >= start && at + n <= start + filled) { return k; }
+        k = k + 1;
+    }
+    return -1;
+}
+
+// RVA → 文件偏移（须在某节的文件内容里），不在则 -1。
+function fileAt(img: Bytes, pe: int, rva: int, n: int): int {
+    const k = sectionOf(img, pe, rva, n, true);
+    if (k < 0) { return -1; }
+    const s = pe + 24 + u(img, pe + 20, 2) + 40 * k;
+    return rva - u(img, s + 12, 4) + u(img, s + 20, 4);
+}
+
+function relocChecks(t: Ref<Tally>, name: string, img: Bytes, pe: int): void {
+    const opt = pe + 24;
+    const base = u(img, opt + 24, 8);
+    const imageSize = u(img, opt + 56, 4);
+    const dirRva = u(img, opt + 112 + 8 * 5, 4);
+    const dirSize = u(img, opt + 112 + 8 * 5 + 4, 4);
+    const dirAt = fileAt(img, pe, dirRva, dirSize);
+    if (!check(t, name + ":reloc-dir", u(img, opt + 108, 4) > 5 && dirSize > 0 && dirAt >= 0, "没有基址重定位目录，或不在文件内容里")) { return; }
+    const sites: Map<int, bool> = mapNew();
+    let problem = "";
+    let at = 0;
+    while (at < dirSize && len(problem) == 0) {
+        const page = u(img, dirAt + at, 4);
+        const size = u(img, dirAt + at + 4, 4);
+        if ((page & 4095) != 0 || size < 8 || size % 4 != 0 || at + size > dirSize) { problem = "块头不对：页 " + toStr(page) + "，块长 " + toStr(size); break; }
+        let e = 8;
+        while (e < size) {
+            const entry = u(img, dirAt + at + e, 2);
+            const kind = entry >>> 12;
+            const rva = page + (entry & 4095);
+            if (kind == 0 && e + 2 == size) { e = e + 2; continue; }
+            if (kind != 10) { problem = "类型 " + toStr(kind) + "（RVA " + toStr(rva) + "）"; break; }
+            const off = fileAt(img, pe, rva, 8);
+            if (off < 0) { problem = "RVA " + toStr(rva) + " 不在有文件内容的字节上"; break; }
+            if (mapHas(sites, rva)) { problem = "RVA " + toStr(rva) + " 重复"; break; }
+            mapSet(sites, rva, true);
+            const value = u(img, off, 8);
+            if (value < base || value >= base + imageSize) { problem = "RVA " + toStr(rva) + " 存的 " + toStr(value) + " 不在映像内"; break; }
+            e = e + 2;
+        }
+        at = at + size;
+    }
+    check(t, name + ":reloc-blocks", len(problem) == 0 && mapLen(sites) > 0, problem + "（共 " + toStr(mapLen(sites)) + " 处）");
+    const tlsRva = u(img, opt + 112 + 8 * 9, 4);
+    if (tlsRva != 0) {
+        check(t, name + ":reloc-tls", mapHas(sites, tlsRva) && mapHas(sites, tlsRva + 8) && mapHas(sites, tlsRva + 16) && mapHas(sites, tlsRva + 24),
+            "TLS 目录 " + toStr(tlsRva) + " 的四个 VA 不都有重定位");
+    }
+    // 反查：非代码、非可丢弃节里看着像映像内地址的 8 字节值都须有重定位。
+    const nsec = u(img, pe + 6, 2);
+    const sh = opt + u(img, pe + 20, 2);
+    let missing = 0;
+    let first = "";
+    let k = 0;
+    while (k < nsec) {
+        const s = sh + 40 * k;
+        const chars = u(img, s + 36, 4);
+        if ((chars & 32) == 0 && (chars & 0x02000000) == 0) {
+            const va = u(img, s + 12, 4);
+            let filled = u(img, s + 16, 4);
+            if (u(img, s + 8, 4) < filled) { filled = u(img, s + 8, 4); }
+            const raw = u(img, s + 20, 4);
+            let i = 0;
+            while (i + 8 <= filled) {
+                const value = bytesGetLE<int>(img, raw + i) ?? 0;
+                if (value >= base && value < base + imageSize && !mapHas(sites, va + i)) {
+                    missing = missing + 1;
+                    if (len(first) == 0) { first = "RVA " + toStr(va + i) + " 存 " + toStr(value); }
+                }
+                i = i + 1;
+            }
+        }
+        k = k + 1;
+    }
+    check(t, name + ":reloc-complete", missing == 0, toStr(missing) + " 处像映像内地址却没有重定位，首处 " + first);
+}
+
+function noInts(): List<int> { return listNew(); }
+
+// 从 at 起解码一条序言指令（或探测组）：[种类, 寄存器, 字节, 长度]；种类 0 push、1 设帧指针、2 分配，不认识的长度为 0。
+function prologueInsn(img: Bytes, at: int): List<int> {
+    const out: List<int> = listNew();
+    const b = u(img, at, 1);
+    if (b >= 0x50 && b <= 0x57) { listPush(out, 0); listPush(out, b - 0x50); listPush(out, 8); listPush(out, 1); return out; }
+    if (b == 0x41 && u(img, at + 1, 1) >= 0x50 && u(img, at + 1, 1) <= 0x57) { listPush(out, 0); listPush(out, u(img, at + 1, 1) - 0x50 + 8); listPush(out, 8); listPush(out, 2); return out; }
+    if (b == 0x48 && u(img, at + 1, 2) == 0xE589) { listPush(out, 1); listPush(out, 5); listPush(out, 0); listPush(out, 3); return out; }
+    if (b == 0x48 && u(img, at + 1, 2) == 0xEC83) { listPush(out, 2); listPush(out, 4); listPush(out, u(img, at + 3, 1)); listPush(out, 4); return out; }
+    if (b == 0x48 && u(img, at + 1, 2) == 0xEC81) { listPush(out, 2); listPush(out, 4); listPush(out, u(img, at + 3, 4)); listPush(out, 7); return out; }
+    if (b == 0xB8 && u(img, at + 5, 1) == 0xE8 && u(img, at + 10, 3) == 0xC42948) { listPush(out, 2); listPush(out, 4); listPush(out, u(img, at + 1, 4)); listPush(out, 13); return out; }
+    listPush(out, -1); listPush(out, -1); listPush(out, 0); listPush(out, 0); return out;
+}
+
+// 一个 RUNTIME_FUNCTION 的核对：不合即得原因。
+function unwindEntry(img: Bytes, pe: int, begin: int, end: int, info: int): string {
+    const at = fileAt(img, pe, info, 4);
+    if (at < 0 || info % 4 != 0) { return "UNWIND_INFO 不在文件内容里或未对齐"; }
+    const head = u(img, at, 1);
+    const prolog = u(img, at + 1, 1);
+    const count = u(img, at + 2, 1);
+    const frame = u(img, at + 3, 1);
+    if ((head & 7) != 1 || (head >>> 3) != 0) { return "版本或标志不对：" + toStr(head); }
+    if (prolog > end - begin || (frame & 15) != 0 && (frame & 15) != 5 || (frame >>> 4) != 0) { return "序言长或帧寄存器不对"; }
+    if (fileAt(img, pe, info, 4 + 2 * count) < 0) { return "展开码越界"; }
+    // 码按数组次序（偏移降序）解开，再倒过来按偏移升序对照指令。
+    const codes: List<List<int>> = listNew();
+    let i = 0;
+    while (i < count) {
+        const offset = u(img, at + 4 + 2 * i, 1);
+        const op = u(img, at + 5 + 2 * i, 1) & 15;
+        const opInfo = u(img, at + 5 + 2 * i, 1) >>> 4;
+        const code: List<int> = listNew();
+        listPush(code, offset);
+        if (op == 0) { listPush(code, 0); listPush(code, opInfo); listPush(code, 8); i = i + 1; }
+        else if (op == 2) { listPush(code, 2); listPush(code, 4); listPush(code, opInfo * 8 + 8); i = i + 1; }
+        else if (op == 1 && opInfo == 0) { listPush(code, 2); listPush(code, 4); listPush(code, u(img, at + 6 + 2 * i, 2) * 8); i = i + 2; }
+        else if (op == 1 && opInfo == 1) { listPush(code, 2); listPush(code, 4); listPush(code, u(img, at + 6 + 2 * i, 4)); i = i + 3; }
+        else if (op == 3) { listPush(code, 1); listPush(code, 5); listPush(code, 0); i = i + 1; }
+        else { return "不认识的展开码 " + toStr(op); }
+        listPush(codes, code);
+    }
+    if (i != count) { return "码槽数对不上"; }
+    let cursor = 0;
+    let setFrame = false;
+    let k = listLen(codes) - 1;
+    while (k >= 0) {
+        const code: List<int> = listGet(codes, k) catch noInts();
+        const d = prologueInsn(img, fileAt(img, pe, begin, 1) + cursor);
+        const size = listGet(d, 3) catch 0;
+        if (size == 0) { return "序言偏移 " + toStr(cursor) + " 处不认识的指令"; }
+        cursor = cursor + size;
+        if ((listGet(code, 0) catch -1) != cursor) { return "码偏移 " + toStr(listGet(code, 0) catch -1) + " 对不上指令结束处 " + toStr(cursor); }
+        if ((listGet(d, 0) catch -1) != (listGet(code, 1) catch -2) || (listGet(d, 1) catch -1) != (listGet(code, 2) catch -2)
+            || (listGet(d, 2) catch -1) != (listGet(code, 3) catch -2)) { return "偏移 " + toStr(cursor) + " 处指令与展开码不符"; }
+        if ((listGet(code, 1) catch -1) == 1) { setFrame = true; }
+        k = k - 1;
+    }
+    if (cursor != prolog) { return "序言长 " + toStr(prolog) + "，指令到 " + toStr(cursor); }
+    if (setFrame != ((frame & 15) == 5)) { return "帧寄存器与 SET_FPREG 不符"; }
+    return "";
+}
+
+function unwindChecks(t: Ref<Tally>, name: string, img: Bytes, pe: int): void {
+    const opt = pe + 24;
+    const dirRva = u(img, opt + 112 + 8 * 3, 4);
+    const dirSize = u(img, opt + 112 + 8 * 3 + 4, 4);
+    const dirAt = fileAt(img, pe, dirRva, dirSize);
+    if (!check(t, name + ":pdata-dir", dirSize > 0 && dirSize % 12 == 0 && dirAt >= 0, "没有异常目录，或大小 " + toStr(dirSize) + " 不是 12 的倍数")) { return; }
+    // .text：第一个代码节。
+    const sh = opt + u(img, pe + 20, 2);
+    const textVa = u(img, sh + 12, 4);
+    const textEnd = textVa + u(img, sh + 8, 4);
+    const begins: Map<int, bool> = mapNew();
+    let problem = "";
+    let previous = 0;
+    let at = 0;
+    while (at < dirSize) {
+        const begin = u(img, dirAt + at, 4);
+        const end = u(img, dirAt + at + 4, 4);
+        const info = u(img, dirAt + at + 8, 4);
+        if (begin < previous || end <= begin || begin < textVa || end > textEnd) { problem = "第 " + toStr(at / 12) + " 项范围不对或未按升序"; break; }
+        const why = unwindEntry(img, pe, begin, end, info);
+        if (len(why) > 0) { problem = "函数 " + toStr(begin) + "：" + why; break; }
+        mapSet(begins, begin, true);
+        previous = end;
+        at = at + 12;
+    }
+    check(t, name + ":pdata", len(problem) == 0, problem + "（共 " + toStr(dirSize / 12) + " 项）");
+    // 程序函数的序言特征 55 48 89 E5 53 41 56 41 57 每一处都须是 .pdata 函数的起点。
+    const raw = u(img, sh + 20, 4);
+    const size = u(img, sh + 16, 4);
+    let missing = 0;
+    let first = -1;
+    let i = 0;
+    while (i + 9 <= size) {
+        if (u(img, raw + i, 1) == 0x55 && u(img, raw + i + 1, 4) == 0x53E58948 && u(img, raw + i + 5, 4) == 0x57415641 && !mapHas(begins, textVa + i)) {
+            missing = missing + 1;
+            if (first < 0) { first = textVa + i; }
+        }
+        i = i + 1;
+    }
+    check(t, name + ":pdata-tx-functions", missing == 0, toStr(missing) + " 个程序函数没有展开信息，首个在 " + toStr(first));
+}
+
+// 函数目录覆盖：--map 的函数范围标进 .text 的位图，范围外只许填充与导入跳板（FF 25 disp32）。
+function coverageCheck(t: Ref<Tally>, name: string, img: Bytes, pe: int, mapPath: string): void {
+    const doc = jsonParse(readBytes(mapPath) catch bytesNew(0)) catch jsonNew(0);
+    const m = jsonGet(doc, "map") ?? jsonNew(0);
+    const preferred = parseHex((jsonGet(jsonGet(m, "image") ?? jsonNew(0), "preferred_base") ?? jsonNew(JSON_STR)).s);
+    const fns = jsonGet(m, "functions") ?? jsonNew(JSON_ARR);
+    const sh = pe + 24 + u(img, pe + 20, 2);
+    const textVa = u(img, sh + 12, 4);
+    const raw = u(img, sh + 20, 4);
+    const size = u(img, sh + 8, 4);
+    const covered: Bytes = bytesNew(size);
+    let outside = 0;
+    for (f in fns.items) {
+        let lo = parseHex((jsonGet(f, "link_va") ?? jsonNew(JSON_STR)).s) - preferred - textVa;
+        const hi = parseHex((jsonGet(f, "link_va_end") ?? jsonNew(JSON_STR)).s) - preferred - textVa;
+        if (lo < 0 || hi > size || hi <= lo) { outside = outside + 1; continue; }
+        while (lo < hi) { bytesSet(covered, lo, 1); lo = lo + 1; }
+    }
+    let gaps = 0;
+    let first = -1;
+    let i = 0;
+    while (i < size) {
+        const c = u(img, raw + i, 1);
+        if ((bytesGet(covered, i) ?? 0) == 1 || c == 0xCC || c == 0x90 || c == 0) { i = i + 1; continue; }
+        if (c == 0xFF && u(img, raw + i + 1, 1) == 0x25 && i + 6 <= size && (bytesGet(covered, i + 5) ?? 0) == 0) { i = i + 6; continue; }
+        gaps = gaps + 1;
+        if (first < 0) { first = textVa + i; }
+        i = i + 1;
+    }
+    check(t, name + ":function-coverage", listLen(fns.items) > 0 && outside == 0 && gaps == 0,
+        toStr(listLen(fns.items)) + " 个函数，" + toStr(outside) + " 个范围不在 .text 里，" + toStr(gaps) + " 个字节不在任何函数里，首个在 " + toStr(first));
+}
+
+// 回溯用例：按 --map 把各帧（返回地址减 1）对到函数，核对开头的调用链。
+function backtraceCheck(t: Ref<Tally>, compiler: string, root: string, dir: string): void | Error {
+    const out = join(dir, "backtrace");
+    if (!mkdirs(out)) { return err("建不了目录：" + out); }
+    const map = join(out, "map.json");
+    step(compiler, plus(plus(list1("build"), list1("tests/pe/backtrace-windows.tx")), plus(plus(list1("--target=x86_64-windows"), list1("--out")),
+                plus(list1(out), plus(plus(list1("--map"), list1(map)), list1("--map-format=json"))))), root)?;
+    const r = capture(join(out, exeName("backtrace-windows")), listNew(), dir, 60000000000, 65536)?;
+    const doc = jsonParse(readBytes(map) catch bytesNew(0)) catch jsonNew(0);
+    const m = jsonGet(doc, "map") ?? jsonNew(0);
+    const image = jsonGet(m, "image") ?? jsonNew(0);
+    const preferred = parseHex((jsonGet(image, "preferred_base") ?? jsonNew(JSON_STR)).s);
+    const fns = jsonGet(m, "functions") ?? jsonNew(JSON_ARR);
+    let base = -1;
+    const names: List<string> = listNew();
+    for (line in strSplit(r.out, "\n")) {
+        const parts = strSplit(line, " ");
+        if (listLen(parts) != 2) { continue; }
+        const value = parseDec(listGet(parts, 1) catch "");
+        if ((listGet(parts, 0) catch "") == "base") { base = value; continue; }
+        let hit = "outside";
+        for (f in fns.items) {
+            const lo = parseHex((jsonGet(f, "link_va") ?? jsonNew(JSON_STR)).s) - preferred;
+            const hi = parseHex((jsonGet(f, "link_va_end") ?? jsonNew(JSON_STR)).s) - preferred;
+            if (value - 1 - base >= lo && value - 1 - base < hi) {
+                hit = (jsonGet(f, "name") ?? jsonNew(JSON_STR)).s;
+                if ((jsonGet(f, "origin") ?? jsonNew(JSON_STR)).s == "ffi-rtfn") { hit = "<ffi>"; }
+                break;
+            }
+        }
+        listPush(names, hit);
+    }
+    const want = strSplit("<ffi> capture deep deep deep deep main __tx_native_entry __tx_entry", " ");
+    let ok = r.code == 0 && base > 0 && listLen(names) > listLen(want);
+    let k = 0;
+    while (ok && k < listLen(names)) {
+        let expected = "outside";
+        if (k < listLen(want)) { expected = listGet(want, k) catch ""; }
+        if ((listGet(names, k) catch "") != expected) { ok = false; }
+        k = k + 1;
+    }
+    let seen = "";
+    for (n in names) { seen = seen + " " + n; }
+    check(t, "x86_64-windows/backtrace", ok, "退出码 " + toStr(r.code) + "，回溯到的函数：" + seen + r.err);
+}
+
+function parseHex(s: string): int {
+    let v = 0;
+    let i = 0;
+    if (strByteSub(s, 0, 2) == "0x") { i = 2; }
+    while (i < len(s)) {
+        const c = byteAt(s, i) catch 0;
+        let d = -1;
+        if (c >= 48 && c <= 57) { d = c - 48; } else if (c >= 97 && c <= 102) { d = c - 87; } else if (c >= 65 && c <= 70) { d = c - 55; }
+        if (d < 0) { return -1; }
+        v = v * 16 + d;
+        i = i + 1;
+    }
+    return v;
+}
+
+function parseDec(s: string): int {
+    let v = 0;
+    let i = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) catch 0;
+        if (c < 48 || c > 57) { return -1; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+function toolchainVersion(compiler: string, cwd: string): string | Error {
+    const r = capture(compiler, plus(list1("capabilities"), list1("--format=json")), cwd, 60000000000, 1048576)?;
+    const key = "\"toolchain_version\":\"";
+    const at = strByteIndexOf(r.out, key);
+    if (r.code != 0 || at < 0) { return err("capabilities 没有 toolchain_version：" + r.err); }
+    const rest = strByteSub(r.out, at + len(key), len(r.out) - at - len(key));
+    const end = strByteIndexOf(rest, "\"");
+    if (end <= 0) { return err("toolchain_version 格式不对"); }
+    return strByteSub(rest, 0, end);
+}
+
+function run(args: []string): int | Error {
+    let compiler = "";
+    let work = "";
+    let root = "";
+    let i: int = 0;
+    while (i < len(args)) {
+        const a = args[i];
+        if (i + 1 >= len(args)) {
+            return err("缺少取值或未知参数：" + a);
+        }
+        const v = args[i + 1];
+        if (a == "--compiler") {
+            compiler = v;
+        } else if (a == "--work") {
+            work = v;
+        } else if (a == "--root") {
+            root = v;
+        } else {
+            return err("未知参数：" + a);
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0 || len(work) == 0) {
+        return err("用法：taixu run --toolchain scripts/test_pe_image.tx --compiler <taixu> --work <目录> [--root <仓库>]");
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = osRealPath(absolute(root));
+    compiler = osRealPath(absolute(compiler));
+    if (!mkdirs(absolute(work))) {
+        return err("建不了工作目录：" + work);
+    }
+    const dir = osRealPath(absolute(work));
+    const version = toolchainVersion(compiler, root)?;
+    const major = versionPart(version, 0);
+    const minor = versionPart(version, 1);
+    const t = tallyNew();
+    const samples: List<Sample> = listNew();
+    // 三元组写全：不带架构的 windows 在 arm64 宿主上取 aarch64-windows。
+    listPush(samples, Sample { src: "examples/hello.tx", stem: "hello", target: "x86_64-windows", machine: 34404 });
+    listPush(samples, Sample { src: "tests/debug/basic.tx", stem: "basic", target: "x86_64-windows", machine: 34404 });
+    listPush(samples, Sample { src: "examples/hello.tx", stem: "hello", target: "aarch64-windows", machine: 43620 });
+    for (s in samples) {
+        const name = s.target + "/" + s.stem;
+        const first = join(join(dir, s.target), "a");
+        const second = join(join(dir, s.target), "b");
+        if (!mkdirs(join(dir, s.target))) { return err("建不了目录：" + join(dir, s.target)); }
+        const x64 = s.target == "x86_64-windows";
+        const map = join(dir, s.target + "-" + s.stem + ".map.json");
+        let withMap = list1("--out");
+        if (x64) { withMap = plus(plus(list1("--map"), list1(map)), plus(list1("--map-format=json"), list1("--out"))); }
+        step(compiler, plus(plus(list1("build"), list1(s.src)), plus(list1("--target=" + s.target), plus(withMap, list1(first)))), root)?;
+        step(compiler, plus(plus(list1("build"), list1(s.src)), plus(list1("--target=" + s.target), plus(list1("--out"), list1(second)))), root)?;
+        const img = readBytes(join(first, s.stem + ".exe")) catch bytesNew(0);
+        const img2 = readBytes(join(second, s.stem + ".exe")) catch bytesNew(0);
+        check(t, name + ":deterministic", bytesLen(img) > 0 && bytesEqual(img, img2),
+            "两次生成不同（" + toStr(bytesLen(img)) + "／" + toStr(bytesLen(img2)) + " 字节）");
+        headerChecks(t, name, img, s.machine, major, minor);
+        if (x64) { coverageCheck(t, name, img, u(img, 60, 4), map); }
+    }
+    if (hostTarget() != "windows" || hostArch() != "x86_64") {
+        print("SKIP run：不是 Windows x86_64 宿主");
+        return summary(t, "pe-image");
+    }
+    const hello = join(join(join(dir, "x86_64-windows"), "a"), exeName("hello"));
+    const r = capture(hello, listNew(), dir, 60000000000, 65536)?;
+    check(t, "x86_64-windows/hello:run", r.code == 0 && r.out == "Hello, 太虚!\n", "退出码 " + toStr(r.code) + "，输出 " + r.out + r.err);
+    backtraceCheck(t, compiler, root, dir)?;
+    return summary(t, "pe-image");
+}
+
+function main(args: []string): int {
+    return run(args) catch (e) {
+        eprint("test_pe_image: " + e.message);
+        return 1;
+    };
+}

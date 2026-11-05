@@ -59,7 +59,7 @@ def main():
             p = run([compiler, 'fmt', source])
             ok = p.returncode == case['exit'] and p.stdout == case['expected'].encode('utf-8')
             record('golden ' + case['id'], ok, p.stderr.decode('utf-8', 'replace')[-500:])
-            if case.get('lex_invalid'):
+            if case.get('lex_invalid') or case.get('rejected'):  # rejected：词元层拒绝（零空白相邻的 ++／--，D3 v0.49）
                 record('golden lexical rejection ' + case['id'], not p.stdout and '无法格式化' in p.stderr.decode('utf-8', 'replace'))
             elif p.returncode == 0:
                 formatted = work / (case['id'] + '-formatted.tx')

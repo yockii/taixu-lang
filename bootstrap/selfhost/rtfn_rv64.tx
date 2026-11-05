@@ -1,0 +1,541 @@
+// rtfn 的 RISC-V 底层（6、7）：rtfn.tx 的每个对外接口在
+// 缓冲为 RISC-V 时转到这里的 rv64Rt*，调用处不变。结构照 rtfn_la64.tx，寄存器一一对应：
+//   实参 a0..a7（x10..x17），其余在 [sp] 起；结果 a0（第二结果 a1）；值槽窗口 s1（x9，TB = s1 & TB_MASK，用一对移位取）；
+//   临时 t0..t3（x5..x7、x28，t0 兼作最近一个局部槽的缓存）；t5（x30）放间接目标与杂项；t6（x31）只给 rv64_asm 的合法化；
+//   浮点自用 ft8、ft9（f28、f29）。每个函数建帧记录（ra、s0 存在 [s0−8]、[s0−16]，s0 为进入时的 sp，psABI 的约定），局部在
+//   [sp + base + 8k]，栈指针始终 16 字节对齐。
+// - 系统调用：ecall，号在 a7，实参 a0..a5，结果 a0；内核只改 a0，分配器仍按调用对待（从严，同 A64）。
+// - 除法显式检查除零与 INT_MIN／−1 后 ebreak（SIGTRAP，同 A64 的 brk；RISC-V 没有能让内核发 SIGFPE 的指令，div 不陷入、结果
+//   有定义）。
+// - 原子照 psABI 的映射（Table A.6）：取得读 ld＋fence r,rw，释放写 fence rw,w＋sd；比较交换为 lr.d.aqrl／sc.d.rl 循环（受约束
+//   循环：lr 与 sc 之间只有一条向前的 bne），加与交换为 amoadd.d.aqrl／amoswap.d.aqrl。只用 RV64G 的指令。
+import { TB_MASK, tbOffset } from "./thread_block_abi";
+import { rv64Emit, rv64Br, rv64BCond, rv64AddrOf, rv64SymAccess, rv64MovImm, rv64AddImm, rv64Mem, rv64Frame, rv64FrameAlloc } from "./rv64_asm";
+import { rv64R, rv64R2, rv64I, rv64Shift, rv64Amo, rv64Lr, rv64Fence } from "./rv64_encode";
+import { RV64_ADD, RV64_SUB, RV64_AND, RV64_OR, RV64_XOR, RV64_MUL, RV64_DIV, RV64_REM, RV64_ADDI, RV64_ADDIW, RV64_SLLI, RV64_SRLI, RV64_SRAI } from "./rv64_encode";
+import { RV64_EBREAK, RV64_ECALL, RV64_JALR, RV64_AQ, RV64_RL, RV64_LR_D, RV64_SC_D, RV64_AMOSWAP_D, RV64_AMOADD_D } from "./rv64_encode";
+import { RV64_LBU, RV64_LHU, RV64_LWU, RV64_LD, RV64_SB, RV64_SH, RV64_SW, RV64_SD } from "./rv64_encode";
+import { RV64_BEQ, RV64_BNE, RV64_BLT, RV64_BGE, RV64_BLTU, RV64_BGEU } from "./rv64_encode";
+import { RV64_FADD_D, RV64_FSUB_D, RV64_FMUL_D, RV64_FDIV_D, RV64_FMV_D_X, RV64_FMV_X_D, RV64_FMV_W_X, RV64_FMV_X_W } from "./rv64_encode";
+import { RV64_FCVT_S_D, RV64_FCVT_D_S, RV64_FCVT_D_L, RV64_FLT_D, RV64_FLE_D, RV64_FEQ_D } from "./rv64_encode";
+import { asBufferLabel, asBufferFunctionPrologueEnd, asBufferFunctionEpilogueStart } from "./assemble";
+import { RtOp, RtFn, OP_LOCAL, OP_IMM, OP_ADDR, OP_GLOBAL_ACQ, L, I, rtfnFail, rtfnOpen, rtfnSlot, rtfnCache, rtfnCached, rtfnLabel, rtfnCFloat, rtfnCVar, rtfnHome, rtfnGuardWrite } from "./rtfn_base";
+import { rtfnParallelMoves } from "./rtfn_alloc";
+
+const ZERO: int = 0;
+const RA: int = 1;
+const SP: int = 2;
+const FP: int = 8;
+const W: int = 9;
+const A0: int = 10;
+const A7: int = 17;
+const X_S0: int = 5;
+const X_S1: int = 6;
+const X_S2: int = 7;
+const X_S3: int = 28;
+const T5: int = 30;
+const F0: int = 28;
+const F1: int = 29;
+const FA0: int = 10;
+
+function aw(f: Ref<RtFn>, word: int, what: string): void { if (rtfnOpen(f)) { rv64Emit(f.b, word, what); } }
+function aMov(f: Ref<RtFn>, rd: int, rs: int): void { if (rd != rs) { aw(f, rv64I(RV64_ADDI, rd, rs, 0), "mv"); } }
+function aAddImm(f: Ref<RtFn>, rd: int, rs: int, imm: int): void { if (rtfnOpen(f)) { rv64AddImm(f.b, rd, rs, imm); } }
+function aLd(f: Ref<RtFn>, rt: int, base: int, off: int): void { if (rtfnOpen(f)) { rv64Mem(f.b, RV64_LD, rt, base, off); } }
+function aSt(f: Ref<RtFn>, rt: int, base: int, off: int): void { if (rtfnOpen(f)) { rv64Mem(f.b, RV64_SD, rt, base, off); } }
+// 帧事件跟在所述指令之后（first 为发射前的条目数）。
+function aFrame(f: Ref<RtFn>, first: int, kind: string, reg: int, bytes: int): void { if (rtfnOpen(f)) { rv64Frame(f.b, first, kind, reg, bytes); } }
+// TB = s1 & TB_MASK：掩码是 −2^k（清低 k 位），用 srli／slli 一对。
+function tbShift(): int {
+    let k = 0;
+    while (k < 63 && (TB_MASK & (1 << k)) == 0) { k = k + 1; }
+    return k;
+}
+function aTb(f: Ref<RtFn>, r: int): void {
+    const k = tbShift();
+    if (TB_MASK != -(1 << k)) { rtfnFail(f, "TbMaskNotPowerOfTwo"); return; }
+    aw(f, rv64Shift(RV64_SRLI, r, W, k, 64), "srli tb");
+    aw(f, rv64Shift(RV64_SLLI, r, r, k, 64), "slli tb");
+}
+// 操作数进寄存器 r（只写 r，以及合法化用的 t6）；t0 兼作最近一个局部槽的缓存。
+function aLoad(f: Ref<RtFn>, r: int, x: Ref<RtOp>): void {
+    if (!rtfnOpen(f)) { return; }
+    if (x.kind != OP_LOCAL || rtfnHome(f, x.name) != r) { rtfnGuardWrite(f, r); }
+    const keep = f.raxSlot;
+    const keepOk = r != X_S0 && f.raxAt == listLen(f.b.entries);
+    if (x.kind == OP_LOCAL) {
+        const home = rtfnHome(f, x.name);
+        if (home >= 0) {
+            if (r != home) { aMov(f, r, home); }
+            if (keepOk) { rtfnCache(f, keep); }
+            return;
+        }
+        const slot = rtfnSlot(f, x.name);
+        if (rtfnCached(f, slot)) {
+            if (r != X_S0) { aMov(f, r, X_S0); rtfnCache(f, slot); }
+            return;
+        }
+        aLd(f, r, SP, slot);
+        if (r == X_S0) { rtfnCache(f, slot); } else if (keepOk) { rtfnCache(f, keep); }
+        return;
+    }
+    if (x.kind == OP_IMM) {
+        rv64MovImm(f.b, r, x.num);
+    } else {
+        const off = tbOffset(x.name);
+        if (off >= 0) {
+            aTb(f, r);
+            if (x.kind == OP_ADDR) { if (off != 0) { aAddImm(f, r, r, off); } } else { aLd(f, r, r, off); }
+        } else if (x.kind == OP_ADDR) {
+            rv64AddrOf(f.b, r, x.name, 0);
+        } else if (x.kind == OP_GLOBAL_ACQ) {
+            rv64SymAccess(f.b, RV64_LD, r, r, x.name, 0);
+            aw(f, rv64Fence(2, 3), "fence r, rw");
+        } else {
+            rv64SymAccess(f.b, RV64_LD, r, r, x.name, 0);
+        }
+    }
+    if (keepOk) { rtfnCache(f, keep); }
+}
+function aStore(f: Ref<RtFn>, dst: string, r: int): void {
+    const home = rtfnHome(f, dst);
+    if (home >= 0) { if (r != home) { aMov(f, home, r); } return; }
+    const slot = rtfnSlot(f, dst);
+    aSt(f, r, SP, slot);
+    if (r == X_S0) { rtfnCache(f, slot); }
+}
+function aLocalLabel(f: Ref<RtFn>, what: string): string {
+    f.seq = f.seq + 1;
+    return f.name + "__" + what + toStr(f.seq);
+}
+// x86 的寄存器号（rtLoadReg／rtStoreReg 的外部写法）→ RISC-V 临时寄存器（9 落在池里的 t4；10、11 只出现在 x86 分支，不映射）。
+function aRegOf(r: int): int {
+    if (r == 0) { return X_S0; }
+    if (r == 1) { return X_S1; }
+    if (r == 2) { return X_S2; }
+    if (r == 8) { return X_S3; }
+    if (r == 9) { return 29; }
+    return -1;
+}
+// 操作数所在的寄存器：落寄存器的局部直接用它的家，否则取进 r。
+function aSrc(f: Ref<RtFn>, r: int, x: Ref<RtOp>): int {
+    if (x.kind == OP_LOCAL) { const h = rtfnHome(f, x.name); if (h >= 0) { return h; } }
+    if (x.kind == OP_IMM && x.num == 0) { return ZERO; }
+    aLoad(f, r, x);
+    return r;
+}
+// 结果写进哪个寄存器：dst 落寄存器即它的家，否则 r（随后 aPut 存槽）。
+function aDst(f: Ref<RtFn>, dst: string, r: int): int { const h = rtfnHome(f, dst); if (h >= 0) { return h; } return r; }
+function aPut(f: Ref<RtFn>, dst: string, r: int): void { if (rtfnHome(f, dst) < 0) { aStore(f, dst, r); } }
+
+/// 跨调用的寄存器局部存回自己的槽（reload 为真则取回）。
+export function rv64RtSpill(f: Ref<RtFn>, r: int, slot: int, reload: bool): void {
+    if (reload) { aLd(f, r, SP, slot); } else { aSt(f, r, SP, slot); }
+}
+
+export function rv64RtBegin(f: Ref<RtFn>, nparams: int, maxArgs: int): void {
+    let outArgs = maxArgs - 8;
+    if (outArgs < 0) { outArgs = 0; }
+    f.base = outArgs * 8;
+    f.frame = f.base + listLen(f.locals) * 8;
+    if (f.frame % 16 != 0) { f.frame = f.frame + 8; }
+    asBufferLabel(f.b, f.name, 1);
+    // 帧记录：addi sp,-16; sd ra,8(sp); sd s0,0(sp) 一组记“压入 ra、压入 s0”（布局同逐个压栈）；addi s0,sp,16 设帧指针
+    // （进入时的 sp；调用方栈上的实参从 [s0] 起）。
+    let first = listLen(f.b.entries);
+    aw(f, rv64I(RV64_ADDI, SP, SP, -16), "addi sp");
+    if (rtfnOpen(f)) { rv64Mem(f.b, RV64_SD, RA, SP, 8); rv64Mem(f.b, RV64_SD, FP, SP, 0); }
+    aFrame(f, first, "push-nonvolatile", RA, 8); aFrame(f, first, "push-nonvolatile", FP, 8);
+    first = listLen(f.b.entries);
+    aw(f, rv64I(RV64_ADDI, FP, SP, 16), "addi s0, sp, 16");
+    aFrame(f, first, "set-frame-pointer", FP, 16);
+    if (f.frame > 0 && rtfnOpen(f)) { rv64FrameAlloc(f.b, f.frame); }
+    asBufferFunctionPrologueEnd(f.b);
+    // 在栈槽的参数照旧入槽；落寄存器的，寄存器来的经并行赋值（成环经 t5）入家，栈上来的最后直接取。
+    const dsts: List<int> = listNew();
+    const srcs: List<int> = listNew();
+    let k = 0;
+    while (k < nparams) {
+        const home = rtfnHome(f, listGet(f.locals, k) catch "");
+        if (home >= 0) {
+            if (k < 8) { listPush(dsts, home); listPush(srcs, A0 + k); }
+        } else if (k < 8) {
+            aSt(f, A0 + k, SP, f.base + k * 8);
+        } else {
+            aLd(f, X_S0, FP, (k - 8) * 8);
+            aSt(f, X_S0, SP, f.base + k * 8);
+        }
+        k = k + 1;
+    }
+    const moves = rtfnParallelMoves(dsts, srcs, T5);
+    k = 0;
+    while (k < listLen(moves)) { aMov(f, listGet(moves, k) catch 0, listGet(moves, k + 1) catch 0); k = k + 2; }
+    k = 8;
+    while (k < nparams) {
+        const home = rtfnHome(f, listGet(f.locals, k) catch "");
+        if (home >= 0) { aLd(f, home, FP, (k - 8) * 8); }
+        k = k + 1;
+    }
+}
+// 尾声从释放起（sp 回到帧记录处，s0 − 16）；帧为 0 时这条不动 sp，留在尾声之前（事件只记改变栈的指令）。
+export function rv64RtRetVoid(f: Ref<RtFn>): void {
+    if (f.frame == 0) { aw(f, rv64I(RV64_ADDI, SP, FP, -16), "addi sp, s0, -16"); }
+    asBufferFunctionEpilogueStart(f.b);
+    let first = listLen(f.b.entries);
+    if (f.frame > 0) {
+        aw(f, rv64I(RV64_ADDI, SP, FP, -16), "addi sp, s0, -16");
+        aFrame(f, first, "release-stack", SP, f.frame);
+        first = listLen(f.b.entries);
+    }
+    if (rtfnOpen(f)) { rv64Mem(f.b, RV64_LD, FP, SP, 0); rv64Mem(f.b, RV64_LD, RA, SP, 8); }
+    aw(f, rv64I(RV64_ADDI, SP, SP, 16), "addi sp");
+    aFrame(f, first, "pop-nonvolatile", FP, 8); aFrame(f, first, "pop-nonvolatile", RA, 8);
+    first = listLen(f.b.entries);
+    aw(f, rv64I(RV64_JALR, ZERO, RA, 0), "ret");
+    aFrame(f, first, "return", -1, 0);
+}
+/// 操作数进 RISC-V 寄存器 r（返回值寄存器 a0、a1 等）。
+export function rv64RtLoadX(f: Ref<RtFn>, r: int, x: Ref<RtOp>): void { aLoad(f, r, x); }
+export function rv64RtLoadReg(f: Ref<RtFn>, r: int, x: Ref<RtOp>): void {
+    if (aRegOf(r) < 0) { rtfnFail(f, "BadRegister"); return; }
+    aLoad(f, aRegOf(r), x);
+}
+export function rv64RtStoreReg(f: Ref<RtFn>, dst: string, r: int): void {
+    if (aRegOf(r) < 0) { rtfnFail(f, "BadRegister"); return; }
+    aStore(f, dst, aRegOf(r));
+}
+export function rv64RtSet(f: Ref<RtFn>, dst: string, x: Ref<RtOp>): void {
+    const h = rtfnHome(f, dst);
+    if (h >= 0) { aLoad(f, h, x); return; }
+    aLoad(f, X_S0, x); aStore(f, dst, X_S0);
+}
+export function rv64RtSetGlobal(f: Ref<RtFn>, symbol: string, x: Ref<RtOp>): void {
+    aLoad(f, X_S0, x);
+    const at = tbOffset(symbol);
+    if (at >= 0) { aTb(f, T5); aSt(f, X_S0, T5, at); } else if (rtfnOpen(f)) { rv64SymAccess(f.b, RV64_SD, X_S0, T5, symbol, 0); }
+}
+export function rv64RtSetRbx(f: Ref<RtFn>, x: Ref<RtOp>): void { aLoad(f, X_S0, x); aMov(f, W, X_S0); }
+export function rv64RtOp(f: Ref<RtFn>, dst: string, a: Ref<RtOp>, op: string, c: Ref<RtOp>): void {
+    if ((op == "add" || op == "sub") && f.alloc && c.kind == OP_IMM && c.num >= -2047 && c.num <= 2047) {
+        // add／sub 立即数：sub 换成加相反数（模 2^64 相同）。
+        const ri = aSrc(f, X_S0, a);
+        const rr = aDst(f, dst, X_S0);
+        let n = c.num;
+        if (op == "sub") { n = -n; }
+        aw(f, rv64I(RV64_ADDI, rr, ri, n), "op " + op);
+        aPut(f, dst, rr);
+        return;
+    }
+    const ra = aSrc(f, X_S0, a);
+    const rc = aSrc(f, X_S1, c);
+    const rd = aDst(f, dst, X_S0);
+    let code = -1;
+    if (op == "add") { code = RV64_ADD; }
+    if (op == "sub") { code = RV64_SUB; }
+    if (op == "and") { code = RV64_AND; }
+    if (op == "or") { code = RV64_OR; }
+    if (op == "xor") { code = RV64_XOR; }
+    if (op == "imul") { code = RV64_MUL; }
+    if (code < 0) { rtfnFail(f, "BadOp " + op); return; }
+    aw(f, rv64R(code, rd, ra, rc), "op " + op);
+    aPut(f, dst, rd);
+}
+export function rv64RtShift(f: Ref<RtFn>, dst: string, a: Ref<RtOp>, op: string, count: int): void {
+    const ra = aSrc(f, X_S0, a);
+    const rd = aDst(f, dst, X_S0);
+    let code = -1;
+    if (op == "shl") { code = RV64_SLLI; }
+    if (op == "shr") { code = RV64_SRLI; }
+    if (op == "sar") { code = RV64_SRAI; }
+    if (code < 0) { rtfnFail(f, "BadShift " + op); return; }
+    aw(f, rv64Shift(code, rd, ra, count, 64), "shift " + op);
+    aPut(f, dst, rd);
+}
+/// 商与余（向零截断，同 x86 的 idiv）：除数为 0、或 INT_MIN／−1 时 ebreak（SIGTRAP）。
+export function rv64RtDivMod(f: Ref<RtFn>, quot: string, rem: string, a: Ref<RtOp>, c: Ref<RtOp>): void {
+    aLoad(f, X_S0, a);
+    aLoad(f, X_S1, c);
+    const nz = aLocalLabel(f, "dmnz");
+    const ok = aLocalLabel(f, "dmok");
+    if (rtfnOpen(f)) { rv64BCond(f.b, RV64_BNE, X_S1, ZERO, nz); }
+    aw(f, RV64_EBREAK, "ebreak");
+    if (rtfnOpen(f)) { asBufferLabel(f.b, nz, 1); }
+    aw(f, rv64I(RV64_ADDI, X_S2, ZERO, -1), "li -1");
+    if (rtfnOpen(f)) { rv64BCond(f.b, RV64_BNE, X_S1, X_S2, ok); }
+    if (rtfnOpen(f)) { rv64MovImm(f.b, X_S2, 0 - 9223372036854775807 - 1); }
+    if (rtfnOpen(f)) { rv64BCond(f.b, RV64_BNE, X_S0, X_S2, ok); }
+    aw(f, RV64_EBREAK, "ebreak");
+    if (rtfnOpen(f)) { asBufferLabel(f.b, ok, 1); }
+    aw(f, rv64R(RV64_DIV, X_S2, X_S0, X_S1), "div");
+    aw(f, rv64R(RV64_REM, X_S3, X_S0, X_S1), "rem");
+    if (len(quot) > 0) { aStore(f, quot, X_S2); }
+    if (len(rem) > 0) { aStore(f, rem, X_S3); }
+}
+// 读按宽度零扩展（同 A64 的 ldrb／ldrh／ldr w）。
+function loadOp(width: int): int {
+    if (width == 1) { return RV64_LBU; }
+    if (width == 2) { return RV64_LHU; }
+    if (width == 4) { return RV64_LWU; }
+    return RV64_LD;
+}
+function storeOp(width: int): int {
+    if (width == 1) { return RV64_SB; }
+    if (width == 2) { return RV64_SH; }
+    if (width == 4) { return RV64_SW; }
+    return RV64_SD;
+}
+export function rv64RtLoad(f: Ref<RtFn>, dst: string, addr: Ref<RtOp>, off: int, width: int): void {
+    const ra = aSrc(f, X_S0, addr);
+    const rd = aDst(f, dst, X_S0);
+    if (rtfnOpen(f)) { rv64Mem(f.b, loadOp(width), rd, ra, off); }
+    aPut(f, dst, rd);
+}
+export function rv64RtStore(f: Ref<RtFn>, addr: Ref<RtOp>, off: int, value: Ref<RtOp>, width: int): void {
+    const ra = aSrc(f, X_S0, addr);
+    const rv = aSrc(f, X_S1, value);
+    if (rtfnOpen(f)) { rv64Mem(f.b, storeOp(width), rv, ra, off); }
+}
+export function rv64RtAddrOf(f: Ref<RtFn>, dst: string, local: string): void {
+    if (rtfnHome(f, local) >= 0) { rtfnFail(f, "AddressOfRegisterLocal"); return; }
+    aAddImm(f, X_S0, SP, rtfnSlot(f, local)); aStore(f, dst, X_S0);
+}
+export function rv64RtJump(f: Ref<RtFn>, label: string): void { if (rtfnOpen(f)) { rv64Br(f.b, 0, rtfnLabel(f, label)); } }
+/// if (a <cc> c) goto label；sf 0 只比低 32 位（rtIf32：两边先 addiw 符号扩展，有无符号与相等的次序都不变）。
+export function rv64RtIf(f: Ref<RtFn>, sf: int, a: Ref<RtOp>, cc: string, c: Ref<RtOp>, label: string): void {
+    let ra = aSrc(f, X_S0, a);
+    let rc = aSrc(f, X_S1, c);
+    if (sf == 0) {
+        aw(f, rv64I(RV64_ADDIW, X_S0, ra, 0), "sext.w");
+        aw(f, rv64I(RV64_ADDIW, X_S1, rc, 0), "sext.w");
+        ra = X_S0;
+        rc = X_S1;
+    }
+    // gt／le／ugt／ule 交换两边：a > c 即 c < a。
+    let op = -1;
+    let swap = false;
+    if (cc == "eq") { op = RV64_BEQ; }
+    if (cc == "ne") { op = RV64_BNE; }
+    if (cc == "lt") { op = RV64_BLT; }
+    if (cc == "ge") { op = RV64_BGE; }
+    if (cc == "gt") { op = RV64_BLT; swap = true; }
+    if (cc == "le") { op = RV64_BGE; swap = true; }
+    if (cc == "ult") { op = RV64_BLTU; }
+    if (cc == "uge") { op = RV64_BGEU; }
+    if (cc == "ugt") { op = RV64_BLTU; swap = true; }
+    if (cc == "ule") { op = RV64_BGEU; swap = true; }
+    if (op < 0) { rtfnFail(f, "BadCondition " + cc); return; }
+    if (!rtfnOpen(f)) { return; }
+    if (swap) { rv64BCond(f.b, op, rc, ra, rtfnLabel(f, label)); } else { rv64BCond(f.b, op, ra, rc, rtfnLabel(f, label)); }
+}
+export function rv64RtCall(f: Ref<RtFn>, result: string, target: string, args: List<Ref<RtOp>>): void {
+    if (listLen(args) > 8 + f.base / 8) {
+        rtfnFail(f, "OutgoingCallFrameTooSmall");
+        return;
+    }
+    let k = 8;
+    while (k < listLen(args)) {
+        aLoad(f, X_S0, listGet(args, k) catch I(0));
+        aSt(f, X_S0, SP, (k - 8) * 8);
+        k = k + 1;
+    }
+    let indirect = false;
+    if (len(target) > 1 && (byteAt(target, 0) catch 0) == 42) {
+        indirect = true;
+        aLoad(f, T5, L(strSub(target, 1, len(target) - 1)));
+    }
+    k = 0;
+    while (k < listLen(args) && k < 8) {
+        aLoad(f, A0 + k, listGet(args, k) catch I(0));
+        k = k + 1;
+    }
+    if (indirect) { aw(f, rv64I(RV64_JALR, RA, T5, 0), "jalr ra"); } else if (rtfnOpen(f)) { rv64Br(f.b, 1, target); }
+    f.raxSlot = -1;
+    if (len(result) > 0) { aStore(f, result, A0); }
+}
+/// Linux 的裸系统调用：实参 a0..a5，a7＝号，ecall，结果在 a0（−errno 约定）。内核只改 a0，分配器仍按调用看待（从严）；
+/// 装实参的次序同 rv64RtCall，a7 最后装（实参的来源可能在 a7）。
+export function rv64RtSyscall(f: Ref<RtFn>, result: string, nr: int, args: List<Ref<RtOp>>): void {
+    if (listLen(args) > 6) {
+        rtfnFail(f, "TooManySyscallArguments");
+        return;
+    }
+    let k = 0;
+    while (k < listLen(args)) {
+        aLoad(f, A0 + k, listGet(args, k) catch I(0));
+        k = k + 1;
+    }
+    aLoad(f, A7, I(nr));
+    aw(f, RV64_ECALL, "ecall");
+    f.raxSlot = -1;
+    if (len(result) > 0) { aStore(f, result, A0); }
+}
+/// LP64D 的 C 调用（同龙芯）：定参整数 a0..a7、浮点 fa0..fa7，浮点寄存器用完改用整数寄存器，再用完才
+/// 上栈；变参（类别 2、7）不进浮点寄存器、按整数规则；栈上的实参每个占一个 8 字节槽，从 [sp] 起。32 位整数（类别 3）不论有无
+/// 符号都符号扩展后放进寄存器（psABI：RV64 的 unsigned int 也符号扩展）。外部结构体按值（ffi_abi 已拆成按类别的片段，RISC-V
+/// 不用类别 8）：ex 为第二整数结果 a1 与第二浮点结果 fa1 的局部（桩的 r2、f2），多出的项不许有。
+export function rv64RtCallC(f: Ref<RtFn>, ri: string, rf: string, fp: string, args: List<Ref<RtOp>>, cls: List<int>, ex: List<string>): void {
+    let e = 2;
+    while (e < listLen(ex)) { if (len(listGet(ex, e) catch "") > 0) { rtfnFail(f, "Rv64ExtraCallResult"); return; } e = e + 1; }
+    // 先定每个实参的去处：0..7 整数寄存器 aN、8..15 浮点寄存器 faN、16 起为栈槽（16＋槽号）。
+    const where: List<int> = listNew();
+    let ni = 0;
+    let nf = 0;
+    let ns = 0;
+    for (c in cls) {
+        if (rtfnCFloat(c) && !rtfnCVar(c) && nf < 8) {
+            listPush(where, 8 + nf);
+            nf = nf + 1;
+        } else if (ni < 8) {
+            listPush(where, ni);
+            ni = ni + 1;
+        } else {
+            listPush(where, 16 + ns);
+            ns = ns + 1;
+        }
+    }
+    if (ns * 8 > f.base) {
+        rtfnFail(f, "OutgoingCallFrameTooSmall");
+        return;
+    }
+    // 栈上的与浮点寄存器的先装（经 t0），整数寄存器最后装（来源可能在 a0..a7）。
+    let k = 0;
+    while (k < listLen(args)) {
+        const w = listGet(where, k) catch 0;
+        const c = listGet(cls, k) catch 0;
+        if (w >= 8) {
+            aLoad(f, X_S0, listGet(args, k) catch I(0));
+            if (c == 3) { aw(f, rv64I(RV64_ADDIW, X_S0, X_S0, 0), "sext.w"); }
+            // f32（类别 6）放进浮点寄存器须 NaN 装箱（高 32 位全 1，RISC-V 的 F 扩展；没装箱的单精度值在被调方读作 NaN）：fmv.w.x。
+            if (w >= 16) { aSt(f, X_S0, SP, (w - 16) * 8); }
+            else if (c == 6) { aw(f, rv64R2(RV64_FMV_W_X, FA0 + w - 8, X_S0), "fmv.w.x"); }
+            else { aw(f, rv64R2(RV64_FMV_D_X, FA0 + w - 8, X_S0), "fmv.d.x"); }
+        }
+        k = k + 1;
+    }
+    aLoad(f, T5, L(fp));
+    k = 0;
+    while (k < listLen(args)) {
+        const w = listGet(where, k) catch 0;
+        if (w < 8) {
+            aLoad(f, A0 + w, listGet(args, k) catch I(0));
+            if ((listGet(cls, k) catch 0) == 3) { aw(f, rv64I(RV64_ADDIW, A0 + w, A0 + w, 0), "sext.w"); }
+        }
+        k = k + 1;
+    }
+    aw(f, rv64I(RV64_JALR, RA, T5, 0), "jalr ra");
+    f.raxSlot = -1;
+    if (len(rf) > 0) {
+        aw(f, rv64R2(RV64_FMV_X_D, X_S1, FA0), "fmv.x.d");
+        aStore(f, rf, X_S1);
+    }
+    const f2 = listGet(ex, 1) catch "";
+    if (len(f2) > 0) {
+        aw(f, rv64R2(RV64_FMV_X_D, X_S1, FA0 + 1), "fmv.x.d");
+        aStore(f, f2, X_S1);
+    }
+    const r2 = listGet(ex, 0) catch "";
+    if (len(r2) > 0) { aStore(f, r2, A0 + 1); }
+    if (len(ri) > 0) { aStore(f, ri, A0); }
+}
+export function rv64RtF64ToF32Bits(f: Ref<RtFn>, dst: string, x: Ref<RtOp>): void {
+    aLoad(f, X_S0, x);
+    aw(f, rv64R2(RV64_FMV_D_X, F0, X_S0), "fmv.d.x");
+    aw(f, rv64R2(RV64_FCVT_S_D, F0, F0), "fcvt.s.d");
+    aw(f, rv64R2(RV64_FMV_X_W, X_S0, F0), "fmv.x.w");
+    // fmv.x.w 符号扩展；位型只取低 32 位（同 A64 的 fmov w 零扩展）。
+    aw(f, rv64Shift(RV64_SLLI, X_S0, X_S0, 32, 64), "slli 32");
+    aw(f, rv64Shift(RV64_SRLI, X_S0, X_S0, 32, 64), "srli 32");
+    aStore(f, dst, X_S0);
+}
+export function rv64RtF32BitsToF64(f: Ref<RtFn>, dst: string, x: Ref<RtOp>): void {
+    aLoad(f, X_S0, x);
+    aw(f, rv64R2(RV64_FMV_W_X, F0, X_S0), "fmv.w.x");
+    aw(f, rv64R2(RV64_FCVT_D_S, F0, F0), "fcvt.d.s");
+    aw(f, rv64R2(RV64_FMV_X_D, X_S0, F0), "fmv.x.d");
+    aStore(f, dst, X_S0);
+}
+/// opcode：0 fmul、1 fdiv、2 fadd、3 fsub（rtfn.tx 的 rtFop 已核过）。
+export function rv64RtFop(f: Ref<RtFn>, dst: string, a: Ref<RtOp>, opcode: int, op: string, c: Ref<RtOp>): void {
+    aLoad(f, X_S0, a);
+    aLoad(f, X_S1, c);
+    aw(f, rv64R2(RV64_FMV_D_X, F0, X_S0), "fmv.d.x");
+    aw(f, rv64R2(RV64_FMV_D_X, F1, X_S1), "fmv.d.x");
+    let code = RV64_FMUL_D;
+    if (opcode == 1) { code = RV64_FDIV_D; }
+    if (opcode == 2) { code = RV64_FADD_D; }
+    if (opcode == 3) { code = RV64_FSUB_D; }
+    aw(f, rv64R(code, F0, F0, F1), op);
+    aw(f, rv64R2(RV64_FMV_X_D, X_S0, F0), "fmv.x.d");
+    aStore(f, dst, X_S0);
+}
+/// 浮点比较转移：feq／flt／fle 把结果写进 t0，为真即跳。无序时三者都得 0，只有 ne 成立（feq 为 0 即跳）；gt／ge 交换两边。
+export function rv64RtFIf(f: Ref<RtFn>, a: Ref<RtOp>, cc: string, c: Ref<RtOp>, label: string): void {
+    aLoad(f, X_S0, a);
+    aLoad(f, X_S1, c);
+    aw(f, rv64R2(RV64_FMV_D_X, F0, X_S0), "fmv.d.x");
+    aw(f, rv64R2(RV64_FMV_D_X, F1, X_S1), "fmv.d.x");
+    let w = -1;
+    let onFalse = false;
+    if (cc == "lt") { w = rv64R(RV64_FLT_D, X_S0, F0, F1); }
+    if (cc == "le") { w = rv64R(RV64_FLE_D, X_S0, F0, F1); }
+    if (cc == "gt") { w = rv64R(RV64_FLT_D, X_S0, F1, F0); }
+    if (cc == "ge") { w = rv64R(RV64_FLE_D, X_S0, F1, F0); }
+    if (cc == "eq") { w = rv64R(RV64_FEQ_D, X_S0, F0, F1); }
+    if (cc == "ne") { w = rv64R(RV64_FEQ_D, X_S0, F0, F1); onFalse = true; }
+    if (w < 0) { rtfnFail(f, "BadFloatCondition " + cc); return; }
+    aw(f, w, "fcmp");
+    if (!rtfnOpen(f)) { return; }
+    if (onFalse) { rv64BCond(f.b, RV64_BEQ, X_S0, ZERO, rtfnLabel(f, label)); } else { rv64BCond(f.b, RV64_BNE, X_S0, ZERO, rtfnLabel(f, label)); }
+}
+export function rv64RtIntToF64(f: Ref<RtFn>, dst: string, x: Ref<RtOp>): void {
+    aLoad(f, X_S0, x);
+    aw(f, rv64R2(RV64_FCVT_D_L, F0, X_S0), "fcvt.d.l");
+    aw(f, rv64R2(RV64_FMV_X_D, X_S0, F0), "fmv.x.d");
+    aStore(f, dst, X_S0);
+}
+// t0 = addr + off。
+function aAtomicAddr(f: Ref<RtFn>, addr: Ref<RtOp>, off: int): void {
+    aLoad(f, X_S0, addr);
+    if (off != 0) { aAddImm(f, X_S0, X_S0, off); }
+}
+export function rv64RtLoadAcq(f: Ref<RtFn>, dst: string, addr: Ref<RtOp>, off: int): void {
+    aAtomicAddr(f, addr, off);
+    aw(f, rv64I(RV64_LD, X_S0, X_S0, 0), "ld");
+    aw(f, rv64Fence(2, 3), "fence r, rw");
+    aStore(f, dst, X_S0);
+}
+export function rv64RtStoreRel(f: Ref<RtFn>, addr: Ref<RtOp>, off: int, value: Ref<RtOp>): void {
+    aAtomicAddr(f, addr, off);
+    aLoad(f, X_S1, value);
+    aw(f, rv64Fence(3, 1), "fence rw, w");
+    if (rtfnOpen(f)) { rv64Mem(f.b, RV64_SD, X_S1, X_S0, 0); }
+}
+export function rv64RtAtomicAdd(f: Ref<RtFn>, old: string, addr: Ref<RtOp>, off: int, v: Ref<RtOp>): void {
+    aAtomicAddr(f, addr, off);
+    aLoad(f, X_S1, v);
+    aw(f, rv64Amo(RV64_AMOADD_D | RV64_AQ | RV64_RL, X_S2, X_S1, X_S0), "amoadd.d.aqrl");
+    aStore(f, old, X_S2);
+}
+// 比较交换：1: lr.d.aqrl t2,(t0); bne t2,t1,2f; sc.d.rl t5,t3,(t0); bnez t5,1b; 2:。旧值留在 t2。lr 与 sc 之间只有一条向前的
+// bne（受约束的 LR/SC 循环，保证前进）。
+export function rv64RtAtomicCas(f: Ref<RtFn>, old: string, addr: Ref<RtOp>, off: int, expect: Ref<RtOp>, desired: Ref<RtOp>): void {
+    aAtomicAddr(f, addr, off);
+    aLoad(f, X_S1, expect);
+    aLoad(f, X_S3, desired);
+    const retry = aLocalLabel(f, "llsc");
+    const done = aLocalLabel(f, "llsc_done");
+    if (rtfnOpen(f)) { asBufferLabel(f.b, retry, 1); }
+    aw(f, rv64Lr(RV64_LR_D | RV64_AQ | RV64_RL, X_S2, X_S0), "lr.d.aqrl");
+    if (rtfnOpen(f)) { rv64BCond(f.b, RV64_BNE, X_S2, X_S1, done); }
+    aw(f, rv64Amo(RV64_SC_D | RV64_RL, T5, X_S3, X_S0), "sc.d.rl");
+    if (rtfnOpen(f)) { rv64BCond(f.b, RV64_BNE, T5, ZERO, retry); }
+    if (rtfnOpen(f)) { asBufferLabel(f.b, done, 1); }
+    aStore(f, old, X_S2);
+}
+export function rv64RtAtomicXchg(f: Ref<RtFn>, old: string, addr: Ref<RtOp>, off: int, v: Ref<RtOp>): void {
+    aAtomicAddr(f, addr, off);
+    aLoad(f, X_S1, v);
+    aw(f, rv64Amo(RV64_AMOSWAP_D | RV64_AQ | RV64_RL, X_S2, X_S1, X_S0), "amoswap.d.aqrl");
+    aStore(f, old, X_S2);
+}
+export function rv64RtTrap(f: Ref<RtFn>): void { aw(f, RV64_EBREAK, "ebreak"); }

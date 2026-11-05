@@ -1,0 +1,150 @@
+// ============================================================================
+// stdlib 用例：Linux 上取文件信息的两条路径逐项对照。sys_arch 在 x86_64、aarch64 上走 newfstatat／
+// fstat，龙芯只用 statx（sys_statx）；这里对同一组路径与 fd 同时走两条，比对返回码、类型与权限、大小、修改时间，并核对
+// 各自的绝对结果——龙芯那份代码每次 verify 都在真机上跑到。只在 Linux 宿主上运行（verify 跳过名字以 -linux.tx 结尾的
+// 用例）。
+// 运行：taixu test tests/stat-diff-linux.tx（原生编译器，Linux）
+// ============================================================================
+
+import { STAT_BUF, statPath, statFd, stMode, stSize, stMtimeSec, stMtimeNsec } from "std/sys_arch";
+import { STATX_BUF, statxPath, statxFd, stxMode, stxSize, stxMtimeSec, stxMtimeNsec } from "std/sys_statx";
+import { fsMkdirs } from "std/fs";
+import { fileOpen, fileWrite, fileClose, FILE_WRITE } from "std/file";
+
+declare function lxOpenat(dir: int, path: string, flags: int, mode: int): int from syscall "openat";
+declare function lxClose(fd: int): int from syscall "close";
+declare function lxSymlinkat(target: string, dir: int, path: string): int from syscall "symlinkat";
+declare function lxUnlinkat(dir: int, path: string, flags: int): int from syscall "unlinkat";
+
+const AT_FDCWD: int = -100;
+const AT_REMOVEDIR: int = 512;
+// O_RDONLY｜O_CLOEXEC（目录也能这样打开）
+const OPEN_READ: int = 524288;
+const S_IFMT: int = 61440;
+const S_IFREG: int = 32768;
+const S_IFDIR: int = 16384;
+const S_IFCHR: int = 8192;
+const ENOENT: int = 2;
+const EBADF: int = 9;
+const ENOTDIR: int = 20;
+const DIR: string = "taixu-statdiff.tmp";
+
+// 删掉上一次留下的（不存在也无妨）。
+function cleanup(): void {
+    for (p in [DIR + "/link", DIR + "/dangling", DIR + "/f.txt"]) {
+        lxUnlinkat(AT_FDCWD, p, 0);
+    }
+    lxUnlinkat(AT_FDCWD, DIR + "/sub", AT_REMOVEDIR);
+    lxUnlinkat(AT_FDCWD, DIR, AT_REMOVEDIR);
+}
+
+// 目录里放一个 5 字节的文件、一个子目录、指向文件的符号链接与悬空的符号链接。
+function setup(): void {
+    cleanup();
+    fsMkdirs(DIR + "/sub") catch panic("建目录失败");
+    const f = fileOpen(DIR + "/f.txt", FILE_WRITE) catch panic("建文件失败");
+    fileWrite(f, bytesFromStr("hello")) catch panic("写失败");
+    fileClose(f);
+    assert(lxSymlinkat("f.txt", AT_FDCWD, DIR + "/link") == 0, "建符号链接");
+    assert(lxSymlinkat("nope", AT_FDCWD, DIR + "/dangling") == 0, "建悬空符号链接");
+}
+
+// 两条路径的结果一致得空串，否则是差异说明；一致时 want 返回码（0 或 -errno）也要对上。
+function compare(what: string, ra: int, a: Bytes, rb: int, b: Bytes, want: int): string {
+    if (ra != rb) {
+        return what + "：返回码 " + toStr(ra) + " 对 statx " + toStr(rb);
+    }
+    if (ra != want) {
+        return what + "：返回码 " + toStr(ra) + "，应为 " + toStr(want);
+    }
+    if (ra != 0) {
+        return "";
+    }
+    if (stMode(a) != stxMode(b)) {
+        return what + "：mode " + toStr(stMode(a)) + " 对 statx " + toStr(stxMode(b));
+    }
+    if (stSize(a) != stxSize(b)) {
+        return what + "：size " + toStr(stSize(a)) + " 对 statx " + toStr(stxSize(b));
+    }
+    if (stMtimeSec(a) != stxMtimeSec(b) || stMtimeNsec(a) != stxMtimeNsec(b)) {
+        return what + "：mtime 不一致";
+    }
+    if (stMtimeNsec(a) < 0 || stMtimeNsec(a) > 999999999) {
+        return what + "：mtime 纳秒越界 " + toStr(stMtimeNsec(a));
+    }
+    return "";
+}
+
+function diffPath(path: string, want: int): string {
+    const a = bytesNew(STAT_BUF);
+    const b = bytesNew(STATX_BUF);
+    return compare(path, statPath(path, a), a, statxPath(path, b), b, want);
+}
+
+function diffFd(what: string, fd: int, want: int): string {
+    const a = bytesNew(STAT_BUF);
+    const b = bytesNew(STATX_BUF);
+    return compare(what, statFd(fd, a), a, statxFd(fd, b), b, want);
+}
+
+// 按路径取（跟随符号链接）的类型与大小；失败得 -1。
+function kindOf(path: string): int {
+    const a = bytesNew(STAT_BUF);
+    if (statPath(path, a) != 0) {
+        return -1;
+    }
+    return stMode(a) & S_IFMT;
+}
+
+function sizeOf(path: string): int {
+    const a = bytesNew(STAT_BUF);
+    if (statPath(path, a) != 0) {
+        return -1;
+    }
+    return stSize(a);
+}
+
+test "stat 与 statx：文件、目录、符号链接、字符设备" {
+    setup();
+    for (p in [DIR + "/f.txt", DIR + "/sub", DIR, DIR + "/link", "/dev/null", "."]) {
+        const d = diffPath(p, 0);
+        assert(d == "", d);
+    }
+    assert(kindOf(DIR + "/f.txt") == S_IFREG, "文件是 S_IFREG");
+    assert(sizeOf(DIR + "/f.txt") == 5, "文件 5 字节");
+    assert(kindOf(DIR + "/sub") == S_IFDIR, "目录是 S_IFDIR");
+    assert(kindOf(DIR + "/link") == S_IFREG && sizeOf(DIR + "/link") == 5, "符号链接跟随到文件");
+    assert(kindOf("/dev/null") == S_IFCHR, "/dev/null 是字符设备");
+    cleanup();
+}
+
+test "stat 与 statx：错误码一致" {
+    setup();
+    let d = diffPath(DIR + "/nope", -ENOENT);
+    assert(d == "", d);
+    d = diffPath(DIR + "/dangling", -ENOENT);
+    assert(d == "", d);
+    d = diffPath(DIR + "/f.txt/x", -ENOTDIR);
+    assert(d == "", d);
+    d = diffPath("", -ENOENT);
+    assert(d == "", d);
+    cleanup();
+}
+
+test "按 fd：fstat 与 statx 的 AT_EMPTY_PATH" {
+    setup();
+    const ff = lxOpenat(AT_FDCWD, DIR + "/f.txt", OPEN_READ, 0);
+    const fdir = lxOpenat(AT_FDCWD, DIR + "/sub", OPEN_READ, 0);
+    assert(ff >= 0 && fdir >= 0, "打开文件与目录");
+    let d = diffFd("文件 fd", ff, 0);
+    assert(d == "", d);
+    d = diffFd("目录 fd", fdir, 0);
+    assert(d == "", d);
+    const a = bytesNew(STAT_BUF);
+    assert(statFd(fdir, a) == 0 && (stMode(a) & S_IFMT) == S_IFDIR, "目录 fd 是 S_IFDIR");
+    lxClose(ff);
+    lxClose(fdir);
+    d = diffFd("负 fd", -1, -EBADF);
+    assert(d == "", d);
+    cleanup();
+}

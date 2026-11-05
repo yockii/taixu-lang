@@ -22,22 +22,32 @@ class ValidationTests(unittest.TestCase):
             boot.mkdir()
             entry = boot / 'entry.tx'
             entry.write_text('import { value } from "./platform";\n', encoding='utf-8')
-            windows, linux = [boot / ('platform_' + host + '.tx') for host in ['windows', 'linux']]
-            for path in [windows, linux]:
+            windows, linux, macos = [boot / ('platform_' + host + '.tx') for host in ['windows', 'linux', 'macos']]
+            for path in [windows, linux, macos]:
                 path.write_text('export function value(): int { return 1; }\n', encoding='utf-8')
             with contextlib.redirect_stdout(io.StringIO()):
-                self.assertTrue(check_edges(root, [entry, windows, linux]))
-                self.assertFalse(check_edges(root, [entry, windows]))
-                linux.write_text('import { bad } from "../outside";\n', encoding='utf-8')
+                # 编译器自身要编成的每个目标（Windows、Linux 两端 x86_64，M1 原生自举的 aarch64-macos，交叉编的
+                # aarch64-linux）沿自己的后缀链都要解析得到：缺 macOS 一端或 Linux 一端都不够。
+                self.assertTrue(check_edges(root, [entry, windows, linux, macos]))
                 self.assertFalse(check_edges(root, [entry, windows, linux]))
-                linux.write_text('import { value } from "./entry";\n', encoding='utf-8')
-                self.assertFalse(check_edges(root, [entry, windows, linux]))
-                # 类 Unix 的 _unix 也能满足 Linux 一端；只有 _macos 不够（编译器自身在 Windows／Linux 上自举，macOS 上的自举在适配 M3）。
-                unix, macos = boot / 'platform_unix.tx', boot / 'platform_macos.tx'
-                for path in [unix, macos]:
-                    path.write_text('export function value(): int { return 2; }\n', encoding='utf-8')
-                self.assertTrue(check_edges(root, [entry, windows, unix]))
                 self.assertFalse(check_edges(root, [entry, windows, macos]))
+                self.assertFalse(check_edges(root, [entry, linux, macos]))
+                linux.write_text('import { bad } from "../outside";\n', encoding='utf-8')
+                self.assertFalse(check_edges(root, [entry, windows, linux, macos]))
+                linux.write_text('import { value } from "./entry";\n', encoding='utf-8')
+                self.assertFalse(check_edges(root, [entry, windows, linux, macos]))
+                # 类 Unix 的 _unix 同时满足 Linux 与 macOS 两端。
+                unix = boot / 'platform_unix.tx'
+                unix.write_text('export function value(): int { return 2; }\n', encoding='utf-8')
+                self.assertTrue(check_edges(root, [entry, windows, unix]))
+                # 带目标后缀的文件只在选中它的目标上要求解析：x_linux 导入只有 y_linux 的 ./y 成立（只有 Linux 两个
+                # 目标选中 x_linux）；x_unix 导入同样的 ./y 不成立（aarch64-macos 也选中它，那里解析不到）。
+                x_linux, x_unix, y_linux = boot / 'x_linux.tx', boot / 'x_unix.tx', boot / 'y_linux.tx'
+                y_linux.write_text('export function y(): int { return 3; }\n', encoding='utf-8')
+                for path in [x_linux, x_unix]:
+                    path.write_text('import { y } from "./y";\n', encoding='utf-8')
+                self.assertTrue(check_edges(root, [x_linux, y_linux]))
+                self.assertFalse(check_edges(root, [x_unix, y_linux]))
 
     def test_environment_reaches_child_and_removes_overrides(self):
         with patch.dict(os.environ, {'TAIXU_EMIT_MIRROR': '1', 'TAIXU_REGALLOC_MIRROR': '1',

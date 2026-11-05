@@ -1,0 +1,282 @@
+// rtfn 的龙芯底层探针（7、9）：用 rtfn 在龙芯缓冲里写一个小程序，链接成静态 ELF（不用
+// libc）。在龙芯 Linux（或 qemu-loongarch64）上运行：逐项核对 rtfn 原语，全部相符打印 “la64 rtfn ok” 并以 0 退出；第 k 项不符即
+// 以 k 退出。系统调用一律经 rtSyscall 传 x86_64 的号（write 1、exit_group 231、fstat 5、newfstatat 262），顺带核对号表翻译与
+// fstat／newfstatat → statx 的改写；C 调用调本探针手写的几个 LP64D 函数。第二个映像做除零，须被 break 7 终止（SIGFPE）。
+// 用法：la64_rtfn_probe <输出目录>。
+import { RtFn, RtOp, L, I, A, G } from "./selfhost/rtfn_base";
+import { rtBegin, rtFailed, rtEnd, rtSet, rtSetGlobal, rtOp, rtShift, rtDivMod, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtIf32, rtCall2, rtCallList, rtCallC, rtF64ToF32Bits, rtF32BitsToF64, rtFop, rtFIf, rtIntToF64, rtLoadAcq, rtStoreRel, rtAtomicAdd, rtAtomicCas, rtAtomicXchg, rtRet, rtSyscall, rtRdataBytes } from "./selfhost/rtfn";
+import { StructuredBuffer, asBufferSection, asBufferLabel, asBufferQuad, asStructuredBegin, asFailedAs, asLastErrAs } from "./selfhost/assemble";
+import { asBufferNewLa64, la64BufferSubmit, la64Emit, la64B, la64MovImm } from "./selfhost/la64_asm";
+import { la64R2, la64R3, la64Code, la64Jirl } from "./selfhost/la64_encode";
+import { LA64_SYSCALL, LA64_ADD_D, LA64_FMUL_D, LA64_MOVGR2FR_D, LA64_FFINT_D_L, LA64_LD_D, LA64_OR } from "./selfhost/la64_encode";
+import { la64Si12 } from "./selfhost/la64_encode";
+import { elfWriteObject, elfObjectOk, elfObjectBytes, elfObjectError } from "./selfhost/emit_elf_object";
+import { linkElfObjects, elfObjectsBytes, elfObjectsError, elfDynReset } from "./selfhost/link_elf_objects";
+
+const MODULE: string = "bootstrap/la64_rtfn_probe.tx";
+let failures: List<string> = listNew();
+
+function done(f: Ref<RtFn>): void {
+    rtEnd(f);
+    if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
+}
+
+// check(k)：x 与 want 不等时 exit_group(k)。
+function check(f: Ref<RtFn>, k: int, x: Ref<RtOp>, want: Ref<RtOp>): void {
+    const ok = "ok" + toStr(k);
+    rtIf(f, x, "eq", want, ok);
+    const args: List<Ref<RtOp>> = listNew(); listPush(args, I(k));
+    rtSyscall(f, "", 231, args);
+    rtLabel(f, ok);
+}
+
+// x（局部）cc 立即数 v 按 32 位比较，须得 want；不符以 k 退出。
+function if32(f: Ref<RtFn>, k: int, x: int, cc: string, v: int, want: bool): void {
+    const taken = "t" + toStr(k);
+    const after = "a" + toStr(k);
+    rtSet(f, "x", I(x));
+    rtIf32(f, L("x"), cc, I(v), taken);
+    if (want) { check(f, k, I(0), I(1)); }
+    rtJump(f, after);
+    rtLabel(f, taken);
+    if (!want) { check(f, k, I(0), I(1)); }
+    rtLabel(f, after);
+}
+
+// 十个参数求加权和：a0 + 2·a1 + … + 10·a9（第 9、10 个在栈上）。
+function sum10(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "p_sum10", "a0 a1 a2 a3 a4 a5 a6 a7 a8 a9", "s t", 0, MODULE);
+    rtSet(f, "s", I(0));
+    let k = 0;
+    while (k < 10) {
+        rtOp(f, "t", L("a" + toStr(k)), "imul", I(k + 1));
+        rtOp(f, "s", L("s"), "add", L("t"));
+        k = k + 1;
+    }
+    rtRet(f, L("s"));
+    done(f);
+}
+
+// 大帧：4200 个局部（帧超过 32 KiB），最后一个局部的读写要走偏移合法化（t8 变址形）。
+function bigFrame(b: Ref<StructuredBuffer>): void {
+    let names = "";
+    let k = 0;
+    while (k < 4200) { names = names + " v" + toStr(k); k = k + 1; }
+    const f = rtBegin(b, "p_big", "x", names, 0, MODULE);
+    rtSet(f, "v4199", L("x"));
+    rtSet(f, "v0", I(5));
+    rtOp(f, "v4198", L("v4199"), "add", L("v0"));
+    rtRet(f, L("v4198"));
+    done(f);
+}
+
+// 手写的 LP64D 函数（C 调用的被调方）：
+//   p_cmul(double x, long n)：fa0 = x × (double)n。
+//   p_csum9(long a0..a8)：a0 = 九个整数之和（第 9 个在调用方的 [sp]）。
+//   p_cid(int x)：a0 = a0（看 32 位实参在寄存器里是否已符号扩展）。
+function cFunctions(b: Ref<StructuredBuffer>): void {
+    asBufferLabel(b, "p_cmul", 1);
+    la64Emit(b, la64R2(LA64_MOVGR2FR_D, 1, 4), "movgr2fr.d");
+    la64Emit(b, la64R2(LA64_FFINT_D_L, 1, 1), "ffint.d.l");
+    la64Emit(b, la64R3(LA64_FMUL_D, 0, 0, 1), "fmul.d");
+    la64Emit(b, la64Jirl(0, 1, 0), "ret");
+    asBufferLabel(b, "p_csum9", 1);
+    let r = 5;
+    while (r <= 11) { la64Emit(b, la64R3(LA64_ADD_D, 4, 4, r), "add.d"); r = r + 1; }
+    la64Emit(b, la64Si12(LA64_LD_D, 12, 3, 0), "ld.d [sp]");
+    la64Emit(b, la64R3(LA64_ADD_D, 4, 4, 12), "add.d");
+    la64Emit(b, la64Jirl(0, 1, 0), "ret");
+    asBufferLabel(b, "p_cid", 1);
+    la64Emit(b, la64R3(LA64_OR, 4, 4, 0), "move");
+    la64Emit(b, la64Jirl(0, 1, 0), "ret");
+}
+
+// 进程入口：bl la64_main，以结果 exit_group（入口没有可返回的地址）。
+function start(b: Ref<StructuredBuffer>): void {
+    asBufferLabel(b, "la64_start", 1);
+    la64B(b, 1, "la64_main");
+    la64MovImm(b, 11, 94);
+    la64Emit(b, la64Code(LA64_SYSCALL, 0), "syscall");
+}
+
+function cCall(f: Ref<RtFn>, ri: string, rf: string, fn: string, args: List<Ref<RtOp>>, cls: List<int>): void {
+    rtSet(f, "fp", A(fn));
+    rtCallC(f, ri, rf, "fp", args, cls, false);
+}
+
+function mainFn(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "la64_main", "", "fp r q m x y p buf0 buf1 h d e g st0 st1 st2 st3 st4 st5 st6 st7 st8 st9 st10 st11 st12 st13 st14 st15 st16 st17 st18 st19 st20 st21 st22 st23 st24 st25 st26 st27 st28 st29 st30 st31", 10, MODULE);
+    // 1..6 运算与移位
+    rtOp(f, "x", I(40), "add", I(2)); check(f, 1, L("x"), I(42));
+    rtOp(f, "x", I(5), "sub", I(9)); check(f, 2, L("x"), I(-4));
+    rtOp(f, "x", I(-1), "imul", I(-7)); check(f, 3, L("x"), I(7));
+    rtOp(f, "x", I(12), "and", I(10)); rtOp(f, "x", L("x"), "or", I(1)); rtOp(f, "x", L("x"), "xor", I(16)); check(f, 4, L("x"), I(25));
+    rtShift(f, "x", I(-8), "sar", 2); check(f, 5, L("x"), I(-2));
+    rtShift(f, "x", I(-8), "shr", 60); rtShift(f, "y", I(3), "shl", 62); rtOp(f, "x", L("x"), "add", L("y")); check(f, 6, L("x"), I(-4611686018427387889));
+    // 7..8 除法与取余（有符号，向零截断）
+    rtDivMod(f, "q", "m", I(-17), I(5)); check(f, 7, L("q"), I(-3)); check(f, 8, L("m"), I(-2));
+    // 9..12 读写各宽度（栈上缓冲），读为零扩展
+    rtAddrOf(f, "p", "buf0");
+    rtStore(f, L("p"), 0, I(-1), 8);
+    rtStore(f, L("p"), 1, I(0), 1);
+    rtLoad(f, "x", L("p"), 0, 8); check(f, 9, L("x"), I(-65281));
+    rtLoad(f, "x", L("p"), 2, 2); check(f, 10, L("x"), I(65535));
+    rtStore(f, L("p"), 4, I(305419896), 4);
+    rtLoad(f, "x", L("p"), 4, 4); check(f, 11, L("x"), I(305419896));
+    rtLoad(f, "x", L("p"), 7, 1); check(f, 12, L("x"), I(18));
+    // 13..14 全局：地址、读、写
+    rtLoad(f, "x", A("p_cell"), 0, 8); check(f, 13, L("x"), I(123456789));
+    rtSetGlobal(f, "p_cell", I(-5)); rtSet(f, "x", G("p_cell")); check(f, 14, L("x"), I(-5));
+    // 15 十参数调用（栈上实参）
+    const args: List<Ref<RtOp>> = listNew();
+    let k = 0;
+    while (k < 10) { listPush(args, I(k + 1)); k = k + 1; }
+    rtCallList(f, "x", "p_sum10", args); check(f, 15, L("x"), I(385));
+    // 16 间接调用
+    rtSet(f, "h", A("p_sum10"));
+    rtCallList(f, "x", "*h", args); check(f, 16, L("x"), I(385));
+    // 17 大帧
+    rtCall2(f, "x", "p_big", I(100), I(0)); check(f, 17, L("x"), I(105));
+    // 18 C 调用：p_cmul(1.5, 8) = 12.0（浮点实参与结果、整数实参）
+    const cargs: List<Ref<RtOp>> = listNew(); listPush(cargs, I(4609434218613702656)); listPush(cargs, I(8));
+    const ccls: List<int> = listNew(); listPush(ccls, 1); listPush(ccls, 0);
+    cCall(f, "", "d", "p_cmul", cargs, ccls); check(f, 18, L("d"), I(4622945017495814144));
+    // 19..20 f32：12.0 → 0x41400000 → 12.0
+    rtF64ToF32Bits(f, "e", L("d")); check(f, 19, L("e"), I(1094713344));
+    rtF32BitsToF64(f, "g", L("e")); check(f, 20, L("g"), L("d"));
+    // 21 循环与 32 位比较：数到 1000
+    rtSet(f, "x", I(0));
+    rtLabel(f, "loop");
+    rtOp(f, "x", L("x"), "add", I(1));
+    rtIf32(f, L("x"), "ult", I(1000), "loop");
+    check(f, 21, L("x"), I(1000));
+    rtIf(f, I(-1), "ult", I(1), "bad"); rtIf(f, I(1), "gt", I(-1), "good"); rtJump(f, "bad");
+    rtLabel(f, "bad"); check(f, 22, I(0), I(1));
+    rtLabel(f, "good");
+    // 23..27 浮点：1.5+2.25、7.5−2.5、1.5×2.5、7.5÷2.5、(double)−3
+    rtFop(f, "x", I(4609434218613702656), "fadd", I(4612248968380809216)); check(f, 23, L("x"), I(4615626668101337088));
+    rtFop(f, "x", I(4620130267728707584), "fsub", I(4612811918334230528)); check(f, 24, L("x"), I(4617315517961601024));
+    rtFop(f, "x", I(4609434218613702656), "fmul", I(4612811918334230528)); check(f, 25, L("x"), I(4615626668101337088));
+    rtFop(f, "x", I(4620130267728707584), "fdiv", I(4612811918334230528)); check(f, 26, L("x"), I(4613937818241073152));
+    rtIntToF64(f, "x", I(-3)); check(f, 27, L("x"), I(-4609434218613702656));
+    // 28..29 比较：NaN 与 1.0 只有 ne 成立；1.5 < 2.5、2.5 >= 2.5
+    for (cc in strSplit("lt le gt ge eq", " ")) {
+        rtFIf(f, I(9221120237041090560), cc, I(4607182418800017408), "nanbad");
+    }
+    rtFIf(f, I(9221120237041090560), "ne", I(4607182418800017408), "nanok");
+    rtLabel(f, "nanbad"); check(f, 28, I(0), I(1));
+    rtLabel(f, "nanok");
+    rtFIf(f, I(4612811918334230528), "lt", I(4609434218613702656), "fbad");
+    rtFIf(f, I(4609434218613702656), "lt", I(4612811918334230528), "f1");
+    rtJump(f, "fbad");
+    rtLabel(f, "f1");
+    rtFIf(f, I(4612811918334230528), "ge", I(4612811918334230528), "f2");
+    rtLabel(f, "fbad"); check(f, 29, I(0), I(1));
+    rtLabel(f, "f2");
+    // 30..35 原子与内存序（p_cell 现为 −5）
+    rtAtomicAdd(f, "x", A("p_cell"), 0, I(12)); check(f, 30, L("x"), I(-5));
+    rtLoadAcq(f, "x", A("p_cell"), 0); check(f, 31, L("x"), I(7));
+    rtAtomicCas(f, "x", A("p_cell"), 0, I(7), I(70)); check(f, 32, L("x"), I(7));
+    rtAtomicCas(f, "x", A("p_cell"), 0, I(7), I(700)); check(f, 33, L("x"), I(70));
+    rtAtomicXchg(f, "x", A("p_cell"), 0, I(1)); check(f, 34, L("x"), I(70));
+    rtStoreRel(f, A("p_cell"), 0, I(99)); rtSet(f, "x", G("p_cell")); check(f, 35, L("x"), I(99));
+    // 36..43 32 位比较的 le（有符号）与 ule：只看低 32 位。
+    if32(f, 36, 4294967295, "le", 0, true);
+    if32(f, 37, 4294967296, "le", 0, true);
+    if32(f, 38, 1, "le", 0, false);
+    if32(f, 39, 2147483648, "le", 0, true);
+    if32(f, 40, 1, "ule", 1, true);
+    if32(f, 41, 0, "ule", 1, true);
+    if32(f, 42, 2, "ule", 1, false);
+    if32(f, 43, 4294967295, "ule", 1, false);
+    // 44 C 调用的第 9 个整数实参在栈上：1+2+…+9 = 45
+    const nine: List<Ref<RtOp>> = listNew();
+    const nineCls: List<int> = listNew();
+    k = 1;
+    while (k <= 9) { listPush(nine, I(k)); listPush(nineCls, 0); k = k + 1; }
+    cCall(f, "x", "", "p_csum9", nine, nineCls); check(f, 44, L("x"), I(45));
+    // 45 32 位实参（类别 3）按 LP64D 符号扩展：0xFFFFFFFF 到被调方是 −1
+    const w32: List<Ref<RtOp>> = listNew(); listPush(w32, I(4294967295));
+    const w32Cls: List<int> = listNew(); listPush(w32Cls, 3);
+    cCall(f, "x", "", "p_cid", w32, w32Cls); check(f, 45, L("x"), I(-1));
+    // 46..47 fstat(1) → statx(1, "", AT_EMPTY_PATH…)：成功，类型位非 0（statx 的 stx_mode 在偏移 28，u16）
+    rtAddrOf(f, "p", "st0");
+    const fs: List<Ref<RtOp>> = listNew(); listPush(fs, I(1)); listPush(fs, L("p"));
+    rtSyscall(f, "r", 5, fs); check(f, 46, L("r"), I(0));
+    rtLoad(f, "x", L("p"), 28, 2); rtOp(f, "x", L("x"), "and", I(61440));
+    rtIf(f, L("x"), "eq", I(0), "stbad");
+    // 48 newfstatat(AT_FDCWD, ".", buf, 0) → statx：是目录
+    const ns: List<Ref<RtOp>> = listNew(); listPush(ns, I(-100)); listPush(ns, A("p_dot")); listPush(ns, L("p")); listPush(ns, I(0));
+    rtSyscall(f, "r", 262, ns); check(f, 47, L("r"), I(0));
+    rtLoad(f, "x", L("p"), 28, 2); rtOp(f, "x", L("x"), "and", I(61440)); check(f, 48, L("x"), I(16384));
+    rtJump(f, "stok");
+    rtLabel(f, "stbad"); check(f, 49, I(0), I(1));
+    rtLabel(f, "stok");
+    // 打印并返回 0（入口以它 exit_group）
+    const wargs: List<Ref<RtOp>> = listNew(); listPush(wargs, I(1)); listPush(wargs, A("p_msg")); listPush(wargs, I(13));
+    rtSyscall(f, "r", 1, wargs);
+    rtRet(f, I(0));
+    done(f);
+}
+
+function divZeroFn(b: Ref<StructuredBuffer>): void {
+    const f = rtBegin(b, "la64_main", "", "q d", 0, MODULE);
+    rtSet(f, "d", G("p_zero"));
+    rtDivMod(f, "q", "", I(7), L("d"));
+    rtRet(f, L("q"));
+    done(f);
+}
+
+function link(b: Ref<StructuredBuffer>, path: string): int {
+    asStructuredBegin();
+    la64BufferSubmit(b);
+    if (asFailedAs() != 0) { eprint("asm: " + asLastErrAs()); return 65; }
+    const exports: List<string> = listNew(); listPush(exports, "la64_start");
+    const r = elfWriteObject(exports);
+    if (elfObjectOk(r) != 1) { eprint("elf: " + elfObjectError(r)); return 66; }
+    const objects: List<Bytes> = listNew(); listPush(objects, elfObjectBytes(r));
+    elfDynReset();
+    if (linkElfObjects(objects, "la64_start") != 0) { eprint("link: " + elfObjectsError()); return 67; }
+    writeFileBytes(path, elfObjectsBytes()) catch (e) { eprint(e.message); return 68; };
+    return 0;
+}
+
+// 只读数据：消息、"."、statx 的空路径（运行时内核另行提供 __tx_la64_empty，这里独立链接自带一份）。
+function rodata(b: Ref<StructuredBuffer>): void {
+    rtRdataBytes(b, "p_msg", "la64 rtfn ok\n");
+    rtRdataBytes(b, "p_dot", ".");
+    asBufferSection(b, 1, 1);
+    asBufferLabel(b, "__tx_la64_empty", 1);
+    asBufferQuad(b, 0, 1);
+    asBufferSection(b, 2, 1);
+    asBufferLabel(b, "p_cell", 1);
+    asBufferQuad(b, 123456789, 1);
+    asBufferLabel(b, "p_zero", 1);
+    asBufferQuad(b, 0, 1);
+    asBufferSection(b, 0, 1);
+}
+
+function main(args: []string): int {
+    if (len(args) < 1) { eprint("usage: la64_rtfn_probe <outdir>"); return 64; }
+    const b = asBufferNewLa64();
+    asBufferSection(b, 0, 1);
+    start(b);
+    cFunctions(b);
+    sum10(b);
+    bigFrame(b);
+    mainFn(b);
+    rodata(b);
+    if (listLen(failures) > 0) { eprint("rtfn: " + (listGet(failures, 0) catch "")); return 69; }
+    const c1 = link(b, args[0] + "/rtfn_ok");
+    if (c1 != 0) { return c1; }
+    const z = asBufferNewLa64();
+    asBufferSection(z, 0, 1);
+    start(z);
+    divZeroFn(z);
+    rodata(z);
+    if (listLen(failures) > 0) { eprint("rtfn: " + (listGet(failures, 0) catch "")); return 69; }
+    const c2 = link(z, args[0] + "/rtfn_divzero");
+    if (c2 != 0) { return c2; }
+    print("PASS_LA64_RTFN");
+    return 0;
+}

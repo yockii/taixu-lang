@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""原生仓库的行尾、行数、导入边界与 Zig 清退检查。"""
+"""原生仓库的行尾、行数、导入边界，以及编译器、预置库与标准库只含太虚源码的检查。"""
 import argparse
 from collections import Counter
 import fnmatch
@@ -10,7 +10,10 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parent.parent
-IGNORED = {'.git', '.zig-cache', '.tools', 'zig-out', 'zig-out-rel', 'work', '.tmp', '__pycache__', 'node_modules', 'dist'}
+IGNORED = {'.git', '.tools', 'work', '.tmp', '__pycache__', 'node_modules', 'dist'}
+# 只许太虚源码的目录（标准库在公开仓里位于 stdlib/）。
+PURE = ('bootstrap/', 'prelude/', 'stdlib/src/')
+COMMIT = re.compile(r'[0-9a-f]{40}')
 
 
 def source_files(root):
@@ -90,10 +93,22 @@ def imports(text):
     return re.findall(r'^\s*import\s+[^;]*?\sfrom\s+"([^"\n]+)"\s*;', text, re.MULTILINE)
 
 
-# 按目标选文件（D3 v0.35，同 bootstrap/selfhost/target.tx 的 targetFileSuffixes／targetFileSuffixesAll）：产品目标各自的
-# 后缀链，与同组兄弟文件的全部后缀。macOS 目前只用于分析，不要求编译器源码对它可解析。
-TARGET_CHAINS = {'windows': ['windows_x86_64', 'windows'], 'linux': ['linux_x86_64', 'linux', 'unix']}
-ALL_SUFFIXES = ['windows', 'linux', 'macos', 'unix'] + [o + '_' + a for o in ['windows', 'linux', 'macos'] for a in ['x86_64', 'aarch64']]
+# 按目标选文件（D3 v0.35，同 bootstrap/selfhost/target.tx 的 targetFileSuffixes／targetFileSuffixesAll）：编译器自身要编成的
+# 各目标的后缀链（M1 门原生编 aarch64-macos，交叉编 aarch64-linux，A4f 起交叉编 loongarch64-linux，A5f 起交叉编
+# riscv64-linux，A6c 起交叉编 aarch64-windows），与同组兄弟文件的全部后缀。
+TARGET_CHAINS = {'windows': ['windows_x86_64', 'windows'], 'aarch64-windows': ['windows_aarch64', 'windows'],
+                 'linux': ['linux_x86_64', 'linux', 'unix'],
+                 'aarch64-macos': ['macos_aarch64', 'macos', 'unix'], 'aarch64-linux': ['linux_aarch64', 'linux', 'unix'],
+                 'loongarch64-linux': ['linux_loongarch64', 'linux', 'unix'], 'riscv64-linux': ['linux_riscv64', 'linux', 'unix']}
+ALL_SUFFIXES = ['windows', 'linux', 'macos', 'unix'] + [o + '_' + a for o in ['windows', 'linux', 'macos']
+                                                        for a in ['x86_64', 'aarch64', 'loongarch64', 'riscv64']]
+
+
+def selecting_chains(path):
+    # 带目标后缀的文件只在后缀链含该后缀的目标上入选，它的导入也只需在这些目标上解析得到（取最长的后缀：_linux_aarch64
+    # 先于 _linux）；不带后缀的文件各目标都入选。
+    sfx = max((s for s in ALL_SUFFIXES if path.stem.endswith('_' + s)), key=len, default=None)
+    return [chain for chain in TARGET_CHAINS.values() if sfx is None or sfx in chain]
 
 
 def check_edges(root, files):
@@ -115,8 +130,8 @@ def check_edges(root, files):
             target = target.resolve()
             variant = lambda sfx: target.with_name(target.stem + '_' + sfx + '.tx')
             targets = [p for p in [target, *map(variant, ALL_SUFFIXES)] if p in nodes]
-            # 与原生目标选择一致：每个产品目标沿自己的后缀链都要解析得到；依赖取同组全部现存文件。
-            if not targets or not all(any(p in nodes for p in [*map(variant, chain), target]) for chain in TARGET_CHAINS.values()):
+            # 与原生目标选择一致：选中本文件的每个目标沿自己的后缀链都要解析得到；依赖取同组全部现存文件。
+            if not targets or not all(any(p in nodes for p in [*map(variant, chain), target]) for chain in selecting_chains(path)):
                 bad.append((path, 'missing or outside compiler source: ' + spec))
                 continue
             for target in targets:
@@ -150,10 +165,27 @@ def check_edges(root, files):
     return not bad
 
 
+def check_pure(root, files):
+    """编译器、预置库与标准库只含太虚源码：PURE 下只许 .tx；bootstrap/ 下另许无扩展名、内容为一个提交号的固定阶段文件。"""
+    bad = []
+    for p in files:
+        rel = p.relative_to(root).as_posix()
+        if not rel.startswith(PURE) or p.suffix == '.tx':
+            continue
+        if rel.startswith('bootstrap/') and '/' not in rel[len('bootstrap/'):] and not p.suffix \
+                and COMMIT.fullmatch(p.read_text(encoding='utf-8', errors='replace').strip()):
+            continue
+        bad.append(rel)
+    for rel in bad:
+        print('FAIL not Taixu source', rel)
+    print('pure:', len(bad), 'non-Taixu files under', ', '.join(PURE))
+    return not bad
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--root', type=Path, default=ROOT)
-    ap.add_argument('--only', choices=['eol', 'linecount', 'edges', 'no-zig', 'all'], default='all')
+    ap.add_argument('--only', choices=['eol', 'linecount', 'edges', 'pure', 'all'], default='all')
     a = ap.parse_args()
     root = a.root.resolve()
     files = source_files(root)
@@ -164,12 +196,8 @@ def main():
         linecount(root, files)
     if a.only in ('all', 'edges'):
         ok = check_edges(root, files) and ok
-    if a.only in ('all', 'no-zig'):
-        zig = [p.relative_to(root).as_posix() for p in files if p.suffix.lower() == '.zig']
-        for path in zig:
-            print('FAIL Zig source', path)
-        print('no-zig:', len(zig), 'Zig source files')
-        ok = not zig and ok
+    if a.only in ('all', 'pure'):
+        ok = check_pure(root, files) and ok
     return 0 if ok else 1
 
 

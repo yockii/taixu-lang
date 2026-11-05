@@ -6,7 +6,7 @@
 
 写码时随手查的**速查手册**（语言面／内建函数全表／诊断码／CLI 子命令／
 标准库模块）：[../quickref.md](../quickref.md)。语言的权威定义见
-[语言规范](../design/D3-s1-language-spec-v0.42.md)。
+语言规范。
 
 ## 章节
 
@@ -21,7 +21,7 @@
 | 07 | [07-closures-events.md](07-closures-events.md) | 闭包与函数类型：捕获、fn 类型字段、事件订阅 |
 | 08 | [08-async-tasks.md](08-async-tasks.md) | 异步与任务：async/await、TaskGroup、定时器与取消 |
 | 09 | [09-toolchain.md](09-toolchain.md) | 工具链：fmt/test/doc/lsp/dap/build 与发布 |
-| 10 | [10-gui.md](10-gui.md) | GUI 现状：迁移空窗期说明 |
+| 10 | [10-gui.md](10-gui.md) | GUI 入门：取 GUI 库、`taixu init gui`、真窗、发布与重放测试 |
 | 11 | [11-ai-workflow.md](11-ai-workflow.md) | AI 原生工作流：CLI/LSP/MCP 三通道、诊断码即事实源 |
 | 12 | [12-syntax-tour.md](12-syntax-tour.md) | 关键字全表、字面量与转义、语法糖、进阶语法、有意没有的写法 |
 

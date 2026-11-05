@@ -1,0 +1,109 @@
+// RISC-V 编译器的交叉构建与自举不动点（gate.tx 的 rv64-bootstrap 步）：用受测编译器把
+// bootstrap/taixu.tx 交叉编成 riscv64-linux 的编译器 C，任何宿主上都核对它是静态的 ELF64 RISC-V 可执行文件（e_machine 243、
+// e_flags 0x4、没有 PT_INTERP）且两次交叉构建逐字节相同；RISC-V Linux 宿主上直接运行、别处有 TAIXU_QEMU_RISCV64 时经它运行
+// C，由 C 在本仓自举出 D，核对 D 与 C 逐字节相同（不动点）。没有运行条件时自举一项记 SKIP，不记通过。
+// 运行：taixu run --toolchain scripts/test_rv64_bootstrap.tx --compiler <taixu> --work <目录> [--root <仓库>]
+import { absolute, exeName, join, list1, mkdirs, plus, step, readBytes } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { capture, check, summary, tallyNew } from "./test_lib";
+
+function u(b: Bytes, at: int, n: int): int {
+    let v = 0;
+    let k = n - 1;
+    while (k >= 0) {
+        v = (v << 8) | ((bytesGetLE<u8>(b, at + k) ?? 0) as int);
+        k = k - 1;
+    }
+    return v;
+}
+
+// 程序头里有没有 PT_INTERP（3）：静态产物没有。
+function hasInterp(img: Bytes): bool {
+    const phoff = u(img, 32, 8);
+    const phnum = u(img, 56, 2);
+    let k = 0;
+    while (k < phnum) {
+        if (u(img, phoff + k * 56, 4) == 3) { return true; }
+        k = k + 1;
+    }
+    return false;
+}
+
+function crossBuild(compiler: string, root: string, out: string): void | Error {
+    return step(compiler, plus(plus(list1("build"), list1("bootstrap/taixu.tx")), plus(list1("--toolchain"), plus(list1("--target=riscv64-linux"), plus(list1("--out"), list1(out))))), root);
+}
+
+function run(args: []string): int | Error {
+    let compiler = "";
+    let work = "";
+    let root = "";
+    let i: int = 0;
+    while (i < len(args)) {
+        const a = args[i];
+        if (i + 1 >= len(args)) {
+            return err("缺少取值或未知参数：" + a);
+        }
+        const v = args[i + 1];
+        if (a == "--compiler") {
+            compiler = v;
+        } else if (a == "--work") {
+            work = v;
+        } else if (a == "--root") {
+            root = v;
+        } else {
+            return err("未知参数：" + a);
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0 || len(work) == 0) {
+        return err("用法：taixu run --toolchain scripts/test_rv64_bootstrap.tx --compiler <taixu> --work <目录> [--root <仓库>]");
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = osRealPath(absolute(root));
+    compiler = osRealPath(absolute(compiler));
+    if (!mkdirs(absolute(work))) {
+        return err("建不了工作目录：" + work);
+    }
+    const dir = osRealPath(absolute(work));
+    const t = tallyNew();
+    const first = join(dir, "c");
+    const second = join(dir, "c2");
+    crossBuild(compiler, root, first)?;
+    crossBuild(compiler, root, second)?;
+    const c = join(first, "taixu");
+    const img = readBytes(c) catch bytesNew(0);
+    const img2 = readBytes(join(second, "taixu")) catch bytesNew(0);
+    check(t, "cross-build", bytesLen(img) > 0, "交叉构建没有产物：" + c);
+    check(t, "deterministic", bytesLen(img) > 0 && bytesEqual(img, img2), "两次交叉构建不同（" + toStr(bytesLen(img)) + "／" + toStr(bytesLen(img2)) + " 字节）");
+    const header = bytesLen(img) >= 64 && u(img, 0, 4) == 1179403647 && u(img, 4, 1) == 2 && u(img, 5, 1) == 1 && u(img, 16, 2) == 2;
+    check(t, "elf", header && u(img, 18, 2) == 243 && u(img, 48, 4) == 4 && !hasInterp(img), "不是静态的 ELF64 RISC-V 可执行文件");
+    const native = hostTarget() == "linux" && hostArch() == "riscv64";
+    const qemu = getEnv("TAIXU_QEMU_RISCV64") ?? "";
+    if (!native && len(qemu) == 0) {
+        print("SKIP self-build：不是 RISC-V Linux 宿主，也没有设 TAIXU_QEMU_RISCV64");
+        return summary(t, "rv64-bootstrap");
+    }
+    // C 在本仓自举出 D（RISC-V 宿主上缺省目标即 riscv64-linux）。
+    const d = join(dir, "d");
+    const buildArgs = plus(plus(list1("build"), list1("bootstrap/taixu.tx")), plus(list1("--toolchain"), plus(list1("--out"), list1(d))));
+    let cmd = c;
+    let cmdArgs = buildArgs;
+    if (!native) {
+        cmd = qemu;
+        cmdArgs = plus(list1(c), buildArgs);
+    }
+    const r = capture(cmd, cmdArgs, root, 3600000000000, 65536)?;
+    check(t, "self-build", r.code == 0, "退出码 " + toStr(r.code) + "，输出 " + r.out + r.err);
+    const dimg = readBytes(join(d, "taixu")) catch bytesNew(0);
+    check(t, "fixpoint", bytesLen(dimg) > 0 && bytesEqual(img, dimg), "自举出的 D（" + toStr(bytesLen(dimg)) + " 字节）与交叉构建的 C 不同");
+    return summary(t, "rv64-bootstrap");
+}
+
+function main(args: []string): int {
+    return run(args) catch (e) {
+        eprint("test_rv64_bootstrap: " + e.message);
+        return 1;
+    };
+}

@@ -1,0 +1,211 @@
+// 龙芯写出链路的端到端探针：用 la64_asm 手写两个目标文件，经 ELF loongarch64 对象与
+// 链接器写成静态可执行文件（不用 libc，直接 syscall）。在龙芯 Linux（或 qemu-loongarch64）上运行应依次打印五行：
+//   la64 image: write ok          ← syscall write、符号地址（pcalau12i＋addi.d：PCALA_HI20＋LO12）
+//   la64 image: relax ok          ← 向前越过 128 KiB 的 beq 与向后越过 128 KiB 的 blt 换成长形式（取反跳过一条＋b）
+//   la64 image: consts ok         ← 约 300 个 64 位常数经 la64MovImm 合成，与 .rodata 里的同值逐个比较（偏移超 2047 的读走 ldptr）
+//   la64 image: float ok          ← ffint／fcmp（clt、cune）／bceqz、bcnez
+//   la64 image: call/data ok      ← 跨对象 bl（B26）、.data 里的绝对地址（R_LARCH_64）、读 .data（pcalau12i＋ld.d 的 LO12）
+// 然后 exit_group(0)；不符时以 12..14 退出。用法：la64_image_probe <输出文件> [<目标文件目录>]；构建成功打印 PASS_LA64_IMAGE、字节数与常数个数。
+import { StructuredBuffer, asBufferLabel, asStructuredBegin, asStructuredSection, asStructuredLabel, asStructuredByte, asStructuredQuad, asStructuredAlign, asStructuredAddress, asFailedAs, asLastErrAs } from "./selfhost/assemble";
+import { asBufferNewLa64, la64BufferSubmit, la64Emit, la64B, la64BCond, la64Bz, la64Bc, la64AddrOf, la64SymAccess, la64MovImm, la64Mem } from "./selfhost/la64_asm";
+import { la64R2, la64R3, la64Ui12, la64Code, la64Jirl, la64Fcmp } from "./selfhost/la64_encode";
+import { LA64_ANDI, LA64_SYSCALL, LA64_BREAK, LA64_LD_D, LA64_BEQ, LA64_BNE, LA64_BLT, LA64_BEQZ, LA64_BCEQZ, LA64_BCNEZ } from "./selfhost/la64_encode";
+import { LA64_MOVGR2FR_D, LA64_FFINT_D_L, LA64_CLT, LA64_CUNE } from "./selfhost/la64_encode";
+import { elfWriteObject, elfObjectOk, elfObjectBytes, elfObjectError } from "./selfhost/emit_elf_object";
+import { linkElfObjects, elfObjectsBytes, elfObjectsError, elfDynReset } from "./selfhost/link_elf_objects";
+
+const A0: int = 4;
+const A1: int = 5;
+const A2: int = 6;
+const A7: int = 11;
+const T0: int = 12;
+const T1: int = 13;
+const T2: int = 14;
+const RA: int = 1;
+// 通用表的系统调用号（loongarch64）：write 64、exit_group 94。
+const SYS_WRITE: int = 64;
+const SYS_EXIT_GROUP: int = 94;
+
+function text(label: string, s: string): void {
+    asStructuredSection(1);
+    asStructuredLabel(label);
+    let i = 0;
+    while (i < len(s)) { asStructuredByte(byteAt(s, i) catch 0); i = i + 1; }
+    asStructuredSection(0);
+}
+
+function syscall(b: Ref<StructuredBuffer>, nr: int): void {
+    la64MovImm(b, A7, nr);
+    la64Emit(b, la64Code(LA64_SYSCALL, 0), "syscall");
+}
+// write(1, 符号, n)。
+function write(b: Ref<StructuredBuffer>, symbol: string, n: int): void {
+    la64MovImm(b, A0, 1);
+    la64AddrOf(b, A1, symbol, 0);
+    la64MovImm(b, A2, n);
+    syscall(b, SYS_WRITE);
+}
+function exitWith(b: Ref<StructuredBuffer>, code: int): void {
+    la64MovImm(b, A0, code);
+    syscall(b, SYS_EXIT_GROUP);
+}
+
+function object(exports: List<string>): Bytes {
+    const r = elfWriteObject(exports);
+    if (elfObjectOk(r) != 1) { eprint("elf: " + elfObjectError(r)); return bytesNew(0); }
+    return elfObjectBytes(r);
+}
+
+const MSG_WRITE: string = "la64 image: write ok\n";
+const MSG_RELAX: string = "la64 image: relax ok\n";
+const MSG_CONSTS: string = "la64 image: consts ok\n";
+const MSG_FLOAT: string = "la64 image: float ok\n";
+const MSG_CALL: string = "la64 image: call/data ok\n";
+
+let seed: int = 88172645463325252;
+function next(): int {
+    seed = seed ^ (seed << 13);
+    seed = seed ^ (seed >>> 7);
+    seed = seed ^ (seed << 17);
+    return seed;
+}
+// 合成用的常数：各位段的边界，加随机值与随机值右移若干位（覆盖 1～4 条指令的各种组合）。
+function constants(): List<int> {
+    const out: List<int> = listNew();
+    for (w in strSplit("0 1 -1 2047 2048 -2048 -2049 4095 4096 4097 65535 2147483647 -2147483648 2147483648 4294967295 4294967296 -4294967296", " ")) {
+        listPush(out, parse(w));
+    }
+    for (w in strSplit("2251799813685247 2251799813685248 -2251799813685248 4503599627370495 4503599627370496 9223372036854775807 1311768467463790320 -4503599627370496 -4503599627368449 81985529216486895", " ")) {
+        listPush(out, parse(w));
+    }
+    listPush(out, 0 - 9223372036854775807 - 1);
+    let k = 0;
+    while (k < 140) {
+        const r = next();
+        listPush(out, r);
+        listPush(out, r >> ((next() >>> 1) % 64));
+        k = k + 1;
+    }
+    return out;
+}
+function parse(s: string): int {
+    let v = 0;
+    let i = 0;
+    let neg = false;
+    if ((byteAt(s, 0) catch 0) == 45) { neg = true; i = 1; }
+    while (i < len(s)) { v = v * 10 + ((byteAt(s, i) catch 48) - 48); i = i + 1; }
+    if (neg) { v = -v; }
+    return v;
+}
+
+function first(consts: List<int>): Bytes {
+    const b = asBufferNewLa64();
+    asBufferLabel(b, "la64_main", 1);
+    write(b, "msg_write", len(MSG_WRITE));
+    // 向前越过 128 KiB 的 beq（$zero == $zero，必跳）：短形式够不着，换成 bne +8; b .Lfar。
+    la64BCond(b, LA64_BEQ, 0, 0, ".Lfar");
+    asBufferLabel(b, ".Lback", 1);
+    write(b, "msg_relax", len(MSG_RELAX));
+    la64B(b, 0, ".Lafter");
+    let k = 0;
+    while (k < 40000) { la64Emit(b, la64Ui12(LA64_ANDI, 0, 0, 0), "nop"); k = k + 1; }
+    la64Emit(b, la64Code(LA64_BREAK, 1), "break");
+    asBufferLabel(b, ".Lfar", 1);
+    // 向后越过 128 KiB 的 blt（0 < 1，必跳）。
+    la64MovImm(b, T1, 1);
+    la64BCond(b, LA64_BLT, 0, T1, ".Lback");
+    la64Emit(b, la64Code(LA64_BREAK, 2), "break");
+    asBufferLabel(b, ".Lafter", 1);
+    // 常数：t2 指向 .rodata 的表，逐个合成进 t0、读进 t1，不等即以 12 退出。
+    la64AddrOf(b, T2, "la64_consts", 0);
+    k = 0;
+    for (v in consts) {
+        la64MovImm(b, T0, v);
+        la64Mem(b, LA64_LD_D, T1, T2, k * 8);
+        la64BCond(b, LA64_BNE, T0, T1, ".Lbad12");
+        k = k + 1;
+    }
+    write(b, "msg_consts", len(MSG_CONSTS));
+    // 浮点：3.0 与 2.0，2 < 3 为真（bceqz 不跳），3 != 3 为假（bcnez 不跳）。
+    la64MovImm(b, T0, 3);
+    la64Emit(b, la64R2(LA64_MOVGR2FR_D, 0, T0), "movgr2fr.d");
+    la64Emit(b, la64R2(LA64_FFINT_D_L, 0, 0), "ffint.d.l");
+    la64MovImm(b, T0, 2);
+    la64Emit(b, la64R2(LA64_MOVGR2FR_D, 1, T0), "movgr2fr.d");
+    la64Emit(b, la64R2(LA64_FFINT_D_L, 1, 1), "ffint.d.l");
+    la64Emit(b, la64Fcmp(LA64_CLT, 0, 1, 0), "fcmp.clt.d");
+    la64Bc(b, LA64_BCEQZ, 0, ".Lbad13");
+    la64Emit(b, la64Fcmp(LA64_CUNE, 1, 0, 0), "fcmp.cune.d");
+    la64Bc(b, LA64_BCNEZ, 1, ".Lbad13");
+    write(b, "msg_float", len(MSG_FLOAT));
+    // 跨对象调用；返回写出的字节数，为 0 即以 14 退出。
+    la64B(b, 1, "la64_helper");
+    la64Bz(b, LA64_BEQZ, A0, ".Lbad14");
+    exitWith(b, 0);
+    asBufferLabel(b, ".Lbad12", 1);
+    exitWith(b, 12);
+    asBufferLabel(b, ".Lbad13", 1);
+    exitWith(b, 13);
+    asBufferLabel(b, ".Lbad14", 1);
+    exitWith(b, 14);
+    asStructuredBegin();
+    la64BufferSubmit(b);
+    if (asFailedAs() != 0) { eprint("la64: " + asLastErrAs()); return bytesNew(0); }
+    text("msg_write", MSG_WRITE);
+    text("msg_relax", MSG_RELAX);
+    text("msg_consts", MSG_CONSTS);
+    text("msg_float", MSG_FLOAT);
+    asStructuredSection(1);
+    asStructuredAlign(3);
+    asStructuredLabel("la64_consts");
+    for (v in consts) { asStructuredQuad(v); }
+    asStructuredSection(0);
+    const exports: List<string> = listNew(); listPush(exports, "la64_main");
+    return object(exports);
+}
+
+function second(): Bytes {
+    const b = asBufferNewLa64();
+    asBufferLabel(b, "la64_helper", 1);
+    // a1 ＝ [cell]：.data 里存着 msg_call 的绝对地址。
+    la64SymAccess(b, LA64_LD_D, A1, T0, "la64_cell", 0);
+    la64MovImm(b, A0, 1);
+    la64MovImm(b, A2, len(MSG_CALL));
+    syscall(b, SYS_WRITE);
+    la64Emit(b, la64Jirl(0, RA, 0), "jirl");
+    asStructuredBegin();
+    la64BufferSubmit(b);
+    if (asFailedAs() != 0) { eprint("la64: " + asLastErrAs()); return bytesNew(0); }
+    text("msg_call", MSG_CALL);
+    asStructuredSection(2);
+    asStructuredAlign(3);
+    asStructuredLabel("la64_cell");
+    asStructuredAddress("msg_call");
+    asStructuredSection(0);
+    const exports: List<string> = listNew(); listPush(exports, "la64_helper");
+    return object(exports);
+}
+
+function main(args: []string): int {
+    if (len(args) < 1) { eprint("usage: la64_image_probe <out>"); return 64; }
+    const consts = constants();
+    const a = first(consts);
+    if (asFailedAs() != 0) { eprint("asm: " + asLastErrAs()); return 65; }
+    const c = second();
+    if (asFailedAs() != 0) { eprint("asm: " + asLastErrAs()); return 65; }
+    if (bytesLen(a) == 0 || bytesLen(c) == 0) { return 66; }
+    const objects: List<Bytes> = listNew();
+    listPush(objects, a);
+    listPush(objects, c);
+    // 第二个参数给目录时另写出两个目标文件（交 GNU ld 等独立链接器核对重定位）。
+    if (len(args) >= 2) {
+        writeFileBytes(args[1] + "/la64_a.o", a) catch (e) { eprint(e.message); return 68; };
+        writeFileBytes(args[1] + "/la64_b.o", c) catch (e) { eprint(e.message); return 68; };
+    }
+    elfDynReset();
+    if (linkElfObjects(objects, "la64_main") != 0) { eprint("link: " + elfObjectsError()); return 67; }
+    const image = elfObjectsBytes();
+    writeFileBytes(args[0], image) catch (e) { eprint(e.message); return 68; };
+    print("PASS_LA64_IMAGE " + toStr(bytesLen(image)) + " " + toStr(listLen(consts)));
+    return 0;
+}

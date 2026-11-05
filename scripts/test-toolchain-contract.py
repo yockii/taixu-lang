@@ -1,4 +1,4 @@
-"""TOOL-98 public metadata, schema and compatibility regression gate."""
+"""public metadata, schema and compatibility regression gate."""
 import argparse
 import hashlib
 import json
@@ -54,7 +54,7 @@ def main():
     check('capabilities schema', cap.returncode == 0 and data.get('schema') == 'capabilities/1', cap.stdout)
     # 产品版本为 SemVer，可带预发布后缀（0.3.0-beta.1；开发线另加 -dev）；同 sync_toolchain_docs.product_version 的规则。
     check('product is SemVer version', bool(re.fullmatch(r'(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?', v)), v)
-    check('gate is separate', c.get('version_gate') == 'V0.52' and c.get('version_gate') != v, c)
+    check('no internal gate field', 'version_gate' not in c, c)
     check('schema inventory', set(c.get('schemas', [])) == SCHEMAS and len(c.get('schemas', [])) == len(SCHEMAS), c)
     check('version CLI agrees', bool(v) and ('taixu ' + v + ' ') in run('--version').stdout.decode('utf8', 'replace'))
     plain = run('capabilities')

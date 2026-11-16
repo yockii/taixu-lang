@@ -1,0 +1,460 @@
+// 冻结的前端输出：bootstrap/lexer.tx 的记号流、parser.tx 的 AST（二进制与文本）、`doc --format=json` 与 spike/loads 的诊断。
+//
+// 按文件冻结原生输出（stdout 的 SHA-256 与退出码），防前端回归。输入要稳定，冻结的输出才有意义（同 Go 的 testdata＋golden、Rust insta
+// 的快照）：
+// - 夹具（tests/cases、examples 等）取工作树，清单 tests/frozen/frontend-outputs.json。清单同时记每个输入文件的 SHA-256：输入没变而输出
+//   变了是前端回归；输入变了则报“输入已改”，审阅输出变化后 --update（夹具改动要连同冻结值一起提交）。两种都判失败。
+// - 编译器自己的源码 bootstrap/ 每个提交都在变，开发仓另以 tests/frozen/frontend-pinned.json 固定一个提交，经 git archive 取那时的
+//   bootstrap/ 作输入。公开仓没有这份清单（也没有那段提交历史），只查夹具；开发仓的门带 --require-pinned，缺了即失败。
+//
+// 运行（仓根）：taixu run --toolchain scripts/test_frontend_frozen.tx --compiler <原生 taixu> [--work 目录] [--update] [--require-pinned]
+// --update 按当前输出重写清单（有固定提交清单时一并重写；格式同 Python 的 json.dumps(indent=1, sort_keys=True)）。清单外的新文件只提示。
+import { absolute, deleteTree, dirOf, exeName, findInPath, join, kindOf, mkdirs, nat, readBytes, startsWith, untar } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { Job, Raw, captureRaw, runPool } from "./test_lib";
+import { crlf, headChars, slashes, sorted, strip, tailChars } from "./test_text";
+import { hexOf, lossyText, sha256Of } from "./check_lib";
+import { J_OBJ, Jv, jArray, jDump, jDumpSpaced, jGet, jHas, jNull, jNumber, jObject, jParse, jParseBytes, jPretty, jPush, jSet,
+    jSorted, jString, jText } from "./test_json";
+
+const MANIFEST: string = "tests/frozen/frontend-outputs.json";
+const PINNED_MANIFEST: string = "tests/frozen/frontend-pinned.json";
+const CORPUS: []string = ["tests/cases", "tests/nrt-cases", "examples", "docs/design", "skill/taixu/examples", "spike/loads"];
+const PINNED: string = "bootstrap";
+const SEMA: string = "spike/loads";
+const KINDS: []string = ["lexer", "parser-bin", "parser-text", "doc", "sema"];
+const RUN_NS: int = 300000000000;
+const BUILD_NS: int = 900000000000;
+const DRAIN_NS: int = 10000000000;
+const MAX_OUTPUT: int = 1073741824;
+// 每组至多这么多个任务一起进子进程池（输出算完摘要即丢，不全攒在内存里）。
+const CHUNK: int = 200;
+const WIDTH: int = 8;
+
+struct Input {
+    rel: string,
+    base: string,
+}
+
+struct Task {
+    kind: string,
+    rel: string,
+}
+
+function noNames(): List<string> {
+    const xs: List<string> = listNew();
+    return xs;
+}
+
+function endsTx(n: string): bool {
+    return len(n) > 3 && (byteAt(n, len(n) - 3) ?? 0) == 46 && (byteAt(n, len(n) - 2) ?? 0) == 116 && (byteAt(n, len(n) - 1) ?? 0) == 120;
+}
+
+// base 下 rel 目录里的全部 .tx（递归，相对 base、正斜杠；同 Path.rglob）。
+function rglob(base: string, rel: string, out: List<string>): void {
+    const dir = join(base, rel);
+    const names = localListDir(nat(dir), "") catch noNames();
+    for (n in names) {
+        const k = localEntryKind(nat(dir), n);
+        if (k == 2) {
+            rglob(base, rel + "/" + n, out);
+        } else if (k == 1 && endsTx(n)) {
+            listPush(out, rel + "/" + n);
+        }
+    }
+}
+
+// 固定提交的 bootstrap/，展开到 work/pinned；得展开根。
+function pinnedTree(root: string, work: string, commit: string): string | Error {
+    const git = findInPath("git");
+    if (len(git) == 0) {
+        return err("FAIL 取不到 " + commit + " 的 " + PINNED + "（需要 git 与可达的提交）：PATH 里没有 git");
+    }
+    const a: List<string> = listNew();
+    listPush(a, "archive");
+    listPush(a, "--format=tar");
+    listPush(a, commit);
+    listPush(a, PINNED);
+    const r = captureRaw(nat(git), a, nat(root), RUN_NS, DRAIN_NS, MAX_OUTPUT)?;
+    if (r.code != 0) {
+        return err("FAIL 取不到 " + commit + " 的 " + PINNED + "（需要 git 与可达的提交）：" + strip(lossyText(r.err)));
+    }
+    const dest = join(work, "pinned");
+    deleteTree(dest);
+    mkdirs(dest);
+    untar(r.out, dest)?;
+    return dest;
+}
+
+// (相对路径, 所在根) 的有序列表：夹具取工作树，bootstrap 取固定提交（没有固定提交清单时不取）。同一相对路径以后者为准。
+function corpus(root: string, pinnedRoot: string): List<Input> {
+    const where: Map<string, string> = mapNew();
+    for (d in CORPUS) {
+        const xs: List<string> = listNew();
+        rglob(root, d, xs);
+        for (x in xs) {
+            mapSet(where, x, root);
+        }
+    }
+    if (len(pinnedRoot) > 0) {
+        const xs: List<string> = listNew();
+        rglob(pinnedRoot, PINNED, xs);
+        for (x in xs) {
+            mapSet(where, x, pinnedRoot);
+        }
+    }
+    const out: List<Input> = listNew();
+    for (rel in sorted(mapKeys(where))) {
+        listPush(out, Input { rel: rel, base: mapGet(where, rel) ?? root });
+    }
+    return out;
+}
+
+function shaHex(b: Bytes): string {
+    return hexOf(sha256Of(b, 0, bytesLen(b)));
+}
+
+function digestOf(r: Ref<Raw>): string {
+    return toStr(r.code) + ":" + shaHex(crlf(r.out));
+}
+
+// dev-check 的诊断，去掉随宿主变化的 path 与渲染文本：{"exit": 退出码, "diags": [{"code", "module", "line", "col", "msg"}]}。
+function diagnostics(r: Ref<Raw>): Ref<Jv> {
+    const v = jObject();
+    jSet(v, "exit", jNumber(r.code));
+    const diags = jArray();
+    const text = lossyText(crlf(r.out));
+    for (line in strSplit(text, "\n")) {
+        if (len(line) == 0) {
+            continue;
+        }
+        const row = jParse(line) catch (e) {
+            jSet(v, "diags", jString("unparsable dev-check output: " + line));
+            return v;
+        };
+        if (jHas(row, "code")) {
+            const d = jObject();
+            const ks = ["code", "module", "line", "col", "msg"];
+            for (k in ks) {
+                jSet(d, k, jGet(row, k) ?? jNull());
+            }
+            jPush(diags, d);
+        }
+    }
+    jSet(v, "diags", diags);
+    return v;
+}
+
+function args1(a: string): List<string> {
+    const xs: List<string> = listNew();
+    listPush(xs, a);
+    return xs;
+}
+
+function args2(a: string, b: string): List<string> {
+    const xs = args1(a);
+    listPush(xs, b);
+    return xs;
+}
+
+function args3(a: string, b: string, c: string): List<string> {
+    const xs = args2(a, b);
+    listPush(xs, c);
+    return xs;
+}
+
+function readJson(path: string): Ref<Jv> | Error {
+    return jParseBytes(readBytes(path)?);
+}
+
+function main(args: []string): int {
+    let compiler = "";
+    let work = "";
+    let root = "";
+    let update = false;
+    let requirePinned = false;
+    let i = 0;
+    while (i < len(args)) {
+        const a = args[i];
+        if (a == "--update") {
+            update = true;
+            i = i + 1;
+        } else if (a == "--require-pinned") {
+            requirePinned = true;
+            i = i + 1;
+        } else if (i + 1 < len(args) && (a == "--compiler" || a == "--work" || a == "--root")) {
+            if (a == "--compiler") {
+                compiler = args[i + 1];
+            } else if (a == "--work") {
+                work = args[i + 1];
+            } else {
+                root = args[i + 1];
+            }
+            i = i + 2;
+        } else {
+            eprint("用法：taixu run --toolchain scripts/test_frontend_frozen.tx --compiler <原生 taixu> [--work 目录] [--update] [--require-pinned]");
+            return 2;
+        }
+    }
+    if (len(compiler) == 0) {
+        eprint("要给 --compiler");
+        return 2;
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = slashes(absolute(root));
+    compiler = absolute(compiler);
+    if (len(work) == 0) {
+        work = join(slashes(osRealPath(tempDir())), "taixu-frozen-" + toStr(monoNs()));
+    }
+    work = slashes(absolute(work));
+    mkdirs(work);
+    // 前端工具：词法与语法分析的独立程序。
+    const tools: Map<string, string> = mapNew();
+    const names = ["lexer", "parser"];
+    for (name in names) {
+        const out = join(work, name);
+        deleteTree(out);
+        const ba: List<string> = listNew();
+        listPush(ba, "build");
+        listPush(ba, "bootstrap/" + name + ".tx");
+        listPush(ba, "--toolchain");
+        listPush(ba, "--out");
+        listPush(ba, nat(out));
+        const r = captureRaw(nat(compiler), ba, nat(root), BUILD_NS, DRAIN_NS, MAX_OUTPUT) catch (e) {
+            print("FAIL build " + name + " " + e.message);
+            return 1;
+        };
+        if (r.code != 0) {
+            print("FAIL build " + name + " " + tailChars(lossyText(r.out), 500) + " " + tailChars(lossyText(r.err), 500));
+            return 1;
+        }
+        mapSet(tools, name, join(out, exeName(name)));
+    }
+    let pinnedRoot = "";
+    let hasPinned = false;
+    let pinnedDoc = jObject();
+    if (kindOf(join(root, PINNED_MANIFEST)) == 1) {
+        hasPinned = true;
+        pinnedDoc = readJson(join(root, PINNED_MANIFEST)) catch (e) {
+            print("FAIL 读不了 " + PINNED_MANIFEST + "：" + e.message);
+            return 1;
+        };
+    } else if (requirePinned) {
+        print("FAIL 缺 " + PINNED_MANIFEST + "（开发仓的门要求固定提交的输入）");
+        return 1;
+    } else {
+        print("NOTE 没有 " + PINNED_MANIFEST + "：只查夹具，不查 " + PINNED + "/ 的固定提交输入");
+    }
+    if (hasPinned) {
+        pinnedRoot = pinnedTree(root, work, jText(jGet(pinnedDoc, "commit")) ?? "") catch (e) {
+            eprint(e.message);
+            return 1;
+        };
+    }
+    const files = corpus(root, pinnedRoot);
+    const inputs: Map<string, string> = mapNew();
+    for (f in files) {
+        mapSet(inputs, f.rel, shaHex(readBytes(join(f.base, f.rel)) catch bytesNew(0)));
+    }
+    // 任务：每个文件 lexer、parser-bin、parser-text、doc，spike/loads 下的另有 sema；按此次序记结果。
+    const tasks: List<Task> = listNew();
+    const jobs: List<Job> = listNew();
+    for (f in files) {
+        listPush(tasks, Task { kind: "lexer", rel: f.rel });
+        listPush(jobs, Job { exe: nat(mapGet(tools, "lexer") ?? ""), args: args1(f.rel), cwd: nat(f.base) });
+        listPush(tasks, Task { kind: "parser-bin", rel: f.rel });
+        listPush(jobs, Job { exe: nat(mapGet(tools, "parser") ?? ""), args: args2(f.rel, "--bin"), cwd: nat(f.base) });
+        listPush(tasks, Task { kind: "parser-text", rel: f.rel });
+        listPush(jobs, Job { exe: nat(mapGet(tools, "parser") ?? ""), args: args1(f.rel), cwd: nat(f.base) });
+        listPush(tasks, Task { kind: "doc", rel: f.rel });
+        listPush(jobs, Job { exe: nat(compiler), args: args3("doc", "--format=json", f.rel), cwd: nat(f.base) });
+        if (startsWith(f.rel, SEMA + "/")) {
+            listPush(tasks, Task { kind: "sema", rel: f.rel });
+            listPush(jobs, Job { exe: nat(compiler), args: args2("dev-check", f.rel), cwd: nat(root) });
+        }
+    }
+    // 当前结果：种类 → 有序的 (相对路径, 值)。
+    const current: Map<string, Ref<Jv>> = mapNew();
+    for (k in KINDS) {
+        mapSet(current, k, jObject());
+    }
+    let from = 0;
+    while (from < listLen(jobs)) {
+        const chunk: List<Job> = listNew();
+        let k = from;
+        while (k < listLen(jobs) && k < from + CHUNK) {
+            listPush(chunk, listGet(jobs, k) catch Job { exe: "", args: listNew(), cwd: "" });
+            k = k + 1;
+        }
+        const results = runPool(chunk, WIDTH, RUN_NS, DRAIN_NS, MAX_OUTPUT);
+        k = 0;
+        while (k < listLen(chunk)) {
+            const t = listGet(tasks, from + k) catch Task { kind: "", rel: "" };
+            const r = listGet(results, k) catch new Raw { code: -2, out: bytesNew(0), err: bytesNew(0), timedOut: false };
+            const rows = mapGet(current, t.kind) ?? jObject();
+            if (t.kind == "sema") {
+                jSet(rows, t.rel, diagnostics(r));
+            } else {
+                jSet(rows, t.rel, jString(digestOf(r)));
+            }
+            k = k + 1;
+        }
+        from = from + CHUNK;
+    }
+    if (update) {
+        return writeManifests(root, compiler, inputs, current, hasPinned, pinnedDoc);
+    }
+    const frozen = readJson(join(root, MANIFEST)) catch (e) {
+        print("FAIL 读不了 " + MANIFEST + "：" + e.message);
+        return 1;
+    };
+    if (hasPinned) {
+        let k = 0;
+        while (k < listLen(pinnedDoc.keys)) {
+            const kind = listGet(pinnedDoc.keys, k) catch "";
+            const rows = listGet(pinnedDoc.items, k) catch pinnedDoc;
+            if (rows.kind == J_OBJ) {
+                const dest = jGet(frozen, kind) ?? jObject();
+                if (!jHas(frozen, kind)) {
+                    jSet(frozen, kind, dest);
+                }
+                let j = 0;
+                while (j < listLen(rows.keys)) {
+                    jSet(dest, listGet(rows.keys, j) catch "", listGet(rows.items, j) catch rows);
+                    j = j + 1;
+                }
+            }
+            k = k + 1;
+        }
+    }
+    const fails: List<string> = listNew();
+    const fresh: List<string> = listNew();
+    const wantInputs = jGet(frozen, "inputs") ?? jObject();
+    const changed: Map<string, int> = mapNew();
+    const changedList: List<string> = listNew();
+    for (rel in sorted(mapKeys(inputs))) {
+        const want = jText(jGet(wantInputs, rel));
+        if (want != None && (want ?? "") != (mapGet(inputs, rel) ?? "")) {
+            mapSet(changed, rel, 1);
+            listPush(changedList, rel);
+        }
+    }
+    for (rel in changedList) {
+        listPush(fails, "输入已改 " + rel + "：审阅它的输出变化后 --update，连同夹具一起提交");
+    }
+    let checked = 0;
+    for (kind in KINDS) {
+        const rows = mapGet(current, kind) ?? jObject();
+        if (listLen(rows.keys) == 0) {
+            continue;
+        }
+        const want = jGet(frozen, kind) ?? jObject();
+        let k = 0;
+        while (k < listLen(rows.keys)) {
+            const rel = listGet(rows.keys, k) catch "";
+            const value = listGet(rows.items, k) catch rows;
+            checked = checked + 1;
+            const old = jGet(want, rel);
+            if (old == None) {
+                listPush(fresh, kind + " " + rel);
+            } else {
+                const o = old ?? value;
+                if (jDump(jSorted(o)) != jDump(jSorted(value)) && !mapHas(changed, rel)) {
+                    listPush(fails, kind + " " + rel + ": frozen " + headChars(jDumpSpaced(o), 200) + ", now " + headChars(jDumpSpaced(value), 200));
+                }
+            }
+            k = k + 1;
+        }
+        const gone: List<string> = listNew();
+        for (rel in want.keys) {
+            if (!jHas(rows, rel)) {
+                listPush(gone, rel);
+            }
+        }
+        for (rel in sorted(gone)) {
+            print("NOTE " + kind + " " + rel + " 已不在语料中（清单可用 --update 更新）");
+        }
+    }
+    for (line in fails) {
+        print("FAIL " + line);
+    }
+    let shown = 0;
+    for (line in fresh) {
+        if (shown < 20) {
+            print("NEW  " + line + " （未冻结；确认后 --update）");
+        }
+        shown = shown + 1;
+    }
+    let verdict = "PASS";
+    if (listLen(fails) > 0) {
+        verdict = "FAIL";
+    }
+    print("SUMMARY " + verdict + " checked=" + toStr(checked) + " mismatched=" + toStr(listLen(fails)) + " new=" + toStr(listLen(fresh)));
+    if (listLen(fails) > 0) {
+        return 1;
+    }
+    return 0;
+}
+
+// --update：按当前输出重写清单（夹具与固定提交的输入各写各的）。
+function writeManifests(root: string, compiler: string, inputs: Map<string, string>, current: Map<string, Ref<Jv>>, hasPinned: bool,
+    pinnedDoc: Ref<Jv>): int {
+    const compilerSha = shaHex(readBytes(compiler) catch bytesNew(0));
+    let note = "";
+    if (kindOf(join(root, MANIFEST)) == 1) {
+        const old = readJson(join(root, MANIFEST)) catch jObject();
+        note = jText(jGet(old, "note")) ?? "";
+    }
+    if (!writeOne(root, MANIFEST, note, compilerSha, "", inputs, current, false)) {
+        return 1;
+    }
+    if (hasPinned) {
+        if (!writeOne(root, PINNED_MANIFEST, jText(jGet(pinnedDoc, "note")) ?? "", compilerSha, jText(jGet(pinnedDoc, "commit")) ?? "",
+                inputs, current, true)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+function writeOne(root: string, rel: string, note: string, compilerSha: string, commit: string, inputs: Map<string, string>,
+    current: Map<string, Ref<Jv>>, mine: bool): bool {
+    const doc = jObject();
+    jSet(doc, "note", jString(note));
+    jSet(doc, "compiler_sha256", jString(compilerSha));
+    if (len(commit) > 0) {
+        jSet(doc, "commit", jString(commit));
+    }
+    const ins = jObject();
+    for (r in mapKeys(inputs)) {
+        if (startsWith(r, PINNED + "/") == mine) {
+            jSet(ins, r, jString(mapGet(inputs, r) ?? ""));
+        }
+    }
+    jSet(doc, "inputs", ins);
+    for (kind in KINDS) {
+        const rows = mapGet(current, kind) ?? jObject();
+        const part = jObject();
+        let k = 0;
+        while (k < listLen(rows.keys)) {
+            const r = listGet(rows.keys, k) catch "";
+            if (startsWith(r, PINNED + "/") == mine) {
+                jSet(part, r, listGet(rows.items, k) catch rows);
+            }
+            k = k + 1;
+        }
+        if (listLen(part.keys) > 0) {
+            jSet(doc, kind, part);
+        }
+    }
+    const path = join(root, rel);
+    mkdirs(dirOf(path));
+    writeFile(path, jPretty(jSorted(doc), 1) + "\n") catch (e) {
+        print("FAIL 写不了 " + rel + "：" + e.message);
+        return false;
+    };
+    print("UPDATED " + rel + " " + toStr(listLen(ins.keys)) + " files");
+    return true;
+}

@@ -1,0 +1,248 @@
+// file-dialog-linux —— Linux 文件对话框经 XDG 门户（G5 第二部分）：用例在一个线程里扮演会话总线兼门户（抽象名字空间的 Unix 域
+// 套接字，DBUS_SESSION_BUS_ADDRESS 指过去），端到端核对客户端的认证、Hello、订阅、version 探测，OpenFile／SaveFile 的编组（属主、
+// 标题、handle_token、modal、过滤器通配、current_name），以及 Response 的解析：选中（取第一个 URI、%xx 解码、跳过别的结果键）、
+// 取消、信号先于回复到达、旧版门户回另一条请求路径、错误回复、不是 file:// 的 URI、别的路径上的信号不算。只在有 X 服务器的
+// Linux 上跑（文件名 -linux 后缀；属主要真窗的 XID）；不弹任何界面。
+import { setenv } from "std/os";
+import { windowOpenEx, windowClose, guiQuery, dialogOpenFile, dialogSaveFile } from "gui/surface";
+import { DbusMsg, dbusMsg, dbusReply, dbusReader, drStr, drSig, drBool, drU32, drArrayOpen, drStruct, drSkip, dwStr, dwSig, dwU32, dwArrayOpen, dwArrayClose, dwStruct, DBUS_CALL, DBUS_RETURN, DBUS_ERROR, DBUS_SIGNAL } from "gui/engine/dbus";
+import { BusConn, busFromFd, busReadLine, busWriteRaw, busRecv, busSend } from "gui/engine/busconn";
+
+declare function tSocket(domain: int, kind: int, proto: int): int from syscall "socket";
+declare function tBind(fd: int, addr: Bytes, alen: int): int from syscall "bind";
+declare function tListen(fd: int, backlog: int): int from syscall "listen";
+declare function tAccept(fd: int, addr: int, alen: int, flags: int): int from syscall "accept4";
+declare function tGetpid(): int from syscall "getpid";
+declare function tClose(fd: int): int from syscall "close";
+declare function tPpoll(fds: Bytes, count: int, timeout: Bytes, signals: int, maskSize: int): int from syscall "ppoll";
+
+const REQ: string = "/org/freedesktop/portal/desktop/request/1_42/";
+
+function listenAbstract(name: string): int {
+    const p = bytesFromStr(name);
+    const sa = bytesNew(3 + bytesLen(p));
+    bytesSet(sa, 0, 1);
+    let i: int = 0;
+    while (i < bytesLen(p)) {
+        bytesSet(sa, 3 + i, bytesGet(p, i) catch 0);
+        i = i + 1;
+    }
+    const fd: int = tSocket(1, 524289, 0);
+    if (fd < 0 || tBind(fd, sa, bytesLen(sa)) != 0 || tListen(fd, 1) != 0) {
+        return -1;
+    }
+    return fd;
+}
+
+function reply(c: Ref<BusConn>, to: DbusMsg, sig: string, body: Bytes): void {
+    let r: DbusMsg = dbusReply(to, DBUS_RETURN);
+    r.sig = sig;
+    r.body = body;
+    busSend(c, r);
+}
+
+function response(c: Ref<BusConn>, path: string, code: int, uris: List<string>): void {
+    let s: DbusMsg = dbusMsg(DBUS_SIGNAL, ":1.42", path, "org.freedesktop.portal.Request", "Response");
+    s.sig = "ua{sv}";
+    dwU32(s.body, code);
+    const at: int = dwArrayOpen(s.body, 8);
+    // 客户端要跳过的别的结果键：current_filter（sa(us)）与 choices（a(ss)）。
+    dwStruct(s.body);
+    dwStr(s.body, "current_filter");
+    dwSig(s.body, "(sa(us))");
+    dwStruct(s.body);
+    dwStr(s.body, "文本");
+    const fa: int = dwArrayOpen(s.body, 8);
+    dwStruct(s.body);
+    dwU32(s.body, 0);
+    dwStr(s.body, "*.txt");
+    dwArrayClose(s.body, fa, 8);
+    if (listLen(uris) > 0) {
+        dwStruct(s.body);
+        dwStr(s.body, "uris");
+        dwSig(s.body, "as");
+        const ua: int = dwArrayOpen(s.body, 4);
+        for (u in uris) {
+            dwStr(s.body, u);
+        }
+        dwArrayClose(s.body, ua, 4);
+    }
+    dwStruct(s.body);
+    dwStr(s.body, "choices");
+    dwSig(s.body, "a(ss)");
+    const ca: int = dwArrayOpen(s.body, 8);
+    dwArrayClose(s.body, ca, 8);
+    dwArrayClose(s.body, at, 8);
+    busSend(c, s);
+}
+
+function strs(a: string, b: string): List<string> {
+    const l: List<string> = listNew();
+    if (a != "") {
+        listPush(l, a);
+    }
+    if (b != "") {
+        listPush(l, b);
+    }
+    return l;
+}
+
+// OpenFile／SaveFile 的实参记成一行；返回 handle_token。
+function describe(m: DbusMsg, log: List<string>): string {
+    const r = dbusReader(m);
+    const parent: string = drStr(r);
+    const title: string = drStr(r);
+    const end: int = drArrayOpen(r, 8);
+    let token: string = "";
+    let modal: string = "-";
+    let filters: string = "";
+    let name: string = "-";
+    let other: string = "";
+    while (!r.bad && r.pos < end) {
+        drStruct(r);
+        const key: string = drStr(r);
+        const vs: string = drSig(r);
+        if (key == "handle_token" && vs == "s") {
+            token = drStr(r);
+        } else if (key == "modal" && vs == "b") {
+            modal = toStr(drBool(r));
+        } else if (key == "current_name" && vs == "s") {
+            name = drStr(r);
+        } else if (key == "filters" && vs == "a(sa(us))") {
+            const fe: int = drArrayOpen(r, 8);
+            while (!r.bad && r.pos < fe) {
+                drStruct(r);
+                filters = filters + " " + drStr(r) + "=";
+                const pe: int = drArrayOpen(r, 8);
+                while (!r.bad && r.pos < pe) {
+                    drStruct(r);
+                    filters = filters + toStr(drU32(r)) + ":" + drStr(r) + ";";
+                }
+            }
+        } else {
+            other = other + " " + key;
+            drSkip(r, vs);
+        }
+    }
+    let owner: string = "none";
+    if (strFind(parent, "x11:") == 0 && bytesLen(bytesFromStr(parent)) > 4) {
+        owner = "x11";
+    } else if (parent != "") {
+        owner = "bad";
+    }
+    listPush(log, m.member + " sig=" + m.sig + " owner=" + owner + " title=" + title + " token=" + token + " modal=" + modal + " name=" + name + " filters=[" + filters + " ] other=[" + other + " ] bad=" + toStr(r.bad || r.pos != end));
+    return token;
+}
+
+// 扮演总线兼门户：认证、Hello、订阅、属性，再按序应答六次文件选择。
+function serve(lfd: int): List<string> {
+    const log: List<string> = listNew();
+    const fds = bytesNew(8); bytesSetLE<i32>(fds, 0, lfd as i32); bytesSetLE<i16>(fds, 4, 1 as i16);
+    const timeout = bytesNew(16); bytesSetLE<i64>(timeout, 0, 10);
+    if (tPpoll(fds, 1, timeout, 0, 0) <= 0) { listPush(log, "accept timeout"); return log; }
+    const c = busFromFd(tAccept(lfd, 0, 0, 524288));
+    const auth: string = busReadLine(c, 10000);
+    listPush(log, "auth nul " + toStr(strFind(auth, "AUTH EXTERNAL ") == 1) + " hex-uid " + toStr(bytesLen(bytesFromStr(auth)) > 15));
+    busWriteRaw(c, bytesFromStr("OK 0123456789abcdef0123456789abcdef\r\n"));
+    listPush(log, "begin " + toStr(busReadLine(c, 10000) == "BEGIN"));
+    let n: int = 0;
+    while (n < 6) {
+        const m: DbusMsg = busRecv(c, 10000);
+        if (m.kind == 0) {
+            listPush(log, "recv failed");
+            return log;
+        }
+        if (m.kind != DBUS_CALL) {
+            listPush(log, "unexpected kind " + toStr(m.kind));
+        } else if (m.member == "Hello") {
+            const b = bytesNew(0);
+            dwStr(b, ":1.42");
+            reply(c, m, "s", b);
+            listPush(log, "Hello dest=" + m.dest);
+        } else if (m.member == "AddMatch" || m.member == "RemoveMatch") {
+            listPush(log, m.member + " " + drStr(dbusReader(m)));
+            reply(c, m, "", bytesNew(0));
+        } else if (m.member == "Get") {
+            const r = dbusReader(m);
+            listPush(log, "Get dest=" + m.dest + " path=" + m.path + " " + drStr(r) + " " + drStr(r));
+            const b = bytesNew(0);
+            dwSig(b, "u");
+            dwU32(b, 4);
+            reply(c, m, "v", b);
+        } else if (m.member == "OpenFile" || m.member == "SaveFile") {
+            n = n + 1;
+            const token: string = describe(m, log);
+            const handle = bytesNew(0);
+            dwStr(handle, REQ + token);
+            if (n == 1) {
+                // 别的路径上的信号不算；取第一个 URI。
+                reply(c, m, "o", handle);
+                response(c, REQ + "other", 0, strs("file:///wrong", ""));
+                response(c, REQ + token, 0, strs("file:///tmp/%E6%A0%B7%E4%BE%8B%20a.txt", "file:///tmp/second.txt"));
+            } else if (n == 2) {
+                reply(c, m, "o", handle);
+                response(c, REQ + token, 1, strs("", ""));
+            } else if (n == 3) {
+                // 信号先于回复到达。
+                response(c, REQ + token, 0, strs("file://localhost/home/u/%E6%96%B0%E6%96%87%E4%BB%B6.tx", ""));
+                reply(c, m, "o", handle);
+            } else if (n == 4) {
+                // 旧版门户：回的请求路径与预知的不同。
+                const legacy = bytesNew(0);
+                dwStr(legacy, REQ + "legacy7");
+                reply(c, m, "o", legacy);
+                response(c, REQ + "legacy7", 0, strs("file:///opt/x.txt", ""));
+            } else if (n == 5) {
+                let e: DbusMsg = dbusReply(m, DBUS_ERROR);
+                e.errName = "org.freedesktop.portal.Error.Failed";
+                e.sig = "s";
+                dwStr(e.body, "故意失败");
+                busSend(c, e);
+            } else {
+                reply(c, m, "o", handle);
+                response(c, REQ + token, 0, strs("https://example.com/a.txt", ""));
+            }
+        } else {
+            listPush(log, "unexpected call " + m.member);
+        }
+    }
+    // 收尾：最后一次的 RemoveMatch。
+    const last: DbusMsg = busRecv(c, 10000);
+    if (last.member == "RemoveMatch") {
+        listPush(log, last.member + " " + drStr(dbusReader(last)));
+        reply(c, last, "", bytesNew(0));
+    }
+    return log;
+}
+
+export function main(args: []string): int {
+    args;
+    const name: string = "taixu-fakebus-" + toStr(tGetpid());
+    const lfd: int = listenAbstract(name);
+    if (lfd < 0) {
+        print("listen failed");
+        return 1;
+    }
+    defer { tClose(lfd); }
+    setenv("DBUS_SESSION_BUS_ADDRESS", "unix:abstract=" + name + ",guid=0123456789abcdef0123456789abcdef") catch (e) {
+        print("setenv failed");
+        return 1;
+    };
+    const t = threadSpawn((): List<string> => {
+            return serve(lfd);
+        });
+    const id: int = windowOpenEx("门户探针", 200, 120, 16);
+    print("real " + toStr(id > 0) + " dialog-cap " + toStr(guiQuery(7)));
+    print("open1 [" + dialogOpenFile(id, "打开文本", [{ name: "文本", exts: ["txt", "MD"] }, { name: "所有文件", exts: ["*"] }]) + "]");
+    print("open2 [" + dialogOpenFile(0, "", []) + "]");
+    print("save1 [" + dialogSaveFile(id, "另存为", [{ name: "Taixu 源码", exts: ["tx"] }], "未命名.tx") + "]");
+    print("open3 [" + dialogOpenFile(id, "旧版门户", []) + "]");
+    print("open4 [" + dialogOpenFile(id, "出错", []) + "]");
+    print("open5 [" + dialogOpenFile(id, "非本地", []) + "]");
+    windowClose(id);
+    const log: List<string> = threadJoin(t) catch strs("thread failed", "");
+    for (l in log) {
+        print(l);
+    }
+    return 0;
+}

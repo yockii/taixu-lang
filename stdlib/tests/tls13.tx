@@ -1,0 +1,126 @@
+import { tls13ExpandLabel, tls13DeriveSecret, tls13Finished, tls13UpdateSecret, tls13HandshakeSecrets, tls13ApplicationSecrets } from "std/tls13_kdf";
+import { Tls13RecordKeys, tls13TrafficKeys, tls13Seal, tls13Open } from "std/tls13_record";
+import { constantTimeEqual } from "std/crypto/subtle";
+import { aes128GcmSeal } from "std/crypto/gcm";
+import { parseInt } from "std/strconv";
+
+function hex(text: string): Bytes {
+    if (text == "-") { return bytesNew(0); }
+    const out = bytesNew(len(text) / 2); let i = 0;
+    while (i < bytesLen(out)) {
+        const a = byteAt(text, i * 2); const b = byteAt(text, i * 2 + 1);
+        let av = a - 48; let bv = b - 48;
+        if (a >= 97) { av = a - 87; } if (b >= 97) { bv = b - 87; }
+        assert(av >= 0 && av < 16 && bv >= 0 && bv < 16, "fixture hex"); bytesSet(out, i, av * 16 + bv); i = i + 1;
+    }
+    return out;
+}
+
+function number(text: string): int { return parseInt(text) catch panic("fixture number"); }
+function keys(): Ref<Tls13RecordKeys> { return tls13TrafficKeys(bytesNew(32)) catch panic("traffic keys"); }
+
+test "TLS 1.3：RFC 8448 与独立实现的 64 项密钥和记录" {
+    const fixture = readFile("tests/vectors/tls13.txt") catch panic("TLS fixture");
+    let expand = 0; let records = 0; let updates = 0; let handshake = 0; let application = 0; let finished = 0;
+    for (line in strSplit(fixture, "\n")) {
+        if (len(line) == 0 || byteAt(line, 0) == 35) { continue; }
+        const p = strSplit(line, " "); const kind = listGet(p, 0); const secret = hex(listGet(p, 1));
+        if (kind == "expand") {
+            const expected = hex(listGet(p, 4)); const label = bytesToStr(hex(listGet(p, 2))) catch panic("label");
+            assert(constantTimeEqual(tls13ExpandLabel(secret, label, hex(listGet(p, 3)), bytesLen(expected)) catch panic("expand"), expected), "expand " + toStr(expand));
+            expand = expand + 1;
+        } else if (kind == "handshake") {
+            const h = tls13HandshakeSecrets(secret, hex(listGet(p, 2))) catch panic("handshake schedule");
+            assert(constantTimeEqual(h.handshake, hex(listGet(p, 3))) && constantTimeEqual(h.client, hex(listGet(p, 4)))
+                && constantTimeEqual(h.server, hex(listGet(p, 5))), "RFC handshake secrets"); handshake = handshake + 1;
+        } else if (kind == "application") {
+            const a = tls13ApplicationSecrets(secret, hex(listGet(p, 2))) catch panic("application schedule");
+            assert(constantTimeEqual(a.master, hex(listGet(p, 3))) && constantTimeEqual(a.client, hex(listGet(p, 4)))
+                && constantTimeEqual(a.server, hex(listGet(p, 5))), "RFC application secrets"); application = application + 1;
+        } else if (kind == "finished") {
+            assert(constantTimeEqual(tls13Finished(secret, hex(listGet(p, 2))) catch panic("Finished"), hex(listGet(p, 3))), "RFC Finished"); finished = finished + 1;
+        } else if (kind == "update") {
+            assert(constantTimeEqual(tls13UpdateSecret(secret) catch panic("update"), hex(listGet(p, 2))), "traffic update"); updates = updates + 1;
+        } else {
+            assert(kind == "record", "fixture kind");
+            const seq = number(listGet(p, 2)); const contentType = number(listGet(p, 3)); const padding = number(listGet(p, 4));
+            const plain = hex(listGet(p, 5)); const wire = hex(listGet(p, 6)); const original = bytesSlice(wire, 0, bytesLen(wire));
+            const writer = tls13TrafficKeys(secret) catch panic("write keys"); const reader = tls13TrafficKeys(secret) catch panic("read keys");
+            writer.sequence = seq; reader.sequence = seq;
+            assert(constantTimeEqual(tls13Seal(writer, contentType, plain, padding) catch panic("seal"), wire), "wire " + toStr(records));
+            const opened = tls13Open(reader, wire) catch panic("open");
+            assert(opened.contentType == contentType && constantTimeEqual(opened.content, plain), "plaintext " + toStr(records));
+            assert(writer.sequence == seq + 1 && reader.sequence == seq + 1 && constantTimeEqual(wire, original), "sequence and immutable input");
+            records = records + 1;
+        }
+    }
+    assert(expand == 22 && records == 23 && updates == 16 && handshake == 1 && application == 1 && finished == 1, "complete counts");
+}
+
+function openFails(state: Ref<Tls13RecordKeys>, record: Bytes): bool { tls13Open(state, record) catch (e) { return true; }; return false; }
+function sealFails(state: Ref<Tls13RecordKeys>, kind: int, data: Bytes, pad: int): bool { tls13Seal(state, kind, data, pad) catch (e) { return true; }; return false; }
+
+test "TLS 记录：顺序、重放、截断与失败封死" {
+    const writer = keys(); const reader = keys();
+    const a = tls13Seal(writer, 23, bytesFromStr("first"), 0) catch panic("first record");
+    const b = tls13Seal(writer, 23, bytesFromStr("second"), 3) catch panic("second record");
+    assert(constantTimeEqual((tls13Open(reader, a) catch panic("first open")).content, bytesFromStr("first")), "first");
+    assert(openFails(reader, a) && reader.failed && reader.sequence == 1 && openFails(reader, b), "replay destroys read state");
+    assert(openFails(keys(), b), "reordering rejected");
+    let i = 0;
+    while (i < bytesLen(a)) {
+        const broken = bytesSlice(a, 0, bytesLen(a)); bytesSet(broken, i, (bytesGet(broken, i) catch 0) ^ 1);
+        const r = keys(); assert(openFails(r, broken) && r.failed && openFails(r, a), "tamper " + toStr(i));
+        const truncated = keys(); assert(openFails(truncated, bytesSlice(a, 0, i)) && truncated.failed, "truncate " + toStr(i)); i = i + 1;
+    }
+    const clean = keys(); tls13Open(clean, a) catch panic("clean a");
+    assert(constantTimeEqual((tls13Open(clean, b) catch panic("clean b")).content, bytesFromStr("second")), "ordered records pass");
+}
+
+function rawRecord(inner: Bytes): Bytes {
+    const state = keys(); const length = bytesLen(inner) + 16; const aad = bytesNew(5);
+    bytesSet(aad, 0, 23); bytesSet(aad, 1, 3); bytesSet(aad, 2, 3); bytesSet(aad, 3, length / 256); bytesSet(aad, 4, length % 256);
+    const sealed = aes128GcmSeal(state.key, state.iv, aad, inner) catch panic("raw AEAD");
+    bytesAppend(aad, sealed); return aad;
+}
+
+test "TLS 记录：内层类型、padding 与长度边界" {
+    const writer = keys(); const reader = keys();
+    const full = bytesNew(16384);
+    const record = tls13Seal(writer, 23, full, 0) catch panic("max content");
+    assert(bytesLen((tls13Open(reader, record) catch panic("max open")).content) == 16384, "max content accepted");
+    const padded = tls13Seal(writer, 23, bytesNew(0), 16384) catch panic("max padding");
+    assert(bytesLen((tls13Open(reader, padded) catch panic("padded open")).content) == 0, "empty app with max padding");
+    assert(sealFails(writer, 23, full, 1) && sealFails(writer, 23, bytesNew(16385), 0) && sealFails(writer, 23, full, -1), "outer bounds");
+    assert(sealFails(writer, 20, bytesNew(1), 0) && sealFails(writer, 21, bytesNew(0), 0) && sealFails(writer, 22, bytesNew(0), 0), "invalid or empty inner type");
+    assert(writer.sequence == 2, "invalid seal does not consume sequence");
+    assert(openFails(keys(), rawRecord(bytesNew(32))), "all zero inner");
+    for (kind in [20, 21, 22, 24]) {
+        const inner = bytesNew(1); bytesSet(inner, 0, kind);
+        assert(openFails(keys(), rawRecord(inner)), "invalid or empty inner " + toStr(kind));
+    }
+    const tooLong = bytesNew(16386); bytesSet(tooLong, 0, 23);
+    assert(openFails(keys(), rawRecord(tooLong)), "excess padded inner");
+    const oversized = bytesNew(5); bytesSet(oversized, 0, 23); bytesSet(oversized, 1, 3); bytesSet(oversized, 2, 3); bytesSet(oversized, 3, 65); bytesSet(oversized, 4, 1);
+    assert(openFails(keys(), oversized), "ciphertext length upper bound");
+}
+
+function labelFails(secret: Bytes, label: string, context: Bytes, length: int): bool {
+    tls13ExpandLabel(secret, label, context, length) catch (e) { return true; }; return false;
+}
+
+test "TLS 密钥：标签边界、密钥更新与记录次数" {
+    const secret = bytesNew(32);
+    assert(labelFails(bytesNew(31), "key", bytesNew(0), 16) && labelFails(secret, "", bytesNew(0), 16), "secret and label bounds");
+    let longest = ""; let i = 0;
+    while (i < 249) { longest = longest + "x"; i = i + 1; }
+    assert(bytesLen(tls13ExpandLabel(secret, longest, bytesNew(255), 32) catch panic("exact label bounds")) == 32, "exact label bounds");
+    assert(labelFails(secret, longest + "x", bytesNew(0), 1) && labelFails(secret, "key", bytesNew(256), 1), "label/context upper bound");
+    assert(labelFails(secret, "key", bytesNew(0), -1) && labelFails(secret, "key", bytesNew(0), 8161), "output upper bound");
+    const writer = keys(); const reader = keys(); writer.sequence = 16777215; reader.sequence = 16777215;
+    const last = tls13Seal(writer, 23, bytesNew(0), 0) catch panic("last record");
+    tls13Open(reader, last) catch panic("last open");
+    assert(sealFails(writer, 23, bytesNew(0), 0) && openFails(reader, last), "mandatory key update limit");
+    const update = tls13UpdateSecret(secret) catch panic("update"); const next = tls13TrafficKeys(update) catch panic("new keys");
+    assert(next.sequence == 0 && !constantTimeEqual(next.key, writer.key) && !constantTimeEqual(next.iv, writer.iv), "fresh key and nonce after update");
+}

@@ -1,0 +1,363 @@
+// 控制台门（test_native_console.tx）的 Windows 部分（导出面同 console_os_linux.tx、console_os_macos.tx）：外层经 ConPTY 起内层助手、
+// 读回伪控制台送出的 UTF-8／VT 字节；内层助手重开这个新控制台的 CONIN$／CONOUT$ 作标准句柄并设代码页，原生子进程经 runProcess
+// 继承这些真控制台句柄。结构体按 x64／ARM64 的布局写在 Bytes 里；属性表须以地址填进 STARTUPINFOEX，太虚取不到 Bytes 的地址，
+// 经 HeapAlloc 取一块地址已知的内存。
+//
+// 输出管道由单线程轮询（PeekNamedPipe 有数据才 ReadFile，间隔里以 WaitForSingleObject 等子进程）。关伪控制台时 conhost 会把
+// 最后一屏写进输出管道，Windows 11 24H2 之前 ClosePseudoConsole 要等它写完才返回——输出管道建成 1 MiB 缓冲，这一屏写得进去，
+// 不会与读端互等；关掉之后照读到管道断开为止。
+import { J_BOOL, Jv, jArray, jNull, jNumber, jPush, jSet } from "./test_json";
+
+declare type SECURITY_ATTRIBUTES;
+declare type OVERLAPPED;
+declare function CreatePipe(r: Bytes, w: Bytes, sa: SECURITY_ATTRIBUTES?, size: u32): i32 from "kernel32";
+declare function CreatePseudoConsole(size: u32, input: isize, output: isize, flags: u32, pc: Bytes): i32 from "kernel32";
+declare function ClosePseudoConsole(pc: isize): void from "kernel32";
+declare function InitializeProcThreadAttributeList(list: isize, count: u32, flags: u32, size: Bytes): i32 from "kernel32";
+declare function UpdateProcThreadAttribute(list: isize, flags: u32, attr: usize, value: isize, size: usize, prev: isize, ret: isize): i32
+from "kernel32";
+declare function DeleteProcThreadAttributeList(list: isize): void from "kernel32";
+declare function GetProcessHeap(): isize from "kernel32";
+declare function HeapAlloc(heap: isize, flags: u32, size: usize): isize from "kernel32";
+declare function HeapFree(heap: isize, flags: u32, mem: isize): i32 from "kernel32";
+declare function CreateProcessW(app: wstr, cmd: wstr, pa: SECURITY_ATTRIBUTES?, ta: SECURITY_ATTRIBUTES?, inherit: i32, flags: u32, env: isize,
+    cwd: wstr, si: Bytes, pi: Bytes): i32 from "kernel32";
+declare function ReadFile(h: isize, buf: Bytes, n: u32, got: Bytes, ov: OVERLAPPED?): i32 from "kernel32";
+declare function WriteFile(h: isize, buf: Bytes, n: u32, put: Bytes, ov: OVERLAPPED?): i32 from "kernel32";
+declare function PeekNamedPipe(h: isize, buf: isize, n: u32, read: isize, avail: Bytes, left: isize): i32 from "kernel32";
+declare function WaitForSingleObject(h: isize, ms: u32): u32 from "kernel32";
+declare function GetExitCodeProcess(h: isize, code: Bytes): i32 from "kernel32";
+declare function TerminateProcess(h: isize, code: u32): i32 from "kernel32";
+declare function CloseHandle(h: isize): i32 from "kernel32";
+declare function GetLastError(): u32 from "kernel32";
+declare function Sleep(ms: u32): void from "kernel32";
+declare function CreateFileW(name: wstr, access: u32, share: u32, sa: SECURITY_ATTRIBUTES?, disposition: u32, flags: u32, template: isize): isize
+from "kernel32";
+declare function GetStdHandle(which: u32): isize from "kernel32";
+declare function SetStdHandle(which: u32, h: isize): i32 from "kernel32";
+declare function GetFileType(h: isize): u32 from "kernel32";
+declare function GetConsoleMode(h: isize, mode: Bytes): i32 from "kernel32";
+declare function SetConsoleCP(page: u32): i32 from "kernel32";
+declare function SetConsoleOutputCP(page: u32): i32 from "kernel32";
+declare function GetConsoleCP(): u32 from "kernel32";
+declare function GetConsoleOutputCP(): u32 from "kernel32";
+
+// STD_INPUT_HANDLE／STD_OUTPUT_HANDLE／STD_ERROR_HANDLE（−10、−11、−12 的 DWORD 写法）。
+const STD_HANDLES: []int = [4294967286, 4294967285, 4294967284];
+const DEVICES: []string = ["CONIN$", "CONOUT$", "CONOUT$"];
+const PSEUDOCONSOLE_ATTRIBUTE: int = 131094;
+const EXTENDED_STARTUPINFO_PRESENT: int = 524288;
+const STARTUPINFOEX_SIZE: int = 112;
+const LIMIT_MS: int = 90000;
+const OUTPUT_CAP: int = 4194304;
+const PIPE_BUFFER: int = 1048576;
+const BLOCK: int = 16384;
+const ERROR_BROKEN_PIPE: int = 109;
+const ERROR_NO_DATA: int = 232;
+
+// 一次终端运行：退出码、读到的原始字节、读的过程中出的错。
+export struct Term {
+    code: int,
+    raw: Bytes,
+    errors: List<string>,
+}
+
+// 外层起进程用到的句柄；收尾时逐个归还。
+struct Con {
+    handles: List<int>,
+    pseudo: int,
+    attrs: int,
+    initialized: bool,
+    process: int,
+    thread: int,
+    output: int,
+    total: int,
+    raw: Bytes,
+    errors: List<string>,
+}
+
+function winError(what: string): Error {
+    return err(what + " failed: error " + toStr(GetLastError() as int));
+}
+
+// subprocess.list2cmdline：含空格、制表符或为空的实参加引号，引号前的反斜杠加倍并转义引号，引号包住时末尾的反斜杠也加倍。
+function cmdLine(argv: List<string>): string {
+    let out = "";
+    for (a in argv) {
+        if (len(out) > 0) {
+            out = out + " ";
+        }
+        const quote = len(a) == 0 || strFind(a, " ") >= 0 || strFind(a, "\t") >= 0;
+        if (quote) {
+            out = out + "\"";
+        }
+        let slashes = 0;
+        let i = 0;
+        let start = 0;
+        while (i < len(a)) {
+            const c = byteAt(a, i) ?? 0;
+            if (c == 92) {
+                slashes = slashes + 1;
+            } else if (c == 34) {
+                out = out + strSlice(a, start, i - slashes) + backslashes(slashes * 2) + "\\\"";
+                start = i + 1;
+                slashes = 0;
+            } else {
+                slashes = 0;
+            }
+            i = i + 1;
+        }
+        out = out + strSlice(a, start, len(a));
+        if (quote) {
+            out = out + backslashes(slashes) + "\"";
+        }
+    }
+    return out;
+}
+
+function backslashes(n: int): string {
+    let s = "";
+    let i = 0;
+    while (i < n) {
+        s = s + "\\";
+        i = i + 1;
+    }
+    return s;
+}
+
+function pipe(c: Ref<Con>, size: int): List<int> | Error {
+    const r = bytesNew(8);
+    const w = bytesNew(8);
+    if (CreatePipe(r, w, None, size as u32) == 0) {
+        return winError("CreatePipe");
+    }
+    const ends: List<int> = listNew();
+    listPush(ends, bytesGetLE<int>(r, 0) ?? 0);
+    listPush(ends, bytesGetLE<int>(w, 0) ?? 0);
+    listPush(c.handles, (listGet(ends, 0) catch 0));
+    listPush(c.handles, (listGet(ends, 1) catch 0));
+    return ends;
+}
+
+function closeOwned(c: Ref<Con>, h: int): void {
+    const kept: List<int> = listNew();
+    for (x in c.handles) {
+        if (x != h) {
+            listPush(kept, x);
+        }
+    }
+    c.handles = kept;
+    const closed = CloseHandle(h as isize);
+}
+
+// 读掉输出管道里现有的字节（不阻塞）；管道断开得 false。
+function drainNow(c: Ref<Con>): bool {
+    const avail = bytesNew(4);
+    const got = bytesNew(4);
+    const block = bytesNew(BLOCK);
+    while (true) {
+        if (PeekNamedPipe(c.output as isize, 0, 0, 0, avail, 0) == 0) {
+            const e = GetLastError() as int;
+            if (e != 0 && e != ERROR_BROKEN_PIPE && e != ERROR_NO_DATA) {
+                listPush(c.errors, "PeekNamedPipe failed: error " + toStr(e));
+            }
+            return false;
+        }
+        const n = (bytesGetLE<u32>(avail, 0) ?? 0) as int;
+        if (n == 0) {
+            return true;
+        }
+        let want = n;
+        if (want > BLOCK) {
+            want = BLOCK;
+        }
+        if (ReadFile(c.output as isize, block, want as u32, got, None) == 0) {
+            const e = GetLastError() as int;
+            if (e != 0 && e != ERROR_BROKEN_PIPE && e != ERROR_NO_DATA) {
+                listPush(c.errors, "ReadFile failed: error " + toStr(e));
+            }
+            return false;
+        }
+        const k = (bytesGetLE<u32>(got, 0) ?? 0) as int;
+        c.total = c.total + k;
+        if (c.total > OUTPUT_CAP) {
+            listPush(c.errors, "console output exceeded 4 MiB");
+        } else {
+            bytesAppend(c.raw, bytesSlice(block, 0, k));
+        }
+    }
+    return true;
+}
+
+function launch(c: Ref<Con>, argv: List<string>, cwd: string): int | Error {
+    const input = pipe(c, 0)?;
+    const output = pipe(c, PIPE_BUFFER)?;
+    c.output = (listGet(output, 0) catch 0);
+    const pc = bytesNew(8);
+    // COORD{160, 50} 按值传：x 在低 16 位、y 在高 16 位。
+    const status = CreatePseudoConsole((160 | (50 << 16)) as u32, (listGet(input, 0) catch 0) as isize, (listGet(output, 1) catch 0) as isize, 0, pc);
+    if (status != 0) {
+        return err("CreatePseudoConsole HRESULT " + hex32((status as int) & 4294967295));
+    }
+    c.pseudo = bytesGetLE<int>(pc, 0) ?? 0;
+    const size = bytesNew(8);
+    const probe = InitializeProcThreadAttributeList(0, 1, 0, size);
+    const heap = GetProcessHeap();
+    c.attrs = HeapAlloc(heap, 0, (bytesGetLE<int>(size, 0) ?? 0) as usize) as int;
+    if (c.attrs == 0) {
+        return err("HeapAlloc failed");
+    }
+    if (InitializeProcThreadAttributeList(c.attrs as isize, 1, 0, size) == 0) {
+        return winError("InitializeProcThreadAttributeList");
+    }
+    c.initialized = true;
+    if (UpdateProcThreadAttribute(c.attrs as isize, 0, PSEUDOCONSOLE_ATTRIBUTE as usize, c.pseudo as isize, 8, 0, 0) == 0) {
+        return winError("UpdateProcThreadAttribute");
+    }
+    const si = bytesNew(STARTUPINFOEX_SIZE);
+    bytesSetLE<u32>(si, 0, STARTUPINFOEX_SIZE as u32);
+    bytesSetLE<int>(si, 104, c.attrs);
+    const pi = bytesNew(24);
+    if (CreateProcessW(listGet(argv, 0) catch "", cmdLine(argv), None, None, 0, EXTENDED_STARTUPINFO_PRESENT as u32, 0, cwd, si, pi) == 0) {
+        return winError("CreateProcessW");
+    }
+    c.process = bytesGetLE<int>(pi, 0) ?? 0;
+    c.thread = bytesGetLE<int>(pi, 8) ?? 0;
+    closeOwned(c, (listGet(input, 0) catch 0));
+    closeOwned(c, (listGet(output, 1) catch 0));
+    const deadline = monoNs() + LIMIT_MS * 1000000;
+    while (true) {
+        const open = drainNow(c);
+        if ((WaitForSingleObject(c.process as isize, 20) as int) == 0) {
+            break;
+        }
+        if (monoNs() >= deadline) {
+            const killed = TerminateProcess(c.process as isize, 99);
+            const waited = WaitForSingleObject(c.process as isize, 5000);
+            return err("ConPTY child exceeded 90 seconds");
+        }
+    }
+    const code = bytesNew(4);
+    if (GetExitCodeProcess(c.process as isize, code) == 0) {
+        return winError("GetExitCodeProcess");
+    }
+    return (bytesGetLE<u32>(code, 0) ?? 0) as int;
+}
+
+function hex32(v: int): string {
+    const digits = "0123456789abcdef";
+    let s = "";
+    let x = v;
+    while (x > 0) {
+        s = strSlice(digits, x % 16, x % 16 + 1) + s;
+        x = x / 16;
+    }
+    if (len(s) == 0) {
+        s = "0";
+    }
+    return "0x" + s;
+}
+
+// 关伪控制台并读到输出管道断开（至多 10 秒），再归还属性表与句柄。
+function finish(c: Ref<Con>): void {
+    if (c.pseudo != 0) {
+        ClosePseudoConsole(c.pseudo as isize);
+    }
+    if (c.output != 0) {
+        const deadline = monoNs() + 10 * 1000000000;
+        let open = drainNow(c);
+        while (open && monoNs() < deadline) {
+            Sleep(10);
+            open = drainNow(c);
+        }
+        if (open) {
+            listPush(c.errors, "ConPTY reader failed to stop");
+        }
+    }
+    if (c.initialized) {
+        DeleteProcThreadAttributeList(c.attrs as isize);
+    }
+    if (c.attrs != 0) {
+        const freed = HeapFree(GetProcessHeap(), 0, c.attrs as isize);
+    }
+    if (c.thread != 0) {
+        const t = CloseHandle(c.thread as isize);
+    }
+    if (c.process != 0) {
+        const p = CloseHandle(c.process as isize);
+    }
+    for (h in c.handles) {
+        const x = CloseHandle(h as isize);
+    }
+}
+
+// 在 cwd 里把 argv 接到一个 160×50 的 ConPTY 上运行（至多 90 秒）。起不来、超时得 Error。
+export function terminal(argv: List<string>, cwd: string): Ref<Term> | Error {
+    const c = new Con { handles: listNew(), pseudo: 0, attrs: 0, initialized: false, process: 0, thread: 0, output: 0, total: 0, raw: bytesNew(0),
+        errors: listNew() };
+    const r = launch(c, argv, cwd) catch (e) {
+        finish(c);
+        return e;
+    };
+    finish(c);
+    return new Term { code: r, raw: c.raw, errors: c.errors };
+}
+
+// 内层助手：重开新控制台的设备作标准句柄（经 ConPTY 接上的进程可能还拿着外层重定向的句柄），设输入输出代码页并核对；
+// 情况记进 info。不成立得原因，成立得空串。
+export function attach(page: int, info: Ref<Jv>): string {
+    let k = 0;
+    while (k < 3) {
+        const h = CreateFileW(DEVICES[k], 3221225472, 3, None, 3, 0, 0);
+        if (h == 0 || h == -1) {
+            return "CreateFileW " + DEVICES[k] + " failed: error " + toStr(GetLastError() as int);
+        }
+        if (SetStdHandle(STD_HANDLES[k] as u32, h) == 0) {
+            return "SetStdHandle failed: error " + toStr(GetLastError() as int);
+        }
+        k = k + 1;
+    }
+    if (SetConsoleCP(page as u32) == 0 || SetConsoleOutputCP(page as u32) == 0) {
+        return "SetConsoleCP failed: error " + toStr(GetLastError() as int);
+    }
+    const handles = jArray();
+    let all = true;
+    k = 0;
+    while (k < 3) {
+        const mode = bytesNew(4);
+        const ok = GetConsoleMode(GetStdHandle(STD_HANDLES[k] as u32), mode) != 0;
+        jPush(handles, jBool(ok));
+        all = all && ok;
+        k = k + 1;
+    }
+    jSet(info, "console_handles", handles);
+    const input = GetConsoleCP() as int;
+    const output = GetConsoleOutputCP() as int;
+    jSet(info, "input_codepage", jNumber(input));
+    jSet(info, "output_codepage", jNumber(output));
+    if (!all) {
+        return "standard handles are not all console handles";
+    }
+    if (input != page || output != page) {
+        return "code pages " + toStr(input) + "/" + toStr(output) + " instead of " + toStr(page);
+    }
+    return "";
+}
+
+// 标准句柄 n（0～2）是不是字符设备（同 msvcrt 的 isatty）。
+export function isTty(n: int): bool {
+    return (GetFileType(GetStdHandle(STD_HANDLES[n] as u32)) as int) == 2;
+}
+
+// 原样写字节到标准输出（不经运行时的控制台转码；同 Python 的 os.write(1, …)）。
+export function writeRaw(b: Bytes): bool {
+    const put = bytesNew(4);
+    return WriteFile(GetStdHandle(STD_HANDLES[1] as u32), b, bytesLen(b) as u32, put, None) != 0;
+}
+
+function jBool(v: bool): Ref<Jv> {
+    const b = jNull();
+    b.kind = J_BOOL;
+    b.truth = v;
+    return b;
+}

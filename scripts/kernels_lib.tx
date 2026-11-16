@@ -1,0 +1,114 @@
+// 内核对象的取源与生成（build.tx 与 perf_attribute.tx 共用）：从提交里取出编译器源码、找出源码树嵌入了哪些内核、用内核生成器
+// 逐个生成。种子要能编 build.tx，本文件同样只用种子有的内建。
+import { join, list1, mkdirs, nothing, plus, readBytes, shaOf, step, trimLine, untar, words } from "./build_lib";
+
+export const KERNEL_FLAGS: string = "--with-move --with-alloc --with-rc --with-str --with-strb --with-zero --with-list --with-file --with-argv --with-store-slots --with-nrt";
+// 内核对象名（taixu.tx 以 nrt-kernel/<名> 嵌入）：kernel-<目标>[-heapcheck].<扩展名>，目标即三元组（x86_64-windows 等）；COFF 对象
+// （只有 x86_64-windows）为 .obj，其余都是 ELF 可重定位对象，为 .o。名字带 -heapcheck 的是 --heap-check 用的检测内核（页堆＋对象号隔离，
+// 设计 v052-heap-check-tool），生成时加 --generic=heapcheck。名单不在这里列：取自源码树 taixu.tx 的嵌入行（kernelsOf），嵌入行与编译器
+// 目标表一致由 repo_hygiene 的 kernels 一项核对。
+// 目标分层 X4 之前的提交（固定阶段、perf_attribute 测的旧提交）用不规则的旧名，下面两串按位置给出旧名的目标，只为认旧树，不再增加。
+// 较早的固定阶段没有 macOS 的两个，也没有 -heapcheck 的四个；之前没有 aarch64-linux 的两个，A4d 之前没有 loongarch64-linux
+// 的两个，A5d 之前没有 riscv64-linux 的两个，A6c 之前没有 aarch64-windows 的两个。
+const LEGACY_TARGETS: string = "x86_64-windows x86_64-linux x86_64-macos aarch64-macos x86_64-windows x86_64-linux x86_64-macos aarch64-macos aarch64-linux aarch64-linux loongarch64-linux loongarch64-linux riscv64-linux riscv64-linux aarch64-windows aarch64-windows";
+const LEGACY_NAMES: string = "kernel.obj kernel-linux.o kernel-macos.o kernel-macos-aarch64.o kernel-heapcheck.obj kernel-linux-heapcheck.o kernel-macos-heapcheck.o kernel-macos-aarch64-heapcheck.o kernel-linux-aarch64.o kernel-linux-aarch64-heapcheck.o kernel-linux-loongarch64.o kernel-linux-loongarch64-heapcheck.o kernel-linux-riscv64.o kernel-linux-riscv64-heapcheck.o kernel-windows-aarch64.o kernel-windows-aarch64-heapcheck.o";
+
+// 取出提交的 bootstrap/（及 prelude/，若有）到 dest（git archive 成 tar 再在这里解开，不检出、不动索引）。
+export function extractSources(git: string, root: string, commit: string, dest: string, work: string): void | Error {
+    const errFile = join(work, "git-stderr.txt");
+    const paths: List<string> = listNew();
+    listPush(paths, "bootstrap");
+    const probe = plus(plus(list1("-C"), list1(root)), plus(list1("cat-file"), plus(list1("-e"), list1(commit + ":prelude"))));
+    if ((runProcess(git, probe, errFile) catch -1) == 0) {
+        listPush(paths, "prelude");
+    }
+    const tar = join(work, "stage.tar");
+    const args = plus(plus(list1("-C"), list1(root)), plus(plus(list1("archive"), list1("--format=tar")), plus(plus(list1("-o"), list1(tar)), plus(list1(commit), paths))));
+    if ((runProcess(git, args, errFile) catch -1) != 0) {
+        return err("git archive 失败：" + commit + "（" + trimLine(readFile(errFile) catch "") + "）");
+    }
+    const t = readBytes(tar) catch (e) {
+        return e;
+    };
+    if (!mkdirs(dest)) {
+        return err("建不了：" + dest);
+    }
+    untar(t, dest) catch (e) {
+        return e;
+    };
+    removeFile(tar) catch (e) {};
+    return nothing();
+}
+
+// 内核对象名 → 目标：旧名查上表，新名按 kernel-<架构>-<系统>[-heapcheck].<o|obj> 拆出；都不是得空串。
+function kernelTarget(name: string): string {
+    const names = words(LEGACY_NAMES);
+    let i: int = 0;
+    while (i < listLen(names)) {
+        if ((listGet(names, i) catch "") == name) {
+            return listGet(words(LEGACY_TARGETS), i) catch "";
+        }
+        i = i + 1;
+    }
+    const dot = strSplit(name, ".");
+    const ext = listGet(dot, 1) catch "";
+    if (listLen(dot) != 2 || !(ext == "o" || ext == "obj")) {
+        return "";
+    }
+    const parts = strSplit(listGet(dot, 0) catch "", "-");
+    const n = listLen(parts);
+    if ((listGet(parts, 0) catch "") != "kernel" || !(n == 3 || (n == 4 && (listGet(parts, 3) catch "") == "heapcheck"))) {
+        return "";
+    }
+    return (listGet(parts, 1) catch "") + "-" + (listGet(parts, 2) catch "");
+}
+
+// 源码树嵌入的内核（目标、对象名交替）：taixu.tx 里每个 embedBytes("nrt-kernel/<名>") 一项，按出现的先后。认不出目标的名字得 Error。
+// （按 strSplit 切，不用 strIndexOf：taixu.tx 有中文注释，码点下标与字节下标不同。）
+export function kernelsOf(tree: string): List<string> | Error {
+    const path = join(tree, "bootstrap/taixu.tx");
+    const text = readFile(path) catch (e) {
+        return err("读不了 " + path + "：" + e.message);
+    };
+    const out: List<string> = listNew();
+    const pieces = strSplit(text, "embedBytes(\"nrt-kernel/");
+    let i: int = 1;
+    while (i < listLen(pieces)) {
+        const name = listGet(strSplit(listGet(pieces, i) catch "", "\""), 0) catch "";
+        const target = kernelTarget(name);
+        if (len(target) == 0) {
+            return err(path + " 嵌入的内核名认不出目标：nrt-kernel/" + name + "（应为 kernel-<架构>-<系统>[-heapcheck].<o|obj>）");
+        }
+        listPush(out, target);
+        listPush(out, name);
+        i = i + 1;
+    }
+    if (listLen(out) == 0) {
+        return err(path + " 里没有嵌入内核（embedBytes(\"nrt-kernel/<名>\")）");
+    }
+    return out;
+}
+
+// 以内核开关 flags 生成 kernels（目标、名交替）到 outDir，得各对象的 sha256（名、值交替）。
+export function generateKernels(generator: string, outDir: string, kernels: List<string>, flags: List<string>, root: string): List<string> | Error {
+    if (!mkdirs(outDir)) {
+        return err("建不了：" + outDir);
+    }
+    const sums: List<string> = listNew();
+    let i: int = 0;
+    while (i + 1 < listLen(kernels)) {
+        const target = listGet(kernels, i) catch "";
+        const name = listGet(kernels, i + 1) catch "";
+        let args = plus(plus(list1("--target"), list1(target)), plus(list1(join(outDir, name)), flags));
+        if (strIndexOf(name, "-heapcheck") >= 0) {
+            args = plus(args, list1("--generic=heapcheck"));
+        }
+        step(generator, args, root) catch (e) {
+            return e;
+        };
+        listPush(sums, name);
+        listPush(sums, shaOf(join(outDir, name)));
+        i = i + 2;
+    }
+    return sums;
+}

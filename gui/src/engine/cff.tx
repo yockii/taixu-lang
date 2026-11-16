@@ -1,0 +1,526 @@
+// ============================================================================
+// engine/cff —— CFF 字形轮廓（GUI 原生引擎 G1）：Type 2 字形程序解释器。
+//
+// 收普通与 CID 键控的 CFF（FDArray＋FDSelect 格式 0、3，各 FD 自带局部子程序）。路径运算全收
+// （含 flex 族）；提示（stem、hintmask）只按规则吃掉参数与掩码字节，不做 hinting；算术运算与
+// 已废弃的 seac 不支持（遇到即当作无此字形）。FontMatrix 按缺省的 1/1000 对待（与 head 的 upem
+// 一致的字体都如此）。子程序递归不超过 10 层，每个字形至多执行 200000 个运算，防恶意数据。
+// ============================================================================
+
+import { u8, u16, i16, i32, uN } from "./bin";
+
+export struct CffInfo {
+    ok: bool,
+    charStrings: int,
+    gsubrs: int,
+    subrs: int, // 非 CID：局部子程序 INDEX（-1 为无）
+    fdSelect: int, // CID：FDSelect 偏移（-1 为非 CID）
+    fdSubrs: List<int>, // CID：各 FD 的局部子程序 INDEX（-1 为无）
+}
+
+export function cffNone(): CffInfo {
+    return { ok: false, charStrings: -1, gsubrs: -1, subrs: -1, fdSelect: -1, fdSubrs: listNew() };
+}
+
+// —— INDEX ——
+
+function idxCount(b: Bytes, o: int): int {
+    return u16(b, o);
+}
+
+function idxOffSize(b: Bytes, o: int): int {
+    return u8(b, o + 2);
+}
+
+function idxData(b: Bytes, o: int): int {
+    return o + 3 + (idxCount(b, o) + 1) * idxOffSize(b, o) - 1;
+}
+
+function idxStart(b: Bytes, o: int, i: int): int {
+    return idxData(b, o) + uN(b, o + 3 + i * idxOffSize(b, o), idxOffSize(b, o));
+}
+
+function idxEnd(b: Bytes, o: int, i: int): int {
+    return idxStart(b, o, i + 1);
+}
+
+// INDEX 之后的偏移；结构不对得 -1。
+function idxSkip(b: Bytes, o: int): int {
+    const n: int = idxCount(b, o);
+    if (n == 0) {
+        return o + 2;
+    }
+    const os: int = idxOffSize(b, o);
+    if (os < 1 || os > 4 || o + 3 + (n + 1) * os > bytesLen(b)) {
+        return -1;
+    }
+    const end: int = idxEnd(b, o, n - 1);
+    if (end > bytesLen(b)) {
+        return -1;
+    }
+    return end;
+}
+
+// —— DICT：键为运算符（转义的记作 1200+第二字节），值为操作数（实数读作 0） ——
+
+function dictParse(b: Bytes, s: int, e: int): Map<int, List<int>> {
+    const d: Map<int, List<int>> = mapNew();
+    let ops: List<int> = listNew();
+    let p: int = s;
+    while (p < e) {
+        const v: int = u8(b, p);
+        if (v <= 21) {
+            let key: int = v;
+            p = p + 1;
+            if (v == 12) {
+                key = 1200 + u8(b, p);
+                p = p + 1;
+            }
+            mapSet(d, key, ops);
+            ops = listNew();
+        } else if (v == 28) {
+            listPush(ops, i16(b, p + 1));
+            p = p + 3;
+        } else if (v == 29) {
+            listPush(ops, i32(b, p + 1));
+            p = p + 5;
+        } else if (v == 30) {
+            p = p + 1;
+            while (p < e && (u8(b, p) & 15) != 15 && (u8(b, p) >> 4) != 15) {
+                p = p + 1;
+            }
+            p = p + 1;
+            listPush(ops, 0);
+        } else if (v >= 32 && v <= 246) {
+            listPush(ops, v - 139);
+            p = p + 1;
+        } else if (v >= 247 && v <= 250) {
+            listPush(ops, (v - 247) * 256 + u8(b, p + 1) + 108);
+            p = p + 2;
+        } else if (v >= 251 && v <= 254) {
+            listPush(ops, -(v - 251) * 256 - u8(b, p + 1) - 108);
+            p = p + 2;
+        } else {
+            p = p + 1;
+        }
+    }
+    return d;
+}
+
+function dictInt(d: Map<int, List<int>>, key: int, i: int): int {
+    const none: List<int> = listNew();
+    const v: List<int> = mapGet(d, key) catch none;
+    return listTryGet(v, i) catch -1;
+}
+
+// Private DICT 里的局部子程序 INDEX 的绝对偏移；没有得 -1。
+function privSubrs(b: Bytes, base: int, d: Map<int, List<int>>): int {
+    const size: int = dictInt(d, 18, 0);
+    const off: int = dictInt(d, 18, 1);
+    if (size < 0 || off < 0 || base + off + size > bytesLen(b)) {
+        return -1;
+    }
+    const priv: Map<int, List<int>> = dictParse(b, base + off, base + off + size);
+    const rel: int = dictInt(priv, 19, 0);
+    if (rel <= 0 || idxSkip(b, base + off + rel) < 0) {
+        return -1;
+    }
+    return base + off + rel;
+}
+
+export function cffParse(b: Bytes, base: int): CffInfo | Error {
+    const nameIdx: int = base + u8(b, base + 2);
+    const topIdx: int = idxSkip(b, nameIdx);
+    const strIdx: int = idxSkip(b, topIdx);
+    const gsubrs: int = idxSkip(b, strIdx);
+    if (topIdx < 0 || strIdx < 0 || gsubrs < 0 || idxSkip(b, gsubrs) < 0 || idxCount(b, topIdx) < 1) {
+        return err("头部 INDEX 损坏");
+    }
+    const top: Map<int, List<int>> = dictParse(b, idxStart(b, topIdx, 0), idxEnd(b, topIdx, 0));
+    const cs: int = dictInt(top, 17, 0);
+    if (cs <= 0 || idxSkip(b, base + cs) < 0) {
+        return err("缺 CharStrings");
+    }
+    let info: CffInfo = { ok: true, charStrings: base + cs, gsubrs: gsubrs, subrs: -1, fdSelect: -1, fdSubrs: listNew() };
+    if (mapHas(top, 1230)) {
+        const fda: int = base + dictInt(top, 1236, 0);
+        const fds: int = dictInt(top, 1237, 0);
+        if (fds <= 0 || idxSkip(b, fda) < 0) {
+            return err("CID 字体缺 FDArray 或 FDSelect");
+        }
+        info.fdSelect = base + fds;
+        let i: int = 0;
+        while (i < idxCount(b, fda)) {
+            const fd: Map<int, List<int>> = dictParse(b, idxStart(b, fda, i), idxEnd(b, fda, i));
+            listPush(info.fdSubrs, privSubrs(b, base, fd));
+            i = i + 1;
+        }
+    } else {
+        info.subrs = privSubrs(b, base, top);
+    }
+    return info;
+}
+
+// CID 字形所属的 FD；查不到得 -1。
+function fdOf(b: Bytes, c: CffInfo, gid: int): int {
+    const o: int = c.fdSelect;
+    const fmt: int = u8(b, o);
+    if (fmt == 0) {
+        return u8(b, o + 1 + gid);
+    }
+    if (fmt == 3) {
+        const n: int = u16(b, o + 1);
+        let lo: int = 0;
+        let hi: int = n - 1;
+        while (lo <= hi) {
+            const mid: int = (lo + hi) / 2;
+            const r: int = o + 3 + mid * 3;
+            if (gid < u16(b, r)) {
+                hi = mid - 1;
+            } else if (gid >= u16(b, r + 3)) {
+                lo = mid + 1;
+            } else {
+                return u8(b, r + 2);
+            }
+        }
+    }
+    return -1;
+}
+
+function bias(n: int): int {
+    if (n < 1240) {
+        return 107;
+    }
+    if (n < 33900) {
+        return 1131;
+    }
+    return 32768;
+}
+
+// —— Type 2 解释器 ——
+
+struct T2 {
+    st: List<float>,
+    path: List<float>,
+    x: float,
+    y: float,
+    stems: int,
+    width: bool,
+    budget: int,
+    fail: bool,
+    end: bool,
+}
+
+function arg(t: Ref<T2>, i: int): float {
+    return listTryGet(t.st, i) catch 0.0;
+}
+
+function clear(t: Ref<T2>): void {
+    t.st = listNew();
+}
+
+// 第一个清栈运算前多出的一个参数是字宽，丢掉（字宽另取自 hmtx）。
+function dropWidth(t: Ref<T2>, extra: bool): void {
+    if (!t.width && extra && listLen(t.st) > 0) {
+        listRemoveAt(t.st, 0);
+    }
+    t.width = true;
+}
+
+function moveTo(t: Ref<T2>, dx: float, dy: float): void {
+    t.x = t.x + dx;
+    t.y = t.y + dy;
+    listPush(t.path, 0.0);
+    listPush(t.path, t.x);
+    listPush(t.path, t.y);
+}
+
+function lineTo(t: Ref<T2>, dx: float, dy: float): void {
+    t.x = t.x + dx;
+    t.y = t.y + dy;
+    listPush(t.path, 1.0);
+    listPush(t.path, t.x);
+    listPush(t.path, t.y);
+}
+
+function curveTo(t: Ref<T2>, dxa: float, dya: float, dxb: float, dyb: float, dxc: float, dyc: float): void {
+    const ax: float = t.x + dxa;
+    const ay: float = t.y + dya;
+    const bx: float = ax + dxb;
+    const by: float = ay + dyb;
+    t.x = bx + dxc;
+    t.y = by + dyc;
+    listPush(t.path, 3.0);
+    listPush(t.path, ax);
+    listPush(t.path, ay);
+    listPush(t.path, bx);
+    listPush(t.path, by);
+    listPush(t.path, t.x);
+    listPush(t.path, t.y);
+}
+
+// hvcurveto（horiz 为 true）与 vhcurveto：方向交替，最后一段可多一个参数。
+function hvCurves(t: Ref<T2>, horizStart: bool): void {
+    const n: int = listLen(t.st);
+    let i: int = 0;
+    let horiz: bool = horizStart;
+    while (i + 4 <= n) {
+        let last: float = 0.0;
+        if (n - i == 5) {
+            last = arg(t, i + 4);
+        }
+        if (horiz) {
+            curveTo(t, arg(t, i), 0.0, arg(t, i + 1), arg(t, i + 2), last, arg(t, i + 3));
+        } else {
+            curveTo(t, 0.0, arg(t, i), arg(t, i + 1), arg(t, i + 2), arg(t, i + 3), last);
+        }
+        i = i + 4;
+        horiz = !horiz;
+    }
+}
+
+function doOp(b: Bytes, c: CffInfo, t: Ref<T2>, op: int, local: int, depth: int): void {
+    const n: int = listLen(t.st);
+    if (op == 1 || op == 3 || op == 18 || op == 23) {
+        dropWidth(t, n % 2 == 1);
+        t.stems = t.stems + listLen(t.st) / 2;
+        clear(t);
+    } else if (op == 21) {
+        dropWidth(t, n > 2);
+        moveTo(t, arg(t, 0), arg(t, 1));
+        clear(t);
+    } else if (op == 22) {
+        dropWidth(t, n > 1);
+        moveTo(t, arg(t, 0), 0.0);
+        clear(t);
+    } else if (op == 4) {
+        dropWidth(t, n > 1);
+        moveTo(t, 0.0, arg(t, 0));
+        clear(t);
+    } else if (op == 5) {
+        let i: int = 0;
+        while (i + 2 <= n) {
+            lineTo(t, arg(t, i), arg(t, i + 1));
+            i = i + 2;
+        }
+        clear(t);
+    } else if (op == 6 || op == 7) {
+        let i: int = 0;
+        let horiz: bool = op == 6;
+        while (i < n) {
+            if (horiz) {
+                lineTo(t, arg(t, i), 0.0);
+            } else {
+                lineTo(t, 0.0, arg(t, i));
+            }
+            horiz = !horiz;
+            i = i + 1;
+        }
+        clear(t);
+    } else if (op == 8) {
+        let i: int = 0;
+        while (i + 6 <= n) {
+            curveTo(t, arg(t, i), arg(t, i + 1), arg(t, i + 2), arg(t, i + 3), arg(t, i + 4), arg(t, i + 5));
+            i = i + 6;
+        }
+        clear(t);
+    } else if (op == 24) {
+        let i: int = 0;
+        while (i + 6 <= n - 2) {
+            curveTo(t, arg(t, i), arg(t, i + 1), arg(t, i + 2), arg(t, i + 3), arg(t, i + 4), arg(t, i + 5));
+            i = i + 6;
+        }
+        lineTo(t, arg(t, i), arg(t, i + 1));
+        clear(t);
+    } else if (op == 25) {
+        let i: int = 0;
+        while (i + 2 <= n - 6) {
+            lineTo(t, arg(t, i), arg(t, i + 1));
+            i = i + 2;
+        }
+        curveTo(t, arg(t, i), arg(t, i + 1), arg(t, i + 2), arg(t, i + 3), arg(t, i + 4), arg(t, i + 5));
+        clear(t);
+    } else if (op == 26) {
+        let i: int = 0;
+        let dx1: float = 0.0;
+        if (n % 2 == 1) {
+            dx1 = arg(t, 0);
+            i = 1;
+        }
+        while (i + 4 <= n) {
+            curveTo(t, dx1, arg(t, i), arg(t, i + 1), arg(t, i + 2), 0.0, arg(t, i + 3));
+            dx1 = 0.0;
+            i = i + 4;
+        }
+        clear(t);
+    } else if (op == 27) {
+        let i: int = 0;
+        let dy1: float = 0.0;
+        if (n % 2 == 1) {
+            dy1 = arg(t, 0);
+            i = 1;
+        }
+        while (i + 4 <= n) {
+            curveTo(t, arg(t, i), dy1, arg(t, i + 1), arg(t, i + 2), arg(t, i + 3), 0.0);
+            dy1 = 0.0;
+            i = i + 4;
+        }
+        clear(t);
+    } else if (op == 30 || op == 31) {
+        hvCurves(t, op == 31);
+        clear(t);
+    } else if (op == 19 || op == 20) {
+        dropWidth(t, n % 2 == 1);
+        t.stems = t.stems + listLen(t.st) / 2;
+        clear(t);
+    } else if (op == 14) {
+        dropWidth(t, n == 1 || n == 5);
+        if (listLen(t.st) == 4) {
+            t.fail = true;
+        }
+        t.end = true;
+    } else if (op == 10 || op == 29) {
+        let sub: int = c.gsubrs;
+        if (op == 10) {
+            sub = local;
+        }
+        if (n < 1 || sub < 0) {
+            t.fail = true;
+            return;
+        }
+        const idx: int = (listTryPop(t.st) catch 0.0) as int + bias(idxCount(b, sub));
+        if (idx < 0 || idx >= idxCount(b, sub)) {
+            t.fail = true;
+            return;
+        }
+        run(b, c, t, idxStart(b, sub, idx), idxEnd(b, sub, idx), local, depth + 1);
+    } else {
+        t.fail = true;
+    }
+}
+
+function flexOp(t: Ref<T2>, op: int): void {
+    const n: int = listLen(t.st);
+    if (op == 35 && n >= 13) {
+        curveTo(t, arg(t, 0), arg(t, 1), arg(t, 2), arg(t, 3), arg(t, 4), arg(t, 5));
+        curveTo(t, arg(t, 6), arg(t, 7), arg(t, 8), arg(t, 9), arg(t, 10), arg(t, 11));
+    } else if (op == 34 && n >= 7) {
+        const y0: float = t.y;
+        curveTo(t, arg(t, 0), 0.0, arg(t, 1), arg(t, 2), arg(t, 3), 0.0);
+        curveTo(t, arg(t, 4), 0.0, arg(t, 5), y0 - t.y, arg(t, 6), 0.0);
+    } else if (op == 36 && n >= 9) {
+        const y0: float = t.y;
+        curveTo(t, arg(t, 0), arg(t, 1), arg(t, 2), arg(t, 3), arg(t, 4), 0.0);
+        const dy5: float = arg(t, 7);
+        curveTo(t, arg(t, 5), 0.0, arg(t, 6), dy5, arg(t, 8), y0 - (t.y + dy5));
+    } else if (op == 37 && n >= 11) {
+        const x0: float = t.x;
+        const y0: float = t.y;
+        let dx: float = 0.0;
+        let dy: float = 0.0;
+        let i: int = 0;
+        while (i < 10) {
+            dx = dx + arg(t, i);
+            dy = dy + arg(t, i + 1);
+            i = i + 2;
+        }
+        curveTo(t, arg(t, 0), arg(t, 1), arg(t, 2), arg(t, 3), arg(t, 4), arg(t, 5));
+        const ax: float = t.x + arg(t, 6);
+        const ay: float = t.y + arg(t, 7);
+        const bx: float = ax + arg(t, 8);
+        const by: float = ay + arg(t, 9);
+        let ex: float = bx;
+        let ey: float = by;
+        let adx: float = dx;
+        if (adx < 0.0) {
+            adx = -adx;
+        }
+        let ady: float = dy;
+        if (ady < 0.0) {
+            ady = -ady;
+        }
+        if (adx > ady) {
+            ex = bx + arg(t, 10);
+            ey = y0;
+        } else {
+            ex = x0;
+            ey = by + arg(t, 10);
+        }
+        curveTo(t, ax - t.x, ay - t.y, bx - ax, by - ay, ex - bx, ey - by);
+    } else {
+        t.fail = true;
+    }
+    clear(t);
+}
+
+function run(b: Bytes, c: CffInfo, t: Ref<T2>, s: int, e: int, local: int, depth: int): void {
+    if (depth > 10 || e > bytesLen(b)) {
+        t.fail = true;
+        return;
+    }
+    let p: int = s;
+    while (p < e && !t.fail && !t.end) {
+        t.budget = t.budget - 1;
+        if (t.budget < 0 || listLen(t.st) > 48) {
+            t.fail = true;
+            return;
+        }
+        const v: int = u8(b, p);
+        if (v >= 32 && v <= 246) {
+            listPush(t.st, (v - 139) as float);
+            p = p + 1;
+        } else if (v >= 247 && v <= 250) {
+            listPush(t.st, ((v - 247) * 256 + u8(b, p + 1) + 108) as float);
+            p = p + 2;
+        } else if (v >= 251 && v <= 254) {
+            listPush(t.st, (-(v - 251) * 256 - u8(b, p + 1) - 108) as float);
+            p = p + 2;
+        } else if (v == 28) {
+            listPush(t.st, i16(b, p + 1) as float);
+            p = p + 3;
+        } else if (v == 255) {
+            listPush(t.st, (i32(b, p + 1) as float) / 65536.0);
+            p = p + 5;
+        } else if (v == 11) {
+            return;
+        } else if (v == 12) {
+            const op2: int = u8(b, p + 1);
+            p = p + 2;
+            if (op2 == 0) {
+                clear(t);
+            } else {
+                flexOp(t, op2);
+            }
+        } else {
+            p = p + 1;
+            doOp(b, c, t, v, local, depth);
+            if (v == 19 || v == 20) {
+                p = p + (t.stems + 7) / 8;
+            }
+        }
+    }
+}
+
+/// 字形 gid 的轮廓追加到 path（字体单位，y 向上）；失败得 false（path 不动）。
+export function cffOutline(b: Bytes, c: CffInfo, gid: int, path: List<float>): bool {
+    if (!c.ok || gid < 0 || gid >= idxCount(b, c.charStrings)) {
+        return false;
+    }
+    let local: int = c.subrs;
+    if (c.fdSelect >= 0) {
+        const fd: int = fdOf(b, c, gid);
+        if (fd < 0 || fd >= listLen(c.fdSubrs)) {
+            return false;
+        }
+        local = listTryGet(c.fdSubrs, fd) catch -1;
+    }
+    const t = new T2 { st: listNew(), path: listNew(), x: 0.0, y: 0.0, stems: 0, width: false, budget: 200000, fail: false, end: false };
+    run(b, c, t, idxStart(b, c.charStrings, gid), idxEnd(b, c.charStrings, gid), local, 0);
+    if (t.fail) {
+        return false;
+    }
+    for (v in t.path) {
+        listPush(path, v);
+    }
+    return true;
+}

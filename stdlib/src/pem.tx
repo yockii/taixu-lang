@@ -1,0 +1,107 @@
+// RFC 7468 文本容器，Bytes 保存任意二进制内容。边界严格成对，base64 的 padding 与剩余位须规范。
+export struct PemBlock { label: string, data: Bytes }
+export struct PemLimits { maxInputBytes: int, maxDecodedBytes: int, maxBlocks: int }
+struct Decode { data: Bytes, quartet: List<int>, count: int, padded: bool }
+
+function decoder(): Ref<Decode> {
+    const quartet: List<int> = listNew();
+    for (value in [0, 0, 0, 0]) { listPush(quartet, value); }
+    return new Decode { data: bytesNew(0), quartet: quartet, count: 0, padded: false };
+}
+
+export function pemDefaultLimits(): PemLimits { return PemLimits { maxInputBytes: 33554432, maxDecodedBytes: 16777216, maxBlocks: 4096 }; }
+export function pemDecode(text: string): List<PemBlock> | Error { return pemDecodeLimit(text, pemDefaultLimits()); }
+
+function space(c: int): bool { return c == 32 || (c >= 9 && c <= 13); }
+
+function trimLine(text: string): string {
+    const raw = bytesFromStr(text); let from = 0; let end = bytesLen(raw);
+    while (from < end && space(byteAt(text, from))) { from = from + 1; }
+    while (end > from && space(byteAt(text, end - 1))) { end = end - 1; }
+    return bytesToStr(bytesSlice(raw, from, end - from)) catch panic("pem: UTF-8 line bounds");
+}
+
+function lines(text: string): List<string> {
+    const raw = bytesFromStr(text); const out: List<string> = listNew(); let start = 0; let i = 0;
+    while (i < len(text)) {
+        const c = byteAt(text, i);
+        if (c == 10 || c == 13) {
+            listPush(out, bytesToStr(bytesSlice(raw, start, i - start)) catch panic("pem: UTF-8 split bounds"));
+            if (c == 13 && i + 1 < len(text) && byteAt(text, i + 1) == 10) { i = i + 1; }
+            i = i + 1; start = i;
+        } else { i = i + 1; }
+    }
+    listPush(out, bytesToStr(bytesSlice(raw, start, len(text) - start)) catch panic("pem: UTF-8 tail bounds")); return out;
+}
+
+function boundary(line: string, marker: string): string | Error {
+    const prefix = "-----" + marker + " "; const size = len(line);
+    if (size < len(prefix) + 5 || strFind(line, prefix) != 0) { return err("pem: invalid boundary"); }
+    let i = 0;
+    while (i < size) { if (byteAt(line, i) < 32 || byteAt(line, i) > 126) { return err("pem: non-ASCII boundary"); } i = i + 1; }
+    if (strSlice(line, size - 5, size) != "-----") { return err("pem: invalid boundary suffix"); }
+    const label = strSlice(line, len(prefix), size - 5); let separated = true; i = 0;
+    while (i < len(label)) {
+        const c = byteAt(label, i);
+        if (c == 32 || c == 45) {
+            if (separated || i + 1 == len(label)) { return err("pem: invalid label separator"); } separated = true;
+        } else {
+            if (c < 33 || c > 126) { return err("pem: invalid label character"); } separated = false;
+        }
+        i = i + 1;
+    }
+    return label;
+}
+
+function digit(c: int): int {
+    if (c >= 65 && c <= 90) { return c - 65; } if (c >= 97 && c <= 122) { return c - 71; }
+    if (c >= 48 && c <= 57) { return c + 4; } if (c == 43) { return 62; } if (c == 47) { return 63; } if (c == 61) { return 64; }
+    return -1;
+}
+
+function appendLine(state: Ref<Decode>, line: string, limit: int): void | Error {
+    let i = 0;
+    while (i < len(line)) {
+        const c = byteAt(line, i); i = i + 1;
+        if (space(c)) { continue; }
+        const d = digit(c);
+        if (d < 0 || state.padded) { return err("pem: invalid base64 character or padding tail"); }
+        listSet(state.quartet, state.count, d); state.count = state.count + 1;
+        if (state.count == 4) {
+            const a = listGet(state.quartet, 0); const b = listGet(state.quartet, 1); const c2 = listGet(state.quartet, 2); const d2 = listGet(state.quartet, 3);
+            if (a == 64 || b == 64 || (c2 == 64 && d2 != 64) || (c2 == 64 && (b & 15) != 0) || (d2 == 64 && c2 != 64 && (c2 & 3) != 0)) {
+                return err("pem: non-canonical base64 quartet");
+            }
+            let n = 3; if (d2 == 64) { n = 2; } if (c2 == 64) { n = 1; }
+            if (n > limit - bytesLen(state.data)) { return err("pem: decoded byte limit"); }
+            listPush(bytesAsList(state.data), ((a << 2) | (b >> 4)) as u8);
+            if (n > 1) { listPush(bytesAsList(state.data), (((b & 15) << 4) | (c2 >> 2)) as u8); }
+            if (n > 2) { listPush(bytesAsList(state.data), (((c2 & 3) << 6) | d2) as u8); }
+            state.count = 0; state.padded = d2 == 64;
+        }
+    }
+    return done();
+}
+
+export function pemDecodeLimit(text: string, limits: PemLimits): List<PemBlock> | Error {
+    if (limits.maxInputBytes < 0 || limits.maxDecodedBytes < 0 || limits.maxBlocks < 0 || len(text) > limits.maxInputBytes) { return err("pem: invalid limits or input too large"); }
+    const out: List<PemBlock> = listNew(); let inside = false; let label = ""; let total = 0;
+    let state = decoder();
+    for (raw in lines(text)) {
+        const line = trimLine(raw);
+        if (!inside) {
+            if (strFind(line, "-----BEGIN ") == 0) {
+                if (listLen(out) >= limits.maxBlocks) { return err("pem: block count limit"); }
+                label = boundary(line, "BEGIN")?; inside = true;
+                state = decoder();
+            }
+        } else if (strFind(line, "-----END ") == 0) {
+            if (boundary(line, "END")? != label || state.count != 0) { return err("pem: mismatched label or incomplete base64"); }
+            listPush(out, PemBlock { label: label, data: state.data }); total = total + bytesLen(state.data); inside = false;
+        } else { appendLine(state, line, limits.maxDecodedBytes - total)?; }
+    }
+    if (inside) { return err("pem: missing END boundary"); }
+    return out;
+}
+
+function done(): void {}

@@ -1,7 +1,7 @@
 # 太虚速查手册（quickref）
 
 写码时随手查的单文件手册：语言面、内建函数、诊断码、命令行子命令与标准库
-模块，对应 0.3.0-beta.1。与[入门教程](tutorial/README.md)配套——教程讲
+模块，对应 0.3.0-beta.2。与[入门教程](tutorial/README.md)配套——教程讲
 “怎么用”，本手册管“查细节”；语言的权威定义见
 语言规范。
 
@@ -417,4 +417,4 @@ const (a, b) = xs;                           // 解构声明：每个都是 T?
 失败一律经 `T | Error` 返回。完整签名以 `taixu doc <模块文件>` 的输出或
 标准库源码为准。
 
-GUI 外部库 taixu-gui 不随包：取库、`taixu init gui`、真窗与重放测试见[教程第 10 章](tutorial/10-gui.md)。
+GUI 库随附于 `gui/`：安装、`taixu init gui`、真窗与重放测试见[教程第 10 章](tutorial/10-gui.md)。

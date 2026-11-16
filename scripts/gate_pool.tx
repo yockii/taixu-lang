@@ -1,0 +1,175 @@
+// 单线程、有限并发的门步进程池。依赖完成后可运行；独占任务等待队列空出。日志持续落盘，完成结果交回编排层。
+import { join, nat } from "./build_lib";
+
+export struct GateTask {
+    name: string,
+    exe: string,
+    args: List<string>,
+    cwd: string,
+    deps: List<string>,
+    exclusive: bool,
+}
+
+export struct GateResult {
+    code: int,
+    log: Bytes,
+    elapsedMs: int,
+}
+
+struct Live {
+    idx: int,
+    h: int,
+    log: Bytes,
+    outOpen: bool,
+    errOpen: bool,
+    ended: bool,
+    code: int,
+    started: int,
+    endedAt: int,
+    timedOut: bool,
+    flushedAt: int,
+    flushedLen: int,
+}
+
+struct Started {
+    h: int,
+    error: string,
+}
+
+function start(task: GateTask): Ref<Started> {
+    const h = procSpawn(task.exe, task.args, task.cwd, 0) catch (e) {
+        return new Started { h: -1, error: e.message };
+    };
+    return new Started { h: h, error: "" };
+}
+
+function emptyTask(): GateTask {
+    return GateTask { name: "", exe: "", args: listNew(), cwd: "", deps: listNew(), exclusive: false };
+}
+
+function emptyLive(): Ref<Live> {
+    return new Live { idx: -1, h: 0, log: bytesNew(0), outOpen: false, errOpen: false, ended: true, code: 1, started: 0,
+        endedAt: 0, timedOut: false, flushedAt: 0, flushedLen: 0 };
+}
+
+function flush(path: string, log: Bytes): void {
+    writeFileBytes(nat(path), log) catch (e) {};
+}
+
+function ready(task: GateTask, completed: Map<string, int>): bool {
+    for (name in task.deps) {
+        if (!mapHas(completed, name)) { return false; }
+    }
+    return true;
+}
+
+// done 在本线程中同步调用，可以更新父层的报告。completed 是已有的前置结果（例如普通产物报告）。
+export function gatePool(tasks: List<GateTask>, width: int, work: string, initial: List<string>, limitNs: int, drainNs: int,
+    done: (string, Ref<GateResult>) => void): void {
+    const completed: Map<string, int> = mapNew();
+    for (name in initial) { mapSet(completed, name, 1); }
+    const state: List<int> = listNew();
+    for (task in tasks) { listPush(state, 0); }
+    const active: List<Ref<Live>> = listNew();
+    const buf = bytesNew(65536);
+    let left = listLen(tasks);
+    while (left > 0) {
+        while (listLen(active) < width) {
+            let next = -1;
+            let k = 0;
+            while (k < listLen(tasks)) {
+                const task = listGet(tasks, k) catch emptyTask();
+                if ((listGet(state, k) catch 2) == 0 && ready(task, completed)) { next = k; break; }
+                k = k + 1;
+            }
+            if (next < 0) { break; }
+            const task = listGet(tasks, next) catch emptyTask();
+            const first = listGet(active, 0);
+            if (first != None) {
+                const running = listGet(tasks, (first ?? emptyLive()).idx) catch emptyTask();
+                if (running.exclusive || task.exclusive) { break; }
+            }
+            const started = monoNs();
+            print("START " + task.name);
+            listSet(state, next, 1);
+            const child = start(task);
+            if (child.h < 0) {
+                const log = bytesFromStr("起不了 " + task.exe + "：" + child.error + "\n");
+                flush(join(work, task.name + ".log"), log);
+                done(task.name, new GateResult { code: 1, log: log, elapsedMs: (monoNs() - started) / 1000000 });
+                mapSet(completed, task.name, 1);
+                listSet(state, next, 2);
+                left = left - 1;
+                continue;
+            }
+            listPush(active, new Live { idx: next, h: child.h, log: bytesNew(0), outOpen: true, errOpen: true, ended: false, code: 0,
+                    started: started, endedAt: 0, timedOut: false, flushedAt: started, flushedLen: 0 });
+            if (task.exclusive) { break; }
+        }
+        if (listLen(active) == 0 && left > 0) {
+            // 无法满足的依赖是编排错误，不能把未执行的任务算成通过。
+            let k = 0;
+            while (k < listLen(tasks)) {
+                if ((listGet(state, k) catch 2) == 0) {
+                    const task = listGet(tasks, k) catch emptyTask();
+                    const log = bytesFromStr("门步依赖无法满足：" + task.name + "\n");
+                    flush(join(work, task.name + ".log"), log);
+                    done(task.name, new GateResult { code: 1, log: log, elapsedMs: 0 });
+                    listSet(state, k, 2);
+                    left = left - 1;
+                }
+                k = k + 1;
+            }
+            continue;
+        }
+        let progressed = false;
+        let k = 0;
+        while (k < listLen(active)) {
+            const s = listGet(active, k) catch emptyLive();
+            const task = listGet(tasks, s.idx) catch emptyTask();
+            if (s.outOpen) {
+                const n = procRead(s.h, 1, buf);
+                if (n < 0) { s.outOpen = false; }
+                else if (n > 0) { bytesAppend(s.log, bytesSlice(buf, 0, n)); progressed = true; }
+            }
+            if (s.errOpen) {
+                const n = procRead(s.h, 2, buf);
+                if (n < 0) { s.errOpen = false; }
+                else if (n > 0) { bytesAppend(s.log, bytesSlice(buf, 0, n)); progressed = true; }
+            }
+            if (!s.ended) {
+                const code = procWait(s.h, 0);
+                if (code != None) { s.code = code ?? 1; s.ended = true; s.endedAt = monoNs(); progressed = true; }
+            }
+            const now = monoNs();
+            if (!s.ended && !s.timedOut && now - s.started >= limitNs) { s.timedOut = true; procKill(s.h); }
+            const path = join(work, task.name + ".log");
+            const size = bytesLen(s.log);
+            if (size != s.flushedLen && now - s.flushedAt >= 2000000000 + size / 1048576 * 1000000000) {
+                flush(path, s.log); s.flushedLen = size; s.flushedAt = now;
+            }
+            if (s.ended && ((!s.outOpen && !s.errOpen) || now - s.endedAt >= drainNs)) {
+                procClose(s.h);
+                if (s.timedOut) {
+                    bytesAppend(s.log, bytesFromStr("超时：" + toStr(limitNs / 1000000000) + " 秒后结束了子进程\n"));
+                    s.code = 1;
+                }
+                if (s.outOpen || s.errOpen) { bytesAppend(s.log, bytesFromStr("子进程已退出，后代进程仍占着输出管道；停止读取\n")); }
+                flush(path, s.log);
+                done(task.name, new GateResult { code: s.code, log: s.log, elapsedMs: (monoNs() - s.started) / 1000000 });
+                mapSet(completed, task.name, 1);
+                listSet(state, s.idx, 2);
+                left = left - 1;
+                listRemoveAt(active, k);
+                progressed = true;
+                continue;
+            }
+            k = k + 1;
+        }
+        if (!progressed && listLen(active) > 0) {
+            const first = listGet(active, 0) catch emptyLive();
+            if (first.outOpen || first.errOpen) { const waited = ioWait(first.h, 6, 5); }
+            else { const waited = procWait(first.h, 5); }
+        }
+    }
+}

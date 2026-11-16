@@ -1,0 +1,940 @@
+// toolchain-contract 的服务边界增量：私有 `taixu mcp`／`taixu lsp` 实例的缺省安全策略、根与链接、协议预算、可信执行与会话代、
+// 硬超时后 worker 及其后代的回收、守护进程式产物的清理（类 Unix）、只结束本实例自己的 worker 后的恢复、启动参数的失败即关、LSP 的
+// 根与网络 URI、可执行文件旁标准库的授权、主机共享挂载。只使用私有工作目录和受控样本；进程只结束本检查自己起的（按启动标记核对，
+// 不误杀复用了号的进程）。
+//
+// MCP、LSP 客户端用 test_mcp_client.tx、test_lsp_session.tx，进程探查用 proc_info_os_*.tx（后代、启动标记、只结束本实例的 worker）。
+import { baseOf, copyFile, deleteTree, join, mkdirs, nat, startsWith } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { makeDirLink } from "./test_lib";
+import { Jv, jDump, jGet, jLen, jObject, jParse, jQuote, jText } from "./test_json";
+import { at, dump, has, isArr, isObj, item, textIs, textOf, trueAt } from "./test_jv";
+import { Mcp, Res, call, errNone, finish, hardTimeout, isE, mcpOpen, mcpPid, notE, pending, raw, show, tool, waitId } from "./test_mcp_client";
+import { Lsp, diags, finish as lspFinish, init as lspInit, lspOpen, notify, open, request, uriOf } from "./test_lsp_session";
+import { nap, peerExited, runWithInput } from "./test_proto";
+import { killIfSame, killOwnedWorker, procDescendants, procStartMark } from "./proc_info_os";
+import { Ctx, Run, SEC, chk, cut, runAt, strs, text } from "./contract_lib";
+
+// Linux：子进程 setsid、关掉标准流后常驻；父进程打印子进程 PID 后退出。fork、pause 只在 x86_64 上有号，改用两种架构都有的
+// clone(SIGCHLD, 0, 0, 0, 0) 与 ppoll(NULL, 0, NULL, NULL, 8)。
+const DAEMON: string = "declare function lxClone(flags: int, stack: int, ptid: int, ctid: int, tls: int): int from syscall \"clone\";\n"
++ "declare function lxSetsid(): int from syscall \"setsid\";\n"
++ "declare function lxClose(fd: int): int from syscall \"close\";\n"
++ "declare function lxPpoll(fds: int, n: int, timeout: int, mask: int, size: int): int from syscall \"ppoll\";\n"
++ "export function main(args: []string): int {\n"
++ "    const pid = lxClone(17, 0, 0, 0, 0);\n"
++ "    if (pid == 0) {\n"
++ "        lxSetsid();\n"
++ "        lxClose(0);\n"
++ "        lxClose(1);\n"
++ "        lxClose(2);\n"
++ "        while (true) { lxPpoll(0, 0, 0, 0, 8); }\n"
++ "    }\n"
++ "    print(toStr(pid));\n"
++ "    return 0;\n"
++ "}\n";
+// macOS：同上，经 libSystem（M3：父进程退出后守护进程过继给 launchd，服务凭回收 cookie 找回）。
+const DAEMON_MACOS: string = "declare function fork(): i32 from \"libSystem\";\n"
++ "declare function setsid(): i32 from \"libSystem\";\n"
++ "declare function close(fd: i32): i32 from \"libSystem\";\n"
++ "declare function pause(): i32 from \"libSystem\";\n"
++ "export function main(args: []string): int {\n"
++ "    const pid = fork();\n"
++ "    if (pid == 0) {\n"
++ "        setsid();\n"
++ "        close(0);\n"
++ "        close(1);\n"
++ "        close(2);\n"
++ "        while (true) { pause(); }\n"
++ "    }\n"
++ "    print(toStr(pid));\n"
++ "    return 0;\n"
++ "}\n";
+const GOOD: string = "export function main(args: []string): int { print(\"safe\"); return 0; }\n";
+const UNKNOWN_SESSION: string = "未知会话（已退出、被 kill 或超时清扫）";
+
+function windows(): bool {
+    return hostTarget() == "windows";
+}
+
+function unixName(): string {
+    if (hostTarget() == "macos") {
+        return "macos";
+    }
+    return "linux";
+}
+
+function writeTextTo(path: string, s: string): void {
+    writeFile(path, s) catch (e) {
+        eprint("写不了 " + path + "：" + e.message);
+    };
+}
+
+function listOf(dir: string): List<string> {
+    const xs = listDir(dir) catch (e) {
+        const none: List<string> = listNew();
+        return none;
+    };
+    return xs;
+}
+
+function emptyDir(dir: string): bool {
+    return listLen(listOf(dir)) == 0;
+}
+
+function pathArg(p: string): string {
+    return "{\"path\": " + jQuote(p) + "}";
+}
+
+// 进程记录：号与启动标记（取不到标记的不记）。
+struct Rec {
+    pid: int,
+    mark: string,
+}
+
+function records(pids: List<int>): List<Ref<Rec>> {
+    const out: List<Ref<Rec>> = listNew();
+    for (pid in pids) {
+        const m = procStartMark(pid);
+        if (len(m) > 0) {
+            listPush(out, new Rec { pid: pid, mark: m });
+        }
+    }
+    return out;
+}
+
+// 记录里的进程都已不在（号消失，或同号已是别的进程；僵尸仍占着号，不算已回收）。
+function gone(recs: List<Ref<Rec>>): bool {
+    for (r in recs) {
+        if (procStartMark(r.pid) == r.mark) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function goneWithin(recs: List<Ref<Rec>>, seconds: int): bool {
+    const end = monoNs() + seconds * SEC;
+    while (monoNs() < end) {
+        if (gone(recs)) {
+            return true;
+        }
+        nap(50);
+    }
+    return gone(recs);
+}
+
+function emptyWithin(dir: string, seconds: int): bool {
+    const end = monoNs() + seconds * SEC;
+    while (monoNs() < end) {
+        if (emptyDir(dir)) {
+            return true;
+        }
+        nap(50);
+    }
+    return emptyDir(dir);
+}
+
+function recsText(recs: List<Ref<Rec>>): string {
+    let s = "[";
+    let first = true;
+    for (r in recs) {
+        if (!first) {
+            s = s + ", ";
+        }
+        s = s + "(" + toStr(r.pid) + ", '" + r.mark + "')";
+        first = false;
+    }
+    return s + "]";
+}
+
+function listText(xs: List<string>): string {
+    let s = "[";
+    let first = true;
+    for (x in xs) {
+        if (!first) {
+            s = s + ", ";
+        }
+        s = s + "'" + x + "'";
+        first = false;
+    }
+    return s + "]";
+}
+
+function closeText(m: Ref<Mcp>): string {
+    return text(m.p.err);
+}
+
+// 收尾：退出码 0 且没有坏行。
+function closed(c: Ref<Ctx>, name: string, m: Ref<Mcp>): void {
+    const code = finish(m);
+    chk(c, name, code == 0 && listLen(m.p.bad) == 0, closeText(m));
+}
+
+function security(r: Ref<Jv>?): Ref<Jv>? {
+    return at(at(r, "result"), "security");
+}
+
+function emptyArrayAt(v: Ref<Jv>?, key: string): bool {
+    const x = at(v, key);
+    return isArr(x) && jLen(x ?? jObject()) == 0;
+}
+
+function boolIs(v: Ref<Jv>?, key: string, want: bool): bool {
+    const x = at(v, key);
+    if (x == None) {
+        return false;
+    }
+    return jDump(x ?? jObject()) == toStr(want);
+}
+
+function intIs(v: Ref<Jv>?, key: string, want: int): bool {
+    const x = at(v, key);
+    if (x == None) {
+        return false;
+    }
+    return jDump(x ?? jObject()) == toStr(want);
+}
+
+function okIs(r: Ref<Res>, want: bool): bool {
+    return boolIs(r.sc, "ok", want);
+}
+
+function mentionsOutside(r: Ref<Res>): bool {
+    const s = dump(r.sc);
+    return strFind(s, "controlled-outside-marker") >= 0 || strFind(s, "controlledOutsideExport") >= 0;
+}
+
+function plusList(xs: List<string>, ys: List<string>): List<string> {
+    const out: List<string> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+    }
+    for (y in ys) {
+        listPush(out, y);
+    }
+    return out;
+}
+
+export function serviceSecurity(c0: Ref<Ctx>): void {
+    const work = jn(c0.work, "service-security");
+    mkdirs(work);
+    const c = new Ctx { t: c0.t, rows: c0.rows, compiler: c0.compiler, root: c0.root, work: work };
+    const inside = jn(work, "workspace");
+    const outside = jn(work, "outside");
+    const library = jn(work, "library");
+    const products = jn(work, "products");
+    for (p in [inside, outside, library, products]) {
+        mkdirs(p);
+    }
+    for (d in [inside, outside, library]) {
+        writeTextTo(jn(d, "main.tx"), GOOD);
+    }
+    writeTextTo(jn(inside, "spin.tx"), "function main(args: []string): int { let n = 0; while (true) { n = n + 1; } return n; }\n");
+    writeFileBytes(jn(outside, "secret.bin"), bytesFromStr("controlled-outside-marker")) catch (e) {};
+    writeTextTo(jn(inside, "escape.tx"), "const b: Bytes = embedBytes(\"../outside/secret.bin\");\nfunction main(args: []string): int { return bytesLen(b); }\n");
+    writeTextTo(jn(inside, "invalid.tx"), "function main(args: []string): int { return missing; }\n");
+    writeTextTo(jn(inside, "import-outside.tx"), "import { value } from \"../outside/variant\";\nfunction main(args: []string): int { return value(); }\n");
+    writeTextTo(jn(outside, "variant.tx"), "export function value(): int { return 1; }\n");
+    for (target in ["windows", "linux", "macos"]) {
+        writeTextTo(jn(outside, "variant_" + target + ".tx"), "export function controlledOutsideExport(): int { return 1; }\n");
+    }
+    const junction = jn(inside, "junction");
+    if (listLen(listOf(junction)) == 0 && (fileSize(jn(junction, "main.tx")) catch -1) < 0) {
+        makeDirLink(nat(outside), nat(junction), work) catch (e) {
+            eprint(e.message);
+        };
+    }
+    const args = strs(["--workspace", inside, "--library-root", library]);
+
+    defaults(c, inside, outside, products, args);
+    linkRoot(c, inside, library, products);
+    trusted(c, inside, library, products, args);
+    if (!windows()) {
+        daemon(c, inside, products, args);
+    }
+    idle(c, inside, products, args);
+    const flagSets: List<List<string>> = listNew();
+    listPush(flagSets, strs(["--worker-generation", "1"]));
+    listPush(flagSets, strs(["--worker-generation", "1", "--worker-scratch", products]));
+    listPush(flagSets, strs(["--request-timeout-ms", "0"]));
+    listPush(flagSets, strs(["--worker-memory-mib", "1048577"]));
+    listPush(flagSets, strs(["--worker-cpu-s", "86401"]));
+    listPush(flagSets, strs(["--allow-mount-type", "nfs4"]));
+    listPush(flagSets, strs(["--allow-mount-type", "fuse.sshfs"]));
+    listPush(flagSets, strs(["--allow-mount-type"]));
+    for (flags in flagSets) {
+        const p = runAt(c.compiler, plusList(strs(["mcp"]), flags), inside, 10);
+        chk(c, "service:startup-fail-closed:" + joinSpace(flags), p.code == 64 && strFind(text(p.out), "READY") < 0, tailOf(text(p.err), 500));
+    }
+    lspChecks(c, inside, outside, library);
+    stdlibChecks(c, products);
+    hostShare(c);
+}
+
+function joinSpace(xs: List<string>): string {
+    let s = "";
+    let first = true;
+    for (x in xs) {
+        if (!first) {
+            s = s + " ";
+        }
+        s = s + x;
+        first = false;
+    }
+    return s;
+}
+
+function tailOf(s: string, n: int): string {
+    if (len(s) <= n) {
+        return s;
+    }
+    let k = len(s) - n;
+    while (k < len(s) && ((byteAt(s, k) ?? 0) & 192) == 128) {
+        k = k + 1;
+    }
+    return bytesToStr(bytesSlice(bytesFromStr(s), k, len(s) - k)) catch "";
+}
+
+// 缺省实例：安全缺省、拒绝执行、根外与网络路径、不安全输入、失败后恢复、协议的解析与预算。
+function defaults(c: Ref<Ctx>, inside: string, outside: string, products: string, args: List<string>): void {
+    const m = mcpOpen(c.compiler, inside, products, args) catch (e) {
+        chk(c, "service:default-close", false, e.message);
+        return;
+    };
+    const discover = call(m, "server/discover", "");
+    const policy = security(discover);
+    chk(c, "service:discover-safe-defaults", boolIs(policy, "network_paths", false) && boolIs(policy, "workspace_execution_trusted", false)
+        && boolIs(policy, "untrusted_execution", false) && boolIs(policy, "os_sandbox_verified", false)
+        && textIs(policy, "worker_limit_verification", "required_before_requests") && intIs(policy, "worker_memory_bytes", 4294967296)
+        && intIs(policy, "worker_cpu_seconds", 60) && intIs(policy, "request_timeout_ms", 10000) && boolIs(policy, "client_stdout_write_nonblocking", false)
+        && emptyArrayAt(policy, "host_share_mount_types"), dump(discover));
+    let reaping = "linux_subreaper";
+    if (windows()) {
+        reaping = "windows_job";
+    } else if (hostTarget() == "macos") {
+        reaping = "macos_env_cookie";
+    }
+    chk(c, "service:discover-process-reaping", textIs(policy, "worker_reaping", reaping), dump(policy));
+    for (name in ["run", "test", "debug_start"]) {
+        const r = tool(m, name, "{\"path\": \"main.tx\", \"trust\": true, \"trusted\": true}");
+        chk(c, "service:default-deny:" + name, isE(r) && errNone(r) && textIs(r.sc, "schema", "tool-error/1") && textIs(r.sc, "reason", "untrusted_execution_denied"),
+            show(r));
+    }
+    const first = tool(m, "compile", pathArg("main.tx"));
+    const digest = textOf(first.sc, "txc_sha256");
+    chk(c, "service:default-compile", len(digest) > 0 && notE(first) && errNone(first), show(first));
+    for (path in [jn(outside, "main.tx"), "//security-test.invalid/share/main.tx"]) {
+        const r = tool(m, "compile", pathArg(path));
+        let label = "outside";
+        if (startsWith(path, "//")) {
+            label = "network";
+        }
+        chk(c, "service:outside-network-deny:" + label, isE(r) && errNone(r) && textIs(r.sc, "reason", "path_not_trusted"), show(r));
+    }
+    for (path in ["junction/main.tx", "escape.tx", "invalid.tx", "import-outside.tx"]) {
+        const r = tool(m, "compile", pathArg(path));
+        chk(c, "service:unsafe-input-reject:" + path, isE(r) && errNone(r) && textIs(r.sc, "schema", "compile/1") && okIs(r, false) && !mentionsOutside(r),
+            show(r));
+    }
+    const again = tool(m, "compile", pathArg("main.tx"));
+    chk(c, "service:failure-recovery", notE(again) && textIs(again.sc, "txc_sha256", digest) && len(digest) > 0, show(again));
+    raw(m, "{\"jsonrpc\":\"2.0\",\"id\":991,\"method\":\"pi\rng\"}\n");
+    const r1 = waitId(m, "null", 60000);
+    chk(c, "service:literal-CR-is-parse-error", intIs(at(r1, "error"), "code", -32700), dump(r1));
+    let big = "[";
+    let i = 0;
+    while (i < 20000) {
+        if (i > 0) {
+            big = big + ",";
+        }
+        big = big + "0";
+        i = i + 1;
+    }
+    raw(m, big + "]\n");
+    const r2 = waitId(m, "null", 60000);
+    chk(c, "service:json-token-budget", textIs(at(r2, "error"), "message", "RequestTooComplex"), dump(r2));
+    let longName = "";
+    i = 0;
+    while (i < 65) {
+        longName = longName + "x";
+        i = i + 1;
+    }
+    const r3 = tool(m, longName, "{}");
+    chk(c, "service:unknown-tool-name-bound", r3.kind == 2 && intIs(r3.obj, "code", -32602) && textIs(r3.obj, "message", "Unknown tool: name too long")
+        && jLen(r3.obj ?? jObject()) == 2, show(r3));
+    const values: []string = ["0", "-1", "true", "1.5", "\"1\"", "null", "10001"];
+    const reprs: []string = ["0", "-1", "True", "1.5", "'1'", "None", "10001"];
+    i = 0;
+    while (i < len(values)) {
+        const r = tool(m, "compile", "{\"path\": \"main.tx\", \"timeout_ms\": " + values[i] + "}");
+        chk(c, "service:budget-deny:" + reprs[i], r.sc == None && r.e == 1 && r.kind == 1 && strFind(r.text, "1..10000") >= 0, show(r));
+        i = i + 1;
+    }
+    const ping = call(m, "ping", "");
+    chk(c, "service:parse-budget-recovery", isObj(at(ping, "result")) && jLen(at(ping, "result") ?? jObject()) == 0, toStr(listLen(pending(m))) + " pending");
+    closed(c, "service:default-close", m);
+    chk(c, "service:default-product-cleanup", emptyDir(products), listText(listOf(products)));
+}
+
+// 路径同一（Windows 不分大小写，分隔符与末尾斜杠不计）。
+function same(a: string, b: string): bool {
+    let x = strReplace2(a, 92, 47);
+    let y = strReplace2(b, 92, 47);
+    x = trimSlash(x);
+    y = trimSlash(y);
+    if (windows()) {
+        return lower(x) == lower(y);
+    }
+    return x == y;
+}
+
+function strReplace2(s: string, from: int, to: int): string {
+    const b = bytesFromStr(s);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        if ((bytesGet(b, i) ?? 0) == from) {
+            bytesSet(b, i, to);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(b) catch s;
+}
+
+function trimSlash(s: string): string {
+    let n = len(s);
+    while (n > 0 && (byteAt(s, n - 1) ?? 0) == 47) {
+        n = n - 1;
+    }
+    return bytesToStr(bytesSlice(bytesFromStr(s), 0, n)) catch s;
+}
+
+function lower(s: string): string {
+    const b = bytesFromStr(s);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const v = bytesGet(b, i) ?? 0;
+        if (v >= 65 && v <= 90) {
+            bytesSet(b, i, v + 32);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(b) catch s;
+}
+
+// 信任根经链接给出（类 Unix 为符号链接，Windows 为目录联接；macOS 的 /tmp、/var 即如此）：启动时解析为真实路径一次，roots 报真实根、
+// root_aliases 报写法与真实根；按写法与按真实路径都能编译，根之下的链接照样拒绝。
+function linkRoot(c: Ref<Ctx>, inside: string, library: string, products: string): void {
+    const alias = jn(c.work, "workspace-alias");
+    if ((fileSize(jn(alias, "main.tx")) catch -1) < 0) {
+        makeDirLink(nat(inside), nat(alias), c.work) catch (e) {
+            eprint(e.message);
+        };
+    }
+    const real = osRealPath(inside);
+    const m = mcpOpen(c.compiler, alias, products, strs(["--workspace", alias, "--library-root", library])) catch (e) {
+        chk(c, "service:link-root-close", false, e.message);
+        return;
+    };
+    const policy = security(call(m, "server/discover", ""));
+    const roots = at(policy, "roots");
+    const aliases = at(policy, "root_aliases");
+    let realSeen = false;
+    let aliasSeen = false;
+    let i = 0;
+    while (i < jLenOf(roots)) {
+        const r = jText(item(roots, i)) ?? "";
+        if (same(r, real)) {
+            realSeen = true;
+        }
+        if (same(r, alias)) {
+            aliasSeen = true;
+        }
+        i = i + 1;
+    }
+    chk(c, "service:link-root-real", realSeen && !aliasSeen, dump(policy));
+    let pair = false;
+    i = 0;
+    while (i < jLenOf(aliases)) {
+        const x = item(aliases, i);
+        if (same(textOf(x, "given"), alias) && same(textOf(x, "real"), real)) {
+            pair = true;
+        }
+        i = i + 1;
+    }
+    chk(c, "service:link-root-alias", pair, dump(policy));
+    const cases: []string = ["given", "real", "relative"];
+    const paths: []string = [jn(alias, "main.tx"), jn(real, "main.tx"), "main.tx"];
+    i = 0;
+    while (i < len(cases)) {
+        const r = tool(m, "compile", pathArg(paths[i]));
+        chk(c, "service:link-root-compile:" + cases[i], notE(r) && errNone(r) && okIs(r, true), show(r));
+        i = i + 1;
+    }
+    const inner = tool(m, "compile", pathArg(jn(jn(alias, "junction"), "main.tx")));
+    chk(c, "service:link-root-inner-link-reject", isE(inner) && errNone(inner) && okIs(inner, false) && strFind(dump(inner.sc), "controlled-outside-marker") < 0,
+        show(inner));
+    closed(c, "service:link-root-close", m);
+}
+
+function jLenOf(v: Ref<Jv>?): int {
+    if (!isArr(v)) {
+        return 0;
+    }
+    return jLen(v ?? jObject());
+}
+
+function sessionOf(r: Ref<Res>): string {
+    return textOf(r.sc, "session");
+}
+
+// 显式可信：执行、库根只读、会话代；硬超时结束并回收 worker 及其后代，下一请求起新的 worker，旧会话失效、会话号不复用。
+function trusted(c: Ref<Ctx>, inside: string, library: string, products: string, args: List<string>): void {
+    const m = mcpOpen(c.compiler, inside, products, plusList(args, strs(["--trust-workspace"]))) catch (e) {
+        chk(c, "service:trusted-close", false, e.message);
+        return;
+    };
+    const run1 = tool(m, "run", pathArg("main.tx"));
+    chk(c, "service:explicit-trusted-run", notE(run1) && errNone(run1) && textIs(run1.sc, "stdout", "safe\n"), show(run1));
+    const lib = tool(m, "compile", pathArg(jn(library, "main.tx")));
+    chk(c, "service:library-read", notE(lib) && okIs(lib, true), show(lib));
+    const libRun = tool(m, "run", pathArg(jn(library, "main.tx")));
+    chk(c, "service:library-execution-denied", isE(libRun) && textIs(libRun.sc, "reason", "untrusted_execution_denied"), show(libRun));
+    const start = tool(m, "debug_start", pathArg("main.tx"));
+    const oldId = sessionOf(start);
+    chk(c, "service:session-generation", len(oldId) > 0 && startsWith(oldId, "1."), show(start));
+    let descendants: List<Ref<Rec>> = listNew();
+    if (!windows()) {
+        descendants = records(procDescendants(mcpPid(m), false));
+        chk(c, "service:" + unixName() + "-worker-and-live-debug-identified", listLen(descendants) >= 2, recsText(descendants));
+    }
+    const begin = monoNs();
+    const slow = tool(m, "compile", "{\"path\": \"main.tx\", \"timeout_ms\": 1}");
+    chk(c, "service:hard-compile-timeout", hardTimeout(slow.sc) && isE(slow) && errNone(slow) && monoNs() - begin < 5 * SEC, show(slow));
+    if (!windows()) {
+        chk(c, "service:" + unixName() + "-timeout-descendants-reaped", goneWithin(descendants, 5), recsText(descendants));
+    }
+    const restart = tool(m, "compile", pathArg("main.tx"));
+    chk(c, "service:worker-restart-compile", notE(restart) && okIs(restart, true), show(restart));
+    const frames = tool(m, "debug_frames", "{\"session\": " + jQuote(oldId) + "}");
+    chk(c, "service:old-session-invalid", isE(frames) && textIs(frames.sc, "error", UNKNOWN_SESSION), show(frames));
+    const next = tool(m, "debug_start", pathArg("main.tx"));
+    const newId = sessionOf(next);
+    chk(c, "service:session-no-reuse", startsWith(newId, "2.") && newId != oldId, show(next));
+    const killed = tool(m, "debug_kill", "{\"session\": " + jQuote(newId) + "}");
+    closed(c, "service:trusted-close", m);
+    chk(c, "service:restart-product-cleanup", emptyDir(products), listText(listOf(products)));
+}
+
+// 受信程序按守护进程的通常做法 fork、setsid、关掉标准流后常驻：它脱离进程组，产物退出后过继给服务。服务须杀掉并收割它，否则重建
+// worker 时每个 tools/call 都停在 cleanup_pending。
+function daemon(c: Ref<Ctx>, inside: string, products: string, args: List<string>): void {
+    let src = DAEMON;
+    if (hostTarget() == "macos") {
+        src = DAEMON_MACOS;
+    }
+    writeTextTo(jn(inside, "daemon.tx"), src);
+    let recs: List<Ref<Rec>> = listNew();
+    const name = unixName();
+    const m = mcpOpen(c.compiler, inside, products, plusList(args, strs(["--trust-workspace"]))) catch (e) {
+        chk(c, "service:" + name + "-daemon-close", false, e.message);
+        return;
+    };
+    const started = tool(m, "run", pathArg("daemon.tx"));
+    const out = trimmed(textOf(started.sc, "stdout"));
+    let pid = 0;
+    if (allDigits(out)) {
+        pid = numberOf(out);
+    }
+    chk(c, "service:" + name + "-daemon-started", notE(started) && pid > 0, show(started));
+    if (pid > 0) {
+        const one: List<int> = listNew();
+        listPush(one, pid);
+        recs = records(one);
+    }
+    const retired = tool(m, "compile", "{\"path\": \"main.tx\", \"timeout_ms\": 1}");
+    chk(c, "service:" + name + "-daemon-worker-retired", hardTimeout(retired.sc) && isE(retired) && errNone(retired), show(retired));
+    const after = tool(m, "compile", pathArg("main.tx"));
+    chk(c, "service:" + name + "-daemon-no-cleanup-pending", notE(after) && okIs(after, true), show(after));
+    chk(c, "service:" + name + "-daemon-killed-and-reaped", pid > 0 && goneWithin(recs, 5), recsText(recs));
+    closed(c, "service:" + name + "-daemon-close", m);
+    // 失败时不把守护进程留在机器上；按启动标记核对，不误杀复用号的进程。
+    for (r in recs) {
+        killIfSame(r.pid, r.mark);
+    }
+    chk(c, "service:" + name + "-daemon-product-cleanup", emptyDir(products), listText(listOf(products)));
+}
+
+function trimmed(s: string): string {
+    let a = 0;
+    let b = len(s);
+    while (a < b && isBlank(byteAt(s, a) ?? 0)) {
+        a = a + 1;
+    }
+    while (b > a && isBlank(byteAt(s, b - 1) ?? 0)) {
+        b = b - 1;
+    }
+    return bytesToStr(bytesSlice(bytesFromStr(s), a, b - a)) catch "";
+}
+
+function isBlank(ch: int): bool {
+    return ch == 32 || ch == 9 || ch == 10 || ch == 13;
+}
+
+function allDigits(s: string): bool {
+    if (len(s) == 0) {
+        return false;
+    }
+    let i = 0;
+    while (i < len(s)) {
+        const ch = byteAt(s, i) ?? 0;
+        if (ch < 48 || ch > 57) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function numberOf(s: string): int {
+    let n = 0;
+    let i = 0;
+    while (i < len(s)) {
+        n = n * 10 + ((byteAt(s, i) ?? 48) - 48);
+        i = i + 1;
+    }
+    return n;
+}
+
+// 空闲时结束本实例自己的 worker：服务不等请求就清理产物、自身不退出，下一请求起新一代。
+function idle(c: Ref<Ctx>, inside: string, products: string, args: List<string>): void {
+    const m = mcpOpen(c.compiler, inside, products, plusList(args, strs(["--trust-workspace"]))) catch (e) {
+        chk(c, "service:idle-recovery-close", false, e.message);
+        return;
+    };
+    const r = tool(m, "compile", pathArg("main.tx"));
+    chk(c, "service:idle-worker-start", notE(r) && okIs(r, true) && !emptyDir(products), show(r));
+    chk(c, "service:kill-owned-idle-worker", killOwnedWorker(mcpPid(m), c.compiler), toStr(mcpPid(m)));
+    chk(c, "service:idle-crash-cleanup-without-request", emptyWithin(products, 5) && !peerExited(m.p), listText(listOf(products)));
+    const next = tool(m, "debug_start", pathArg("main.tx"));
+    chk(c, "service:idle-crash-next-generation", notE(next) && startsWith(sessionOf(next), "2."), show(next));
+    closed(c, "service:idle-recovery-close", m);
+    chk(c, "service:idle-recovery-product-cleanup", emptyDir(products), listText(listOf(products)));
+}
+
+// LSP：根外的工作区文件夹不授权、根内与库根有文档符号、网络 URI 拒绝、导入写法与磁盘逐字节核对。
+function lspChecks(c: Ref<Ctx>, inside: string, outside: string, library: string): void {
+    const s = lspOpen(c.compiler, strs(["lsp", "--stdio", "--workspace", inside, "--library-root", library]), c.root) catch (e) {
+        chk(c, "service:lsp-close", false, e.message);
+        return;
+    };
+    const r = request(s, "initialize", "{\"capabilities\": {}, \"workspaceFolders\": [{\"uri\": " + jQuote(uriOf(outside)) + ", \"name\": \"untrusted\"}]}");
+    const access = at(at(at(at(r, "result"), "capabilities"), "experimental"), "taixuFileAccess");
+    chk(c, "service:lsp-initialize", isObj(at(r, "result")) && jLen(at(r, "result") ?? jObject()) > 0 && boolIs(access, "network_paths", false)
+        && emptyArrayAt(access, "host_share_mount_types"), dump(r));
+    notify(s, "initialized", "{}");
+    const dirs: []string = [outside, inside, library];
+    const names: []string = ["outside", "workspace", "library"];
+    const expected: []bool = [false, true, true];
+    let i = 0;
+    while (i < len(dirs)) {
+        const uri = uriOf(jn(dirs[i], "main.tx"));
+        open(s, uri, GOOD);
+        const q = request(s, "textDocument/documentSymbol", "{\"textDocument\": {\"uri\": " + jQuote(uri) + "}}");
+        const symbols = at(q, "result");
+        chk(c, "service:lsp-document-root:" + names[i], isArr(symbols) && (jLenOf(symbols) > 0) == expected[i], dump(q));
+        i = i + 1;
+    }
+    for (uri in ["file://security-test.invalid/share/main.tx", "file:////security-test.invalid/share/main.tx"]) {
+        open(s, uri, GOOD);
+        const q = request(s, "textDocument/documentSymbol", "{\"textDocument\": {\"uri\": " + jQuote(uri) + "}}");
+        chk(c, "service:lsp-network-uri-deny", isArr(at(q, "result")) && jLenOf(at(q, "result")) == 0, dump(q));
+    }
+    // 导入写法与磁盘逐字节核对在服务模式下经受根约束的 localListDir（D3 v0.35 §6.1-4）：与检查命令同一条 3008。
+    mkdirs(jn(inside, "caselib"));
+    writeTextTo(jn(jn(inside, "caselib"), "Case.tx"), "export function caseValue(): int { return 3; }\n");
+    const caseNames: []string = ["case-mismatch", "case-exact"];
+    const specs: []string = ["./caselib/case", "./caselib/Case"];
+    const wants: []bool = [true, false];
+    i = 0;
+    while (i < len(caseNames)) {
+        const uri = uriOf(jn(inside, caseNames[i] + ".tx"));
+        open(s, uri, "import { caseValue } from \"" + specs[i] + "\";\nexport function main(args: []string): int { return caseValue(); }\n");
+        const ds = diags(s, uri);
+        let hit = false;
+        let j = 0;
+        while (j < jLenOf(ds)) {
+            if (strFind(textOf(item(ds, j), "message"), "在磁盘上为 'Case.tx'") >= 0) {
+                hit = true;
+            }
+            j = j + 1;
+        }
+        chk(c, "service:lsp-import-spelling:" + caseNames[i], hit == wants[i] && (wants[i] || jLenOf(ds) == 0), dump(ds));
+        i = i + 1;
+    }
+    const code = lspFinish(s, true);
+    chk(c, "service:lsp-close", code == 0, tailOf(text(s.p.err), 500));
+}
+
+// 与可执行文件同目录的 taixu-stdlib/src（以及发布包布局的 stdlib/src）自动纳入库根；失效的 TAIXU_STDLIB 只告警。
+export function stdlibChecks(c: Ref<Ctx>, products: string): void {
+    const install = jn(c.work, "install");
+    const user = jn(c.work, "user-workspace");
+    mkdirs(jn(jn(install, "taixu-stdlib"), "src"));
+    mkdirs(user);
+    writeTextTo(jn(jn(jn(install, "taixu-stdlib"), "src"), "probe.tx"), "export function probeValue(): int { return 7; }\n");
+    writeTextTo(jn(user, "main.tx"), "import { probeValue } from \"std/probe\";\nexport function main(args: []string): int { return probeValue(); }\n");
+    const installed = jn(install, baseOf(c.compiler));
+    copyFile(c.compiler, installed, true);
+    const savedStd = getEnv("TAIXU_STDLIB") ?? "";
+    const savedGui = getEnv("TAIXU_GUI_ROOT") ?? "";
+    setEnv("TAIXU_STDLIB", "") catch (e) {};
+    setEnv("TAIXU_GUI_ROOT", "") catch (e) {};
+    authorized(c, installed, user, products, "service:sibling-stdlib");
+    // 发布包与公开仓的布局：标准库在编译器旁的 stdlib/src，同一信任域、同样自动授权。
+    const release = jn(c.work, "release-install");
+    mkdirs(jn(jn(release, "stdlib"), "src"));
+    writeTextTo(jn(jn(jn(release, "stdlib"), "src"), "probe.tx"), "export function probeValue(): int { return 7; }\n");
+    const packaged = jn(release, baseOf(c.compiler));
+    copyFile(c.compiler, packaged, true);
+    authorized(c, packaged, user, products, "service:release-stdlib");
+    mkdirs(jn(jn(release, "gui"), "src"));
+    writeTextTo(jn(jn(jn(release, "gui"), "src"), "probe.tx"), "export function guiValue(): int { return 9; }\n");
+    const guiUser = jn(c.work, "gui-workspace");
+    mkdirs(guiUser);
+    const guiMain = "import { guiValue } from \"gui/probe\";\nexport function main(args: []string): int { return guiValue(); }\n";
+    writeTextTo(jn(guiUser, "main.tx"), guiMain);
+    authorized(c, packaged, guiUser, products, "service:release-gui");
+    const ls = lspOpen(packaged, strs(["lsp", "--stdio", "--workspace", guiUser]), guiUser) catch (e) { panic(e.message); };
+    const guiInit = lspInit(ls, "");
+    chk(c, "service:release-gui-lsp-initialize", isObj(at(guiInit, "result")), dump(guiInit));
+    const guiUri = uriOf(jn(guiUser, "main.tx"));
+    open(ls, guiUri, guiMain);
+    const guiParams = "{\"textDocument\": {\"uri\": " + jQuote(guiUri) + "}, \"position\": {\"line\": 1, \"character\": 53}}";
+    const guiHover = request(ls, "textDocument/hover", guiParams);
+    chk(c, "service:release-gui-lsp-hover", strFind(textOf(at(at(guiHover, "result"), "contents"), "value"), "function guiValue(): int") >= 0, dump(guiHover));
+    const guiDefinition = request(ls, "textDocument/definition", guiParams);
+    const guiLocation = at(guiDefinition, "result");
+    chk(c, "service:release-gui-lsp-definition", isObj(guiLocation)
+        && textIs(guiLocation, "uri", uriOf(jn(jn(jn(release, "gui"), "src"), "probe.tx"))), dump(guiDefinition));
+    const guiExit = lspFinish(ls, true);
+    chk(c, "service:release-gui-lsp-close", guiExit == 0, "exit=" + toStr(guiExit) + " " + tailOf(text(ls.p.err), 500));
+    setEnv("TAIXU_STDLIB", jn(c.work, "missing-stdlib")) catch (e) {};
+    const p = runAt(installed, strs(["mcp", "--workspace", user]), user, 30);
+    chk(c, "service:stale-stdlib-env-warns", p.code == 0 && strFind(text(p.err), "忽略 TAIXU_STDLIB") >= 0, "(" + toStr(p.code) + ", " + tailOf(text(p.err), 300) + ")");
+    setEnv("TAIXU_STDLIB", savedStd) catch (e) {};
+    setEnv("TAIXU_GUI_ROOT", savedGui) catch (e) {};
+}
+
+function authorized(c: Ref<Ctx>, exe: string, user: string, products: string, label: string): void {
+    const m = mcpOpen(exe, user, products, strs(["--workspace", user])) catch (e) {
+        chk(c, label + "-close", false, e.message);
+        return;
+    };
+    const r = tool(m, "compile", pathArg("main.tx"));
+    chk(c, label + "-authorized", notE(r) && errNone(r) && okIs(r, true), show(r));
+    closed(c, label + "-close", m);
+}
+
+// 不经 initialize 直接问 server/discover；退出码与 stderr 一并带回。
+struct Discover {
+    security: Ref<Jv>?,
+    code: int,
+    err: string,
+}
+
+function discoverPolicy(c: Ref<Ctx>, cwd: string, flags: List<string>): Ref<Discover> {
+    const line = "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"server/discover\"}\n";
+    const p = runWithInput(c.compiler, plusList(strs(["mcp"]), flags), cwd, bytesFromStr(line), 30000) catch (e) {
+        return new Discover { security: None, code: -2, err: e.message };
+    };
+    const out = text(p.pending);
+    for (row in strSplit(out, "\n")) {
+        const doc = readJv(row);
+        if (doc != None && intIs(doc, "id", 1)) {
+            return new Discover { security: security(doc), code: p.code, err: text(p.err) };
+        }
+    }
+    return new Discover { security: None, code: p.code, err: text(p.err) };
+}
+
+function readJv(s: string): Ref<Jv>? {
+    const v = jParse(trimmed(s)) catch (e) {
+        return None;
+    };
+    return v;
+}
+
+// （可写目录, 类型）：TAIXU_TEST_HOST_SHARE_DIR 优先，否则在本机的主机共享挂载点下试建临时目录；没有为空串。
+struct Share {
+    dir: string,
+    kind: string,
+}
+
+function hostShareDir(): Ref<Share> {
+    const none = new Share { dir: "", kind: "" };
+    if (hostTarget() != "linux") {
+        return none; // 这几类主机共享挂载只出现在 Linux（WSL、虚拟机、容器）上。
+    }
+    const kinds: []string = ["9p", "drvfs", "virtiofs", "fuse.grpcfuse", "fakeowner"];
+    const mounts: List<string> = listNew();
+    const types: List<string> = listNew();
+    const info = readFile("/proc/self/mountinfo") catch "";
+    for (line in strSplit(info, "\n")) {
+        const fields = strSplit(line, " ");
+        let at0 = -1;
+        let k = 0;
+        while (k < listLen(fields)) {
+            if ((listGet(fields, k) catch "") == "-") {
+                at0 = k;
+                break;
+            }
+            k = k + 1;
+        }
+        if (at0 < 0 || at0 + 3 >= listLen(fields)) {
+            continue;
+        }
+        const kind = listGet(fields, at0 + 1) catch "";
+        let known = false;
+        for (x in kinds) {
+            if (x == kind) {
+                known = true;
+            }
+        }
+        if (!known) {
+            continue;
+        }
+        if (kind == "9p") {
+            let remote = false;
+            for (opt in strSplit(listGet(fields, at0 + 3) catch "", ",")) {
+                if (opt == "trans=tcp" || opt == "trans=rdma") {
+                    remote = true;
+                }
+            }
+            if (remote) {
+                continue;
+            }
+        }
+        listPush(mounts, strReplaceText(listGet(fields, 4) catch "", "\\040", " "));
+        listPush(types, kind);
+    }
+    const configured = getEnv("TAIXU_TEST_HOST_SHARE_DIR") ?? "";
+    if (len(configured) > 0) {
+        let best = -1;
+        let i = 0;
+        while (i < listLen(mounts)) {
+            const m = listGet(mounts, i) catch "";
+            if ((configured == m || startsWith(configured, trimSlash(m) + "/")) && (best < 0 || len(m) > len(listGet(mounts, best) catch ""))) {
+                best = i;
+            }
+            i = i + 1;
+        }
+        if (best < 0) {
+            return none;
+        }
+        const dir = makeTemp(configured);
+        if (len(dir) == 0) {
+            return none;
+        }
+        return new Share { dir: dir, kind: listGet(types, best) catch "" };
+    }
+    let i = 0;
+    while (i < listLen(mounts)) {
+        const dir = makeTemp(listGet(mounts, i) catch "");
+        if (len(dir) > 0) {
+            return new Share { dir: dir, kind: listGet(types, i) catch "" };
+        }
+        i = i + 1;
+    }
+    return none;
+}
+
+// 在 parent 下新建 taixu-host-share-<随机> 目录（同 tempfile.mkdtemp）；建不了为空串。
+function makeTemp(parent: string): string {
+    let n = 0;
+    while (n < 8) {
+        const dir = trimSlash(parent) + "/taixu-host-share-" + toStr(monoNs() % 1000000007) + toStr(n);
+        if (!dirExists(dir) && mkdirs(dir) && dirExists(dir)) {
+            return dir;
+        }
+        n = n + 1;
+    }
+    return "";
+}
+
+function dirExists(dir: string): bool {
+    const xs = listDir(dir) catch (e) {
+        return false;
+    };
+    return true;
+}
+
+function strReplaceText(s: string, a: string, b: string): string {
+    let out = "";
+    let rest = s;
+    let at0 = strFind(rest, a);
+    while (at0 >= 0) {
+        const head = bytesToStr(bytesSlice(bytesFromStr(rest), 0, at0)) catch "";
+        out = out + head + b;
+        rest = bytesToStr(bytesSlice(bytesFromStr(rest), at0 + len(a), len(rest) - at0 - len(a))) catch "";
+        at0 = strFind(rest, a);
+    }
+    return out + rest;
+}
+
+// 主机共享挂载作服务根：Windows 上忽略开关；Linux 上开关进 discover，本机有可写的共享挂载时实测策略样本、缺省拒绝与 worker 编译。
+function hostShare(c: Ref<Ctx>): void {
+    const plain = jn(c.work, "workspace");
+    const d = discoverPolicy(c, plain, strs(["--workspace", plain, "--allow-mount-type", "9p"]));
+    if (windows()) {
+        chk(c, "service:host-share-windows-ignored", d.code == 0 && emptyArrayAt(d.security, "host_share_mount_types") && strFind(d.err, "忽略 --allow-mount-type") >= 0,
+            "(" + toStr(d.code) + ", " + dump(d.security) + ", " + tailOf(d.err, 300) + ")");
+        return;
+    }
+    const types = at(d.security, "host_share_mount_types");
+    chk(c, "service:host-share-discover-opt-in", d.code == 0 && jLenOf(types) == 1 && (jText(item(types, 0)) ?? "") == "9p"
+        && boolIs(d.security, "network_paths", false), "(" + toStr(d.code) + ", " + dump(d.security) + ", " + tailOf(d.err, 300) + ")");
+    const found = hostShareDir();
+    if (len(found.dir) == 0) {
+        print("NOT-RUN service:host-share-live 本机没有可写的主机共享挂载（可设 TAIXU_TEST_HOST_SHARE_DIR）");
+        return;
+    }
+    const share = found.dir;
+    const kind = found.kind;
+    writeFileBytes(jn(share, "ok.bin"), bytesFromStr("abc")) catch (e) {};
+    writeTextTo(jn(share, "main.tx"), GOOD);
+    const outside = jn(c.work, "outside");
+    makeDirLink(nat(outside), nat(jn(share, "link")), c.work) catch (e) {
+        print("NOTE service:host-share-live 共享上建不了符号链接（" + e.message + "），链接拒绝一项只剩不存在路径");
+    };
+    const out = jn(c.work, "mount-policy-live");
+    const b = runAt(c.compiler, strs(["build", jn(c.root, "tests/tool-security/mount-policy.tx"), "--toolchain", "--out", out]), c.root, 300);
+    chk(c, "service:host-share-live-build", b.code == 0, tailOf(text(b.out) + text(b.err), 800));
+    if (b.code == 0) {
+        const p = runAt(jn(out, "mount-policy"), strs([share, kind]), c.root, 60);
+        chk(c, "service:host-share-live-policy", p.code == 0 && strFind(text(p.out), "PASS_MOUNT_POLICY_LIVE_" + kind) >= 0,
+            "(" + toStr(p.code) + ", " + tailOf(text(p.out), 300) + ", " + tailOf(text(p.err), 300) + ")");
+    }
+    const deny = runAt(c.compiler, strs(["lsp", "--stdio", "--workspace", share]), c.root, 30);
+    chk(c, "service:host-share-default-deny", deny.code == 64 && strFind(text(deny.err), "--allow-mount-type " + kind) >= 0,
+        "(" + toStr(deny.code) + ", " + tailOf(text(deny.err), 300) + ")");
+    // 开启后 worker 按转发的选项重新核验根：编译走 worker，转发漏掉就编不了。
+    const products = jn(c.work, "host-share-products");
+    mkdirs(products);
+    const m = mcpOpen(c.compiler, share, products, strs(["--workspace", share, "--allow-mount-type", kind])) catch (e) {
+        chk(c, "service:host-share-close", false, e.message);
+        deleteTree(share);
+        return;
+    };
+    const got = at(security(call(m, "server/discover", "")), "host_share_mount_types");
+    const r = tool(m, "compile", pathArg("main.tx"));
+    chk(c, "service:host-share-worker-compile", jLenOf(got) == 1 && (jText(item(got, 0)) ?? "") == kind && notE(r) && errNone(r) && okIs(r, true),
+        "(" + dump(got) + ", " + show(r) + ")");
+    closed(c, "service:host-share-close", m);
+    deleteTree(share);
+}
+
+// 本地写法的路径拼接（Windows 上分隔符一律为 \）。
+function jn(a: string, b: string): string {
+    return nat(join(a, b));
+}

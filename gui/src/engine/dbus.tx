@@ -1,0 +1,545 @@
+// ============================================================================
+// engine/dbus —— D-Bus 消息的编组与解组（GUI 原生引擎 G5 第二部分；纯函数，三端都能跑）。连接、认证与收发在 engine/busconn
+// （Linux，经 from syscall 的 Unix 域套接字），门户的请求与结果在 engine/portal。
+//
+// - 按 D-Bus 规范（https://dbus.freedesktop.org/doc/dbus-specification.html）：发出的消息一律小端（'l'），收到的大小端都认；
+//   对齐相对消息开头——正文从 8 字节对齐处开始，单独编组的正文相对它自己的开头对齐，二者等价。
+// - 头部字段按代码 1..9，未知代码的字段跳过；消息总长上限 128 MiB（规范上限）。
+// - 写：在 Bytes 尾部追加，数组先写长度占位、写完回填。读：DbusR 游标，越界、格式或 UTF-8 不对时置 bad，此后的读一律得零值，
+//   调用方看 bad。签名里的类型 y b n q i u x t d h s o g a ( ) { } v 都能跳过（变体与容器嵌套至多 32 层）。
+// ============================================================================
+
+export const DBUS_CALL: int = 1;
+export const DBUS_RETURN: int = 2;
+export const DBUS_ERROR: int = 3;
+export const DBUS_SIGNAL: int = 4;
+export const DBUS_NO_REPLY: int = 1;
+
+const MAX_MSG: int = 134217728;
+const MAX_DEPTH: int = 32;
+
+/// 一条消息。replyTo 为 0 表示没有 REPLY_SERIAL；空串字段不写进头部。big 是正文的端序（收到的消息可能是大端）。
+export struct DbusMsg {
+    kind: int,
+    flags: int,
+    serial: int,
+    replyTo: int,
+    path: string,
+    iface: string,
+    member: string,
+    errName: string,
+    dest: string,
+    sender: string,
+    sig: string,
+    body: Bytes,
+    big: bool,
+}
+
+/// 新消息（正文与签名另填）。
+export function dbusMsg(kind: int, dest: string, path: string, iface: string, member: string): DbusMsg {
+    return DbusMsg { kind: kind, flags: 0, serial: 0, replyTo: 0, path: path, iface: iface, member: member, errName: "", dest: dest, sender: "", sig: "", body: bytesNew(0), big: false };
+}
+
+/// 对某条方法调用的回复（kind 为 DBUS_RETURN 或 DBUS_ERROR；错误时 errName 另填）。
+export function dbusReply(to: DbusMsg, kind: int): DbusMsg {
+    let m: DbusMsg = dbusMsg(kind, to.sender, "", "", "");
+    m.replyTo = to.serial;
+    return m;
+}
+
+// —— 写 ——
+
+export function dwPad(b: Bytes, n: int): void {
+    while (bytesLen(b) % n != 0) {
+        bytesPush(b, 0);
+    }
+}
+
+export function dwByte(b: Bytes, v: int): void {
+    bytesPush(b, v & 0xFF);
+}
+
+export function dwU32(b: Bytes, v: int): void {
+    dwPad(b, 4);
+    bytesPush(b, v & 0xFF);
+    bytesPush(b, (v >> 8) & 0xFF);
+    bytesPush(b, (v >> 16) & 0xFF);
+    bytesPush(b, (v >> 24) & 0xFF);
+}
+
+export function dwBool(b: Bytes, v: bool): void {
+    if (v) {
+        dwU32(b, 1);
+    } else {
+        dwU32(b, 0);
+    }
+}
+
+/// 串与对象路径（u32 长度、UTF-8 字节、NUL）。
+export function dwStr(b: Bytes, s: string): void {
+    const u = bytesFromStr(s);
+    dwU32(b, bytesLen(u));
+    bytesAppend(b, u);
+    bytesPush(b, 0);
+}
+
+/// 签名（字节长度、ASCII、NUL）。
+export function dwSig(b: Bytes, s: string): void {
+    const u = bytesFromStr(s);
+    bytesPush(b, bytesLen(u) & 0xFF);
+    bytesAppend(b, u);
+    bytesPush(b, 0);
+}
+
+/// 开一个数组：写长度占位并补齐到元素的对齐；返回长度字段的位置，交给 dwArrayClose。
+export function dwArrayOpen(b: Bytes, elemAlign: int): int {
+    dwU32(b, 0);
+    const at: int = bytesLen(b) - 4;
+    dwPad(b, elemAlign);
+    return at;
+}
+
+/// 收一个数组：回填长度（不含长度之后到第一个元素的补齐）。
+export function dwArrayClose(b: Bytes, at: int, elemAlign: int): void {
+    const start: int = alignUp(at + 4, elemAlign);
+    bytesSetLE<u32>(b, at, (bytesLen(b) - start) as u32);
+}
+
+/// 结构与字典项的开头（8 字节对齐）。
+export function dwStruct(b: Bytes): void {
+    dwPad(b, 8);
+}
+
+/// 编出整条消息（小端），序号为 serial。
+export function dbusEncode(m: DbusMsg, serial: int): Bytes {
+    const b = bytesNew(0);
+    dwByte(b, 0x6C);
+    dwByte(b, m.kind);
+    dwByte(b, m.flags);
+    dwByte(b, 1);
+    dwU32(b, bytesLen(m.body));
+    dwU32(b, serial);
+    const at: int = dwArrayOpen(b, 8);
+    field(b, 1, "o", m.path);
+    field(b, 2, "s", m.iface);
+    field(b, 3, "s", m.member);
+    field(b, 4, "s", m.errName);
+    if (m.replyTo != 0) {
+        dwStruct(b);
+        dwByte(b, 5);
+        dwSig(b, "u");
+        dwU32(b, m.replyTo);
+    }
+    field(b, 6, "s", m.dest);
+    field(b, 7, "s", m.sender);
+    field(b, 8, "g", m.sig);
+    dwArrayClose(b, at, 8);
+    dwPad(b, 8);
+    bytesAppend(b, m.body);
+    return b;
+}
+
+function field(b: Bytes, code: int, t: string, v: string): void {
+    if (v == "") {
+        return;
+    }
+    dwStruct(b);
+    dwByte(b, code);
+    dwSig(b, t);
+    if (t == "g") {
+        dwSig(b, v);
+    } else {
+        dwStr(b, v);
+    }
+}
+
+// —— 读 ——
+
+/// 缓冲 b 从 at 起是否有一条完整的消息：完整得总长；还不够得 0；格式不对或超过上限得 -1。
+export function dbusFrameLen(b: Bytes, at: int): int {
+    const avail: int = bytesLen(b) - at;
+    if (avail < 16) {
+        return 0;
+    }
+    const e: int = bytesGet(b, at) catch 0;
+    if (e != 0x6C && e != 0x42) {
+        return -1;
+    }
+    const big: bool = e == 0x42;
+    const bodyLen: int = rd32(b, at + 4, big);
+    const fieldsLen: int = rd32(b, at + 12, big);
+    if (bodyLen > MAX_MSG || fieldsLen > MAX_MSG) {
+        return -1;
+    }
+    const total: int = alignUp(16 + fieldsLen, 8) + bodyLen;
+    if (total > MAX_MSG) {
+        return -1;
+    }
+    if (avail < total) {
+        return 0;
+    }
+    return total;
+}
+
+/// 解出一条消息（b 恰为一条）；格式不对得 None。
+export function dbusDecode(b: Bytes): DbusMsg? {
+    const n: int = dbusFrameLen(b, 0);
+    if (n <= 0 || n != bytesLen(b)) {
+        return None;
+    }
+    const big: bool = (bytesGet(b, 0) catch 0) == 0x42;
+    const kind: int = bytesGet(b, 1) catch 0;
+    if (kind < 1 || kind > 4 || (bytesGet(b, 3) catch 0) != 1) {
+        return None;
+    }
+    let m: DbusMsg = dbusMsg(kind, "", "", "", "");
+    m.flags = bytesGet(b, 2) catch 0;
+    m.serial = rd32(b, 8, big);
+    const r = new DbusR { b: b, pos: 12, big: big, bad: false };
+    const end: int = drArrayOpen(r, 8);
+    while (!r.bad && r.pos < end) {
+        drStruct(r);
+        const code: int = drByte(r);
+        const t: string = drSig(r);
+        if (code == 1 && t == "o") {
+            m.path = drStr(r);
+        } else if (code == 2 && t == "s") {
+            m.iface = drStr(r);
+        } else if (code == 3 && t == "s") {
+            m.member = drStr(r);
+        } else if (code == 4 && t == "s") {
+            m.errName = drStr(r);
+        } else if (code == 5 && t == "u") {
+            m.replyTo = drU32(r);
+        } else if (code == 6 && t == "s") {
+            m.dest = drStr(r);
+        } else if (code == 7 && t == "s") {
+            m.sender = drStr(r);
+        } else if (code == 8 && t == "g") {
+            m.sig = drSig(r);
+        } else {
+            drSkip(r, t);
+        }
+    }
+    if (r.bad || r.pos != end || m.serial == 0) {
+        return None;
+    }
+    const at: int = alignUp(end, 8);
+    m.body = bytesSlice(b, at, n - at);
+    m.big = big;
+    return m;
+}
+
+/// 读游标（对齐相对 b 的开头）。
+export struct DbusR {
+    b: Bytes,
+    pos: int,
+    big: bool,
+    bad: bool,
+}
+
+/// 读某条消息的正文。
+export function dbusReader(m: DbusMsg): Ref<DbusR> {
+    return new DbusR { b: m.body, pos: 0, big: m.big, bad: false };
+}
+
+// 对齐到 align 后还有 n 个字节可读。
+function need(r: Ref<DbusR>, align: int, n: int): bool {
+    if (r.bad) {
+        return false;
+    }
+    r.pos = alignUp(r.pos, align);
+    if (r.pos + n > bytesLen(r.b)) {
+        r.bad = true;
+        return false;
+    }
+    return true;
+}
+
+export function drByte(r: Ref<DbusR>): int {
+    if (!need(r, 1, 1)) {
+        return 0;
+    }
+    const v: int = bytesGet(r.b, r.pos) catch 0;
+    r.pos = r.pos + 1;
+    return v;
+}
+
+export function drU32(r: Ref<DbusR>): int {
+    if (!need(r, 4, 4)) {
+        return 0;
+    }
+    const v: int = rd32(r.b, r.pos, r.big);
+    r.pos = r.pos + 4;
+    return v;
+}
+
+export function drBool(r: Ref<DbusR>): bool {
+    const v: int = drU32(r);
+    if (v > 1) {
+        r.bad = true;
+    }
+    return v == 1;
+}
+
+/// 串与对象路径：长度、字节、NUL；字节不是合法 UTF-8 或缺 NUL 时置 bad。
+export function drStr(r: Ref<DbusR>): string {
+    const n: int = drU32(r);
+    if (r.bad || n < 0 || !need(r, 1, n + 1)) {
+        return "";
+    }
+    return takeText(r, n);
+}
+
+export function drSig(r: Ref<DbusR>): string {
+    const n: int = drByte(r);
+    if (!need(r, 1, n + 1)) {
+        return "";
+    }
+    return takeText(r, n);
+}
+
+function takeText(r: Ref<DbusR>, n: int): string {
+    if ((bytesGet(r.b, r.pos + n) catch 1) != 0) {
+        r.bad = true;
+        return "";
+    }
+    const s: string = bytesToStr(bytesSlice(r.b, r.pos, n)) catch (e) {
+        r.bad = true;
+        return "";
+    };
+    r.pos = r.pos + n + 1;
+    return s;
+}
+
+/// 读数组的长度并补齐到元素的对齐，返回数组的终点（元素从 r.pos 读到它为止）。
+export function drArrayOpen(r: Ref<DbusR>, elemAlign: int): int {
+    const n: int = drU32(r);
+    if (r.bad || n > MAX_MSG || !need(r, elemAlign, 0)) {
+        r.bad = true;
+        return r.pos;
+    }
+    if (r.pos + n > bytesLen(r.b)) {
+        r.bad = true;
+        return r.pos;
+    }
+    return r.pos + n;
+}
+
+/// 结构与字典项的开头。
+export function drStruct(r: Ref<DbusR>): void {
+    need(r, 8, 0);
+}
+
+/// 跳过一个类型为 t（单个完整类型）的值。
+export function drSkip(r: Ref<DbusR>, t: string): void {
+    skipAt(r, bytesFromStr(t), 0, 0);
+}
+
+// 跳过签名 s 在 i 处的单个完整类型的值；返回签名里该类型之后的位置（出错置 bad、得 -1）。
+function skipAt(r: Ref<DbusR>, s: Bytes, i: int, depth: int): int {
+    if (r.bad || depth > MAX_DEPTH) {
+        r.bad = true;
+        return -1;
+    }
+    const c: int = bytesGet(s, i) catch 0;
+    if (c == 0x79) {
+        need(r, 1, 1);
+        r.pos = r.pos + 1;
+    } else if (c == 0x6E || c == 0x71) {
+        need(r, 2, 2);
+        r.pos = r.pos + 2;
+    } else if (c == 0x62 || c == 0x69 || c == 0x75 || c == 0x68) {
+        need(r, 4, 4);
+        r.pos = r.pos + 4;
+    } else if (c == 0x78 || c == 0x74 || c == 0x64) {
+        need(r, 8, 8);
+        r.pos = r.pos + 8;
+    } else if (c == 0x73 || c == 0x6F) {
+        drStr(r);
+    } else if (c == 0x67) {
+        drSig(r);
+    } else if (c == 0x76) {
+        const vs = bytesFromStr(drSig(r));
+        if (sigNext(vs, 0, 0) != bytesLen(vs)) {
+            r.bad = true;
+            return -1;
+        }
+        skipAt(r, vs, 0, depth + 1);
+    } else if (c == 0x61) {
+        const e: int = sigNext(s, i, depth);
+        if (e < 0) {
+            r.bad = true;
+            return -1;
+        }
+        r.pos = drArrayOpen(r, alignOf(bytesGet(s, i + 1) catch 0));
+        return e;
+    } else if (c == 0x28 || c == 0x7B) {
+        drStruct(r);
+        let j: int = i + 1;
+        while (!r.bad && (bytesGet(s, j) catch 0) != 0x29 && (bytesGet(s, j) catch 0) != 0x7D) {
+            j = skipAt(r, s, j, depth + 1);
+            if (j < 0) {
+                return -1;
+            }
+        }
+        if (r.bad) {
+            return -1;
+        }
+        return j + 1;
+    } else {
+        r.bad = true;
+        return -1;
+    }
+    if (r.bad) {
+        return -1;
+    }
+    return i + 1;
+}
+
+/// 签名 s 在 i 处的单个完整类型之后的位置；不是完整类型得 -1。字典项只能是数组的元素，键须是基本类型；结构至少一个成员。
+export function sigNext(s: Bytes, i: int, depth: int): int {
+    if (depth > MAX_DEPTH) {
+        return -1;
+    }
+    const c: int = bytesGet(s, i) catch 0;
+    if (c == 0x61) {
+        if ((bytesGet(s, i + 1) catch 0) != 0x7B) {
+            return sigNext(s, i + 1, depth + 1);
+        }
+        const k: int = bytesGet(s, i + 2) catch 0;
+        if (alignOf(k) == 0 || k == 0x76 || k == 0x61 || k == 0x28 || k == 0x7B) {
+            return -1;
+        }
+        const j: int = sigNext(s, i + 3, depth + 1);
+        if (j < 0 || (bytesGet(s, j) catch 0) != 0x7D) {
+            return -1;
+        }
+        return j + 1;
+    }
+    if (c == 0x28) {
+        let j: int = i + 1;
+        while ((bytesGet(s, j) catch 0) != 0x29) {
+            if (j >= bytesLen(s)) {
+                return -1;
+            }
+            j = sigNext(s, j, depth + 1);
+            if (j < 0) {
+                return -1;
+            }
+        }
+        if (j == i + 1) {
+            return -1;
+        }
+        return j + 1;
+    }
+    if (c == 0x7B || alignOf(c) == 0) {
+        return -1;
+    }
+    return i + 1;
+}
+
+// 类型码的对齐；不认识的码得 0。
+function alignOf(c: int): int {
+    if (c == 0x79 || c == 0x67 || c == 0x76) {
+        return 1;
+    }
+    if (c == 0x6E || c == 0x71) {
+        return 2;
+    }
+    if (c == 0x62 || c == 0x69 || c == 0x75 || c == 0x68 || c == 0x73 || c == 0x6F || c == 0x61) {
+        return 4;
+    }
+    if (c == 0x78 || c == 0x74 || c == 0x64 || c == 0x28 || c == 0x7B) {
+        return 8;
+    }
+    return 0;
+}
+
+function alignUp(v: int, n: int): int {
+    return (v + n - 1) / n * n;
+}
+
+function rd32(b: Bytes, at: int, big: bool): int {
+    if (big) {
+        return (bytesGetBE<u32>(b, at) catch 0) as int;
+    }
+    return (bytesGetLE<u32>(b, at) catch 0) as int;
+}
+
+// —— 认证与地址 ——
+
+/// SASL EXTERNAL 的认证行（不含开头的 NUL 字节）：身份是十进制 uid 的 ASCII 再写成十六进制。
+export function dbusAuthLine(uid: int): string {
+    const d = bytesFromStr(toStr(uid));
+    let s: string = "AUTH EXTERNAL ";
+    let i: int = 0;
+    while (i < bytesLen(d)) {
+        s = s + hex2(bytesGet(d, i) catch 0);
+        i = i + 1;
+    }
+    return s + "\r\n";
+}
+
+function hex2(v: int): string {
+    const digits: string = "0123456789abcdef";
+    const hi: int = (v >> 4) & 15;
+    const lo: int = v & 15;
+    return strSlice(digits, hi, hi + 1) + strSlice(digits, lo, lo + 1);
+}
+
+/// 总线地址里第一个 unix 传输的套接字：["path" 或 "abstract", 路径]（值里的 %xx 已解码）；没有得空表。
+export function dbusUnixAddr(addr: string): List<string> {
+    for (one in strSplit(addr, ";")) {
+        if (strFind(one, "unix:") == 0) {
+            const rest: string = strSlice(one, 5, len(one));
+            for (kv in strSplit(rest, ",")) {
+                const eq: int = strFind(kv, "=");
+                if (eq > 0) {
+                    const k: string = strSlice(kv, 0, eq);
+                    const v: string = unescape(strSlice(kv, eq + 1, len(kv)));
+                    if ((k == "path" || k == "abstract") && v != "") {
+                        const out: List<string> = listNew();
+                        listPush(out, k);
+                        listPush(out, v);
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    return listNew();
+}
+
+/// %xx 解码（不合规的 % 原样保留；解出的字节不是合法 UTF-8 时得空串）。
+export function unescape(s: string): string {
+    const b = bytesFromStr(s);
+    const out = bytesNew(0);
+    let i: int = 0;
+    while (i < bytesLen(b)) {
+        const c: int = bytesGet(b, i) catch 0;
+        const h: int = hexVal(bytesGet(b, i + 1) catch 0);
+        const l: int = hexVal(bytesGet(b, i + 2) catch 0);
+        if (c == 0x25 && h >= 0 && l >= 0) {
+            bytesPush(out, h * 16 + l);
+            i = i + 3;
+        } else {
+            bytesPush(out, c);
+            i = i + 1;
+        }
+    }
+    return bytesToStr(out) catch "";
+}
+
+function hexVal(c: int): int {
+    if (c >= 0x30 && c <= 0x39) {
+        return c - 0x30;
+    }
+    if (c >= 0x61 && c <= 0x66) {
+        return c - 0x61 + 10;
+    }
+    if (c >= 0x41 && c <= 0x46) {
+        return c - 0x41 + 10;
+    }
+    return -1;
+}

@@ -1,23 +1,16 @@
-// 自举构建驱动：只凭源码与一个原生 taixu 重建出 C=D 不动点，不经 Python。
+// 自举构建驱动：只凭源码与一个原生 taixu 重建出 C=D 不动点。
 // 用法（在仓库根运行）：taixu run --toolchain scripts/build.tx [--compiler <原生 taixu>] [--work <目录>] [--out <目录>]
 //   [--sync-docs] [--keep-runs N] [--start-stage K] [--link-object <内核对象>] [--root <仓库根>]
 // 流程：所选编译器编不了的固定阶段（bootstrap/STAGE<n>）逐个补上，用（最后一个阶段的）编译器编内核生成器并生成
 // 各目标内核，编 B（嵌入新内核）、B → C → D，C 须等于 D；D 再编一次内核生成器，生成的内核须与嵌入的相同；D 原子地放到
 // --out 并写 build.json（gate.tx 读其中的 work 找 B）。
-import { sha256Hex } from "../bootstrap/selfhost/sha256";
-import { JsonValue, JSON_NULL, JSON_STR, jsonNew, jsonParseStr, jsonGet } from "../bootstrap/selfhost/json_parse";
+import { jsonParseStr } from "../bootstrap/selfhost/json_parse";
 import { jsonQuote } from "../bootstrap/selfhost/json_text";
 import { osRealPath, osRename } from "./build_os";
-import { absolute, byteSub, copyFile, exeName, findInPath, finishRunDir, freshRunDir, join, kindOf, list1, mkdirs, nothing, parseDigits,
-    plus, readBytes, removeTree, runIn, shaOf, startsWith, step, trimLine, untar, words } from "./build_lib";
-
-const KERNEL_FLAGS: string = "--with-move --with-alloc --with-rc --with-str --with-strb --with-zero --with-list --with-file --with-argv --with-store-slots --with-nrt";
-// 目标与内核对象名（taixu.tx 以 nrt-kernel/<名> 嵌入；较早的固定阶段没有 macOS 的两个，也没有 -heapcheck 的四个，
-// 之前没有 aarch64-linux 的两个，A4d 之前没有 loongarch64-linux 的两个，A5d 之前没有 riscv64-linux 的两个，A6c 之前没有
-// aarch64-windows 的两个）。
-// 名字带 -heapcheck 的是 --heap-check 用的检测内核（页堆＋对象号隔离，设计 v052-heap-check-tool），生成时加 --generic=heapcheck。
-const KERNEL_TARGETS: string = "x86_64-windows x86_64-linux x86_64-macos aarch64-macos x86_64-windows x86_64-linux x86_64-macos aarch64-macos aarch64-linux aarch64-linux loongarch64-linux loongarch64-linux riscv64-linux riscv64-linux aarch64-windows aarch64-windows";
-const KERNEL_NAMES: string = "kernel.obj kernel-linux.o kernel-macos.o kernel-macos-aarch64.o kernel-heapcheck.obj kernel-linux-heapcheck.o kernel-macos-heapcheck.o kernel-macos-aarch64-heapcheck.o kernel-linux-aarch64.o kernel-linux-aarch64-heapcheck.o kernel-linux-loongarch64.o kernel-linux-loongarch64-heapcheck.o kernel-linux-riscv64.o kernel-linux-riscv64-heapcheck.o kernel-windows-aarch64.o kernel-windows-aarch64-heapcheck.o";
+import { capture, field, syncDocs, text } from "./toolchain_docs";
+import { KERNEL_FLAGS, extractSources, generateKernels, kernelsOf } from "./kernels_lib";
+import { absolute, copyFile, exeName, findInPath, finishRunDir, freshRunDir, join, kindOf, list1, mkdirs, parseDigits, plus,
+    removeTree, runIn, shaOf, step, trimLine, words } from "./build_lib";
 
 struct Opts {
     root: string,
@@ -86,77 +79,6 @@ function firstNeededStage(compiler: string, link: List<string>, tflag: List<stri
     return 1;
 }
 
-// 取出提交的 bootstrap/（及 prelude/，若有）到 dest（git archive 成 tar 再在这里解开，不检出、不动索引）。
-function extractStage(git: string, root: string, commit: string, dest: string, work: string): void | Error {
-    const errFile = join(work, "git-stderr.txt");
-    const paths: List<string> = listNew();
-    listPush(paths, "bootstrap");
-    const probe = plus(plus(list1("-C"), list1(root)), plus(list1("cat-file"), plus(list1("-e"), list1(commit + ":prelude"))));
-    if ((runProcess(git, probe, errFile) catch -1) == 0) {
-        listPush(paths, "prelude");
-    }
-    const tar = join(work, "stage.tar");
-    const args = plus(plus(list1("-C"), list1(root)), plus(plus(list1("archive"), list1("--format=tar")), plus(plus(list1("-o"), list1(tar)), plus(list1(commit), paths))));
-    if ((runProcess(git, args, errFile) catch -1) != 0) {
-        return err("git archive 失败：" + commit + "（" + trimLine(readFile(errFile) catch "") + "）");
-    }
-    const t = readBytes(tar) catch (e) {
-        return e;
-    };
-    if (!mkdirs(dest)) {
-        return err("建不了：" + dest);
-    }
-    untar(t, dest) catch (e) {
-        return e;
-    };
-    removeFile(tar) catch (e) {};
-    return nothing();
-}
-
-// ---- 内核 ----
-
-// 源码树嵌入的内核（目标、对象名）：taixu.tx 里出现 nrt-kernel/<名> 的那些。
-function kernelsOf(tree: string): List<string> {
-    const text = readFile(join(tree, "bootstrap/taixu.tx")) catch "";
-    const targets = words(KERNEL_TARGETS);
-    const names = words(KERNEL_NAMES);
-    const out: List<string> = listNew();
-    let i: int = 0;
-    while (i < listLen(names)) {
-        const name = listGet(names, i) catch "";
-        if (strIndexOf(text, "nrt-kernel/" + name) >= 0) {
-            listPush(out, listGet(targets, i) catch "");
-            listPush(out, name);
-        }
-        i = i + 1;
-    }
-    return out;
-}
-
-// 生成 kernels（目标、名交替）到 outDir，得各对象的 sha256（名、值交替）。
-function generateKernels(generator: string, outDir: string, kernels: List<string>, root: string): List<string> | Error {
-    if (!mkdirs(outDir)) {
-        return err("建不了：" + outDir);
-    }
-    const sums: List<string> = listNew();
-    let i: int = 0;
-    while (i + 1 < listLen(kernels)) {
-        const target = listGet(kernels, i) catch "";
-        const name = listGet(kernels, i + 1) catch "";
-        let args = plus(plus(list1("--target"), list1(target)), plus(list1(join(outDir, name)), words(KERNEL_FLAGS)));
-        if (strIndexOf(name, "-heapcheck") >= 0) {
-            args = plus(args, list1("--generic=heapcheck"));
-        }
-        step(generator, args, root) catch (e) {
-            return e;
-        };
-        listPush(sums, name);
-        listPush(sums, shaOf(join(outDir, name)));
-        i = i + 2;
-    }
-    return sums;
-}
-
 function sameList(a: List<string>, b: List<string>): bool {
     if (listLen(a) != listLen(b)) {
         return false;
@@ -168,118 +90,6 @@ function sameList(a: List<string>, b: List<string>): bool {
         }
         i = i + 1;
     }
-    return true;
-}
-
-// ---- 派生文档（同 sync_toolchain_docs.py：内容只由太虚渲染）----
-
-function sourceVersion(root: string): string | Error {
-    const text = readFile(join(root, "bootstrap/selfhost/toolchain.tx")) catch (e) {
-        return e;
-    };
-    const key = "export const TOOLCHAIN_VERSION: string = \"";
-    let found = "";
-    let count: int = 0;
-    for (line in strSplit(text, "\n")) {
-        const l = trimLine(line);
-        if (startsWith(l, key) && (byteAt(l, len(l) - 1) ?? 0) == 59 && (byteAt(l, len(l) - 2) ?? 0) == 34) {
-            found = byteSub(l, len(key), len(l) - len(key) - 2);
-            count = count + 1;
-        }
-    }
-    if (count != 1 || len(found) == 0) {
-        return err("toolchain.tx 必须只有一个字面量 TOOLCHAIN_VERSION 定义");
-    }
-    return found;
-}
-
-// 对象的成员（缺席或不是对象时得 None）与字符串值（缺席或不是字符串时得 ""）。
-function field(v: Ref<JsonValue>?, key: string): Ref<JsonValue>? {
-    return jsonGet(v ?? jsonNew(JSON_NULL), key);
-}
-
-function text(v: Ref<JsonValue>?): string {
-    const x = v ?? jsonNew(JSON_NULL);
-    if (x.kind != JSON_STR) {
-        return "";
-    }
-    return x.s;
-}
-
-function capture(compiler: string, args: List<string>, root: string): string | Error {
-    const r = runIn(compiler, args, root, true, false) catch (e) {
-        return e;
-    };
-    if (r.code != 0) {
-        return err("退出码 " + toStr(r.code) + "：" + compiler + " " + (listGet(args, 0) catch ""));
-    }
-    return bytesToStr(r.out) catch (e) {
-        return err("输出不是合法的 UTF-8：" + compiler);
-    };
-}
-
-function lfOnly(s: string): string {
-    const b = bytesFromStr(s);
-    const out = bytesNew(0);
-    let i: int = 0;
-    while (i < bytesLen(b)) {
-        const c = bytesGet(b, i) ?? 0;
-        if (c != 13 || (bytesGet(b, i + 1) ?? 0) != 10) {
-            bytesPush(out, c);
-        }
-        i = i + 1;
-    }
-    return bytesToStr(out) catch s;
-}
-
-// 写入得 true，已一致得 false。
-function syncDocs(compiler: string, root: string): bool | Error {
-    const version = sourceVersion(root) catch (e) {
-        return e;
-    };
-    const capText = capture(compiler, plus(list1("capabilities"), list1("--format=json")), root) catch (e) {
-        return e;
-    };
-    const cap = jsonParseStr(capText) catch (e) {
-        return err("capabilities 不是 JSON");
-    };
-    const data = field(cap, "capabilities");
-    const registry = text(field(field(data, "change_registry"), "sha256"));
-    const changes = readBytes(join(root, "bootstrap/changes.tx")) catch (e) {
-        return e;
-    };
-    if (text(field(cap, "schema")) != "capabilities/1" || text(field(data, "compiler")) != "native-tx"
-        || text(field(data, "toolchain_version")) != version) {
-        return err("所选编译器与当前源码产品版本不一致；请先构建当前源码");
-    }
-    if (registry != sha256Hex(changes)) {
-        return err("所选编译器内嵌变更注册表与当前源码不一致；请先重新构建");
-    }
-    const listText = capture(compiler, plus(list1("changes"), list1("--format=json")), root) catch (e) {
-        return e;
-    };
-    const listed = jsonParseStr(listText) catch (e) {
-        return err("changes --format=json 不是 JSON");
-    };
-    if (text(field(listed, "schema")) != "changes/1" || text(field(listed, "toolchain_version")) != version) {
-        return err("编译器 changes 与 capabilities 的产品版本不一致");
-    }
-    const rendered = capture(compiler, list1("changes"), root) catch (e) {
-        return e;
-    };
-    let doc = lfOnly(rendered);
-    if (strIndexOf(doc, "\r") >= 0 || !startsWith(doc, "# 太虚工具链兼容变更\n")) {
-        return err("changes 文档格式无效");
-    }
-    doc = trimLine(doc) + "\n";
-    const path = join(root, "docs/ai/toolchain-changes.md");
-    const current = readFile(path) catch "";
-    if (current == doc) {
-        return false;
-    }
-    writeFile(path, doc) catch (e) {
-        return e;
-    };
     return true;
 }
 
@@ -398,14 +208,17 @@ function build(o: Ref<Opts>, current: string): string | Error {
         }
         const name = "s" + toStr(k);
         const src = join(boot, name + "-src");
-        extractStage(git, root, pin, src, boot) catch (e) {
+        extractSources(git, root, pin, src, boot) catch (e) {
             return e;
         };
         const genDir = join(boot, name + "-gen");
         step(a0, plus(plus(plus(list1("build"), list1("bootstrap/runtime_memory_gen.tx")), plus(plus(list1("--toolchain"), list1("--runtime=native")), tflag)), plus(a0Link, plus(list1("--out"), list1(genDir)))), src) catch (e) {
             return e;
         };
-        generateKernels(join(genDir, exeName("runtime_memory_gen")), join(src, "bootstrap/nrt-kernel"), kernelsOf(src), root) catch (e) {
+        const stageKernels = kernelsOf(src) catch (e) {
+            return e;
+        };
+        generateKernels(join(genDir, exeName("runtime_memory_gen")), join(src, "bootstrap/nrt-kernel"), stageKernels, words(KERNEL_FLAGS), root) catch (e) {
             return e;
         };
         step(a0, plus(plus(plus(list1("build"), list1("bootstrap/taixu.tx")), plus(plus(list1("--toolchain"), list1("--runtime=native")), tflag)), plus(a0Link, plus(list1("--out"), list1(join(boot, name))))), src) catch (e) {
@@ -423,8 +236,10 @@ function build(o: Ref<Opts>, current: string): string | Error {
     step(a0, plus(plus(plus(list1("build"), list1("bootstrap/runtime_memory_gen.tx")), plus(plus(list1("--toolchain"), list1("--runtime=native")), tflag)), plus(a0Link, plus(list1("--out"), list1(gen)))), root) catch (e) {
         return e;
     };
-    const currentKernels = kernelsOf(root);
-    const embedded = generateKernels(join(gen, exeName("runtime_memory_gen")), join(root, "bootstrap/nrt-kernel"), currentKernels, root) catch (e) {
+    const currentKernels = kernelsOf(root) catch (e) {
+        return e;
+    };
+    const embedded = generateKernels(join(gen, exeName("runtime_memory_gen")), join(root, "bootstrap/nrt-kernel"), currentKernels, words(KERNEL_FLAGS), root) catch (e) {
         return e;
     };
     let i: int = 1;
@@ -450,7 +265,7 @@ function build(o: Ref<Opts>, current: string): string | Error {
     step(prev, plus(plus(plus(list1("build"), list1("bootstrap/runtime_memory_gen.tx")), plus(list1("--toolchain"), tflag)), plus(list1("--out"), list1(join(boot, "gen-d")))), root) catch (e) {
         return e;
     };
-    const again = generateKernels(join(join(boot, "gen-d"), exeName("runtime_memory_gen")), join(boot, "kernels-d"), currentKernels, root) catch (e) {
+    const again = generateKernels(join(join(boot, "gen-d"), exeName("runtime_memory_gen")), join(boot, "kernels-d"), currentKernels, words(KERNEL_FLAGS), root) catch (e) {
         return e;
     };
     const names = plus(builtStages, words("b c d"));
@@ -530,7 +345,7 @@ function run(o: Ref<Opts>): int | Error {
     const hd = listGet(h, 2) catch "";
     const d = join(join(join(current, "bootstrap"), "d"), exeName("taixu"));
     if (o.syncDocs) {
-        const changed = syncDocs(d, o.root) catch (e) {
+        const changed = syncDocs(d, o.root, false) catch (e) {
             finishRunDir(current);
             return e;
         };

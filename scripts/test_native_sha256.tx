@@ -1,0 +1,229 @@
+// 原生 SHA-256 门：以 --toolchain 编出
+// bootstrap/selfhost/sha256-probe.tx，在一个进程里对全部输入求摘要（复用的常量与每次调用的状态一并受检），与入库的已知答案
+// tests/vectors/sha256.txt 逐行比较，再查输入文件未被改动。答案由独立参照生成后入库；输入为已公布的向量、0～300 字节的每个填充边界
+// 与 511 字节～1 MiB 的二进制输入，其中 random 行由 test_random.tx 按同一种子现场生成（与生成答案时取的字节逐个相同）。
+// 运行（仓根）：taixu run --toolchain scripts/test_native_sha256.tx --compiler <taixu> --work <目录> [--root <仓库>]
+// 构建或探针超时记为失败。
+import { absolute, exeName, join, mkdirs, nat, readBytes } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { lossyText } from "./check_lib";
+import { captureRaw } from "./test_lib";
+import { Rng, rngBytes, rngNew } from "./test_random";
+import { byteSub, digits, reprBytes, reprStr } from "./test_text";
+
+const SEC: int = 1000000000;
+const MAX_OUTPUT: int = 67108864;
+
+function startsWith(s: string, p: string): bool {
+    return len(s) >= len(p) && byteSub(s, 0, len(p)) == p;
+}
+
+function hexValue(c: int): int {
+    if (c >= 48 && c <= 57) {
+        return c - 48;
+    }
+    if (c >= 97 && c <= 102) {
+        return c - 87;
+    }
+    if (c >= 65 && c <= 70) {
+        return c - 55;
+    }
+    return -1;
+}
+
+// 输入写法 text:、repeat:<十六进制>x<次数>、random:<长度> 得出的字节（random 从 rng 依次取）。
+function inputOf(spec: string, rng: Ref<Rng>): Bytes | Error {
+    if (startsWith(spec, "text:")) {
+        return bytesFromStr(byteSub(spec, 5, len(spec) - 5));
+    }
+    if (startsWith(spec, "random:")) {
+        return rngBytes(rng, digits(byteSub(spec, 7, len(spec) - 7)));
+    }
+    if (startsWith(spec, "repeat:")) {
+        const body = byteSub(spec, 7, len(spec) - 7);
+        let x = 0;
+        while (x < len(body) && (byteAt(body, x) ?? 0) != 120) {
+            x = x + 1;
+        }
+        const unit = bytesNew(0);
+        let i = 0;
+        while (i + 1 < x) {
+            bytesPush(unit, hexValue(byteAt(body, i) ?? 0) * 16 + hexValue(byteAt(body, i + 1) ?? 0));
+            i = i + 2;
+        }
+        const times = digits(byteSub(body, x + 1, len(body) - x - 1));
+        const out = bytesNew(0);
+        let k = 0;
+        while (k < times) {
+            bytesAppend(out, unit);
+            k = k + 1;
+        }
+        return out;
+    }
+    return err("向量里不认得的输入写法：" + spec);
+}
+
+function sameBytes(a: Bytes, b: Bytes): bool {
+    if (bytesLen(a) != bytesLen(b)) {
+        return false;
+    }
+    let i = 0;
+    while (i < bytesLen(a)) {
+        if ((bytesGet(a, i) ?? 0) != (bytesGet(b, i) ?? 0)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 同 str.splitlines()（探针只写 \n，Windows 上也去掉 \r）。
+function linesOf(s: string): List<string> {
+    const out: List<string> = listNew();
+    const parts = strSplit(s, "\n");
+    let i = 0;
+    while (i < listLen(parts)) {
+        let l = listGet(parts, i) catch "";
+        if (len(l) > 0 && (byteAt(l, len(l) - 1) ?? 0) == 13) {
+            l = byteSub(l, 0, len(l) - 1);
+        }
+        if (i < listLen(parts) - 1 || len(l) > 0) {
+            listPush(out, l);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+function pad3(n: int): string {
+    let s = toStr(n);
+    while (len(s) < 3) {
+        s = "0" + s;
+    }
+    return s;
+}
+
+function status(ok: bool): string {
+    if (ok) {
+        return "PASS";
+    }
+    return "FAIL";
+}
+
+function run(argv: []string): int | Error {
+    let compiler = "";
+    let work = "";
+    let root = "";
+    let i = 0;
+    while (i + 1 < len(argv)) {
+        if (argv[i] == "--compiler") {
+            compiler = argv[i + 1];
+        } else if (argv[i] == "--work") {
+            work = argv[i + 1];
+        } else if (argv[i] == "--root") {
+            root = argv[i + 1];
+        } else {
+            return err("未知参数：" + argv[i]);
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0 || len(work) == 0 || i != len(argv)) {
+        return err("用法：taixu run --toolchain scripts/test_native_sha256.tx --compiler <taixu> --work <目录> [--root <仓库>]");
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = osRealPath(absolute(nat(root)));
+    compiler = osRealPath(absolute(nat(compiler)));
+    if (!mkdirs(absolute(nat(work)))) {
+        return err("建不了工作目录：" + work);
+    }
+    work = osRealPath(absolute(nat(work)));
+    const bargs: List<string> = listNew();
+    listPush(bargs, "build");
+    listPush(bargs, "bootstrap/selfhost/sha256-probe.tx");
+    listPush(bargs, "--toolchain");
+    listPush(bargs, "--out");
+    listPush(bargs, nat(join(work, "probe")));
+    const build = captureRaw(compiler, bargs, root, 180 * SEC, 10 * SEC, MAX_OUTPUT)?;
+    if (build.code != 0 || build.timedOut) {
+        print(lossyText(build.err));
+        return 1;
+    }
+    const table = readFile(nat(join(root, "tests/vectors/sha256.txt")))?;
+    const rng = rngNew(20261020);
+    const data: List<Bytes> = listNew();
+    const expected: List<string> = listNew();
+    const names: List<string> = listNew();
+    for (line in linesOf(table)) {
+        if (len(line) == 0 || (byteAt(line, 0) ?? 0) == 35) {
+            continue;
+        }
+        const sp = strSplit(line, " ");
+        if (listLen(sp) != 2) {
+            return err("向量行写法不对：" + line);
+        }
+        const b = inputOf(listGet(sp, 0) catch "", rng)?;
+        const name = "input-" + pad3(listLen(data)) + ".bin";
+        writeFileBytes(nat(join(work, name)), b)?;
+        listPush(data, b);
+        listPush(expected, listGet(sp, 1) catch "");
+        listPush(names, name);
+    }
+    const p = captureRaw(nat(join(join(work, "probe"), exeName("sha256-probe"))), names, work, 180 * SEC, 10 * SEC, MAX_OUTPUT)?;
+    const got = linesOf(lossyText(p.out));
+    let same = listLen(got) == listLen(expected);
+    let k = 0;
+    while (same && k < listLen(got)) {
+        same = (listGet(got, k) catch "") == (listGet(expected, k) catch "");
+        k = k + 1;
+    }
+    const ok = p.code == 0 && !p.timedOut && bytesLen(p.err) == 0 && same;
+    print(status(ok) + " sha256 (" + toStr(listLen(data)) + " inputs)");
+    if (!ok) {
+        print("exit=" + toStr(p.code) + ", stderr=" + reprBytes(p.err, 500) + ", lines=" + toStr(listLen(got)));
+        let diffs = "";
+        let shown = 0;
+        k = 0;
+        while (k < listLen(expected) && shown < 5) {
+            const x = listGet(expected, k) catch "";
+            let y = "None";
+            let differs = true;
+            if (k < listLen(got)) {
+                y = reprStr(listGet(got, k) catch "");
+                differs = (listGet(got, k) catch "") != x;
+            }
+            if (differs) {
+                if (shown > 0) {
+                    diffs = diffs + ", ";
+                }
+                diffs = diffs + "(" + toStr(k) + ", " + reprStr(x) + ", " + y + ")";
+                shown = shown + 1;
+            }
+            k = k + 1;
+        }
+        print("first differences: [" + diffs + "]");
+    }
+    let unchanged = true;
+    k = 0;
+    while (k < listLen(names)) {
+        const now = readBytes(nat(join(work, listGet(names, k) catch ""))) catch bytesNew(0);
+        if (!sameBytes(now, listGet(data, k) catch bytesNew(0))) {
+            unchanged = false;
+        }
+        k = k + 1;
+    }
+    print(status(unchanged) + " inputs unchanged");
+    print("SUMMARY " + status(ok && unchanged) + " (2 checks)");
+    if (ok && unchanged) {
+        return 0;
+    }
+    return 1;
+}
+
+function main(argv: []string): int {
+    return run(argv) catch (e) {
+        eprint("test_native_sha256: " + e.message);
+        return 1;
+    };
+}

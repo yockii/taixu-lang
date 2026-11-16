@@ -1,0 +1,270 @@
+// 完整自编译的耗时、峰值常驻内存与泄漏检查（描述性观测，不作性能验收）。把 bootstrap/、prelude/ 的 .tx 与 taixu.tx 嵌入的全部内核
+// （bootstrap/nrt-kernel/ 下，先跑 build.tx 生成）拷进 <work>/src，所给编译器放到 src/A：先编一份带 --leak-check 的编译器，让它自编一遍
+// （退出时报泄漏即失败，产物须与 A 逐字节相同）；再预热一次、测 runs 次完整自编译，产物都须与 A 相同。
+//
+// 每次自编译由 perf_lib.tx 的帮手进程起编译器：墙钟从起子进程到它退出；峰值常驻内存 Windows 为 PeakWorkingSetSize，Linux、macOS 为帮手
+// 的 getrusage(RUSAGE_CHILDREN) 的 ru_maxrss。子进程的环境去掉 TAIXU_* 变量（置空）、PATH 指向空目录；stderr 存为 <work>/<名>.log。
+//
+//   taixu run --toolchain scripts/native_self_profile.tx --compiler <原生 taixu> --work <新目录> [--runs 5] [--root <仓库根>]
+import { cleanEnv, isPerfHelper, jFloat, median, perfHelperMain, perfMeasure, txHashes } from "./perf_lib";
+import { kernelsOf } from "./kernels_lib";
+import { absolute, copyFile, dirOf, exeName, join, kindOf, mkdirs, parseDigits, shaOf } from "./build_lib";
+import { captureRaw } from "./test_lib";
+import { Jv, jArray, jGet, jNull, jNumber, jObject, jParseBytes, jPretty, jPush, jSet, jString, jText } from "./test_json";
+
+const USAGE: string = "用法：native_self_profile --compiler <原生 taixu> --work <新目录> [--runs 5] [--root <仓库根>]";
+const SEC: int = 1000000000;
+const LIMIT_MS: int = 1200000;
+
+struct Opts {
+    compiler: string,
+    work: string,
+    runs: int,
+    root: string,
+}
+
+function parse(argv: []string): Ref<Opts> | Error {
+    const o = new Opts { compiler: "", work: "", runs: 5, root: "" };
+    let i = 0;
+    while (i + 1 < len(argv)) {
+        const a = argv[i];
+        const v = argv[i + 1];
+        if (a == "--compiler") {
+            o.compiler = absolute(v);
+        } else if (a == "--work") {
+            o.work = absolute(v);
+        } else if (a == "--runs") {
+            o.runs = parseDigits(v);
+        } else if (a == "--root") {
+            o.root = absolute(v);
+        } else {
+            return err(USAGE);
+        }
+        i = i + 2;
+    }
+    if (i != len(argv) || len(o.compiler) == 0 || len(o.work) == 0) {
+        return err(USAGE);
+    }
+    if (o.runs < 5) {
+        return err("--runs 至少 5");
+    }
+    if (len(o.root) == 0) {
+        o.root = absolute(currentDir() catch ".");
+    }
+    return o;
+}
+
+// 所给编译器须是原生太虚（capabilities 报 native-tx）。
+function checkNative(compiler: string): void | Error {
+    const args: List<string> = listNew();
+    listPush(args, "capabilities");
+    listPush(args, "--format=json");
+    const r = captureRaw(compiler, args, dirOf(compiler), 30 * SEC, 5 * SEC, 16777216)?;
+    if (r.code != 0) {
+        return err(compiler + " capabilities 失败（退出码 " + toStr(r.code) + "）");
+    }
+    const doc = jParseBytes(r.out)?;
+    const caps = jGet(doc, "capabilities") ?? doc;
+    if ((jText(jGet(caps, "compiler")) ?? "") != "native-tx") {
+        return err("所选编译器不是原生太虚：" + compiler);
+    }
+    return nothing();
+}
+
+function nothing(): void {
+}
+
+// root 下 rel 目录（递归）的 .tx 文件拷到 dest 下同样的位置。
+function copyTx(root: string, rel: string, dest: string): void | Error {
+    const names = listDir(join(root, rel))?;
+    for (n in names) {
+        const r = rel + "/" + n;
+        const k = kindOf(join(root, r));
+        if (k == 2) {
+            copyTx(root, r, dest)?;
+        } else if (k == 1 && len(n) > 3 && strSlice(n, len(n) - 3, len(n)) == ".tx") {
+            if (!mkdirs(dirOf(join(dest, r))) || !copyFile(join(root, r), join(dest, r), false)) {
+                return err("拷不了 " + r);
+            }
+        }
+    }
+    return nothing();
+}
+
+function save(o: Ref<Opts>, doc: Ref<Jv>): void {
+    writeFile(join(o.work, "report.json"), jPretty(doc, 2) + "\n") catch (e) {
+        eprint("写不了 report.json：" + e.message);
+    };
+}
+
+struct Built {
+    product: string,
+    sha: string,
+    ns: int,
+    peak: int,
+}
+
+// 用 builder 自编一遍（另加 flags），产物在 src/<name>；measured 为真时记进 samples，否则记在 doc 的 <name> 下。
+function build(o: Ref<Opts>, doc: Ref<Jv>, src: string, name: string, builder: string, flags: List<string>, measured: bool): Ref<Built> | Error {
+    const out = join(src, name);
+    const args: List<string> = listNew();
+    listPush(args, "build");
+    listPush(args, "bootstrap/taixu.tx");
+    listPush(args, "--toolchain");
+    for (f in flags) {
+        listPush(args, f);
+    }
+    listPush(args, "--out");
+    listPush(args, out);
+    const s = perfMeasure(builder, args, src, LIMIT_MS);
+    writeFile(join(o.work, name + ".log"), s.stderr) catch (e) {};
+    if (len(s.error) > 0) {
+        return err("self-build " + name + " 测不了：" + s.error);
+    }
+    const product = join(out, exeName("taixu"));
+    let digest = "";
+    if (kindOf(product) == 1) {
+        digest = shaOf(product);
+    }
+    const peak = s.peakKib * 1024;
+    const row = jObject();
+    jSet(row, "name", jString(name));
+    jSet(row, "exit", jNumber(s.exit));
+    jSet(row, "ns", jNumber(s.wallNs));
+    jSet(row, "peak_rss", jNumber(peak));
+    if (len(digest) > 0) {
+        jSet(row, "sha256", jString(digest));
+    } else {
+        jSet(row, "sha256", jNull());
+    }
+    if (measured) {
+        jPush(jGet(doc, "samples") ?? doc, row);
+    } else {
+        jSet(doc, name, row);
+    }
+    save(o, doc);
+    print(name + " " + toStr(s.exit) + " " + toStr((s.wallNs as float) / 1000000000.0) + " s " + toStr((peak as float) / 1048576.0) + " MiB");
+    if (s.exit != 0 || peak <= 0) {
+        return err("self-build failed: " + name);
+    }
+    return new Built { product: product, sha: digest, ns: s.wallNs, peak: peak };
+}
+
+function run(o: Ref<Opts>, doc: Ref<Jv>, src: string, binary: string, expected: string): void | Error {
+    const none: List<string> = listNew();
+    const leak: List<string> = listNew();
+    listPush(leak, "--leak-check");
+    // 先核对完整编译链的退出泄漏；失败时不再耗时采样。
+    const instrumented = build(o, doc, src, "instrumented", binary, leak, false)?;
+    const check = build(o, doc, src, "instrumented-self", instrumented.product, none, false)?;
+    if (check.sha != expected) {
+        return err("instrumented compiler changed output");
+    }
+    const warm = build(o, doc, src, "warmup", binary, none, false)?;
+    if (warm.sha != expected) {
+        return err("warmup changed compiler identity");
+    }
+    const ns: List<float> = listNew();
+    let peakMax = 0;
+    let i = 0;
+    while (i < o.runs) {
+        const b = build(o, doc, src, "sample-" + toStr(i), binary, none, true)?;
+        if (b.sha != expected) {
+            return err("self-build is not byte-identical");
+        }
+        listPush(ns, b.ns as float);
+        if (b.peak > peakMax) {
+            peakMax = b.peak;
+        }
+        i = i + 1;
+    }
+    jSet(doc, "median_ns", jFloat(median(ns)));
+    jSet(doc, "peak_rss_max", jNumber(peakMax));
+    return nothing();
+}
+
+function main(argv: []string): int {
+    if (isPerfHelper(argv)) {
+        return perfHelperMain(argv);
+    }
+    const o = parse(argv) catch (e) {
+        eprint(e.message);
+        return 2;
+    };
+    checkNative(o.compiler) catch (e) {
+        eprint(e.message);
+        return 2;
+    };
+    if (kindOf(o.work) != 0) {
+        eprint("--work 须是新目录：" + o.work);
+        return 2;
+    }
+    const src = join(o.work, "src");
+    const kernels = join(src, "bootstrap/nrt-kernel");
+    if (!mkdirs(kernels)) {
+        eprint("建不了 " + kernels);
+        return 2;
+    }
+    for (dir in strSplit("bootstrap prelude", " ")) {
+        copyTx(o.root, dir, src) catch (e) {
+            eprint(e.message);
+            return 2;
+        };
+    }
+    // taixu.tx 嵌入的全部内核（目标、名交替）。
+    const kernelSums = jObject();
+    const list = kernelsOf(o.root) catch (e) {
+        eprint(e.message);
+        return 2;
+    };
+    let k = 1;
+    while (k < listLen(list)) {
+        const name = listGet(list, k) catch "";
+        const from = join(join(o.root, "bootstrap/nrt-kernel"), name);
+        if (!copyFile(from, join(kernels, name), false)) {
+            eprint("拷不了内核 " + from + "（先跑 build.tx 生成内核）");
+            return 2;
+        }
+        jSet(kernelSums, name, jString(shaOf(join(kernels, name))));
+        k = k + 2;
+    }
+    const binary = join(join(src, "A"), exeName("taixu"));
+    if (!mkdirs(dirOf(binary)) || !copyFile(o.compiler, binary, true)) {
+        eprint("拷不了编译器到 " + binary);
+        return 2;
+    }
+    const expected = shaOf(binary);
+    const empty = join(o.work, "empty-path");
+    if (!mkdirs(empty)) {
+        eprint("建不了 " + empty);
+        return 2;
+    }
+    cleanEnv(empty) catch (e) {
+        eprint("改不了环境：" + e.message);
+        return 2;
+    };
+    const sources = jObject();
+    txHashes(src, "bootstrap", sources);
+    txHashes(src, "prelude", sources);
+    const doc = jObject();
+    jSet(doc, "scope", jString("descriptive full self-build; no exclusive-CPU claim; not a formal acceptance run"));
+    jSet(doc, "clock", jString("helper monotonic ns, spawn through exit"));
+    jSet(doc, "rss", jString("Windows PeakWorkingSetSize / Linux, macOS getrusage(RUSAGE_CHILDREN) ru_maxrss of a fresh helper"));
+    jSet(doc, "compiler_sha256", jString(expected));
+    jSet(doc, "N", jNumber(o.runs));
+    jSet(doc, "source_sha256", sources);
+    jSet(doc, "kernels", kernelSums);
+    jSet(doc, "samples", jArray());
+    jSet(doc, "status", jString("RUNNING"));
+    run(o, doc, src, binary, expected) catch (e) {
+        jSet(doc, "status", jString("FAIL"));
+        jSet(doc, "error", jString(e.message));
+        save(o, doc);
+        eprint(e.message);
+        return 1;
+    };
+    jSet(doc, "status", jString("PASS"));
+    save(o, doc);
+    print("PASS full self-build profile " + join(o.work, "report.json"));
+    return 0;
+}

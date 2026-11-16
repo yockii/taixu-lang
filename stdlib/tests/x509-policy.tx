@@ -1,0 +1,84 @@
+import { X509Certificate, X509Extension } from "std/x509_types";
+import { x509ParseCertificate } from "std/x509";
+import { x509ReadPathPolicy } from "std/x509_policy";
+import { x509ParseNameConstraints, x509ApplyNameConstraints, x509NoNameConstraints, X509NameBudget } from "std/x509_constraints";
+import { p256Hex } from "std/crypto/p256_field";
+
+function leaf(): Ref<X509Certificate> {
+    const fixture = readFile("tests/vectors/x509.txt") catch panic("certificate fixture"); let count = 0;
+    for (line in strSplit(fixture, "\n")) {
+        if (len(line) == 0 || byteAt(line, 0) == 35) { continue; }
+        const p = strSplit(line, " "); if (listGet(p, 0) != "good") { continue; }
+        if (count == 1) { return x509ParseCertificate(p256Hex(listGet(p, 1))) catch panic("parse fixture"); } count = count + 1;
+    }
+    panic("missing leaf");
+}
+function badConstraints(data: Bytes): bool { x509ParseNameConstraints(data) catch (e) { return true; }; return false; }
+function node(tag: int, data: Bytes): Bytes {
+    const n = bytesLen(data); let header = bytesNew(2); bytesSet(header, 0, tag);
+    if (n < 128) { bytesSet(header, 1, n); }
+    else if (n < 256) { header = bytesNew(3); bytesSet(header, 0, tag); bytesSet(header, 1, 129); bytesSet(header, 2, n); }
+    else { header = bytesNew(4); bytesSet(header, 0, tag); bytesSet(header, 1, 130); bytesSet(header, 2, n / 256); bytesSet(header, 3, n % 256); }
+    const list = bytesAsList(header); for (b in bytesAsList(data)) { listPush(list, b); } return header;
+}
+function join(a: Bytes, b: Bytes): Bytes { const out = bytesSlice(a, 0, bytesLen(a)); for (v in bytesAsList(b)) { listPush(bytesAsList(out), v); } return out; }
+function permitted(base: Bytes): Bytes { return node(48, node(160, node(48, base))); }
+function policyError(cert: Ref<X509Certificate>, oid: string, encoding: string, critical: bool): bool {
+    cert.extensions = listNew(); listPush(cert.extensions, X509Extension { oidHex: oid, critical: critical, value: p256Hex(encoding) });
+    x509ReadPathPolicy(cert) catch (e) { return true; }; return false;
+}
+
+test "名称约束：DER 形状、标签、默认距离与地址掩码" {
+    for (good in ["3012a010300e820c6578616d706c652e74657374", "3007a0053003820161", "3008a0063004a4023000"]) {
+        assert(!badConstraints(p256Hex(good)), "accepted canonical constraint");
+    }
+    assert(!badConstraints(permitted(node(135, p256Hex("7f000000ff000000")))), "IPv4 /8");
+    for (bad in ["", "3000", "3002a000", "3004a0023000", "3006a00430028200", "3008a00630048202612e", "3100"]) { assert(badConstraints(p256Hex(bad)), "invalid constraint DER"); }
+    for (base in [node(132, p256Hex("3000")), node(128, bytesFromStr("x")), node(130, bytesFromStr(".")), node(130, p256Hex("610062")), node(135, p256Hex("7f000000ff00ff00")), node(135, bytesNew(7)), node(134, bytesFromStr("https://example.test"))]) {
+        assert(badConstraints(permitted(base)), "unsupported type or invalid identity");
+    }
+    const base = node(130, bytesFromStr("example.test"));
+    for (distance in ["800100", "800101", "810101"]) { assert(badConstraints(node(48, node(160, node(48, join(base, p256Hex(distance)))))), "subtree minimum/maximum"); }
+    const group = node(160, node(48, base));
+    assert(badConstraints(node(48, join(group, group))), "duplicate permitted group");
+    assert(badConstraints(node(48, join(node(161, node(48, base)), group))), "reversed groups");
+    const many = bytesNew(0); const subtree = node(48, base); let i = 0;
+    while (i < 128) { for (b in bytesAsList(subtree)) { listPush(bytesAsList(many), b); } i = i + 1; }
+    assert(!badConstraints(node(48, node(160, many))), "exactly 128 name constraints");
+    assert(badConstraints(node(48, node(160, join(many, subtree)))), "129 name constraints rejected");
+}
+
+test "名称约束：通配符交集和比较次数硬边界" {
+    const cert = leaf();
+    const allowed = x509ParseNameConstraints(permitted(node(130, bytesFromStr("example.test")))) catch panic("permitted");
+    const exact = new X509NameBudget { comparisons: 65534 };
+    x509ApplyNameConstraints(allowed, cert, exact) catch (e) { panic(e.message); };
+    assert(exact.comparisons == 65536, "exact comparison budget");
+    const exceeded = new X509NameBudget { comparisons: 65535 }; let failed = false;
+    x509ApplyNameConstraints(allowed, cert, exceeded) catch (e) { failed = true; }; assert(failed, "comparison budget cannot overflow");
+    const excluded = x509ParseNameConstraints(node(48, node(161, node(48, node(130, bytesFromStr("foo.example.test")))))) catch panic("excluded");
+    failed = false; x509ApplyNameConstraints(excluded, cert, new X509NameBudget { comparisons: 0 }) catch (e) { failed = true; };
+    assert(failed, "wildcard identity intersects excluded exact host");
+    for (raw in ["3000", "3003a20161", "3003890161", "3002a000"]) {
+        cert.extensions = listNew(); listPush(cert.extensions, X509Extension { oidHex: "551d11", critical: true, value: p256Hex(raw) });
+        failed = false;
+        x509ApplyNameConstraints(x509NoNameConstraints(), cert, new X509NameBudget { comparisons: 0 }) catch (e) { failed = true; };
+        assert(failed, "empty, invalid or unsupported critical SAN");
+    }
+}
+
+test "路径策略：关键扩展、基本约束、用途和未支持策略" {
+    const cert = leaf(); const original = x509ReadPathPolicy(cert) catch panic("original leaf policy");
+    assert(!original.ca && original.basicPresent && original.serverAuth, "independent leaf extensions");
+    for (encoding in ["3003010100", "3003020100", "30060101ff0201ff"]) {
+        assert(policyError(cert, "551d13", encoding, true), "invalid BasicConstraints");
+    }
+    for (encoding in ["030100", "03020000", "03020701", "03020700", "0303070080", "0303070001"]) { assert(policyError(cert, "551d0f", encoding, true), "invalid KeyUsage"); }
+    for (encoding in ["03020080", "0303070600"]) { assert(!policyError(cert, "551d0f", encoding, true), "non-minimal KeyUsage accepted like Go and OpenSSL"); }
+    assert(policyError(cert, "551d25", "3000", false), "empty EKU");
+    assert(policyError(cert, "2a0304", "0500", true), "unknown critical extension");
+    for (oid in ["551d21", "551d24", "551d36"]) { assert(policyError(cert, oid, "3000", false), "recognized unsupported constraints are never ignored"); }
+    assert(!policyError(cert, "2a0304", "0500", false), "unknown noncritical extension");
+    assert(!policyError(cert, "551d13", "30060101ff020100", true), "CA pathLen zero");
+    assert(!policyError(cert, "551d0f", "03020780", true), "digitalSignature named bit");
+}

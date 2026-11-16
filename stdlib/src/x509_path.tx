@@ -1,0 +1,98 @@
+// 纯太虚 TLS 服务证书路径；独立根集合是唯一信任来源。
+import { X509Certificate } from "./x509_types";
+import { x509ParseCertificate } from "./x509";
+import { x509VerifyCertificateSignature } from "./x509_keys";
+import { x509CheckServerInputs } from "./x509_verify_common";
+import { X509PathPolicy, x509ReadPathPolicy } from "./x509_policy";
+import { X509NameBudget, x509ApplyNameConstraints, x509NoNameConstraints } from "./x509_constraints";
+
+struct Candidate { cert: Ref<X509Certificate>, policy: Ref<X509PathPolicy>?, error: string, trusted: bool }
+struct Search { candidates: List<Ref<Candidate>>, nowSecs: int, attempts: int, names: Ref<X509NameBudget>, lastError: string }
+
+function candidate(der: Bytes, trusted: bool): Ref<Candidate> | Error {
+    const cert = x509ParseCertificate(der)?; const out = new Candidate { cert: cert, policy: None, error: "", trusted: trusted };
+    const policy = x509ReadPathPolicy(cert) catch (e) { out.error = e.message; return out; }; out.policy = policy; return out;
+}
+
+function valid(search: Ref<Search>, path: List<Ref<Candidate>>): void | Error {
+    let i = 0;
+    for (item in path) {
+        const cert = item.cert; const policy = item.policy;
+        if (policy == None) { return err(item.error); }
+        if (search.nowSecs < cert.notBeforeSecs || search.nowSecs > cert.notAfterSecs) { return err("x509: certificate outside validity period"); }
+        if (!policy.serverAuth) { return err("x509: certificate EKU excludes server authentication"); }
+        if (i == 0) {
+            if (policy.keyUsagePresent && !policy.digitalSignature) { return err("x509: TLS leaf KeyUsage excludes digital signature"); }
+        } else {
+            // 显式信任锚可来自旧版 CA 证书；中间证书必须携带 CA 基本约束。
+            if ((!item.trusted || policy.basicPresent) && !policy.ca) { return err("x509: issuer is not a CA"); }
+            if (policy.keyUsagePresent && !policy.certSign) { return err("x509: issuer KeyUsage excludes certificate signing"); }
+            let intermediates = 0; let j = 1;
+            while (j < i) { const below = listGet(path, j).cert; if (!bytesEqual(below.subject, below.issuer)) { intermediates = intermediates + 1; } j = j + 1; }
+            if (policy.pathLen >= 0 && intermediates > policy.pathLen) { return err("x509: path length constraint"); }
+            j = 0;
+            while (j < i) {
+                const below = listGet(path, j).cert;
+                if (j == 0 || !bytesEqual(below.subject, below.issuer)) { x509ApplyNameConstraints(policy.constraints, below, search.names)?; } j = j + 1;
+            }
+        }
+        // 即使没有上级名称约束，也核对已处理 SAN 的编码与关键名字类型。
+        x509ApplyNameConstraints(x509NoNameConstraints(), cert, search.names)?;
+        i = i + 1;
+    }
+    return done();
+}
+
+function walk(search: Ref<Search>, path: List<Ref<Candidate>>): bool {
+    const current = listGet(path, listLen(path) - 1);
+    if (current.trusted) {
+        valid(search, path) catch (e) { search.lastError = e.message; return false; }; return true;
+    }
+    if (listLen(path) >= 16) { search.lastError = "x509: certificate path depth limit"; return false; }
+    // 根优先，不依赖服务器给的中间证书顺序；同一主体可有多个交叉签名版本。
+    let trusted = true; let pass = 0;
+    while (pass < 2) {
+        for (parent in search.candidates) {
+            if (parent.trusted != trusted || !bytesEqual(current.cert.issuer, parent.cert.subject)) { continue; }
+            let cycle = false;
+            for (seen in path) { if (bytesEqual(seen.cert.der, parent.cert.der)) { cycle = true; } }
+            if (cycle) { continue; }
+            if (parent.policy == None) { search.lastError = parent.error; continue; }
+            if (search.attempts >= 100) { search.lastError = "x509: certificate signature attempt limit"; return false; }
+            search.attempts = search.attempts + 1;
+            const verified = x509VerifyCertificateSignature(current.cert, parent.cert) catch (e) { search.lastError = e.message; continue; };
+            if (!verified) { search.lastError = "x509: invalid certificate signature"; continue; }
+            listPush(path, parent); const success = walk(search, path); listPop(path);
+            if (success) { return true; }
+        }
+        trusted = false; pass = pass + 1;
+    }
+    return false;
+}
+
+export function x509VerifyServerPath(chain: List<Bytes>, hostname: string, nowSecs: int, roots: List<Bytes>): void | Error {
+    x509CheckServerInputs(chain, hostname, roots)?;
+    if (listLen(roots) == 0) { return err("x509: no trust anchors"); }
+    if (nowSecs < -62135596800 || nowSecs > 253402300799) { return err("x509: time outside calendar range"); }
+    const candidates: List<Ref<Candidate>> = listNew();
+    // 根集合先建，服务端送来相同 DER 时复用独立根的信任属性。
+    for (der in roots) {
+        let duplicate = false; for (existing in candidates) { if (bytesEqual(existing.cert.der, der)) { duplicate = true; } }
+        if (!duplicate) { listPush(candidates, candidate(der, true)?); }
+    }
+    let leaf: Ref<Candidate>? = None;
+    for (der in chain) {
+        let found: Ref<Candidate>? = None;
+        for (existing in candidates) { if (bytesEqual(existing.cert.der, der)) { found = existing; break; } }
+        if (found == None) { const item = candidate(der, false)?; listPush(candidates, item); found = item; }
+        if (leaf == None) { leaf = found; }
+    }
+    const first = leaf catch panic("x509: checked leaf");
+    if (first.policy == None) { return err(first.error); }
+    const search = new Search { candidates: candidates, nowSecs: nowSecs, attempts: 0, names: new X509NameBudget { comparisons: 0 }, lastError: "x509: no path to a trusted anchor" };
+    const path: List<Ref<Candidate>> = listNew(); listPush(path, first);
+    if (!walk(search, path)) { return err(search.lastError); }
+    return done();
+}
+
+function done(): void {}

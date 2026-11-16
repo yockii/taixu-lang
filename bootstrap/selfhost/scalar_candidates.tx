@@ -1,0 +1,87 @@
+// Scalar eligibility is independent of physical register numbers and emitters.
+// A candidate still needs edge/call materialization before slot writes can go.
+import { ScalarBlock, ScalarLoop } from "./scalar_loops";
+
+export struct ScalarInstruction {
+    uses: List<int>, useTags: List<int>, def: int, defTag: int,
+    killFrom: int, barrier: bool,
+}
+export struct ScalarEntry { tags: List<int>, live: List<int> }
+export struct ScalarCandidate {
+    region: int, slot: int, tag: int, reads: int, writes: int, barriers: int,
+}
+export struct ScalarCandidates { values: List<Ref<ScalarCandidate>>, work: int, limited: bool }
+struct Budget { maximum: int, used: int }
+function charge(b: Ref<Budget>, amount: int): bool {
+    if (amount > b.maximum - b.used) { b.used = b.maximum; return false; }
+    b.used = b.used + amount; return true;
+}
+function limited(b: Ref<Budget>): ScalarCandidates { return ScalarCandidates { values: listNew(), work: b.used, limited: true }; }
+function at(xs: List<int>, i: int): int { return listGet(xs, i) catch panic("scalar candidate index"); }
+function blockAt(xs: List<Ref<ScalarBlock>>, i: int): Ref<ScalarBlock> { return listGet(xs, i) catch panic("scalar candidate block"); }
+function insAt(xs: List<Ref<ScalarInstruction>>, i: int): Ref<ScalarInstruction> { return listGet(xs, i) catch panic("scalar candidate instruction"); }
+
+/// Selects loop-carried scalar slots, proving every use/definition in each
+/// region has the header's exact runtime tag (int=1, float=2, bool=3).
+/// A call/window kill disqualifies a slot even if later overwritten again.
+/// Read-only scalars are left for invariant hoisting. The live header facts
+/// may overapproximate liveness, but must include every actually live slot.
+export function scalarCandidates(blocks: List<Ref<ScalarBlock>>, regions: List<Ref<ScalarLoop>>,
+    instructions: List<Ref<ScalarInstruction>>, entries: List<Ref<ScalarEntry>>,
+    slots: int, maximum: int): ScalarCandidates | Error {
+    if (slots < 0 || maximum < 0) { return err("scalar candidate: negative size or budget"); }
+    if (listLen(entries) != listLen(regions)) { return err("scalar candidate: entry count"); }
+    const budget = new Budget { maximum: maximum, used: 0 };
+    const count = listLen(instructions);
+    if (!charge(budget, listLen(blocks) + count)) { return limited(budget); }
+    let end = -1;
+    for (block in blocks) {
+        if (block.first != end + 1 || block.last < block.first || block.last >= count) { return err("scalar candidate: PC ranges"); }
+        end = block.last;
+    }
+    if (end + 1 != count) { return err("scalar candidate: instruction count"); }
+    for (ins in instructions) {
+        if (listLen(ins.uses) != listLen(ins.useTags)) { return err("scalar candidate: use tag count"); }
+        if (ins.def < -1 || ins.def >= slots || ins.killFrom < -1 || ins.killFrom > slots) { return err("scalar candidate: definition bounds"); }
+        for (slot in ins.uses) {
+            if (!charge(budget, 1)) { return limited(budget); }
+            if (slot < 0 || slot >= slots) { return err("scalar candidate: use bounds"); }
+        }
+    }
+    const values: List<Ref<ScalarCandidate>> = listNew(); let ri = 0;
+    for (region in regions) {
+        if (!charge(budget, 1)) { return limited(budget); }
+        if (region.header < 0 || region.last < region.header || region.last >= listLen(blocks)) { return err("scalar candidate: region bounds"); }
+        const entry = listGet(entries, ri) catch panic("scalar candidate entry");
+        if (listLen(entry.tags) != slots || listLen(entry.live) != slots) { return err("scalar candidate: entry width"); }
+        const first = blockAt(blocks, region.header).first; const last = blockAt(blocks, region.last).last;
+        let slot = 0;
+        while (slot < slots) {
+            if (!charge(budget, 1)) { return limited(budget); }
+            const tag = at(entry.tags, slot);
+            if (tag >= 1 && tag <= 3 && at(entry.live, slot) != 0) {
+                let valid = true; let reads = 0; let writes = 0; let barriers = 0; let pc = first;
+                while (pc <= last && valid) {
+                    if (!charge(budget, 1)) { return limited(budget); }
+                    const ins = insAt(instructions, pc);
+                    if (ins.barrier) { barriers = barriers + 1; }
+                    if (ins.killFrom >= 0 && slot >= ins.killFrom) { valid = false; }
+                    if (ins.def == slot) { writes = writes + 1; if (ins.defTag != tag) { valid = false; } }
+                    let ui = 0;
+                    for (used in ins.uses) {
+                        if (!charge(budget, 1)) { return limited(budget); }
+                        if (used == slot) { reads = reads + 1; if (at(ins.useTags, ui) != tag) { valid = false; } }
+                        ui = ui + 1;
+                    }
+                    pc = pc + 1;
+                }
+                if (valid && reads > 0 && writes > 0) {
+                    listPush(values, new ScalarCandidate { region: ri, slot: slot, tag: tag, reads: reads, writes: writes, barriers: barriers });
+                }
+            }
+            slot = slot + 1;
+        }
+        ri = ri + 1;
+    }
+    return ScalarCandidates { values: values, work: budget.used, limited: false };
+}

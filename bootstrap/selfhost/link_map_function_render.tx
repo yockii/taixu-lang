@@ -1,5 +1,5 @@
 import { LinkMapData, LinkMapFunction, linkMapIsa } from "./link_map_data";
-import { nativeFrameDelta } from "./native_function_data";
+import { NativeFrameEvent, NativeFunction, nativeFrameDelta } from "./native_function_data";
 import { mapHex, mapJoin } from "./link_map_format";
 import { jsonQuote } from "./json_text";
 
@@ -30,6 +30,11 @@ function numbering(isa: string): string {
     if (isa == "riscv64") { return "riscv64-gpr"; }
     return "x86-64-gpr";
 }
+// 文本视图里尚未覆盖的几类：有空洞时另列手写运行时及其字节数。
+function uncovered(d: Ref<LinkMapData>): string {
+    if (d.holeBytes > 0) { return "目录外的手写运行时（" + toStr(d.holeBytes) + " 字节）、链接跳板及无目录外部对象尚未覆盖。"; }
+    return "链接跳板及无目录外部对象尚未覆盖。";
+}
 function entrySp(isa: string): string {
     if (isa == "aarch64" || isa == "loongarch64" || isa == "riscv64") { return "call-site-sp"; }
     return "return-address-slot";
@@ -46,14 +51,25 @@ export function mapFunctionCoverage(d: Ref<LinkMapData>): string {
         let present = false; for (row in d.functions) { if (row.source.origin == origin) { present = true; break; } }
         if (present) { if (len(origins) > 0) { origins = origins + ","; } origins = origins + jsonQuote(origin); }
     }
-    // runtime-manual：x86_64-windows 内核的手写例程已全部登记（PE 规范化 P3 第 7 项）；其他目标只登记了与它共用的那些，仍列为缺口。
+    // runtime-manual：放入的运行时内核里有不在函数范围内的代码（尚未登记的手写例程）时列为缺口；内核的手写例程全部登记后自然不列，
+    // 不按目标名判断（目标分层 X5a）。
     let excluded = "\"linker-thunks\",\"external-objects-without-metadata\"";
-    if (d.target != "x86_64-windows") { excluded = "\"runtime-manual\"," + excluded; }
+    if (d.holeBytes > 0) { excluded = "\"runtime-manual\"," + excluded; }
     return "\"function_ranges\":" + coverage + ",\"frame_events\":" + frameCoverage
     + ",\"frame_functions\":" + frameCount + ",\"boundary_functions\":" + boundaryCount
     + ",\"included_function_origins\":[" + origins + "]"
     + ",\"object_metadata\":{\"schema\":\"txfn/3\",\"present_objects\":" + toStr(d.metadataObjects) + ",\"absent_objects\":" + toStr(d.unknownObjects) + "}"
     + ",\"excluded_function_origins\":[" + excluded + "]";
+}
+function realigned(f: Ref<NativeFunction>): bool {
+    for (e in f.events) { if (e.kind == "align-stack") { return true; } }
+    return false;
+}
+function bodySp(f: Ref<NativeFunction>): string { if (realigned(f)) { return "realigned"; } return "fixed"; }
+// align-stack 与 restore-stack-pointer 改变的量取决于进入时的对齐，写 null。
+function spDelta(e: Ref<NativeFrameEvent>): string {
+    if (e.kind == "align-stack" || e.kind == "restore-stack-pointer") { return "null"; }
+    return decimal(nativeFrameDelta(e));
 }
 function functionJson(row: Ref<LinkMapFunction>, isa: string): string {
     const f = row.source; const parts: List<string> = listNew();
@@ -74,13 +90,14 @@ function functionJson(row: Ref<LinkMapFunction>, isa: string): string {
         listPush(parts, "{\"start_offset\":" + decimal(ep.begin - f.begin) + ",\"end_offset\":" + decimal(ep.end - f.begin) + "}");
     }
     if (f.stackModel != "fixed-call") { listPush(parts, "],\"frame\":null}"); return mapJoin(parts, 0, listLen(parts)); }
+    // 重对齐帧（带 align-stack）：函数体里的栈指针相对对齐后的栈顶固定，相对进入时未知；调用方的帧经帧指针取（link-map/7）。
     listPush(parts, "],\"frame\":{\"offset_basis\":\"function-start\",\"effect_at\":\"instruction-end\",\"register_numbering\":" + jsonQuote(numbering(isa))
-        + ",\"entry_sp\":" + jsonQuote(entrySp(isa)) + ",\"body_sp\":\"fixed\",\"register_recovery\":" + jsonQuote(recovery) + ",\"events\":[");
+        + ",\"entry_sp\":" + jsonQuote(entrySp(isa)) + ",\"body_sp\":" + jsonQuote(bodySp(f)) + ",\"register_recovery\":" + jsonQuote(recovery) + ",\"events\":[");
     first = true;
     for (e in f.events) {
         if (!first) { listPush(parts, ","); } first = false;
         listPush(parts, "{\"instruction_start_offset\":" + decimal(e.before - f.begin) + ",\"instruction_end_offset\":" + decimal(e.after - f.begin)
-            + ",\"kind\":" + jsonQuote(e.kind) + ",\"register\":" + index(e.reg) + ",\"bytes\":" + decimal(e.bytes) + ",\"sp_delta\":" + decimal(nativeFrameDelta(e)) + "}");
+            + ",\"kind\":" + jsonQuote(e.kind) + ",\"register\":" + index(e.reg) + ",\"bytes\":" + decimal(e.bytes) + ",\"sp_delta\":" + spDelta(e) + "}");
     }
     listPush(parts, "]}}"); return mapJoin(parts, 0, listLen(parts));
 }
@@ -96,16 +113,18 @@ export function mapFunctionsText(d: Ref<LinkMapData>): string {
     const parts: List<string> = listNew(); const isa = linkMapIsa(d);
     listPush(parts, "生产者声明函数 " + toStr(listLen(d.functions)) + "（已提供目录完整、未截断；地址右端排他）\nID  来源  栈模型  起点..终点  大小 bytes  序言偏移/尾声数  固定栈 bytes  保存寄存器  名字  模块\n");
     for (row in d.functions) {
-        const f = row.source; let saves = ""; let allocation = 0;
+        const f = row.source; let saves = ""; let allocation = 0; let align = 0;
         for (e in f.events) {
             if (e.kind == "allocate-stack") { allocation = e.bytes; }
+            if (e.kind == "align-stack") { align = e.bytes; }
             if (e.kind == "push-nonvolatile") { if (len(saves) > 0) { saves = saves + ","; } saves = saves + registerName(isa, e.reg); }
         }
-        let frameText = toStr(f.prologueEnd - f.begin) + "/" + toStr(listLen(f.epilogues)) + "  " + toStr(allocation) + "  [" + saves + "]";
+        let fixed = toStr(allocation); if (align > 0) { fixed = fixed + "（重对齐 " + toStr(align) + "）"; }
+        let frameText = toStr(f.prologueEnd - f.begin) + "/" + toStr(listLen(f.epilogues)) + "  " + fixed + "  [" + saves + "]";
         if (f.stackModel != "fixed-call") { frameText = "未知/未知  未知  未知（停止展开）"; }
         listPush(parts, toStr(row.id) + "  " + f.origin + "  " + f.stackModel + "  " + mapHex(row.va) + ".." + mapHex(row.va + (f.end - f.begin)) + "  " + toStr(f.end - f.begin)
             + "  " + frameText + "  " + jsonQuote(f.name) + "  " + jsonQuote(f.module) + "\n");
     }
-    listPush(parts, "对象目录 " + toStr(d.metadataObjects) + "，缺失目录 " + toStr(d.unknownObjects) + "；RtFn 只声明固定的栈指针动作，不提供完整寄存器恢复。\n特殊入口只声明范围和栈边界，帧为未知，消费者须停止展开；不从 ret 或符号推断调用帧。其余手写运行时、链接跳板及无目录外部对象尚未覆盖。完整尾声与指令事件见 JSON，机器字段使用 " + numbering(isa) + " 编号。\n");
+    listPush(parts, "对象目录 " + toStr(d.metadataObjects) + "，缺失目录 " + toStr(d.unknownObjects) + "；RtFn 只声明固定的栈指针动作，不提供完整寄存器恢复。\n特殊入口只声明范围和栈边界，帧为未知，消费者须停止展开；不从 ret 或符号推断调用帧。" + uncovered(d) + "完整尾声与指令事件见 JSON，机器字段使用 " + numbering(isa) + " 编号。\n");
     return mapJoin(parts, 0, listLen(parts));
 }

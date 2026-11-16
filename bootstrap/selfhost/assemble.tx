@@ -168,6 +168,7 @@ let asRipPending: int = -1;
 
 function asReset(): void {
     nativeFunctionsReset();
+    asNoFallThrough = false; asLastTransfer = false; asCurrentFunction = ""; asFallThroughs = listNew();
     asRipPending = -1;
     as_line_ascii = 0;
     as_failed = 0;
@@ -2195,7 +2196,8 @@ export function asStructuredMem(size: int, base: int, index: int, scale: int, di
     if (size < 0 || size > 3 || base < -1 || base > 15 || index < -1 || index > 15 || scale < 0 || scale > 3 || rip < 0 || rip > 1) {
         asFail("BadOperand"); return emptyOperand();
     }
-    if ((rip == 1 && (len(symbol) == 0 || base != -1 || index != -1)) || (rip == 0 && base < 0)) {
+    // rip 相对只编“符号本身”（memEncTx 不带位移）：带位移的拒绝，不静默丢掉（目标分层 X5e）。
+    if ((rip == 1 && (len(symbol) == 0 || base != -1 || index != -1 || disp != 0)) || (rip == 0 && base < 0)) {
         asFail("BadOperand"); return emptyOperand();
     }
     return new Operand { kind: OPD_MEM, cls: 0, num: 0, imm: 0, memSize: size,
@@ -2213,6 +2215,44 @@ export function asStructuredInstruction(mn: string, nops: int, a: Ref<Operand>, 
     op0 = a; op1 = b; op2 = c;
     asmEncodeOperands(mn, nops);
     if (asRipPending >= 0) { asRipSettle(); }
+    // 只在函数块模式（内核生成）下读；普通程序每条指令都比三次串，不算。
+    if (asNoFallThrough) { asLastTransfer = mn == "ret" || mn == "jmp" || mn == "ud2"; }
+}
+// 按函数取舍的对象（函数块模式，内核；docs/design/v052-runtime-on-demand-link-v0.2-20261108.md 第二节）：链接器按函数目录把代码节
+// 切成块、只放入可达的块，所以每个登记的函数须以无条件转移结束（x86_64：ret、jmp、ud2；A64：b、br、ret、brk、udf；龙芯：b、
+// rd 为 0 的 jirl、break；RISC-V：rd 为 0 的 jal／jalr、ebreak、unimp）——落入下一个函数的写法，在下一个函数被丢弃或不紧随其后时
+// 会跑进别的代码；A64、龙芯、RISC-V 的汇编器在这个模式下把跳到别的函数的标号留成修补（x86_64 的标号引用本来都是修补）。
+// 内核生成器在 asStructuredBegin 之后打开；asReset 关闭。
+let asNoFallThrough: bool = false;
+let asLastTransfer: bool = false;
+let asCurrentFunction: string = "";
+let asFallThroughs: List<string> = listNew();
+export function asFunctionBlocks(on: bool): void { asNoFallThrough = on; }
+export function asFunctionBlocksOn(): bool { return asNoFallThrough; }
+// 定长指令集的函数结束：末条指令字（代码节末 4 字节）须是无条件转移，否则记下函数名（asFallThroughCheck 一并报）。
+export function asWordFunctionEnd(name: string): void {
+    if (!asNoFallThrough) { return; }
+    const text = as_img.text;
+    const n = bytesLen(text);
+    let w = -1;
+    if (n >= 4) { w = (bytesGet(text, n - 4) catch 0) | ((bytesGet(text, n - 3) catch 0) << 8) | ((bytesGet(text, n - 2) catch 0) << 16) | ((bytesGet(text, n - 1) catch 0) << 24); }
+    let ends = false;
+    if (as_img.isa == ISA_A64) {
+        ends = (w & 0xFC000000) == 0x14000000 || (w & 0xFFFFFC1F) == 0xD61F0000 || (w & 0xFFFFFC1F) == 0xD65F0000
+        || (w & 0xFFE0001F) == 0xD4200000 || (w >= 0 && (w & 0xFFFF0000) == 0);
+    } else if (as_img.isa == ISA_LA64) {
+        ends = (w & 0xFC000000) == 0x50000000 || (w & 0xFC00001F) == 0x4C000000 || (w & 0xFFFF8000) == 0x002A0000;
+    } else if (as_img.isa == ISA_RV64) {
+        ends = (w & 0xFFF) == 0x06F || (w & 0x7FFF) == 0x067 || w == 0x00100073 || w == 0xC0001073;
+    }
+    if (!ends) { listPush(asFallThroughs, name); }
+}
+// 提交末尾：有落空的函数即失败（列出全部）。
+export function asFallThroughCheck(): void {
+    if (as_failed == 1 || listLen(asFallThroughs) == 0) { return; }
+    let names = "";
+    for (n in asFallThroughs) { names = names + " " + n; }
+    asFail("FunctionFallsThrough:" + names);
 }
 // C prototype buffered emission. No instruction text is constructed or parsed.
 // A64 缓冲（asBufferNewA64）另有条目 kind 20..26，由 a64_asm.tx 写入并经 a64BufferSubmit 提交。
@@ -2329,6 +2369,14 @@ export function asBufferFrame(buf: Ref<StructuredBuffer>, kind: string, reg: int
     } else if (kind == "set-frame-pointer") {
         if (reg != 5 || size != 0) { asFail("BadBufferedFrameOperand"); return; }
         mn = "mov"; n = 2; a = asStructuredReg(0, 5); b = asStructuredReg(0, 4);
+    } else if (kind == "align-stack") {
+        // 栈重对齐（同 LLVM X86FrameLowering 的重对齐帧）：设帧指针之后 and rsp, −size，size 为不小于 16 的 2 的幂。
+        if (reg != 4 || size < 16 || size > 128 || (size & (size - 1)) != 0) { asFail("BadBufferedFrameOperand"); return; }
+        mn = "and"; n = 2; a = asStructuredReg(0, 4); b = asStructuredImm(0 - size);
+    } else if (kind == "restore-stack-pointer") {
+        // 重对齐帧的尾声：lea rsp, [rbp − size]，经帧指针把 rsp 复原到对齐之前（size 为设帧指针之后压入的字节数）。
+        if (reg != 4 || size < 0 || size > 128 || size % 8 != 0) { asFail("BadBufferedFrameOperand"); return; }
+        mn = "lea"; n = 2; a = asStructuredReg(0, 4); b = asStructuredMem(2, 5, -1, 0, 0 - size, 0, "");
     }
     else { asFail("BadBufferedFrameKind"); return; }
     asBufferInstruction(buf, mn, n, a, b, missing, 1);
@@ -2353,6 +2401,25 @@ export function asManualReturn(buf: Ref<StructuredBuffer>, bytes: int): void {
     asBufferFunctionEpilogueStart(buf);
     asBufferFrame(buf, "release-stack", 4, bytes);
     asBufferFrame(buf, "return", -1, 8);
+}
+// x86_64 类 Unix 目标不返回的致命入口（目标分层 X5c：手写致命出口、可移植版 str 的入口）：经 call 或 jmp 到达、栈对齐未知，
+// push rbp；mov rbp, rsp 设帧指针后 and rsp, −16（align-stack）、留 32 字节影子空间（allocate-stack），同 macOS 蹦床的重对齐帧，
+// 展开器经帧指针越过。没有尾声：正文以 ud2 结束（不返回的调用之后补 ud2），再 asBufferFunctionEnd。
+export function asManualFatalFrame(buf: Ref<StructuredBuffer>): void {
+    asBufferFrame(buf, "push-nonvolatile", 5, 8);
+    asBufferFrame(buf, "set-frame-pointer", 5, 0);
+    asBufferFrame(buf, "align-stack", 4, 16);
+    asBufferFrame(buf, "allocate-stack", 4, 32);
+    asBufferFunctionPrologueEnd(buf);
+}
+// x86_64-windows 上的同一类入口（PE 规范化 P3 第 7 项）：PE 的展开码表达不了 and rsp, −16，帧事实只记到设帧指针，对齐与 32 字节
+// 影子空间是序言之后的正文指令；展开器同样经帧指针越过。
+export function asManualFatalFrameWindows(buf: Ref<StructuredBuffer>): void {
+    asBufferFrame(buf, "push-nonvolatile", 5, 8);
+    asBufferFrame(buf, "set-frame-pointer", 5, 0);
+    asBufferFunctionPrologueEnd(buf);
+    asBufferInstruction(buf, "and", 2, asStructuredReg(0, 4), asStructuredImm(-16), asStructuredMissing(), 1);
+    asBufferInstruction(buf, "sub", 2, asStructuredReg(0, 4), asStructuredImm(32), asStructuredMissing(), 1);
 }
 // Append exactly the original source length: self-append is finite, no iteration truncation.
 function asBufferGet(buf: Ref<StructuredBuffer>, index: int): Ref<StructuredEntry> {
@@ -2384,10 +2451,15 @@ export function asBufferSubmit(buf: Ref<StructuredBuffer>): void {
         else if (entry.kind == 8) { asStructuredAddressAddend(entry.name, entry.value); }
         else if (entry.kind == 9 || entry.kind == 14) {
             if (as_cur != SEC_TEXT) { asFail("FunctionOutsideText"); return; }
+            asLastTransfer = false; asCurrentFunction = entry.name;
             if (entry.kind == 14) { nativeFunctionBoundaryBegin(entry.mnemonic, entry.name, entry.b.label, asHere()); }
             else { nativeFunctionOwnedBegin(entry.mnemonic, entry.name, entry.a.label, asHere()); }
         }
-        else if (entry.kind == 10) { if (as_cur != SEC_TEXT) { asFail("FunctionEndOutsideText"); return; } nativeFunctionEnd(asHere()); }
+        else if (entry.kind == 10) {
+            if (as_cur != SEC_TEXT) { asFail("FunctionEndOutsideText"); return; }
+            if (asNoFallThrough && !asLastTransfer) { listPush(asFallThroughs, asCurrentFunction); }
+            nativeFunctionEnd(asHere());
+        }
         else if (entry.kind == 11) { nativeFunctionPrologueEnd(asHere()); }
         else if (entry.kind == 12) { nativeFunctionEpilogueStart(asHere()); }
         else if (entry.kind == 13) {
@@ -2406,6 +2478,7 @@ export function asBufferSubmit(buf: Ref<StructuredBuffer>): void {
         else { asFail("BadInstruction"); return; }
         i = i + 1;
     }
+    asFallThroughCheck();
 }
 
 let asProducerMeta: List<int> = listNew();
@@ -2440,6 +2513,7 @@ export function asProducerFrame(kind: string, reg: int, size: int, line: int): v
 export function asProducerBeginFunction(): void {
     asProducerMeta = listNew(); asProducerNames = listNew(); asProducerOperands = listNew();
 }
+export function asProducerBodyCount(): int { return listLen(asProducerNames); }
 export function asProducerSubmitBody(): void {
     // Shape is checked once here: every instruction pushed four meta words and
     // three operands, so the per-entry reads below stay in range.

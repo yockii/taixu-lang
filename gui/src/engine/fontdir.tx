@@ -1,0 +1,315 @@
+// ============================================================================
+// engine/fontdir —— 系统字体查找（按族名找字体文件与 TTC 面号；GUI 原生引擎 G2 起）。
+//
+// - 扫各平台的系统字体目录（fontdirs_<系统>），对 .ttf／.otf／.ttc／.otc 只读文件头、表目录与 name 表
+//   （不读整个文件），收集族名（name 1、16，含各语言，“微软雅黑”“Microsoft YaHei”都能找到）与子族名（2、17）。
+//   第一次查找时建索引，之后在进程内复用。同一族名优先取子族名为 Regular 的面。
+// - 字体文件是不可信输入：读长度与计数都有上限（name 表至多 1 MiB、表数至多 512、TTC 至多 256 面、文件至多
+//   8192 个、目录至多 6 层），越界读作 0，坏文件跳过，不 trap。
+// - 只负责找；重放与定格态不查系统字体由 engine/text 单点强制（结果只取决于脚本与内嵌字体）。
+// ============================================================================
+
+import { fileOpen, fileRead, fileSeek, fileClose, FILE_READ, SEEK_START } from "std/file";
+import { readDir, statIsDir } from "std/fs";
+import { fontDirs } from "./fontdirs";
+import { u16, u32, tag, byteSlice } from "./bin";
+
+const MAX_FILES: int = 8192;
+const MAX_DEPTH: int = 6;
+const MAX_FACES: int = 256;
+const MAX_TABLES: int = 512;
+const MAX_NAME_BYTES: int = 1048576;
+
+/// 系统字体的一个面：文件路径与 TTC 面号（单字体文件为 0）；没找到时 path 为空串。
+export struct SysFace {
+    path: string,
+    index: int,
+}
+
+struct Entry {
+    family: string, // 归一化族名
+    path: string,
+    index: int,
+    rank: int, // 0 Regular，1 Normal／Book／Roman，2 其余
+}
+
+let built: bool = false;
+let entries: List<Entry> = listNew();
+let files: int = 0;
+
+// 族名归一化：ASCII 字母转小写、去首尾空白；非 ASCII 原样（中文名逐字节比对）。
+function norm(s: string): string {
+    const b = bytesFromStr(s);
+    let start: int = 0;
+    let end: int = bytesLen(b);
+    while (start < end && (bytesGet(b, start) catch 0) == 32) {
+        start = start + 1;
+    }
+    while (end > start && (bytesGet(b, end - 1) catch 0) == 32) {
+        end = end - 1;
+    }
+    const out = bytesSlice(b, start, end - start);
+    let i: int = 0;
+    while (i < bytesLen(out)) {
+        const c: int = bytesGet(out, i) catch 0;
+        if (c >= 65 && c <= 90) {
+            bytesSet(out, i, c + 32);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(out) catch "";
+}
+
+function rankOf(sub: string): int {
+    const s: string = norm(sub);
+    if (s == "regular") {
+        return 0;
+    }
+    if (s == "normal" || s == "book" || s == "roman" || s == "plain" || s == "standard") {
+        return 1;
+    }
+    return 2;
+}
+
+// UTF-16BE（平台 0、3）→ string；孤立代理丢弃。
+function utf16be(b: Bytes, off: int, n: int): string {
+    const out = bytesNew(0);
+    let i: int = 0;
+    while (i + 1 < n) {
+        let cp: int = u16(b, off + i);
+        i = i + 2;
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < n) {
+            const lo: int = u16(b, off + i);
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                i = i + 2;
+            } else {
+                cp = -1;
+            }
+        } else if (cp >= 0xD800 && cp <= 0xDFFF) {
+            cp = -1;
+        }
+        if (cp == 0 || cp < 0) {
+            continue;
+        }
+        if (cp < 0x80) {
+            bytesPush(out, cp);
+        } else if (cp < 0x800) {
+            bytesPush(out, 0xC0 | (cp >> 6));
+            bytesPush(out, 0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            bytesPush(out, 0xE0 | (cp >> 12));
+            bytesPush(out, 0x80 | ((cp >> 6) & 0x3F));
+            bytesPush(out, 0x80 | (cp & 0x3F));
+        } else {
+            bytesPush(out, 0xF0 | (cp >> 18));
+            bytesPush(out, 0x80 | ((cp >> 12) & 0x3F));
+            bytesPush(out, 0x80 | ((cp >> 6) & 0x3F));
+            bytesPush(out, 0x80 | (cp & 0x3F));
+        }
+    }
+    return bytesToStr(out) catch "";
+}
+
+// 平台 1（Mac Roman）只收 ASCII 字节。
+function macAscii(b: Bytes, off: int, n: int): string {
+    const out = bytesNew(0);
+    let i: int = 0;
+    while (i < n) {
+        const c: int = bytesGet(b, off + i) catch 0;
+        if (c >= 32 && c < 127) {
+            bytesPush(out, c);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(out) catch "";
+}
+
+function readAt(f: int, off: int, n: int): Bytes {
+    fileSeek(f, off, SEEK_START) catch (e) {
+        return bytesNew(0);
+    };
+    return fileRead(f, n) catch bytesNew(0);
+}
+
+// 一个面的 name 表 → 索引条目（族名 16 配子族名 17，族名 1 配子族名 2；子族名取英文或 Mac 记录）。
+function addFace(f: int, path: string, index: int, dir: int): void {
+    const head: Bytes = readAt(f, dir, 12);
+    const ver: int = u32(head, 0);
+    if (bytesLen(head) < 12 || (ver != 65536 && ver != tag("OTTO") && ver != tag("true"))) {
+        return;
+    }
+    const nt: int = u16(head, 4);
+    if (nt < 1 || nt > MAX_TABLES) {
+        return;
+    }
+    const recs: Bytes = readAt(f, dir + 12, nt * 16);
+    let nameOff: int = -1;
+    let nameLen: int = 0;
+    let i: int = 0;
+    while (i < nt && i * 16 + 16 <= bytesLen(recs)) {
+        if (u32(recs, i * 16) == tag("name")) {
+            nameOff = u32(recs, i * 16 + 8);
+            nameLen = u32(recs, i * 16 + 12);
+        }
+        i = i + 1;
+    }
+    if (nameOff < 0 || nameLen < 6) {
+        return;
+    }
+    if (nameLen > MAX_NAME_BYTES) {
+        nameLen = MAX_NAME_BYTES;
+    }
+    const nb: Bytes = readAt(f, nameOff, nameLen);
+    const count: int = u16(nb, 2);
+    const strOff: int = u16(nb, 4);
+    const fam1: List<string> = listNew();
+    const fam16: List<string> = listNew();
+    let sub2: string = "";
+    let sub17: string = "";
+    let r: int = 0;
+    while (r < count && 6 + r * 12 + 12 <= bytesLen(nb)) {
+        const at: int = 6 + r * 12;
+        const plat: int = u16(nb, at);
+        const lang: int = u16(nb, at + 4);
+        const nid: int = u16(nb, at + 6);
+        const slen: int = u16(nb, at + 8);
+        const off: int = strOff + u16(nb, at + 10);
+        r = r + 1;
+        if (!(nid == 1 || nid == 2 || nid == 16 || nid == 17) || off + slen > bytesLen(nb)) {
+            continue;
+        }
+        let s: string = "";
+        if (plat == 0 || plat == 3) {
+            s = utf16be(nb, off, slen);
+        } else if (plat == 1) {
+            s = macAscii(nb, off, slen);
+        } else {
+            continue;
+        }
+        if (len(s) == 0) {
+            continue;
+        }
+        const english: bool = (plat == 3 && lang == 0x409) || (plat == 1 && lang == 0);
+        if (nid == 1) {
+            listPush(fam1, s);
+        } else if (nid == 16) {
+            listPush(fam16, s);
+        } else if (nid == 2 && (english || len(sub2) == 0)) {
+            sub2 = s;
+        } else if (nid == 17 && (english || len(sub17) == 0)) {
+            sub17 = s;
+        }
+    }
+    let sub16: string = sub17;
+    if (len(sub16) == 0) {
+        sub16 = sub2;
+    }
+    for (n in fam16) {
+        const e: Entry = { family: norm(n), path: path, index: index, rank: rankOf(sub16) };
+        listPush(entries, e);
+    }
+    for (n in fam1) {
+        const e: Entry = { family: norm(n), path: path, index: index, rank: rankOf(sub2) };
+        listPush(entries, e);
+    }
+}
+
+function fontExt(name: string): bool {
+    const n: string = norm(name);
+    const k: int = len(n);
+    if (k < 5) {
+        return false;
+    }
+    const ext: string = byteSlice(n, k - 4, k);
+    return ext == ".ttf" || ext == ".otf" || ext == ".ttc" || ext == ".otc";
+}
+
+function addFile(path: string): void {
+    files = files + 1;
+    const f: int = fileOpen(path, FILE_READ) catch (e) {
+        return;
+    };
+    const head: Bytes = readAt(f, 0, 12);
+    if (u32(head, 0) == tag("ttcf")) {
+        let n: int = u32(head, 8);
+        if (n > MAX_FACES) {
+            n = MAX_FACES;
+        }
+        const offs: Bytes = readAt(f, 12, n * 4);
+        let i: int = 0;
+        while (i < n && i * 4 + 4 <= bytesLen(offs)) {
+            addFace(f, path, i, u32(offs, i * 4));
+            i = i + 1;
+        }
+    } else {
+        addFace(f, path, 0, 0);
+    }
+    fileClose(f);
+}
+
+function scan(dir: string, depth: int, recursive: bool): void {
+    const names: List<string> = readDir(dir) catch (e) {
+        return;
+    };
+    for (name in names) {
+        if (files >= MAX_FILES) {
+            return;
+        }
+        if (name == "." || name == "..") {
+            continue;
+        }
+        const p: string = dir + "/" + name;
+        if (fontExt(name)) {
+            addFile(p);
+        } else if (recursive && depth < MAX_DEPTH && (statIsDir(p) catch false)) {
+            scan(p, depth + 1, recursive);
+        }
+    }
+}
+
+function build(): void {
+    if (built) {
+        return;
+    }
+    built = true;
+    for (d in fontDirs()) {
+        // 目录项以“/”结尾表示要递归（Linux、macOS 的字体目录有子目录）。
+        if (len(d) > 1 && (byteTryAt(d, len(d) - 1) catch 0) == 47) {
+            scan(byteSlice(d, 0, len(d) - 1), 0, true);
+        } else {
+            scan(d, 0, false);
+        }
+    }
+}
+
+/// 按族名找系统字体的面；没找到 path 为空串。
+export function sysFontFind(family: string): SysFace {
+    build();
+    const want: string = norm(family);
+    let best: int = -1;
+    let bestRank: int = 99;
+    let i: int = 0;
+    while (i < listLen(entries)) {
+        const e: Entry = listGet(entries, i);
+        if (e.family == want && e.rank < bestRank) {
+            best = i;
+            bestRank = e.rank;
+        }
+        i = i + 1;
+    }
+    if (best < 0) {
+        return { path: "", index: 0 };
+    }
+    const e: Entry = listGet(entries, best);
+    return { path: e.path, index: e.index };
+}
+
+/// 索引规模（族名条目数、扫过的文件数；测试与诊断用）。
+export function sysFontStats(): List<int> {
+    build();
+    const out: List<int> = listNew();
+    listPush(out, listLen(entries));
+    listPush(out, files);
+    return out;
+}

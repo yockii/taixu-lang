@@ -1,0 +1,114 @@
+// GUI-owned navigation state. Completion generations exclude stale results.
+import { BrowserContent, contentHome, contentError } from "./content";
+import { httpAddress } from "std/http_client";
+import { parseUri, resolveUri, uriString, unescapeComponent } from "std/url";
+import { trim } from "std/string";
+
+export struct BrowserHistory { url: string, scroll: int }
+export struct BrowserRequest { url: string, history: int, generation: int, restoreScroll: int, reload: bool }
+export struct BrowserNavigation { content: BrowserContent, history: List<BrowserHistory>, cursor: int, intent: int, generation: int, pending: BrowserRequest?, loading: bool, scroll: int, anchorPending: bool }
+
+export function navigationNew(): Ref<BrowserNavigation> | Error {
+    const home = contentHome()?; const history: List<BrowserHistory> = listNew(); listPush(history, BrowserHistory { url: home.url, scroll: 0 });
+    return new BrowserNavigation { content: home, history: history, cursor: 0, intent: 0, generation: 0, pending: None, loading: false, scroll: 0, anchorPending: false };
+}
+// Encode raw Unicode/space in a user-entered URL or HTML reference. Keep ASCII
+// URI delimiters and existing percent escapes for the strict URI parser to check.
+function uriText(text: string): string | Error {
+    const source = trim(text); if (len(source) > 4096) { return err("browser navigation: address exceeds 4096 bytes"); }
+    const out = bytesNew(0); const hex = "0123456789ABCDEF"; let i = 0;
+    while (i < len(source)) {
+        const b = byteAt(source, i);
+        if (b < 32 || b == 127) { return err("browser navigation: address contains a control character"); }
+        if (b >= 128 || b == 32) { listPush(bytesAsList(out), 37 as u8); listPush(bytesAsList(out), byteAt(hex, b >> 4) as u8); listPush(bytesAsList(out), byteAt(hex, b & 15) as u8); }
+        else { listPush(bytesAsList(out), b as u8); } i = i + 1;
+    } return bytesToStr(out);
+}
+export function navigationAddress(text: string): string | Error {
+    let target = uriText(text)?;
+    if (target == "about:home") { return target; }
+    if (len(target) == 0) { return err("browser navigation: empty address"); }
+    if (strFind(target, "://") < 0) { target = "https://" + target; }
+    if (len(target) > 4096) { return err("browser navigation: encoded address exceeds 4096 bytes"); }
+    const address = httpAddress(target)?; return uriString(address.uri);
+}
+function remember(state: Ref<BrowserNavigation>): void {
+    if (state.cursor >= 0 && state.cursor < listLen(state.history)) {
+        let entry = listGet(state.history, state.cursor); entry.scroll = state.scroll; listSet(state.history, state.cursor, entry);
+    }
+}
+function begin(state: Ref<BrowserNavigation>, target: string, history: int, reload: bool): void | Error {
+    const url = navigationAddress(target)?;
+    if (history < -1 || history >= listLen(state.history)) { return err("browser navigation: invalid history index"); }
+    if (state.generation == 9223372036854775807) { return err("browser navigation: generation limit"); }
+    remember(state); state.generation = state.generation + 1; let restore = 0;
+    if (history >= 0) { restore = listGet(state.history, history).scroll; state.intent = history; } else { state.intent = state.cursor; }
+    state.pending = BrowserRequest { url: url, history: history, generation: state.generation, restoreScroll: restore, reload: reload };
+    state.loading = true; state.anchorPending = false; return done();
+}
+export function navigationOpen(state: Ref<BrowserNavigation>, text: string): void | Error { return begin(state, text, -1, false); }
+export function navigationStop(state: Ref<BrowserNavigation>): void {
+    if (state.generation < 9223372036854775807) { state.generation = state.generation + 1; }
+    state.pending = None; state.loading = false; state.intent = state.cursor; state.anchorPending = false;
+}
+export function navigationStep(state: Ref<BrowserNavigation>, delta: int): bool | Error {
+    if (delta != -1 && delta != 1) { return err("browser navigation: history step must be -1 or 1"); }
+    const pending = state.pending;
+    if (state.loading && pending != None && pending.history < 0 && delta == -1) { navigationStop(state); return true; }
+    let base = state.cursor; if (state.loading) { base = state.intent; } const next = base + delta;
+    if (next < 0 || next >= listLen(state.history)) { return false; }
+    begin(state, listGet(state.history, next).url, next, false)?; return true;
+}
+export function navigationReload(state: Ref<BrowserNavigation>): void | Error {
+    const pending = state.pending;
+    if (pending != None) { return begin(state, pending.url, pending.history, true); }
+    return begin(state, state.content.url, state.cursor, true);
+}
+function identity(text: string): string | Error { let uri = parseUri(text)?; uri.fragment = None; return uriString(uri); }
+export function navigationCommit(state: Ref<BrowserNavigation>, generation: int, content: BrowserContent): bool | Error {
+    if (!state.loading || generation != state.generation) { return false; }
+    const pending = state.pending; if (pending == None) { return false; }
+    if (len(content.url) > 4096) { return err("browser navigation: final address exceeds 4096 bytes"); }
+    if (content.url != "about:home") { httpAddress(content.url)?; }
+    remember(state);
+    if (pending.history >= 0) {
+        if (pending.history >= listLen(state.history)) { return err("browser navigation: history changed during load"); }
+        state.cursor = pending.history; let entry = listGet(state.history, state.cursor); entry.url = content.url; listSet(state.history, state.cursor, entry); state.scroll = pending.restoreScroll;
+    } else {
+        while (listLen(state.history) > state.cursor + 1) { listPop(state.history); }
+        listPush(state.history, BrowserHistory { url: content.url, scroll: 0 });
+        if (listLen(state.history) > 256) {
+            const kept: List<BrowserHistory> = listNew(); let i = 1;
+            while (i < listLen(state.history)) { listPush(kept, listGet(state.history, i)); i = i + 1; } state.history = kept;
+        }
+        state.cursor = listLen(state.history) - 1; state.scroll = 0;
+    }
+    state.content = content; state.loading = false; state.pending = None; state.intent = state.cursor;
+    const committedUri = parseUri(content.url)?; state.anchorPending = pending.history < 0 && committedUri.fragment != None;
+    if (len(content.error) > 0) { state.scroll = 0; state.anchorPending = false; } return true;
+}
+export function navigationFail(state: Ref<BrowserNavigation>, generation: int, message: string): bool | Error {
+    if (!state.loading || generation != state.generation) { return false; }
+    const pending = state.pending; if (pending == None) { return false; }
+    return navigationCommit(state, generation, contentError(pending.url, message)?);
+}
+export function navigationLocal(state: Ref<BrowserNavigation>): bool | Error {
+    const pending = state.pending; if (pending == None) { return false; }
+    if (pending.url == "about:home") { return navigationCommit(state, pending.generation, contentHome()?); }
+    if (pending.reload || len(state.content.error) > 0 || identity(pending.url)? != identity(state.content.url)?) { return false; }
+    let content = state.content; content.url = pending.url; return navigationCommit(state, pending.generation, content);
+}
+export function navigationLink(state: Ref<BrowserNavigation>, href: string): void | Error {
+    if (trim(href) == "about:home") { return navigationOpen(state, "about:home"); }
+    let base = state.content.url;
+    if (len(state.content.document.baseHref) > 0) { base = uriString(resolveUri(base, uriText(state.content.document.baseHref)?)?); }
+    const target = uriString(resolveUri(base, uriText(href)?)?);
+    // Only http(s) and the explicit home route reach begin; javascript/file/data
+    // references never become navigation jobs.
+    if (target != "about:home") { httpAddress(target)?; } return navigationOpen(state, target);
+}
+export function navigationFragment(state: Ref<BrowserNavigation>): string? {
+    const uri = parseUri(state.content.url) catch (e) { return None; }; const fragment = uri.fragment;
+    if (fragment == None) { return None; } return unescapeComponent(fragment, false) catch fragment;
+}
+function done(): void {}

@@ -1,0 +1,472 @@
+// 性能脚本共用的测量：每个样本由新起的一份自身（--perf-helper）运行，读数由
+// perf_os_*.tx 按系统取——Linux 用户态 instructions 与 cycles（perf_event_open），macOS 退休指令与周期（proc_pid_rusage），Windows 子进程
+// CPU 周期（QueryProcessCycleTime）；另记墙钟、CPU 时间与峰值常驻内存。帮手进程只起这一个子进程，CPU 时间与峰值才是它独有的。
+// 用法：脚本的 main 先判断 isPerfHelper(argv)，是则 return perfHelperMain(argv)；测量处调 perfMeasure。另有样本的读数名与 JSON、中位数与
+// 极差、定点小数、UTC 时间、剖析脚本的环境与 CPU 策略等几个脚本共用的小件。
+import { PerfSample, ownCpus, perfRun, pinCpu, unixSeconds } from "./perf_os";
+import { baseOf, copyFile, dirOf, join, kindOf, mkdirs, onWindows, shaOf } from "./build_lib";
+import { lossyText } from "./check_lib";
+import { captureRaw } from "./test_lib";
+import { J_BOOL, J_NUM, Jv, jArray, jNumber, jObject, jPush, jSet, jString } from "./test_json";
+
+export const PERF_HELPER: string = "--perf-helper";
+const SEC: int = 1000000000;
+const MAX_OUTPUT: int = 268435456;
+let serial: int = 0;
+
+// argv 是帮手的命令行：--perf-helper <结果文件> <工作目录> <限时毫秒> <程序> [实参…]。
+export function isPerfHelper(argv: []string): bool {
+    return len(argv) >= 5 && argv[0] == PERF_HELPER;
+}
+
+function digits(s: string): int {
+    let v = 0;
+    let neg = false;
+    let i = 0;
+    if (len(s) > 0 && (byteAt(s, 0) ?? 0) == 45) {
+        neg = true;
+        i = 1;
+    }
+    while (i < len(s)) {
+        const c = byteAt(s, i) ?? 0;
+        if (c < 48 || c > 57) {
+            return 0;
+        }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    if (neg) {
+        return -v;
+    }
+    return v;
+}
+
+// 一行里的换行换成空格（错误说明写在结果文件的第二行）。
+function oneLine(s: string): string {
+    const b = bytesFromStr(s);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) ?? 0;
+        if (c == 10 || c == 13) {
+            bytesSet(b, i, 32);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(b) catch s;
+}
+
+// 帮手：跑一个样本，结果写进结果文件——第一行是退出码、墙钟纳秒、CPU 纳秒、峰值 KiB、指令、周期、周期计时与子进程刚起来时的 CPU
+// 集合（逗号分隔，没有记 -），第二行是错误说明，其后是子进程的 stderr。
+export function perfHelperMain(argv: []string): int {
+    const rest: List<string> = listNew();
+    let i = 5;
+    while (i < len(argv)) {
+        listPush(rest, argv[i]);
+        i = i + 1;
+    }
+    const s = perfRun(argv[4], rest, argv[2], digits(argv[3]));
+    let cpus = s.cpus;
+    if (len(cpus) == 0) {
+        cpus = "-";
+    }
+    const text = toStr(s.exit) + " " + toStr(s.wallNs) + " " + toStr(s.cpuNs) + " " + toStr(s.peakKib) + " " + toStr(s.instructions) + " "
+    + toStr(s.cycles) + " " + toStr(s.cycleTime) + " " + cpus + "\n" + oneLine(s.error) + "\n" + s.stderr;
+    writeFileBytes(argv[1], bytesFromStr(text)) catch (e) {
+        eprint("写不了 " + argv[1] + "：" + e.message);
+        return 1;
+    };
+    return 0;
+}
+
+function failed(why: string): Ref<PerfSample> {
+    return new PerfSample { exit: -1, wallNs: 0, cpuNs: 0, peakKib: 0, instructions: -1, cycles: -1, cycleTime: -1, cpus: "", error: why,
+        stderr: "" };
+}
+
+// 在 cwd 里测一次 exe args（stdin 接空设备，stdout 丢弃，stderr 留在样本里），至多 limitMs 毫秒。帮手本身起不来或没写出结果时，样本的
+// error 说明原因。
+export function perfMeasure(exe: string, args: List<string>, cwd: string, limitMs: int): Ref<PerfSample> {
+    serial = serial + 1;
+    const note = join(tempDir(), "taixu-perf-" + toStr(monoNs()) + "-" + toStr(serial) + ".txt");
+    const ha: List<string> = listNew();
+    listPush(ha, PERF_HELPER);
+    listPush(ha, note);
+    listPush(ha, cwd);
+    listPush(ha, toStr(limitMs));
+    listPush(ha, exe);
+    for (a in args) {
+        listPush(ha, a);
+    }
+    const h = captureRaw(selfExePath(), ha, cwd, (limitMs / 1000 + 120) * SEC, 10 * SEC, MAX_OUTPUT) catch (e) {
+        return failed("helper spawn " + e.message);
+    };
+    const raw = readFileBytes(note) catch (e) {
+        return failed("helper wrote no result (exit " + toStr(h.code) + "): " + lossyText(h.err));
+    };
+    removeFile(note) catch (e) {};
+    const text = lossyText(raw);
+    const first = strFind(text, "\n");
+    if (first < 0) {
+        return failed("helper result malformed");
+    }
+    const tail = strSlice(text, first + 1, len(text));
+    const second = strFind(tail, "\n");
+    if (second < 0) {
+        return failed("helper result malformed");
+    }
+    const nums = strSplit(strSlice(text, 0, first), " ");
+    if (listLen(nums) != 8) {
+        return failed("helper result malformed");
+    }
+    let cpus = listGet(nums, 7) catch "";
+    if (cpus == "-") {
+        cpus = "";
+    }
+    return new PerfSample { exit: digits(listGet(nums, 0) catch ""), wallNs: digits(listGet(nums, 1) catch ""), cpuNs: digits(listGet(nums, 2) catch ""),
+        peakKib: digits(listGet(nums, 3) catch ""), instructions: digits(listGet(nums, 4) catch ""), cycles: digits(listGet(nums, 5) catch ""),
+        cycleTime: digits(listGet(nums, 6) catch ""), cpus: cpus, error: strSlice(tail, 0, second), stderr: strSlice(tail, second + 1, len(tail)) };
+}
+
+// Windows 上被测的编译器先复制进 dir 再测（在设好子进程环境之后调）：同一个可执行文件还被别的进程映射着时（承载脚本的 taixu run、
+// 编辑器里的 LSP），新起进程的峰值工作集会多算进共享的映像页（2026-11-10 实测：taixu --version 26 MB 对 45 MB，编 lexer 60 MB 对
+// 66 MB；周期数看不出差别）。编译器先按环境变量、再按自身目录找标准库与 GUI 根（driver.tx 的 libRoot），所以对应环境变量为空而
+// 编译器目录下有 taixu-stdlib/src、stdlib/src 或 taixu-gui/src 时不复制，照原样测并提示。Linux、macOS 的峰值不受影响，不复制。
+// 得要测的路径。
+export function privateExe(exe: string, dir: string): string | Error {
+    if (!onWindows()) {
+        return exe;
+    }
+    const home = dirOf(exe);
+    for (lib in strSplit("TAIXU_STDLIB:taixu-stdlib/src TAIXU_STDLIB:stdlib/src TAIXU_GUI_ROOT:taixu-gui/src", " ")) {
+        const parts = strSplit(lib, ":");
+        const env = getEnv(listGet(parts, 0) catch "") catch "";
+        const sib = join(home, listGet(parts, 1) catch "");
+        if (len(env) == 0 && kindOf(sib) == 2) {
+            eprint("提示：" + exe + " 同目录下有 " + sib + "（编译器按自身位置找库），不复制、照原样测；别的进程也在用这个文件时峰值工作集偏高");
+            return exe;
+        }
+    }
+    const to = join(dir, baseOf(exe));
+    if (!mkdirs(dir) || !copyFile(exe, to, true)) {
+        return err("复制不了 " + exe + " 到 " + to);
+    }
+    return to;
+}
+
+// ---- 读数、统计与记录 ----
+
+// 本宿主的判定指标与缺省样本数：Linux、macOS 为指令数、3 个；Windows 为子进程 CPU 周期、11 个（协议 §五）。
+export function defaultMetric(): string {
+    if (hostTarget() == "windows") {
+        return "cycle_time";
+    }
+    return "instructions";
+}
+
+export function defaultRuns(): int {
+    if (hostTarget() == "windows") {
+        return 11;
+    }
+    return 3;
+}
+
+// 本宿主样本的读数名（不含退出码）：Windows 没有指令数与用户态周期，别处没有 cycle_time。
+export function metricNames(): List<string> {
+    const out: List<string> = listNew();
+    if (hostTarget() == "windows") {
+        listPush(out, "cycle_time");
+    } else {
+        listPush(out, "instructions");
+        listPush(out, "cycles");
+    }
+    listPush(out, "wall_s");
+    listPush(out, "cpu_s");
+    listPush(out, "peak_kib");
+    return out;
+}
+
+export function isMetric(name: string): bool {
+    for (m in metricNames()) {
+        if (m == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+export function metricOf(s: Ref<PerfSample>, name: string): float {
+    if (name == "instructions") {
+        return s.instructions as float;
+    }
+    if (name == "cycles") {
+        return s.cycles as float;
+    }
+    if (name == "cycle_time") {
+        return s.cycleTime as float;
+    }
+    if (name == "wall_s") {
+        return (s.wallNs as float) / 1000000000.0;
+    }
+    if (name == "cpu_s") {
+        return (s.cpuNs as float) / 1000000000.0;
+    }
+    return s.peakKib as float;
+}
+
+// 一个数值的 JSON（toStr 给最短的往返位数，整数值不带小数点）。
+export function jFloat(x: float): Ref<Jv> {
+    return new Jv { kind: J_NUM, text: toStr(x), truth: false, items: listNew(), keys: listNew() };
+}
+
+export function jBool(v: bool): Ref<Jv> {
+    return new Jv { kind: J_BOOL, text: "", truth: v, items: listNew(), keys: listNew() };
+}
+
+// 一个样本的 JSON：exit 与本宿主的各读数。
+export function sampleJson(s: Ref<PerfSample>): Ref<Jv> {
+    const o = jObject();
+    jSet(o, "exit", jNumber(s.exit));
+    for (m in metricNames()) {
+        jSet(o, m, jFloat(metricOf(s, m)));
+    }
+    return o;
+}
+
+// 中位数（奇数个取中间那个，偶数个取中间两个的平均）。
+export function median(xs: List<float>): float {
+    const v: List<float> = listNew();
+    for (x in xs) {
+        let at = listLen(v);
+        listPush(v, x);
+        while (at > 0 && (listGet(v, at - 1) catch 0.0) > x) {
+            listSet(v, at, listGet(v, at - 1) catch 0.0);
+            at = at - 1;
+        }
+        listSet(v, at, x);
+    }
+    const n = listLen(v);
+    if (n == 0) {
+        return 0.0;
+    }
+    if (n % 2 == 1) {
+        return listGet(v, n / 2) catch 0.0;
+    }
+    return ((listGet(v, n / 2 - 1) catch 0.0) + (listGet(v, n / 2) catch 0.0)) / 2.0;
+}
+
+// 极差占中位数的百分比；中位数为 0 时记 0。
+export function spreadPct(xs: List<float>, med: float): float {
+    if (listLen(xs) == 0 || med == 0.0) {
+        return 0.0;
+    }
+    let lo = listGet(xs, 0) catch 0.0;
+    let hi = lo;
+    for (x in xs) {
+        if (x < lo) {
+            lo = x;
+        }
+        if (x > hi) {
+            hi = x;
+        }
+    }
+    return (hi - lo) / med * 100.0;
+}
+
+// 定点小数（四舍五入到 digits 位）；sign 为真时正数也带“+”。
+export function fixed(x: float, digits: int, sign: bool): string {
+    let scale = 1;
+    let k = 0;
+    while (k < digits) {
+        scale = scale * 10;
+        k = k + 1;
+    }
+    let neg = x < 0.0;
+    let ax = x;
+    if (neg) {
+        ax = 0.0 - x;
+    }
+    const v = (ax * (scale as float) + 0.5) as int;
+    if (v == 0) {
+        neg = false;
+    }
+    let text = toStr(v / scale);
+    if (digits > 0) {
+        let frac = toStr(v % scale);
+        while (len(frac) < digits) {
+            frac = "0" + frac;
+        }
+        text = text + "." + frac;
+    }
+    if (neg) {
+        return "-" + text;
+    }
+    if (sign) {
+        return "+" + text;
+    }
+    return text;
+}
+
+// 十进制小数实参（如 3、3.0、0.5、-1.25）；别的写法得 Error。
+export function parseDecimal(s: string): float | Error {
+    let i = 0;
+    let neg = false;
+    if (len(s) > 0 && (byteAt(s, 0) ?? 0) == 45) {
+        neg = true;
+        i = 1;
+    }
+    let v = 0.0;
+    let scale = 0.0;
+    let digits = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) ?? 0;
+        if (c == 46 && scale == 0.0) {
+            scale = 1.0;
+        } else if (c >= 48 && c <= 57) {
+            v = v * 10.0 + ((c - 48) as float);
+            if (scale > 0.0) {
+                scale = scale * 10.0;
+            }
+            digits = digits + 1;
+        } else {
+            return err("不是十进制小数：" + s);
+        }
+        i = i + 1;
+    }
+    if (digits == 0) {
+        return err("不是十进制小数：" + s);
+    }
+    if (scale > 0.0) {
+        v = v / scale;
+    }
+    if (neg) {
+        return 0.0 - v;
+    }
+    return v;
+}
+
+function two(v: int): string {
+    if (v < 10) {
+        return "0" + toStr(v);
+    }
+    return toStr(v);
+}
+
+// 当前 UTC 时间，ISO 8601 到秒（如 2026-11-09T08:12:33+00:00）。日期由 Unix 秒按格里历换算（Howard Hinnant 的 civil_from_days）。
+export function isoUtcNow(): string {
+    const t = unixSeconds();
+    const days = t / 86400;
+    const secs = t % 86400;
+    const z = days + 719468;
+    const era = z / 146097;
+    const doe = z - era * 146097;
+    const yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const mp = (5 * doy + 2) / 153;
+    const d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + 3;
+    if (mp >= 10) {
+        m = mp - 9;
+    }
+    let y = yoe + era * 400;
+    if (m <= 2) {
+        y = y + 1;
+    }
+    return toStr(y) + "-" + two(m) + "-" + two(d) + "T" + two(secs / 3600) + ":" + two(secs % 3600 / 60) + ":" + two(secs % 60) + "+00:00";
+}
+
+// 宿主名（基线记录的文件名，如 linux-x86_64、macos-arm64、windows-amd64）。
+export function hostName(): string {
+    let arch = hostArch();
+    if (arch == "aarch64" && hostTarget() != "linux") {
+        arch = "arm64";
+    } else if (arch == "x86_64" && hostTarget() == "windows") {
+        arch = "amd64";
+    }
+    return hostTarget() + "-" + arch;
+}
+
+// ---- 剖析脚本（compiler_regression、compiler_profile、native_self_profile）共用 ----
+
+// 编译器与运行时读的 TAIXU_* 变量置空、PATH 换成 emptyDir（一个空目录），此后起的子进程都带这份环境。内建没法删除环境变量，这几个
+// 置空与未设等价：库根非空才用，TAIXU_TEST_FAIL_PAGES 格式不对即不生效，TAIXU_PROBE_FORMAT 只认 elf，TAIXU_DEBUG_CHANNEL 由 procSpawn
+// 自行去掉，TAIXU_REAP_COOKIE 只在受限子进程里用。
+export function cleanEnv(emptyDir: string): void | Error {
+    for (name in strSplit("TAIXU_STDLIB TAIXU_GUI_ROOT TAIXU_TEST_FAIL_PAGES TAIXU_PROBE_FORMAT TAIXU_DEBUG_CHANNEL TAIXU_REAP_COOKIE", " ")) {
+        setEnv(name, "")?;
+    }
+    setEnv("PATH", emptyDir)?;
+    return nothing();
+}
+
+function nothing(): void {
+}
+
+// 逗号分隔的 CPU 号写成 JSON 数组。
+export function cpuList(cpus: string): Ref<Jv> {
+    const a = jArray();
+    for (c in strSplit(cpus, ",")) {
+        if (len(c) > 0) {
+            jPush(a, jNumber(digits(c)));
+        }
+    }
+    return a;
+}
+
+// cpu < 0：沿用调用者的设置；否则把本进程（及此后起的子进程）固定在 cpu 上并核对。得记录用的策略。
+export function cpuPolicy(cpu: int): Ref<Jv> | Error {
+    const o = jObject();
+    if (cpu < 0) {
+        jSet(o, "mode", jString("inherited"));
+        return o;
+    }
+    const before = ownCpus();
+    pinCpu(cpu)?;
+    const after = ownCpus();
+    if (after != toStr(cpu)) {
+        return err("CPU 亲和性未生效：" + after);
+    }
+    jSet(o, "mode", jString("fixed"));
+    jSet(o, "cpu", jNumber(cpu));
+    jSet(o, "before", cpuList(before));
+    jSet(o, "parent_actual", cpuList(after));
+    return o;
+}
+
+// dir 下（递归）各 .tx 文件的 sha256，键为相对 base 的路径（以 / 分隔）。
+export function txHashes(base: string, rel: string, out: Ref<Jv>): void {
+    const names = listDir(join(base, rel)) catch (e) {
+        return;
+    };
+    for (n in names) {
+        const r = rel + "/" + n;
+        const k = kindOf(join(base, r));
+        if (k == 2) {
+            txHashes(base, r, out);
+        } else if (k == 1 && len(n) > 3 && strSlice(n, len(n) - 3, len(n)) == ".tx") {
+            jSet(out, r, jString(shaOf(join(base, r))));
+        }
+    }
+}
+
+// stderr 里 --time 的阶段行（[time] <阶段> <毫秒> ms），名、值交替。
+export function timePhases(stderr: string): List<string> {
+    const out: List<string> = listNew();
+    for (line0 in strSplit(stderr, "\n")) {
+        let line = line0;
+        if (len(line) > 0 && (byteAt(line, len(line) - 1) ?? 0) == 13) {
+            line = strSlice(line, 0, len(line) - 1);
+        }
+        if (len(line) < 11 || strSlice(line, 0, 7) != "[time] " || strSlice(line, len(line) - 3, len(line)) != " ms") {
+            continue;
+        }
+        const parts = strSplit(strSlice(line, 7, len(line) - 3), " ");
+        if (listLen(parts) == 2) {
+            const v = listGet(parts, 1) catch "";
+            if (len(v) > 0 && digits(v) >= 0 && toStr(digits(v)) == v) {
+                listPush(out, listGet(parts, 0) catch "");
+                listPush(out, v);
+            }
+        }
+    }
+    return out;
+}

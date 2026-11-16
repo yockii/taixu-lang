@@ -1,0 +1,1242 @@
+// 标准库原生验证：格式、test/run、冻结产物输出、泄漏检查与卫生门（逐项输出 PASS／FAIL，末行 SUMMARY，可另写报告；有失败项退出 1）。
+// 用法（在标准库根运行）：taixu run --toolchain verify.tx --compiler <原生 taixu> [--core <核心仓>] [--root <标准库>] [--report <文件>]
+// 不导入标准库自己的模块（被测物）与核心仓的件；行尾检查调核心仓的 scripts/repo_hygiene.tx。
+
+const SEC: int = 1000000000;
+const LIMIT_NS: int = 600 * SEC;
+const KEEP: int = 268435456;
+
+struct Row {
+    name: string,
+    ok: bool,
+    exit: string,
+    detail: string,
+    full: bool,
+}
+
+struct Ctx {
+    compiler: string,
+    root: string,
+    sandbox: string,
+    rows: List<Row>,
+}
+
+struct Ran {
+    code: int,
+    out: Bytes,
+    err: Bytes,
+    timedOut: bool,
+}
+
+// ---- 文本与路径 ----
+
+function piece(s: string, from: int, n: int): string {
+    return strSlice(s, from, from + n);
+}
+
+function startsWith(s: string, prefix: string): bool {
+    return len(s) >= len(prefix) && piece(s, 0, len(prefix)) == prefix;
+}
+
+function endsWith(s: string, suffix: string): bool {
+    return len(s) >= len(suffix) && piece(s, len(s) - len(suffix), len(suffix)) == suffix;
+}
+
+function onWindows(): bool {
+    return hostTarget() == "windows";
+}
+
+function join(a: string, b: string): string {
+    if (len(a) == 0) {
+        return b;
+    }
+    if (endsWith(a, "/") || endsWith(a, "\\")) {
+        return a + b;
+    }
+    return a + "/" + b;
+}
+
+// 交给本机 API 的形态（Windows 上 / 换成 \）。
+function nat(p: string): string {
+    if (!onWindows()) {
+        return p;
+    }
+    const b = bytesFromStr(p);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        if ((bytesGet(b, i) ?? 0) == 47) {
+            bytesSet(b, i, 92);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(b) catch p;
+}
+
+function slashes(p: string): string {
+    const b = bytesFromStr(p);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        if ((bytesGet(b, i) ?? 0) == 92) {
+            bytesSet(b, i, 47);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(b) catch p;
+}
+
+function lastSlash(p: string): int {
+    let i = len(p) - 1;
+    while (i >= 0) {
+        if ((byteAt(p, i) ?? 0) == 47) {
+            return i;
+        }
+        i = i - 1;
+    }
+    return -1;
+}
+
+function dirOf(p: string): string {
+    const i = lastSlash(p);
+    if (i < 0) {
+        return ".";
+    }
+    if (i == 0) {
+        return "/";
+    }
+    return piece(p, 0, i);
+}
+
+function baseOf(p: string): string {
+    const i = lastSlash(p);
+    return piece(p, i + 1, len(p) - i - 1);
+}
+
+function kindOf(p: string): int {
+    return localEntryKind(nat(dirOf(p)), baseOf(p));
+}
+
+function readAll(p: string): Bytes | Error {
+    return readLocalFileBytes(nat(dirOf(p)), baseOf(p), 1073741824);
+}
+
+function namesIn(dir: string): List<string> {
+    const none: List<string> = listNew();
+    return localListDir(nat(dir), "") catch none;
+}
+
+function copyTree(from: string, to: string): void | Error {
+    makeDir(nat(to))?;
+    for (n in namesIn(from)) {
+        const k = localEntryKind(nat(from), n);
+        if (k == 2) {
+            copyTree(join(from, n), join(to, n))?;
+        } else if (k == 1) {
+            writeFileBytes(nat(join(to, n)), readAll(join(from, n))?)?;
+        }
+    }
+}
+
+// 删掉整棵目录（Windows 经 cmd 的 rd /s /q，类 Unix 经 rm -rf；同 Python 的 TemporaryDirectory 收尾）。
+function deleteTree(dir: string): void {
+    let exe = "/bin/rm";
+    const args: List<string> = listNew();
+    if (onWindows()) {
+        exe = slashes(getEnv("ComSpec") ?? "C:/Windows/System32/cmd.exe");
+        listPush(args, "/d");
+        listPush(args, "/c");
+        listPush(args, "rd");
+        listPush(args, "/s");
+        listPush(args, "/q");
+        listPush(args, nat(dir));
+    } else {
+        listPush(args, "-rf");
+        listPush(args, dir);
+    }
+    const r = capture(exe, args, dirOf(dir), 300 * SEC) catch (e) {
+        eprint("删不掉 " + dir + "：" + e.message);
+        return;
+    };
+}
+
+// 绝对路径（相对的接在当前目录后；/ 分隔）。
+function absPath(p: string): string {
+    const s = slashes(p);
+    if (startsWith(s, "/") || (len(s) >= 2 && (byteAt(s, 1) ?? 0) == 58)) {
+        return s;
+    }
+    return join(slashes(currentDir() catch "."), s);
+}
+
+// PATH 上的可执行文件（Windows 另试 .exe）；没有得空串。
+function findInPath(name: string): string {
+    const path = getEnv("PATH") ?? "";
+    let sep = 58;
+    if (onWindows()) {
+        sep = 59;
+    }
+    let start = 0;
+    let i = 0;
+    while (i <= len(path)) {
+        if (i == len(path) || (byteAt(path, i) ?? 0) == sep) {
+            const dir = piece(path, start, i - start);
+            if (len(dir) > 0) {
+                const p = join(slashes(dir), name);
+                if (kindOf(p) == 1) {
+                    return p;
+                }
+                if (onWindows() && kindOf(p + ".exe") == 1) {
+                    return p + ".exe";
+                }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// 不合法的 UTF-8 换成 U+FFFD（同 Python 的 decode('utf-8', 'replace')）。
+function lossy(b: Bytes): string {
+    const s = bytesToStr(b) catch (e) {
+        const out = bytesNew(0);
+        let i = 0;
+        while (i < bytesLen(b)) {
+            const n = seqLen(b, i);
+            if (n == 0) {
+                bytesPush(out, 239);
+                bytesPush(out, 191);
+                bytesPush(out, 189);
+                i = i + 1;
+            } else {
+                bytesAppend(out, bytesSlice(b, i, n));
+                i = i + n;
+            }
+        }
+        return bytesToStr(out) catch "";
+    };
+    return s;
+}
+
+// b[i] 起一个合法 UTF-8 字符的字节数；不合法得 0。
+function seqLen(b: Bytes, i: int): int {
+    const c = bytesGet(b, i) ?? 0;
+    if (c < 128) {
+        return 1;
+    }
+    let n = 0;
+    let lo = 128;
+    let hi = 191;
+    if (c >= 194 && c <= 223) {
+        n = 2;
+    } else if (c >= 224 && c <= 239) {
+        n = 3;
+        if (c == 224) {
+            lo = 160;
+        } else if (c == 237) {
+            hi = 159;
+        }
+    } else if (c >= 240 && c <= 244) {
+        n = 4;
+        if (c == 240) {
+            lo = 144;
+        } else if (c == 244) {
+            hi = 143;
+        }
+    } else {
+        return 0;
+    }
+    if (i + n > bytesLen(b)) {
+        return 0;
+    }
+    let k = 1;
+    while (k < n) {
+        const d = bytesGet(b, i + k) ?? 0;
+        if (k == 1 && (d < lo || d > hi)) {
+            return 0;
+        }
+        if (k > 1 && (d < 128 || d > 191)) {
+            return 0;
+        }
+        k = k + 1;
+    }
+    return n;
+}
+
+// 末尾 n 个字符（码点）。
+function tailChars(s: string, n: int): string {
+    let count = 0;
+    let at = len(s);
+    while (at > 0 && count < n) {
+        at = at - 1;
+        const c = byteAt(s, at) ?? 0;
+        if (c < 128 || c >= 192) {
+            count = count + 1;
+        }
+    }
+    return piece(s, at, len(s) - at);
+}
+
+function lf(b: Bytes): Bytes {
+    const out = bytesNew(0);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) ?? 0;
+        if (!(c == 13 && (bytesGet(b, i + 1) ?? 0) == 10)) {
+            bytesPush(out, c);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+function strLess(a: string, b: string): bool {
+    return strCompare(a, b) < 0;
+}
+
+function sortedNames(xs: List<string>): List<string> {
+    const out: List<string> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+        let k = listLen(out) - 1;
+        while (k > 0 && strLess(nameKey(x), nameKey(listGet(out, k - 1) ?? ""))) {
+            listSet(out, k, listGet(out, k - 1) ?? "");
+            k = k - 1;
+        }
+        listSet(out, k, x);
+    }
+    return out;
+}
+
+// 同 Python 按 Path 排序：Windows 上不分大小写。
+function nameKey(s: string): string {
+    if (!onWindows()) {
+        return s;
+    }
+    const b = bytesFromStr(s);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) ?? 0;
+        if (c >= 65 && c <= 90) {
+            bytesSet(b, i, c + 32);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(b) catch s;
+}
+
+// 仿 Python repr 的字符串（单引号；含单引号不含双引号时用双引号；控制字符转义，其余字节原样）。
+function repr(s: string): string {
+    let q = 39;
+    if (strFind(s, "'") >= 0 && strFind(s, "\"") < 0) {
+        q = 34;
+    }
+    const out = bytesNew(0);
+    bytesPush(out, q);
+    const b = bytesFromStr(s);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const v = bytesGet(b, i) ?? 0;
+        if (v == 92) {
+            bytesAppend(out, bytesFromStr("\\\\"));
+        } else if (v == 10) {
+            bytesAppend(out, bytesFromStr("\\n"));
+        } else if (v == 13) {
+            bytesAppend(out, bytesFromStr("\\r"));
+        } else if (v == 9) {
+            bytesAppend(out, bytesFromStr("\\t"));
+        } else if (v == q) {
+            bytesPush(out, 92);
+            bytesPush(out, q);
+        } else if (v < 32 || v == 127) {
+            bytesAppend(out, bytesFromStr("\\x" + hex2(v)));
+        } else {
+            bytesPush(out, v);
+        }
+        i = i + 1;
+    }
+    bytesPush(out, q);
+    return bytesToStr(out) catch s;
+}
+
+function hex2(v: int): string {
+    const h = "0123456789abcdef";
+    return piece(h, (v >> 4) & 15, 1) + piece(h, v & 15, 1);
+}
+
+function reprList(xs: List<string>): string {
+    let out = "[";
+    let first = true;
+    for (x in xs) {
+        if (!first) {
+            out = out + ", ";
+        }
+        out = out + repr(x);
+        first = false;
+    }
+    return out + "]";
+}
+
+// ---- 子进程 ----
+
+function strs(a: []string): List<string> {
+    const out: List<string> = listNew();
+    for (x in a) {
+        listPush(out, x);
+    }
+    return out;
+}
+
+function capture(exe: string, args: List<string>, cwd: string, limitNs: int): Ran | Error {
+    const h = procSpawnLimited(nat(exe), args, nat(cwd), 0, 8589934592, limitNs / SEC + 30) catch (e) {
+        return err("起不了 " + exe + "：" + e.message);
+    };
+    const out = bytesNew(0);
+    const errs = bytesNew(0);
+    const buf = bytesNew(65536);
+    const deadline = monoNs() + limitNs;
+    let code = 0;
+    let timedOut = false;
+    let outOpen = true;
+    let errOpen = true;
+    let ended = false;
+    let drainDeadline = 0;
+    while (!ended || outOpen || errOpen) {
+        if (!ended) {
+            const w = procWait(h, 0);
+            if (w != None) {
+                code = w ?? -1;
+                procKill(h); // 主进程结束后收回仍持有管道的组内后代。
+                ended = true;
+            }
+        }
+        if (!timedOut && monoNs() >= deadline) {
+            timedOut = true;
+            procKill(h);
+            drainDeadline = monoNs() + 2000000000;
+        }
+        if (timedOut && monoNs() >= drainDeadline) {
+            procCloseStream(h, 1); procCloseStream(h, 2); break;
+        }
+        let mask = 0;
+        if (outOpen) {
+            mask = mask | 2;
+        }
+        if (errOpen) {
+            mask = mask | 4;
+        }
+        if (mask == 0) {
+            const waited = procWait(h, 100);
+            continue;
+        }
+        const ready = ioWait(h, mask, 100);
+        if ((ready & 2) != 0) {
+            const n = procRead(h, 1, buf);
+            if (n < 0) {
+                outOpen = false;
+            } else if (n > 0 && bytesLen(out) < KEEP) {
+                bytesAppend(out, bytesSlice(buf, 0, n));
+            }
+        }
+        if ((ready & 4) != 0) {
+            const n = procRead(h, 2, buf);
+            if (n < 0) {
+                errOpen = false;
+            } else if (n > 0 && bytesLen(errs) < KEEP) {
+                bytesAppend(errs, bytesSlice(buf, 0, n));
+            }
+        }
+    }
+    procClose(h);
+    return Ran { code: code, out: out, err: errs, timedOut: timedOut };
+}
+
+// ---- 逐项 ----
+
+function record(c: Ref<Ctx>, name: string, ok: bool, exit: string, detail: string): bool {
+    let shownDetail = "";
+    if (!ok) {
+        shownDetail = tailChars(detail, 1000);
+    }
+    listPush(c.rows, Row { name: name, ok: ok, exit: exit, detail: shownDetail, full: true });
+    if (ok) {
+        print("PASS " + name + " " + shownDetail);
+    } else {
+        print("FAIL " + name + " " + shownDetail);
+    }
+    return ok;
+}
+
+// argv[0] 为可执行文件；want 不为 None 时 stdout（CRLF 当 LF）须恰为它且 stderr 为空；tests 为真时末行须恰为“N passed, 0 failed”且
+// stderr 里没有泄漏报告（子串 '0 failed' 会把 '10 failed' 当通过）。
+function check(c: Ref<Ctx>, name: string, argv: List<string>, want: Bytes?, tests: bool): bool {
+    const args: List<string> = listNew();
+    let k = 1;
+    while (k < listLen(argv)) {
+        listPush(args, nat(listGet(argv, k) ?? ""));
+        k = k + 1;
+    }
+    const p = capture(listGet(argv, 0) ?? "", args, c.sandbox, LIMIT_NS) catch (e) {
+        return record(c, name, false, "null", e.message);
+    };
+    const both = bytesNew(0);
+    bytesAppend(both, p.out);
+    bytesAppend(both, p.err);
+    if (p.timedOut) {
+        return record(c, name, false, "null", "超时 600 s：" + lossy(both));
+    }
+    let ok = p.code == 0;
+    if (want != None) {
+        ok = ok && bytesLen(p.err) == 0 && bytesEqual(lf(p.out), want ?? bytesNew(0));
+    }
+    if (tests) {
+        ok = ok && summaryOk(lf(p.out)) && !contains(p.err, "[runtime:leak]");
+    }
+    return record(c, name, ok, toStr(p.code), lossy(both));
+}
+
+function contains(b: Bytes, needle: string): bool {
+    const n = bytesFromStr(needle);
+    let i = 0;
+    while (i + bytesLen(n) <= bytesLen(b)) {
+        if (bytesEqual(bytesSlice(b, i, bytesLen(n)), n)) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 去掉末尾的换行后最后一行恰为“<数字> passed, <数字> failed”，且失败数为 0。
+function summaryOk(out: Bytes): bool {
+    let end = bytesLen(out);
+    while (end > 0 && (bytesGet(out, end - 1) ?? 0) == 10) {
+        end = end - 1;
+    }
+    let start = end;
+    while (start > 0 && (bytesGet(out, start - 1) ?? 0) != 10) {
+        start = start - 1;
+    }
+    const line = bytesToStr(bytesSlice(out, start, end - start)) catch "";
+    const a = digitsAt(line, 0);
+    if (a == 0 || !startsWith(piece(line, a, len(line) - a), " passed, ")) {
+        return false;
+    }
+    const from = a + 9;
+    const b = digitsAt(line, from);
+    return b > from && b + 7 == len(line) && piece(line, b, 7) == " failed" && piece(line, from, b - from) == "0";
+}
+
+// from 起连续数字之后的位置。
+function digitsAt(s: string, from: int): int {
+    let i = from;
+    while (i < len(s) && (byteAt(s, i) ?? 0) >= 48 && (byteAt(s, i) ?? 0) <= 57) {
+        i = i + 1;
+    }
+    return i;
+}
+
+// ---- 最小 JSON 读取（只用于 tests/native-products.json 与编译器的 capabilities）----
+
+struct J {
+    kind: int,
+    text: string,
+    items: List<Ref<J>>,
+    keys: List<string>,
+}
+
+struct P {
+    s: Bytes,
+    at: int,
+    bad: bool,
+}
+
+function jNew(kind: int, text: string): Ref<J> {
+    return new J { kind: kind, text: text, items: listNew(), keys: listNew() };
+}
+
+function ws(p: Ref<P>): void {
+    while (p.at < bytesLen(p.s)) {
+        const c = bytesGet(p.s, p.at) ?? 0;
+        if (c != 32 && c != 9 && c != 10 && c != 13) {
+            return;
+        }
+        p.at = p.at + 1;
+    }
+}
+
+// kind：1 字符串、2 数、3 true、4 false、5 null、6 数组、7 对象。
+function value(p: Ref<P>): Ref<J> {
+    ws(p);
+    const c = bytesGet(p.s, p.at) ?? 0;
+    if (c == 34) {
+        return jNew(1, str(p));
+    }
+    if (c == 91) {
+        p.at = p.at + 1;
+        const a = jNew(6, "");
+        ws(p);
+        if ((bytesGet(p.s, p.at) ?? 0) == 93) {
+            p.at = p.at + 1;
+            return a;
+        }
+        while (!p.bad) {
+            listPush(a.items, value(p));
+            ws(p);
+            const d = bytesGet(p.s, p.at) ?? 0;
+            p.at = p.at + 1;
+            if (d == 93) {
+                return a;
+            }
+            if (d != 44) {
+                p.bad = true;
+            }
+        }
+        return a;
+    }
+    if (c == 123) {
+        p.at = p.at + 1;
+        const o = jNew(7, "");
+        ws(p);
+        if ((bytesGet(p.s, p.at) ?? 0) == 125) {
+            p.at = p.at + 1;
+            return o;
+        }
+        while (!p.bad) {
+            ws(p);
+            const k = str(p);
+            ws(p);
+            if ((bytesGet(p.s, p.at) ?? 0) != 58) {
+                p.bad = true;
+                return o;
+            }
+            p.at = p.at + 1;
+            listPush(o.keys, k);
+            listPush(o.items, value(p));
+            ws(p);
+            const d = bytesGet(p.s, p.at) ?? 0;
+            p.at = p.at + 1;
+            if (d == 125) {
+                return o;
+            }
+            if (d != 44) {
+                p.bad = true;
+            }
+        }
+        return o;
+    }
+    for (lit in ["true", "false", "null"]) {
+        const b = bytesFromStr(lit);
+        if (p.at + bytesLen(b) <= bytesLen(p.s) && bytesEqual(bytesSlice(p.s, p.at, bytesLen(b)), b)) {
+            p.at = p.at + bytesLen(b);
+            if (lit == "true") {
+                return jNew(3, lit);
+            }
+            if (lit == "false") {
+                return jNew(4, lit);
+            }
+            return jNew(5, lit);
+        }
+    }
+    const start = p.at;
+    while (p.at < bytesLen(p.s)) {
+        const d = bytesGet(p.s, p.at) ?? 0;
+        if (!((d >= 48 && d <= 57) || d == 45 || d == 43 || d == 46 || d == 101 || d == 69)) {
+            break;
+        }
+        p.at = p.at + 1;
+    }
+    if (p.at == start) {
+        p.bad = true;
+    }
+    return jNew(2, bytesToStr(bytesSlice(p.s, start, p.at - start)) catch "");
+}
+
+function str(p: Ref<P>): string {
+    if ((bytesGet(p.s, p.at) ?? 0) != 34) {
+        p.bad = true;
+        return "";
+    }
+    p.at = p.at + 1;
+    const out = bytesNew(0);
+    while (p.at < bytesLen(p.s)) {
+        const c = bytesGet(p.s, p.at) ?? 0;
+        p.at = p.at + 1;
+        if (c == 34) {
+            return bytesToStr(out) catch "";
+        }
+        if (c != 92) {
+            bytesPush(out, c);
+            continue;
+        }
+        const e = bytesGet(p.s, p.at) ?? 0;
+        p.at = p.at + 1;
+        if (e == 110) {
+            bytesPush(out, 10);
+        } else if (e == 116) {
+            bytesPush(out, 9);
+        } else if (e == 114) {
+            bytesPush(out, 13);
+        } else if (e == 98) {
+            bytesPush(out, 8);
+        } else if (e == 102) {
+            bytesPush(out, 12);
+        } else if (e == 117) {
+            let v = hex4(p);
+            if (v >= 55296 && v <= 56319 && (bytesGet(p.s, p.at) ?? 0) == 92 && (bytesGet(p.s, p.at + 1) ?? 0) == 117) {
+                p.at = p.at + 2;
+                const lo = hex4(p);
+                v = 65536 + ((v - 55296) << 10) + (lo - 56320);
+            }
+            bytesAppend(out, utf8(v));
+        } else {
+            bytesPush(out, e);
+        }
+    }
+    p.bad = true;
+    return "";
+}
+
+function hex4(p: Ref<P>): int {
+    let v = 0;
+    let k = 0;
+    while (k < 4) {
+        const c = bytesGet(p.s, p.at) ?? 0;
+        let d = 0;
+        if (c >= 48 && c <= 57) {
+            d = c - 48;
+        } else if (c >= 97 && c <= 102) {
+            d = c - 87;
+        } else if (c >= 65 && c <= 70) {
+            d = c - 55;
+        } else {
+            p.bad = true;
+        }
+        v = v * 16 + d;
+        p.at = p.at + 1;
+        k = k + 1;
+    }
+    return v;
+}
+
+function utf8(v: int): Bytes {
+    const b = bytesNew(0);
+    if (v < 128) {
+        bytesPush(b, v);
+    } else if (v < 2048) {
+        bytesPush(b, 192 | (v >> 6));
+        bytesPush(b, 128 | (v & 63));
+    } else if (v < 65536) {
+        bytesPush(b, 224 | (v >> 12));
+        bytesPush(b, 128 | ((v >> 6) & 63));
+        bytesPush(b, 128 | (v & 63));
+    } else {
+        bytesPush(b, 240 | (v >> 18));
+        bytesPush(b, 128 | ((v >> 12) & 63));
+        bytesPush(b, 128 | ((v >> 6) & 63));
+        bytesPush(b, 128 | (v & 63));
+    }
+    return b;
+}
+
+function parse(b: Bytes): Ref<J>? {
+    const p = new P { s: b, at: 0, bad: false };
+    const v = value(p);
+    ws(p);
+    if (p.bad || p.at != bytesLen(b)) {
+        return None;
+    }
+    return v;
+}
+
+function field(o: Ref<J>?, key: string): Ref<J>? {
+    if (o == None) {
+        return None;
+    }
+    const x = o ?? jNew(5, "");
+    if (x.kind != 7) {
+        return None;
+    }
+    let found: Ref<J>? = None;
+    let i = 0;
+    while (i < listLen(x.keys)) {
+        if ((listGet(x.keys, i) ?? "") == key) {
+            found = listGet(x.items, i);
+        }
+        i = i + 1;
+    }
+    return found;
+}
+
+function textOf(v: Ref<J>?): string {
+    if (v == None) {
+        return "";
+    }
+    const x = v ?? jNew(5, "");
+    if (x.kind != 1) {
+        return "";
+    }
+    return x.text;
+}
+
+// ---- 报告 ----
+
+function jsonStr(s: string): string {
+    const out = bytesNew(0);
+    bytesPush(out, 34);
+    const b = bytesFromStr(s);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const v = bytesGet(b, i) ?? 0;
+        if (v == 34) {
+            bytesAppend(out, bytesFromStr("\\\""));
+        } else if (v == 92) {
+            bytesAppend(out, bytesFromStr("\\\\"));
+        } else if (v == 10) {
+            bytesAppend(out, bytesFromStr("\\n"));
+        } else if (v == 13) {
+            bytesAppend(out, bytesFromStr("\\r"));
+        } else if (v == 9) {
+            bytesAppend(out, bytesFromStr("\\t"));
+        } else if (v == 8) {
+            bytesAppend(out, bytesFromStr("\\b"));
+        } else if (v == 12) {
+            bytesAppend(out, bytesFromStr("\\f"));
+        } else if (v < 32) {
+            bytesAppend(out, bytesFromStr("\\u00" + hex2(v)));
+        } else {
+            bytesPush(out, v);
+        }
+        i = i + 1;
+    }
+    bytesPush(out, 34);
+    return bytesToStr(out) catch s;
+}
+
+function boolText(b: bool): string {
+    if (b) {
+        return "true";
+    }
+    return "false";
+}
+
+// 同 Python 的 json.dumps(…, ensure_ascii=False, indent=2)。
+function reportText(c: Ref<Ctx>, digest: string): string {
+    let out = "{\n  \"compiler\": " + jsonStr(c.compiler) + ",\n  \"compiler_sha256\": " + jsonStr(digest) + ",\n  \"rows\": [";
+    let first = true;
+    for (r in c.rows) {
+        if (!first) {
+            out = out + ",";
+        }
+        first = false;
+        out = out + "\n    {\n      \"name\": " + jsonStr(r.name) + ",\n      \"ok\": " + boolText(r.ok);
+        if (r.full) {
+            out = out + ",\n      \"exit\": " + r.exit + ",\n      \"detail\": " + jsonStr(r.detail);
+        }
+        out = out + "\n    }";
+    }
+    if (!first) {
+        out = out + "\n  ";
+    }
+    return out + "]\n}\n";
+}
+
+// SHA-256（FIPS 180-4），只给报告记编译器的摘要。
+const K256: []int = [1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401,
+    607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983,
+    1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895,
+    666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800,
+    3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218,
+    1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298];
+
+function rotr(x: int, n: int): int {
+    return ((x >> n) | (x << (32 - n))) & 4294967295;
+}
+
+function sha256Hex(d: Bytes): string {
+    const h: List<int> = listNew();
+    for (v in [1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225]) {
+        listPush(h, v);
+    }
+    const m = bytesSlice(d, 0, bytesLen(d));
+    const bits = bytesLen(d) * 8;
+    bytesPush(m, 128);
+    while (bytesLen(m) % 64 != 56) {
+        bytesPush(m, 0);
+    }
+    let k = 7;
+    while (k >= 0) {
+        bytesPush(m, (bits >> (8 * k)) & 255);
+        k = k - 1;
+    }
+    const w: List<int> = listNew();
+    let i = 0;
+    while (i < 64) {
+        listPush(w, 0);
+        i = i + 1;
+    }
+    let off = 0;
+    while (off < bytesLen(m)) {
+        i = 0;
+        while (i < 16) {
+            listSet(w, i, ((bytesGet(m, off + 4 * i) ?? 0) << 24) | ((bytesGet(m, off + 4 * i + 1) ?? 0) << 16)
+                | ((bytesGet(m, off + 4 * i + 2) ?? 0) << 8) | (bytesGet(m, off + 4 * i + 3) ?? 0));
+            i = i + 1;
+        }
+        while (i < 64) {
+            const a = listGet(w, i - 15) ?? 0;
+            const b = listGet(w, i - 2) ?? 0;
+            const s0 = rotr(a, 7) ^ rotr(a, 18) ^ (a >> 3);
+            const s1 = rotr(b, 17) ^ rotr(b, 19) ^ (b >> 10);
+            listSet(w, i, ((listGet(w, i - 16) ?? 0) + s0 + (listGet(w, i - 7) ?? 0) + s1) & 4294967295);
+            i = i + 1;
+        }
+        let a = listGet(h, 0) ?? 0;
+        let b = listGet(h, 1) ?? 0;
+        let c = listGet(h, 2) ?? 0;
+        let e2 = listGet(h, 3) ?? 0;
+        let e = listGet(h, 4) ?? 0;
+        let f = listGet(h, 5) ?? 0;
+        let g = listGet(h, 6) ?? 0;
+        let hh = listGet(h, 7) ?? 0;
+        i = 0;
+        while (i < 64) {
+            const t1 = (hh + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ ((e ^ 4294967295) & g)) + K256[i] + (listGet(w, i) ?? 0))
+            & 4294967295;
+            const t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) & 4294967295;
+            hh = g;
+            g = f;
+            f = e;
+            e = (e2 + t1) & 4294967295;
+            e2 = c;
+            c = b;
+            b = a;
+            a = (t1 + t2) & 4294967295;
+            i = i + 1;
+        }
+        listSet(h, 0, ((listGet(h, 0) ?? 0) + a) & 4294967295);
+        listSet(h, 1, ((listGet(h, 1) ?? 0) + b) & 4294967295);
+        listSet(h, 2, ((listGet(h, 2) ?? 0) + c) & 4294967295);
+        listSet(h, 3, ((listGet(h, 3) ?? 0) + e2) & 4294967295);
+        listSet(h, 4, ((listGet(h, 4) ?? 0) + e) & 4294967295);
+        listSet(h, 5, ((listGet(h, 5) ?? 0) + f) & 4294967295);
+        listSet(h, 6, ((listGet(h, 6) ?? 0) + g) & 4294967295);
+        listSet(h, 7, ((listGet(h, 7) ?? 0) + hh) & 4294967295);
+        off = off + 64;
+    }
+    let out = "";
+    for (v in h) {
+        let s = 28;
+        while (s >= 0) {
+            out = out + piece("0123456789abcdef", (v >> s) & 15, 1);
+            s = s - 4;
+        }
+    }
+    return out;
+}
+
+// ---- 入口 ----
+
+// --compiler，缺省取 TAIXU_NATIVE 或 PATH 上的 taixu；须是原生太虚编译器（capabilities 里 compiler 为 native-tx）。
+function nativeCompiler(value: string): string | Error {
+    let candidate = value;
+    if (len(candidate) == 0) {
+        candidate = getEnv("TAIXU_NATIVE") ?? "";
+    }
+    if (len(candidate) == 0) {
+        candidate = findInPath("taixu");
+    }
+    if (len(candidate) == 0) {
+        return err("请给出 --compiler <原生 taixu>");
+    }
+    const compiler = absPath(candidate);
+    const p = capture(compiler, strs(["capabilities", "--format=json"]), ".", 30 * SEC)?;
+    if (p.code != 0 || p.timedOut) {
+        return err("capabilities 失败：" + compiler);
+    }
+    if (textOf(field(field(parse(p.out), "capabilities"), "compiler")) != "native-tx") {
+        return err("所选编译器不是原生太虚：" + compiler);
+    }
+    return compiler;
+}
+
+function run(argv: []string): int | Error {
+    let compilerArg = "";
+    let core = "";
+    let root = "";
+    let report = "";
+    let i = 0;
+    while (i + 1 < len(argv)) {
+        if (argv[i] == "--compiler") {
+            compilerArg = argv[i + 1];
+        } else if (argv[i] == "--core") {
+            core = argv[i + 1];
+        } else if (argv[i] == "--root") {
+            root = argv[i + 1];
+        } else if (argv[i] == "--report") {
+            report = argv[i + 1];
+        } else {
+            return err("未知参数：" + argv[i]);
+        }
+        i = i + 2;
+    }
+    if (i != len(argv)) {
+        return err("用法：taixu run --toolchain verify.tx [--compiler <原生 taixu>] [--core <核心仓>] [--root <标准库>] [--report <文件>]");
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = absPath(root);
+    // 公开仓 taixu-lang 里标准库在 stdlib/、核心即上级目录；开发布局里核心仓是同级的 taixu-project。
+    if (len(core) == 0) {
+        core = dirOf(root);
+        if (kindOf(join(core, "bootstrap/taixu.tx")) != 1) {
+            core = join(dirOf(root), "taixu-project");
+        }
+    }
+    core = absPath(core);
+    const compiler = nativeCompiler(compilerArg)?;
+    setEnv("TAIXU_STDLIB", nat(join(root, "src")))?;
+    const c = new Ctx { compiler: compiler, root: root, sandbox: "", rows: listNew() };
+    const tempRoot = join(root, ".tmp");
+    if (kindOf(tempRoot) != 2) {
+        makeDir(nat(tempRoot))?;
+    }
+    const work = join(tempRoot, "native-verify-" + toStr(monoNs()));
+    makeDir(nat(work))?;
+    c.sandbox = join(work, "run");
+    makeDir(nat(c.sandbox))?;
+    copyTree(join(root, "tests"), join(c.sandbox, "tests"))?;
+    body(c, work);
+    deleteTree(work);
+    // 行尾：核心仓的卫生门对标准库根取文件清单、查 CR（输出原样转出）。
+    const h = capture(compiler, strs(["run", "--toolchain", nat(join(core, "scripts/repo_hygiene.tx")), "--root", nat(root), "--only", "eol"]), root,
+        LIMIT_NS)?;
+    const shown = lossy(lf(h.out));
+    print(piece(shown, 0, len(shown) - trailingNewlines(shown)));
+    const ok = h.code == 0 && !h.timedOut && endsWith(piece(shown, 0, len(shown) - trailingNewlines(shown)), " with CR")
+    && strFind(shown, "eol: ") >= 0;
+    listPush(c.rows, Row { name: "LF", ok: ok, exit: "", detail: "", full: false });
+    if (ok) {
+        print("PASS LF");
+    } else {
+        print("FAIL LF");
+    }
+    linecount(root);
+    let failed = 0;
+    for (r in c.rows) {
+        if (!r.ok) {
+            failed = failed + 1;
+        }
+    }
+    let status = "PASS";
+    if (failed > 0) {
+        status = "FAIL";
+    }
+    print("SUMMARY " + status + " checks=" + toStr(listLen(c.rows)) + " failures=" + toStr(failed));
+    if (len(report) > 0) {
+        const dest = slashes(report);
+        if (kindOf(dirOf(dest)) != 2) {
+            makeDir(nat(dirOf(dest)))?;
+        }
+        writeFile(nat(dest), reportText(c, sha256Hex(readAll(compiler)?)))?;
+    }
+    if (failed > 0) {
+        return 1;
+    }
+    return 0;
+}
+
+function trailingNewlines(s: string): int {
+    let n = 0;
+    while (n < len(s) && (byteAt(s, len(s) - 1 - n) ?? 0) == 10) {
+        n = n + 1;
+    }
+    return n;
+}
+
+function body(c: Ref<Ctx>, work: string): void {
+    const compiler = c.compiler;
+    const root = c.root;
+    const tests = join(root, "tests");
+    check(c, "fmt", strs([compiler, "fmt", "--check", join(root, "src"), tests]), None, false);
+    const names: List<string> = listNew();
+    for (n in namesIn(tests)) {
+        if (endsWith(n, ".tx") && kindOf(join(tests, n)) == 1) {
+            listPush(names, n);
+        }
+    }
+    for (name in sortedNames(names)) {
+        if (startsWith(name, "aot-")) {
+            continue;
+        }
+        // 平台外部函数／系统调用用例只在对应原生宿主执行。
+        if ((endsWith(name, "-linux.tx") && hostTarget() != "linux") || (endsWith(name, "-windows.tx") && hostTarget() != "windows") || (endsWith(name, "-macos.tx") && hostTarget() != "macos")) {
+            print("SKIP " + name + " （平台用例与当前宿主不同）");
+            continue;
+        }
+        const source = join(tests, name);
+        // -toolchain.tx 结尾的用例用到工具链内建（runProcess 等），按工具链构建（test 与 run 都是）。
+        const tc: List<string> = listNew();
+        if (endsWith(name, "-toolchain.tx")) {
+            listPush(tc, "--toolchain");
+        }
+        if (!endsWith(name, "-async.tx")) {
+            check(c, "test " + name, plusAll(strs([compiler, "test"]), tc, strs([source])), None, true);
+            check(c, "test " + name + " leak", plusAll(strs([compiler, "test"]), tc, strs(["--leak-check", source])), None, true);
+        }
+        const outName = piece(name, 0, len(name) - 3) + ".out";
+        const out = join(tests, outName);
+        if (kindOf(out) == 1) {
+            const expected = lf(readAll(out) catch bytesNew(0));
+            check(c, "run " + name, plusAll(strs([compiler, "run"]), tc, strs([source])), expected, false);
+            check(c, "run " + name + " leak", plusAll(strs([compiler, "run"]), tc, strs(["--leak-check", source])), expected, false);
+        } else if (endsWith(name, "-async.tx") || endsWith(name, "-verify.tx")) {
+            record(c, "run " + name, false, "null", "缺少伴文件 " + outName);
+        }
+    }
+    const doc = parse(readAll(join(tests, "native-products.json")) catch bytesNew(0));
+    const cases: List<Ref<J>> = listNew();
+    const casesV = field(doc, "cases");
+    if (casesV != None) {
+        for (x in (casesV ?? jNew(6, "")).items) {
+            listPush(cases, x);
+        }
+    }
+    const listed: List<string> = listNew();
+    for (x in cases) {
+        listPush(listed, textOf(field(x, "file")));
+    }
+    const present: List<string> = listNew();
+    for (n in names) {
+        if (startsWith(n, "aot-")) {
+            listPush(present, n);
+        }
+    }
+    const ls = plainSorted(listed);
+    const ps = plainSorted(present);
+    record(c, "native-products 覆盖全部 aot-*.tx", sameList(ls, ps), "null", "清单 " + reprList(ls) + "，实有 " + reprList(ps));
+    let exe = "";
+    if (onWindows()) {
+        exe = ".exe";
+    }
+    for (x in cases) {
+        const file = textOf(field(x, "file"));
+        const source = join(tests, file);
+        const stem = piece(file, 0, len(file) - 3);
+        const expected = bytesFromStr(textOf(field(x, "stdout")));
+        check(c, "CLI " + file, strs([compiler, "run", source]), expected, false);
+        for (mode in ["native", "leak"]) {
+            const outDir = join(work, stem + "-" + mode);
+            const flags: List<string> = listNew();
+            if (mode == "leak") {
+                listPush(flags, "--leak-check");
+            }
+            if (check(c, "build " + file + " " + mode, plusAll(strs([compiler, "build", source]), flags, strs(["--out", outDir])), None, false)) {
+                check(c, "product " + file + " " + mode, strs([join(outDir, stem + exe)]), expected, false);
+            }
+        }
+    }
+}
+
+function plusAll(a: List<string>, b: List<string>, c: List<string>): List<string> {
+    const out: List<string> = listNew();
+    for (x in a) {
+        listPush(out, x);
+    }
+    for (x in b) {
+        listPush(out, x);
+    }
+    for (x in c) {
+        listPush(out, x);
+    }
+    return out;
+}
+
+function plainSorted(xs: List<string>): List<string> {
+    const out: List<string> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+        let k = listLen(out) - 1;
+        while (k > 0 && strLess(x, listGet(out, k - 1) ?? "")) {
+            listSet(out, k, listGet(out, k - 1) ?? "");
+            k = k - 1;
+        }
+        listSet(out, k, x);
+    }
+    return out;
+}
+
+function sameList(a: List<string>, b: List<string>): bool {
+    if (listLen(a) != listLen(b)) {
+        return false;
+    }
+    let i = 0;
+    while (i < listLen(a)) {
+        if ((listGet(a, i) ?? "") != (listGet(b, i) ?? "?")) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 只报告：src/*.tx 的行数（换行个数）前 10 名，写成 [(行数, '文件名'), …]。
+function linecount(root: string): void {
+    const src = join(root, "src");
+    const counts: List<int> = listNew();
+    const names: List<string> = listNew();
+    for (n in namesIn(src)) {
+        if (endsWith(n, ".tx") && kindOf(join(src, n)) == 1) {
+            const d = readAll(join(src, n)) catch bytesNew(0);
+            let count = 0;
+            let i = 0;
+            while (i < bytesLen(d)) {
+                if ((bytesGet(d, i) ?? 0) == 10) {
+                    count = count + 1;
+                }
+                i = i + 1;
+            }
+            listPush(counts, count);
+            listPush(names, n);
+        }
+    }
+    let over = 0;
+    for (n in counts) {
+        if (n > 1000) {
+            over = over + 1;
+        }
+    }
+    const taken: List<bool> = listNew();
+    for (x in counts) {
+        listPush(taken, false);
+    }
+    let top = "[";
+    let k = 0;
+    while (k < 10 && k < listLen(counts)) {
+        let best = -1;
+        let j = 0;
+        while (j < listLen(counts)) {
+            if (!(listGet(taken, j) ?? true)) {
+                if (best < 0 || (listGet(counts, j) ?? 0) > (listGet(counts, best) ?? 0)
+                    || ((listGet(counts, j) ?? 0) == (listGet(counts, best) ?? 0) && strLess(listGet(names, best) ?? "", listGet(names, j) ?? ""))) {
+                    best = j;
+                }
+            }
+            j = j + 1;
+        }
+        listSet(taken, best, true);
+        if (k > 0) {
+            top = top + ", ";
+        }
+        top = top + "(" + toStr(listGet(counts, best) ?? 0) + ", " + repr(listGet(names, best) ?? "") + ")";
+        k = k + 1;
+    }
+    print("linecount report-only: " + toStr(listLen(counts)) + " files; " + toStr(over) + " over soft limit; top " + top + "]");
+}
+
+function main(argv: []string): int {
+    return run(argv) catch (e) {
+        eprint("verify: " + e.message);
+        return 2;
+    };
+}

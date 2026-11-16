@@ -1,0 +1,69 @@
+import { X509Certificate } from "std/x509_types";
+import { x509ParseCertificate } from "std/x509";
+import { x509RsaPublicKey, x509TlsRsaPublicKey, x509P256PublicKey, x509VerifyCertificateSignature } from "std/x509_keys";
+import { p256Hex } from "std/crypto/p256_field";
+import { constantTimeEqual } from "std/crypto/subtle";
+
+function certificates(): List<Ref<X509Certificate>> {
+    const fixture = readFile("tests/vectors/x509.txt") catch panic("certificate fixture"); const out: List<Ref<X509Certificate>> = listNew();
+    for (line in strSplit(fixture, "\n")) {
+        if (len(line) == 0 || byteAt(line, 0) == 35) { continue; }
+        const p = strSplit(line, " ");
+        if (listGet(p, 0) == "good") { listPush(out, x509ParseCertificate(p256Hex(listGet(p, 1))) catch panic("parse")); }
+    }
+    return out;
+}
+
+function signatureError(cert: Ref<X509Certificate>): bool { x509VerifyCertificateSignature(cert, cert) catch (e) { return true; }; return false; }
+function rsaError(cert: Ref<X509Certificate>): bool { x509RsaPublicKey(cert) catch (e) { return true; }; return false; }
+function tlsRsaError(cert: Ref<X509Certificate>): bool { x509TlsRsaPublicKey(cert) catch (e) { return true; }; return false; }
+function ecError(cert: Ref<X509Certificate>): bool { x509P256PublicKey(cert) catch (e) { return true; }; return false; }
+
+test "X.509 密钥：RSA、P-256 与参数核对" {
+    const certs = certificates(); const rsa = listGet(certs, 0); const ec = listGet(certs, 1);
+    const key = x509RsaPublicKey(rsa) catch panic("RSA key");
+    assert(key.bits == 2048 && key.exponent == 65537, "RSA public numbers");
+    // TLS 与证书链的 RSA 下限 2048 位：同一证书换成 1024 位模数后只解码可读，策略入口拒绝。
+    assert((x509TlsRsaPublicKey(rsa) catch panic("2048-bit TLS key")).bits == 2048, "2048-bit key passes TLS policy");
+    const small = listGet(certificates(), 0); let hex = "30818902818100c0"; let k = 0; while (k < 126) { hex = hex + "00"; k = k + 1; }
+    small.publicKey = p256Hex(hex + "010203010001");
+    assert((x509RsaPublicKey(small) catch panic("1024-bit decode")).bits == 1024, "1024-bit key decodes");
+    assert(tlsRsaError(small), "1024-bit key refused by TLS policy");
+    const point = x509P256PublicKey(ec) catch panic("EC point");
+    assert(bytesLen(point) == 65 && constantTimeEqual(point, ec.publicKey), "P-256 uncompressed key");
+    bytesSet(point, 0, 0); assert((bytesGet(ec.publicKey, 0) catch 0) == 4, "point output owned");
+    assert(rsaError(ec) && ecError(rsa) && rsaError(listGet(certs, 4)) && ecError(listGet(certs, 4)), "wrong and unknown key types");
+    ec.publicKeyAlgorithm.parameters = p256Hex("06082a8648ce3d030108"); assert(ecError(ec), "unsupported curve");
+    rsa.publicKeyAlgorithm.parameters = p256Hex("020100"); assert(rsaError(rsa), "invalid RSA parameters");
+}
+
+test "X.509 签名：独立 RSA 与 ECDSA 链、篡改和错签发者" {
+    const certs = certificates(); const rootRsa = listGet(certs, 0); const leafEc = listGet(certs, 1);
+    const rootEc = listGet(certs, 2); const leafRsa = listGet(certs, 3);
+    assert(x509VerifyCertificateSignature(rootRsa, rootRsa) catch panic("RSA self signature"), "RSA self signature");
+    assert(x509VerifyCertificateSignature(leafEc, rootRsa) catch panic("RSA signed leaf"), "RSA signed EC leaf");
+    assert(x509VerifyCertificateSignature(rootEc, rootEc) catch panic("EC self signature"), "EC self signature");
+    assert(x509VerifyCertificateSignature(leafRsa, rootEc) catch panic("EC signed leaf"), "EC signed RSA leaf");
+    assert(!(x509VerifyCertificateSignature(leafEc, rootEc) catch panic("wrong issuer")) && !(x509VerifyCertificateSignature(leafRsa, rootRsa) catch panic("wrong issuer")), "wrong issuer key type");
+    bytesSet(leafEc.signature, bytesLen(leafEc.signature) - 1, (bytesGet(leafEc.signature, bytesLen(leafEc.signature) - 1) catch 0) ^ 1);
+    assert(!(x509VerifyCertificateSignature(leafEc, rootRsa) catch panic("RSA tamper")), "RSA signature altered");
+    bytesSet(leafRsa.tbs, bytesLen(leafRsa.tbs) - 1, (bytesGet(leafRsa.tbs, bytesLen(leafRsa.tbs) - 1) catch 0) ^ 1);
+    assert(!(x509VerifyCertificateSignature(leafRsa, rootEc) catch panic("ECDSA tamper")), "ECDSA signed bytes altered");
+    assert(signatureError(listGet(certs, 4)), "unsupported algorithm is Error");
+}
+
+test "X.509 PSS：SHA-256 profile 与合法但不支持的参数" {
+    const fixture = readFile("tests/vectors/x509-pss.txt") catch panic("PSS cert fixture"); let good = 0; let unsupported = 0;
+    for (line in strSplit(fixture, "\n")) {
+        if (len(line) == 0 || byteAt(line, 0) == 35) { continue; }
+        const p = strSplit(line, " "); const cert = x509ParseCertificate(p256Hex(listGet(p, 1))) catch panic("PSS parse");
+        if (listGet(p, 0) == "ok") {
+            assert(x509VerifyCertificateSignature(cert, cert) catch panic("PSS verify"), "PSS SHA-256");
+            const original = bytesSlice(cert.signature, 0, bytesLen(cert.signature));
+            bytesSet(cert.signature, 0, (bytesGet(cert.signature, 0) catch 0) ^ 1);
+            assert(!(x509VerifyCertificateSignature(cert, cert) catch panic("PSS tamper")), "altered PSS");
+            assert(!constantTimeEqual(cert.signature, original), "changed input exercised"); good = good + 1;
+        } else { assert(listGet(p, 0) == "unsupported" && signatureError(cert), "unsupported PSS parameters"); unsupported = unsupported + 1; }
+    }
+    assert(good == 1 && unsupported == 3, "all PSS fixtures");
+}

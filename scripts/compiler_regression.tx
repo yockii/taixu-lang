@@ -1,0 +1,265 @@
+// 同源编译耗时的 ABBA/BAAB 墙钟对照：两臂（基线与候选编译器）编同一批负载，产物须逐字节相同，各取墙钟中位数，候选/基线不超过
+// 1.03 记 PASS。墙钟受调度与频率影响（同一二进制 A/A 可差 ±11%），判退化以
+// perf_compare.tx 的指令数为准；本脚本用于“改了编译器自身、产物应不变”的优化，看用户实际等待的时间。
+//
+// 每个样本由 perf_lib.tx 的帮手进程起编译器，墙钟从起子进程到它退出；子进程的环境去掉 TAIXU_* 变量（置空）、PATH 指向空目录。
+// --kernel 让两臂都以 --link-object 链同一个内核对象（缺省用各自内嵌的内核）。--cpu 把本进程及子进程固定在一个逻辑 CPU 上，并核对
+// 每个编译器进程实际的集合（macOS 不支持）。
+//
+//   taixu run --toolchain scripts/compiler_regression.tx --baseline <基线编译器> --compiler <候选编译器> --work <新目录>
+//       [--kernel <内核对象>] [--runs 7] [--only lexer|all] [--cpu N] [--root <仓库根>]
+import { cleanEnv, cpuList, cpuPolicy, fixed, isPerfHelper, jBool, jFloat, median, perfHelperMain, perfMeasure, privateExe } from "./perf_lib";
+import { absolute, baseOf, exeName, join, kindOf, mkdirs, parseDigits, shaOf } from "./build_lib";
+import { Jv, jArray, jGet, jNull, jNumber, jObject, jPretty, jPush, jSet, jString } from "./test_json";
+
+const USAGE: string = "用法：compiler_regression --baseline <基线编译器> --compiler <候选编译器> --work <新目录> [--kernel <内核对象>]"
++ " [--runs 7] [--only lexer|all] [--cpu N] [--root <仓库根>]";
+const LIMIT_MS: int = 120000;
+
+struct Opts {
+    baseline: string,
+    compiler: string,
+    kernel: string,
+    runs: int,
+    work: string,
+    only: string,
+    cpu: int,
+    root: string,
+}
+
+function parse(argv: []string): Ref<Opts> | Error {
+    const o = new Opts { baseline: "", compiler: "", kernel: "", runs: 7, work: "", only: "all", cpu: -1, root: "" };
+    let i = 0;
+    while (i + 1 < len(argv)) {
+        const a = argv[i];
+        const v = argv[i + 1];
+        if (a == "--baseline") {
+            o.baseline = absolute(v);
+        } else if (a == "--compiler") {
+            o.compiler = absolute(v);
+        } else if (a == "--kernel") {
+            o.kernel = absolute(v);
+        } else if (a == "--runs") {
+            o.runs = parseDigits(v);
+        } else if (a == "--work") {
+            o.work = absolute(v);
+        } else if (a == "--only") {
+            o.only = v;
+        } else if (a == "--cpu") {
+            o.cpu = parseDigits(v);
+            if (o.cpu < 0) {
+                return err("--cpu 须为非负整数");
+            }
+        } else if (a == "--root") {
+            o.root = absolute(v);
+        } else {
+            return err(USAGE);
+        }
+        i = i + 2;
+    }
+    if (i != len(argv) || len(o.baseline) == 0 || len(o.compiler) == 0 || len(o.work) == 0) {
+        return err(USAGE);
+    }
+    if (o.runs < 5) {
+        return err("--runs 至少 5");
+    }
+    if (o.only != "lexer" && o.only != "all") {
+        return err("--only 取 lexer 或 all");
+    }
+    if (len(o.root) == 0) {
+        o.root = absolute(currentDir() catch ".");
+    }
+    return o;
+}
+
+function stemOf(load: string): string {
+    const b = baseOf(load);
+    return strSlice(b, 0, len(b) - 3);
+}
+
+function armOrder(r: int): List<string> {
+    if (r == -1) {
+        return strSplit("old new", " ");
+    }
+    if (r % 2 == 0) {
+        return strSplit("old new new old", " ");
+    }
+    return strSplit("new old old new", " ");
+}
+
+function run(o: Ref<Opts>, doc: Ref<Jv>): bool | Error {
+    const loads = jGet(doc, "loads") ?? doc;
+    let names = "bootstrap/lexer.tx bootstrap/parser.tx bootstrap/semamirror.tx";
+    if (o.only == "lexer") {
+        names = "bootstrap/lexer.tx";
+    }
+    let allPass = true;
+    for (load in strSplit(names, " ")) {
+        const stem = stemOf(load);
+        const oldNs: List<float> = listNew();
+        const newNs: List<float> = listNew();
+        const rows = jArray();
+        let expected = "";
+        let r = -1;
+        while (r < o.runs) {
+            let k = 0;
+            for (arm in armOrder(r)) {
+                const dest = join(join(o.work, stem), toStr(r) + "-" + toStr(k) + "-" + arm);
+                if (!mkdirs(dest)) {
+                    return err("建不了 " + dest);
+                }
+                let exe = o.baseline;
+                if (arm == "new") {
+                    exe = o.compiler;
+                }
+                const args: List<string> = listNew();
+                listPush(args, "build");
+                listPush(args, load);
+                // 编译器源码按工具链程序编（v0.51 起两种模式下 byteAt、listGet 等签名不同）。
+                listPush(args, "--toolchain");
+                if (len(o.kernel) > 0) {
+                    listPush(args, "--link-object");
+                    listPush(args, o.kernel);
+                }
+                listPush(args, "--out");
+                listPush(args, dest);
+                const s = perfMeasure(exe, args, o.root, LIMIT_MS);
+                if (len(s.error) > 0) {
+                    return err(arm + " 臂编 " + load + " 测不了：" + s.error);
+                }
+                if (s.exit != 0) {
+                    return err(arm + " 臂编 " + load + " 失败（退出码 " + toStr(s.exit) + "）：" + s.stderr);
+                }
+                if (o.cpu >= 0 && s.cpus != toStr(o.cpu)) {
+                    return err("子进程未继承指定 CPU：" + s.cpus);
+                }
+                const digest = shaOf(join(dest, exeName(stem)));
+                if (len(expected) == 0) {
+                    expected = digest;
+                }
+                if (digest != expected) {
+                    return err(load + " 的 " + arm + " 臂产物与先前不同：" + digest + " ≠ " + expected);
+                }
+                const row = jObject();
+                jSet(row, "round", jNumber(r));
+                jSet(row, "arm", jString(arm));
+                jSet(row, "ns", jNumber(s.wallNs));
+                jSet(row, "sha", jString(digest));
+                if (o.cpu >= 0) {
+                    jSet(row, "cpu_affinity", cpuList(s.cpus));
+                }
+                jPush(rows, row);
+                if (r >= 0) {
+                    if (arm == "old") {
+                        listPush(oldNs, s.wallNs as float);
+                    } else {
+                        listPush(newNs, s.wallNs as float);
+                    }
+                }
+                k = k + 1;
+            }
+            r = r + 1;
+        }
+        const mo = median(oldNs);
+        const mn = median(newNs);
+        const ratio = mn / mo;
+        const ok = ratio <= 1.03;
+        const med = jObject();
+        jSet(med, "old", jFloat(mo));
+        jSet(med, "new", jFloat(mn));
+        const entry = jObject();
+        jSet(entry, "input_sha", jString(shaOf(join(o.root, load))));
+        jSet(entry, "samples", rows);
+        jSet(entry, "medians_ns", med);
+        jSet(entry, "ratio", jFloat(ratio));
+        jSet(entry, "pass", jBool(ok));
+        jSet(loads, load, entry);
+        save(o, doc);
+        let verdict = "FAIL";
+        if (ok) {
+            verdict = "PASS";
+        } else {
+            allPass = false;
+        }
+        print(load + " ratio " + toStr(ratio) + " delta " + fixed((ratio - 1.0) * 100.0, 3, true) + "% " + verdict);
+    }
+    return allPass;
+}
+
+function save(o: Ref<Opts>, doc: Ref<Jv>): void {
+    writeFile(join(o.work, "report.json"), jPretty(doc, 2) + "\n") catch (e) {
+        eprint("写不了 report.json：" + e.message);
+    };
+}
+
+function main(argv: []string): int {
+    if (isPerfHelper(argv)) {
+        return perfHelperMain(argv);
+    }
+    const o = parse(argv) catch (e) {
+        eprint(e.message);
+        return 2;
+    };
+    if (kindOf(o.work) != 0) {
+        eprint("--work 须是新目录：" + o.work);
+        return 2;
+    }
+    const empty = join(o.work, "empty-path");
+    if (!mkdirs(empty)) {
+        eprint("建不了 " + empty);
+        return 2;
+    }
+    const policy = cpuPolicy(o.cpu) catch (e) {
+        eprint(e.message);
+        return 2;
+    };
+    cleanEnv(empty) catch (e) {
+        eprint("改不了环境：" + e.message);
+        return 2;
+    };
+    // Windows 上两臂的编译器先复制进工作目录再测（perf_lib 的 privateExe）。
+    o.baseline = privateExe(o.baseline, join(o.work, "arm-old")) catch (e) {
+        eprint(e.message);
+        return 2;
+    };
+    o.compiler = privateExe(o.compiler, join(o.work, "arm-new")) catch (e) {
+        eprint(e.message);
+        return 2;
+    };
+    const doc = jObject();
+    const compilers = jObject();
+    jSet(compilers, "old", jString(shaOf(o.baseline)));
+    jSet(compilers, "new", jString(shaOf(o.compiler)));
+    jSet(doc, "compilers", compilers);
+    jSet(doc, "N", jNumber(o.runs));
+    if (len(o.kernel) > 0) {
+        jSet(doc, "kernel_sha256", jString(shaOf(o.kernel)));
+    } else {
+        jSet(doc, "kernel_sha256", jNull());
+    }
+    jSet(doc, "host", jString(hostTarget()));
+    jSet(doc, "order", jString("ABBA, then BAAB; one excluded warmup per arm and load"));
+    jSet(doc, "clock", jString("helper monotonic ns, spawn through exit"));
+    jSet(doc, "path", jString("empty"));
+    jSet(doc, "cpu_policy", policy);
+    jSet(doc, "priority_policy", jString("unchanged"));
+    jSet(doc, "loads", jObject());
+    const ok = run(o, doc) catch (e) {
+        jSet(doc, "status", jString("FAIL"));
+        jSet(doc, "error", jString(e.message));
+        save(o, doc);
+        eprint(e.message);
+        return 1;
+    };
+    let status = "FAIL";
+    if (ok) {
+        status = "PASS";
+    }
+    jSet(doc, "status", jString(status));
+    save(o, doc);
+    print("STATUS " + status);
+    if (ok) {
+        return 0;
+    }
+    return 1;
+}

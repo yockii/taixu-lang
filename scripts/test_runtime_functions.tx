@@ -1,0 +1,1611 @@
+// 运行时例程的函数目录与独立安全核对（gate.tx 的 runtime-functions 步）：
+// - 探针 bootstrap/runtime_function_probe.tx（--leak-check）写出带 .txfn 的夹具对象，独立解码（scripts/check_txfn.tx）对照映射；
+//   边界模型与保存寄存器的定点损坏须拒绝；
+// - 七个内核对象的目录：真有多返回点的函数、ELF 机器号、链接后的映射对照产物字节（scripts/check_frames.tx）、去掉目录不改装载内容、
+//   COFF 长节名、九种目录损坏（另核不带 --map 的拒绝）、多带一个对象；
+// - 独立安全核对：内核例程的对象由测试专用生成器写出，与 C 驱动（tests/runtime-security，TAIXU_TEST_CC 或 PATH 里的 cc／gcc／clang）
+//   链成受限进程执行（rc 边界与过度释放、值槽与检测器对照、try-io、Weak 表、Windows 取参；macOS 上 arm64 原生与 x86_64 经 Rosetta）；
+//   Mach-O 目标文件对照同一映像的 ELF（scripts/check_macho_pair.tx）；Linux 收割者 ABI；FFI 借用与被调方保存的向量寄存器；
+// - 内存上限扫描：tests/runtime-security/oom-sweep.tx 在逐级收紧的进程内存上限下只许三种结局（macOS 不执行）。
+// 运行（仓根）：taixu run --toolchain scripts/test_runtime_functions.tx --compiler <taixu> --work <目录> [--root <仓库>]
+// 受限进程由工具链内建 procSpawnLimited 起（Windows 的作业对象另限 CPU 时间、进程数上限为 32；不留 core）；独立安全报告的每行
+// 只记 label、exit、stdout、stderr；解码夹具与内核目录、核对产物帧失败或超时时记一行 FAIL 继续；FAIL 行的细节写成本文件的文字。
+import { absolute, copyFile, exeName, findInPath, join, kindOf, mkdirs, nat, readBytes, removeTree } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { hexOf, lossyText, sha256Of } from "./check_lib";
+import { Seg, getLE, hexVal, imageLayout, setLE } from "./check_obj";
+import { decAt, verifyBoundaries, verifyFunctions } from "./check_frames";
+import { FEv, FRow, Meta, OSec, absent, duplicate, longCoffName, objSections, txfnMetadata } from "./check_txfn";
+import { machoPairProblems } from "./check_macho_pair";
+import { captureLimited, captureRaw } from "./test_lib";
+import { J_BOOL, J_NULL, J_NUM, J_STR, Jv, jArray, jEq, jNull, jNumber, jObject, jParseBytes, jPretty, jPush, jSet, jString } from "./test_json";
+import { at, count, isNull, item, textIs, textOf } from "./test_jv";
+import { contains, headChars, reprStr } from "./test_text";
+import { noTarget, targetNamed } from "./targets";
+
+const SEC: int = 1000000000;
+const MAX_OUTPUT: int = 67108864;
+const GIB: int = 1073741824;
+
+struct Ctx {
+    compiler: string,
+    root: string,
+    work: string,
+    checks: Ref<Jv>,
+    total: int,
+    failures: int,
+}
+
+struct Res {
+    code: int,
+    out: Bytes,
+    err: Bytes,
+}
+
+function check(c: Ref<Ctx>, name: string, ok: bool, detail: string): bool {
+    const row = jObject();
+    jSet(row, "name", jString(name));
+    jSet(row, "ok", boolJv(ok));
+    jPush(c.checks, row);
+    c.total = c.total + 1;
+    if (ok) {
+        print("PASS " + name + " ");
+    } else {
+        c.failures = c.failures + 1;
+        print("FAIL " + name + " " + headChars(detail, 1000));
+    }
+    return ok;
+}
+
+// 这几处只在失败时记一行 FAIL，成功时不出行。
+function mustPass(c: Ref<Ctx>, name: string, ok: bool, detail: string): bool {
+    if (!ok) {
+        check(c, name, false, detail);
+    }
+    return ok;
+}
+
+function boolJv(b: bool): Ref<Jv> {
+    return new Jv { kind: J_BOOL, text: "", truth: b, items: listNew(), keys: listNew() };
+}
+
+function sh(c: Ref<Ctx>, exe: string, args: List<string>, cwd: string, limit: int): Res {
+    const r = captureRaw(exe, args, cwd, limit * SEC, 10 * SEC, MAX_OUTPUT) catch (e) {
+        return Res { code: -2, out: bytesNew(0), err: bytesFromStr(e.message) };
+    };
+    return Res { code: r.code, out: r.out, err: r.err };
+}
+
+function tx(c: Ref<Ctx>, args: List<string>): Res {
+    return sh(c, c.compiler, args, c.root, 300);
+}
+
+function strs(a: []string): List<string> {
+    const xs: List<string> = listNew();
+    for (x in a) {
+        listPush(xs, x);
+    }
+    return xs;
+}
+
+function plusL(xs: List<string>, ys: List<string>): List<string> {
+    const out: List<string> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+    }
+    for (y in ys) {
+        listPush(out, y);
+    }
+    return out;
+}
+
+function parseOr(b: Bytes): Ref<Jv>? {
+    const v = jParseBytes(b) catch (e) {
+        return None;
+    };
+    return v;
+}
+
+function readOr(path: string): Bytes {
+    return readBytes(path) catch bytesNew(0);
+}
+
+function writeObj(path: string, d: Bytes): void {
+    writeFileBytes(path, d) catch (e) {};
+}
+
+function writeText(path: string, text: string): void | Error {
+    writeFileBytes(path, bytesFromStr(text))?;
+}
+
+function errText(r: Res): string {
+    return "(" + toStr(r.code) + ", " + reprStr(lossyText(r.err)) + ")";
+}
+
+function numText(v: Ref<Jv>?): string {
+    if (v == None) {
+        return "None";
+    }
+    const x = v ?? jNull();
+    if (x.kind == J_NULL) {
+        return "None";
+    }
+    return x.text;
+}
+
+function decOr(v: Ref<Jv>?, key: string, dflt: int): int {
+    return decAt(v, key) catch dflt;
+}
+
+// 映射对照目录：运行时按需链入，映射只列放入的函数——须是独立解码的目录的子集（按模块与名字对上），放入次序（地址）同
+// 目录次序，逐项事实与目录相同（起止、序言、尾声与帧事件都还原成代码节内的偏移）。
+function compareRows(rows: List<FRow>, actual: List<Ref<Jv>>): void | Error {
+    const index: Map<string, int> = mapNew();
+    let i = 0;
+    while (i < listLen(rows)) {
+        const raw = listGet(rows, i) ?? emptyRow();
+        mapSet(index, raw.module + "\n" + raw.name, i);
+        i = i + 1;
+    }
+    if (listLen(mapKeys(index)) != listLen(rows) || listLen(actual) == 0 || listLen(actual) > listLen(rows)) {
+        return err("row count " + toStr(listLen(rows)) + " vs " + toStr(listLen(actual)));
+    }
+    const picked: List<int> = listNew();
+    const vas: List<int> = listNew();
+    for (f in actual) {
+        const k = mapGet(index, textOf(f, "module") + "\n" + textOf(f, "name"));
+        if (k == None) {
+            return err(textOf(f, "name") + ": not in the directory");
+        }
+        listPush(picked, k ?? -1);
+        const va = hexVal(textOf(f, "link_va"));
+        if (va == None) {
+            return err(textOf(f, "name") + ": link_va");
+        }
+        listPush(vas, va ?? 0);
+    }
+    // 按地址的稳定排序（同 Python 的 sorted），其下目录序号须不减。
+    const order: List<int> = listNew();
+    i = 0;
+    while (i < listLen(vas)) {
+        listPush(order, i);
+        let j = i;
+        while (j > 0 && (listGet(vas, listGet(order, j - 1) ?? 0) ?? 0) > (listGet(vas, i) ?? 0)) {
+            listSet(order, j, listGet(order, j - 1) ?? 0);
+            j = j - 1;
+        }
+        listSet(order, j, i);
+        i = i + 1;
+    }
+    i = 1;
+    while (i < listLen(order)) {
+        if ((listGet(picked, listGet(order, i - 1) ?? 0) ?? 0) > (listGet(picked, listGet(order, i) ?? 0) ?? 0)) {
+            return err("placement order differs from the directory");
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < listLen(actual)) {
+        const raw = listGet(rows, listGet(picked, i) ?? 0) ?? emptyRow();
+        const f = listGet(actual, i) ?? jNull();
+        const begin = decAt(f, "input_section_begin")?;
+        let prologue = begin;
+        if (!isNull(at(f, "prologue_end_offset"))) {
+            prologue = begin + decAt(f, "prologue_end_offset")?;
+        }
+        if (raw.model != textOf(f, "stack_model") || raw.module != textOf(f, "module") || raw.name != textOf(f, "name") || raw.origin != textOf(f, "origin")
+            || raw.begin != begin || raw.end != decAt(f, "input_section_end")? || raw.prologue != prologue) {
+            return err(raw.name + ": row facts");
+        }
+        const base = raw.begin;
+        const eps = at(f, "epilogues");
+        if (listLen(raw.epStart) != count(eps)) {
+            return err(raw.name + ": epilogue count");
+        }
+        let k = 0;
+        while (k < count(eps)) {
+            if ((listGet(raw.epStart, k) catch -1) != base + decAt(item(eps, k), "start_offset")?
+                || (listGet(raw.epEnd, k) catch -1) != base + decAt(item(eps, k), "end_offset")?) {
+                return err(raw.name + ": epilogue " + toStr(k));
+            }
+            k = k + 1;
+        }
+        let events = at(at(f, "frame"), "events");
+        if (isNull(at(f, "frame"))) {
+            events = None;
+        }
+        if (listLen(raw.events) != count(events)) {
+            return err(raw.name + ": event count");
+        }
+        k = 0;
+        while (k < count(events)) {
+            const e = item(events, k);
+            const r = listGet(raw.events, k) ?? emptyEv();
+            let reg = -1;
+            if (!isNull(at(e, "register"))) {
+                reg = decAt(e, "register")?;
+            }
+            if (r.before != base + decAt(e, "instruction_start_offset")? || r.after != base + decAt(e, "instruction_end_offset")?
+                || r.kind != textOf(e, "kind") || r.reg != reg || r.bytes != decAt(e, "bytes")?) {
+                return err(raw.name + ": event " + toStr(k));
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// verifyFunctions 的结论：通过得空串，否则得原因。
+function verifyWhy(doc: Ref<Jv>?, image: Bytes, segs: List<Seg>): string {
+    const saves = verifyFunctions(doc, image, segs) catch (e) {
+        return e.message;
+    };
+    return "";
+}
+
+function emptyRow(): FRow {
+    return FRow { module: "", name: "", origin: "", model: "", modelPosition: 0, begin: 0, end: 0, prologue: 0, beginPosition: 0, epStart: listNew(),
+        epEnd: listNew(), events: listNew() };
+}
+
+function emptyEv(): FEv {
+    return FEv { before: 0, after: 0, kind: "", reg: 0, bytes: 0, position: 0 };
+}
+
+function jvList(v: Ref<Jv>?): List<Ref<Jv>> {
+    const out: List<Ref<Jv>> = listNew();
+    let i = 0;
+    while (i < count(v)) {
+        const x = item(v, i);
+        if (x != None) {
+            listPush(out, x ?? jNull());
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+function objIndexIs(f: Ref<Jv>, want: string): bool {
+    return numText(at(f, "object_index")) == want;
+}
+
+function regsOf(r: FRow, kind: string): string {
+    let s = "";
+    for (e in r.events) {
+        if (e.kind == kind) {
+            s = s + toStr(e.reg) + ",";
+        }
+    }
+    return s;
+}
+
+function putW(d: Bytes, at: int, w: int, v: int): Bytes {
+    const out = bytesSlice(d, 0, bytesLen(d));
+    setLE(out, at, w, v);
+    return out;
+}
+
+function tripleOf(target: string): string {
+    if (target == "linux") {
+        return "x86_64-linux";
+    }
+    if (target == "windows") {
+        return "x86_64-windows";
+    }
+    return target;
+}
+
+function basicExe(target: string): string {
+    if (target == "windows") {
+        return "basic.exe";
+    }
+    return "basic";
+}
+
+function hasAny(b: Bytes, needles: []string): bool {
+    const t = lossyText(b);
+    for (n in needles) {
+        if (contains(t, n)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 探针夹具：独立解码的目录对照映射，边界模型与保存寄存器的定点损坏须拒绝。
+function fixtureChecks(c: Ref<Ctx>, fixture: string): bool | Error {
+    const work = c.work;
+    const p = sh(c, nat(join(join(work, "probe"), exeName("runtime_function_probe"))), strs([fixture]), c.root, 120);
+    writeObj(nat(join(work, "probe.stdout")), p.out);
+    writeObj(nat(join(work, "probe.stderr")), p.err);
+    check(c, "multiple/zero returns, malformed payload, ownership, missing/duplicate end, no leaks", p.code == 0 && bytesLen(p.err) == 0,
+        "(" + toStr(p.code) + ", " + reprStr(lossyText(p.out)) + ", " + reprStr(lossyText(p.err)) + ")");
+    if (p.code != 0) {
+        return true;
+    }
+    const doc = parseOr(p.out);
+    const code = readOr(nat(join(fixture, "fixture.bin")));
+    const segs: List<Seg> = listNew();
+    listPush(segs, Seg { va: 5242880, off: 512, hasOff: true, file: bytesLen(code) - 512, mem: bytesLen(code) - 512 });
+    const verified = verifyWhy(doc, code, segs);
+    if (!mustPass(c, "independent fixture frame bytes", len(verified) == 0, verified)) {
+        return false;
+    }
+    const fs = at(at(doc, "map"), "functions");
+    check(c, "independent multi-epilogue bytes and explicit end", count(at(item(fs, 0), "epilogues")) == 2 && count(at(item(fs, 1), "epilogues")) == 0
+        && isArr(at(item(fs, 1), "epilogues")), "");
+    for (target in ["windows", "linux"]) {
+        // 夹具对象是 x86_64 的：写明三元组（不带架构的 linux、windows 在 arm64 宿主上取 aarch64-linux、aarch64-windows）。
+        const triple = tripleOf(target);
+        let suffix = ".o";
+        if (target == "windows") {
+            suffix = ".obj";
+        }
+        const kernel = (targetNamed(triple) ?? noTarget()).kernel;
+        const data = readOr(nat(join(fixture, "fixture" + suffix)));
+        let why = "";
+        const md = txfnMetadata(data, target) catch (e) {
+            mustPass(c, "independent object codec:" + target, false, e.message);
+            return false;
+        };
+        compareRows(md.rows, jvList(fs)) catch (e) {
+            why = e.message;
+        };
+        if (!check(c, "independent object codec:" + target, len(why) == 0, why)) {
+            return false;
+        }
+        const shell = listGet(md.rows, 2) ?? emptyRow();
+        check(c, "saved-GPR multiple epilogue object codec:" + target, shell.origin == "ffi-callback-shell" && listLen(shell.epStart) == 2
+            && regsOf(shell, "push-nonvolatile") == "3,12," && regsOf(shell, "pop-nonvolatile") == "12,3,12,3,", "");
+        let models = "";
+        let boundaryOk = true;
+        let i = 3;
+        while (i < listLen(md.rows)) {
+            const r = listGet(md.rows, i) ?? emptyRow();
+            models = models + r.model + ",";
+            if (r.origin != "process-thread-entry" || listLen(r.events) != 0 || listLen(r.epStart) != 0) {
+                boundaryOk = false;
+            }
+            i = i + 1;
+        }
+        check(c, "four boundary models survive object codec:" + target, models == "process-entry,thread-entry,stack-transition,stack-disposal,"
+            && boundaryOk, "");
+        const r3 = listGet(md.rows, 3) ?? emptyRow();
+        const bad: List<Bytes> = listNew();
+        const names: List<string> = listNew();
+        listPush(names, "unknown-stack-model");
+        listPush(bad, putW(data, r3.modelPosition, 1, 120));
+        listPush(names, "invented-boundary-prologue");
+        listPush(bad, putW(data, r3.beginPosition + 16, 8, r3.begin + 1));
+        listPush(names, "old-version-two");
+        listPush(bad, putW(data, md.meta.at + 4, 4, 2));
+        let k = 0;
+        while (k < listLen(names)) {
+            const name = listGet(names, k) ?? "";
+            const r = rejectBuild(c, target, triple, kernel, suffix, name, listGet(bad, k) ?? bytesNew(0));
+            check(c, "reject boundary object:" + target + ":" + name, r.code == 1 && r.ok
+                && hasAny(r.err, ["UnknownStackModel", "BadBoundaryFrame", "UnknownFunctionMetadataVersion"]), errText(Res { code: r.code, out: bytesNew(0), err: r.err }));
+            k = k + 1;
+        }
+        const gnames: []string = ["invalid-save-register", "duplicate-save", "wrong-save-size", "second-epilogue-register"];
+        const gevent: []int = [0, 1, 0, 8];
+        const gfield: []int = [17, 17, 18, 17];
+        const gvalue: []int = [1, 4, 16, 6];
+        const gwidth: []int = [1, 1, 8, 1];
+        k = 0;
+        while (k < 4) {
+            const e = listGet(shell.events, gevent[k]) ?? emptyEv();
+            const r = rejectBuild(c, target, triple, kernel, suffix, gnames[k], putW(data, e.position + gfield[k], gwidth[k], gvalue[k]));
+            check(c, "reject saved-GPR object:" + target + ":" + gnames[k], r.code == 1 && r.ok && contains(lossyText(r.err), "BadFrame"),
+                errText(Res { code: r.code, out: bytesNew(0), err: r.err }));
+            k = k + 1;
+        }
+    }
+    return true;
+}
+
+function isArr(v: Ref<Jv>?): bool {
+    return v != None && (v ?? jNull()).kind == 4;
+}
+
+struct Rej {
+    code: int,
+    ok: bool,
+    err: Bytes,
+}
+
+// 带损坏的对象链接 tests/debug/basic.tx：须失败、不写映射、不留产物。
+function rejectBuild(c: Ref<Ctx>, target: string, triple: string, kernel: string, suffix: string, name: string, data: Bytes): Rej {
+    const work = c.work;
+    const path = nat(join(work, target + "-" + name + suffix));
+    writeObj(path, data);
+    const output = nat(join(work, target + "-" + name));
+    const mapping = nat(join(work, target + "-" + name + ".json"));
+    const p = tx(c, strs(["build", nat(join(c.root, "tests/debug/basic.tx")), "--target=" + triple, "--out", output, "--link-object",
+                nat(join(join(c.root, "bootstrap/nrt-kernel"), kernel)), "--link-object", path, "--map", mapping, "--map-format=json"]));
+    return Rej { code: p.code, ok: kindOf(mapping) == 0 && kindOf(nat(join(output, basicExe(target)))) == 0, err: p.err };
+}
+
+// 装载内容的内存字节数之和（PE 为 .text、.rdata、.data 三节的 VirtualSize，其余为各装载段的内存大小）。
+function loadedSize(image: Bytes): int {
+    let total = 0;
+    if (bytesLen(image) >= 2 && getLE(image, 0, 2) == 0x5A4D) {
+        const pe = getLE(image, 60, 4);
+        const count = getLE(image, pe + 6, 2);
+        const base = pe + 24 + getLE(image, pe + 20, 2);
+        let i = 0;
+        while (i < count) {
+            const h = base + 40 * i;
+            const nb = bytesSlice(image, h, 8);
+            let e = 8;
+            while (e > 0 && (bytesGet(nb, e - 1) ?? 1) == 0) {
+                e = e - 1;
+            }
+            const name = bytesToStr(bytesSlice(nb, 0, e)) catch "";
+            if (name == ".text" || name == ".rdata" || name == ".data") {
+                total = total + getLE(image, h + 8, 4);
+            }
+            i = i + 1;
+        }
+        return total;
+    }
+    for (s in imageLayout(image).segs) {
+        total = total + s.mem;
+    }
+    return total;
+}
+
+function machineFor(target: string): int {
+    if (contains(target, "aarch64-")) {
+        return 183;
+    }
+    if (target == "loongarch64-linux") {
+        return 258;
+    }
+    if (target == "riscv64-linux") {
+        return 243;
+    }
+    return 62;
+}
+
+// 七个内核对象的目录（macOS 的两个内核同为 ELF 目标文件，机器号 62／183，产物交叉构建、只做静态核对；aarch64-linux、
+// loongarch64-linux（机器号 258）、riscv64-linux（机器号 243）同）。
+function kernelChecks(c: Ref<Ctx>, fixture: string, probeBuilt: bool): void | Error {
+    const work = c.work;
+    const targets: []string = ["windows", "linux", "aarch64-linux", "loongarch64-linux", "riscv64-linux", "x86_64-macos", "aarch64-macos"];
+    let t = 0;
+    while (t < 7) {
+        const target = targets[t];
+        t = t + 1;
+        const triple = tripleOf(target);
+        const kernelName = (targetNamed(triple) ?? noTarget()).kernel;
+        const kernel = nat(join(join(c.root, "bootstrap/nrt-kernel"), kernelName));
+        const data = readOr(kernel);
+        const md = txfnMetadata(data, target) catch (e) {
+            mustPass(c, "kernel metadata:" + target, false, e.message);
+            continue;
+        };
+        let multi = false;
+        for (r in md.rows) {
+            if (listLen(r.epStart) > 1) {
+                multi = true;
+            }
+        }
+        check(c, "kernel has real multi-return functions:" + target, listLen(md.rows) > 200 && multi, "");
+        if (target != "windows") {
+            check(c, "kernel object machine names the register numbering:" + target, getLE(data, 18, 2) == machineFor(target), "");
+        }
+        const dest = nat(join(work, target));
+        const mapping = nat(join(work, target + ".json"));
+        const args = strs(["build", nat(join(c.root, "tests/debug/basic.tx")), "--target=" + triple, "--out", dest]);
+        const p = tx(c, plusL(args, strs(["--map", mapping, "--map-format=json", "--link-object", kernel])));
+        check(c, "kernel map:" + target, p.code == 0, errText(p));
+        if (p.code != 0) {
+            continue;
+        }
+        const doc = parseOr(readOr(mapping));
+        const product = nat(join(dest, basicExe(target)));
+        const image = readOr(product);
+        const lay = imageLayout(image);
+        let why = verifyWhy(doc, image, lay.segs);
+        if (len(why) == 0) {
+            verifyBoundaries(doc, image, target, false) catch (e) {
+                why = e.message;
+            };
+        }
+        if (!check(c, "kernel boundary ranges and real instruction endpoints:" + target, len(why) == 0 && lay.ok, why + lay.why)) {
+            continue;
+        }
+        const actual: List<Ref<Jv>> = listNew();
+        for (f in jvList(at(at(doc, "map"), "functions"))) {
+            if (objIndexIs(f, "0")) {
+                listPush(actual, f);
+            }
+        }
+        why = "";
+        compareRows(md.rows, actual) catch (e) {
+            why = e.message;
+        };
+        if (!mustPass(c, "kernel object codec:" + target, len(why) == 0, why)) {
+            continue;
+        }
+        let relocated = true;
+        for (f in actual) {
+            if (!objIndexIs(f, "0") || numText(at(f, "input_section_index")) != toStr(md.text.index)) {
+                relocated = false;
+            }
+        }
+        check(c, "every kernel fact relocated and independently decoded:" + target, relocated, "");
+        const stripped = nat(join(work, "without-metadata-" + kernelName));
+        writeObj(stripped, absent(data, target));
+        const pb = tx(c, plusL(args, strs(["--map", mapping, "--map-format=json", "--link-object", stripped])));
+        let bareOk = false;
+        if (pb.code == 0) {
+            const bare = at(parseOr(readOr(mapping)), "map");
+            const om = at(at(bare, "coverage"), "object_metadata");
+            let txOnly = count(at(bare, "functions")) > 0;
+            for (f in jvList(at(bare, "functions"))) {
+                if (!textIs(f, "origin", "tx-generated")) {
+                    txOnly = false;
+                }
+            }
+            // 目录决定按需链入：没有目录时链接器不能按函数取舍，内核整节放入（x86_64-windows 照旧以内核的全部导出为根），装载的内容
+            // 比有目录时多；函数事实为未知。
+            bareOk = loadedSize(readOr(product)) > loadedSize(image) && textIs(om, "schema", "txfn/3") && numText(at(om, "present_objects")) == "0"
+            && numText(at(om, "absent_objects")) == "1" && jLenOf(om) == 3 && txOnly;
+        }
+        check(c, "absent directory is unknown and whole kernel placed:" + target, bareOk, errText(pb));
+        const po = tx(c, plusL(args, strs(["--link-object", kernel])));
+        check(c, "metadata on/off identical product:" + target, po.code == 0 && bytesEqual(readOr(product), image), errText(po));
+        if (target == "windows") {
+            const longName = nat(join(work, "long-name.obj"));
+            writeObj(longName, longCoffName(data) catch bytesNew(0));
+            const pl = tx(c, plusL(args, strs(["--map", mapping, "--map-format=json", "--link-object", longName])));
+            const lf = at(at(parseOr(readOr(mapping)), "map"), "functions");
+            const df = at(at(doc, "map"), "functions");
+            check(c, "COFF long section name metadata:" + target, pl.code == 0 && bytesEqual(readOr(product), image) && lf != None && df != None
+                && jEq(lf ?? jNull(), df ?? jNull()), errText(pl));
+        }
+        variantChecks(c, target, triple, md, data)?;
+        if (probeBuilt && kindOf(nat(join(fixture, "fixture.o"))) == 1 && (target == "windows" || target == "linux")) {
+            let extraName = "fixture.o";
+            if (target == "windows") {
+                extraName = "fixture.obj";
+            }
+            const extra = nat(join(fixture, extraName));
+            const pe = tx(c, plusL(args, strs(["--link-object", kernel, "--link-object", extra, "--map", mapping, "--map-format=json"])));
+            check(c, "additional object directory:" + target, pe.code == 0, errText(pe));
+            if (pe.code == 0) {
+                const mapped = parseOr(readOr(mapping));
+                let extraNames = "";
+                let extraRows = 0;
+                for (f in jvList(at(at(mapped, "map"), "functions"))) {
+                    if (objIndexIs(f, "1")) {
+                        extraRows = extraRows + 1;
+                        extraNames = textOf(f, "name");
+                    }
+                }
+                // 附加对象同样按目录切块取舍（COFF 与 ELF 一致）：没人引用的函数不放入；夹具在 fixture_branch 之后有一条目录外的
+                // 指令（空洞），并进其后的 fixture_zero_return 那块并钉住，所以恰好放入这一个。
+                check(c, "additional object split by directory, gap block kept:" + target, extraRows == 1 && extraNames == "fixture_zero_return"
+                    && numText(at(at(at(at(mapped, "map"), "coverage"), "object_metadata"), "present_objects")) == "2", "");
+                const newImage = readOr(product);
+                const nl = imageLayout(newImage);
+                why = verifyWhy(mapped, newImage, nl.segs);
+                mustPass(c, "additional object frames:" + target, len(why) == 0, why);
+            }
+        }
+    }
+}
+
+function jLenOf(v: Ref<Jv>?): int {
+    if (v == None) {
+        return 0;
+    }
+    return listLen((v ?? jNull()).keys);
+}
+
+// 九种目录损坏：每种都须拒绝（不写映射、不留产物），原因写在 stderr；ELF 目标上结构不合规的几种不带 --map 也拒绝。
+function variantChecks(c: Ref<Ctx>, target: string, triple: string, md: Meta, data: Bytes): void | Error {
+    const work = c.work;
+    const names: List<string> = listNew();
+    const bad: List<Bytes> = listNew();
+    const at0 = md.meta.at;
+    listPush(names, "version");
+    listPush(bad, putW(data, at0 + 4, 4, 1));
+    listPush(names, "text-section");
+    listPush(bad, putW(data, at0 + 8, 4, 0xffffffff));
+    listPush(names, "text-size");
+    listPush(bad, putW(data, at0 + 12, 8, -1));
+    listPush(names, "count");
+    listPush(bad, putW(data, at0 + 84, 4, 0xffffffff));
+    listPush(names, "integer-overflow");
+    listPush(bad, putW(data, (listGet(md.rows, 0) ?? emptyRow()).beginPosition, 8, -1));
+    let framed: FEv? = None;
+    for (r in md.rows) {
+        if (framed == None && listLen(r.events) > 0) {
+            framed = listGet(r.events, 0) ?? emptyEv();
+        }
+    }
+    const fe = framed ?? FEv { before: 0, after: 0, kind: "", reg: 0, bytes: 0, position: 0 };
+    listPush(names, "frame-kind");
+    listPush(bad, putW(data, fe.position + 16, 1, 255));
+    listPush(names, "code-identity");
+    listPush(bad, putW(data, md.text.at, 1, (bytesGet(data, md.text.at) ?? 0) ^ 1));
+    let multiRow: FRow? = None;
+    for (r in md.rows) {
+        if (multiRow == None && listLen(r.epStart) > 1) {
+            multiRow = r;
+        }
+    }
+    const releases: List<FEv> = listNew();
+    if (multiRow != None) {
+        for (e in (multiRow ?? emptyRow()).events) {
+            if (e.kind == "release-stack") {
+                listPush(releases, e);
+            }
+        }
+    }
+    const second = listGet(releases, 1) catch FEv { before: 0, after: 0, kind: "", reg: 0, bytes: 0, position: 0 };
+    listPush(names, "second-epilogue-balance");
+    listPush(bad, putW(data, second.position + 18, 8, second.bytes + 8));
+    listPush(names, "duplicate-section");
+    listPush(bad, duplicate(data, target) catch bytesNew(0));
+    const expected: []string = ["UnknownFunctionMetadataVersion", "InvalidFunctionMetadataTextSection", "FunctionMetadataTextMismatch",
+        "InvalidFunctionMetadataCount", "FunctionMetadataIntegerOverflow", "UnknownFrameEvent", "FunctionMetadataTextMismatch", "BadFrameRelease",
+        "DuplicateFunctionMetadataSection"];
+    let suffix = ".o";
+    if (target == "windows") {
+        suffix = ".obj";
+    }
+    let k = 0;
+    while (k < listLen(names)) {
+        const name = listGet(names, k) ?? "";
+        const path = nat(join(work, target + "-bad-" + name + suffix));
+        writeObj(path, listGet(bad, k) ?? bytesNew(0));
+        const failedMap = nat(join(work, target + "-bad-" + name + ".json"));
+        const badDest = nat(join(work, target + "-bad-" + name));
+        const basic = nat(join(c.root, "tests/debug/basic.tx"));
+        const p = tx(c, strs(["build", basic, "--target=" + triple, "--out", badDest, "--link-object", path, "--map", failedMap, "--map-format=json"]));
+        check(c, "reject invalid metadata:" + target + ":" + name, p.code == 1 && kindOf(failedMap) == 0 && kindOf(nat(join(badDest, basicExe(target)))) == 0
+            && contains(lossyText(p.err), expected[k]), errText(p));
+        if (target != "windows" && (name == "version" || name == "text-section" || name == "text-size" || name == "count" || name == "integer-overflow"
+                || name == "duplicate-section")) {
+            // 产物函数符号（v052-image-symbols）每次构建都读内核目录的名字与起止：结构不合规的目录不带 --map 也拒绝，原因同名；代码摘要
+            // 与帧事实只在 --map 时核对。
+            const q = tx(c, strs(["build", basic, "--target=" + triple, "--out", badDest, "--link-object", path]));
+            check(c, "reject invalid metadata without map:" + target + ":" + name, q.code == 1 && kindOf(nat(join(badDest, "basic"))) == 0
+                && contains(lossyText(q.err), expected[k]), errText(q));
+        }
+        k = k + 1;
+    }
+}
+
+// ---- 独立安全核对 ----
+
+struct Sec {
+    c: Ref<Ctx>,
+    work: string,
+    windows: bool,
+    macos: bool,
+    target: string,
+    suffix: string,
+    cc: string,
+    compilerSha: string,
+    rows: Ref<Jv>,
+    genNames: List<string>,
+    genPaths: List<string>,
+}
+
+struct Row {
+    exit: int,
+    hasExit: bool,
+    out: string,
+    err: string,
+    label: string,
+}
+
+function rowText(r: Row): string {
+    let code = "None";
+    if (r.hasExit) {
+        code = toStr(r.exit);
+    }
+    return "{'exit': " + code + ", 'stdout': " + reprStr(headChars(r.out, 300)) + ", 'stderr': " + reprStr(headChars(r.err, 300)) + ", 'label': "
+    + reprStr(r.label) + "}";
+}
+
+function saveSec(s: Ref<Sec>): void {
+    const report = jObject();
+    jSet(report, "compiler_sha256", jString(s.compilerSha));
+    jSet(report, "target", jString(s.target));
+    jSet(report, "cc", jString(s.cc));
+    jSet(report, "rows", s.rows);
+    writeText(nat(join(s.work, "report.json")), jPretty(report, 2) + "\n") catch (e) {};
+}
+
+// 受限进程里跑一次（至多 15 秒、内存 2 GiB、CPU 10 秒；Linux 的外部库按 LD_LIBRARY_PATH＝工作目录找）。
+function execute(s: Ref<Sec>, exe: string, args: List<string>, label: string, envName: string, envValue: string): Row {
+    // 子进程的环境：本进程当前的环境另加 LD_LIBRARY_PATH＝工作目录（Linux 产物按 DT_NEEDED 找外部库）与 envName（若给出），经 setEnv
+    // 设在本进程、起完子进程即设回（原先没有的设回空串；setEnv 不能删变量）。Windows 上不设 LD_LIBRARY_PATH。
+    const names: List<string> = listNew();
+    const values: List<string> = listNew();
+    if (!s.windows) {
+        listPush(names, "LD_LIBRARY_PATH");
+        listPush(values, s.work);
+    }
+    if (len(envName) > 0) {
+        listPush(names, envName);
+        listPush(values, envValue);
+    }
+    const saved: List<string> = listNew();
+    let i = 0;
+    while (i < listLen(names)) {
+        const n = listGet(names, i) ?? "";
+        listPush(saved, getEnv(n) ?? "");
+        setEnv(n, listGet(values, i) ?? "") catch (e) {};
+        i = i + 1;
+    }
+    let row = Row { exit: 0, hasExit: false, out: "", err: "", label: label };
+    const r = captureLimited(exe, args, s.work, 15 * SEC, 10 * SEC, MAX_OUTPUT, 2 * GIB, 10) catch (e) {
+        row = Row { exit: 0, hasExit: false, out: "", err: e.message, label: label };
+        restoreEnv(names, saved);
+        return record(s, row);
+    };
+    restoreEnv(names, saved);
+    row = Row { exit: r.code, hasExit: !r.timedOut, out: textOut(r.out), err: textOut(r.err), label: label };
+    return record(s, row);
+}
+
+function restoreEnv(names: List<string>, saved: List<string>): void {
+    let i = 0;
+    while (i < listLen(names)) {
+        setEnv(listGet(names, i) ?? "", listGet(saved, i) ?? "") catch (e) {};
+        i = i + 1;
+    }
+}
+
+// 子进程输出的文本：Windows 上按文本模式读回（通用换行：CRLF 与单独的 CR 都成 LF），类 Unix 原样。
+function textOut(b: Bytes): string {
+    const t = lossyText(b);
+    if (hostTarget() != "windows") {
+        return t;
+    }
+    const src = bytesFromStr(t);
+    const out = bytesNew(0);
+    let i = 0;
+    while (i < bytesLen(src)) {
+        const ch = bytesGet(src, i) ?? 0;
+        if (ch == 13) {
+            bytesPush(out, 10);
+            if ((bytesGet(src, i + 1) ?? 0) == 10) {
+                i = i + 1;
+            }
+        } else {
+            bytesPush(out, ch);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(out) catch t;
+}
+
+function record(s: Ref<Sec>, row: Row): Row {
+    const j = jObject();
+    jSet(j, "label", jString(row.label));
+    if (row.hasExit) {
+        jSet(j, "exit", jNumber(row.exit));
+    } else {
+        jSet(j, "exit", jNull());
+    }
+    jSet(j, "stdout", jString(row.out));
+    jSet(j, "stderr", jString(row.err));
+    jPush(s.rows, j);
+    saveSec(s);
+    return row;
+}
+
+function secCheck(s: Ref<Sec>, name: string, ok: bool, detail: string): bool {
+    return check(s.c, "independent-security: " + name, ok, detail);
+}
+
+// 编 C 驱动：驱动共用的独立分配器（*.h）与在夹具目录里的源文件先拷进工作目录。
+function cbuild(s: Ref<Sec>, name: string, sources: List<string>, flags: List<string>): bool {
+    const fixtures = nat(join(s.c.root, "tests/runtime-security"));
+    const none: List<string> = listNew();
+    const entries = listDir(fixtures) catch none;
+    for (e in entries) {
+        if (len(e) > 2 && (byteAt(e, len(e) - 2) ?? 0) == 46 && (byteAt(e, len(e) - 1) ?? 0) == 104) {
+            copyFile(nat(join(fixtures, e)), nat(join(s.work, e)), false);
+        }
+    }
+    for (src in sources) {
+        if (kindOf(nat(join(fixtures, src))) == 1) {
+            copyFile(nat(join(fixtures, src)), nat(join(s.work, src)), false);
+        }
+    }
+    const args = plusL(plusL(strs(["-O2", "-Wall", "-Wextra"]), flags), plusL(sources, strs(["-o", name])));
+    const p = sh(s.c, s.cc, args, s.work, 60);
+    return secCheck(s, "C build " + name, p.code == 0, reprStr(lossyText(p.err)));
+}
+
+function txbuild(s: Ref<Sec>, source: string, name: string, flags: List<string>): string {
+    const out = nat(join(s.work, name));
+    const p = tx(s.c, plusL(plusL(strs(["build", source]), flags), strs(["--out", out])));
+    secCheck(s, "TX build " + name, p.code == 0, reprStr(lossyText(p.err)));
+    if (p.code != 0) {
+        return "";
+    }
+    let stem = baseName(source);
+    if (len(stem) > 3 && (byteAt(stem, len(stem) - 3) ?? 0) == 46) {
+        stem = bytesToStr(bytesSlice(bytesFromStr(stem), 0, len(stem) - 3)) catch stem;
+    }
+    return nat(join(out, stem + s.suffix));
+}
+
+function baseName(p: string): string {
+    const b = bytesFromStr(p);
+    let start = 0;
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const ch = bytesGet(b, i) ?? 0;
+        if (ch == 47 || ch == 92) {
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return bytesToStr(bytesSlice(b, start, bytesLen(b) - start)) catch p;
+}
+
+// 测试专用的对象生成器（bootstrap/native_*_probe.tx）属工具链程序：读 TAIXU_PROBE_FORMAT、写文件。每个只编一次（编不过也只试一次）。
+function generator(s: Ref<Sec>, producer: string): string {
+    let i = 0;
+    while (i < listLen(s.genNames)) {
+        if ((listGet(s.genNames, i) catch "") == producer) {
+            return listGet(s.genPaths, i) catch "";
+        }
+        i = i + 1;
+    }
+    const path = txbuild(s, nat(join(join(s.c.root, "bootstrap"), producer + ".tx")), producer, strs(["--toolchain"]));
+    listPush(s.genNames, producer);
+    listPush(s.genPaths, path);
+    return path;
+}
+
+function inList(v: int, xs: []int): bool {
+    for (x in xs) {
+        if (x == v) {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct Arch {
+    triple: string,
+    flags: List<string>,
+    tag: string,
+}
+
+struct Producer {
+    name: string,
+    cname: string,
+    modes: List<string>,
+}
+
+function modeFlags(mode: string): List<string> {
+    if (mode == "nrt") {
+        return strs(["-DRC_NRT"]);
+    }
+    if (mode == "generic") {
+        return strs(["-DRC_NRT", "-DRC_GENERIC"]);
+    }
+    if (mode == "quarantine") {
+        return strs(["-DSLOTS_QUARANTINE"]);
+    }
+    return listNew();
+}
+
+function marker(cname: string): string {
+    if (cname == "rc-boundary.c") {
+        return "PASS RC";
+    }
+    if (cname == "slot-faults.c") {
+        return "PASS slots:";
+    }
+    if (cname == "try-io.c") {
+        return "PASS try-write";
+    }
+    if (cname == "weak-faults.c") {
+        return "PASS weak:";
+    }
+    return "PASS argv:";
+}
+
+function securityChecks(c: Ref<Ctx>): void | Error {
+    const work = nat(join(c.work, "independent-security"));
+    mkdirs(work);
+    const windows = hostTarget() == "windows";
+    const macos = hostTarget() == "macos";
+    let target = "linux";
+    let suffix = "";
+    if (windows) {
+        target = "windows";
+        suffix = ".exe";
+    } else if (macos) {
+        target = "macos";
+    }
+    // 直调内核例程的 C 驱动在 macOS 上经 Mach-O 目标文件执行（v052-macho-object）：arm64 原生跑可移植版，x86_64 经 Rosetta 跑手写与
+    // 可移植版。try-io 的 macOS 探针对象带 SIGPIPE 处置（__tx_tool_nopipe），libSystem 调用由 try-io.c 提供。
+    let cc = getEnv("TAIXU_TEST_CC") ?? "";
+    for (n in ["cc", "gcc", "clang"]) {
+        if (len(cc) == 0) {
+            cc = findInPath(n);
+        }
+    }
+    check(c, "independent-security: C verifier available", len(cc) > 0, "set TAIXU_TEST_CC to a GCC/Clang compatible compiler");
+    if (len(cc) == 0) {
+        return;
+    }
+    const comp = readOr(c.compiler);
+    const s = new Sec { c: c, work: work, windows: windows, macos: macos, target: target, suffix: suffix, cc: cc, compilerSha: hexOf(sha256Of(comp, 0, bytesLen(comp))),
+        rows: jArray(), genNames: listNew(), genPaths: listNew() };
+    securityBody(s)?;
+}
+
+function securityBody(s: Ref<Sec>): void | Error {
+    const c = s.c;
+    const work = s.work;
+    const windows = s.windows;
+    const macos = s.macos;
+    const objExt = s.suffix;
+    let obj = ".o";
+    if (windows) {
+        obj = ".obj";
+    }
+    // (目标三元组, cc 的架构参数, 名字后缀)：macOS 宿主为 Apple silicon，arm64 原生、x86_64 经 Rosetta（目标文件为 Mach-O）；Linux 按
+    // 宿主架构（aarch64 宿主的系统 C 编译器只链 aarch64 对象）。
+    const a64Linux = !windows && !macos && hostArch() == "aarch64";
+    const arches: List<Arch> = listNew();
+    if (macos) {
+        listPush(arches, Arch { triple: "aarch64-macos", flags: listNew(), tag: "-aarch64" });
+        listPush(arches, Arch { triple: "x86_64-macos", flags: strs(["-arch", "x86_64"]), tag: "-x86_64" });
+    } else if (a64Linux) {
+        listPush(arches, Arch { triple: "aarch64-linux", flags: listNew(), tag: "" });
+    } else {
+        listPush(arches, Arch { triple: "x86_64-" + s.target, flags: listNew(), tag: "" });
+    }
+    for (a in arches) {
+        const a64 = contains(a.triple, "aarch64");
+        const producers: List<Producer> = listNew();
+        // arm64 内核全为可移植版（rtfn），没有手写的 plain／nrt。
+        if (a64) {
+            listPush(producers, Producer { name: "native_rc_boundary_probe", cname: "rc-boundary.c", modes: strs(["generic"]) });
+        } else {
+            listPush(producers, Producer { name: "native_rc_boundary_probe", cname: "rc-boundary.c", modes: strs(["plain", "nrt", "generic"]) });
+        }
+        // quarantine：页堆内核的对象号隔离（检测形态，设计 v052-heap-check-tool）。
+        listPush(producers, Producer { name: "native_store_slots_probe", cname: "slot-faults.c", modes: strs(["", "quarantine"]) });
+        listPush(producers, Producer { name: "native_try_io_probe", cname: "try-io.c", modes: strs([""]) });
+        listPush(producers, Producer { name: "native_weak_table_probe", cname: "weak-faults.c", modes: strs([""]) });
+        if (windows) {
+            listPush(producers, Producer { name: "native_windows_argv_probe", cname: "argv-split.c", modes: strs([""]) });
+        }
+        for (pr in producers) {
+            const gen = generator(s, pr.name);
+            if (len(gen) == 0) {
+                continue;
+            }
+            for (mode in pr.modes) {
+                let name = pr.name + a.tag;
+                if (len(mode) > 0) {
+                    name = pr.name + "-" + mode + a.tag;
+                }
+                const objPath = nat(join(work, name + obj));
+                let gargs = strs(["--target", a.triple, objPath]);
+                if (len(mode) > 0) {
+                    listPush(gargs, mode);
+                }
+                const generated = execute(s, gen, gargs, name + "-object", "", "");
+                secCheck(s, "object " + name, generated.hasExit && generated.exit == 0 && kindOf(objPath) == 1, rowText(generated));
+                if (!(generated.hasExit && generated.exit == 0)) {
+                    continue;
+                }
+                const binary = "check-" + name + objExt;
+                if (!cbuild(s, binary, plusL(strs([pr.cname]), strs([name + obj])), plusL(a.flags, modeFlags(mode)))) {
+                    continue;
+                }
+                // argv 驱动逐个起子进程走完整取参路径（procSpawnLimited 的作业对象至多 32 个进程）。
+                const row = execute(s, nat(join(work, binary)), listNew(), name, "", "");
+                secCheck(s, name, row.hasExit && row.exit == 0 && contains(row.out, marker(pr.cname)), rowText(row));
+                if (pr.cname == "rc-boundary.c" && a.triple == "aarch64-linux") {
+                    // 同一驱动强制走 LL/SC（TX_A64_LLSC=1）：原子的两种形态都在真机上核对（缺省按 auxv 的 LSE 标志）。
+                    const lr = execute(s, nat(join(work, binary)), listNew(), name + "-llsc", "TX_A64_LLSC", "1");
+                    secCheck(s, name + " LL/SC", lr.hasExit && lr.exit == 0 && contains(lr.out, "atomics llsc") && contains(lr.out, marker(pr.cname)), rowText(lr));
+                }
+                if (pr.cname == "rc-boundary.c" && (mode == "nrt" || mode == "generic")) {
+                    // 过度释放（运行时加固 H1）：计数已为 0 再释放，快路径与三个通用臂都以 4012 终止、不返回。
+                    let arm = 0;
+                    while (arm < 4) {
+                        const orr = execute(s, nat(join(work, binary)), strs(["over-release", toStr(arm)]), mode + a.tag + "-over-release-" + toStr(arm), "", "");
+                        secCheck(s, mode + a.tag + " over-release arm " + toStr(arm), orr.hasExit && orr.exit == 88
+                            && contains(orr.out, "TRAP code=4012 fn=ffffffff pc=0") && contains(orr.out, "引用计数下溢"), rowText(orr));
+                        arm = arm + 1;
+                    }
+                }
+                if (pr.cname == "slot-faults.c" && mode == "quarantine") {
+                    // 负对照：检测形态的检查对标准形态的对象必须失败（标准槽表立即复用号码、状态只有 64 字节）。
+                    const plain = "native_store_slots_probe" + a.tag + obj;
+                    if (kindOf(nat(join(work, plain))) == 1 && cbuild(s, binary + "-negative", strs([pr.cname, plain]), plusL(a.flags, strs(["-DSLOTS_QUARANTINE"])))) {
+                        const nr = execute(s, nat(join(work, binary + "-negative")), listNew(), name + "-negative", "", "");
+                        secCheck(s, name + " negative (standard slots)", !(nr.hasExit && nr.exit == 0) && !contains(nr.out, "PASS slots:"), rowText(nr));
+                    }
+                }
+                if (pr.cname == "slot-faults.c") {
+                    const controls: []string = ["invalid-free", "double-free", "left-canary", "right-bound", "use-after-free"];
+                    for (control in controls) {
+                        const cr = execute(s, nat(join(work, binary)), strs([control]), control + a.tag, "", "");
+                        let ok = false;
+                        if (cr.hasExit) {
+                            if (control == "invalid-free") {
+                                ok = cr.exit == 84;
+                            } else if (control == "double-free") {
+                                ok = cr.exit == 85;
+                            } else if (control == "left-canary") {
+                                ok = cr.exit == 86;
+                            } else if (windows) {
+                                // 访问无权限页：Windows 0xC0000005；Linux SIGSEGV；macOS 为 SIGBUS 或 SIGSEGV。
+                                ok = cr.exit == 3221225477;
+                            } else if (macos) {
+                                ok = inList(cr.exit, [-10, 138, -11, 139]);
+                            } else {
+                                ok = inList(cr.exit, [-11, 139]);
+                            }
+                        }
+                        secCheck(s, "detector control " + control + a.tag, ok, rowText(cr));
+                    }
+                }
+            }
+        }
+    }
+    machoPairs(s);
+    if (!windows && !macos && cbuild(s, "reaper-layout", strs(["reaper-layout.c", "reaper-signal-layout.c"]), listNew())) {
+        const row = execute(s, nat(join(work, "reaper-layout")), listNew(), "reaper-layout", "", "");
+        secCheck(s, "Linux reaper ABI", row.hasExit && row.exit == 0 && contains(row.out, "PASS independent Linux reaper ABI headers"), rowText(row));
+    }
+    ffiChecks(s, a64Linux)?;
+}
+
+// Mach-O 目标文件对照同一映像的 ELF（独立解析，scripts/check_macho_pair.tx）：任何宿主都可交叉生成，三端都执行。
+function machoPairs(s: Ref<Sec>): void {
+    const work = s.work;
+    const triples: []string = ["aarch64-macos", "x86_64-macos"];
+    for (triple in triples) {
+        const prods: List<string> = listNew();
+        const modes: List<string> = listNew();
+        if (triple == "aarch64-macos") {
+            listPush(prods, "native_rc_boundary_probe");
+            listPush(modes, "generic");
+        } else {
+            listPush(prods, "native_rc_boundary_probe");
+            listPush(modes, "plain");
+            listPush(prods, "native_rc_boundary_probe");
+            listPush(modes, "nrt");
+            listPush(prods, "native_rc_boundary_probe");
+            listPush(modes, "generic");
+        }
+        listPush(prods, "native_store_slots_probe");
+        listPush(modes, "");
+        listPush(prods, "native_store_slots_probe");
+        listPush(modes, "quarantine");
+        listPush(prods, "native_weak_table_probe");
+        listPush(modes, "");
+        let i = 0;
+        while (i < listLen(prods)) {
+            const producer = listGet(prods, i) catch "";
+            const mode = listGet(modes, i) catch "";
+            i = i + 1;
+            const gen = generator(s, producer);
+            if (len(gen) == 0) {
+                continue;
+            }
+            let name = "pair-" + producer + "-" + triple;
+            if (len(mode) > 0) {
+                name = "pair-" + producer + "-" + mode + "-" + triple;
+            }
+            let elf = bytesNew(0);
+            let macho = bytesNew(0);
+            let generated = true;
+            for (fmt in ["elf", "macho"]) {
+                const objPath = nat(join(work, name + "." + fmt + ".o"));
+                let gargs = strs(["--target", triple, objPath]);
+                if (len(mode) > 0) {
+                    listPush(gargs, mode);
+                }
+                const row = execute(s, gen, gargs, name + "-" + fmt, "TAIXU_PROBE_FORMAT", fmt);
+                if (row.hasExit && row.exit == 0 && kindOf(objPath) == 1) {
+                    if (fmt == "elf") {
+                        elf = readOr(objPath);
+                    } else {
+                        macho = readOr(objPath);
+                    }
+                } else {
+                    generated = false;
+                }
+            }
+            let problems: List<string> = listNew();
+            if (!generated) {
+                listPush(problems, "generation failed");
+            } else {
+                problems = machoPairProblems(elf, macho);
+            }
+            let detail = "";
+            let k = 0;
+            for (pb in problems) {
+                if (k < 8) {
+                    if (k > 0) {
+                        detail = detail + "; ";
+                    }
+                    detail = detail + pb;
+                }
+                k = k + 1;
+            }
+            const shown = bytesToStr(bytesSlice(bytesFromStr(name), 5, len(name) - 5)) catch name;
+            secCheck(s, "Mach-O object vs ELF " + shown, listLen(problems) == 0, detail);
+        }
+    }
+}
+
+function ffiChecks(s: Ref<Sec>, a64Linux: bool): void | Error {
+    const work = s.work;
+    const windows = s.windows;
+    const macos = s.macos;
+    let library = "libffi_safety_probe.so";
+    if (windows) {
+        library = "ffi_safety_probe.dll";
+    } else if (macos) {
+        library = "libffi_safety_probe.dylib";
+    }
+    // macOS 按 LC_LOAD_DYLIB 绑定库路径（D3 外部库写法：绝对路径、@executable_path/、@loader_path/），给绝对路径；其余宿主产物旁边的
+    // 库即可（同 test_heap_check.tx）。
+    let named = library;
+    if (macos) {
+        named = nat(join(work, library));
+    }
+    // 回调前后被调方保存的向量寄存器：Windows xmm6–15、arm64 d8–d15（Apple silicon 上产物为 aarch64-macos，aarch64 Linux 上为
+    // aarch64-linux；x86_64 的 SysV 没有被调方保存的向量寄存器）。
+    const simd: List<string> = listNew();
+    if (windows) {
+        listPush(simd, "xmm-windows.S");
+    } else if (macos || a64Linux) {
+        listPush(simd, "simd-arm64.S");
+    }
+    let libFlags = strs(["-shared", "-fPIC"]);
+    if (windows) {
+        libFlags = strs(["-shared", "-static-libgcc"]);
+    }
+    if (!cbuild(s, library, plusL(strs(["ffi-probe.c"]), simd), libFlags)) {
+        return;
+    }
+    const fixtures: List<string> = listNew();
+    listPush(fixtures, "ffi-bytes");
+    if (listLen(simd) > 0) {
+        listPush(fixtures, "ffi-xmm");
+    }
+    for (mode in ["normal", "leak", "debug"]) {
+        let flags: List<string> = listNew();
+        if (mode == "leak") {
+            flags = strs(["--leak-check"]);
+        } else if (mode == "debug") {
+            flags = strs(["--debug"]);
+        }
+        for (fixture in fixtures) {
+            const source = nat(join(work, fixture + ".tx"));
+            const text = lossyText(readOr(nat(join(join(s.c.root, "tests/runtime-security"), fixture + ".tx"))));
+            writeText(source, replaceAll(text, "from \"ffi_safety_probe\"", "from \"" + named + "\""))?;
+            const product = txbuild(s, source, fixture + "-" + mode, flags);
+            if (len(product) == 0) {
+                continue;
+            }
+            copyFile(nat(join(work, library)), nat(join(dirOfPath(product), library)), false);
+            if (fixture == "ffi-xmm") {
+                const row = execute(s, product, listNew(), fixture + "-" + mode, "", "");
+                let label = "A64 d8-d15 ";
+                if (windows) {
+                    label = "XMM128 ";
+                }
+                secCheck(s, label + mode, row.hasExit && row.exit == 0 && contains(row.out, "PASS_XMM128"), rowText(row));
+            } else {
+                // D3 v0.34：借用期内任何改变长度的操作 trap 4024，与容量无关；*-spare 先留出空余容量（v0.33 的按容量规则放行这几种），
+                // list-push-spare 走内核快路径。
+                const actions: []string = ["safe", "push", "empty-push", "append", "list-push", "list-insert", "after-nested", "push-spare", "append-spare",
+                    "list-push-spare", "list-pop", "list-remove"];
+                for (action in actions) {
+                    const row = execute(s, product, strs([action]), fixture + "-" + mode + "-" + action, "", "");
+                    // 4024 须由内建按调用处报出（带源码位置）：落到运行时内部不带位置的兜底，说明有快路径漏查借用位。
+                    let expected = false;
+                    if (action == "safe") {
+                        expected = row.hasExit && row.exit == 0 && contains(row.out, "PASS_FFI_BYTES_ALIAS");
+                    } else {
+                        expected = row.hasExit && row.exit == 3 && contains(row.err, "[runtime:ffi_buffer_borrow]") && contains(row.err, "ffi-bytes.tx:");
+                    }
+                    secCheck(s, "Bytes " + mode + ":" + action, expected, rowText(row));
+                }
+            }
+        }
+    }
+}
+
+function dirOfPath(p: string): string {
+    const b = bytesFromStr(p);
+    let cut = -1;
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const ch = bytesGet(b, i) ?? 0;
+        if (ch == 47 || ch == 92) {
+            cut = i;
+        }
+        i = i + 1;
+    }
+    if (cut <= 0) {
+        return p;
+    }
+    return bytesToStr(bytesSlice(b, 0, cut)) catch p;
+}
+
+function replaceAll(s: string, from: string, to: string): string {
+    const parts = strSplit(s, from);
+    let out = "";
+    let i = 0;
+    for (p in parts) {
+        if (i > 0) {
+            out = out + to;
+        }
+        out = out + p;
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---- 内存上限扫描（原 oom_sweep_checks） ----
+
+struct Capped {
+    exit: int,
+    hasExit: bool,
+    timedOut: bool,
+    out: string,
+    err: string,
+    limit: int,
+    spawnError: string,
+}
+
+function capped(exe: string, work: string, limit: int, rows: Ref<Jv>): Capped {
+    const r = captureLimited(exe, listNew(), work, 30 * SEC, 10 * SEC, MAX_OUTPUT, limit, 20) catch (e) {
+        const x = Capped { exit: 0, hasExit: false, timedOut: false, out: "", err: "", limit: limit, spawnError: e.message };
+        pushCapped(rows, x);
+        return x;
+    };
+    const x = Capped { exit: r.code, hasExit: !r.timedOut, timedOut: r.timedOut, out: textOut(r.out), err: textOut(r.err), limit: limit, spawnError: "" };
+    pushCapped(rows, x);
+    return x;
+}
+
+function pushCapped(rows: Ref<Jv>, x: Capped): void {
+    const j = jObject();
+    if (x.hasExit) {
+        jSet(j, "exit", jNumber(x.exit));
+    } else {
+        jSet(j, "exit", jNull());
+    }
+    jSet(j, "stdout", jString(x.out));
+    jSet(j, "stderr", jString(x.err));
+    if (len(x.spawnError) > 0) {
+        jSet(j, "exec_error", jString(x.spawnError));
+    }
+    if (x.timedOut) {
+        jSet(j, "timeout", boolJv(true));
+    }
+    jSet(j, "limit", jNumber(x.limit));
+    jPush(rows, j);
+}
+
+function onlyJoinFailed(lines: List<string>, upTo: int): bool {
+    let i = 0;
+    while (i < upTo) {
+        if ((listGet(lines, i) catch "") != "JOIN_FAILED") {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 同 Python 的 str.splitlines（这里只会出现 \n 与 \r\n）。
+function splitLines(s: string): List<string> {
+    const out: List<string> = listNew();
+    if (len(s) == 0) {
+        return out;
+    }
+    for (line in strSplit(s, "\n")) {
+        if (len(line) > 0 && (byteAt(line, len(line) - 1) ?? 0) == 13) {
+            listPush(out, bytesToStr(bytesSlice(bytesFromStr(line), 0, len(line) - 1)) catch line);
+        } else {
+            listPush(out, line);
+        }
+    }
+    if ((byteAt(s, len(s) - 1) ?? 0) == 10) {
+        const last = listPop(out);
+    }
+    return out;
+}
+
+// 每次只许三种结局：跑完且校验和正确（pass）；致命 OOM（退出码 3、“taixu: 内存不足”、无别的输出）；进程在太虚代码运行之前就起不来
+// （loader：Windows 加载器的 0xC0000142／0xC0000017，类 Unix 为 exec 失败，均无任何输出）。超时算作 other。
+function kindOf2(x: Capped, expected: string, windows: bool): string {
+    if (x.timedOut) {
+        return "other";
+    }
+    const lines = splitLines(x.out);
+    const n = listLen(lines);
+    if (x.hasExit && x.exit == 0 && len(x.err) == 0 && n > 0 && (listGet(lines, n - 1) catch "") == expected && onlyJoinFailed(lines, n - 1)) {
+        return "pass";
+    }
+    if (x.hasExit && x.exit == 3 && x.err == "taixu: 内存不足\n" && onlyJoinFailed(lines, n)) {
+        return "oom";
+    }
+    if (len(x.out) == 0 && len(x.err) == 0) {
+        if (windows) {
+            if (x.hasExit && (x.exit == 3221225794 || x.exit == 3221225495)) {
+                return "loader";
+            }
+        } else if (!x.hasExit) {
+            return "loader";
+        }
+    }
+    return "other";
+}
+
+function oomSweep(c: Ref<Ctx>): void | Error {
+    if (hostTarget() == "macos") {
+        // 未执行，不记通过：macOS 不执行 RLIMIT_AS（setrlimit 即失败），内存上限由工具链的看守线程按物理足迹事后执行，扫描另需按那套
+        // 机制设计。
+        print("SKIP oom-sweep: macOS 宿主上不执行（没有可用的 RLIMIT_AS）；取页失败路径由门步 oom-fault 注入扫描覆盖");
+        return;
+    }
+    const work = nat(join(c.work, "oom-sweep"));
+    mkdirs(work);
+    const windows = hostTarget() == "windows";
+    const out = nat(join(work, "product"));
+    const p = tx(c, strs(["build", nat(join(c.root, "tests/runtime-security/oom-sweep.tx")), "--out", out]));
+    const both = bytesNew(0);
+    bytesAppend(both, p.out);
+    bytesAppend(both, p.err);
+    check(c, "oom-sweep: build", p.code == 0, reprStr(lossyText(both)));
+    if (p.code != 0) {
+        return;
+    }
+    const exe = nat(join(out, exeName("oom-sweep")));
+    const rows = jArray();
+    const full = capped(exe, work, 4 * GIB, rows);
+    const expected = stripText(full.out);
+    check(c, "oom-sweep: unlimited run", full.hasExit && full.exit == 0 && startsWithText(expected, "PASS_OOM_SWEEP "), cappedText(full));
+    if (!(full.hasExit && full.exit == 0)) {
+        return;
+    }
+    let low = 1048576;
+    let high = 4 * GIB;
+    // 能跑完的最小上限（近似：线程调度可能让边界附近不单调，扫描本身不依赖它精确）。
+    while (high - low > 65536) {
+        const mid = (low + high) / 2;
+        if (kindOf2(capped(exe, work, mid, rows), expected, windows) == "pass") {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    const points = 96;
+    const kinds: List<string> = listNew();
+    const counts: List<int> = listNew();
+    let i = 0;
+    while (i <= points) {
+        const limit = high / 3 + (high - high / 3) * i / points;
+        const k = kindOf2(capped(exe, work, limit, rows), expected, windows);
+        let found = -1;
+        let q = 0;
+        while (q < listLen(kinds)) {
+            if ((listGet(kinds, q) catch "") == k) {
+                found = q;
+            }
+            q = q + 1;
+        }
+        if (found < 0) {
+            listPush(kinds, k);
+            listPush(counts, 1);
+        } else {
+            listSet(counts, found, (listGet(counts, found) catch 0) + 1);
+        }
+        i = i + 1;
+    }
+    // 跑完的那些次里线程创建失败（JOIN_FAILED）的总次数；以及 other 结局的前五行。
+    let joins = 0;
+    let others = "";
+    let nothers = 0;
+    i = 0;
+    while (i < jLenArr(rows)) {
+        const x = cappedOf(item(rows, i));
+        const k = kindOf2(x, expected, windows);
+        if (k == "pass") {
+            joins = joins + countOf(x.out, "JOIN_FAILED");
+        }
+        if (k == "other") {
+            if (nothers < 5) {
+                others = others + cappedText(x) + " ";
+            }
+            nothers = nothers + 1;
+        }
+        i = i + 1;
+    }
+    const outcomes = jObject();
+    i = 0;
+    let oomCount = 0;
+    let summary = "{";
+    while (i < listLen(kinds)) {
+        const k = listGet(kinds, i) catch "";
+        const n = listGet(counts, i) catch 0;
+        jSet(outcomes, k, jNumber(n));
+        if (k == "oom") {
+            oomCount = n;
+        }
+        if (i > 0) {
+            summary = summary + ", ";
+        }
+        summary = summary + "'" + k + "': " + toStr(n);
+        i = i + 1;
+    }
+    summary = summary + "}";
+    const report = jObject();
+    jSet(report, "minimal_pass", jNumber(high));
+    jSet(report, "join_failed_runs", jNumber(joins));
+    jSet(report, "outcomes", outcomes);
+    jSet(report, "rows", rows);
+    writeText(nat(join(work, "report.json")), jPretty(report, 1) + "\n")?;
+    check(c, "oom-sweep: every capped run passes or ends in the defined fatal OOM", nothers == 0, others);
+    check(c, "oom-sweep: the sweep reaches allocation failures", oomCount >= 8, summary);
+}
+
+function jLenArr(v: Ref<Jv>): int {
+    return listLen(v.items);
+}
+
+// 报告里的一行还原成 Capped（统计用）。
+function cappedOf(v: Ref<Jv>?): Capped {
+    const e = at(v, "exit");
+    let hasExit = false;
+    let exit = 0;
+    if (e != None && !isNull(e)) {
+        hasExit = true;
+        exit = decOr(v, "exit", 0);
+    }
+    return Capped { exit: exit, hasExit: hasExit, timedOut: isTrueAt(v, "timeout"), out: textOf(v, "stdout"),
+        err: textOf(v, "stderr"), limit: decOr(v, "limit", 0), spawnError: textOf(v, "exec_error") };
+}
+
+function isTrueAt(v: Ref<Jv>?, key: string): bool {
+    const x = at(v, key);
+    return x != None && (x ?? jNull()).kind == J_BOOL && (x ?? jNull()).truth;
+}
+
+function countOf(s: string, needle: string): int {
+    let n = 0;
+    for (line in strSplit(s, needle)) {
+        n = n + 1;
+    }
+    return n - 1;
+}
+
+function cappedText(x: Capped): string {
+    let code = "None";
+    if (x.hasExit) {
+        code = toStr(x.exit);
+    }
+    return "{'exit': " + code + ", 'stdout': " + reprStr(headChars(x.out, 200)) + ", 'stderr': " + reprStr(headChars(x.err, 200)) + ", 'limit': "
+    + toStr(x.limit) + "}";
+}
+
+function stripText(s: string): string {
+    let i = 0;
+    let n = len(s);
+    while (i < n && isWs(byteAt(s, i) ?? 0)) {
+        i = i + 1;
+    }
+    while (n > i && isWs(byteAt(s, n - 1) ?? 0)) {
+        n = n - 1;
+    }
+    return bytesToStr(bytesSlice(bytesFromStr(s), i, n - i)) catch s;
+}
+
+function isWs(ch: int): bool {
+    return ch == 32 || ch == 9 || ch == 10 || ch == 13 || ch == 11 || ch == 12;
+}
+
+function startsWithText(s: string, prefix: string): bool {
+    if (len(s) < len(prefix)) {
+        return false;
+    }
+    let i = 0;
+    while (i < len(prefix)) {
+        if ((byteAt(s, i) ?? 0) != (byteAt(prefix, i) ?? 1)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function body(c: Ref<Ctx>): void | Error {
+    const work = c.work;
+    const built = tx(c, strs(["build", nat(join(c.root, "bootstrap/runtime_function_probe.tx")), "--toolchain", "--leak-check", "--out",
+                nat(join(work, "probe"))]));
+    check(c, "runtime ownership probe build", built.code == 0, reprStr(lossyText(built.err)));
+    const fixture = nat(join(work, "fixture"));
+    mkdirs(fixture);
+    if (built.code == 0) {
+        fixtureChecks(c, fixture)?;
+    }
+    kernelChecks(c, fixture, built.code == 0)?;
+    securityChecks(c)?;
+    oomSweep(c)?;
+}
+
+function run(argv: []string): int | Error {
+    let compiler = "";
+    let work = "";
+    let root = "";
+    let i = 0;
+    while (i + 1 < len(argv)) {
+        if (argv[i] == "--compiler") {
+            compiler = argv[i + 1];
+        } else if (argv[i] == "--work") {
+            work = argv[i + 1];
+        } else if (argv[i] == "--root") {
+            root = argv[i + 1];
+        } else {
+            return err("未知参数：" + argv[i]);
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0 || len(work) == 0 || i != len(argv)) {
+        return err("用法：taixu run --toolchain scripts/test_runtime_functions.tx --compiler <taixu> --work <目录> [--root <仓库>]");
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = osRealPath(absolute(nat(root)));
+    compiler = osRealPath(absolute(nat(compiler)));
+    if (!mkdirs(absolute(nat(work)))) {
+        return err("建不了工作目录：" + work);
+    }
+    work = osRealPath(absolute(nat(work)));
+    const c = new Ctx { compiler: compiler, root: root, work: work, checks: jArray(), total: 0, failures: 0 };
+    body(c)?;
+    const report = jObject();
+    let status = "PASS";
+    if (c.failures > 0) {
+        status = "FAIL";
+    }
+    jSet(report, "status", jString(status));
+    jSet(report, "total", jNumber(c.total));
+    jSet(report, "failed", jNumber(c.failures));
+    jSet(report, "checks", c.checks);
+    writeText(nat(join(work, "report.json")), jPretty(report, 2) + "\n")?;
+    print("runtime functions: " + toStr(c.total - c.failures) + " / " + toStr(c.total) + " PASS");
+    if (c.failures > 0) {
+        return 1;
+    }
+    return 0;
+}
+
+function main(argv: []string): int {
+    return run(argv) catch (e) {
+        eprint("test_runtime_functions: " + e.message);
+        return 1;
+    };
+}

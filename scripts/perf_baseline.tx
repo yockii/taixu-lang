@@ -1,0 +1,685 @@
+// 性能基线：用一个编译器测编译耗时套件与生成代码套件，结果追加到
+// bench/baseline/<宿主>.jsonl（每次一行，不改写旧行）。计数同 perf_compare.tx 的测量（perf_lib.tx）：Linux instructions:u，macOS
+// proc_pid_rusage 的退休指令数，Windows 子进程 CPU 周期（只记录）；Windows 上编译器先复制进工作目录再测（perf_lib 的 privateExe）。
+//
+// 编译套件（`<编译器> build <源> --out <目录>`；各项的实参记在 args 里）：
+//   主基准  self、lexer、parser、semamirror（bootstrap/ 下的编译器源码，带 --toolchain）、hello（examples/hello.tx）
+//   次基准  运行时现生成的压力输入（生成规则带版本号 STRESS_VERSION，改了规则须加一）：
+//           big-function（一个函数里 3000 条语句，压活跃与逃逸分析及其预算）、many-modules（200 个模块链式导入，压模块发现与链接）、
+//           deep-nesting（嵌套 64 层的 if 与循环，压控制流）
+// 生成代码套件：bench/algo 的九个负载（同构移植，校验和与 C 版逐字节一致才计入）；同机的参考实现——C（cc -O2 -ffp-contract=off，
+// bench/algo/cmp/cmp.c）必测，Go（cmp.go）、Rust（cmp.rs）在 PATH 上找得到才测，找不到记“未测”。参考只作定位，不作门。
+//
+//   taixu run --toolchain scripts/perf_baseline.tx --compiler <taixu> [--runs N] [--warmup N] [--suite compile,runtime]
+//       [--stdlib <标准库仓>] [--record <文件>] [--no-record] [--only <用例,…>] [--root <仓库根>]
+import { PerfSample } from "./perf_os";
+import { defaultMetric, defaultRuns, fixed, hostName, isoUtcNow, isPerfHelper, jBool, jFloat, median, metricNames, metricOf, perfHelperMain,
+    perfMeasure, privateExe, spreadPct, sampleJson } from "./perf_lib";
+import { absolute, deleteTree, dirOf, exeName, findInPath, join, kindOf, mkdirs, parseDigits, shaOf, trimLine } from "./build_lib";
+import { lossyText } from "./check_lib";
+import { captureRaw } from "./test_lib";
+import { J_NUM, J_OBJ, Jv, jArray, jDumpSpaced, jGet, jInt, jLen, jAt, jNull, jNumber, jObject, jParseBytes, jPush, jSet, jSorted, jString, jText } from "./test_json";
+
+const USAGE: string = "用法：perf_baseline --compiler <taixu> [--runs N] [--warmup N] [--suite compile,runtime] [--stdlib <标准库仓>]"
++ " [--record <文件>] [--no-record] [--only <用例,…>] [--root <仓库根>]";
+const STRESS_VERSION: int = 1;
+const PRIMARY: string = "self lexer parser semamirror hello";
+const SECONDARY: string = "big-function many-modules deep-nesting";
+const LOADS: string = "fib-rec fib-iter qsort sieve mandelbrot matmul nbody string-build-find json-roundtrip";
+const SEC: int = 1000000000;
+const LIMIT_MS: int = 3600000;
+const MAX_OUTPUT: int = 268435456;
+
+struct Opts {
+    root: string,
+    compiler: string,
+    runs: int,
+    warmup: int,
+    suite: string,
+    stdlib: string,
+    record: string,
+    noRecord: bool,
+    only: string,
+}
+
+function parse(argv: []string): Ref<Opts> | Error {
+    const o = new Opts { root: "", compiler: "", runs: 0, warmup: 1, suite: "compile,runtime", stdlib: "", record: "", noRecord: false, only: "" };
+    let i = 0;
+    while (i < len(argv)) {
+        const a = argv[i];
+        if (a == "--no-record") {
+            o.noRecord = true;
+            i = i + 1;
+            continue;
+        }
+        if (i + 1 >= len(argv)) {
+            return err(USAGE);
+        }
+        const v = argv[i + 1];
+        if (a == "--compiler") {
+            o.compiler = absolute(v);
+        } else if (a == "--runs") {
+            o.runs = parseDigits(v);
+            if (o.runs < 1) {
+                return err("--runs 须为正整数");
+            }
+        } else if (a == "--warmup") {
+            o.warmup = parseDigits(v);
+            if (o.warmup < 0) {
+                return err("--warmup 须为非负整数");
+            }
+        } else if (a == "--suite") {
+            o.suite = v;
+        } else if (a == "--stdlib") {
+            o.stdlib = absolute(v);
+        } else if (a == "--record") {
+            o.record = absolute(v);
+        } else if (a == "--only") {
+            o.only = v;
+        } else if (a == "--root") {
+            o.root = absolute(v);
+        } else {
+            return err(USAGE);
+        }
+        i = i + 2;
+    }
+    if (len(o.compiler) == 0) {
+        return err(USAGE);
+    }
+    if (len(o.root) == 0) {
+        o.root = absolute(currentDir() catch ".");
+    }
+    if (o.runs == 0) {
+        o.runs = defaultRuns();
+    }
+    // 标准库仓（json-roundtrip 用到 std/）：公开仓为仓内 stdlib/，开发仓为同级的 taixu-stdlib。
+    if (len(o.stdlib) == 0) {
+        if (kindOf(join(o.root, "stdlib/src")) == 2) {
+            o.stdlib = join(o.root, "stdlib");
+        } else {
+            o.stdlib = join(dirOf(o.root), "taixu-stdlib");
+        }
+    }
+    return o;
+}
+
+function has(csv: string, name: string): bool {
+    for (x in strSplit(csv, ",")) {
+        if (x == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function picked(o: Ref<Opts>, name: string): bool {
+    return len(o.only) == 0 || has(o.only, name);
+}
+
+// ---- 压力输入（与 STRESS_VERSION 1 的生成逐字节相同） ----
+
+function bigFunction(d: string): string | Error {
+    let s = "export function main(args: []string): int {\n    let a = len(args);\n    let b = 1;\n    let s = 0;\n";
+    let i = 0;
+    while (i < 3000) {
+        const k = i % 4;
+        if (k == 0) {
+            s = s + "    a = a + " + toStr(i % 97) + ";\n";
+        } else if (k == 1) {
+            s = s + "    if (a > " + toStr(i % 89) + ") { b = b + a; } else { b = b - 1; }\n";
+        } else if (k == 2) {
+            s = s + "    s = s + (a ^ b) % " + toStr(i % 83 + 1) + ";\n";
+        } else {
+            s = s + "    const t" + toStr(i) + " = s + b;\n    s = t" + toStr(i) + " % 1000003;\n";
+        }
+        i = i + 1;
+    }
+    s = s + "    print(toStr(s));\n    return 0;\n}\n";
+    const p = join(d, "big-function.tx");
+    writeFile(p, s)?;
+    return p;
+}
+
+function manyModules(d: string): string | Error {
+    const n = 200;
+    writeFile(join(d, "m0.tx"), "export function f0(x: int): int {\n    return x + 1;\n}\n")?;
+    let i = 1;
+    while (i < n) {
+        const prev = toStr(i - 1);
+        writeFile(join(d, "m" + toStr(i) + ".tx"), "import { f" + prev + " } from \"./m" + prev + "\";\n\nexport function f" + toStr(i)
+            + "(x: int): int {\n    return f" + prev + "(x) + " + toStr(i) + ";\n}\n")?;
+        i = i + 1;
+    }
+    const last = toStr(n - 1);
+    const p = join(d, "many-modules.tx");
+    writeFile(p, "import { f" + last + " } from \"./m" + last + "\";\n\nexport function main(args: []string): int {\n    print(toStr(f" + last
+        + "(len(args))));\n    return 0;\n}\n")?;
+    return p;
+}
+
+function indent(k: int): string {
+    let s = "";
+    let i = 0;
+    while (i < k) {
+        s = s + "    ";
+        i = i + 1;
+    }
+    return s;
+}
+
+function deepNesting(d: string): string | Error {
+    const depth = 64;
+    let s = "export function main(args: []string): int {\n    let s = 0;\n    let i = 0;\n";
+    let k = 0;
+    while (k < depth) {
+        const pad = indent(k + 1);
+        if (k % 2 == 0) {
+            s = s + pad + "if (i < " + toStr(1000 + k) + ") {\n";
+        } else {
+            s = s + pad + "while (s < " + toStr(k * 3 + 1) + ") {\n";
+        }
+        s = s + pad + "    s = s + " + toStr(k + 1) + ";\n";
+        k = k + 1;
+    }
+    k = depth - 1;
+    while (k >= 0) {
+        s = s + indent(k + 1) + "}\n";
+        k = k - 1;
+    }
+    s = s + "    print(toStr(s));\n    return 0;\n}\n";
+    const p = join(d, "deep-nesting.tx");
+    writeFile(p, s)?;
+    return p;
+}
+
+// 编译套件一项的源与开关。
+function compileArgs(name: string, stress: string): List<string> | Error {
+    const out: List<string> = listNew();
+    if (name == "self") {
+        listPush(out, "bootstrap/taixu.tx");
+        listPush(out, "--toolchain");
+    } else if (name == "lexer" || name == "parser" || name == "semamirror") {
+        // 编译器源码按工具链程序编（v0.51 起 byteAt、listGet 等在两种模式下签名不同）。
+        listPush(out, "bootstrap/" + name + ".tx");
+        listPush(out, "--toolchain");
+    } else if (name == "hello") {
+        listPush(out, "examples/hello.tx");
+    } else if (name == "big-function") {
+        listPush(out, bigFunction(stress)?);
+    } else if (name == "many-modules") {
+        listPush(out, manyModules(stress)?);
+    } else {
+        listPush(out, deepNesting(stress)?);
+    }
+    return out;
+}
+
+// ---- 测量 ----
+
+// 先跑 warmup 次不计，再测 runs 次；各读数的中位数、极差与全部样本。
+function measure(o: Ref<Opts>, exe: string, args: List<string>, cwd: string, label: string): Ref<Jv> | Error {
+    let w = 0;
+    while (w < o.warmup) {
+        const s = perfMeasure(exe, args, cwd, LIMIT_MS);
+        if (len(s.error) > 0) {
+            return err(label + " 测不了：" + s.error);
+        }
+        w = w + 1;
+    }
+    const rows: List<Ref<PerfSample>> = listNew();
+    let r = 0;
+    while (r < o.runs) {
+        const s = perfMeasure(exe, args, cwd, LIMIT_MS);
+        if (len(s.error) > 0) {
+            return err(label + " 测不了：" + s.error);
+        }
+        if (s.exit != 0) {
+            return err(label + " 失败（退出码 " + toStr(s.exit) + "）：" + s.stderr);
+        }
+        listPush(rows, s);
+        r = r + 1;
+    }
+    const med = jObject();
+    const spread = jObject();
+    for (m in metricNames()) {
+        const xs: List<float> = listNew();
+        for (s in rows) {
+            listPush(xs, metricOf(s, m));
+        }
+        const v = median(xs);
+        jSet(med, m, jFloat(v));
+        jSet(spread, m, jFloat(spreadPct(xs, v)));
+    }
+    const samples = jArray();
+    for (s in rows) {
+        jPush(samples, sampleJson(s));
+    }
+    const out = jObject();
+    jSet(out, "median", med);
+    jSet(out, "spread_pct", spread);
+    jSet(out, "samples", samples);
+    return out;
+}
+
+// 画像里的整数（numeric_encoding 为 decimal-string/int64：64 位整数写成十进制字符串；也收数字）；取不到记 null。
+function numOrNull(v: Ref<Jv>?): Ref<Jv> {
+    let n = jInt(v);
+    const t = jText(v);
+    if (n == None && t != None) {
+        n = jInt(new Jv { kind: J_NUM, text: t ?? "", truth: false, items: listNew(), keys: listNew() });
+    }
+    if (n == None) {
+        return jNull();
+    }
+    return jNumber(n ?? 0);
+}
+
+function wallTable(list: Ref<Jv>?): Ref<Jv> {
+    const o = jObject();
+    if (list == None) {
+        return o;
+    }
+    const a = list ?? jNull();
+    let i = 0;
+    while (i < jLen(a)) {
+        const q = jAt(a, i);
+        if (q != None) {
+            const item = q ?? jNull();
+            jSet(o, jText(jGet(item, "name")) ?? "", numOrNull(jGet(item, "wall_ns")));
+        }
+        i = i + 1;
+    }
+    return o;
+}
+
+// 不计时的一次 profile compile：分析预算命中、文本中转与阶段墙钟；旧编译器没有的字段记 null，整个取不到记 null。
+function profileFacts(o: Ref<Opts>, src: List<string>): Ref<Jv> {
+    const args: List<string> = listNew();
+    listPush(args, "profile");
+    listPush(args, "compile");
+    for (s in src) {
+        listPush(args, s);
+    }
+    listPush(args, "--format=json");
+    listPush(args, "--top");
+    listPush(args, "0");
+    const r = captureRaw(o.compiler, args, o.root, 1800 * SEC, 10 * SEC, MAX_OUTPUT) catch (e) {
+        return jNull();
+    };
+    const doc = jParseBytes(r.out) catch (e) {
+        return jNull();
+    };
+    const pv = jGet(doc, "profile");
+    if (pv == None) {
+        return jNull();
+    }
+    const x = pv ?? doc;
+    if (x.kind != J_OBJ) {
+        return jNull();
+    }
+    const s = jGet(x, "summary") ?? jObject();
+    const hops = jGet(x, "text_hops") ?? jObject();
+    const f = jObject();
+    jSet(f, "functions", numOrNull(jGet(s, "functions_total")));
+    jSet(f, "analysis_skipped_functions", numOrNull(jGet(s, "analysis_skipped_functions")));
+    jSet(f, "analysis_max_cells", numOrNull(jGet(s, "analysis_max_cells")));
+    jSet(f, "analysis_budget_cells", numOrNull(jGet(s, "analysis_budget_cells")));
+    jSet(f, "seb1_utf8_bytes", numOrNull(jGet(hops, "seb1_utf8_bytes")));
+    jSet(f, "fab1_utf8_bytes", numOrNull(jGet(hops, "fab1_utf8_bytes")));
+    jSet(f, "record_utf8_bytes", numOrNull(jGet(s, "record_utf8_bytes")));
+    jSet(f, "phases_ns", wallTable(jGet(x, "phases")));
+    jSet(f, "codegen_details_ns", wallTable(jGet(x, "codegen_details")));
+    return f;
+}
+
+function gitCommit(root: string): string {
+    const git = findInPath("git");
+    if (len(git) == 0) {
+        return "";
+    }
+    const args: List<string> = listNew();
+    listPush(args, "rev-parse");
+    listPush(args, "HEAD");
+    const r = captureRaw(git, args, root, 60 * SEC, 5 * SEC, 65536) catch (e) {
+        return "";
+    };
+    if (r.code != 0) {
+        return "";
+    }
+    return trimLine(lossyText(r.out));
+}
+
+// 跑一下，成功得 stdout；失败得 None。
+function quiet(exe: string, args: List<string>, cwd: string): Bytes? {
+    const r = captureRaw(exe, args, cwd, 1800 * SEC, 10 * SEC, MAX_OUTPUT) catch (e) {
+        return None;
+    };
+    if (r.code != 0 || r.timedOut) {
+        return None;
+    }
+    return r.out;
+}
+
+function args3(a: string, b: string, c: string): List<string> {
+    const out: List<string> = listNew();
+    listPush(out, a);
+    listPush(out, b);
+    listPush(out, c);
+    return out;
+}
+
+struct Refs {
+    names: List<string>,
+    exes: List<string>,
+}
+
+// 同机的参考实现：C 必备（TAIXU_TEST_CC，否则 PATH 上的 cc／gcc／clang），Go、Rust 找得到才编。编不出的记空串。
+function references(o: Ref<Opts>, work: string): Ref<Refs> {
+    const src = join(o.root, "bench/algo/cmp");
+    const refs = new Refs { names: listNew(), exes: listNew() };
+    let cc = getEnv("TAIXU_TEST_CC") ?? "";
+    for (name in strSplit("cc,gcc,clang", ",")) {
+        if (len(cc) == 0) {
+            cc = findInPath(name);
+        }
+    }
+    let c = "";
+    if (len(cc) > 0) {
+        const out = join(work, exeName("cmp-c"));
+        // -ffp-contract=off：不把乘加融合成 FMA，按 IEEE 逐步舍入（同太虚）；Apple clang 默认融合，arm64 上 nbody 的结果会变。
+        const a: List<string> = listNew();
+        listPush(a, "-O2");
+        listPush(a, "-ffp-contract=off");
+        listPush(a, "-o");
+        listPush(a, out);
+        listPush(a, join(src, "cmp.c"));
+        if (quiet(cc, a, work) != None) {
+            c = out;
+        }
+    }
+    listPush(refs.names, "c");
+    listPush(refs.exes, c);
+    const go = findInPath("go");
+    let g = "";
+    if (len(go) > 0) {
+        const out = join(work, exeName("cmp-go"));
+        const a = args3("build", "-o", out);
+        listPush(a, join(src, "cmp.go"));
+        if (quiet(go, a, work) != None) {
+            g = out;
+        }
+    }
+    listPush(refs.names, "go");
+    listPush(refs.exes, g);
+    const rustc = findInPath("rustc");
+    let rs = "";
+    if (len(rustc) > 0) {
+        const out = join(work, exeName("cmp-rs"));
+        const a = args3("-O", "-o", out);
+        listPush(a, join(src, "cmp.rs"));
+        if (quiet(rustc, a, work) != None) {
+            rs = out;
+        }
+    }
+    listPush(refs.names, "rust");
+    listPush(refs.exes, rs);
+    return refs;
+}
+
+// 换行统一成 LF 后比较。
+function sameText(a: Bytes, b: Bytes): bool {
+    return lfOnly(a) == lfOnly(b);
+}
+
+function lfOnly(b: Bytes): string {
+    const out = bytesNew(0);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) ?? 0;
+        if (!(c == 13 && (bytesGet(b, i + 1) ?? 0) == 10)) {
+            bytesPush(out, c);
+        }
+        i = i + 1;
+    }
+    return lossyText(out);
+}
+
+function right(s: string, n: int): string {
+    let t = s;
+    while (len(t) < n) {
+        t = t + " ";
+    }
+    return t;
+}
+
+function compileSuite(o: Ref<Opts>, work: string, metric: string, record: Ref<Jv>): void | Error {
+    const stress = join(work, "stress");
+    if (!mkdirs(stress)) {
+        return err("建不了 " + stress);
+    }
+    const compile = jGet(record, "compile") ?? jObject();
+    for (tier in strSplit("primary,secondary", ",")) {
+        let names = PRIMARY;
+        if (tier == "secondary") {
+            names = SECONDARY;
+        }
+        for (name in strSplit(names, " ")) {
+            if (!picked(o, name)) {
+                continue;
+            }
+            const src = compileArgs(name, stress)?;
+            const args: List<string> = listNew();
+            listPush(args, "build");
+            for (s in src) {
+                listPush(args, s);
+            }
+            listPush(args, "--out");
+            listPush(args, join(work, "out-" + name));
+            const row = measure(o, o.compiler, args, o.root, name)?;
+            jSet(row, "tier", jString(tier));
+            const a = jArray();
+            for (s in src) {
+                jPush(a, jString(s));
+            }
+            jSet(row, "args", a);
+            jSet(row, "profile", profileFacts(o, src));
+            jSet(compile, name, row);
+            const med = jGet(jGet(row, "median") ?? row, metric) ?? row;
+            const spr = jGet(jGet(row, "spread_pct") ?? row, metric) ?? row;
+            print("compile " + right(name, 14) + " " + right(tier, 9) + " " + metric + " " + med.text + "（极差 "
+                + fixed(parseFloatText(spr.text), 3, false) + "%）");
+        }
+    }
+    return nothing();
+}
+
+function nothing(): void {
+}
+
+// JSON 数字原文转回 float（只用于打印）。
+function parseFloatText(t: string): float {
+    let v = 0.0;
+    let scale = 0.0;
+    let i = 0;
+    while (i < len(t)) {
+        const c = byteAt(t, i) ?? 0;
+        if (c == 46) {
+            scale = 1.0;
+        } else if (c >= 48 && c <= 57) {
+            v = v * 10.0 + ((c - 48) as float);
+            if (scale > 0.0) {
+                scale = scale * 10.0;
+            }
+        } else {
+            break;
+        }
+        i = i + 1;
+    }
+    if (scale > 0.0) {
+        return v / scale;
+    }
+    return v;
+}
+
+function medianOf(row: Ref<Jv>, metric: string): float {
+    const m = jGet(jGet(row, "median") ?? row, metric) ?? row;
+    return parseFloatText(m.text);
+}
+
+function runtimeSuite(o: Ref<Opts>, work: string, metric: string, record: Ref<Jv>, bad: List<string>): void | Error {
+    const refs = references(o, work);
+    const refJson = jObject();
+    let k = 0;
+    while (k < listLen(refs.names)) {
+        const exe = listGet(refs.exes, k) catch "";
+        if (len(exe) > 0) {
+            jSet(refJson, listGet(refs.names, k) catch "", jString(shaOf(exe)));
+        } else {
+            jSet(refJson, listGet(refs.names, k) catch "", jNull());
+        }
+        k = k + 1;
+    }
+    jSet(record, "references", refJson);
+    const runtime = jGet(record, "runtime") ?? jObject();
+    const cExe = listGet(refs.exes, 0) catch "";
+    for (load in strSplit(LOADS, " ")) {
+        if (!picked(o, load)) {
+            continue;
+        }
+        const out = join(work, "rt-" + load);
+        const b = args3("build", join(o.root, "bench/algo/" + load + ".tx"), "--out");
+        listPush(b, out);
+        const built = captureRaw(o.compiler, b, o.root, 1800 * SEC, 10 * SEC, MAX_OUTPUT)?;
+        const exe = join(out, exeName(load));
+        if (built.code != 0 || kindOf(exe) != 1) {
+            return err("编不了 " + load + "：" + lossyText(built.err));
+        }
+        const none: List<string> = listNew();
+        const got = quiet(exe, none, work) ?? bytesNew(0);
+        let matches = false;
+        if (len(cExe) > 0) {
+            const one: List<string> = listNew();
+            listPush(one, load);
+            const expect = quiet(cExe, one, work);
+            if (expect != None) {
+                matches = sameText(got, expect ?? bytesNew(0));
+            }
+        }
+        const entry = measure(o, exe, none, work, load)?;
+        jSet(entry, "product_bytes", jNumber(fileSize(exe) catch -1));
+        jSet(entry, "product_sha256", jString(shaOf(exe)));
+        jSet(entry, "checksum_matches_c", jBool(matches));
+        const rj = jObject();
+        k = 0;
+        while (k < listLen(refs.names)) {
+            const lang = listGet(refs.names, k) catch "";
+            const ref = listGet(refs.exes, k) catch "";
+            if (len(ref) > 0) {
+                const one: List<string> = listNew();
+                listPush(one, load);
+                jSet(rj, lang, measure(o, ref, one, work, lang + " " + load)?);
+            } else {
+                jSet(rj, lang, jNull());
+            }
+            k = k + 1;
+        }
+        jSet(entry, "refs", rj);
+        jSet(runtime, load, entry);
+        let ratio = "";
+        const cr = jGet(rj, "c");
+        if (cr != None && (cr ?? rj).kind == J_OBJ) {
+            const cm = medianOf(cr ?? rj, metric);
+            if (cm != 0.0) {
+                ratio = "，对 C " + fixed(medianOf(entry, metric) / cm, 2, false) + "×";
+            }
+        }
+        let note = "";
+        if (!matches) {
+            note = "（校验和与 C 不同）";
+            listPush(bad, load);
+        }
+        print("runtime " + right(load, 18) + " " + metric + " " + toStr(medianOf(entry, metric)) + ratio + note);
+    }
+    return nothing();
+}
+
+function main(argv: []string): int {
+    if (isPerfHelper(argv)) {
+        return perfHelperMain(argv);
+    }
+    const o = parse(argv) catch (e) {
+        eprint(e.message);
+        return 2;
+    };
+    const metric = defaultMetric();
+    const host = hostName();
+    setEnv("TAIXU_STDLIB", join(o.stdlib, "src")) catch (e) {
+        eprint("设不了 TAIXU_STDLIB：" + e.message);
+        return 2;
+    };
+    const work = join(tempDir(), "taixu-baseline-" + toStr(monoNs()));
+    if (!mkdirs(work)) {
+        eprint("建不了 " + work);
+        return 2;
+    }
+    o.compiler = privateExe(o.compiler, join(work, "compiler")) catch (e) {
+        deleteTree(work);
+        eprint(e.message);
+        return 2;
+    };
+    const record = jObject();
+    jSet(record, "schema", jString("perf-baseline/1"));
+    jSet(record, "date", jString(isoUtcNow()));
+    jSet(record, "host", jString(host));
+    jSet(record, "commit", jString(gitCommit(o.root)));
+    jSet(record, "compiler_sha256", jString(shaOf(o.compiler)));
+    jSet(record, "metric", jString(metric));
+    jSet(record, "runs", jNumber(o.runs));
+    jSet(record, "stress_version", jNumber(STRESS_VERSION));
+    jSet(record, "only", jString(o.only));
+    jSet(record, "compile", jObject());
+    jSet(record, "runtime", jObject());
+    jSet(record, "references", jObject());
+    const bad: List<string> = listNew();
+    if (has(o.suite, "compile")) {
+        compileSuite(o, work, metric, record) catch (e) {
+            deleteTree(work);
+            eprint(e.message);
+            return 1;
+        };
+    }
+    if (has(o.suite, "runtime")) {
+        runtimeSuite(o, work, metric, record, bad) catch (e) {
+            deleteTree(work);
+            eprint(e.message);
+            return 1;
+        };
+    }
+    deleteTree(work);
+    if (!o.noRecord) {
+        let path = o.record;
+        if (len(path) == 0) {
+            path = join(o.root, "bench/baseline/" + host + ".jsonl");
+        }
+        mkdirs(dirOf(path));
+        const before = readFile(path) catch "";
+        writeFile(path, before + jDumpSpaced(jSorted(record)) + "\n") catch (e) {
+            eprint("写不了 " + path + "：" + e.message);
+            return 1;
+        };
+        print("追加到 " + path);
+    }
+    if (listLen(bad) > 0) {
+        let names = "";
+        for (n in bad) {
+            if (len(names) > 0) {
+                names = names + ",";
+            }
+            names = names + n;
+        }
+        print("SUMMARY FAIL 校验和与 C 不同：" + names);
+        return 1;
+    }
+    print("SUMMARY PASS");
+    return 0;
+}

@@ -1,0 +1,124 @@
+// 控制台门（test_native_console.tx）的类 Unix 部分（Linux、macOS；导出面同 console_os_windows.tx）：外层开一对 PTY，经 /bin/sh 把
+// 标准三件改接到从端后 exec 内层助手（procSpawn 的子进程只拿到标准三件且 stdout／stderr 走管道，接不上别的描述符），环境加
+// LANG=C.UTF-8；读主端直到 EIO 或流尾（从端再无人持有），至多 90 秒。外层自己也开着从端，子进程结束后才关掉——结束前读主端不会
+// 因为 sh 还没开从端而提前得 EIO。内层助手先 setsid 自成会话（此时没有控制终端），再核对标准三件都是终端。系统原语在
+// console_sys_linux.tx／_macos.tx。
+import { Jv } from "./test_json";
+import { EINTR, EIO, closeFd, isTty as sysIsTty, newSession, ptyOpen, readFd, waitReadable } from "./console_sys";
+
+const LIMIT_NS: int = 90000000000;
+const BLOCK: int = 16384;
+const SHELL: string = "exec <\"$1\" >\"$1\" 2>\"$1\"\nLANG=C.UTF-8\nexport LANG\nshift\nexec \"$@\"\n";
+
+// 一次终端运行：退出码、读到的原始字节、读的过程中出的错。
+export struct Term {
+    code: int,
+    raw: Bytes,
+    errors: List<string>,
+}
+
+// 在 cwd 里把 argv 接到一对新的 PTY 上运行（至多 90 秒）。起不来、超时得 Error。
+export function terminal(argv: List<string>, cwd: string): Ref<Term> | Error {
+    const p = ptyOpen()?;
+    const args: List<string> = listNew();
+    listPush(args, "-c");
+    listPush(args, SHELL);
+    listPush(args, "sh");
+    listPush(args, p.path);
+    for (a in argv) {
+        listPush(args, a);
+    }
+    const h = procSpawn("/bin/sh", args, cwd, 0) catch (e) {
+        closeFd(p.slave);
+        closeFd(p.master);
+        return err("起不了 /bin/sh：" + e.message);
+    };
+    const raw = bytesNew(0);
+    const buf = bytesNew(BLOCK);
+    const deadline = monoNs() + LIMIT_NS;
+    let slave = p.slave;
+    let code = 0;
+    let ended = false;
+    let failure = "";
+    while (monoNs() < deadline) {
+        if (slave >= 0) {
+            const w = procWait(h, 0);
+            if (w != None) {
+                code = w ?? -1;
+                closeFd(slave);
+                slave = -1;
+            }
+        }
+        const ready = waitReadable(p.master, 100);
+        if (ready < 0 && ready != -EINTR) {
+            failure = "poll failed: errno " + toStr(-ready);
+            break;
+        }
+        if (ready > 0) {
+            const n = readFd(p.master, buf, BLOCK);
+            if (n == 0 || n == -EIO) {
+                ended = true;
+                break;
+            }
+            if (n < 0 && n != -EINTR) {
+                failure = "read failed: errno " + toStr(-n);
+                break;
+            }
+            if (n > 0) {
+                bytesAppend(raw, bytesSlice(buf, 0, n));
+            }
+        }
+    }
+    const errors: List<string> = listNew();
+    if (ended) {
+        // sh 改接标准三件之前的报错（若有）还在 stderr 管道里。
+        while (true) {
+            const n = procRead(h, 2, buf);
+            if (n <= 0) {
+                break;
+            }
+            listPush(errors, "sh: " + (bytesToStr(bytesSlice(buf, 0, n)) catch "<不是 UTF-8>"));
+        }
+    } else {
+        procKill(h);
+        const w = procWait(h, 5000);
+    }
+    procClose(h);
+    if (slave >= 0) {
+        closeFd(slave);
+    }
+    closeFd(p.master);
+    if (len(failure) > 0) {
+        return err(failure);
+    }
+    if (!ended) {
+        return err("PTY child exceeded 90 seconds");
+    }
+    return new Term { code: code, raw: raw, errors: errors };
+}
+
+// 内层助手：自成会话，核对标准三件都是终端（info 里已记）；不成立得原因，成立得空串。类 Unix 不设代码页。
+export function attach(page: int, info: Ref<Jv>): string {
+    const s = newSession();
+    if (s < 0) {
+        return "setsid failed: errno " + toStr(-s);
+    }
+    let k = 0;
+    while (k < 3) {
+        if (!sysIsTty(k)) {
+            return "standard descriptor " + toStr(k) + " is not a terminal";
+        }
+        k = k + 1;
+    }
+    return "";
+}
+
+// 描述符 n（0～2）是不是终端。
+export function isTty(n: int): bool {
+    return sysIsTty(n);
+}
+
+// 原样写字节到标准输出（只有 Windows 的反例用到）。
+export function writeRaw(b: Bytes): bool {
+    return stdoutWrite(b) == bytesLen(b);
+}

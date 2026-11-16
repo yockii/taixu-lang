@@ -1,0 +1,140 @@
+// Single-entry loop regions in the program CFG. Regions only describe control
+// flow; they do not assign registers or permit omitting any value-slot write.
+export struct ScalarBlock { first: int, last: int, succs: List<int> }
+export struct ScalarLoop {
+    header: int, last: int, parent: int, depth: int,
+    latches: List<int>, exitFrom: List<int>, exitTo: List<int>,
+}
+export struct ScalarLoops { regions: List<Ref<ScalarLoop>>, work: int, limited: bool }
+struct Budget { maximum: int, used: int }
+
+function charge(b: Ref<Budget>, amount: int): bool {
+    if (amount > b.maximum - b.used) { b.used = b.maximum; return false; }
+    b.used = b.used + amount; return true;
+}
+function limited(b: Ref<Budget>): ScalarLoops { return ScalarLoops { regions: listNew(), work: b.used, limited: true }; }
+function ints(n: int, value: int): List<int> {
+    const out: List<int> = listNew(); let i = 0; while (i < n) { listPush(out, value); i = i + 1; } return out;
+}
+function at(xs: List<int>, i: int): int { return listGet(xs, i) catch panic("scalar CFG index"); }
+function blockAt(xs: List<Ref<ScalarBlock>>, i: int): Ref<ScalarBlock> { return listGet(xs, i) catch panic("scalar CFG block"); }
+function loopAt(xs: List<Ref<ScalarLoop>>, i: int): Ref<ScalarLoop> { return listGet(xs, i) catch panic("scalar CFG region"); }
+function exitEdge(region: Ref<ScalarLoop>, owner: int, next: int, budget: Ref<Budget>): bool {
+    let i = listLen(region.exitFrom) - 1;
+    while (i >= 0 && at(region.exitFrom, i) == owner) {
+        if (!charge(budget, 1)) { return false; }
+        if (at(region.exitTo, i) == next) { return true; } i = i - 1;
+    }
+    listPush(region.exitFrom, owner); listPush(region.exitTo, next); return true;
+}
+
+/// Validates a contiguous block graph and discovers reachable, single-entry
+/// interval loops. Entries are explicit so resume entries cannot be overlooked.
+/// A work limit returns no partial plan; source compilation can retain slots.
+export function scalarLoops(blocks: List<Ref<ScalarBlock>>, entries: List<int>, maximum: int): ScalarLoops | Error {
+    if (maximum < 0) { return err("scalar CFG: negative work limit"); }
+    const budget = new Budget { maximum: maximum, used: 0 };
+    const n = listLen(blocks);
+    if (!charge(budget, n)) { return limited(budget); }
+    if (n == 0) {
+        if (listLen(entries) != 0) { return err("scalar CFG: entry outside graph"); }
+        return ScalarLoops { regions: listNew(), work: budget.used, limited: false };
+    }
+    if (listLen(entries) == 0) { return err("scalar CFG: missing entry"); }
+    const preds: List<List<int>> = listNew();
+    let i = 0;
+    while (i < n) { listPush(preds, listNew()); i = i + 1; }
+    i = 0;
+    while (i < n) {
+        const block = blockAt(blocks, i);
+        if (block.first < 0 || block.last < block.first || (i == 0 && block.first != 0)) { return err("scalar CFG: invalid PC range"); }
+        if (i > 0 && block.first - blockAt(blocks, i - 1).last != 1) { return err("scalar CFG: noncontiguous blocks"); }
+        for (next in block.succs) {
+            if (!charge(budget, 1)) { return limited(budget); }
+            if (next < 0 || next >= n) { return err("scalar CFG: successor outside graph"); }
+            const ps = listGet(preds, next) catch panic("scalar CFG predecessor");
+            if (listLen(ps) == 0 || at(ps, listLen(ps) - 1) != i) { listPush(ps, i); }
+        }
+        i = i + 1;
+    }
+    const roots = ints(n, 0); const reached = ints(n, 0); const queue: List<int> = listNew();
+    for (entry in entries) {
+        if (!charge(budget, 1)) { return limited(budget); }
+        if (entry < 0 || entry >= n) { return err("scalar CFG: entry outside graph"); }
+        listSet(roots, entry, 1);
+        if (at(reached, entry) == 0) { listSet(reached, entry, 1); listPush(queue, entry); }
+    }
+    let head = 0;
+    while (head < listLen(queue)) {
+        const owner = at(queue, head); head = head + 1;
+        for (next in blockAt(blocks, owner).succs) {
+            if (!charge(budget, 1)) { return limited(budget); }
+            if (at(reached, next) == 0) { listSet(reached, next, 1); listPush(queue, next); }
+        }
+    }
+    const ends = ints(n, -1);
+    i = 0;
+    while (i < n) {
+        if (!charge(budget, 1)) { return limited(budget); }
+        if (at(reached, i) != 0) {
+            for (next in blockAt(blocks, i).succs) {
+                if (!charge(budget, 1)) { return limited(budget); }
+                if (next <= i && i > at(ends, next)) { listSet(ends, next, i); }
+            }
+        } i = i + 1;
+    }
+    const regions: List<Ref<ScalarLoop>> = listNew();
+    let header = 0;
+    while (header < n) {
+        if (!charge(budget, 1)) { return limited(budget); }
+        const last = at(ends, header);
+        if (last >= header) {
+            let valid = true; let member = header + 1;
+            while (member <= last && valid) {
+                if (!charge(budget, 1)) { return limited(budget); }
+                if (at(reached, member) != 0) {
+                    if (at(roots, member) != 0) { valid = false; }
+                    for (from in listGet(preds, member) catch panic("scalar CFG predecessor")) {
+                        if (!charge(budget, 1)) { return limited(budget); }
+                        if (at(reached, from) != 0 && (from < header || from > last)) { valid = false; }
+                    }
+                } member = member + 1;
+            }
+            if (valid) {
+                const region = new ScalarLoop { header: header, last: last, parent: -1, depth: 0, latches: listNew(), exitFrom: listNew(), exitTo: listNew() };
+                for (from in listGet(preds, header) catch panic("scalar CFG predecessor")) {
+                    if (!charge(budget, 1)) { return limited(budget); }
+                    if (at(reached, from) != 0 && from >= header && from <= last) { listPush(region.latches, from); }
+                }
+                member = header;
+                while (member <= last) {
+                    if (!charge(budget, 1)) { return limited(budget); }
+                    if (at(reached, member) != 0) {
+                        const block = blockAt(blocks, member);
+                        if (listLen(block.succs) == 0 && !exitEdge(region, member, -1, budget)) { return limited(budget); }
+                        for (next in block.succs) {
+                            if (!charge(budget, 1)) { return limited(budget); }
+                            if ((next < header || next > last) && !exitEdge(region, member, next, budget)) { return limited(budget); }
+                        }
+                    } member = member + 1;
+                }
+                listPush(regions, region);
+            }
+        } header = header + 1;
+    }
+    const stack: List<int> = listNew(); i = 0;
+    while (i < listLen(regions)) {
+        if (!charge(budget, 1)) { return limited(budget); }
+        const region = loopAt(regions, i);
+        while (listLen(stack) > 0 && loopAt(regions, at(stack, listLen(stack) - 1)).last < region.header) {
+            if (!charge(budget, 1)) { return limited(budget); } listPop(stack) catch panic("scalar CFG stack");
+        }
+        if (listLen(stack) > 0) {
+            const parent = at(stack, listLen(stack) - 1);
+            if (loopAt(regions, parent).last < region.last) { return err("scalar CFG: overlapping loop intervals"); }
+            region.parent = parent; region.depth = loopAt(regions, parent).depth + 1;
+        }
+        listPush(stack, i); i = i + 1;
+    }
+    return ScalarLoops { regions: regions, work: budget.used, limited: false };
+}

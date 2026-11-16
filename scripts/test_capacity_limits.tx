@@ -1,0 +1,588 @@
+// 容量与编码上限门：超出上限的程序必须得到诊断，不得静默生成
+// 错误代码；上限之内（含越过旧上限）的程序须正确运行。源码现场生成（不入库，体积大）。
+//
+// 原生链（TXC v6；C3a 之后）：
+// - 越过旧 7 位、8 位、16 位编码上限的程序须编译成功且输出正确：300 个模块顶层绑定、200 个 struct 字段、200 个 enum 变体字段、130 个
+//   闭包捕获、7 万个常量（Bx 32 位）、4 万条指令的循环体（sBx 32 位）、第 300 个外部函数（callbi 编号越过 255）、200 层泛型实例化嵌套；
+//   单函数 300、5000、6 万个局部（寄存器越过旧上限 256，C3b）、300 个参数的函数与箭头函数（越过旧上限 254，C3b）；
+// - 负例须报诊断、不产出：单函数 7 万个局部即寄存器超过 65535 个（3101）、泛型实例化嵌套超过 256 层（3020）、泛型实例类型规模指数
+//   膨胀（3020，须在时限内给出，不得耗尽内存）。
+// - 编译时间（C3c）：大输入须在 120 秒内编完并正确运行——4 万语句循环体、1.6 万个函数、3.2 万个顶层绑定、8 万个字符串常量、6 万个
+//   变体的 enum（本机各约 7–15 秒；任一处退回平方级即在数分钟以上）。
+// - 运行时间（字符串原地追加）：三种逐段累加写法各 40 万轮须在 120 秒内跑完且长度正确（本机约 1 秒；退回整串复制即在数分钟以上）。
+// - 文件与输出（C4b）：128 MiB 的串写出后经 readFile、readFileBytes 读回须完整一致（原先 64 MiB 上限处得错误值）；2400 万字节（800 万个
+//   “太”）的一行输出到标准输出须逐字节正确（Windows 分块写出）。
+// - 异步任务（C4d）：一个任务先后启动并等待 200 万个任务（每个先 sleepMs(0) 再返回），结果须正确、峰值常驻内存不超过 64 MiB（任务记录
+//   回收；原先记录只增不减。本机 Windows 峰值约 227 MiB → 约 7 MiB，与 hello 相当；Linux 约 221 MiB → 约 7 MiB）。峰值经本程序以
+//   --peak-helper 新起的一份自己取（各宿主的取法见 peak_os_*.tx）。
+// 当前门只检查原生链（TXC v6）的上限。
+//
+// 运行（仓根）：taixu run --toolchain scripts/test_capacity_limits.tx --compiler <原生 taixu> [--work 目录]
+import { absolute, exeName, join, mkdirs, nat, readBytes } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { captureRaw } from "./test_lib";
+import { contains, headChars, reprStr, slashes, strip, tailChars } from "./test_text";
+import { lossyText } from "./check_lib";
+import { peakRun } from "./peak_os";
+
+const SEC: int = 1000000000;
+const DRAIN_NS: int = 10000000000;
+const MAX_OUTPUT: int = 1073741824;
+const MIB: int = 1048576;
+
+// ---------------------------------------------------------------- 源码生成
+
+struct Sb {
+    b: Bytes,
+}
+
+function sb(): Ref<Sb> {
+    return new Sb { b: bytesNew(0) };
+}
+
+function put(s: Ref<Sb>, t: string): void {
+    bytesAppend(s.b, bytesFromStr(t));
+}
+
+function done(s: Ref<Sb>): string {
+    return bytesToStr(s.b) catch "";
+}
+
+function n2s(i: int): string {
+    return toStr(i);
+}
+
+function mainWrap(body: List<string>, prints: string): string {
+    const s = sb();
+    put(s, "export function main(args: []string): int {\n");
+    for (x in body) {
+        put(s, "    " + x + "\n");
+    }
+    put(s, "    print(" + prints + ");\n    return 0;\n}\n");
+    return done(s);
+}
+
+function noBody(): List<string> {
+    const xs: List<string> = listNew();
+    return xs;
+}
+
+function one(x: string): List<string> {
+    const xs: List<string> = listNew();
+    listPush(xs, x);
+    return xs;
+}
+
+// "<pre>{i}<post>" 以 sep 连起，i 取 0..n−1。
+function joined(pre: string, post: string, sep: string, n: int): string {
+    const s = sb();
+    let i = 0;
+    while (i < n) {
+        if (i > 0) {
+            put(s, sep);
+        }
+        put(s, pre + n2s(i) + post);
+        i = i + 1;
+    }
+    return done(s);
+}
+
+function globalsSrc(n: int): string {
+    const s = sb();
+    let i = 0;
+    while (i < n) {
+        if (i > 0) {
+            put(s, "\n");
+        }
+        put(s, "let g" + n2s(i) + ": int = " + n2s(i * 10) + ";");
+        i = i + 1;
+    }
+    const last = n2s(n - 1);
+    return done(s) + "\n\n" + mainWrap(one("g" + last + " = 7;"), "toStr(g0) + \" \" + toStr(g1) + \" \" + toStr(g" + last + ")");
+}
+
+function constsSrc(n: int): string {
+    return mainWrap(one("const t = [" + joined("", "", ", ", n) + "];"), "toStr(t[0]) + \" \" + toStr(t[" + n2s(n - 1) + "])");
+}
+
+function jumpsSrc(lines: int): string {
+    const s = sb();
+    put(s, "export function main(args: []string): int {\n    let x = 0;\n    let i = 0;\n    while (i < 3) {\n");
+    let i = 0;
+    while (i < lines) {
+        if (i > 0) {
+            put(s, "\n");
+        }
+        put(s, "        x = x + 1;");
+        i = i + 1;
+    }
+    put(s, "\n        i = i + 1;\n    }\n    print(toStr(x) + \" \" + toStr(i));\n    return 0;\n}\n");
+    return done(s);
+}
+
+function enumSrc(n: int): string {
+    const fs = joined("f", ": int", ", ", n);
+    const args = joined("", "", ", ", n);
+    const pat = joined("f", "", ", ", n);
+    const head = "enum E {\n    A(" + fs + "),\n    B,\n}\n\nfunction pick(e: E): int {\n    return switch (e) {\n        case A(" + pat + ") => f0 + f"
+    + n2s(n - 1) + " * 1000,\n        else => 0,\n    };\n}\n";
+    return head + "\n" + mainWrap(noBody(), "toStr(pick(E.A(" + args + ")))");
+}
+
+function structSrc(n: int): string {
+    const fs = joined("    f", ": int,", "\n", n);
+    const s = sb();
+    let i = 0;
+    while (i < n) {
+        if (i > 0) {
+            put(s, ", ");
+        }
+        put(s, "f" + n2s(i) + ": " + n2s(i));
+        i = i + 1;
+    }
+    const last = n2s(n - 1);
+    const body: List<string> = listNew();
+    listPush(body, "let s = S { " + done(s) + " };");
+    listPush(body, "s.f" + last + " = s.f" + last + " + 1;");
+    return "struct S {\n" + fs + "\n}\n\n" + mainWrap(body, "toStr(s.f0) + \" \" + toStr(s.f" + last + ")");
+}
+
+function capturesSrc(n: int): string {
+    const body: List<string> = listNew();
+    let i = 0;
+    while (i < n) {
+        listPush(body, "const c" + n2s(i) + " = " + n2s(i) + ";");
+        i = i + 1;
+    }
+    listPush(body, "const f = (): int => " + joined("c", "", " + ", n) + ";");
+    return mainWrap(body, "toStr(f())");
+}
+
+function localDecls(n: int): List<string> {
+    const body: List<string> = listNew();
+    let i = 0;
+    while (i < n) {
+        listPush(body, "let v" + n2s(i) + " = " + n2s(i) + ";");
+        i = i + 1;
+    }
+    return body;
+}
+
+function localsSrc(n: int): string {
+    return mainWrap(localDecls(n), "toStr(" + joined("v", "", " + ", n) + ")");
+}
+
+// 局部多而表达式浅（深的连加链受编译器自身的递归深度限制，另属原生栈预算）。
+function localsShallowSrc(n: int): string {
+    return mainWrap(localDecls(n), "toStr(v0 + v" + n2s(n - 1) + ")");
+}
+
+function paramsSrc(n: int): string {
+    const ps = joined("p", ": int", ", ", n);
+    const args = joined("", "", ", ", n);
+    const body: List<string> = listNew();
+    listPush(body, "const f = (" + ps + "): int => p0 + p" + n2s(n - 1) + ";");
+    listPush(body, "const r = big(" + args + ") + f(" + args + ");");
+    return "function big(" + ps + "): int {\n    return " + joined("p", "", " + ", n) + ";\n}\n\n" + mainWrap(body, "toStr(r)");
+}
+
+function externsSrc(n: int, host: string): string {
+    const s = sb();
+    let call = "";
+    let i = 0;
+    if (host == "linux") {
+        // 名字形态（D3 v0.47）按目标架构查号：同一份源码在 x86_64 与 aarch64 宿主上都成立。
+        while (i < n) {
+            if (i > 0) {
+                put(s, "\n");
+            }
+            put(s, "declare function x" + n2s(i) + "(): i32 from syscall \"getpid\";");
+            i = i + 1;
+        }
+        call = "x" + n2s(n - 1) + "() > 0";
+    } else if (host == "macos") {
+        // macOS 不提供稳定的系统调用接口（D3 §6.8-7）：经 libSystem；只声明不调用的不链接（§6.8-9）。
+        while (i < n - 1) {
+            put(s, "declare function x" + n2s(i) + "(): i32 from \"libSystem\";\n");
+            i = i + 1;
+        }
+        put(s, "declare function getpid(): i32 from \"libSystem\";");
+        call = "getpid() > 0";
+    } else {
+        while (i < n - 1) {
+            put(s, "declare function x" + n2s(i) + "(): u32 from \"kernel32\";\n");
+            i = i + 1;
+        }
+        put(s, "declare function GetCurrentProcessId(): u32 from \"kernel32\";");
+        call = "GetCurrentProcessId() > (0 as u32)";
+    }
+    return done(s) + "\n\n" + mainWrap(noBody(), "toStr(" + call + ")");
+}
+
+// g0<T> 调 g1<List<T>> …… 调 g{n−1}：实例化嵌套 n 层（每层在上一层的实例体检查中展开）。
+function genChainSrc(n: int): string {
+    const s = sb();
+    let i = 0;
+    while (i < n) {
+        if (i > 0) {
+            put(s, "\n");
+        }
+        if (i == n - 1) {
+            put(s, "function g" + n2s(i) + "<T>(x: T): int {\n    return " + n2s(i) + ";\n}\n");
+        } else {
+            put(s, "function g" + n2s(i) + "<T>(x: T): int {\n    const l: List< T> = listNew();\n    listPush(l, x);\n    return g" + n2s(i + 1)
+                + "(l);\n}\n");
+        }
+        i = i + 1;
+    }
+    return done(s) + "\n" + mainWrap(noBody(), "toStr(g0(1))");
+}
+
+function fnsSrc(n: int): string {
+    const s = sb();
+    let i = 0;
+    while (i < n) {
+        if (i > 0) {
+            put(s, "\n");
+        }
+        put(s, "function f" + n2s(i) + "(x: int): int {\n    return x + " + n2s(i) + ";\n}\n");
+        i = i + 1;
+    }
+    return done(s) + "\n" + mainWrap(one("const s = f" + n2s(n - 1) + "(f0(1));"), "toStr(s)");
+}
+
+function strsSrc(n: int): string {
+    return mainWrap(one("const t = [" + joined("\"s", "\"", ", ", n) + "];"), "t[" + n2s(n - 1) + "]");
+}
+
+function variantsSrc(n: int): string {
+    const vs = joined("    V", "(x: int)", ",\n", n);
+    const last = n2s(n - 1);
+    return "enum E {\n" + vs + ",\n}\n\nfunction pick(e: E): int {\n    return switch (e) {\n        case V" + last + "(x) => x,\n        else => 0,\n    };\n}\n\n"
+    + mainWrap(noBody(), "toStr(pick(E.V" + last + "(5)))");
+}
+
+function lines(xs: []string): List<string> {
+    const out: List<string> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+    }
+    return out;
+}
+
+// 三种逐段累加写法（join 式每轮两处、右侧为局部变量、链式），唯一持有时须原地追加、线性。
+function strAppendSrc(n: int): string {
+    return mainWrap(lines(["let a = \"\";", "let b = \"\";", "let c = \"\";", "let i = 0;", "while (i < " + n2s(n) + ") {", "    if (i > 0) { a = a + \",\"; }",
+                "    a = a + \"ab\";", "    const piece = \"xy\";", "    b = b + piece;", "    c = c + \"-\" + \"cd\";", "    i = i + 1;", "}"]),
+        "toStr(len(a)) + \" \" + toStr(len(b)) + \" \" + toStr(len(c))");
+}
+
+// 从 16 字节起翻倍：23 次即 128 MiB。工作目录是临时目录，文件留在其中。
+function ioBigSrc(doublings: int): string {
+    return mainWrap(lines(["let s = \"0123456789abcdef\";", "let i = 0;", "while (i < " + n2s(doublings) + ") {", "    s = s + s;", "    i = i + 1;", "}",
+                "writeFile(\"io-big.tmp\", s) catch panic(\"writeFile 失败\");", "const r = readFile(\"io-big.tmp\") catch \"ERR\";",
+                "const b = readFileBytes(\"io-big.tmp\") catch bytesNew(0);"]),
+        "toStr(len(s)) + \" \" + toStr(len(r)) + \" \" + toStr(bytesLen(b)) + \" \" + toStr(r == s)");
+}
+
+function printBigSrc(doublings: int): string {
+    return mainWrap(lines(["let s = \"太\";", "let i = 0;", "while (i < " + n2s(doublings) + ") {", "    s = s + s;", "    i = i + 1;", "}", "print(s);"]),
+        "\"end\"");
+}
+
+function taskChurnSrc(n: int): string {
+    return "async function worker(i: int): int {\n    await sleepMs(0) catch (e) {\n        return -1;\n    };\n    return i;\n}\n\n"
+    + "async function driver(n: int): int {\n    let s = 0;\n    let i = 0;\n    while (i < n) {\n"
+    + "        const v = await worker(i) catch -1;\n        s = s + v;\n        i = i + 1;\n    }\n"
+    + "    print(toStr(s));\n    return s;\n}\n\n"
+    + "export function main(args: []string): int {\n    const d = await driver(" + n2s(n) + ") catch -1;\n    return 0;\n}\n";
+}
+
+function genDeepSrc(): string {
+    return "function deep<T>(x: T, n: int): int {\n    if (n == 0) {\n        return 0;\n    }\n"
+    + "    const l: List< T> = listNew();\n    listPush(l, x);\n    return 1 + deep(l, n - 1);\n}\n\n" + mainWrap(noBody(), "toStr(deep(1, 3))");
+}
+
+function genExpoSrc(): string {
+    return "struct Pair<A, B> {\n    a: A,\n    b: B,\n}\n\n"
+    + "function deep<T>(x: T, n: int): int {\n    if (n == 0) {\n        return 0;\n    }\n"
+    + "    const p = Pair<T, T> { a: x, b: x };\n    return 1 + deep(p, n - 1);\n}\n\n" + mainWrap(noBody(), "toStr(deep(1, 3))");
+}
+
+function sumRange(n: int): int {
+    return n * (n - 1) / 2;
+}
+
+function repeatText(t: string, doublings: int): string {
+    let s = t;
+    let i = 0;
+    while (i < doublings) {
+        s = s + s;
+        i = i + 1;
+    }
+    return s;
+}
+
+// ---------------------------------------------------------------- 用例
+
+// 名、源码、期望诊断（空为须编译成功）、期望输出、编译时限秒、峰值常驻内存上限 MiB（0 为不量）。
+struct Case {
+    name: string,
+    src: string,
+    wantErr: string,
+    wantOut: string,
+    limit: int,
+    mem: int,
+}
+
+function ok(name: string, src: string, want: string, limit: int): Case {
+    return Case { name: name, src: src, wantErr: "", wantOut: want, limit: limit, mem: 0 };
+}
+
+function bad(name: string, src: string, diag: string, limit: int): Case {
+    return Case { name: name, src: src, wantErr: diag, wantOut: "", limit: limit, mem: 0 };
+}
+
+function cases(host: string): List<Case> {
+    const cs: List<Case> = listNew();
+    listPush(cs, ok("globals-300", globalsSrc(300), "0 10 7", 900));
+    listPush(cs, ok("struct-200", structSrc(200), "0 200", 900));
+    listPush(cs, ok("enum-200", enumSrc(200), "199000", 900));
+    listPush(cs, ok("captures-130", capturesSrc(130), n2s(sumRange(130)), 900));
+    listPush(cs, ok("consts-70000", constsSrc(70000), "0 69999", 900));
+    listPush(cs, ok("jumps-40000", jumpsSrc(40000), "120000 3", 120));
+    listPush(cs, ok("externs-300", externsSrc(300, host), "true", 900));
+    listPush(cs, ok("gen-chain-200", genChainSrc(200), "199", 900));
+    listPush(cs, ok("locals-300", localsSrc(300), n2s(sumRange(300)), 900));
+    listPush(cs, ok("locals-5000", localsSrc(5000), n2s(sumRange(5000)), 900));
+    listPush(cs, ok("locals-60000", localsShallowSrc(60000), "59999", 900));
+    listPush(cs, ok("params-300", paramsSrc(300), n2s(sumRange(300) + 299), 900));
+    listPush(cs, bad("locals-70000", localsShallowSrc(70000), "error 3101", 900));
+    listPush(cs, bad("gen-deep", genDeepSrc(), "error 3020", 900));
+    listPush(cs, bad("gen-expo", genExpoSrc(), "error 3020", 120));
+    listPush(cs, ok("fns-16000", fnsSrc(16000), "16000", 120));
+    listPush(cs, ok("globals-32000", globalsSrc(32000), "0 10 7", 120));
+    listPush(cs, ok("strs-80000", strsSrc(80000), "s79999", 120));
+    listPush(cs, ok("variants-60000", variantsSrc(60000), "5", 120));
+    listPush(cs, ok("str-append-400k", strAppendSrc(400000), "1199999 800000 1200000", 120));
+    listPush(cs, ok("io-128m", ioBigSrc(23), "134217728 134217728 134217728 true", 120));
+    listPush(cs, ok("print-24m", printBigSrc(23), repeatText("太", 23) + "\nend", 120));
+    listPush(cs, Case { name: "tasks-2m", src: taskChurnSrc(2000000), wantErr: "", wantOut: n2s(2000000 * 1999999 / 2), limit: 120, mem: 64 });
+    return cs;
+}
+
+// ---------------------------------------------------------------- 运行
+
+function charCount(s: string): int {
+    let n = 0;
+    let i = 0;
+    while (i < len(s)) {
+        if (((byteAt(s, i) ?? 0) & 192) != 128) {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// Python 的 '%.1f' % (peak / 1048576)（二进制精确值按四舍六入五成双）。
+function mib1(peak: int): string {
+    const t = peak * 10;
+    let q = t / MIB;
+    const r = t % MIB;
+    if (r * 2 > MIB || (r * 2 == MIB && q % 2 == 1)) {
+        q = q + 1;
+    }
+    return n2s(q / 10) + "." + n2s(q % 10);
+}
+
+function firstLine(s: string): string {
+    const t = strip(s);
+    if (len(t) == 0) {
+        return "";
+    }
+    let line = listGet(strSplit(t, "\n"), 0) catch "";
+    if (len(line) > 0 && (byteAt(line, len(line) - 1) ?? 0) == 13) {
+        line = bytesToStr(bytesSlice(bytesFromStr(line), 0, len(line) - 1)) catch line;
+    }
+    return line;
+}
+
+function noArgs(): List<string> {
+    const xs: List<string> = listNew();
+    return xs;
+}
+
+function main(args: []string): int {
+    // 取峰值的帮手：新起的一份自己，只起这一个子进程（见 peak_os_*.tx）。
+    if (len(args) >= 3 && args[0] == "--peak-helper") {
+        const rest: List<string> = listNew();
+        let k = 3;
+        while (k < len(args)) {
+            listPush(rest, args[k]);
+            k = k + 1;
+        }
+        const result = peakRun(args[2], rest, currentDir() catch ".", 120000);
+        writeFile(args[1], result) catch (e) {
+            eprint("写不了 " + args[1] + "：" + e.message);
+            return 1;
+        };
+        return 0;
+    }
+    let compiler = "";
+    let work = "";
+    let i = 0;
+    while (i < len(args)) {
+        if (i + 1 < len(args) && args[i] == "--compiler") {
+            compiler = args[i + 1];
+            i = i + 2;
+        } else if (i + 1 < len(args) && args[i] == "--work") {
+            work = args[i + 1];
+            i = i + 2;
+        } else {
+            eprint("用法：taixu run --toolchain scripts/test_capacity_limits.tx --compiler <原生 taixu> [--work 目录]");
+            return 2;
+        }
+    }
+    if (len(compiler) == 0) {
+        eprint("要给 --compiler");
+        return 2;
+    }
+    // 用例在 work 目录里编译：编译器路径先转绝对（POSIX 上相对路径按子进程的 cwd 解析）。
+    compiler = nat(absolute(compiler));
+    if (len(work) == 0) {
+        work = join(slashes(osRealPath(tempDir())), "taixu-limits-" + n2s(monoNs()));
+    }
+    work = slashes(absolute(work));
+    mkdirs(work);
+    const host = hostTarget();
+    let fails = 0;
+    for (c in cases(host)) {
+        writeFile(join(work, c.name + ".tx"), c.src) catch (e) {
+            print("FAIL " + c.name + "  写不了源码：" + e.message);
+            fails = fails + 1;
+            continue;
+        };
+        const outDir = join(work, "out-" + c.name);
+        const ba: List<string> = listNew();
+        listPush(ba, "build");
+        listPush(ba, c.name + ".tx");
+        listPush(ba, "--out");
+        listPush(ba, nat(outDir));
+        const b = captureRaw(compiler, ba, nat(work), c.limit * SEC, DRAIN_NS, MAX_OUTPUT) catch (e) {
+            print("FAIL " + c.name + "  " + e.message);
+            fails = fails + 1;
+            continue;
+        };
+        if (b.timedOut) {
+            print("FAIL " + c.name + "  编译超过 " + n2s(c.limit) + " 秒");
+            fails = fails + 1;
+            continue;
+        }
+        const text = lossyText(b.out) + lossyText(b.err);
+        let passed = false;
+        let detail = "";
+        if (len(c.wantErr) > 0) {
+            passed = b.code == 1 && contains(text, c.wantErr);
+            if (len(strip(text)) > 0) {
+                detail = "exit=" + n2s(b.code) + " " + headChars(firstLine(text), 160);
+            } else {
+                detail = "exit=" + n2s(b.code);
+            }
+        } else if (b.code == 0) {
+            const exe = nat(join(outDir, exeName(c.name)));
+            let rc = 0;
+            let got = "";
+            let timedOut = false;
+            let peak = -1;
+            if (c.mem > 0) {
+                const note = join(work, ".peak-rss");
+                const ha: List<string> = listNew();
+                listPush(ha, "--peak-helper");
+                listPush(ha, nat(note));
+                listPush(ha, exe);
+                const h = captureRaw(selfExePath(), ha, nat(work), 150 * SEC, DRAIN_NS, MAX_OUTPUT) catch (e) {
+                    print("FAIL " + c.name + "  " + e.message);
+                    fails = fails + 1;
+                    continue;
+                };
+                got = lossyText(h.out) + lossyText(h.err);
+                const res = lossyText(readBytes(note) catch bytesFromStr("helper failed"));
+                removeFile(note) catch (e) {};
+                const parts = strSplit(res, " ");
+                if (res == "timeout" || h.timedOut) {
+                    timedOut = true;
+                } else if (listLen(parts) == 2) {
+                    rc = digitsOf(listGet(parts, 0) catch "");
+                    peak = digitsOf(listGet(parts, 1) catch "");
+                } else {
+                    rc = -2;
+                    got = got + res;
+                }
+            } else {
+                const r = captureRaw(exe, noArgs(), nat(work), 120 * SEC, DRAIN_NS, MAX_OUTPUT) catch (e) {
+                    print("FAIL " + c.name + "  " + e.message);
+                    fails = fails + 1;
+                    continue;
+                };
+                timedOut = r.timedOut;
+                rc = r.code;
+                got = lossyText(r.out) + lossyText(r.err);
+            }
+            if (timedOut) {
+                detail = "运行超过 120 秒";
+            } else {
+                passed = rc == 0 && strip(got) == c.wantOut;
+                detail = "run exit=" + n2s(rc) + " out=" + reprStr(headChars(strip(got), 80));
+                const n = charCount(got);
+                if (n > 200) {
+                    detail = detail + " len=" + n2s(n);
+                }
+                if (c.mem > 0) {
+                    passed = passed && 0 < peak && peak <= c.mem * MIB;
+                    detail = detail + " peak=" + mib1(peak) + "MiB（上限 " + n2s(c.mem) + "）";
+                }
+            }
+        } else {
+            detail = "build exit=" + n2s(b.code) + " " + tailChars(strip(text), 160);
+        }
+        if (passed) {
+            print("PASS " + c.name + "  " + detail);
+        } else {
+            print("FAIL " + c.name + "  " + detail);
+            fails = fails + 1;
+        }
+    }
+    if (fails == 0) {
+        print("SUMMARY PASS");
+        return 0;
+    }
+    print("SUMMARY FAIL=" + n2s(fails));
+    return 1;
+}
+
+// 十进制整数（可带负号）；不是时得 −1。
+function digitsOf(s: string): int {
+    let i = 0;
+    let neg = false;
+    if (len(s) > 0 && (byteAt(s, 0) ?? 0) == 45) {
+        neg = true;
+        i = 1;
+    }
+    if (i >= len(s)) {
+        return -1;
+    }
+    let v = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) ?? 0;
+        if (c < 48 || c > 57) {
+            return -1;
+        }
+        v = v * 10 + c - 48;
+        i = i + 1;
+    }
+    if (neg) {
+        return 0 - v;
+    }
+    return v;
+}

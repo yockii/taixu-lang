@@ -1,0 +1,1065 @@
+// ============================================================================
+// engine/platform_macos —— macOS 真窗后端（GUI 原生引擎 G4）：AppKit 经 Objective-C 运行时（libobjc 的 objc_msgSend，每种签名
+// 一个声明模块，见 engine/mac/）；NSRect、NSPoint 等按值收发靠核心 K2（D3 v0.45）。导出面同 platform_windows；没有窗口服务器
+// 会话（ssh 进来而用户没在本机登录）时 platAvailable 为假，框架退回脚本窗。
+//
+// - 事件：不跑 [NSApp run]，platWait 自己取事件（nextEventMatchingMask:untilDate:inMode:dequeue:），表同其他后端：键（keyCode
+//   换 Windows 虚拟键码）、字符（characters，无 Ctrl／Command／Option 时发；产生字符的键不另发按下事件）、左键按下／抬起／
+//   移动与拖动、尺寸、关窗。键盘事件由本模块处理、不转给 AppKit（避免无响应者时的提示音），其余照常 sendEvent:（标题栏拖动、
+//   窗口按钮）。Command 与 Control 都记作 Ctrl（同 Qt 的约定，Command+C 等快捷键因此跨平台一致），Option 记作 Alt。
+// - 坐标：AppKit 的点即 DIP（Retina 上一个点两个像素），y 轴由下往上，换成客户区自上而下；platScale 为 backingScaleFactor×100。
+// - 关窗与尺寸经窗口委托（运行时建的 TaixuWindowDelegate 类，方法实现是太虚回调，只在本线程的外部调用期间被调用）；无框窗用
+//   TaixuWindow 子类，能成为关键窗口（无框的 NSWindow 缺省不能，收不到键盘）。
+// - 呈现：BGRX 面做成 CGImage（CFDataCreate 当场拷贝像素）交给内容视图承载的 CALayer（layer-hosting，AppKit 不改它的内容），
+//   contentsScale 取 backingScaleFactor、内容靠左上，面没盖住的部分是层的黑底；关掉隐式动画。
+// - 没有原生菜单栏项（macOS 的菜单在全局菜单栏、顶层只能是子菜单，与 Windows 的窗口菜单栏不对应）：platMenuAdd 得 -1；没有
+//   亚克力等效果：platSetEffect 得 0。
+// - 剪贴板：NSPasteboard 的通用板，类型 public.utf8-plain-text。
+// - 文件对话框（G5 第二部分）：NSOpenPanel／NSSavePanel 的 runModal（应用模态，不跑 [NSApp run] 也可以；属主参数不用，不做
+//   窗口附着的表单，那要块回调）。过滤：所有扩展名合成一组设 allowedContentTypes（[UTType typeWithFilenameExtension:]，面板不显示
+//   名称；含 "*" 或没有过滤器时不设）。标题非空时设 title 与 message（macOS 11 起面板不显示标题栏，message 显示在面板顶部）。
+//   保存：预填 nameFieldStringValue，可建目录，allowsOtherFileTypes（用户写了别的扩展名时由系统询问用哪个，而不是强改）；覆盖
+//   确认是面板自带的。还没开过窗时先 finishLaunching（附属应用），弹前把本程序置前。
+// - 每次取事件与对外的操作都在一个自动释放池里，AppKit 返回的临时对象随池释放；常驻的字符串与对象 retain。
+// ============================================================================
+
+import { appKitLoad, cls, sel, classNew, classRegister, poolPush, poolPop, msg } from "./mac/rt";
+import { msgP } from "./mac/m_p1";
+import { msgPP } from "./mac/m_p2";
+import { msgI } from "./mac/m_i1";
+import { msgB } from "./mac/m_b1";
+import { msgD } from "./mac/m_d1";
+import { msgRetD } from "./mac/m_rd";
+import { msgRetS } from "./mac/m_rs";
+import { msgS } from "./mac/m_s1";
+import { msgPB } from "./mac/m_pb";
+import { NSPOINT, NSRECT, nsRect } from "./mac/geom";
+import { msgInitWindow } from "./mac/m_win";
+import { msgSize } from "./mac/m_size";
+import { msgPoint } from "./mac/m_pt";
+import { msgRetPoint } from "./mac/m_rpt";
+import { msgRetRect } from "./mac/m_rrect";
+import { msgNextEvent } from "./mac/m_next";
+import { msgMouseEvent } from "./mac/m_mev";
+import { msgKeyEvent } from "./mac/m_kev";
+import { msgOtherEvent } from "./mac/m_oev";
+import { cgSessionAlive, cgImageOf, cgImageFree, cgBlack, cgColorFree, nowMs, cgWheelEvent, cgEventFree } from "./mac/cg";
+import { FdFilter, fdMacExts } from "./filedialog";
+
+declare function class_addMethod(c: usize, name: usize, imp: (usize, usize, usize) => i8, types: string): u8 from "/usr/lib/libobjc.A.dylib";
+
+const EV_KEY_DOWN: int = 1;
+const EV_KEY_UP: int = 2;
+const EV_MOUSE_DOWN: int = 3;
+const EV_MOUSE_UP: int = 4;
+const EV_MOUSE_MOVE: int = 5;
+const EV_CLOSE: int = 6;
+const EV_RESIZE: int = 7;
+const EV_TEXT: int = 8;
+const EV_SCROLL: int = 9;
+const MOD_SHIFT: int = 1;
+const MOD_CTRL: int = 2;
+const MOD_ALT: int = 4;
+const WFLAG_FRAMELESS: int = 1;
+const WFLAG_MAXIMIZED: int = 2;
+const WFLAG_TOPMOST: int = 4;
+const WFLAG_CENTERED: int = 8;
+const WFLAG_HIDDEN: int = 16;
+const QUEUE_MAX: int = 64;
+// NSEventType。
+const NS_LEFT_DOWN: int = 1;
+const NS_LEFT_UP: int = 2;
+const NS_RIGHT_DOWN: int = 3;
+const NS_RIGHT_UP: int = 4;
+const NS_MOVED: int = 5;
+const NS_LEFT_DRAGGED: int = 6;
+const NS_KEY_DOWN: int = 10;
+const NS_KEY_UP: int = 11;
+const NS_SCROLL_WHEEL: int = 22;
+const NS_APP_DEFINED: int = 15;
+// NSEventModifierFlags。
+const NS_SHIFT: int = 0x20000;
+const NS_CONTROL: int = 0x40000;
+const NS_OPTION: int = 0x80000;
+const NS_COMMAND: int = 0x100000;
+// NSWindowStyleMask：有标题栏、可关、可最小化、可调尺寸；无框为 0。
+const STYLE_TITLED: int = 15;
+
+struct MWin {
+    id: int,
+    win: usize, // NSWindow（自己持有：releasedWhenClosed 关掉）
+    view: usize, // contentView
+    layer: usize, // 承载画面的 CALayer（自己持有）
+    num: int, // windowNumber（投递与认领事件）
+    scale: int,
+    cursor: int,
+    q: List<int>, // 每条 5 项：kind、target、x、y、mods
+    head: int,
+    cw: int, // 客户区（点，即 DIP）
+    ch: int,
+    wheel: float, // 不足一点的滚动余数
+}
+
+let wins: List<Ref<MWin>> = listNew();
+let tried: bool = false;
+let avail: bool = false;
+let app: usize = 0;
+let launched: bool = false;
+let regular: bool = false;
+let delegate: usize = 0;
+let winClass: usize = 0;
+let modeStr: usize = 0;
+let utiStr: usize = 0;
+let gravityStr: usize = 0;
+let sysScale: int = 0;
+
+// CG-created scroll events have windowNumber=0; AppKit may copy posted objects.
+// The explicit debug hook retains them behind a window-associated queue marker.
+struct DebugWheel { event: usize, id: int, x: int, y: int }
+let debugWheels: List<DebugWheel> = listNew();
+
+function maxInt(a: int, b: int): int {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+// 串里有 NUL 字节时只取其前（同 Windows 后端，标题里的 NUL 不 trap）。
+function cText(s: string): string {
+    const b = bytesFromStr(s);
+    let i: int = 0;
+    while (i < bytesLen(b)) {
+        if ((bytesGet(b, i) catch 1) == 0) {
+            return bytesToStr(bytesSlice(b, 0, i)) catch "";
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+/// 新的 NSString（自动释放；常驻的要 retain）。
+function nsStr(s: string): usize {
+    return msgS(cls("NSString"), "stringWithUTF8String:", cText(s));
+}
+
+function idxOfId(id: int): int {
+    let i: int = 0;
+    while (i < listLen(wins)) {
+        const w: Ref<MWin> = listGet(wins, i);
+        if (w.id == id) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+function idxOfWin(nswin: usize): int {
+    let i: int = 0;
+    while (i < listLen(wins)) {
+        const w: Ref<MWin> = listGet(wins, i);
+        if (w.win == nswin) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+function idxOfNum(num: int): int {
+    let i: int = 0;
+    while (i < listLen(wins)) {
+        const w: Ref<MWin> = listGet(wins, i);
+        if (w.num == num) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+function winAt(i: int): Ref<MWin> {
+    return listGet(wins, i);
+}
+
+function queued(w: Ref<MWin>): int {
+    return (listLen(w.q) - w.head) / 5;
+}
+
+function push(w: Ref<MWin>, kind: int, target: int, x: int, y: int, m: int): void {
+    if ((kind == EV_MOUSE_MOVE || kind == EV_RESIZE) && queued(w) > 0) {
+        const at: int = listLen(w.q) - 5;
+        if ((listTryGet(w.q, at) catch 0) == kind) {
+            listSet(w.q, at + 2, x);
+            listSet(w.q, at + 3, y);
+            listSet(w.q, at + 4, m);
+            return;
+        }
+    }
+    if (queued(w) >= QUEUE_MAX) {
+        return;
+    }
+    if (w.head > 0 && w.head == listLen(w.q)) {
+        w.q = listNew();
+        w.head = 0;
+    }
+    listPush(w.q, kind);
+    listPush(w.q, target);
+    listPush(w.q, x);
+    listPush(w.q, y);
+    listPush(w.q, m);
+}
+
+function modsOf(flags: int): int {
+    let m: int = 0;
+    if ((flags & NS_SHIFT) != 0) {
+        m = m + MOD_SHIFT;
+    }
+    if ((flags & (NS_CONTROL | NS_COMMAND)) != 0) {
+        m = m + MOD_CTRL;
+    }
+    if ((flags & NS_OPTION) != 0) {
+        m = m + MOD_ALT;
+    }
+    return m;
+}
+
+function flagsOf(m: int): int {
+    let f: int = 0;
+    if ((m & MOD_SHIFT) != 0) {
+        f = f | NS_SHIFT;
+    }
+    if ((m & MOD_CTRL) != 0) {
+        f = f | NS_CONTROL;
+    }
+    if ((m & MOD_ALT) != 0) {
+        f = f | NS_OPTION;
+    }
+    return f;
+}
+
+// 产生字符的键（同 Windows 后端的判定）。
+function printableVk(vk: int): bool {
+    return vk == 0x20 || (vk >= 0x30 && vk <= 0x39) || (vk >= 0x41 && vk <= 0x5A) || (vk >= 0xBA && vk <= 0xC0) || (vk >= 0xDB && vk <= 0xDF) || vk == 0xE2 || (vk >= 0x60 && vk <= 0x6F && vk != 0x6C);
+}
+
+// macOS 虚拟键码（kVK_*，与键盘布局无关的物理位置）→ Windows 虚拟键码（0＝不认识，不发键事件）。
+function vkOfKeyCode(kc: int): int {
+    const letters: []int = [0x00, 0x0B, 0x08, 0x02, 0x0E, 0x03, 0x05, 0x04, 0x22, 0x26, 0x28, 0x25, 0x2E, 0x2D, 0x1F, 0x23, 0x0C, 0x0F, 0x01, 0x11, 0x20, 0x09, 0x0D, 0x07, 0x10, 0x06];
+    let i: int = 0;
+    while (i < len(letters)) {
+        if (letters[i] == kc) {
+            return 0x41 + i; // A..Z
+        }
+        i = i + 1;
+    }
+    const digits: []int = [0x1D, 0x12, 0x13, 0x14, 0x15, 0x17, 0x16, 0x1A, 0x1C, 0x19];
+    i = 0;
+    while (i < len(digits)) {
+        if (digits[i] == kc) {
+            return 0x30 + i; // 0..9
+        }
+        i = i + 1;
+    }
+    const pad: []int = [0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5B, 0x5C];
+    i = 0;
+    while (i < len(pad)) {
+        if (pad[i] == kc) {
+            return 0x60 + i; // 小键盘 0..9
+        }
+        i = i + 1;
+    }
+    const fkeys: []int = [0x7A, 0x78, 0x63, 0x76, 0x60, 0x61, 0x62, 0x64, 0x65, 0x6D, 0x67, 0x6F];
+    i = 0;
+    while (i < len(fkeys)) {
+        if (fkeys[i] == kc) {
+            return 0x70 + i; // F1..F12
+        }
+        i = i + 1;
+    }
+    const from: []int = [0x24, 0x4C, 0x30, 0x31, 0x33, 0x35, 0x75, 0x73, 0x77, 0x74, 0x79, 0x7B, 0x7E, 0x7C, 0x7D, 0x38, 0x3C, 0x3B, 0x3E, 0x3A, 0x3D, 0x39, 0x43, 0x45, 0x4E, 0x41, 0x4B, 0x29, 0x18, 0x2B, 0x1B, 0x2F, 0x2C, 0x32, 0x21, 0x2A, 0x1E, 0x27];
+    const to: []int = [0x0D, 0x0D, 0x09, 0x20, 0x08, 0x1B, 0x2E, 0x24, 0x23, 0x21, 0x22, 0x25, 0x26, 0x27, 0x28, 0x10, 0x10, 0x11, 0x11, 0x12, 0x12, 0x14, 0x6A, 0x6B, 0x6D, 0x6E, 0x6F, 0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF, 0xC0, 0xDB, 0xDC, 0xDD, 0xDE];
+    i = 0;
+    while (i < len(from)) {
+        if (from[i] == kc) {
+            return to[i];
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// UTF-8 串里逐个码位（坏序列整串放弃）。
+function codepoints(s: string): List<int> {
+    const out: List<int> = listNew();
+    const b = bytesFromStr(s);
+    let i: int = 0;
+    while (i < bytesLen(b)) {
+        const c0: int = bytesGet(b, i) catch 0;
+        let n: int = 1;
+        let cp: int = c0;
+        if (c0 >= 0xF0) {
+            n = 4;
+            cp = c0 & 0x07;
+        } else if (c0 >= 0xE0) {
+            n = 3;
+            cp = c0 & 0x0F;
+        } else if (c0 >= 0xC0) {
+            n = 2;
+            cp = c0 & 0x1F;
+        }
+        let k: int = 1;
+        while (k < n) {
+            cp = (cp << 6) | ((bytesGet(b, i + k) catch 0) & 0x3F);
+            k = k + 1;
+        }
+        listPush(out, cp);
+        i = i + n;
+    }
+    return out;
+}
+
+function utf8Of(cp: int): string {
+    const b = bytesNew(0);
+    if (cp < 0x80) {
+        bytesPush(b, cp);
+    } else if (cp < 0x800) {
+        bytesPush(b, 0xC0 | (cp >> 6));
+        bytesPush(b, 0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        bytesPush(b, 0xE0 | (cp >> 12));
+        bytesPush(b, 0x80 | ((cp >> 6) & 0x3F));
+        bytesPush(b, 0x80 | (cp & 0x3F));
+    } else {
+        bytesPush(b, 0xF0 | (cp >> 18));
+        bytesPush(b, 0x80 | ((cp >> 12) & 0x3F));
+        bytesPush(b, 0x80 | ((cp >> 6) & 0x3F));
+        bytesPush(b, 0x80 | (cp & 0x3F));
+    }
+    return bytesToStr(b) catch "";
+}
+
+// —— 委托与窗口子类的方法实现（太虚回调：(self, _cmd, 参数) → BOOL；没有参数的方法第三个实参是寄存器里的旧值、不读） ——
+
+function contentSize(w: Ref<MWin>): void {
+    const r: NSRECT = msgRetRect(w.view, "frame");
+    w.cw = r.size.w as int;
+    w.ch = r.size.h as int;
+}
+
+function impShouldClose(self: usize, cmd: usize, sender: usize): i8 {
+    self;
+    cmd;
+    const i: int = idxOfWin(sender);
+    if (i >= 0) {
+        push(winAt(i), EV_CLOSE, 0, 0, 0, 0);
+    }
+    return 0; // 关不关由程序决定（platDestroy）
+}
+
+function impDidResize(self: usize, cmd: usize, note: usize): i8 {
+    self;
+    cmd;
+    const i: int = idxOfWin(msg(note, "object"));
+    if (i >= 0) {
+        const w: Ref<MWin> = winAt(i);
+        const ow: int = w.cw;
+        const oh: int = w.ch;
+        contentSize(w);
+        if (w.cw > 0 && w.ch > 0 && (w.cw != ow || w.ch != oh)) {
+            push(w, EV_RESIZE, 0, w.cw, w.ch, 0);
+        }
+    }
+    return 0;
+}
+
+function impBacking(self: usize, cmd: usize, note: usize): i8 {
+    self;
+    cmd;
+    const i: int = idxOfWin(msg(note, "object"));
+    if (i >= 0) {
+        const w: Ref<MWin> = winAt(i);
+        w.scale = scaleOf(w.win);
+        msgD(w.layer, "setContentsScale:", (w.scale as float) / 100.0);
+    }
+    return 0;
+}
+
+function impYes(self: usize, cmd: usize, unused: usize): i8 {
+    self;
+    cmd;
+    unused;
+    return 1;
+}
+
+function addMethod(c: usize, name: string, types: string, which: int): void {
+    if (which == 0) {
+        class_addMethod(c, sel(name), impShouldClose, types);
+    } else if (which == 1) {
+        class_addMethod(c, sel(name), impDidResize, types);
+    } else if (which == 2) {
+        class_addMethod(c, sel(name), impBacking, types);
+    } else {
+        class_addMethod(c, sel(name), impYes, types);
+    }
+}
+
+function retained(o: usize): usize {
+    return msg(o, "retain");
+}
+
+// 第一次用到时：装入 AppKit、取 NSApp、建委托类与窗口子类、常驻字符串。没有窗口服务器会话时什么也不碰（开窗会让进程中止）。
+function ensureApp(): bool {
+    if (tried) {
+        return avail;
+    }
+    tried = true;
+    if (!cgSessionAlive() || !appKitLoad()) {
+        return false;
+    }
+    const pool: usize = poolPush();
+    app = msg(cls("NSApplication"), "sharedApplication");
+    if (app != 0) {
+        let dc: usize = classNew(cls("NSObject"), "TaixuWindowDelegate");
+        if (dc != 0) {
+            addMethod(dc, "windowShouldClose:", "c@:@", 0);
+            addMethod(dc, "windowDidResize:", "v@:@", 1);
+            addMethod(dc, "windowDidChangeBackingProperties:", "v@:@", 2);
+            classRegister(dc);
+        } else {
+            dc = cls("TaixuWindowDelegate");
+        }
+        delegate = msg(msg(dc, "alloc"), "init");
+        winClass = classNew(cls("NSWindow"), "TaixuWindow");
+        if (winClass != 0) {
+            addMethod(winClass, "canBecomeKeyWindow", "c@:", 3);
+            addMethod(winClass, "canBecomeMainWindow", "c@:", 3);
+            classRegister(winClass);
+        } else {
+            winClass = cls("TaixuWindow");
+        }
+        modeStr = retained(nsStr("kCFRunLoopDefaultMode"));
+        utiStr = retained(nsStr("public.utf8-plain-text"));
+        gravityStr = retained(nsStr("topLeft"));
+        avail = delegate != 0 && winClass != 0;
+    }
+    poolPop(pool);
+    return avail;
+}
+
+// 第一次开可见窗时才成为普通应用（Dock 图标、菜单栏）；只开不显示的窗（测试）时为附属应用。
+function launch(visible: bool): void {
+    if (visible && !regular) {
+        regular = true;
+        msgI(app, "setActivationPolicy:", 0);
+    } else if (!launched) {
+        msgI(app, "setActivationPolicy:", 1);
+    }
+    if (!launched) {
+        launched = true;
+        msg(app, "finishLaunching");
+    }
+    if (visible) {
+        msgB(app, "activateIgnoringOtherApps:", true);
+    }
+}
+
+function scaleOf(nswin: usize): int {
+    const k: float = msgRetD(nswin, "backingScaleFactor");
+    if (k < 0.5) {
+        return 100;
+    }
+    return (k * 100.0 + 0.5) as int;
+}
+
+/// 系统缩放×100（主屏的 backingScaleFactor；没有窗口服务器或没有屏幕时 100）。
+export function platSystemScale(): int {
+    if (sysScale == 0) {
+        sysScale = 100;
+        if (ensureApp()) {
+            const screen: usize = msg(cls("NSScreen"), "mainScreen");
+            if (screen != 0) {
+                sysScale = scaleOf(screen);
+            }
+        }
+    }
+    return sysScale;
+}
+
+/// 有没有可用的窗口系统（本用户的窗口服务器会话、AppKit 装得上）。
+export function platAvailable(): bool {
+    return ensureApp();
+}
+
+/// 开真窗，引擎编号 id；flags 为 WFLAG_* 位集（16＝不显示，测试用）。成功得 true。
+export function platCreate(id: int, title: string, w: int, h: int, flags: int): bool {
+    if (!platAvailable() || w < 1 || h < 1) {
+        return false;
+    }
+    const pool: usize = poolPush();
+    const visible: bool = (flags & WFLAG_HIDDEN) == 0;
+    launch(visible);
+    let style: int = STYLE_TITLED;
+    if ((flags & WFLAG_FRAMELESS) != 0) {
+        style = 0;
+    }
+    const nswin: usize = msgInitWindow(msg(winClass, "alloc"), nsRect(0.0, 0.0, w as float, h as float), style);
+    if (nswin == 0) {
+        poolPop(pool);
+        return false;
+    }
+    msgB(nswin, "setReleasedWhenClosed:", false);
+    msgB(nswin, "setAcceptsMouseMovedEvents:", true);
+    msgP(nswin, "setDelegate:", delegate);
+    msgP(nswin, "setTitle:", nsStr(title));
+    const view: usize = msg(nswin, "contentView");
+    // layer-hosting：先给视图自己的层再开 wantsLayer，AppKit 不改这个层的内容。
+    const layer: usize = msg(msg(cls("CALayer"), "alloc"), "init");
+    msgP(view, "setLayer:", layer);
+    msgB(view, "setWantsLayer:", true);
+    msgP(layer, "setContentsGravity:", gravityStr);
+    const black: usize = cgBlack();
+    msgP(layer, "setBackgroundColor:", black);
+    cgColorFree(black);
+    const k: int = scaleOf(nswin);
+    msgD(layer, "setContentsScale:", (k as float) / 100.0);
+    const mw = new MWin { id: id, win: nswin, view: view, layer: layer, num: wrapTo<int>(msg(nswin, "windowNumber")), scale: k, cursor: 0, q: listNew(), head: 0, cw: w, ch: h, wheel: 0.0 };
+    listPush(wins, mw);
+    if ((flags & WFLAG_CENTERED) != 0) {
+        msg(nswin, "center");
+    }
+    if ((flags & WFLAG_TOPMOST) != 0) {
+        msgI(nswin, "setLevel:", 3); // NSFloatingWindowLevel
+    }
+    if ((flags & WFLAG_MAXIMIZED) != 0) {
+        msgP(nswin, "zoom:", 0);
+    }
+    if (visible) {
+        msgP(nswin, "makeKeyAndOrderFront:", 0);
+    }
+    contentSize(mw);
+    poolPop(pool);
+    return true;
+}
+
+/// 是不是本模块开的真窗。
+export function platIsReal(id: int): bool {
+    return idxOfId(id) >= 0;
+}
+
+/// 关真窗（幂等）。
+export function platDestroy(id: int): void {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return;
+    }
+    const w: Ref<MWin> = winAt(i);
+    const pool: usize = poolPush();
+    let di = listLen(debugWheels) - 1;
+    while (di >= 0) { if (listGet(debugWheels, di).id == id) { msg(listGet(debugWheels, di).event, "release"); listRemoveAt(debugWheels, di); } di = di - 1; }
+    msgP(w.win, "setDelegate:", 0);
+    msgP(w.win, "orderOut:", 0);
+    msg(w.win, "close");
+    msg(w.win, "release");
+    msg(w.layer, "release");
+    poolPop(pool);
+    listRemoveAt(wins, i);
+}
+
+// —— 事件 ——
+
+function handle(e: usize): void {
+    const t: int = wrapTo<int>(msg(e, "type"));
+    let i: int = idxOfNum(wrapTo<int>(msg(e, "windowNumber")));
+    let debugX = -1; let debugY = -1; let di = 0;
+    while (di < listLen(debugWheels)) {
+        const entry = listGet(debugWheels, di);
+        if (entry.event == e) {
+            i = idxOfId(entry.id); debugX = entry.x; debugY = entry.y;
+            listRemoveAt(debugWheels, di); break;
+        } di = di + 1;
+    }
+    if (i < 0) {
+        msgP(app, "sendEvent:", e);
+        return;
+    }
+    const w: Ref<MWin> = winAt(i);
+    if (t == NS_APP_DEFINED) {
+        // 测试投递（platDebugPost）：子类型 1 关窗、2 改客户区尺寸；在队列里轮到它才执行，与其他投递的事件保持先后。
+        const sub: int = wrapTo<int>(msg(e, "subtype")) & 0xFFFF;
+        if (sub == 1) {
+            msgP(w.win, "performClose:", 0);
+        } else if (sub == 2) {
+            msgSize(w.win, "setContentSize:", wrapTo<int>(msg(e, "data1")) as float, wrapTo<int>(msg(e, "data2")) as float);
+        } else if (sub == 3) {
+            const payload = msg(e, "data1"); let at = 0;
+            while (at < listLen(debugWheels)) {
+                const entry = listGet(debugWheels, at);
+                if (entry.event == payload && entry.id == w.id) { handle(payload); msg(payload, "release"); break; }
+                at = at + 1;
+            }
+        }
+        return;
+    }
+    if (t == NS_KEY_DOWN || t == NS_KEY_UP) {
+        const m: int = modsOf(wrapTo<int>(msg(e, "modifierFlags")));
+        const vk: int = vkOfKeyCode(wrapTo<u16>(msg(e, "keyCode")) as int); // unsigned short：寄存器高位未定义
+        let kind: int = EV_KEY_UP;
+        if (t == NS_KEY_DOWN) {
+            kind = EV_KEY_DOWN;
+        }
+        if (vk != 0 && !(kind == EV_KEY_DOWN && printableVk(vk) && (m & (MOD_CTRL | MOD_ALT)) == 0)) {
+            push(w, kind, vk & 0xFF, 0, 0, m);
+        }
+        if (kind == EV_KEY_DOWN && (m & (MOD_CTRL | MOD_ALT)) == 0) {
+            const chars: string = msgRetS(msg(e, "characters"), "UTF8String");
+            for (cp in codepoints(chars)) {
+                // 功能键的 characters 是私用区 U+F700..U+F8FF，不是文字。
+                if (cp >= 0x20 && cp != 0x7F && !(cp >= 0xF700 && cp <= 0xF8FF)) {
+                    push(w, EV_TEXT, cp, 0, 0, m);
+                }
+            }
+        }
+        return;
+    }
+    if (t == NS_SCROLL_WHEEL) {
+        const p = msgRetPoint(e, "locationInWindow");
+        let x = p.x as int;
+        let y = w.ch - (p.y as int);
+        if (debugX >= 0) { x = debugX; y = debugY; }
+        if (x >= 0 && x < w.cw && y >= 0 && y < w.ch) {
+            let delta = -msgRetD(e, "scrollingDeltaY");
+            if ((msg(e, "hasPreciseScrollingDeltas") & 0xFF) == 0) { delta = delta * 40.0; }
+            if (delta >= -1000000.0 && delta <= 1000000.0) {
+                const total = delta + w.wheel;
+                const whole = total as int;
+                w.wheel = total - (whole as float);
+                if (whole != 0) { push(w, EV_SCROLL, whole, x, y, modsOf(wrapTo<int>(msg(e, "modifierFlags")))); }
+            }
+        }
+        return;
+    }
+    if (t == NS_LEFT_DOWN || t == NS_LEFT_UP || t == NS_MOVED || t == NS_LEFT_DRAGGED) {
+        const p: NSPOINT = msgRetPoint(e, "locationInWindow");
+        const x: int = p.x as int;
+        const y: int = w.ch - (p.y as int);
+        const m: int = modsOf(wrapTo<int>(msg(e, "modifierFlags")));
+        // 标题栏里的不算客户区（照常交给 AppKit：拖动、按钮）。
+        if (y >= 0 && y < w.ch && x >= 0 && x < w.cw || t == NS_LEFT_UP || t == NS_LEFT_DRAGGED) {
+            if (t == NS_LEFT_DOWN) {
+                push(w, EV_MOUSE_DOWN, 1, x, y, m);
+            } else if (t == NS_LEFT_UP) {
+                push(w, EV_MOUSE_UP, 1, x, y, m);
+            } else {
+                push(w, EV_MOUSE_MOVE, 0, x, y, m);
+                applyCursor(w);
+            }
+        }
+    }
+    msgP(app, "sendEvent:", e);
+}
+
+// 取并分派队列里已有的事件；waitMs > 0 时没有事件先等至多这么久。
+function pump(waitMs: int): void {
+    const pool: usize = poolPush();
+    let until: usize = msg(cls("NSDate"), "distantPast");
+    if (waitMs > 0) {
+        until = msgD(cls("NSDate"), "dateWithTimeIntervalSinceNow:", (waitMs as float) / 1000.0);
+    }
+    let e: usize = msgNextEvent(app, until, modeStr);
+    while (e != 0) {
+        handle(e);
+        e = msgNextEvent(app, msg(cls("NSDate"), "distantPast"), modeStr);
+    }
+    poolPop(pool);
+}
+
+function zeros5(): List<int> {
+    const r: List<int> = listNew();
+    let i: int = 0;
+    while (i < 5) {
+        listPush(r, 0);
+        i = i + 1;
+    }
+    return r;
+}
+
+/// 取下一条事件 [kind、target、x、y、mods]（kind 0＝至多等 timeoutMs 毫秒仍无事件）。
+export function platWait(id: int, timeoutMs: int): List<int> {
+    const none: List<int> = zeros5();
+    if (idxOfId(id) < 0) {
+        return none;
+    }
+    pump(0);
+    if (timeoutMs > 0) {
+        const deadline: int = nowMs() + timeoutMs;
+        while (idxOfId(id) >= 0 && queued(winAt(idxOfId(id))) == 0) {
+            const left: int = deadline - nowMs();
+            if (left <= 0) {
+                break;
+            }
+            pump(left);
+        }
+    }
+    const j: int = idxOfId(id);
+    if (j < 0) {
+        return none;
+    }
+    const w: Ref<MWin> = winAt(j);
+    if (queued(w) == 0) {
+        return none;
+    }
+    const rec: List<int> = listNew();
+    let s: int = 0;
+    while (s < 5) {
+        listPush(rec, listTryGet(w.q, w.head + s) catch 0);
+        s = s + 1;
+    }
+    w.head = w.head + 5;
+    return rec;
+}
+
+/// 呈现：像素（BGRX，宽 pw、高 ph）做成 CGImage 交给窗口的层（层持有它，重画不用再给）。失败得 -1。
+export function platPresent(id: int, px: Bytes, pw: int, ph: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0 || pw < 1 || ph < 1 || pw > 32767 || ph > 32767 || bytesLen(px) < pw * ph * 4) {
+        return -1;
+    }
+    const w: Ref<MWin> = winAt(i);
+    const img: usize = cgImageOf(px, pw, ph);
+    if (img == 0) {
+        return -1;
+    }
+    const pool: usize = poolPush();
+    const tx: usize = cls("CATransaction");
+    msg(tx, "begin");
+    msgB(tx, "setDisableActions:", true);
+    msgP(w.layer, "setContents:", img);
+    msg(tx, "commit");
+    poolPop(pool);
+    cgImageFree(img);
+    return 0;
+}
+
+/// 窗口所在屏的缩放×100（backingScaleFactor；换屏时经委托更新）。
+export function platScale(id: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return 100;
+    }
+    return winAt(i).scale;
+}
+
+export function platSetTitle(id: int, title: string): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return -1;
+    }
+    const pool: usize = poolPush();
+    msgP(winAt(i).win, "setTitle:", nsStr(title));
+    poolPop(pool);
+    return 0;
+}
+
+/// 相对移动（DIP 增量；屏幕坐标 y 轴向上，向下移即原点 y 减小）。
+export function platMove(id: int, dx: int, dy: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return -1;
+    }
+    const w: Ref<MWin> = winAt(i);
+    const r: NSRECT = msgRetRect(w.win, "frame");
+    msgPoint(w.win, "setFrameOrigin:", r.origin.x + (dx as float), r.origin.y - (dy as float));
+    return 0;
+}
+
+export function platMinimize(id: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return -1;
+    }
+    msgP(winAt(i).win, "miniaturize:", 0);
+    return 0;
+}
+
+export function platMaximizeToggle(id: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return -1;
+    }
+    msgP(winAt(i).win, "zoom:", 0);
+    return 0;
+}
+
+/// 客户区尺寸（DIP）；尺寸事件经委托的 windowDidResize: 发出。
+export function platClientResize(id: int, cw: int, ch: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0 || cw < 1 || ch < 1) {
+        return -1;
+    }
+    msgSize(winAt(i).win, "setContentSize:", cw as float, ch as float);
+    return 0;
+}
+
+/// 客户区的最小、最大尺寸（DIP；0＝不约束）。
+export function platSetMinMax(id: int, minW: int, minH: int, maxW: int, maxH: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return -1;
+    }
+    const nswin: usize = winAt(i).win;
+    msgSize(nswin, "setContentMinSize:", maxInt(minW, 0) as float, maxInt(minH, 0) as float);
+    let mw: int = 100000;
+    let mh: int = 100000;
+    if (maxW > 0) {
+        mw = maxW;
+    }
+    if (maxH > 0) {
+        mh = maxH;
+    }
+    msgSize(nswin, "setContentMaxSize:", mw as float, mh as float);
+    return 0;
+}
+
+export function platSetTopmost(id: int, on: bool): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return -1;
+    }
+    let level: int = 0; // NSNormalWindowLevel
+    if (on) {
+        level = 3; // NSFloatingWindowLevel
+    }
+    msgI(winAt(i).win, "setLevel:", level);
+    return 0;
+}
+
+/// macOS 的菜单在全局菜单栏、顶层只能是子菜单，与窗口菜单栏不对应：得 -1。
+export function platMenuAdd(id: int, item: int, label: string): int {
+    id;
+    item;
+    label;
+    return -1;
+}
+
+function applyCursor(w: Ref<MWin>): void {
+    let name: string = "arrowCursor";
+    if (w.cursor == 1) {
+        name = "IBeamCursor";
+    }
+    msg(msg(cls("NSCursor"), name), "set");
+}
+
+/// 客户区光标：0 箭头、1 I 形（鼠标在客户区里移动时重设，AppKit 的光标是整个应用的）。
+export function platSetCursor(id: int, kind: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0 || kind < 0 || kind > 1) {
+        return -1;
+    }
+    const w: Ref<MWin> = winAt(i);
+    w.cursor = kind;
+    applyCursor(w);
+    return 0;
+}
+
+/// 窗口整体不透明度 0..255（alphaValue）。
+export function platSetOpacity(id: int, opacity: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0 || opacity < 0 || opacity > 255) {
+        return -1;
+    }
+    msgD(winAt(i).win, "setAlphaValue:", (opacity as float) / 255.0);
+    return 0;
+}
+
+/// 窗口效果：暂无，恒得 0（plain）。
+export function platSetEffect(id: int, effect: int): int {
+    id;
+    effect;
+    return 0;
+}
+
+/// 真窗会话的动画毫秒（单调时钟）。
+export function platAnimMs(): int {
+    return nowMs();
+}
+
+// —— 剪贴板（NSPasteboard 通用板）——
+
+/// 剪贴板可用（有窗口服务器会话）。
+export function platClipAvailable(): bool {
+    return platAvailable();
+}
+
+/// 写剪贴板。不可用或写不进得 -1。
+export function platClipSet(text: string): int {
+    if (!platAvailable()) {
+        return -1;
+    }
+    const pool: usize = poolPush();
+    const pb: usize = msg(cls("NSPasteboard"), "generalPasteboard");
+    msg(pb, "clearContents");
+    const ok: int = wrapTo<u8>(msgPP(pb, "setString:forType:", nsStr(text), utiStr)) as int; // BOOL：只看低 8 位
+    poolPop(pool);
+    if (ok == 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/// 读剪贴板。不可用或没有文字得空串。
+export function platClipGet(): string {
+    if (!platAvailable()) {
+        return "";
+    }
+    const pool: usize = poolPush();
+    const pb: usize = msg(cls("NSPasteboard"), "generalPasteboard");
+    const s: usize = msgP(pb, "stringForType:", utiStr);
+    let out: string = "";
+    if (s != 0) {
+        out = msgRetS(s, "UTF8String");
+    }
+    poolPop(pool);
+    return out;
+}
+
+/// 测试用：同步发 Windows 消息（platform_windows 的 SendMessageW）；本平台没有，得 -1。
+export function platDebugSend(id: int, msg: int, wp: int, lp: int): int {
+    id;
+    msg;
+    wp;
+    lp;
+    return -1;
+}
+
+/// 测试用：经 [NSApp postEvent:atStart:] 给真窗投递一条合成事件，同真实输入走事件分派。type 为 NSEventType：1／2 左键按下／
+/// 抬起、3／4 右键（不发事件，同其他后端只认左键）、5 移动、6 拖动（lp 低 16 位 x、次 16 位 y，客户区坐标自上而下；再 16 位为
+/// 引擎的 mods）；10／11 键按下／抬起（detail 低 16 位为 kVK 键码、其上为键产生的字符码位，0＝不产生字符；lp 的第三个 16 位为
+/// mods）；另有 100 关窗、101 改客户区尺寸（lp 低 16 位宽、次 16 位高）——这两种以应用自定义事件排进队列，轮到时分别经
+/// performClose: 与 setContentSize: 走委托。
+export function platDebugPost(id: int, type: int, detail: int, lp: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return -1;
+    }
+    const w: Ref<MWin> = winAt(i);
+    const pool: usize = poolPush();
+    let ev: usize = 0;
+    const flags: int = flagsOf((lp >> 32) & 0xFFFF);
+    if (type == NS_LEFT_DOWN || type == NS_LEFT_UP || type == NS_RIGHT_DOWN || type == NS_RIGHT_UP || type == NS_MOVED || type == NS_LEFT_DRAGGED) {
+        const x: int = lp & 0xFFFF;
+        const y: int = (lp >> 16) & 0xFFFF;
+        ev = msgMouseEvent(cls("NSEvent"), type, x as float, (w.ch - y) as float, flags, w.num);
+    } else if (type == NS_SCROLL_WHEEL) {
+        // detail: signed low 32 bits = native delta; bit 32 selects lines instead of pixels.
+        const cg = cgWheelEvent(wrapTo<i32>(detail) as int, (detail & (1 << 32)) != 0, flags);
+        if (cg != 0) { ev = msgP(cls("NSEvent"), "eventWithCGEvent:", cg); cgEventFree(cg); }
+        if (ev != 0) {
+            const wheel = ev; msg(wheel, "retain");
+            ev = msgOtherEvent(cls("NSEvent"), w.num, 3, wrapTo<int>(wheel), 0);
+            if (ev != 0) { listPush(debugWheels, DebugWheel { event: wheel, id: id, x: lp & 0xFFFF, y: (lp >> 16) & 0xFFFF }); }
+            else { msg(wheel, "release"); }
+        }
+    } else if (type == NS_KEY_DOWN || type == NS_KEY_UP) {
+        const cp: int = (detail >> 16) & 0x1FFFFF;
+        let text: string = "";
+        if (cp > 0) {
+            text = utf8Of(cp);
+        }
+        const s: usize = nsStr(text);
+        ev = msgKeyEvent(cls("NSEvent"), type, flags, w.num, s, s, detail & 0xFFFF);
+    } else if (type == 100) {
+        ev = msgOtherEvent(cls("NSEvent"), w.num, 1, 0, 0);
+    } else if (type == 101) {
+        ev = msgOtherEvent(cls("NSEvent"), w.num, 2, lp & 0xFFFF, (lp >> 16) & 0xFFFF);
+    }
+    if (ev == 0) {
+        poolPop(pool);
+        return -1;
+    }
+    msgPB(app, "postEvent:atStart:", ev, false);
+    poolPop(pool);
+    return 0;
+}
+
+/// 文件对话框可用（有窗口服务器会话、AppKit 装得上）。
+export function platDialogAvailable(): bool {
+    return platAvailable();
+}
+
+/// 打开文件对话框（NSOpenPanel）：选中得路径，取消或不可用得空串。
+export function platDialogOpen(id: int, title: string, filters: List<FdFilter>): string {
+    id;
+    if (!platAvailable()) {
+        return "";
+    }
+    const pool: usize = poolPush();
+    let out: string = "";
+    const panel: usize = msg(cls("NSOpenPanel"), "openPanel");
+    if (panel != 0) {
+        msgB(panel, "setCanChooseFiles:", true);
+        msgB(panel, "setCanChooseDirectories:", false);
+        msgB(panel, "setAllowsMultipleSelection:", false);
+        out = runPanel(panel, title, filters);
+    }
+    poolPop(pool);
+    return out;
+}
+
+/// 保存文件对话框（NSSavePanel）：defaultName 预填进文件名框；选中得路径，取消或不可用得空串。
+export function platDialogSave(id: int, title: string, filters: List<FdFilter>, defaultName: string): string {
+    id;
+    if (!platAvailable()) {
+        return "";
+    }
+    const pool: usize = poolPush();
+    let out: string = "";
+    const panel: usize = msg(cls("NSSavePanel"), "savePanel");
+    if (panel != 0) {
+        msgB(panel, "setCanCreateDirectories:", true);
+        msgB(panel, "setAllowsOtherFileTypes:", true);
+        if (cText(defaultName) != "") {
+            msgP(panel, "setNameFieldStringValue:", nsStr(defaultName));
+        }
+        out = runPanel(panel, title, filters);
+    }
+    poolPop(pool);
+    return out;
+}
+
+// 设标题与过滤、置前、模态运行；按确定得路径，否则空串。在调用方的自动释放池里。
+function runPanel(panel: usize, title: string, filters: List<FdFilter>): string {
+    if (cText(title) != "") {
+        msgP(panel, "setTitle:", nsStr(title));
+        msgP(panel, "setMessage:", nsStr(title));
+    }
+    const exts: List<string> = fdMacExts(filters);
+    const ut: usize = cls("UTType");
+    if (listLen(exts) > 0 && ut != 0) {
+        const types: usize = msg(cls("NSMutableArray"), "array");
+        for (e in exts) {
+            const t: usize = msgP(ut, "typeWithFilenameExtension:", nsStr(e));
+            if (t != 0) {
+                msgP(types, "addObject:", t);
+            }
+        }
+        msgP(panel, "setAllowedContentTypes:", types);
+    }
+    if (!launched) {
+        launch(false);
+    }
+    msgB(app, "activateIgnoringOtherApps:", true);
+    if (msg(panel, "runModal") != 1) {
+        return "";
+    }
+    const url: usize = msg(panel, "URL");
+    if (url == 0) {
+        return "";
+    }
+    const path: usize = msg(url, "path");
+    if (path == 0) {
+        return "";
+    }
+    return msgRetS(path, "UTF8String");
+}

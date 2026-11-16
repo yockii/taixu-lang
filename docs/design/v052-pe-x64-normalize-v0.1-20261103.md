@@ -81,8 +81,8 @@ ADDR64 时同样出 DIR64（PE 允许修补代码页，MSVC、lld 都这样做�
 6. **核对**：门步 pe-image 增 `.pdata`／`.xdata` 核对（升序、不重叠、在 .text 里，展开码逐个解开、按指令对照序言，每个
    `push rbp; mov rbp, rsp` 开头都是某个 `.pdata` 函数的起点）；Windows 宿主上运行一个经 FFI 调 `RtlCaptureStackBackTrace` 的用例，
    逐帧对照 `--map` 的函数范围（含穿过内核分配器的一层）；另用 LLVM MC 的 `.seh_*` 输出对照编码（aarch64 同法），
-   不进门。受影响的门断言随之更新（`test-native-functions.py` 的 `coverage.unwind`、单条 `sub rsp` 的分配、
-   线程入口形状、开不开 `--map` 产物相同；`test-runtime-functions.py` 的去目录后产物不变——PE 将随 `.pdata` 变化）。
+   不进门。受影响的门断言随之更新（`scripts/test_native_functions.tx` 的 `coverage.unwind`、单条 `sub rsp` 的分配、
+   线程入口形状、开不开 `--map` 产物相同；`scripts/test_runtime_functions.tx` 的去目录后产物不变——PE 将随 `.pdata` 变化）。
 7. **手写内核例程里描述不了的 23 个**（收缩包装 14、多段建帧 7、中段压栈 2；取乙）：
 
    | 选项 | 做法 | 代价 |
@@ -98,7 +98,7 @@ ADDR64 时同样出 DIR64（PE 允许修补代码页，MSVC、lld 都这样做�
 
 ## 四、测试
 
-- 新增 PE 核对（同 aarch64 的 `pe_arm64_check.py` 思路，用太虚写）：头部字段、DllCharacteristics、`.reloc` 覆盖全部绝对写入点
+- 新增 PE 核对（同 aarch64 的 `scripts/pe_arm64_check.tx` 思路）：头部字段、DllCharacteristics、`.reloc` 覆盖全部绝对写入点
   （逐条对照链接器登记）、`.pdata` 按地址升序互不重叠、每个有帧函数都有展开项。
 - 运行时：在随机基址下跑现有产物用例（Windows 的 ASLR 默认对 DYNAMIC_BASE 映像生效）；用 `RtlCaptureStackBackTrace`
   逐帧对照函数目录（同 aarch64-windows 的核对）；`--leak-check`、线程、FFI 回调各一例。

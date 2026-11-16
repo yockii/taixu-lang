@@ -1,0 +1,202 @@
+import { X509Certificate } from "./x509_types";
+import { derRead, derChildren, derContents } from "./crypto/der";
+import { x509Full, x509Name, x509Oid } from "./x509_der";
+import { toLower } from "./string";
+import { parseUri } from "./url";
+import { parseIp } from "./ip";
+
+export struct X509GeneralName { kind: int, data: Bytes }
+export struct X509NameConstraints { permitted: List<X509GeneralName>, excluded: List<X509GeneralName> }
+export struct X509NameBudget { comparisons: int }
+
+export function x509NoNameConstraints(): X509NameConstraints { return X509NameConstraints { permitted: listNew(), excluded: listNew() }; }
+function startsWith(text: string, prefix: string): bool { return len(text) >= len(prefix) && strSlice(text, 0, len(prefix)) == prefix; }
+function endsWith(text: string, suffix: string): bool { return len(text) >= len(suffix) && strSlice(text, len(text) - len(suffix), len(text)) == suffix; }
+
+function ia5(raw: Bytes): string | Error {
+    let i = 0; while (i < bytesLen(raw)) { const b = bytesGet(raw, i) catch 0; if (b < 33 || b > 126) { return err("x509: invalid IA5 name"); } i = i + 1; }
+    return bytesToStr(raw);
+}
+function dnsOk(text: string): bool {
+    if (len(text) < 1 || len(text) > 253) { return false; }
+    for (label in strSplit(text, ".")) {
+        if (len(label) < 1 || len(label) > 63 || byteAt(label, 0) == 45 || byteAt(label, len(label) - 1) == 45) { return false; }
+        for (b in label) { if (!((b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 45)) { return false; } }
+    }
+    return true;
+}
+function dnsBase(text: string): bool { if (startsWith(text, ".")) { return dnsOk(strSlice(text, 1, len(text))); } return dnsOk(text); }
+function mailbox(text: string): bool {
+    const p = strSplit(text, "@");
+    return listLen(p) == 2 && len(listGet(p, 0)) > 0 && dnsOk(listGet(p, 1));
+}
+
+function constraint(kind: int, raw: Bytes): X509GeneralName | Error {
+    if (kind == 2 || kind == 6) {
+        if (!dnsBase(ia5(raw)?)) { return err("x509: invalid DNS name constraint"); }
+    } else if (kind == 1) {
+        const text = ia5(raw)?;
+        if (!(dnsBase(text) || mailbox(text))) { return err("x509: invalid email name constraint"); }
+    } else if (kind == 7) {
+        const n = bytesLen(raw);
+        if (n != 8 && n != 32) { return err("x509: invalid IP constraint length"); }
+        let zero = false; let i = n / 2;
+        while (i < n) {
+            const b = bytesGet(raw, i) catch 0; let bit = 7;
+            while (bit >= 0) { const one = ((b >> bit) & 1) != 0; if (zero && one) { return err("x509: non-contiguous IP mask"); } if (!one) { zero = true; } bit = bit - 1; } i = i + 1;
+        }
+    } else if (kind == 4) {
+        const value = derRead(raw, 0, bytesLen(raw))?;
+        if (value.end != bytesLen(raw)) { return err("x509: trailing directory constraint"); } x509Name(raw, value)?;
+    } else { return err("x509: unsupported name constraint type"); }
+    return X509GeneralName { kind: kind, data: raw };
+}
+
+export function x509ParseNameConstraints(data: Bytes): X509NameConstraints | Error {
+    const out = x509NoNameConstraints(); const root = derRead(data, 0, bytesLen(data))?;
+    if (root.tag != 48 || root.end != bytesLen(data)) { return err("x509: invalid nameConstraints"); }
+    const groups = derChildren(data, root, 2)?; let previous = -1; let count = 0;
+    if (listLen(groups) == 0) { return err("x509: empty nameConstraints"); }
+    for (group in groups) {
+        const index = group.tag - 160;
+        if (index < 0 || index > 1 || index <= previous) { return err("x509: invalid nameConstraints group order"); } previous = index;
+        const subtrees = derChildren(data, group, 128)?;
+        if (listLen(subtrees) == 0) { return err("x509: empty GeneralSubtrees"); }
+        for (subtree in subtrees) {
+            if (subtree.tag != 48) { return err("x509: invalid GeneralSubtree"); }
+            const fields = derChildren(data, subtree, 3)?;
+            // minimum DEFAULT 0 在 DER 中省略；maximum 不属于此证书 profile。
+            if (listLen(fields) != 1) { return err("x509: unsupported subtree distance"); }
+            const base = listGet(fields, 0);
+            const kind = base.tag & 31;
+            if (base.tag != 129 && base.tag != 130 && base.tag != 134 && base.tag != 135 && base.tag != 164) { return err("x509: unsupported constraint GeneralName tag"); }
+            const name = constraint(kind, derContents(data, base)?)?; count = count + 1;
+            if (count > 128) { return err("x509: name constraint count limit"); }
+            if (index == 0) { listPush(out.permitted, name); } else { listPush(out.excluded, name); }
+        }
+    }
+    return out;
+}
+
+function names(cert: Ref<X509Certificate>): List<X509GeneralName> | Error {
+    const out: List<X509GeneralName> = listNew(); listPush(out, X509GeneralName { kind: 4, data: cert.subject }); let san = false;
+    for (extension in cert.extensions) {
+        if (extension.oidHex != "551d11") { continue; } san = true;
+        const data = extension.value; const root = derRead(data, 0, bytesLen(data))?;
+        if (root.tag != 48 || root.end != bytesLen(data)) { return err("x509: invalid constrained SAN"); }
+        const entries = derChildren(data, root, 1024)?;
+        if (listLen(entries) == 0) { return err("x509: empty constrained SAN"); }
+        for (entry in entries) {
+            const kind = entry.tag & 31; const raw = derContents(data, entry)?;
+            if (entry.tag == 129 || entry.tag == 130 || entry.tag == 134) {
+                const text = ia5(raw)?;
+                if (kind == 2 && !dnsOk(text) && !(startsWith(text, "*.") && dnsOk(strSlice(text, 2, len(text))))) { return err("x509: invalid constrained DNS name"); }
+                listPush(out, X509GeneralName { kind: kind, data: raw });
+            }
+            else if (entry.tag == 135) {
+                if (bytesLen(raw) != 4 && bytesLen(raw) != 16) { return err("x509: invalid constrained IP"); } listPush(out, X509GeneralName { kind: 7, data: raw });
+            } else if (entry.tag == 164) {
+                const name = derRead(raw, 0, bytesLen(raw))?;
+                if (name.end != bytesLen(raw)) { return err("x509: trailing SAN directory name"); } x509Name(raw, name)?;
+                listPush(out, X509GeneralName { kind: 4, data: raw });
+            } else {
+                if (entry.tag != 160 && entry.tag != 163 && entry.tag != 165 && entry.tag != 136) { return err("x509: invalid GeneralName tag"); }
+                if (extension.critical) { return err("x509: unsupported critical SAN name"); }
+            }
+        }
+    }
+    if (!san) {
+        const data = cert.subject; const root = derRead(data, 0, bytesLen(data))?;
+        for (rdn in derChildren(data, root, 128)?) {
+            for (attr in derChildren(data, rdn, 32)?) {
+                const pair = derChildren(data, attr, 2)?;
+                if (x509Oid(data, listGet(pair, 0))? == "2a864886f70d010901") {
+                    const value = listGet(pair, 1); if (value.tag != 22) { return err("x509: emailAddress must be IA5"); }
+                    const raw = derContents(data, value)?; ia5(raw)?; listPush(out, X509GeneralName { kind: 1, data: raw });
+                }
+            }
+        }
+    }
+    return out;
+}
+
+function dnsMatch(name: string, base: string, excluded: bool): bool {
+    const n = toLower(name); const b = toLower(base); const leading = startsWith(b, ".");
+    if (leading) { if (endsWith(n, b) && len(n) > len(b)) { return true; } }
+    else if (n == b || endsWith(n, "." + b)) { return true; }
+    // 排除的单个主机也不能落入通配符 SAN 所能表示的集合。
+    if (excluded && startsWith(n, "*.")) {
+        const suffix = strSlice(n, 1, len(n));
+        if (!leading && endsWith(b, suffix) && len(b) > len(suffix)) {
+            const prefix = strSlice(b, 0, len(b) - len(suffix)); if (listLen(strSplit(prefix, ".")) == 1) { return true; }
+        }
+    }
+    return false;
+}
+
+function directoryMatch(name: Bytes, base: Bytes): bool | Error {
+    const nr = derRead(name, 0, bytesLen(name))?; const br = derRead(base, 0, bytesLen(base))?;
+    const ns = derChildren(name, nr, 128)?; const bs = derChildren(base, br, 128)?;
+    if (listLen(ns) < listLen(bs)) { return false; } let i = 0;
+    while (i < listLen(bs)) { if (!bytesEqual(x509Full(name, listGet(ns, i)), x509Full(base, listGet(bs, i)))) { return false; } i = i + 1; } return true;
+}
+
+function uriHost(text: string): string | Error {
+    const uri = parseUri(text)?;
+    if (len(uri.scheme) == 0 || uri.authority == None) { return err("x509: constrained URI requires authority"); }
+    let authority = uri.authority catch ""; const user = strSplit(authority, "@"); authority = listGet(user, listLen(user) - 1);
+    const parts = strSplit(authority, ":");
+    if (listLen(parts) > 2) { return err("x509: constrained URI requires DNS host"); }
+    const host = listGet(parts, 0);
+    if (!dnsOk(host) || bytesLen(parseIp(host) catch bytesNew(0)) > 0) { return err("x509: constrained URI requires DNS host"); }
+    return host;
+}
+
+function matches(name: X509GeneralName, base: X509GeneralName, excluded: bool): bool | Error {
+    if (name.kind != base.kind) { return false; }
+    if (name.kind == 7) {
+        const n = bytesLen(name.data);
+        if (bytesLen(base.data) != n * 2) { return false; } let i = 0;
+        while (i < n) {
+            const mask = bytesGet(base.data, n + i) catch 0;
+            if (((bytesGet(name.data, i) catch 0) & mask) != ((bytesGet(base.data, i) catch 0) & mask)) { return false; } i = i + 1;
+        } return true;
+    }
+    if (name.kind == 4) { return directoryMatch(name.data, base.data); }
+    const n = ia5(name.data)?; const b = ia5(base.data)?;
+    if (name.kind == 2) { return dnsMatch(n, b, excluded); }
+    if (name.kind == 6) {
+        const host = toLower(uriHost(n)?); const lower = toLower(b);
+        if (startsWith(lower, ".")) { return endsWith(host, lower) && len(host) > len(lower); } return host == lower;
+    }
+    if (name.kind == 1) {
+        if (!mailbox(n)) { return err("x509: invalid constrained email"); }
+        const address = strSplit(n, "@"); const expected = strSplit(b, "@");
+        if (listLen(expected) == 2) { return listGet(address, 0) == listGet(expected, 0) && toLower(listGet(address, 1)) == toLower(listGet(expected, 1)); }
+        const host = toLower(listGet(address, 1)); const lower = toLower(b);
+        if (startsWith(lower, ".")) { return endsWith(host, lower) && len(host) > len(lower); } return host == lower;
+    }
+    return err("x509: unsupported constrained identity");
+}
+
+function compare(name: X509GeneralName, base: X509GeneralName, excluded: bool, budget: Ref<X509NameBudget>): bool | Error {
+    budget.comparisons = budget.comparisons + 1;
+    if (budget.comparisons > 65536) { return err("x509: name comparison limit"); } return matches(name, base, excluded);
+}
+
+export function x509ApplyNameConstraints(constraints: X509NameConstraints, cert: Ref<X509Certificate>, budget: Ref<X509NameBudget>): void | Error {
+    for (name in names(cert)?) {
+        for (base in constraints.excluded) {
+            if (base.kind == name.kind && compare(name, base, true, budget)?) { return err("x509: excluded certificate name"); }
+        }
+        let constrained = false; let allowed = false;
+        for (base in constraints.permitted) {
+            if (base.kind != name.kind) { continue; } constrained = true;
+            if (compare(name, base, false, budget)?) { allowed = true; }
+        }
+        if (constrained && !allowed) { return err("x509: certificate name outside permitted subtrees"); }
+    }
+    return done();
+}
+
+function done(): void {}

@@ -1,0 +1,1970 @@
+// 原生调试会话门。§六。
+//
+// 对 tests/debug/cases.json 与 tests/debug/native/cases.json 的每个 proto、dap、mcp 用例，用录 VM 转录时的同一套驱动录原生转录：
+//   - proto：`taixu run --debug <程序>` 的 NDJSON 协议，按脚本发命令、等相应的事件（inspect_all／inspect_named 展开、continue／step
+//     直到退出、eof 提前结束），之后关输入、读完、记退出码（无终结事件而非零退出记 abnormal）；
+//   - dap：`taixu dap` 的 Content-Length 帧，每步先记应答、再按到达次序记事件，等 until 列出的事件，步末等 150 ms 无新消息；
+//   - mcp：`taixu mcp --trust-workspace` 的 tools/call 与方法调用，回执的 session 换成逻辑名。
+// 转录规范化：tests/debug 的绝对路径换成 <dir>（其后的分隔符统一为 /），at_ms 置 0，DAP 消息去掉 seq，连续 9 条以上的
+// stdout（proto）或 output（dap）事件折叠为计数加首尾，MCP 回执里超过 16 条的 events 保留首尾各 3 条。再按金文件的形式（pc 与对象号
+// 置空、去掉 reg_count、帧里只留有名字的槽、serverInfo.version 换成占位）与 tests/debug/native/<种类>/<用例> 逐字节比较（--update
+// 重写金文件，提交前须审阅差异），并与 tests/debug/vm/ 的 VM 转录按 §六的规则对照（§五列出的有意差别除外）：
+//   - proto：ready 的函数名与模块数、入口模块路径，stdout 文本，终结事件，错误信息（有意差别的除外）；只用 continue 驱动的用例另比
+//     合并后的停点序列与各停点的栈形、栈顶行、有名字且不为 none 的槽的简述；inspect 的回复逐节点对照（对象号、VM 的残缺 UTF-8 尾、
+//     VM 缺的枚举类型名、原生给错误值的种类与 payload、cause 除外）；
+//   - dap：程序的 stdout 文本、两边都报的退出码、第一次停下的位置（函数与行）；
+//   - mcp：initialize 的 result（serverInfo.version 除外）、回执类别序列、事件里的 stdout、终结回执、第一次停下的位置、断点回执（原生
+//     对未知模块多一条 error 回执）。
+// 原生独有的用例（生成器、线程、命名变量、从加载态单步）只比金文件。
+//
+// 进程经 test_proto.tx 的原样模式收字节，按行或按帧切分（行按 UTF-8 解码、非法字节换成 U+FFFD、去掉末尾的 \r、\n；帧头逐行读、
+// 去两端空白，Content-Length 不分大小写）；JSON 以独立的 test_json.tx 解析与写出（紧凑写法同 Python 的
+// json.dumps(separators=(',', ':'), ensure_ascii=False)）。子进程的 stderr 照读后丢弃；FAIL 细节里的值按 Python 的 repr 写（非 ASCII
+// 的不可打印字符不转义）。
+//
+// 运行（仓根）：taixu run --toolchain scripts/test_native_debug.tx --compiler <taixu> [--root <仓根>] [--update] [用例 ...]
+// 任何 FAIL 时退出码 1。
+import { absolute, nat, startsWith } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { lossyText } from "./check_lib";
+import { J_ARR, J_BOOL, J_NULL, J_NUM, J_OBJ, J_STR, Jv, jArray, jDump, jEq, jNull, jNumber, jObject, jParse, jPush, jSet, jString } from "./test_json";
+import { at, count, has, isObj, item, sameJv, textIs, textOf, truthy } from "./test_jv";
+import { MODE_RAW, Peer, peerClose, peerExited, peerPump, peerSend, peerStart } from "./test_proto";
+import { byteSub, digits, headChars, indexOf, isSpace, padRight, reprStr, strip } from "./test_text";
+
+const MS: int = 1000000;
+const STEP_TIMEOUT_MS: int = 60000;
+const QUIET_MS: int = 150;
+const FOLD_MIN: int = 9;
+const EVENTS_KEEP: int = 3;
+const UNKNOWN_MODULE: string = "未知模块（见 ready 事件的 modules 清单）";
+
+// ---------------------------------------------------------------- 文本与 JSON 小件
+
+function textAt(v: Ref<Jv>?, key: string): string? {
+    const x = at(v, key);
+    if (x == None || (x ?? jNull()).kind != J_STR) {
+        return None;
+    }
+    return (x ?? jNull()).text;
+}
+
+function eventOf(v: Ref<Jv>?): string {
+    return textAt(v, "event") ?? "";
+}
+
+function isNum(v: Ref<Jv>?): bool {
+    return v != None && (v ?? jNull()).kind == J_NUM;
+}
+
+function isTrueJv(v: Ref<Jv>?): bool {
+    return v != None && (v ?? jNull()).kind == J_BOOL && (v ?? jNull()).truth;
+}
+
+function isFalseJv(v: Ref<Jv>?): bool {
+    return v != None && (v ?? jNull()).kind == J_BOOL && !(v ?? jNull()).truth;
+}
+
+function jTrue(): Ref<Jv> {
+    const v = jNull();
+    v.kind = J_BOOL;
+    v.truth = true;
+    return v;
+}
+
+// 解析不了的原文记作 {"__raw__": 原文}。
+function parseOr(raw: string): Ref<Jv> {
+    return jParse(raw) catch (e) {
+        const o = jObject();
+        jSet(o, "__raw__", jString(raw));
+        return o;
+    };
+}
+
+// 转录行 `< …`／`> …` 的 JSON；解析不了得 null。
+function parseLine(line: string): Ref<Jv> {
+    return jParse(byteSub(line, 2, len(line) - 2)) catch jNull();
+}
+
+function note1(k: string, v: Ref<Jv>): Ref<Jv> {
+    const o = jObject();
+    jSet(o, k, v);
+    return o;
+}
+
+function note2(k1: string, v1: Ref<Jv>, k2: string, v2: Ref<Jv>): Ref<Jv> {
+    const o = note1(k1, v1);
+    jSet(o, k2, v2);
+    return o;
+}
+
+// 浅拷贝对象，去掉 drop 里的键。
+function without(v: Ref<Jv>, drop: List<string>): Ref<Jv> {
+    const o = jObject();
+    let i = 0;
+    while (i < listLen(v.keys)) {
+        const k = listGet(v.keys, i) catch "";
+        let skip = false;
+        for (d in drop) {
+            if (d == k) {
+                skip = true;
+            }
+        }
+        if (!skip) {
+            jSet(o, k, listGet(v.items, i) catch jNull());
+        }
+        i = i + 1;
+    }
+    return o;
+}
+
+function noKeys(): List<string> {
+    const out: List<string> = listNew();
+    return out;
+}
+
+function keys1(a: string): List<string> {
+    const out = noKeys();
+    listPush(out, a);
+    return out;
+}
+
+function noJv(): List<Ref<Jv>> {
+    const out: List<Ref<Jv>> = listNew();
+    return out;
+}
+
+// Python 的 repr（FAIL 细节用）：dict 写 {'k': v}，list 写 [...]，str 用单引号，true／false／null 写 True／False／None。
+function pyRepr(v: Ref<Jv>?): string {
+    if (v == None) {
+        return "None";
+    }
+    const x = v ?? jNull();
+    if (x.kind == J_NULL) {
+        return "None";
+    }
+    if (x.kind == J_BOOL) {
+        if (x.truth) {
+            return "True";
+        }
+        return "False";
+    }
+    if (x.kind == J_NUM) {
+        return x.text;
+    }
+    if (x.kind == J_STR) {
+        return reprStr(x.text);
+    }
+    let s = "[";
+    let close = "]";
+    if (x.kind == J_OBJ) {
+        s = "{";
+        close = "}";
+    }
+    let i = 0;
+    while (i < listLen(x.items)) {
+        if (i > 0) {
+            s = s + ", ";
+        }
+        if (x.kind == J_OBJ) {
+            s = s + reprStr(listGet(x.keys, i) catch "") + ": ";
+        }
+        s = s + pyRepr(listGet(x.items, i) catch jNull());
+        i = i + 1;
+    }
+    return s + close;
+}
+
+// str(x)：字符串原样，其余同 repr。
+function strOf(v: Ref<Jv>?): string {
+    if (v != None && (v ?? jNull()).kind == J_STR) {
+        return (v ?? jNull()).text;
+    }
+    return pyRepr(v);
+}
+
+// 已是 repr 文字的各项写成 Python 列表的 repr。
+function listRepr(xs: List<string>): string {
+    let s = "[";
+    let k = 0;
+    for (x in xs) {
+        if (k > 0) {
+            s = s + ", ";
+        }
+        s = s + x;
+        k = k + 1;
+    }
+    return s + "]";
+}
+
+function strsRepr(xs: List<string>): string {
+    const rs = noKeys();
+    for (x in xs) {
+        listPush(rs, reprStr(x));
+    }
+    return listRepr(rs);
+}
+
+function jvListRepr(xs: List<Ref<Jv>>): string {
+    const rs = noKeys();
+    for (x in xs) {
+        listPush(rs, pyRepr(x));
+    }
+    return listRepr(rs);
+}
+
+function strsEq(a: List<string>, b: List<string>): bool {
+    if (listLen(a) != listLen(b)) {
+        return false;
+    }
+    let i = 0;
+    while (i < listLen(a)) {
+        if ((listGet(a, i) catch "") != (listGet(b, i) catch "")) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function jvListsEq(a: List<Ref<Jv>>, b: List<Ref<Jv>>): bool {
+    if (listLen(a) != listLen(b)) {
+        return false;
+    }
+    let i = 0;
+    while (i < listLen(a)) {
+        if (!jEq(listGet(a, i) catch jNull(), listGet(b, i) catch jNull())) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function isDigit(c: int): bool {
+    return c >= 48 && c <= 57;
+}
+
+// '#' 后跟数字的整段换成 '#'（同 re.sub(r'#\d+', '#', s)）。
+function blankObj(s: string): string {
+    const b = bytesFromStr(s);
+    const out = bytesNew(0);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) ?? 0;
+        bytesPush(out, c);
+        i = i + 1;
+        if (c == 35) {
+            while (i < bytesLen(b) && isDigit(bytesGet(b, i) ?? 0)) {
+                i = i + 1;
+            }
+        }
+    }
+    return bytesToStr(out) catch s;
+}
+
+function replaceAll(s: string, a: string, b: string): string {
+    const parts = strSplit(s, a);
+    let out = listGet(parts, 0) catch "";
+    let i = 1;
+    while (i < listLen(parts)) {
+        out = out + b + (listGet(parts, i) catch "");
+        i = i + 1;
+    }
+    return out;
+}
+
+// 文本的各行（同 str.splitlines()：末尾换行不产生空行，行尾的 \r 去掉）。
+function linesOfText(text: string): List<string> {
+    const out = noKeys();
+    const parts = strSplit(text, "\n");
+    let i = 0;
+    while (i < listLen(parts)) {
+        let l = listGet(parts, i) catch "";
+        if (len(l) > 0 && (byteAt(l, len(l) - 1) ?? 0) == 13) {
+            l = byteSub(l, 0, len(l) - 1);
+        }
+        if (i < listLen(parts) - 1 || len(l) > 0) {
+            listPush(out, l);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+function intAt(v: Ref<Jv>?, key: string, dflt: int): int {
+    const x = at(v, key);
+    if (!isNum(x)) {
+        return dflt;
+    }
+    return digits((x ?? jNull()).text);
+}
+
+// ---------------------------------------------------------------- 规范化
+
+struct Norm {
+    dir: string,
+    bases: List<string>,
+}
+
+function normNew(dir: string): Ref<Norm> {
+    const bases = keys1(dir);
+    const fwd = replaceAll(dir, "\\", "/");
+    if (fwd != dir) {
+        listPush(bases, fwd);
+    }
+    return new Norm { dir: dir, bases: bases };
+}
+
+function stopChar(c: int): bool {
+    return c == 32 || c == 34 || c == 39 || c == 10 || c == 9 || c == 58 || c == 41 || c == 44 || c == 59;
+}
+
+function normText(n: Ref<Norm>, s: string): string {
+    for (b in n.bases) {
+        if (indexOf(s, b) >= 0) {
+            const out = bytesNew(0);
+            let rest = s;
+            while (true) {
+                const i = indexOf(rest, b);
+                if (i < 0) {
+                    break;
+                }
+                bytesAppend(out, bytesFromStr(byteSub(rest, 0, i)));
+                rest = byteSub(rest, i + len(b), len(rest) - i - len(b));
+                let j = 0;
+                while (j < len(rest) && !stopChar(byteAt(rest, j) ?? 0)) {
+                    j = j + 1;
+                }
+                bytesAppend(out, bytesFromStr("<dir>" + replaceAll(byteSub(rest, 0, j), "\\", "/")));
+                rest = byteSub(rest, j, len(rest) - j);
+            }
+            bytesAppend(out, bytesFromStr(rest));
+            return bytesToStr(out) catch s;
+        }
+    }
+    return s;
+}
+
+// key 为父对象里的键（顶层与列表元素为空串）；"__dap__" 表示 DAP 消息的顶层（去掉 seq）。
+function normValue(n: Ref<Norm>, v: Ref<Jv>, key: string): Ref<Jv> {
+    if (v.kind == J_OBJ) {
+        const o = jObject();
+        let i = 0;
+        while (i < listLen(v.keys)) {
+            const k = listGet(v.keys, i) catch "";
+            const x = listGet(v.items, i) catch jNull();
+            if (k == "at_ms") {
+                jSet(o, k, jNumber(0));
+            } else if (!(key == "__dap__" && k == "seq")) {
+                jSet(o, k, normValue(n, x, k));
+            }
+            i = i + 1;
+        }
+        return o;
+    }
+    if (v.kind == J_ARR) {
+        const a = jArray();
+        const total = listLen(v.items);
+        let i = 0;
+        while (i < total) {
+            if (key == "events" && total > 2 * EVENTS_KEEP + 10 && i == EVENTS_KEEP) {
+                jPush(a, note1("elided", jNumber(total - 2 * EVENTS_KEEP)));
+                i = total - EVENTS_KEEP;
+            }
+            jPush(a, normValue(n, listGet(v.items, i) catch jNull(), ""));
+            i = i + 1;
+        }
+        return a;
+    }
+    if (v.kind == J_STR) {
+        return jString(normText(n, v.text));
+    }
+    return v;
+}
+
+// 脚本值里的 `<dir>/…` 换成 tests/debug 的真实路径（同 norm_args；Windows 上分隔符为 \）。
+function normArgs(n: Ref<Norm>, v: Ref<Jv>): Ref<Jv> {
+    if (v.kind == J_OBJ) {
+        const o = jObject();
+        let i = 0;
+        while (i < listLen(v.keys)) {
+            jSet(o, listGet(v.keys, i) catch "", normArgs(n, listGet(v.items, i) catch jNull()));
+            i = i + 1;
+        }
+        return o;
+    }
+    if (v.kind == J_ARR) {
+        const a = jArray();
+        for (x in v.items) {
+            jPush(a, normArgs(n, x));
+        }
+        return a;
+    }
+    if (v.kind == J_STR && startsWith(v.text, "<dir>/")) {
+        return jString(nat(n.dir + "/" + byteSub(v.text, 6, len(v.text) - 6)));
+    }
+    return v;
+}
+
+// ---------------------------------------------------------------- 转录
+
+struct Transcript {
+    lines: List<string>,
+    fold: List<Ref<Jv>>,
+}
+
+function trNew(): Ref<Transcript> {
+    return new Transcript { lines: noKeys(), fold: noJv() };
+}
+
+function trFlush(t: Ref<Transcript>): void {
+    if (listLen(t.fold) == 0) {
+        return;
+    }
+    if (listLen(t.fold) >= FOLD_MIN) {
+        const o = note1("folded", jNumber(listLen(t.fold)));
+        jSet(o, "first", listGet(t.fold, 0) catch jNull());
+        jSet(o, "last", listGet(t.fold, listLen(t.fold) - 1) catch jNull());
+        listPush(t.lines, "< " + jDump(o));
+    } else {
+        for (x in t.fold) {
+            listPush(t.lines, "< " + jDump(x));
+        }
+    }
+    t.fold = noJv();
+}
+
+function trRecv(t: Ref<Transcript>, m: Ref<Jv>, foldable: bool): void {
+    if (foldable) {
+        listPush(t.fold, m);
+        return;
+    }
+    trFlush(t);
+    listPush(t.lines, "< " + jDump(m));
+}
+
+function trSend(t: Ref<Transcript>, text: string): void {
+    trFlush(t);
+    listPush(t.lines, "> " + text);
+}
+
+function trNote(t: Ref<Transcript>, v: Ref<Jv>): void {
+    trFlush(t);
+    listPush(t.lines, "= " + jDump(v));
+}
+
+function trText(t: Ref<Transcript>): string {
+    trFlush(t);
+    const out = bytesNew(0);
+    for (l in t.lines) {
+        bytesAppend(out, bytesFromStr(l));
+        bytesPush(out, 10);
+    }
+    return bytesToStr(out) catch "";
+}
+
+// ---------------------------------------------------------------- 读服务
+
+struct Reader {
+    p: Ref<Peer>,
+    framed: bool,
+    queue: List<string>,
+    // stdout 已关闭、余下的字节已入队：队列取空后 readerGet 报流尾。
+    eof: bool,
+}
+
+// 取到的一条：kind 0 消息、1 流尾、2 超时。
+struct Got {
+    kind: int,
+    text: string,
+}
+
+function spawn(taixu: string, args: List<string>, dir: string, framed: bool): Ref<Reader> | Error {
+    const p = peerStart(taixu, args, dir, MODE_RAW, false)?;
+    return new Reader { p: p, framed: framed, queue: noKeys(), eof: false };
+}
+
+// bytes.strip() 后按 UTF-8 解码。
+function trimBytes(b: Bytes): string {
+    let a = 0;
+    let z = bytesLen(b);
+    while (a < z && isSpace(bytesGet(b, a) ?? 0)) {
+        a = a + 1;
+    }
+    while (z > a && isSpace(bytesGet(b, z - 1) ?? 0)) {
+        z = z - 1;
+    }
+    return lossyText(bytesSlice(b, a, z - a));
+}
+
+function lower(s: string): string {
+    const b = bytesFromStr(s);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) ?? 0;
+        if (c >= 65 && c <= 90) {
+            bytesSet(b, i, c + 32);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(b) catch s;
+}
+
+// 行去掉末尾的 \r、\n（同 rstrip('\r\n')）。
+function stripEol(s: string): string {
+    let n = len(s);
+    while (n > 0 && ((byteAt(s, n - 1) ?? 0) == 13 || (byteAt(s, n - 1) ?? 0) == 10)) {
+        n = n - 1;
+    }
+    return byteSub(s, 0, n);
+}
+
+// from 起下一个换行的位置；没有为 −1。
+function newline(b: Bytes, from: int): int {
+    let i = from;
+    while (i < bytesLen(b)) {
+        if ((bytesGet(b, i) ?? 0) == 10) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 一帧：头逐行读到空行，Content-Length 给出体长；还不完整得假。
+function cutFrame(r: Ref<Reader>): bool {
+    const p = r.p;
+    const n = bytesLen(p.pending);
+    let pos = 0;
+    let size = 0;
+    while (true) {
+        const i = newline(p.pending, pos);
+        if (i < 0) {
+            return false;
+        }
+        const line = trimBytes(bytesSlice(p.pending, pos, i - pos));
+        pos = i + 1;
+        if (len(line) == 0) {
+            break;
+        }
+        const colon = indexOf(line, ":");
+        if (colon >= 0 && lower(strip(byteSub(line, 0, colon))) == "content-length") {
+            size = digits(byteSub(line, colon + 1, len(line) - colon - 1));
+        }
+    }
+    if (n - pos < size) {
+        return false;
+    }
+    listPush(r.queue, lossyText(bytesSlice(p.pending, pos, size)));
+    p.pending = bytesSlice(p.pending, pos + size, n - pos - size);
+    return true;
+}
+
+// 从已收的字节里切出完整的行或帧排进队列；stdout 已关时把余下的（行模式的最后一行）也排进去，再记流尾。
+function cut(r: Ref<Reader>): void {
+    const p = r.p;
+    if (r.framed) {
+        let more = true;
+        while (more) {
+            more = cutFrame(r);
+        }
+    } else {
+        while (true) {
+            const i = newline(p.pending, 0);
+            if (i < 0) {
+                break;
+            }
+            listPush(r.queue, stripEol(lossyText(bytesSlice(p.pending, 0, i + 1))));
+            p.pending = bytesSlice(p.pending, i + 1, bytesLen(p.pending) - i - 1);
+        }
+    }
+    if (!p.outOpen && !r.eof) {
+        if (!r.framed && bytesLen(p.pending) > 0) {
+            listPush(r.queue, stripEol(lossyText(p.pending)));
+            p.pending = bytesNew(0);
+        }
+        r.eof = true;
+    }
+    // stderr 不看，收到的即丢弃。
+    p.err = bytesNew(0);
+}
+
+function readerGet(r: Ref<Reader>, timeoutMs: int): Got {
+    const end = monoNs() + timeoutMs * MS;
+    while (true) {
+        if (listLen(r.queue) > 0) {
+            const t = listGet(r.queue, 0) catch "";
+            listRemoveAt(r.queue, 0);
+            return Got { kind: 0, text: t };
+        }
+        if (r.eof) {
+            return Got { kind: 1, text: "" };
+        }
+        let left = (end - monoNs()) / MS;
+        if (left <= 0) {
+            return Got { kind: 2, text: "" };
+        }
+        if (left > 50) {
+            left = 50;
+        }
+        peerPump(r.p, left);
+        cut(r);
+    }
+    return Got { kind: 2, text: "" };
+}
+
+function send(r: Ref<Reader>, data: Bytes): bool {
+    return peerSend(r.p, data);
+}
+
+// 收尾的读：关输入，读到流尾（每条至多等 60 s；超时则结束进程，timedOut 为真）。
+struct Drain {
+    raws: List<string>,
+    timedOut: bool,
+}
+
+function drain(r: Ref<Reader>): Drain {
+    procCloseStream(r.p.h, 0);
+    const raws = noKeys();
+    while (true) {
+        const g = readerGet(r, STEP_TIMEOUT_MS);
+        if (g.kind == 1) {
+            break;
+        }
+        if (g.kind == 2) {
+            procKill(r.p.h);
+            return Drain { raws: raws, timedOut: true };
+        }
+        listPush(raws, g.text);
+    }
+    return Drain { raws: raws, timedOut: false };
+}
+
+// 读完收尾的消息之后记超时。
+function drainNote(t: Ref<Transcript>, d: Drain): void {
+    if (d.timedOut) {
+        trNote(t, note2("harness", jString("timeout"), "at", jString("eof")));
+    }
+}
+
+// 至多等 60 s 退出、记退出码（crashed 为真且退出码非 0 时记 abnormal）。
+function finishExit(r: Ref<Reader>, t: Ref<Transcript>, crashed: bool): void {
+    const end = monoNs() + STEP_TIMEOUT_MS * MS;
+    let code = jNull();
+    while (true) {
+        if (peerExited(r.p)) {
+            code = jNumber(r.p.code);
+            if (crashed && r.p.code != 0) {
+                code = jString("abnormal");
+            }
+            break;
+        }
+        if (monoNs() >= end) {
+            procKill(r.p.h);
+            code = jString("killed");
+            if (crashed) {
+                code = jString("abnormal");
+            }
+            break;
+        }
+        peerPump(r.p, 50);
+        r.p.err = bytesNew(0);
+    }
+    trNote(t, note1("exit", code));
+    peerClose(r.p);
+}
+
+// ---------------------------------------------------------------- proto
+
+struct ProtoState {
+    done: bool,
+    terminal: bool,
+    frames: Ref<Jv>?,
+}
+
+function isTerminal(ev: string): bool {
+    return ev == "exited" || ev == "trapped" || ev == "compile_failed";
+}
+
+// 命令等到的事件（同 REPLY；起头的 read_until({'ready'}) 记作 "ready"）；error 与终结事件总是结束等待。
+function wanted(cmd: string, ev: string): bool {
+    if (cmd == "ready" || cmd == "breakpoint_set" || cmd == "breakpoint_fn" || cmd == "frames" || cmd == "inspect" || cmd == "stops") {
+        return ev == cmd;
+    }
+    if (cmd == "continue" || cmd == "step") {
+        return ev == "stopped" || ev == "exited" || ev == "trapped";
+    }
+    if (cmd == "kill") {
+        return ev == "exited";
+    }
+    return false;
+}
+
+function protoRecv(n: Ref<Norm>, t: Ref<Transcript>, st: Ref<ProtoState>, raw: string): Ref<Jv> {
+    const msg = normValue(n, parseOr(raw), "");
+    const ev = eventOf(msg);
+    trRecv(t, msg, ev == "stdout");
+    if (isTerminal(ev)) {
+        st.done = true;
+        st.terminal = true;
+    }
+    if (ev == "frames") {
+        st.frames = at(msg, "frames");
+    }
+    return msg;
+}
+
+function readUntil(r: Ref<Reader>, n: Ref<Norm>, t: Ref<Transcript>, st: Ref<ProtoState>, cmd: string): Ref<Jv>? {
+    while (true) {
+        const g = readerGet(r, STEP_TIMEOUT_MS);
+        if (g.kind == 1) {
+            st.done = true;
+            trNote(t, note1("eof", jTrue()));
+            return None;
+        }
+        if (g.kind == 2) {
+            trNote(t, note1("harness", jString("timeout")));
+            procKill(r.p.h);
+            st.done = true;
+            return None;
+        }
+        const msg = protoRecv(n, t, st, g.text);
+        const ev = eventOf(msg);
+        if (wanted(cmd, ev) || ev == "error" || isTerminal(ev)) {
+            return msg;
+        }
+    }
+    return None;
+}
+
+// 发一条命令（串原样发，其余按紧凑 JSON），转录里写规范化后的文字。
+function protoSend(r: Ref<Reader>, n: Ref<Norm>, t: Ref<Transcript>, st: Ref<ProtoState>, cmd: Ref<Jv>): Ref<Jv>? {
+    let text = jDump(cmd);
+    if (cmd.kind == J_STR) {
+        text = cmd.text;
+    }
+    trSend(t, normText(n, text));
+    const b = bytesFromStr(text);
+    bytesPush(b, 10);
+    send(r, b);
+    let name = "";
+    if (cmd.kind == J_OBJ) {
+        name = textAt(cmd, "cmd") ?? "";
+    }
+    return readUntil(r, n, t, st, name);
+}
+
+// 发命令、不看等到的事件。
+function protoDo(r: Ref<Reader>, n: Ref<Norm>, t: Ref<Transcript>, st: Ref<ProtoState>, cmd: Ref<Jv>): void {
+    const reply = protoSend(r, n, t, st, cmd);
+}
+
+function cmdObj(name: string): Ref<Jv> {
+    return note1("cmd", jString(name));
+}
+
+function inspectCmd(frame: int, slot: Ref<Jv>): Ref<Jv> {
+    const o = cmdObj("inspect");
+    jSet(o, "frame", jNumber(frame));
+    jSet(o, "slot", slot);
+    return o;
+}
+
+function runProto(taixu: string, dir: string, c: Ref<Jv>, n: Ref<Norm>): string | Error {
+    const t = trNew();
+    const args = keys1("run");
+    listPush(args, "--debug");
+    listPush(args, textOf(c, "program"));
+    const r = spawn(taixu, args, dir, false)?;
+    const st = new ProtoState { done: false, terminal: false, frames: None };
+    const ready = readUntil(r, n, t, st, "ready");
+    const script = at(c, "script");
+    let k = 0;
+    while (k < count(script)) {
+        const it = item(script, k) ?? jNull();
+        k = k + 1;
+        if (st.done) {
+            trNote(t, note1("skipped", it));
+            continue;
+        }
+        let op = "";
+        let directive = false;
+        if (it.kind == J_OBJ && has(it, "@")) {
+            directive = true;
+            op = textAt(it, "@") ?? "";
+        }
+        if (!directive) {
+            protoDo(r, n, t, st, normArgs(n, it));
+        } else if (op == "inspect_all" || op == "inspect_named") {
+            const idx = intAt(it, "frame", 0);
+            const fs = st.frames;
+            let f: Ref<Jv>? = None;
+            if (idx >= 0 && idx < count(fs)) {
+                f = item(fs, idx);
+            }
+            if (op == "inspect_all") {
+                const m = intAt(f, "reg_count", 0);
+                let slot = 0;
+                while (slot < m && !st.done) {
+                    protoDo(r, n, t, st, inspectCmd(idx, jNumber(slot)));
+                    slot = slot + 1;
+                }
+            } else {
+                // 只在原生会话：该帧里带变量名的槽。
+                const slots = at(f, "slots");
+                let s = 0;
+                while (s < count(slots) && !st.done) {
+                    const sl = item(slots, s);
+                    if (has(sl, "name")) {
+                        protoDo(r, n, t, st, inspectCmd(idx, at(sl, "idx") ?? jNull()));
+                    }
+                    s = s + 1;
+                }
+            }
+        } else if (op == "continue_until_exit" || op == "step_until_exit") {
+            let cmd = cmdObj("continue");
+            if (op == "step_until_exit") {
+                cmd = cmdObj("step");
+                jSet(cmd, "mode", at(it, "mode") ?? jString("into"));
+            }
+            const max = intAt(it, "max", 50);
+            let m = 0;
+            while (m < max && !st.done) {
+                const reply = protoSend(r, n, t, st, cmd);
+                if (truthy(at(it, "frames")) && reply != None && eventOf(reply) == "stopped") {
+                    protoDo(r, n, t, st, cmdObj("frames"));
+                }
+                m = m + 1;
+            }
+            if (!st.done) {
+                trNote(t, note2("harness", jString("max reached"), "op", jString(op)));
+            }
+        } else if (op == "eof") {
+            break;
+        } else {
+            procKill(r.p.h);
+            peerClose(r.p);
+            return err("unknown directive " + reprStr(op) + " in " + textOf(c, "name"));
+        }
+    }
+    const d = drain(r);
+    for (raw in d.raws) {
+        protoRecv(n, t, st, raw);
+    }
+    drainNote(t, d);
+    finishExit(r, t, !st.terminal);
+    return trText(t);
+}
+
+// ---------------------------------------------------------------- dap
+
+function dapMsg(n: Ref<Norm>, raw: string): Ref<Jv> {
+    return normValue(n, parseOr(raw), "__dap__");
+}
+
+function isResponseTo(m: Ref<Jv>, seq: int): bool {
+    return textIs(m, "type", "response") && isNum(at(m, "request_seq")) && intAt(m, "request_seq", -1) == seq;
+}
+
+function removeFirst(xs: List<string>, x: string): void {
+    let i = 0;
+    while (i < listLen(xs)) {
+        if ((listGet(xs, i) catch "") == x) {
+            listRemoveAt(xs, i);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+function runDap(taixu: string, dir: string, c: Ref<Jv>, n: Ref<Norm>): string | Error {
+    const t = trNew();
+    const r = spawn(taixu, keys1("dap"), dir, true)?;
+    let seq = 0;
+    const script = at(c, "script");
+    let k = 0;
+    while (k < count(script)) {
+        const step = item(script, k) ?? jNull();
+        k = k + 1;
+        seq = seq + 1;
+        const msg = note1("seq", jNumber(seq));
+        jSet(msg, "type", jString("request"));
+        jSet(msg, "command", at(step, "request") ?? jNull());
+        const shown = note1("command", at(step, "request") ?? jNull());
+        if (has(step, "arguments")) {
+            const a = normArgs(n, at(step, "arguments") ?? jNull());
+            jSet(msg, "arguments", a);
+            jSet(shown, "arguments", normValue(n, a, ""));
+        }
+        trSend(t, jDump(shown));
+        const body = bytesFromStr(jDump(msg));
+        const data = bytesFromStr("Content-Length: " + toStr(bytesLen(body)) + "\r\n\r\n");
+        bytesAppend(data, body);
+        if (!send(r, data)) {
+            trNote(t, note1("harness", jString("stdin closed")));
+            break;
+        }
+        const want = noKeys();
+        const until = at(step, "until");
+        let u = 0;
+        while (u < count(until)) {
+            listPush(want, strOf(item(until, u)));
+            u = u + 1;
+        }
+        let response: Ref<Jv>? = None;
+        const evs = noJv();
+        const deadline = monoNs() + STEP_TIMEOUT_MS * MS;
+        while ((response == None || listLen(want) > 0) && monoNs() < deadline) {
+            const g = readerGet(r, (deadline - monoNs()) / MS);
+            if (g.kind != 0) {
+                break;
+            }
+            const m = dapMsg(n, g.text);
+            if (isResponseTo(m, seq)) {
+                response = m;
+            } else {
+                listPush(evs, m);
+                if (textIs(m, "type", "event")) {
+                    removeFirst(want, eventOf(m));
+                }
+            }
+        }
+        while (true) {
+            const g = readerGet(r, QUIET_MS);
+            if (g.kind != 0) {
+                break;
+            }
+            const m = dapMsg(n, g.text);
+            if (isResponseTo(m, seq) && response == None) {
+                response = m;
+            } else {
+                listPush(evs, m);
+            }
+        }
+        trRecv(t, response ?? note1("harness", jString("no response")), false);
+        for (e in evs) {
+            trRecv(t, e, eventOf(e) == "output");
+        }
+        if (listLen(want) > 0) {
+            const wa = jArray();
+            for (w in want) {
+                jPush(wa, jString(w));
+            }
+            trNote(t, note2("harness", jString("missing events"), "events", wa));
+        }
+    }
+    const d = drain(r);
+    for (raw in d.raws) {
+        const m = dapMsg(n, raw);
+        trRecv(t, m, eventOf(m) == "output");
+    }
+    drainNote(t, d);
+    finishExit(r, t, false);
+    return trText(t);
+}
+
+// ---------------------------------------------------------------- mcp
+
+struct Session {
+    logical: string,
+    real: Ref<Jv>,
+}
+
+// sessions.get(logical, logical)。
+function sessionReal(ss: List<Session>, logical: Ref<Jv>): Ref<Jv> {
+    if (logical.kind == J_STR) {
+        for (s in ss) {
+            if (s.logical == logical.text) {
+                return s.real;
+            }
+        }
+    }
+    return logical;
+}
+
+// 按真实会话 id 找逻辑名；没有时照原值。
+function sessionLogical(ss: List<Session>, real: Ref<Jv>): Ref<Jv> {
+    for (s in ss) {
+        if (jEq(s.real, real)) {
+            return jString(s.logical);
+        }
+    }
+    return real;
+}
+
+function runMcp(taixu: string, dir: string, c: Ref<Jv>, n: Ref<Norm>): string | Error {
+    const t = trNew();
+    const args = keys1("mcp");
+    listPush(args, "--trust-workspace");
+    const r = spawn(taixu, args, dir, false)?;
+    const sessions: List<Session> = listNew();
+    let rid = 0;
+    const script = at(c, "script");
+    let k = 0;
+    while (k < count(script)) {
+        const step = item(script, k) ?? jNull();
+        k = k + 1;
+        rid = rid + 1;
+        const req = note1("jsonrpc", jString("2.0"));
+        jSet(req, "id", jNumber(rid));
+        const isTool = has(step, "tool");
+        let a = jObject();
+        if (isTool) {
+            const raw = at(step, "arguments") ?? jObject();
+            a = normArgs(n, raw);
+            jSet(req, "method", jString("tools/call"));
+            const params = note1("name", at(step, "tool") ?? jNull());
+            jSet(params, "arguments", a);
+            jSet(req, "params", params);
+            const shown = note1("tool", at(step, "tool") ?? jNull());
+            jSet(shown, "arguments", raw);
+            trSend(t, jDump(shown));
+        } else {
+            jSet(req, "method", at(step, "method") ?? jNull());
+            jSet(req, "params", at(step, "params") ?? jObject());
+            trSend(t, jDump(note1("method", at(step, "method") ?? jNull())));
+        }
+        if (isTool && has(a, "session")) {
+            jSet(a, "session", sessionReal(sessions, at(a, "session") ?? jNull()));
+        }
+        const line = bytesFromStr(jDump(req));
+        bytesPush(line, 10);
+        send(r, line);
+        while (true) {
+            const g = readerGet(r, STEP_TIMEOUT_MS + 30000);
+            if (g.kind == 1) {
+                trNote(t, note1("harness", jString("no response")));
+                break;
+            }
+            if (g.kind == 2) {
+                trNote(t, note1("harness", jString("timeout")));
+                break;
+            }
+            const m = parseOr(g.text);
+            if (!(isNum(at(m, "id")) && intAt(m, "id", -1) == rid)) {
+                trRecv(t, normValue(n, m, ""), false);
+                continue;
+            }
+            const result = at(m, "result");
+            let out = jObject();
+            if (isObj(result) && has(result, "structuredContent")) {
+                let sc = at(result, "structuredContent") ?? jNull();
+                if (textIs(step, "tool", "debug_start") && isObj(sc) && has(sc, "session")) {
+                    listPush(sessions, Session { logical: toStr(listLen(sessions) + 1), real: at(sc, "session") ?? jNull() });
+                }
+                if (isObj(sc) && has(sc, "session")) {
+                    sc = without(sc, noKeys());
+                    jSet(sc, "session", sessionLogical(sessions, at(sc, "session") ?? jNull()));
+                }
+                jSet(out, "structured", sc);
+                if (truthy(at(result, "isError"))) {
+                    jSet(out, "isError", jTrue());
+                }
+            } else {
+                const drop = keys1("jsonrpc");
+                listPush(drop, "id");
+                out = without(m, drop);
+            }
+            trRecv(t, normValue(n, out, ""), false);
+            break;
+        }
+    }
+    const d = drain(r);
+    for (raw in d.raws) {
+        trRecv(t, normValue(n, parseOr(raw), ""), false);
+    }
+    drainNote(t, d);
+    finishExit(r, t, false);
+    return trText(t);
+}
+
+// ---------------------------------------------------------------- 金文件形式
+
+function blankValue(v: Ref<Jv>): Ref<Jv> {
+    if (v.kind == J_OBJ) {
+        const o = jObject();
+        let i = 0;
+        while (i < listLen(v.keys)) {
+            const k = listGet(v.keys, i) catch "";
+            const x = listGet(v.items, i) catch jNull();
+            if (k == "pc") {
+                jSet(o, k, jNumber(0));
+            } else if (k == "slots") {
+                const a = jArray();
+                for (s in x.items) {
+                    if (has(s, "name")) {
+                        jPush(a, blankValue(s));
+                    }
+                }
+                jSet(o, k, a);
+            } else if (k != "reg_count") {
+                jSet(o, k, blankValue(x));
+            }
+            i = i + 1;
+        }
+        return o;
+    }
+    if (v.kind == J_ARR) {
+        const a = jArray();
+        for (x in v.items) {
+            jPush(a, blankValue(x));
+        }
+        return a;
+    }
+    if (v.kind == J_STR) {
+        return jString(blankObj(v.text));
+    }
+    return v;
+}
+
+// 金文件形式：pc 与对象号置空、去掉 reg_count、帧里只留有名字的槽；initialize 的 serverInfo.version 换成占位（产品版本与
+// 调试行为各自演进，CLI／LSP／MCP 的版本一致由 toolchain-contract 核对）。
+function normNative(text: string): string {
+    const out = bytesNew(0);
+    for (line in linesOfText(text)) {
+        let l = line;
+        if (startsWith(line, "< ")) {
+            const msg = parseLine(line);
+            const result = at(msg, "result");
+            if (isObj(result) && has(result, "protocolVersion")) {
+                const info = at(result, "serverInfo");
+                if (isObj(info) && has(info, "version")) {
+                    jSet(info ?? jNull(), "version", jString("<toolchain-version>"));
+                }
+            }
+            l = "< " + jDump(blankValue(msg));
+        }
+        bytesAppend(out, bytesFromStr(l));
+        bytesPush(out, 10);
+    }
+    return bytesToStr(out) catch "";
+}
+
+// ---------------------------------------------------------------- proto 的 VM 对照
+
+// 转录里收到的事件（折叠记录展开为首、中间若干个 text 为 null 的 stdout、尾）。
+function events(text: string): List<Ref<Jv>> {
+    const out = noJv();
+    for (line in linesOfText(text)) {
+        if (startsWith(line, "< ")) {
+            const msg = parseLine(line);
+            if (has(msg, "folded")) {
+                listPush(out, at(msg, "first") ?? jNull());
+                let k = 0;
+                while (k < intAt(msg, "folded", 0) - 2) {
+                    const e = note1("event", jString("stdout"));
+                    jSet(e, "text", jNull());
+                    listPush(out, e);
+                    k = k + 1;
+                }
+                listPush(out, at(msg, "last") ?? jNull());
+            } else {
+                listPush(out, msg);
+            }
+        }
+    }
+    return out;
+}
+
+// 停点 (fn, line, depth + shift) 的 repr。
+function stopKey(e: Ref<Jv>, shift: int): string {
+    return "(" + pyRepr(at(e, "fn")) + ", " + pyRepr(at(e, "line")) + ", " + toStr(intAt(e, "depth", 0) + shift) + ")";
+}
+
+function mergedStops(evs: List<Ref<Jv>>, shift: int): List<string> {
+    const out = noKeys();
+    for (e in evs) {
+        if (eventOf(e) == "stopped") {
+            const key = stopKey(e, shift);
+            if (listLen(out) == 0 || (listGet(out, listLen(out) - 1) catch "") != key) {
+                listPush(out, key);
+            }
+        }
+    }
+    return out;
+}
+
+struct StopFrames {
+    k: int,
+    frames: Ref<Jv>,
+}
+
+// 每个合并后的停点之后第一个非空的 frames 事件，按停点序号（递增）。
+function framesByStop(evs: List<Ref<Jv>>): List<StopFrames> {
+    const out: List<StopFrames> = listNew();
+    let last = "";
+    let k = -1;
+    for (e in evs) {
+        if (eventOf(e) == "stopped") {
+            const key = stopKey(e, 0);
+            if (key != last) {
+                k = k + 1;
+                last = key;
+            }
+        } else if (eventOf(e) == "frames" && truthy(at(e, "frames")) && k >= 0 && framesAt(out, k) == None) {
+            listPush(out, StopFrames { k: k, frames: at(e, "frames") ?? jNull() });
+        }
+    }
+    return out;
+}
+
+function framesAt(xs: List<StopFrames>, k: int): Ref<Jv>? {
+    for (x in xs) {
+        if (x.k == k) {
+            return x.frames;
+        }
+    }
+    return None;
+}
+
+function stdoutText(evs: List<Ref<Jv>>): string {
+    let s = "";
+    let k = 0;
+    for (e in evs) {
+        const tx = textAt(e, "text");
+        if (eventOf(e) == "stdout" && tx != None) {
+            if (k > 0) {
+                s = s + "\n";
+            }
+            s = s + (tx ?? "");
+            k = k + 1;
+        }
+    }
+    return s;
+}
+
+function terminal(evs: List<Ref<Jv>>): Ref<Jv>? {
+    for (e in evs) {
+        if (isTerminal(eventOf(e))) {
+            return e;
+        }
+    }
+    return None;
+}
+
+function firstEvent(evs: List<Ref<Jv>>, name: string): Ref<Jv>? {
+    for (e in evs) {
+        if (eventOf(e) == name) {
+            return e;
+        }
+    }
+    return None;
+}
+
+// 简述相符：对象号置空后相等；VM 在 UTF-8 序列中间截断的串（尾部 U+FFFD）与原生在其前的字符边界截断的相符。
+function sameBrief(native: string, vm: string): bool {
+    const a = blankObj(native);
+    const b = blankObj(vm);
+    if (a == b) {
+        return true;
+    }
+    if (indexOf(b, "\u{FFFD}") < 0) {
+        return false;
+    }
+    let s = b;
+    while (len(s) >= 3 && byteSub(s, len(s) - 3, 3) == "\u{FFFD}") {
+        s = byteSub(s, 0, len(s) - 3);
+    }
+    return s == a;
+}
+
+function errorMessages(evs: List<Ref<Jv>>, drop: string): List<string> {
+    const out = noKeys();
+    for (e in evs) {
+        if (eventOf(e) == "error") {
+            const m = textOf(e, "message");
+            if (m != drop) {
+                listPush(out, m);
+            }
+        }
+    }
+    return out;
+}
+
+// 各帧（自 from 起）的某字段的 repr。
+function fieldReprs(frames: Ref<Jv>?, key: string, from: int): List<string> {
+    const out = noKeys();
+    let i = from;
+    while (i < count(frames)) {
+        listPush(out, pyRepr(at(item(frames, i), key)));
+        i = i + 1;
+    }
+    return out;
+}
+
+function crossCheck(c: Ref<Jv>, nat_: List<Ref<Jv>>, vm: List<Ref<Jv>>, issues: List<string>): void {
+    const name = textOf(c, "name");
+    let continueOnly = true;
+    const script = at(c, "script");
+    let k = 0;
+    while (k < count(script)) {
+        const it = item(script, k);
+        if (isObj(it)) {
+            let op = textAt(it, "@") ?? "";
+            if (truthy(at(it, "cmd"))) {
+                op = textAt(it, "cmd") ?? "";
+            }
+            if (op == "step" || op == "step_until_exit") {
+                continueOnly = false;
+            }
+        }
+        k = k + 1;
+    }
+    const rn = firstEvent(nat_, "ready");
+    const rv = firstEvent(vm, "ready");
+    if ((rn == None) != (rv == None)) {
+        listPush(issues, "ready presence differs");
+    } else if (rn != None) {
+        const fa = fieldReprs(at(rn, "functions"), "name", 0);
+        const fb = fieldReprs(at(rv, "functions"), "name", 0);
+        if (!strsEq(fa, fb)) {
+            listPush(issues, "function names differ: " + listRepr(fa) + " vs " + listRepr(fb));
+        }
+        const mn = at(rn, "modules");
+        const mv = at(rv, "modules");
+        if (count(mn) != count(mv) || !sameJv(at(item(mn, -1), "path"), at(item(mv, -1), "path"))) {
+            listPush(issues, "modules differ: " + pyRepr(mn) + " vs " + pyRepr(mv));
+        }
+    }
+    if (stdoutText(nat_) != stdoutText(vm)) {
+        listPush(issues, "stdout differs");
+    }
+    // VM 进程 panic（没有终结事件）、原生照常收尾的用例。
+    const tn = terminal(nat_);
+    const tv = terminal(vm);
+    if (!sameJv(tn, tv) && !(name == "errors-negative-line" && tv == None)) {
+        listPush(issues, "terminal event differs: " + pyRepr(tn) + " vs " + pyRepr(tv));
+    }
+    // 有意差别：VM 报的错、原生改正后的回执。
+    let dropN = "\u{1}";
+    if (name == "errors-negative-line") {
+        dropN = "breakpoint_set 的 line 需要非负整数";
+    }
+    let dropV = "\u{1}";
+    if (name == "multi-bp") {
+        dropV = UNKNOWN_MODULE;
+    }
+    const en = errorMessages(nat_, dropN);
+    const ev = errorMessages(vm, dropV);
+    if (!strsEq(en, ev)) {
+        listPush(issues, "error messages differ: " + strsRepr(en) + " vs " + strsRepr(ev));
+    }
+    if (!continueOnly) {
+        return;
+    }
+    // D3 v0.53：任务在同步入口（main）的 await 里就地运行，原生的任务帧之下多一层入口帧（栈底的 main，停点深度＋1）；VM 冻结于 v0.17，
+    // 任务在 main 返回后由调度泵运行。对照时去掉这一层再比。
+    const entryAwait = name == "async-bp";
+    let shift = 0;
+    if (entryAwait) {
+        shift = -1;
+    }
+    const sn = mergedStops(nat_, shift);
+    const sv = mergedStops(vm, 0);
+    if (!strsEq(sn, sv)) {
+        listPush(issues, "stops differ: " + listRepr(sn) + " vs " + listRepr(sv));
+        return;
+    }
+    const fv = framesByStop(vm);
+    for (sf in framesByStop(nat_)) {
+        const b = framesAt(fv, sf.k);
+        if (b == None) {
+            continue;
+        }
+        let from = 0;
+        if (entryAwait && count(sf.frames) > 0 && textIs(item(sf.frames, 0), "fn", "main")) {
+            from = 1;
+        }
+        const an = fieldReprs(sf.frames, "fn", from);
+        const bn = fieldReprs(b, "fn", 0);
+        if (!strsEq(an, bn)) {
+            listPush(issues, "stack shape differs: " + listRepr(an) + " vs " + listRepr(bn));
+            continue;
+        }
+        if (count(sf.frames) > from && !sameJv(at(item(sf.frames, -1), "line"), at(item(b, -1), "line"))) {
+            listPush(issues, "top frame line " + pyRepr(at(item(sf.frames, -1), "line")) + " vs " + pyRepr(at(item(b, -1), "line")));
+        }
+        let i = 0;
+        while (i + from < count(sf.frames) && i < count(b)) {
+            const x = item(sf.frames, i + from);
+            const ys = at(item(b, i), "slots");
+            const xs = at(x, "slots");
+            let s = 0;
+            while (s < count(xs)) {
+                const sl = item(xs, s);
+                s = s + 1;
+                if (!has(sl, "name") || textIs(sl, "brief", "none")) {
+                    continue;
+                }
+                let other: Ref<Jv>? = None;
+                let q = 0;
+                while (q < count(ys)) {
+                    if (sameJv(at(item(ys, q), "idx"), at(sl, "idx"))) {
+                        other = item(ys, q);
+                    }
+                    q = q + 1;
+                }
+                if (other == None || !sameBrief(textOf(sl, "brief"), textOf(other, "brief"))) {
+                    let tb = "None";
+                    if (other != None) {
+                        tb = pyRepr(at(other, "brief"));
+                    }
+                    listPush(issues, strOf(at(x, "fn")) + " " + strOf(at(sl, "name")) + "=" + pyRepr(at(sl, "brief")) + " vs VM slot " + tb);
+                }
+            }
+            i = i + 1;
+        }
+    }
+}
+
+// inspect 回复按 (帧, 槽)，每个键取第一次的回复，连同请求之前那个 frames 事件里该槽的条目（没有为 None）。
+struct Pair {
+    key: string,
+    value: Ref<Jv>,
+    entry: Ref<Jv>?,
+}
+
+function pairAt(xs: List<Pair>, key: string): Ref<Jv>? {
+    for (x in xs) {
+        if (x.key == key) {
+            return x.value;
+        }
+    }
+    return None;
+}
+
+function inspectPairs(text: string): List<Pair> {
+    const out: List<Pair> = listNew();
+    let pending = false;
+    let pf: Ref<Jv>? = None;
+    let ps: Ref<Jv>? = None;
+    let frames: Ref<Jv>? = None;
+    for (line in linesOfText(text)) {
+        if (startsWith(line, "> ")) {
+            const cmd = parseLine(line);
+            pending = false;
+            if (isObj(cmd) && textIs(cmd, "cmd", "inspect")) {
+                pending = true;
+                pf = at(cmd, "frame");
+                ps = at(cmd, "slot");
+            }
+        } else if (startsWith(line, "< ")) {
+            const e = parseLine(line);
+            if (!isObj(e)) {
+                continue;
+            }
+            const ev = eventOf(e);
+            if (ev == "frames") {
+                frames = at(e, "frames");
+            } else if (pending && (ev == "inspect" || ev == "error")) {
+                const key = "(" + pyRepr(pf) + ", " + pyRepr(ps) + ")";
+                if (ev == "inspect" && pairAt(out, key) == None) {
+                    let entry: Ref<Jv>? = None;
+                    if (truthy(frames) && isNum(pf)) {
+                        const f = digits((pf ?? jNull()).text);
+                        if (f >= 0 && f < count(frames)) {
+                            const slots = at(item(frames, f), "slots");
+                            let q = 0;
+                            while (q < count(slots) && entry == None) {
+                                if (sameJv(at(item(slots, q), "idx"), ps)) {
+                                    entry = item(slots, q);
+                                }
+                                q = q + 1;
+                            }
+                        }
+                    }
+                    listPush(out, Pair { key: key, value: at(e, "value") ?? jNull(), entry: entry });
+                }
+                pending = false;
+            }
+        }
+    }
+    return out;
+}
+
+// 一个 inspect 节点与 VM 的相符（容许 §五 的有意差别：对象号、VM 的残缺 UTF-8 尾、VM 对 new 出的枚举缺的类型名与变体名、原生给错误
+// 枚举值的种类名、payload 与 cause）。
+function sameNode(n: Ref<Jv>?, v: Ref<Jv>?, path: string, issues: List<string>): void {
+    if (!sameJv(at(n, "tag"), at(v, "tag")) || !sameJv(at(n, "name"), at(v, "name"))) {
+        listPush(issues, path + ": tag/name " + pyRepr(at(n, "tag")) + "/" + pyRepr(at(n, "name")) + " vs VM " + pyRepr(at(v, "tag")) + "/"
+            + pyRepr(at(v, "name")));
+        return;
+    }
+    let vText = "";
+    if (has(v, "text")) {
+        vText = strOf(at(v, "text"));
+    }
+    const vmLacksNames = textIs(n, "tag", "enum") && !has(v, "type") && startsWith(vText, "variant ");
+    const richErr = textIs(n, "tag", "err") && !has(v, "type");
+    if (!sameJv(at(n, "type"), at(v, "type")) && !vmLacksNames && !richErr) {
+        listPush(issues, path + ": type " + pyRepr(at(n, "type")) + " vs VM " + pyRepr(at(v, "type")));
+    }
+    if (!vmLacksNames && !sameBrief(strOf(at(n, "text")), strOf(at(v, "text")))) {
+        listPush(issues, path + ": text " + pyRepr(at(n, "text")) + " vs VM " + pyRepr(at(v, "text")));
+    }
+    if (!sameJv(at(n, "rc"), at(v, "rc")) || !sameJv(at(n, "truncated"), at(v, "truncated"))) {
+        listPush(issues, path + ": rc/truncated " + pyRepr(at(n, "rc")) + "/" + pyRepr(at(n, "truncated")) + " vs VM " + pyRepr(at(v, "rc")) + "/"
+            + pyRepr(at(v, "truncated")));
+    }
+    const kn = noJv();
+    const all = at(n, "children");
+    let i = 0;
+    while (i < count(all)) {
+        const x = item(all, i) ?? jNull();
+        if (!(richErr && (textIs(x, "name", "payload") || textIs(x, "name", "cause")))) {
+            listPush(kn, x);
+        }
+        i = i + 1;
+    }
+    const kv = at(v, "children");
+    if (listLen(kn) != count(kv)) {
+        listPush(issues, path + ": " + toStr(listLen(kn)) + " children vs VM " + toStr(count(kv)));
+        return;
+    }
+    i = 0;
+    while (i < listLen(kn)) {
+        const a = listGet(kn, i) catch jNull();
+        let label = toStr(i);
+        if (has(a, "name")) {
+            label = strOf(at(a, "name"));
+        }
+        sameNode(a, item(kv, i), path + "." + label, issues);
+        i = i + 1;
+    }
+}
+
+function crossCheckInspect(natText: string, vmText: string, issues: List<string>): void {
+    const vm = inspectPairs(vmText);
+    for (p in inspectPairs(natText)) {
+        if (p.entry == None || !has(p.entry, "name") || textIs(p.value, "tag", "none")) {
+            continue;
+        }
+        const other = pairAt(vm, p.key);
+        if (other != None) {
+            sameNode(p.value, other, strOf(at(p.entry, "name")), issues);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- dap 的 VM 对照
+
+function dapStdout(evs: List<Ref<Jv>>): string {
+    let s = "";
+    for (e in evs) {
+        let b: Ref<Jv>? = None;
+        if (eventOf(e) == "output") {
+            b = at(e, "body");
+        } else if (has(e, "category")) {
+            b = e;
+        }
+        const o = at(b, "output");
+        if (isObj(b) && textIs(b, "category", "stdout") && o != None && (o ?? jNull()).kind != J_NULL) {
+            s = s + strOf(o);
+        }
+    }
+    return replaceAll(s, "\n", "");
+}
+
+function dapFirst(evs: List<Ref<Jv>>, name: string): Ref<Jv>? {
+    for (e in evs) {
+        if (textIs(e, "type", "event") && eventOf(e) == name) {
+            return at(e, "body") ?? jObject();
+        }
+    }
+    return None;
+}
+
+// b and b.get('description', '').rsplit(':', 1)[0]：b 缺席或为空对象时照 b 本身。
+function stopWhere(b: Ref<Jv>?): string {
+    if (b == None) {
+        return "\u{1}None";
+    }
+    if (!truthy(b)) {
+        return "\u{1}" + pyRepr(b);
+    }
+    const d = textAt(b, "description") ?? "";
+    let k = len(d) - 1;
+    while (k >= 0) {
+        if ((byteAt(d, k) ?? 0) == 58) {
+            return byteSub(d, 0, k);
+        }
+        k = k - 1;
+    }
+    return d;
+}
+
+function crossCheckDap(nat_: List<Ref<Jv>>, vm: List<Ref<Jv>>, issues: List<string>): void {
+    const on = dapStdout(nat_);
+    const ov = dapStdout(vm);
+    if (on != ov) {
+        listPush(issues, "stdout differs: " + reprStr(on) + " vs " + reprStr(ov));
+    }
+    // VM 在 trap 时不发 exited、在 disconnect 时报结束；原生相反（§五、§四-8）。
+    const en = dapFirst(nat_, "exited");
+    const ev = dapFirst(vm, "exited");
+    if (en != None && ev != None && !sameJv(at(en, "exitCode"), at(ev, "exitCode"))) {
+        listPush(issues, "exit code " + pyRepr(en) + " vs " + pyRepr(ev));
+    }
+    const sn = dapFirst(nat_, "stopped");
+    const sv = dapFirst(vm, "stopped");
+    if (stopWhere(sn) != stopWhere(sv)) {
+        listPush(issues, "first stop " + pyRepr(sn) + " vs " + pyRepr(sv));
+    }
+}
+
+// ---------------------------------------------------------------- mcp 的 VM 对照
+
+struct Reply {
+    req: Ref<Jv>,
+    rep: Ref<Jv>,
+}
+
+// MCP 转录的 (请求, 回执) 对。
+function mcpReplies(text: string): List<Reply> {
+    const out: List<Reply> = listNew();
+    let req: Ref<Jv>? = None;
+    for (line in linesOfText(text)) {
+        if (startsWith(line, "> ")) {
+            req = parseLine(line);
+        } else if (startsWith(line, "< ") && req != None) {
+            listPush(out, Reply { req: req ?? jNull(), rep: parseLine(line) });
+            req = None;
+        }
+    }
+    return out;
+}
+
+function structOf(r: Ref<Jv>): Ref<Jv> {
+    return at(r, "structured") ?? jObject();
+}
+
+function mcpKind(r: Ref<Jv>): string {
+    if (has(r, "error")) {
+        return "('error', " + pyRepr(at(at(r, "error"), "message")) + ")";
+    }
+    if (has(r, "result")) {
+        // 同样的工具实参校验文字改由 isError 结果携带；金文件比新形状，这里只比它的消息。
+        const res = at(r, "result");
+        const content = at(res, "content");
+        const first = item(content, 0);
+        if (isTrueJv(at(res, "isError")) && !has(res, "structuredContent") && count(content) == 1 && textIs(first, "type", "text")
+            && startsWith(textAt(first, "text") ?? "", "Invalid params: ")) {
+            return "('error', " + pyRepr(at(first, "text")) + ")";
+        }
+        return "('result',)";
+    }
+    const s = structOf(r);
+    if (has(s, "start")) {
+        return "('start', " + pyRepr(at(at(s, "start"), "event")) + ")";
+    }
+    if (isFalseJv(at(s, "ok"))) {
+        return "('fail', " + pyRepr(at(s, "error")) + ")";
+    }
+    if (has(s, "killed")) {
+        let code: Ref<Jv>? = None;
+        const ex = at(s, "exited");
+        if (truthy(ex)) {
+            code = at(ex, "code");
+        }
+        return "('killed', " + pyRepr(code) + ")";
+    }
+    return "('event', " + pyRepr(at(s, "event")) + ")";
+}
+
+function mcpInit(rs: List<Reply>): Ref<Jv>? {
+    for (p in rs) {
+        if (textIs(p.req, "method", "initialize")) {
+            const res = without(at(p.rep, "result") ?? jObject(), noKeys());
+            jSet(res, "serverInfo", without(at(res, "serverInfo") ?? jObject(), keys1("version")));
+            return res;
+        }
+    }
+    return None;
+}
+
+function mcpKinds(rs: List<Reply>): List<string> {
+    const out = noKeys();
+    for (p in rs) {
+        const k = mcpKind(p.rep);
+        if (k != "('event', 'stopped')" && (listLen(out) == 0 || (listGet(out, listLen(out) - 1) catch "") != k)) {
+            listPush(out, k);
+        }
+    }
+    return out;
+}
+
+function mcpStdout(rs: List<Reply>): List<string> {
+    const out = noKeys();
+    for (p in rs) {
+        const evs = at(structOf(p.rep), "events");
+        let i = 0;
+        while (i < count(evs)) {
+            const e = item(evs, i);
+            if (has(e, "elided")) {
+                listPush(out, reprStr("<elided " + strOf(at(e, "elided")) + ">"));
+            } else if (eventOf(e) == "stdout") {
+                listPush(out, pyRepr(at(e, "text")));
+            }
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+function mcpFinals(rs: List<Reply>): List<Ref<Jv>> {
+    const out = noJv();
+    const drop = keys1("session");
+    listPush(drop, "events");
+    listPush(drop, "isError");
+    for (p in rs) {
+        const s = structOf(p.rep);
+        let e: Ref<Jv>? = s;
+        if (has(s, "start")) {
+            e = at(s, "start");
+        }
+        if (isObj(e) && isTerminal(eventOf(e))) {
+            listPush(out, without(e ?? jNull(), drop));
+        }
+    }
+    return out;
+}
+
+function mcpFirstStop(rs: List<Reply>): string {
+    for (p in rs) {
+        const s = structOf(p.rep);
+        if (textIs(s, "event", "stopped")) {
+            return "(" + pyRepr(at(s, "fn")) + ", " + pyRepr(at(s, "line")) + ")";
+        }
+    }
+    return "None";
+}
+
+function mcpReceipts(rs: List<Reply>, native: bool): List<string> {
+    const out = noKeys();
+    for (p in rs) {
+        const s = structOf(p.rep);
+        if (has(s, "start")) {
+            const bps = at(s, "breakpoints");
+            const xs = noKeys();
+            let i = 0;
+            while (i < count(bps)) {
+                const b = item(bps, i);
+                if (!(native && textIs(b, "event", "error") && textIs(b, "message", UNKNOWN_MODULE))) {
+                    listPush(xs, pyRepr(at(b, "event")));
+                }
+                i = i + 1;
+            }
+            listPush(out, listRepr(xs));
+        }
+    }
+    return out;
+}
+
+function crossCheckMcp(natText: string, vmText: string, issues: List<string>): void {
+    const nat_ = mcpReplies(natText);
+    const vm = mcpReplies(vmText);
+    const ia = mcpInit(nat_);
+    const ib = mcpInit(vm);
+    if (!sameJv(ia, ib)) {
+        listPush(issues, "initialize differ: " + pyRepr(ia) + " vs " + pyRepr(ib));
+    }
+    const ka = mcpKinds(nat_);
+    const kb = mcpKinds(vm);
+    if (!strsEq(ka, kb)) {
+        listPush(issues, "replies differ: " + listRepr(ka) + " vs " + listRepr(kb));
+    }
+    const sa = mcpStdout(nat_);
+    const sb = mcpStdout(vm);
+    if (!strsEq(sa, sb)) {
+        listPush(issues, "stdout differ: " + listRepr(sa) + " vs " + listRepr(sb));
+    }
+    const fa = mcpFinals(nat_);
+    const fb = mcpFinals(vm);
+    if (!jvListsEq(fa, fb)) {
+        listPush(issues, "final events differ: " + jvListRepr(fa) + " vs " + jvListRepr(fb));
+    }
+    const pa = mcpFirstStop(nat_);
+    const pb = mcpFirstStop(vm);
+    if (pa != pb) {
+        listPush(issues, "first stop differ: " + pa + " vs " + pb);
+    }
+    const ra = mcpReceipts(nat_, true);
+    const rb = mcpReceipts(vm, false);
+    if (!strsEq(ra, rb)) {
+        listPush(issues, "breakpoint receipts differ: " + listRepr(ra) + " vs " + listRepr(rb));
+    }
+}
+
+// ---------------------------------------------------------------- 入口
+
+// 文本文件（换行统一为 \n，同 Python 的 read_text）；读不了得 None。
+function readText(path: string): string? {
+    const s = readFile(path) catch (e) {
+        return None;
+    };
+    return replaceAll(replaceAll(s, "\r\n", "\n"), "\r", "\n");
+}
+
+function goldenIssue(got: string, golden: string?): string {
+    const have = linesOfText(got);
+    let want = noKeys();
+    if (golden != None) {
+        want = linesOfText(golden ?? "");
+    }
+    let i = 0;
+    while (i < listLen(want) && i < listLen(have) && (listGet(want, i) catch "") == (listGet(have, i) catch "")) {
+        i = i + 1;
+    }
+    let h = "None";
+    if (i < listLen(have)) {
+        h = reprStr(headChars(listGet(have, i) catch "", 160));
+    }
+    let w = "None";
+    if (i < listLen(want)) {
+        w = reprStr(headChars(listGet(want, i) catch "", 160));
+    }
+    return "golden line " + toStr(i + 1) + ": got " + h + " want " + w;
+}
+
+function casesOf(path: string): Ref<Jv> | Error {
+    const text = readText(path);
+    if (text == None) {
+        return err("读不了 " + path);
+    }
+    return jParse(text ?? "");
+}
+
+function main(argv: []string): int {
+    let compiler = "";
+    let root = "";
+    let update = false;
+    const only = noKeys();
+    let i = 0;
+    while (i < len(argv)) {
+        if ((argv[i] == "--compiler" || argv[i] == "--root") && i + 1 < len(argv)) {
+            if (argv[i] == "--compiler") {
+                compiler = argv[i + 1];
+            } else {
+                root = argv[i + 1];
+            }
+            i = i + 2;
+        } else if (argv[i] == "--update") {
+            update = true;
+            i = i + 1;
+        } else {
+            listPush(only, argv[i]);
+            i = i + 1;
+        }
+    }
+    if (len(compiler) == 0) {
+        eprint("用法：taixu run --toolchain scripts/test_native_debug.tx --compiler <taixu> [--root <仓根>] [--update] [用例 ...]");
+        return 2;
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    // tests/debug 的真实路径（规范化按它替换）。
+    const dir = osRealPath(absolute(nat(root + "/tests/debug")));
+    const taixu = osRealPath(absolute(nat(compiler)));
+    const cases = noJv();
+    const shared = casesOf(nat(dir + "/cases.json")) catch (e) {
+        eprint(e.message);
+        return 2;
+    };
+    for (x in shared.items) {
+        listPush(cases, x);
+    }
+    const nativeOnly = casesOf(nat(dir + "/native/cases.json")) catch (e) {
+        eprint(e.message);
+        return 2;
+    };
+    for (x in nativeOnly.items) {
+        jSet(x, "native_only", jTrue());
+        listPush(cases, x);
+    }
+    const n = normNew(dir);
+    let fails = 0;
+    let total = 0;
+    for (c in cases) {
+        const kind = textOf(c, "kind");
+        const name = textOf(c, "name");
+        if (kind != "proto" && kind != "dap" && kind != "mcp") {
+            continue;
+        }
+        if (listLen(only) > 0) {
+            let hit = false;
+            for (o in only) {
+                if (o == name) {
+                    hit = true;
+                }
+            }
+            if (!hit) {
+                continue;
+            }
+        }
+        total = total + 1;
+        let text = "";
+        if (kind == "dap") {
+            text = runDap(taixu, dir, c, n) catch (e) {
+                eprint("dap " + name + "：" + e.message);
+                return 1;
+            };
+        } else if (kind == "mcp") {
+            text = runMcp(taixu, dir, c, n) catch (e) {
+                eprint("mcp " + name + "：" + e.message);
+                return 1;
+            };
+        } else {
+            text = runProto(taixu, dir, c, n) catch (e) {
+                eprint("proto " + name + "：" + e.message);
+                return 1;
+            };
+        }
+        const issues = noKeys();
+        const got = normNative(text);
+        const golden = nat(dir + "/native/" + kind + "/" + name + "." + kind);
+        if (update) {
+            writeFile(golden, got) catch (e) {
+                eprint("写不了 " + golden + "：" + e.message);
+                return 1;
+            };
+        } else {
+            const want = readText(golden);
+            if (want == None || (want ?? "") != got) {
+                listPush(issues, goldenIssue(got, want));
+            }
+        }
+        const vmPath = nat(dir + "/vm/" + name + "." + kind);
+        if (kind == "dap") {
+            crossCheckDap(events(text), events(readText(vmPath) ?? ""), issues);
+        } else if (kind == "mcp") {
+            crossCheckMcp(normNative(text), readText(vmPath) ?? "", issues);
+        } else if (!truthy(at(c, "native_only"))) {
+            const vm = readText(vmPath) ?? "";
+            crossCheck(c, events(text), events(vm), issues);
+            crossCheckInspect(text, vm, issues);
+        }
+        if (listLen(issues) > 0) {
+            fails = fails + 1;
+            let joined = "";
+            let k = 0;
+            for (s in issues) {
+                if (k > 0) {
+                    joined = joined + " | ";
+                }
+                joined = joined + s;
+                k = k + 1;
+            }
+            print("FAIL  " + padRight(name, 22) + " " + headChars(joined, 600));
+        } else {
+            print("PASS  " + name);
+        }
+    }
+    if (fails == 0) {
+        print("SUMMARY PASS (" + toStr(total) + " cases)");
+        return 0;
+    }
+    print("SUMMARY FAIL=" + toStr(fails) + " (" + toStr(total) + " cases)");
+    return 1;
+}

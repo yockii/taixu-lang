@@ -1,0 +1,109 @@
+// HTTP 客户端的纯协议状态；网络由调用方驱动，正文返回解码 Bytes，响应头保留 wire 值。
+import { Uri, parseUri, resolveUri, uriString } from "./url";
+import { parseIp } from "./ip";
+import { tls13Hostname } from "./tls13_wire";
+import { httpLower, httpNumber, httpTrim } from "./http_fields";
+import { HttpHead, HttpHeader, HttpParser, HttpLimits, httpResponseParser, httpFeed, httpHeaderValues, httpEncodeRequest } from "./http_wire";
+import { gzipDecode } from "./gzip";
+
+export struct HttpAddress { uri: Uri, host: string, authority: string, port: int, secure: bool, target: string }
+export struct HttpClientResponse { head: Ref<HttpHead>, body: Bytes, trailers: List<HttpHeader> }
+export struct HttpRedirect { next: HttpAddress? }
+export struct HttpReceiver { parser: Ref<HttpParser>, limits: HttpLimits, method: string, head: Ref<HttpHead>?, body: Bytes, trailers: List<HttpHeader>, informational: int, done: bool, failed: bool }
+
+export function httpAddress(text: string): HttpAddress | Error {
+    const uri = parseUri(text)?; const scheme = httpLower(uri.scheme); const authority = uri.authority;
+    if ((scheme != "http" && scheme != "https") || authority == None || len(authority) == 0 || strFind(authority, "@") >= 0) { return err("http client: expected HTTP(S) URL without credentials"); }
+    let host = ""; let portText = ""; let explicitPort = false;
+    if (byteAt(authority, 0) == 91) {
+        const end = strFind(authority, "]"); if (end < 1) { return err("http client: missing IPv6 bracket"); }
+        host = strSlice(authority, 1, end); if (bytesLen(parseIp(host) catch bytesNew(0)) != 16) { return err("http client: unsupported IP literal"); }
+        if (end + 1 < len(authority)) { if (byteAt(authority, end + 1) != 58) { return err("http client: invalid port delimiter"); } explicitPort = true; portText = strSlice(authority, end + 2, len(authority)); }
+    } else {
+        const colon = strFind(authority, ":"); if (colon >= 0) { host = strSlice(authority, 0, colon); portText = strSlice(authority, colon + 1, len(authority)); explicitPort = true; } else { host = authority; }
+    }
+    tls13Hostname(host)?; host = httpLower(host); let port = 80; if (scheme == "https") { port = 443; }
+    if (explicitPort) { port = httpNumber(portText, 10, 65535)?; if (port == 0) { return err("http client: port must be positive"); } }
+    let canonical = host; if (strFind(host, ":") >= 0) { canonical = "[" + host + "]"; }
+    if ((scheme == "http" && port != 80) || (scheme == "https" && port != 443)) { canonical = canonical + ":" + toStr(port); }
+    let normalized = resolveUri(text, text)?; normalized.scheme = scheme; normalized.authority = canonical;
+    if (len(normalized.path) == 0) { normalized.path = "/"; } let target = normalized.path;
+    const query = normalized.query; if (query != None) { target = target + "?" + query; }
+    return HttpAddress { uri: normalized, host: host, authority: canonical, port: port, secure: scheme == "https", target: target };
+}
+
+export function httpClientRequest(address: HttpAddress): Bytes | Error {
+    const headers: List<HttpHeader> = listNew();
+    listPush(headers, HttpHeader { name: "User-Agent", value: bytesFromStr("Taixu-Browser/0.3") });
+    listPush(headers, HttpHeader { name: "Accept", value: bytesFromStr("text/html, text/plain;q=0.9, */*;q=0.1") });
+    listPush(headers, HttpHeader { name: "Accept-Encoding", value: bytesFromStr("gzip") });
+    listPush(headers, HttpHeader { name: "Connection", value: bytesFromStr("close") });
+    return httpEncodeRequest("GET", address.target, address.authority, headers, bytesNew(0), false);
+}
+
+export function httpClientReceiver(method: string, limits: HttpLimits): Ref<HttpReceiver> | Error {
+    if (limits.maxBodyBytes > 67108864) { return err("http client: body limit exceeds decoder capacity"); }
+    return new HttpReceiver { parser: httpResponseParser(method, limits)?, limits: limits, method: method, head: None, body: bytesNew(0), trailers: listNew(), informational: 0, done: false, failed: false };
+}
+function receive(state: Ref<HttpReceiver>, data: Bytes, eof: bool): bool | Error {
+    if (state.failed) { return err("http client: failed receiver"); }
+    if (state.done) { if (bytesLen(data) != 0) { return err("http client: trailing data"); } return true; }
+    let offset = 0; let first = true;
+    while (first || offset < bytesLen(data)) {
+        first = false; const progress = httpFeed(state.parser, bytesSlice(data, offset, bytesLen(data) - offset), eof)?; offset = offset + progress.consumed;
+        for (event in progress.events) {
+            if (event.kind == "headers") {
+                const head = event.head; if (head == None) { return err("http client: missing response headers"); }
+                if (head.status == 101 || head.tunnel) { return err("http client: unsupported upgrade or tunnel"); }
+                if (head.status >= 200) {
+                    if (listLen(head.transferCodings) > 1 || (listLen(head.transferCodings) == 1 && listGet(head.transferCodings, 0) != "chunked")) { return err("http client: unsupported transfer coding"); }
+                    state.head = head;
+                }
+            } else if (event.kind == "body") { bytesAppend(state.body, event.data); }
+            else if (event.kind == "end") { state.trailers = event.trailers; }
+        }
+        if (progress.done) {
+            if (state.parser.head.status < 200) {
+                state.informational = state.informational + 1; if (state.informational > 16) { return err("http client: informational response limit"); }
+                state.parser = httpResponseParser(state.method, state.limits)?;
+                if (offset == bytesLen(data)) { if (eof) { httpFeed(state.parser, bytesNew(0), true)?; } break; }
+            } else {
+                state.done = true; if (offset != bytesLen(data)) { return err("http client: unsolicited trailing response data"); } return true;
+            }
+        } else { if (progress.consumed == 0 || offset == bytesLen(data)) { break; } }
+    } return false;
+}
+export function httpClientFeed(state: Ref<HttpReceiver>, data: Bytes, eof: bool): bool | Error {
+    const result = receive(state, data, eof) catch (e) { state.failed = true; return e; }; return result;
+}
+function decoded(state: Ref<HttpReceiver>): HttpClientResponse | Error {
+    const head = state.head; if (!state.done || state.failed || head == None) { return err("http client: incomplete response"); }
+    let body = state.body;
+    if (state.method != "HEAD" && head.status != 204 && head.status != 304) {
+        const codings: List<string> = listNew();
+        for (field in httpHeaderValues(head, "content-encoding")) {
+            for (item in strSplit(bytesToStr(field)?, ",")) {
+                const coding = httpLower(bytesToStr(httpTrim(bytesFromStr(item)))?); if (len(coding) == 0 || listLen(codings) >= 4) { return err("http client: invalid or excessive content codings"); } listPush(codings, coding);
+            }
+        }
+        let i = listLen(codings) - 1;
+        while (i >= 0) {
+            const coding = listGet(codings, i);
+            // 空正文不解码：重定向等响应常带 Content-Encoding: gzip 而正文为空，浏览器按空正文处理。
+            if (coding == "gzip" || coding == "x-gzip") { if (bytesLen(body) > 0) { body = gzipDecode(body, state.limits.maxBodyBytes)?; } }
+            else if (coding != "identity") { return err("http client: unsupported content coding " + coding); } i = i - 1;
+        }
+    } return HttpClientResponse { head: head, body: body, trailers: state.trailers };
+}
+export function httpClientFinish(state: Ref<HttpReceiver>): HttpClientResponse | Error {
+    const result = decoded(state) catch (e) { state.failed = true; return e; }; return result;
+}
+export function httpClientRedirect(address: HttpAddress, response: HttpClientResponse): HttpRedirect | Error {
+    const status = response.head.status; if (status != 301 && status != 302 && status != 303 && status != 307 && status != 308) { return HttpRedirect { next: None }; }
+    const locations = httpHeaderValues(response.head, "location"); if (listLen(locations) == 0) { return HttpRedirect { next: None }; }
+    if (listLen(locations) != 1) { return err("http client: ambiguous Location"); }
+    const location = bytesToStr(httpTrim(listGet(locations, 0)))?; if (len(location) == 0) { return err("http client: empty Location"); }
+    let uri = resolveUri(uriString(address.uri), location)?; const reference = parseUri(location)?;
+    if (reference.fragment == None) { uri.fragment = address.uri.fragment; }
+    return HttpRedirect { next: httpAddress(uriString(uri))? };
+}

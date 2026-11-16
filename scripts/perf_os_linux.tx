@@ -1,0 +1,184 @@
+// 性能测量取子进程读数的 Linux 部分（导出面同 perf_os_windows.tx、perf_os_macos.tx）：
+// 在本进程上开两个 perf_event_open 计数器（用户态 instructions 与 cycles；disabled、inherit、enable_on_exec），再起子进程——子进程继承
+// 计数器，exec 时启用，本进程自己从不 exec、一直不计；子进程退出时它的读数并回本进程的计数器。读数带启用与实际计数的时长，两者不等
+// 说明计数器被多路复用、读数是内核按比例估的，记为错误。CPU 时间与峰值常驻内存取 getrusage(RUSAGE_CHILDREN)。
+// 调用方须是新起的小进程（perf_lib.tx 的 --perf-helper）：RUSAGE_CHILDREN 是所有已等待子进程的累计与最大值，且 exec 时发起进程那份
+// 地址空间的峰值会并进子进程。
+import { lossyText } from "./check_lib";
+import { maskText, pipesNew, pipesOpen, pump, pumpRest } from "./perf_child";
+
+declare function perfEventOpen(attr: Bytes, pid: int, cpu: int, group: int, flags: int): int from syscall "perf_event_open";
+declare function sysRead(fd: int, buf: Bytes, n: int): int from syscall "read";
+declare function sysClose(fd: int): int from syscall "close";
+declare function getrusage(who: int, usage: Bytes): int from syscall "getrusage";
+declare function clockGettime(clock: int, ts: Bytes): int from syscall "clock_gettime";
+declare function schedGetaffinity(pid: int, n: int, mask: Bytes): int from syscall "sched_getaffinity";
+declare function schedSetaffinity(pid: int, n: int, mask: Bytes): int from syscall "sched_setaffinity";
+
+export struct PerfSample {
+    exit: int,
+    wallNs: int,
+    cpuNs: int,
+    peakKib: int,
+    // 用户态退休指令数与周期数（Linux、macOS）；Windows 为 −1。
+    instructions: int,
+    cycles: int,
+    // QueryProcessCycleTime 的周期（Windows）；别处为 −1。
+    cycleTime: int,
+    // 子进程刚起来时允许它运行的逻辑 CPU，逗号分隔；macOS 为空。
+    cpus: string,
+    // 非空时本样本作废（起不来、超时、计数器多路复用等）。
+    error: string,
+    // 子进程的 stderr（非法 UTF-8 按 U+FFFD 替换）。
+    stderr: string,
+}
+
+// struct perf_event_attr（128 字节）：type、size、config、sample_period、sample_type、read_format、标志位。
+const ATTR_SIZE: int = 128;
+const PERF_TYPE_HARDWARE: int = 0;
+const HW_CPU_CYCLES: int = 0;
+const HW_INSTRUCTIONS: int = 1;
+// PERF_FORMAT_TOTAL_TIME_ENABLED｜PERF_FORMAT_TOTAL_TIME_RUNNING。
+const READ_FORMAT: int = 3;
+// disabled（位 0）、inherit（1）、exclude_kernel（5）、exclude_hv（6）、enable_on_exec（12）。
+const ATTR_FLAGS: int = 4195;
+const PERF_FLAG_FD_CLOEXEC: int = 8;
+const RUSAGE_CHILDREN: int = -1;
+// struct rusage：ru_utime、ru_stime（各为 i64 秒、i64 微秒）之后是 ru_maxrss（KiB）；整个结构 144 字节。
+const MAXRSS_AT: int = 32;
+const SEC: int = 1000000000;
+const DRAIN_MS: int = 10000;
+// CPU 掩码的字节数（1024 个逻辑 CPU）。
+const MASK_BYTES: int = 128;
+
+function counter(config: int): int {
+    const attr = bytesNew(ATTR_SIZE);
+    bytesSetLE<u32>(attr, 0, PERF_TYPE_HARDWARE as u32);
+    bytesSetLE<u32>(attr, 4, ATTR_SIZE as u32);
+    bytesSetLE<int>(attr, 8, config);
+    bytesSetLE<int>(attr, 32, READ_FORMAT);
+    bytesSetLE<int>(attr, 40, ATTR_FLAGS);
+    return perfEventOpen(attr, 0, -1, -1, PERF_FLAG_FD_CLOEXEC);
+}
+
+function fail(why: string): Ref<PerfSample> {
+    return new PerfSample { exit: -1, wallNs: 0, cpuNs: 0, peakKib: 0, instructions: -1, cycles: -1, cycleTime: -1, cpus: "", error: why,
+        stderr: "" };
+}
+
+// 进程 pid（0 为本进程）允许运行的逻辑 CPU；取不到得空串。
+function cpusOf(pid: int): string {
+    const mask = bytesNew(MASK_BYTES);
+    const n = schedGetaffinity(pid, MASK_BYTES, mask);
+    if (n <= 0) {
+        return "";
+    }
+    return maskText(mask, n);
+}
+
+// 在 cwd 里运行 exe（stdin 接空设备，stdout 丢弃，stderr 留在样本里），至多 limitMs 毫秒。
+export function perfRun(exe: string, args: List<string>, cwd: string, limitMs: int): Ref<PerfSample> {
+    const ins = counter(HW_INSTRUCTIONS);
+    if (ins < 0) {
+        return fail("perf_event_open instructions: errno " + toStr(-ins));
+    }
+    const cyc = counter(HW_CPU_CYCLES);
+    if (cyc < 0) {
+        sysClose(ins);
+        return fail("perf_event_open cycles: errno " + toStr(-cyc));
+    }
+    const t0 = monoNs();
+    const h = procSpawn(exe, args, cwd, 0) catch (e) {
+        sysClose(ins);
+        sysClose(cyc);
+        return fail("spawn " + e.message);
+    };
+    const cpus = cpusOf(procPid(h));
+    const p = pipesNew(h);
+    const deadline = t0 + limitMs * 1000000;
+    let code = -1;
+    let exited = false;
+    while (!exited) {
+        let waitMs = 0;
+        if (pipesOpen(p)) {
+            pump(p, 20);
+        } else {
+            waitMs = 20;
+        }
+        const w = procWait(h, waitMs);
+        if (w != None) {
+            code = w ?? -1;
+            exited = true;
+        } else if (monoNs() > deadline) {
+            procKill(h);
+            procClose(h);
+            sysClose(ins);
+            sysClose(cyc);
+            return fail("timeout");
+        }
+    }
+    const wall = monoNs() - t0;
+    pumpRest(p, DRAIN_MS);
+    procClose(h);
+    const a = bytesNew(24);
+    const b = bytesNew(24);
+    const na = sysRead(ins, a, 24);
+    const nb = sysRead(cyc, b, 24);
+    sysClose(ins);
+    sysClose(cyc);
+    if (na != 24 || nb != 24) {
+        return fail("read counters");
+    }
+    const ru = bytesNew(144);
+    if (getrusage(RUSAGE_CHILDREN, ru) != 0) {
+        return fail("getrusage");
+    }
+    const s = new PerfSample { exit: code, wallNs: wall, cpuNs: 0, peakKib: bytesGetLE<int>(ru, MAXRSS_AT) ?? 0,
+        instructions: bytesGetLE<int>(a, 0) ?? -1, cycles: bytesGetLE<int>(b, 0) ?? -1, cycleTime: -1, cpus: cpus, error: "",
+        stderr: lossyText(p.err) };
+    s.cpuNs = ((bytesGetLE<int>(ru, 0) ?? 0) + (bytesGetLE<int>(ru, 16) ?? 0)) * SEC
+    + ((bytesGetLE<int>(ru, 8) ?? 0) + (bytesGetLE<int>(ru, 24) ?? 0)) * 1000;
+    const insOn = bytesGetLE<int>(a, 8) ?? 0;
+    const insRun = bytesGetLE<int>(a, 16) ?? 0;
+    const cycOn = bytesGetLE<int>(b, 8) ?? 0;
+    const cycRun = bytesGetLE<int>(b, 16) ?? 0;
+    if (insOn != insRun || cycOn != cycRun) {
+        s.error = "PMU 计数器被多路复用（instructions " + toStr(insRun) + "/" + toStr(insOn) + "，cycles " + toStr(cycRun) + "/" + toStr(cycOn)
+        + " ns），读数不是精确计数；先停掉占用计数器的进程（如 perf、NMI watchdog）";
+    }
+    return s;
+}
+
+// 本进程允许运行的逻辑 CPU，逗号分隔。
+export function ownCpus(): string {
+    return cpusOf(0);
+}
+
+// 把本进程（及此后起的子进程）固定在逻辑 CPU cpu 上；cpu 不在当前允许的集合里得 Error。
+export function pinCpu(cpu: int): void | Error {
+    if (cpu < 0 || cpu >= MASK_BYTES * 8) {
+        return err("CPU 号超出范围：" + toStr(cpu));
+    }
+    const allowed = bytesNew(MASK_BYTES);
+    const n = schedGetaffinity(0, MASK_BYTES, allowed);
+    if (n <= 0 || cpu >= n * 8 || (((bytesGet(allowed, cpu / 8) ?? 0) >> (cpu % 8)) & 1) == 0) {
+        return err("CPU " + toStr(cpu) + " 不在当前允许集合：" + ownCpus());
+    }
+    const mask = bytesNew(MASK_BYTES);
+    bytesSet(mask, cpu / 8, 1 << (cpu % 8));
+    const r = schedSetaffinity(0, MASK_BYTES, mask);
+    if (r != 0) {
+        return err("sched_setaffinity: errno " + toStr(-r));
+    }
+    return nothing();
+}
+
+function nothing(): void {
+}
+
+// 当前时间的 Unix 秒（CLOCK_REALTIME）。
+export function unixSeconds(): int {
+    const ts = bytesNew(16);
+    clockGettime(0, ts);
+    return bytesGetLE<int>(ts, 0) ?? 0;
+}

@@ -1,0 +1,497 @@
+// ============================================================================
+// engine/raster —— 像素面、绘制原语、绘制记录与投影（GUI 原生引擎 G0；设计见核心仓
+// ）。
+//
+// 光栅语义由整数运算定义，
+// 16 组整数光栅 golden 须逐字节相同：
+// - 像素存为 BGRX（每像素 4 字节，小端 u32 = 0x00RRGGBB，自顶向下行主序），Windows 32 位 DIB、
+//   X11 ZPixmap、macOS 的 32 位小端 CGImage 都可直接呈现；golden 的 sha256 与 .bmp 照旧取自顶
+//   向下的紧凑 RGB（rgbOf 转出）。
+// - clear 整面；fill_rect 与面求交；stroke_rect 为四条 1 像素边（宽或高不足 2 时只画一条）；
+//   line 为整数 Bresenham、两端点都着色；filla 为 src-over 整数混合
+//   (s·a + d·(255−a) + 127) / 255，a=255 与 fill_rect 逐字节相同；blit 为不透明块拷贝，源外
+//   读作黑色、面外丢弃。裁剪矩形旧引擎从未由 .tx 设置过，恒为整面，故不再保留。
+// - 绘制记录从面创建起累积（每条 8 项：种类＋7 个参数），投影文法即 schema v1。
+// - 坐标与尺寸在入口钳到 32 位有符号范围（旧引擎对越界值直接崩溃）；面边长 1..16384、
+//   像素总数不超过 2^26。
+// ============================================================================
+
+import { sha256SumHex } from "std/hash";
+import { encodeBmp } from "std/image";
+
+const OP_CLEAR: int = 1;
+const OP_FILL: int = 2;
+const OP_STROKE: int = 3;
+const OP_LINE: int = 4;
+const OP_BLIT: int = 5;
+const OP_FILLA: int = 6;
+const OP_TEXT: int = 7;
+const OP_SLOTS: int = 8;
+
+const MAX_SIDE: int = 16384;
+const MAX_PIXELS: int = 67108864;
+const MAX_SURFACES: int = 64;
+const I32_MIN: int = -2147483648;
+const I32_MAX: int = 2147483647;
+
+export struct Surf {
+    w: int,
+    h: int,
+    px: Bytes,
+    ops: List<int>,
+    texts: List<string>,
+}
+
+/// 新建面（全黑，记录为空）；尺寸不合法时宽高为 0。
+export function surfMake(w: int, h: int): Surf {
+    if (w < 1 || h < 1 || w > MAX_SIDE || h > MAX_SIDE || w * h > MAX_PIXELS) {
+        return { w: 0, h: 0, px: bytesNew(0), ops: listNew(), texts: listNew() };
+    }
+    return { w: w, h: h, px: bytesNew(w * h * 4), ops: listNew(), texts: listNew() };
+}
+
+function c32(v: int): int {
+    if (v < I32_MIN) {
+        return I32_MIN;
+    }
+    if (v > I32_MAX) {
+        return I32_MAX;
+    }
+    return v;
+}
+
+function nonNeg(v: int): int {
+    if (v < 0) {
+        return 0;
+    }
+    return c32(v);
+}
+
+function minI(a: int, b: int): int {
+    if (a < b) {
+        return a;
+    }
+    return b;
+}
+
+function maxI(a: int, b: int): int {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+function record(s: Surf, kind: int, a: int, b: int, c: int, d: int, e: int, f: int, g: int): void {
+    listPush(s.ops, kind);
+    listPush(s.ops, a);
+    listPush(s.ops, b);
+    listPush(s.ops, c);
+    listPush(s.ops, d);
+    listPush(s.ops, e);
+    listPush(s.ops, f);
+    listPush(s.ops, g);
+}
+
+// 从字节偏移 at 起写 n 个同色像素：先写一个，再按倍增自拷贝（O(log n) 次批量拷贝）。
+function fillRun(px: Bytes, at: int, n: int, rgb: int): void {
+    if (n <= 0) {
+        return;
+    }
+    bytesSetLE<u32>(px, at, rgb as u32);
+    let done: int = 1;
+    while (done < n) {
+        const chunk: int = minI(done, n - done);
+        bytesCopy(px, at + done * 4, px, at, chunk * 4);
+        done = done + chunk;
+    }
+}
+
+function setPx(s: Surf, x: int, y: int, rgb: int): void {
+    if (x < 0 || y < 0 || x >= s.w || y >= s.h) {
+        return;
+    }
+    bytesSetLE<u32>(s.px, (y * s.w + x) * 4, rgb as u32);
+}
+
+function blendPx(s: Surf, x: int, y: int, rgb: int, a: int): void {
+    if (x < 0 || y < 0 || x >= s.w || y >= s.h) {
+        return;
+    }
+    const at: int = (y * s.w + x) * 4;
+    const d: int = bytesGetLE<u32>(s.px, at) catch 0;
+    const na: int = 255 - a;
+    const r: int = (((rgb >> 16) & 255) * a + ((d >> 16) & 255) * na + 127) / 255;
+    const g: int = (((rgb >> 8) & 255) * a + ((d >> 8) & 255) * na + 127) / 255;
+    const b: int = ((rgb & 255) * a + (d & 255) * na + 127) / 255;
+    bytesSetLE<u32>(s.px, at, ((r << 16) | (g << 8) | b) as u32);
+}
+
+/// 整面填色（记录 clear）。
+export function rClear(s: Surf, color: int): void {
+    const rgb: int = color & 0xFFFFFF;
+    record(s, OP_CLEAR, rgb, 0, 0, 0, 0, 0, 0);
+    fillRun(s.px, 0, s.w * s.h, rgb);
+}
+
+/// 填充矩形（宽高先取非负，再与面求交；记录 fill_rect）。
+export function rFillRect(s: Surf, x: int, y: int, w: int, h: int, color: int): void {
+    const rx: int = c32(x);
+    const ry: int = c32(y);
+    const rw: int = nonNeg(w);
+    const rh: int = nonNeg(h);
+    const rgb: int = color & 0xFFFFFF;
+    record(s, OP_FILL, rx, ry, rw, rh, rgb, 0, 0);
+    const x0: int = maxI(rx, 0);
+    const y0: int = maxI(ry, 0);
+    const x1: int = minI(rx + rw, s.w);
+    const y1: int = minI(ry + rh, s.h);
+    if (x0 >= x1 || y0 >= y1) {
+        return;
+    }
+    const rowBytes: int = (x1 - x0) * 4;
+    const first: int = (y0 * s.w + x0) * 4;
+    fillRun(s.px, first, x1 - x0, rgb);
+    let yy: int = y0 + 1;
+    while (yy < y1) {
+        bytesCopy(s.px, (yy * s.w + x0) * 4, s.px, first, rowBytes);
+        yy = yy + 1;
+    }
+}
+
+function hline(s: Surf, x: int, y: int, n: int, rgb: int): void {
+    let i: int = 0;
+    while (i < n) {
+        setPx(s, x + i, y, rgb);
+        i = i + 1;
+    }
+}
+
+function vline(s: Surf, x: int, y: int, n: int, rgb: int): void {
+    let i: int = 0;
+    while (i < n) {
+        setPx(s, x, y + i, rgb);
+        i = i + 1;
+    }
+}
+
+/// 1 像素描边（记录 stroke_rect）：上边、高≥2 时的下边、左边、宽≥2 时的右边。
+export function rStrokeRect(s: Surf, x: int, y: int, w: int, h: int, color: int): void {
+    const rx: int = c32(x);
+    const ry: int = c32(y);
+    const rw: int = nonNeg(w);
+    const rh: int = nonNeg(h);
+    const rgb: int = color & 0xFFFFFF;
+    record(s, OP_STROKE, rx, ry, rw, rh, rgb, 0, 0);
+    hline(s, rx, ry, rw, rgb);
+    if (rh >= 2) {
+        hline(s, rx, ry + rh - 1, rw, rgb);
+    }
+    vline(s, rx, ry, rh, rgb);
+    if (rw >= 2) {
+        vline(s, rx + rw - 1, ry, rh, rgb);
+    }
+}
+
+/// 整数 Bresenham 线段，两端点都着色（记录 line）。
+export function rLine(s: Surf, x0: int, y0: int, x1: int, y1: int, color: int): void {
+    const ax: int = c32(x0);
+    const ay: int = c32(y0);
+    const bx: int = c32(x1);
+    const by: int = c32(y1);
+    const rgb: int = color & 0xFFFFFF;
+    record(s, OP_LINE, ax, ay, bx, by, rgb, 0, 0);
+    let dx: int = bx - ax;
+    if (dx < 0) {
+        dx = -dx;
+    }
+    let dy: int = ay - by;
+    if (dy > 0) {
+        dy = -dy;
+    }
+    let sx: int = -1;
+    if (ax < bx) {
+        sx = 1;
+    }
+    let sy: int = -1;
+    if (ay < by) {
+        sy = 1;
+    }
+    let x: int = ax;
+    let y: int = ay;
+    let e: int = dx + dy;
+    while (true) {
+        setPx(s, x, y, rgb);
+        if (x == bx && y == by) {
+            break;
+        }
+        const e2: int = 2 * e;
+        if (e2 >= dy) {
+            e = e + dy;
+            x = x + sx;
+        }
+        if (e2 <= dx) {
+            e = e + dx;
+            y = y + sy;
+        }
+    }
+}
+
+/// alpha 混合填充（alpha 钳到 0..255；记录 filla）。
+export function rFillRectA(s: Surf, x: int, y: int, w: int, h: int, color: int, alpha: int): void {
+    const rx: int = c32(x);
+    const ry: int = c32(y);
+    const rw: int = nonNeg(w);
+    const rh: int = nonNeg(h);
+    const rgb: int = color & 0xFFFFFF;
+    const a: int = maxI(0, minI(255, alpha));
+    record(s, OP_FILLA, rx, ry, rw, rh, rgb, a, 0);
+    const x0: int = maxI(rx, 0);
+    const y0: int = maxI(ry, 0);
+    const x1: int = minI(rx + rw, s.w);
+    const y1: int = minI(ry + rh, s.h);
+    let yy: int = y0;
+    while (yy < y1) {
+        let xx: int = x0;
+        while (xx < x1) {
+            blendPx(s, xx, yy, rgb, a);
+            xx = xx + 1;
+        }
+        yy = yy + 1;
+    }
+}
+
+/// 把 src 整面不透明地贴到 (x, y)，越出本面的部分丢弃（记录 blit src_rect=(0,0 WxH)）。
+/// src 是另一张面（图像），不与本面重叠。
+export function rBlit(s: Surf, src: Surf, x: int, y: int): void {
+    const dx: int = c32(x);
+    const dy: int = c32(y);
+    record(s, OP_BLIT, 0, 0, src.w, src.h, dx, dy, 0);
+    const x0: int = maxI(dx, 0);
+    const x1: int = minI(dx + src.w, s.w);
+    if (x0 >= x1) {
+        return;
+    }
+    let row: int = maxI(0, -dy);
+    while (row < src.h && dy + row < s.h) {
+        bytesCopy(s.px, ((dy + row) * s.w + x0) * 4, src.px, (row * src.w + (x0 - dx)) * 4, (x1 - x0) * 4);
+        row = row + 1;
+    }
+}
+
+/// 读一个像素的 0xRRGGBB（越界得 -1）。
+export function rGetPixel(s: Surf, x: int, y: int): int {
+    if (x < 0 || y < 0 || x >= s.w || y >= s.h) {
+        return -1;
+    }
+    const v: int = bytesGetLE<u32>(s.px, (y * s.w + x) * 4) catch 0;
+    return v;
+}
+
+/// 写一个像素（不记录；图像逐像素构造用）。
+export function rSetPixel(s: Surf, x: int, y: int, color: int): void {
+    setPx(s, x, y, color & 0xFFFFFF);
+}
+
+/// 由自顶向下的紧凑 RGB 填满整面（不记录；图像解码用）。
+export function rLoadRgb(s: Surf, rgb: Bytes): void {
+    let i: int = 0;
+    const n: int = s.w * s.h;
+    while (i < n) {
+        const r: int = bytesGet(rgb, i * 3) catch 0;
+        const g: int = bytesGet(rgb, i * 3 + 1) catch 0;
+        const b: int = bytesGet(rgb, i * 3 + 2) catch 0;
+        bytesSetLE<u32>(s.px, i * 4, ((r << 16) | (g << 8) | b) as u32);
+        i = i + 1;
+    }
+}
+
+/// 自顶向下的紧凑 RGB（golden 的哈希与 .bmp 的像素来源）。
+export function rgbOf(s: Surf): Bytes {
+    const n: int = s.w * s.h;
+    const out = bytesNew(n * 3);
+    let i: int = 0;
+    while (i < n) {
+        const v: int = bytesGetLE<u32>(s.px, i * 4) catch 0;
+        bytesSet(out, i * 3, (v >> 16) & 255);
+        bytesSet(out, i * 3 + 1, (v >> 8) & 255);
+        bytesSet(out, i * 3 + 2, v & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// 像素哈希：紧凑 RGB 的 SHA-256 小写十六进制。
+export function rSha256(s: Surf): string {
+    return sha256SumHex(rgbOf(s));
+}
+
+const HEX: string = "0123456789abcdef";
+
+function hex2(v: int): string {
+    return (utf8Encode(byteTryAt(HEX, (v >> 4) & 15) catch 48) catch "") + (utf8Encode(byteTryAt(HEX, v & 15) catch 48) catch "");
+}
+
+function colorStr(rgb: int): string {
+    return "#" + hex2((rgb >> 16) & 255) + hex2((rgb >> 8) & 255) + hex2(rgb & 255);
+}
+
+// 文本字节的投影：可打印 ASCII 原样，其余写成 \xNN。
+function escapeBytes(t: string): string {
+    let out: string = "";
+    let i: int = 0;
+    while (i < len(t)) {
+        const ch: int = byteTryAt(t, i) catch 0;
+        if (ch >= 32 && ch < 127) {
+            out = out + (utf8Encode(ch) catch "");
+        } else {
+            out = out + "\\x" + hex2(ch);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// 文本投影（schema v1）：首行 canvas WxH，之后每条记录一行。
+export function rProject(s: Surf): string {
+    let out: string = "canvas " + toStr(s.w) + "x" + toStr(s.h) + "\n";
+    const n: int = listLen(s.ops) / OP_SLOTS;
+    let i: int = 0;
+    while (i < n) {
+        const at: int = i * OP_SLOTS;
+        const k: int = listTryGet(s.ops, at) catch 0;
+        const a: int = listTryGet(s.ops, at + 1) catch 0;
+        const b: int = listTryGet(s.ops, at + 2) catch 0;
+        const c: int = listTryGet(s.ops, at + 3) catch 0;
+        const d: int = listTryGet(s.ops, at + 4) catch 0;
+        const e: int = listTryGet(s.ops, at + 5) catch 0;
+        const f: int = listTryGet(s.ops, at + 6) catch 0;
+        const g: int = listTryGet(s.ops, at + 7) catch 0;
+        out = out + "[" + toStr(i) + "] ";
+        if (k == OP_CLEAR) {
+            out = out + "clear color=" + colorStr(a);
+        } else if (k == OP_FILL || k == OP_STROKE) {
+            let name: string = "fill_rect";
+            if (k == OP_STROKE) {
+                name = "stroke_rect";
+            }
+            out = out + name + " x=" + toStr(a) + " y=" + toStr(b) + " w=" + toStr(c) + " h=" + toStr(d) + " color=" + colorStr(e);
+        } else if (k == OP_LINE) {
+            out = out + "line x0=" + toStr(a) + " y0=" + toStr(b) + " x1=" + toStr(c) + " y1=" + toStr(d) + " color=" + colorStr(e);
+        } else if (k == OP_BLIT) {
+            out = out + "blit src_rect=(" + toStr(a) + "," + toStr(b) + " " + toStr(c) + "x" + toStr(d) + ") -> (" + toStr(e) + "," + toStr(f) + ")";
+        } else if (k == OP_FILLA) {
+            out = out + "filla x=" + toStr(a) + " y=" + toStr(b) + " w=" + toStr(c) + " h=" + toStr(d) + " color=" + colorStr(e) + " a=" + toStr(f);
+        } else if (k == OP_TEXT) {
+            const t: string = listTryGet(s.texts, g) catch "";
+            out = out + "text x=" + toStr(a) + " y=" + toStr(b) + " size=" + toStr(c) + " font=" + toStr(d) + " len=" + toStr(len(t)) + " color=" + colorStr(e) + " bytes=" + escapeBytes(t);
+        }
+        out = out + "\n";
+        i = i + 1;
+    }
+    return out;
+}
+
+/// 记一条文本绘制（像素由文本模块画；G1 起用）。
+export function rRecordText(s: Surf, x: int, y: int, size: int, font: int, color: int, t: string): void {
+    listPush(s.texts, t);
+    record(s, OP_TEXT, c32(x), c32(y), size, font, color & 0xFFFFFF, 0, listLen(s.texts) - 1);
+}
+
+/// 按 8 位覆盖度把颜色混合到 (x, y) 起的 w×h 区域（文字字形用；覆盖度为 0 的像素不动，越出面的丢弃）。
+export function rBlendMask(s: Surf, x: int, y: int, w: int, h: int, cov: Bytes, color: int): void {
+    const rgb: int = color & 0xFFFFFF;
+    let row: int = 0;
+    while (row < h) {
+        let col: int = 0;
+        while (col < w) {
+            const a: int = bytesGet(cov, row * w + col) catch 0;
+            if (a != 0) {
+                blendPx(s, x + col, y + row, rgb, a);
+            }
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+}
+
+/// 写定格三伴 <prefix>.bmp／.sha256／.txt；返回 0 成功、-1 失败。
+export function rWriteTrio(s: Surf, prefix: string): int {
+    const rgb = rgbOf(s);
+    const bmp = encodeBmp(s.w, s.h, rgb) catch (e) {
+        return -1;
+    };
+    let rc: int = 0;
+    writeFileBytes(prefix + ".bmp", bmp) catch (e) {
+        rc = -1;
+    };
+    writeFile(prefix + ".sha256", sha256SumHex(rgb) + "\n") catch (e) {
+        rc = -1;
+    };
+    writeFile(prefix + ".txt", rProject(s)) catch (e) {
+        rc = -1;
+    };
+    return rc;
+}
+
+/// 只写 .bmp（gui/surface 的 surfaceWriteBmp）；返回 0 成功、-1 失败。
+export function rWriteBmp(s: Surf, path: string): int {
+    const bmp = encodeBmp(s.w, s.h, rgbOf(s)) catch (e) {
+        return -1;
+    };
+    let rc: int = 0;
+    writeFileBytes(path, bmp) catch (e) {
+        rc = -1;
+    };
+    return rc;
+}
+
+// ============================================================================
+// 面句柄表：句柄 1..64（旧宿主同界），释放后槽位可复用。
+// ============================================================================
+
+let surfs: List<Surf> = listNew();
+let surfLive: List<bool> = listNew();
+
+/// 新建面，返回句柄 1..64；尺寸不合法或句柄用尽得 -1。
+export function surfNew(w: int, h: int): int {
+    const s: Surf = surfMake(w, h);
+    if (s.w == 0) {
+        return -1;
+    }
+    let i: int = 0;
+    while (i < listLen(surfLive)) {
+        if (!(listTryGet(surfLive, i) catch true)) {
+            listSet(surfs, i, s);
+            listSet(surfLive, i, true);
+            return i + 1;
+        }
+        i = i + 1;
+    }
+    if (listLen(surfs) >= MAX_SURFACES) {
+        return -1;
+    }
+    listPush(surfs, s);
+    listPush(surfLive, true);
+    return listLen(surfs);
+}
+
+/// 句柄是否有效。
+export function surfOk(h: int): bool {
+    return h >= 1 && (listTryGet(surfLive, h - 1) catch false);
+}
+
+/// 取面（句柄无效时得一张 0×0 的空面，调用方应先 surfOk）。
+export function surfAt(h: int): Surf {
+    if (!surfOk(h)) {
+        return surfMake(0, 0);
+    }
+    return listTryGet(surfs, h - 1) catch surfMake(0, 0);
+}
+
+/// 释放面（幂等）。
+export function surfFree(h: int): void {
+    if (surfOk(h)) {
+        listSet(surfs, h - 1, surfMake(0, 0));
+        listSet(surfLive, h - 1, false);
+    }
+}

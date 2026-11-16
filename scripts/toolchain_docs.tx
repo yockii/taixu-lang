@@ -1,0 +1,219 @@
+// 派生文档 docs/ai/toolchain-changes.md 的同步（内容只由太虚渲染）：核对所选编译器就是由当前源码构建的——capabilities 报的产品版本
+// 等于 bootstrap/selfhost/toolchain.tx 的 TOOLCHAIN_VERSION（须是 SemVer 2.0.0 全文）、内嵌变更注册表的 SHA-256 等于
+// bootstrap/changes.tx，changes 报的版本与之相同——再取 `changes` 的输出（统一成 LF、末尾恰一个换行）与文档比较。
+// build.tx 的 --sync-docs（整轮构建之后）与 sync_toolchain_docs.tx（不重建）共用。build.tx 由种子运行，本文件只用种子认得的写法。
+import { sha256Hex } from "../bootstrap/selfhost/sha256";
+import { JsonValue, JSON_NULL, JSON_STR, jsonNew, jsonParseStr, jsonGet } from "../bootstrap/selfhost/json_parse";
+import { byteSub, join, list1, plus, readBytes, runIn, startsWith, trimLine } from "./build_lib";
+
+export const CHANGES_DOC: string = "docs/ai/toolchain-changes.md";
+
+// ---- 产品版本 ----
+
+function isDigit(c: int): bool {
+    return c >= 48 && c <= 57;
+}
+
+function isAlnumDash(c: int): bool {
+    return isDigit(c) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45;
+}
+
+// 非空，只含字母、数字与连字符；semver 时全为数字的还须不带前导零（SemVer 2.0.0 的预发布标识符；构建元数据不限前导零）。
+function isIdent(s: string, semver: bool): bool {
+    if (len(s) == 0) {
+        return false;
+    }
+    let digits = true;
+    let i: int = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) ?? 0;
+        if (!isAlnumDash(c)) {
+            return false;
+        }
+        if (!isDigit(c)) {
+            digits = false;
+        }
+        i = i + 1;
+    }
+    return !semver || !digits || len(s) == 1 || (byteAt(s, 0) ?? 0) != 48;
+}
+
+function idents(s: string, semver: bool): bool {
+    for (part in strSplit(s, ".")) {
+        if (!isIdent(part, semver)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 三段不带前导零的十进制数。
+function core3(s: string): bool {
+    const parts = strSplit(s, ".");
+    if (listLen(parts) != 3) {
+        return false;
+    }
+    for (p in parts) {
+        if (len(p) == 0 || (len(p) > 1 && (byteAt(p, 0) ?? 0) == 48)) {
+            return false;
+        }
+        let i: int = 0;
+        while (i < len(p)) {
+            if (!isDigit(byteAt(p, i) ?? 0)) {
+                return false;
+            }
+            i = i + 1;
+        }
+    }
+    return true;
+}
+
+function firstOf(s: string, c: int): int {
+    let i: int = 0;
+    while (i < len(s)) {
+        if ((byteAt(s, i) ?? 0) == c) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// SemVer 2.0.0：core[-预发布][+构建元数据]。
+export function semverOk(v: string): bool {
+    let rest = v;
+    const plusAt = firstOf(rest, 43);
+    if (plusAt >= 0) {
+        if (!idents(byteSub(rest, plusAt + 1, len(rest) - plusAt - 1), false)) {
+            return false;
+        }
+        rest = byteSub(rest, 0, plusAt);
+    }
+    const dash = firstOf(rest, 45);
+    if (dash < 0) {
+        return core3(rest);
+    }
+    return core3(byteSub(rest, 0, dash)) && idents(byteSub(rest, dash + 1, len(rest) - dash - 1), true);
+}
+
+// toolchain.tx 里唯一的字面量 TOOLCHAIN_VERSION。
+export function sourceVersion(root: string): string | Error {
+    const text = readFile(join(root, "bootstrap/selfhost/toolchain.tx")) catch (e) {
+        return e;
+    };
+    const key = "export const TOOLCHAIN_VERSION: string = \"";
+    let found = "";
+    let count: int = 0;
+    for (line in strSplit(text, "\n")) {
+        const l = trimLine(line);
+        if (startsWith(l, key) && (byteAt(l, len(l) - 1) ?? 0) == 59 && (byteAt(l, len(l) - 2) ?? 0) == 34) {
+            found = byteSub(l, len(key), len(l) - len(key) - 2);
+            count = count + 1;
+        }
+    }
+    if (count != 1 || len(found) == 0) {
+        return err("toolchain.tx 必须只有一个字面量 TOOLCHAIN_VERSION 定义");
+    }
+    if (!semverOk(found)) {
+        return err("TOOLCHAIN_VERSION 不是有效的 SemVer：" + found);
+    }
+    return found;
+}
+
+// ---- 编译器输出 ----
+
+// 对象的成员（缺席或不是对象时得 None）与字符串值（缺席或不是字符串时得 ""）。
+export function field(v: Ref<JsonValue>?, key: string): Ref<JsonValue>? {
+    return jsonGet(v ?? jsonNew(JSON_NULL), key);
+}
+
+export function text(v: Ref<JsonValue>?): string {
+    const x = v ?? jsonNew(JSON_NULL);
+    if (x.kind != JSON_STR) {
+        return "";
+    }
+    return x.s;
+}
+
+// 在 root 下运行编译器，取 stdout；退出码不为 0 或输出不是 UTF-8 得 Error。
+export function capture(compiler: string, args: List<string>, root: string): string | Error {
+    const r = runIn(compiler, args, root, true, false) catch (e) {
+        return e;
+    };
+    if (r.code != 0) {
+        return err("退出码 " + toStr(r.code) + "：" + compiler + " " + (listGet(args, 0) catch ""));
+    }
+    return bytesToStr(r.out) catch (e) {
+        return err("输出不是合法的 UTF-8：" + compiler);
+    };
+}
+
+function lfOnly(s: string): string {
+    const b = bytesFromStr(s);
+    const out = bytesNew(0);
+    let i: int = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) ?? 0;
+        if (c != 13 || (bytesGet(b, i + 1) ?? 0) != 10) {
+            bytesPush(out, c);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(out) catch s;
+}
+
+// ---- 同步 ----
+
+// 写入得 true，已一致得 false；check 时不写，不一致即 Error。
+export function syncDocs(compiler: string, root: string, check: bool): bool | Error {
+    const version = sourceVersion(root) catch (e) {
+        return e;
+    };
+    const capText = capture(compiler, plus(list1("capabilities"), list1("--format=json")), root) catch (e) {
+        return e;
+    };
+    const cap = jsonParseStr(capText) catch (e) {
+        return err("capabilities 不是 JSON");
+    };
+    const data = field(cap, "capabilities");
+    const registry = text(field(field(data, "change_registry"), "sha256"));
+    const changes = readBytes(join(root, "bootstrap/changes.tx")) catch (e) {
+        return e;
+    };
+    if (text(field(cap, "schema")) != "capabilities/1" || text(field(data, "compiler")) != "native-tx"
+        || text(field(data, "toolchain_version")) != version) {
+        return err("所选编译器与当前源码产品版本不一致；请先构建当前源码");
+    }
+    if (registry != sha256Hex(changes)) {
+        return err("所选编译器内嵌变更注册表与当前源码不一致；请先重新构建");
+    }
+    const listText = capture(compiler, plus(list1("changes"), list1("--format=json")), root) catch (e) {
+        return e;
+    };
+    const listed = jsonParseStr(listText) catch (e) {
+        return err("changes --format=json 不是 JSON");
+    };
+    if (text(field(listed, "schema")) != "changes/1" || text(field(listed, "toolchain_version")) != version) {
+        return err("编译器 changes 与 capabilities 的产品版本不一致");
+    }
+    const rendered = capture(compiler, list1("changes"), root) catch (e) {
+        return e;
+    };
+    let doc = lfOnly(rendered);
+    if (strIndexOf(doc, "\r") >= 0 || !startsWith(doc, "# 太虚工具链兼容变更\n")) {
+        return err("changes 文档格式无效");
+    }
+    doc = trimLine(doc) + "\n";
+    const path = join(root, CHANGES_DOC);
+    const current = readFile(path) catch "";
+    if (current == doc) {
+        return false;
+    }
+    if (check) {
+        return err("派生文档未同步；运行 taixu run --toolchain scripts/sync_toolchain_docs.tx --compiler <新编译器>");
+    }
+    writeFile(path, doc) catch (e) {
+        return e;
+    };
+    return true;
+}

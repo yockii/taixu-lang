@@ -1,0 +1,49 @@
+import { x509LoadRootFile, x509SystemRoots } from "std/x509_roots";
+import { x509VerifyServer } from "std/x509_verify";
+import { getenv, setenv } from "std/os";
+import { fsMkdir, fsRemove, fsWriteAll } from "std/fs";
+import { randomBytes } from "std/crypto/rand";
+import { sha256SumHex } from "std/hash";
+import { p256Hex } from "std/crypto/p256_field";
+
+function loadError(path: string): bool { x509LoadRootFile(path) catch (e) { return true; }; return false; }
+function systemError(): bool { x509SystemRoots() catch (e) { return true; }; return false; }
+
+test "Linux 根集合：显式文件、错误不回退与默认系统 bundle" {
+    const configured = getenv("SSL_CERT_FILE"); defer { setenv("SSL_CERT_FILE", configured) catch (e) { panic(e.message); }; }
+    const roots = x509LoadRootFile("tests/vectors/x509-root-bundle.pem") catch panic("root bundle");
+    assert(listLen(roots) == 2, "both independent public roots");
+    setenv("SSL_CERT_FILE", "tests/vectors/x509-root-bundle.pem") catch panic("setenv");
+    const chosen = x509SystemRoots() catch panic("configured root bundle");
+    assert(listLen(chosen) == 2 && bytesEqual(listGet(chosen, 0), listGet(roots, 0)), "explicit file is exclusive");
+    const folder = "x509-roots-" + sha256SumHex(randomBytes(16) catch panic("random")) + ".tmp";
+    fsMkdir(folder) catch panic("mkdir"); defer { fsRemove(folder) catch panic("remove temporary directory"); }
+    const path = folder + "/roots.pem";
+    fsWriteAll(path, "no certificate here\n") catch panic("write empty"); defer { fsRemove(path) catch panic("remove temporary file"); }
+    assert(loadError(path), "empty root set fails");
+    setenv("SSL_CERT_FILE", path) catch panic("setenv"); assert(systemError(), "explicit empty store never falls back");
+    fsWriteAll(path, "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n") catch panic("write malformed");
+    assert(loadError(path) && systemError(), "bad DER fails closed");
+    fsWriteAll(path, "-----BEGIN CERTIFICATE-----\nAA=\n-----END CERTIFICATE-----\n") catch panic("write PEM");
+    assert(loadError(path), "bad PEM rejected");
+    setenv("SSL_CERT_FILE", path + ".missing") catch panic("setenv"); assert(systemError(), "explicit missing file never falls back");
+    setenv("SSL_CERT_FILE", "") catch panic("setenv");
+    assert(listLen(x509SystemRoots() catch panic("system CA bundle")) > 0, "host system roots really loaded");
+}
+
+test "Linux 服务验证：配置根能建链，服务器附根不能产生信任" {
+    const configured = getenv("SSL_CERT_FILE"); defer { setenv("SSL_CERT_FILE", configured) catch (e) { panic(e.message); }; }
+    const fixture = readFile("tests/vectors/x509-search.txt") catch panic("search fixture"); let count = 0;
+    for (line in strSplit(fixture, "\n")) {
+        if (len(line) == 0 || byteAt(line, 0) == 35) { continue; }
+        const fields = strSplit(line, " "); if (listGet(fields, 1) != "duplicate-intermediate") { continue; }
+        const chain: List<Bytes> = listNew(); for (raw in strSplit(listGet(fields, 5), ",")) { listPush(chain, p256Hex(raw)); }
+        setenv("SSL_CERT_FILE", "tests/vectors/x509-root-bundle.pem") catch panic("setenv");
+        x509VerifyServer(chain, "example.test", 1794456000, listNew()) catch (e) { panic(e.message); };
+        const wrong: List<Bytes> = listNew(); const roots = x509LoadRootFile("tests/vectors/x509-root-bundle.pem") catch panic("roots");
+        listPush(wrong, listGet(roots, 1)); listPush(chain, listGet(roots, 0)); let failed = false;
+        x509VerifyServer(chain, "example.test", 1794456000, wrong) catch (e) { failed = true; };
+        assert(failed, "explicit other root excludes configured and server-supplied roots"); count = count + 1;
+    }
+    assert(count == 1, "configured path exercised");
+}

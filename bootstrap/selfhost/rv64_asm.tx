@@ -10,7 +10,7 @@
 //   __tx_pcrel_<代码节偏移>（提交时在 auipc 前定义，偏移在映像里唯一、两次生成相同）。不发 R_RISCV_RELAX，不出压缩指令。
 // - t6（x31）留给本层的合法化（大常数加法、大偏移读写、远跳），不分配给值；t5（x30）留给上层（宏层自用与间接目标）。
 import { StructuredBuffer, StructuredEntry, asBufferNew, asStructuredImm, asStructuredSection, asStructuredLabel, asStructuredAlign, asStructuredByte, asStructuredQuad, asStructuredAddress, asStructuredZero, asStructuredAddressAddend } from "./assemble";
-import { asRv64Word, asA64Here, asImgIsa, asSetIsa, asFailWith, asFailedAs, FIX_RV64_CALL, FIX_RV64_PCREL_HI20, FIX_RV64_PCREL_LO12_I, FIX_RV64_PCREL_LO12_S, asListingActive, asListingA64 } from "./assemble";
+import { asRv64Word, asA64Here, asImgIsa, asSetIsa, asFailWith, asFailedAs, FIX_RV64_CALL, FIX_RV64_PCREL_HI20, FIX_RV64_PCREL_LO12_I, FIX_RV64_PCREL_LO12_S, asListingActive, asListingA64, asFunctionBlocksOn, asWordFunctionEnd, asFallThroughCheck } from "./assemble";
 import { nativeFunctionsActive, nativeFunctionsIsa, nativeFunctionBegin, nativeFunctionOwnedBegin, nativeFunctionBoundaryBegin, nativeFunctionEnd, nativeFunctionPrologueEnd, nativeFunctionEpilogueStart, nativeFunctionEvent } from "./native_function_data";
 import { rv64R, rv64I, rv64S, rv64B, rv64U, rv64J, rv64Shift } from "./rv64_encode";
 import { RV64_ADD, RV64_SUB, RV64_ADDI, RV64_ADDIW, RV64_SLLI, RV64_LUI, RV64_AUIPC, RV64_JALR } from "./rv64_encode";
@@ -187,8 +187,9 @@ function size(e: Ref<StructuredEntry>, level: int, local: bool): int {
     return 0;
 }
 
-// 代码节里各条目的绝对偏移（非代码节的条目为 -1），末尾多一项为代码节终点。起点是映像代码节的当前长度。
-function textOffsets(buf: Ref<StructuredBuffer>, levels: List<int>, labels: Map<string, int>, start: int): List<int> {
+// 代码节里各条目的绝对偏移（非代码节的条目为 -1），末尾多一项为代码节终点。起点是映像代码节的当前长度。localOk[i] 为 1 表示
+// 条目 i 的目标可就地解析（同一缓冲、函数块模式下还须同一函数）。
+function textOffsets(buf: Ref<StructuredBuffer>, levels: List<int>, localOk: List<int>, start: int): List<int> {
     const at: List<int> = listNew();
     let pos = start;
     let sec = 0;
@@ -204,7 +205,7 @@ function textOffsets(buf: Ref<StructuredBuffer>, levels: List<int>, labels: Map<
                 pos = pos + (al - pos % al) % al;
             }
             listPush(at, pos);
-            if (e.kind >= K_WORD && e.kind <= K_B) { pos = pos + size(e, listGet(levels, i) catch 0, mapHas(labels, e.name)); }
+            if (e.kind >= K_WORD && e.kind <= K_B) { pos = pos + size(e, listGet(levels, i) catch 0, (listGet(localOk, i) catch 0) == 1); }
         }
         i = i + 1;
     }
@@ -297,6 +298,26 @@ export function rv64BufferSubmit(buf: Ref<StructuredBuffer>): void {
         if (e.kind == 0 || e.kind == 13) { asFailWith("X86InstructionInRv64Buffer:" + (listGet(rv64BufferX86Sites(buf), 0) catch ""), i + 1); return; }
         i = i + 1;
     }
+    // 函数块模式（内核）：同 a64_asm.tx——条目所属的函数＝之前已结束的函数个数；跳到别的函数的标号登记修补：调用与无条件跳转用
+    // auipc＋jalr（CALL_PLT），条件跳转用长形式（取反的短跳转跳过 auipc＋jalr）。
+    const blocks = asFunctionBlocksOn();
+    const owner: List<int> = listNew();
+    let ended = 0;
+    i = 0;
+    while (i < listLen(buf.entries)) {
+        listPush(owner, ended);
+        if (entryAt(buf, i).kind == 10) { ended = ended + 1; }
+        i = i + 1;
+    }
+    const localOk: List<int> = listNew();
+    i = 0;
+    while (i < listLen(buf.entries)) {
+        const e = entryAt(buf, i);
+        let ok = 0;
+        if (mapHas(labels, e.name) && (!blocks || (listGet(owner, mapGet(labels, e.name) catch 0) catch -1) == (listGet(owner, i) catch -2))) { ok = 1; }
+        listPush(localOk, ok);
+        i = i + 1;
+    }
     const levels: List<int> = listNew();
     i = 0;
     while (i < listLen(buf.entries)) { listPush(levels, 0); i = i + 1; }
@@ -304,14 +325,15 @@ export function rv64BufferSubmit(buf: Ref<StructuredBuffer>): void {
     let changed = true;
     while (changed) {
         changed = false;
-        const at = textOffsets(buf, levels, labels, start);
+        const at = textOffsets(buf, levels, localOk, start);
         i = 0;
         while (i < listLen(buf.entries)) {
             const e = entryAt(buf, i);
             const lv = listGet(levels, i) catch 0;
-            const local = mapHas(labels, e.name);
-            if (e.kind == K_B && !local) { asFailWith("ConditionalBranchTargetNotLocal:" + e.name, i + 1); return; }
-            if ((e.kind == K_B && lv < 2) || (e.kind == K_CALL && e.nops == 0 && local && lv == 0)) {
+            const local = (listGet(localOk, i) catch 0) == 1;
+            if (e.kind == K_B && !mapHas(labels, e.name)) { asFailWith("ConditionalBranchTargetNotLocal:" + e.name, i + 1); return; }
+            if (e.kind == K_B && !local && lv < 2) { listSet(levels, i, 2); changed = true; }
+            else if ((e.kind == K_B && lv < 2) || (e.kind == K_CALL && e.nops == 0 && local && lv == 0)) {
                 const d = (listGet(at, mapGet(labels, e.name) catch 0) catch 0) - (listGet(at, i) catch 0);
                 let grow = false;
                 if (e.kind == K_B && lv == 0) { grow = !inRange(d, -4096, 4094); }
@@ -323,9 +345,10 @@ export function rv64BufferSubmit(buf: Ref<StructuredBuffer>): void {
             i = i + 1;
         }
     }
-    const at = textOffsets(buf, levels, labels, start);
+    const at = textOffsets(buf, levels, localOk, start);
     const listing = asListingActive() && buf.listFn >= 0;
     const fn = buf.listFn;
+    let current = "";
     let lastHi = -1;
     let lastHiSym = "";
     sec = 0;
@@ -354,8 +377,10 @@ export function rv64BufferSubmit(buf: Ref<StructuredBuffer>): void {
             asStructuredAddressAddend(e.name, e.value);
         } else if (e.kind == 9 || e.kind == 14) {
             if (sec != 0) { asFailWith("FunctionOutsideText", line); return; }
+            current = e.name;
             if (e.kind == 14) { nativeFunctionBoundaryBegin(e.mnemonic, e.name, e.b.label, asA64Here()); } else { nativeFunctionOwnedBegin(e.mnemonic, e.name, e.a.label, asA64Here()); }
         } else if (e.kind == 10) {
+            asWordFunctionEnd(current);
             nativeFunctionEnd(asA64Here());
         } else if (e.kind == 11) {
             nativeFunctionPrologueEnd(asA64Here());
@@ -366,12 +391,13 @@ export function rv64BufferSubmit(buf: Ref<StructuredBuffer>): void {
             nativeFunctionEvent(listGet(at, i - e.nops) catch -1, asA64Here(), e.name, e.b.imm, e.a.imm);
         } else if (e.kind == 15) {
             if (sec != 0) { asFailWith("FunctionOutsideText", line); return; }
+            current = e.name;
             nativeFunctionBegin(e.value, e.name, asA64Here());
         } else if (e.kind >= K_WORD && e.kind <= K_B) {
             if (sec != 0) { asFailWith("InstructionOutsideText", line); return; }
             const here = listGet(at, i) catch 0;
             if (asA64Here() != here) { asFailWith("Rv64LayoutMismatch", line); return; }
-            const local = mapHas(labels, e.name);
+            const local = (listGet(localOk, i) catch 0) == 1;
             let d = 0;
             if (local) { d = (listGet(at, mapGet(labels, e.name) catch 0) catch 0) - here; }
             const lv = listGet(levels, i) catch 0;
@@ -433,6 +459,12 @@ export function rv64BufferSubmit(buf: Ref<StructuredBuffer>): void {
                         if (far < 0) { asFailWith("BranchOutOfRange:" + e.name, line); return; }
                         asRv64Word(far, -1, "", 0);
                         if (listing) { listWord(fn, e.line, far, -1, e.name); }
+                    } else if (!local) {
+                        const w1 = rv64U(RV64_AUIPC, RV64_TMP, 0);
+                        const w2 = rv64I(RV64_JALR, RV64_ZERO_REG, RV64_TMP, 0);
+                        asRv64Word(w1, FIX_RV64_CALL, e.name, 0);
+                        asRv64Word(w2, -1, "", 0);
+                        if (listing) { listWord(fn, e.line, w1, FIX_RV64_CALL, e.name); listWord(fn, e.line, w2, -1, ""); }
                     } else {
                         const hi = pairHi(d - 4);
                         if (hi < 0) { asFailWith("BranchOutOfRange:" + e.name, line); return; }
@@ -451,4 +483,5 @@ export function rv64BufferSubmit(buf: Ref<StructuredBuffer>): void {
         i = i + 1;
     }
     if (asFailedAs() == 0 && sec == 0 && asA64Here() != (listGet(at, listLen(buf.entries)) catch -1)) { asFailWith("Rv64LayoutMismatch", listLen(buf.entries)); }
+    asFallThroughCheck();
 }

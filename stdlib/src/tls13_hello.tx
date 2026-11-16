@@ -1,0 +1,67 @@
+import { Tls13Client, Tls13Progress, tls13Transcript, tls13Wipe } from "./tls13_state";
+import { tls13Hostname, tls13ClientHello, tls13ParseServerHello, tls13Message, tls13PlainRecord, tls13PlainRecords, tls13Integer } from "./tls13_wire";
+import { randomBytes } from "./crypto/rand";
+import { x25519PublicKey, x25519 } from "./crypto/ecdh";
+import { p256PublicKey, p256Ecdh } from "./crypto/p256";
+import { p256Less } from "./crypto/p256_point";
+import { p256Hex } from "./crypto/p256_field";
+import { tls13HandshakeSecrets } from "./tls13_kdf";
+import { tls13TrafficKeys } from "./tls13_record";
+import { sha256Sum } from "./hash";
+
+export function tls13NewClient(hostname: string, nowSecs: int, roots: List<Bytes>): Ref<Tls13Client> | Error {
+    const host = tls13Hostname(hostname)?;
+    if (nowSecs < -62135596800 || nowSecs > 253402300799 || listLen(roots) > 4096) { return err("tls13: invalid time or trust anchor count"); }
+    const anchors: List<Bytes> = listNew(); let total = 0;
+    for (root in roots) {
+        if (bytesLen(root) == 0 || bytesLen(root) > 1048576 || total > 33554432 - bytesLen(root)) { return err("tls13: trust anchor size limit"); }
+        total = total + bytesLen(root); listPush(anchors, bytesSlice(root, 0, bytesLen(root)));
+    }
+    const secret = randomBytes(32)?; const publicKey = x25519PublicKey(secret)?;
+    return new Tls13Client { host: host, nowSecs: nowSecs, roots: anchors, phase: 0, failed: false,
+        random: randomBytes(32)?, session: randomBytes(32)?, group: 29, privateKey: secret, publicKey: publicKey,
+        retried: false, sentCcs: false, clientAuth: false, transcript: bytesNew(0), incoming: bytesNew(0), handshake: bytesNew(0),
+        readKeys: None, writeKeys: None, handshakeSecret: bytesNew(0), serverHandshake: bytesNew(0), clientHandshake: bytesNew(0),
+        serverTraffic: bytesNew(0), clientTraffic: bytesNew(0), certificate: None, localClosed: false, peerClosed: false };
+}
+
+function newP256Secret(): Bytes | Error {
+    const order = p256Hex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"); let tries = 0;
+    while (tries < 128) {
+        const secret = randomBytes(32)?; let nonzero = 0; for (b in bytesAsList(secret)) { nonzero = nonzero | (b as int); }
+        if (nonzero != 0 && p256Less(secret, order)) { return secret; } tls13Wipe(secret); tries = tries + 1;
+    }
+    return err("tls13: random source did not produce a valid P-256 scalar");
+}
+
+export function tls13Begin(state: Ref<Tls13Client>): Bytes | Error {
+    if (state.failed || state.phase != 0) { return err("tls13: client already started or failed"); }
+    const message = tls13ClientHello(state.host, state.random, state.session, state.group, state.publicKey, bytesNew(0))?;
+    tls13Transcript(state, message)?; state.phase = 1; return tls13PlainRecord(22, message, 769);
+}
+
+export function tls13AcceptHello(state: Ref<Tls13Client>, body: Bytes, message: Bytes, progress: Tls13Progress): void | Error {
+    const hello = tls13ParseServerHello(body, state.session, state.group)?;
+    if (hello.retry) {
+        if (state.retried) { return err("tls13: repeated HelloRetryRequest"); } state.retried = true;
+        const hash = sha256Sum(state.transcript); state.transcript = bytesNew(0); tls13Transcript(state, tls13Message(254, hash))?; tls13Transcript(state, message)?;
+        if (hello.group != 0) {
+            if (hello.group != 23) { return err("tls13: invalid retry group"); }
+            tls13Wipe(state.privateKey); state.privateKey = newP256Secret()?; state.publicKey = p256PublicKey(state.privateKey)?; state.group = 23;
+        }
+        const retry = tls13ClientHello(state.host, state.random, state.session, state.group, state.publicKey, hello.cookie)?;
+        tls13Transcript(state, retry)?;
+        listPush(progress.outbound, tls13PlainRecord(20, tls13Integer(1, 1), 771)); state.sentCcs = true;
+        for (record in tls13PlainRecords(22, retry, 771)) { listPush(progress.outbound, record); } return done();
+    }
+    tls13Transcript(state, message)?;
+    let shared = bytesNew(0);
+    if (hello.group == 29) { shared = x25519(state.privateKey, hello.key)?; }
+    else { shared = p256Ecdh(state.privateKey, hello.key)?; }
+    tls13Wipe(state.privateKey); state.privateKey = bytesNew(0);
+    const secrets = tls13HandshakeSecrets(shared, sha256Sum(state.transcript))?; tls13Wipe(shared);
+    state.handshakeSecret = secrets.handshake; state.serverHandshake = secrets.server; state.clientHandshake = secrets.client;
+    state.readKeys = tls13TrafficKeys(secrets.server)?; state.writeKeys = tls13TrafficKeys(secrets.client)?; state.phase = 2; return done();
+}
+
+function done(): void {}

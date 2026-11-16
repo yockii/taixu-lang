@@ -1,0 +1,395 @@
+// HTTP/1.0／1.1 单消息增量分帧，RFC 9112。每次喂入返回消费量，保留后续消息和隧道的字节。
+import { httpLower, httpToken, httpTokenByte, httpOws, httpTrim, httpValueOk, httpNumber, httpChunkSize } from "./http_fields";
+import { parseUriLimit } from "./url";
+
+export struct HttpLimits {
+    maxLineBytes: int,
+    maxHeaderBytes: int,
+    maxHeaders: int,
+    maxBodyBytes: int,
+    maxChunkOverheadBytes: int,
+}
+
+export struct HttpHeader { name: string, value: Bytes }
+export struct HttpText { present: bool, value: string }
+
+export struct HttpHead {
+    isRequest: bool,
+    version: string,
+    method: string,
+    target: string,
+    status: int,
+    reason: Bytes,
+    headers: List<HttpHeader>,
+    transferCodings: List<string>,
+    canReuse: bool,
+    tunnel: bool,
+    bodyFraming: string,
+}
+
+export struct HttpEvent {
+    kind: string,
+    head: Ref<HttpHead>?,
+    data: Bytes,
+    trailers: List<HttpHeader>,
+}
+
+export struct HttpFeed { events: List<HttpEvent>, consumed: int, done: bool }
+
+export struct HttpParser {
+    limits: HttpLimits,
+    head: Ref<HttpHead>,
+    requestMethod: string,
+    state: int,
+    line: Bytes,
+    remaining: int,
+    bodyRead: int,
+    headerBytes: int,
+    fieldCount: int,
+    chunkOverhead: int,
+    crlfAt: int,
+    trailers: List<HttpHeader>,
+    failure: string,
+}
+
+// state：0 起始行，1 头，2 定长正文，3 EOF 正文，4 chunk 大小，5 chunk 正文，6 chunk CRLF，7 尾部，8 完成，9 失败。
+export function httpDefaultLimits(): HttpLimits {
+    return HttpLimits { maxLineBytes: 8192, maxHeaderBytes: 65536, maxHeaders: 100, maxBodyBytes: 16777216, maxChunkOverheadBytes: 1048576 };
+}
+
+function parser(request: bool, method: string, limits: HttpLimits): Ref<HttpParser> | Error {
+    if (limits.maxLineBytes < 1 || limits.maxLineBytes > 9223372036854775805 || limits.maxHeaderBytes < 2 || limits.maxHeaders < 0
+        || limits.maxBodyBytes < 0 || limits.maxChunkOverheadBytes < 0) { return err("http: invalid limits"); }
+    if (!request && !httpToken(method)) { return err("http: invalid request method context"); }
+    const head = new HttpHead { isRequest: request, version: "", method: "", target: "", status: 0, reason: bytesNew(0), headers: listNew(),
+        transferCodings: listNew(), canReuse: false, tunnel: false, bodyFraming: "none" };
+    return new HttpParser { limits: limits, head: head, requestMethod: method, state: 0, line: bytesNew(0), remaining: 0, bodyRead: 0,
+        headerBytes: 0, fieldCount: 0, chunkOverhead: 0, crlfAt: 0, trailers: listNew(), failure: "" };
+}
+
+export function httpRequestParser(limits: HttpLimits): Ref<HttpParser> | Error { return parser(true, "", limits); }
+export function httpResponseParser(requestMethod: string, limits: HttpLimits): Ref<HttpParser> | Error { return parser(false, requestMethod, limits); }
+
+function fail(p: Ref<HttpParser>, reason: string): Error { p.state = 9; p.failure = "http: " + reason; return err(p.failure); }
+
+export function httpHeaderValues(head: Ref<HttpHead>, name: string): List<Bytes> {
+    const out: List<Bytes> = listNew();
+    const lower = httpLower(name);
+    for (h in head.headers) { if (httpLower(h.name) == lower) { listPush(out, h.value); } }
+    return out;
+}
+
+// 只取首个字段，present 表示是否存在；不自动合并多值字段（例如 Set-Cookie）。尾部不参与查询。
+export function httpHeaderText(head: Ref<HttpHead>, name: string): HttpText | Error {
+    const lower = httpLower(name);
+    for (h in head.headers) { if (httpLower(h.name) == lower) { return HttpText { present: true, value: bytesToStr(h.value)? }; } }
+    return HttpText { present: false, value: "" };
+}
+
+function versionOk(s: string): bool { return s == "HTTP/1.1" || s == "HTTP/1.0"; }
+
+function authorityOnly(text: string): bool {
+    if (strFind(text, "@") >= 0) { return false; }
+    const full = "http://" + text;
+    const u = parseUriLimit(full, len(full)) catch (e) { return false; };
+    return u.authority != None && (u.authority catch "") == text && len(u.path) == 0 && u.query == None && u.fragment == None;
+}
+
+function targetOk(method: string, target: string): bool {
+    if (target == "*") { return method == "OPTIONS"; }
+    if (method == "CONNECT") {
+        if (!authorityOnly(target)) { return false; }
+        let colon = len(target) - 1;
+        while (colon >= 0 && byteAt(target, colon) != 58) { colon = colon - 1; }
+        if (colon <= 0 || colon == len(target) - 1 || byteAt(target, len(target) - 1) == 93) { return false; }
+        httpNumber(strSlice(target, colon + 1, len(target)), 10, 65535) catch (e) { return false; };
+        return true;
+    }
+    let raw = target;
+    if (byteAt(target, 0) == 47) { raw = "http://http.invalid" + target; }
+    const u = parseUriLimit(raw, len(raw)) catch (e) { return false; };
+    return len(u.scheme) > 0 && u.fragment == None;
+}
+
+function startLine(p: Ref<HttpParser>, line: Bytes): void | Error {
+    const n = bytesLen(line);
+    if (p.head.isRequest) {
+        const text = bytesToStr(line)?;
+        const a = strFind(text, " ");
+        if (a <= 0) { return fail(p, "invalid request line"); }
+        const rest = strSlice(text, a + 1, len(text));
+        const z = strFind(rest, " ");
+        if (z <= 0) { return fail(p, "invalid request target"); }
+        const method = strSlice(text, 0, a);
+        const target = strSlice(rest, 0, z);
+        const version = strSlice(rest, z + 1, len(rest));
+        if (!httpToken(method) || !versionOk(version)) { return fail(p, "invalid method or HTTP version"); }
+        for (c in target) { if (c <= 32 || c >= 127 || c == 35) { return fail(p, "invalid request target octet"); } }
+        if (!targetOk(method, target)) { return fail(p, "invalid request-target form"); }
+        p.head.method = method;
+        p.head.target = target;
+        p.head.version = version;
+    } else {
+        // 原因短语可省，连同其前的空格（“HTTP/1.1 200”）：同 Go 与 curl。
+        if (n < 12 || (bytesGet(line, 8) catch 0) != 32 || (n > 12 && (bytesGet(line, 12) catch 0) != 32)) { return fail(p, "invalid status line"); }
+        const version = bytesToStr(bytesSlice(line, 0, 8))?;
+        if (!versionOk(version)) { return fail(p, "unsupported HTTP version"); }
+        const status = httpNumber(bytesToStr(bytesSlice(line, 9, 3))?, 10, 599)?;
+        if (status < 100) { return fail(p, "invalid status code"); }
+        let reason = bytesNew(0); if (n > 13) { reason = bytesSlice(line, 13, n - 13); }
+        if (!httpValueOk(reason)) { return fail(p, "invalid reason phrase"); }
+        p.head.version = version;
+        p.head.status = status;
+        p.head.reason = reason;
+    }
+    p.state = 1;
+    return;
+}
+
+function field(p: Ref<HttpParser>, line: Bytes, trailer: bool): void | Error {
+    if (p.fieldCount >= p.limits.maxHeaders) { return fail(p, "field count limit exceeded"); }
+    let colon = 0;
+    while (colon < bytesLen(line) && (bytesGet(line, colon) catch 0) != 58) {
+        if (!httpTokenByte(bytesGet(line, colon) catch 0)) { return fail(p, "invalid field name or obsolete folding"); }
+        colon = colon + 1;
+    }
+    if (colon == 0 || colon == bytesLen(line)) { return fail(p, "missing field name or colon"); }
+    const name = bytesToStr(bytesSlice(line, 0, colon))?;
+    const value = httpTrim(bytesSlice(line, colon + 1, bytesLen(line) - colon - 1));
+    if (!httpValueOk(value)) { return fail(p, "invalid field value"); }
+    if (trailer) {
+        const lower = httpLower(name);
+        for (bad in ["content-length", "transfer-encoding", "host", "connection", "te", "trailer", "upgrade"]) {
+            if (lower == bad) { return fail(p, "framing or routing field in trailer"); }
+        }
+        listPush(p.trailers, HttpHeader { name: name, value: value });
+    } else { listPush(p.head.headers, HttpHeader { name: name, value: value }); }
+    p.fieldCount = p.fieldCount + 1;
+    return;
+}
+
+function headerTokens(p: Ref<HttpParser>, name: string, allowEmpty: bool): List<string> | Error {
+    const out: List<string> = listNew();
+    for (value in httpHeaderValues(p.head, name)) {
+        const raw = bytesToStr(value)?;
+        for (part in strSplit(raw, ",")) {
+            const text = bytesToStr(httpTrim(bytesFromStr(part)))?;
+            if (len(text) == 0 && allowEmpty) { continue; }
+            if (!httpToken(text)) { return fail(p, "invalid " + name + " token list"); }
+            listPush(out, httpLower(text));
+        }
+    }
+    return out;
+}
+
+function framing(p: Ref<HttpParser>): void | Error {
+    if (p.head.isRequest) {
+        const hosts = httpHeaderValues(p.head, "host");
+        if (listLen(hosts) > 1 || (p.head.version == "HTTP/1.1" && listLen(hosts) != 1)) { return fail(p, "missing or repeated Host field"); }
+        for (value in hosts) { if (!authorityOnly(bytesToStr(value)?)) { return fail(p, "invalid Host authority"); } }
+    }
+    const connection = headerTokens(p, "connection", true)?;
+    let close = false;
+    let keep = false;
+    for (token in connection) { if (token == "close") { close = true; } if (token == "keep-alive") { keep = true; } }
+    p.head.canReuse = !close && (p.head.version == "HTTP/1.1" || keep);
+    if (!p.head.isRequest && p.requestMethod == "CONNECT" && p.head.status >= 200 && p.head.status < 300) {
+        p.head.tunnel = true;
+        p.head.bodyFraming = "tunnel";
+        p.head.canReuse = false;
+        p.state = 8;
+        return;
+    }
+    const cls = httpHeaderValues(p.head, "content-length");
+    const tes = httpHeaderValues(p.head, "transfer-encoding");
+    if (listLen(cls) > 0 && listLen(tes) > 0) { return fail(p, "Content-Length conflicts with Transfer-Encoding"); }
+    let length: int? = None;
+    for (value in cls) {
+        const text = bytesToStr(value)?;
+        for (part in strSplit(text, ",")) {
+            const raw = bytesToStr(httpTrim(bytesFromStr(part)))?;
+            const n = httpNumber(raw, 10, 9223372036854775807)?;
+            if (length != None && n != (length catch 0)) { return fail(p, "conflicting Content-Length values"); }
+            length = n;
+        }
+    }
+    const codings = headerTokens(p, "transfer-encoding", false)?;
+    p.head.transferCodings = codings;
+    let chunked = -1;
+    let i = 0;
+    while (i < listLen(codings)) {
+        if (listGet(codings, i) == "chunked") { if (chunked >= 0) { return fail(p, "repeated chunked coding"); } chunked = i; }
+        i = i + 1;
+    }
+    if (listLen(tes) > 0 && p.head.version == "HTTP/1.0") { return fail(p, "Transfer-Encoding on HTTP/1.0"); }
+    if (!p.head.isRequest) {
+        const status = p.head.status;
+        // 204 带 Content-Length: 0 与无正文一致（RFC 9112 §6.3 第 1 条），放行；其余分帧字段仍拒绝。
+        if (((status >= 100 && status < 200) || status == 204) && (listLen(tes) > 0 || (listLen(cls) > 0 && (status != 204 || (length catch -1) != 0)))) {
+            return fail(p, "framing fields forbidden on informational or 204 response");
+        }
+        if (p.requestMethod == "HEAD" || status < 200 || status == 204 || status == 304) {
+            p.head.tunnel = status == 101;
+            if (p.head.tunnel) { p.head.canReuse = false; p.head.bodyFraming = "tunnel"; }
+            p.state = 8;
+            return;
+        }
+    }
+    if (listLen(tes) > 0) {
+        if (chunked >= 0 && chunked == listLen(codings) - 1) { p.state = 4; p.head.bodyFraming = "chunked"; return; }
+        if (p.head.isRequest) { return fail(p, "request transfer coding must end in chunked"); }
+        p.state = 3;
+        p.head.bodyFraming = "eof";
+        p.head.canReuse = false;
+        return;
+    }
+    if (length != None) {
+        p.remaining = length catch 0;
+        if (p.remaining > p.limits.maxBodyBytes) { return fail(p, "body byte limit exceeded"); }
+        p.state = 2;
+        p.head.bodyFraming = "length";
+        if (p.remaining == 0) { p.state = 8; }
+    } else if (p.head.isRequest) { p.state = 8; }
+    else { p.state = 3; p.head.canReuse = false; p.head.bodyFraming = "eof"; }
+    return;
+}
+
+function event(kind: string, head: Ref<HttpHead>?, data: Bytes, trailers: List<HttpHeader>): HttpEvent {
+    return HttpEvent { kind: kind, head: head, data: data, trailers: trailers };
+}
+
+function lineReady(p: Ref<HttpParser>, line: Bytes, events: List<HttpEvent>): void | Error {
+    if (p.state == 0) { startLine(p, line)?; }
+    else if (p.state == 1) {
+        if (bytesLen(line) == 0) {
+            framing(p)?;
+            listPush(events, event("headers", p.head, bytesNew(0), listNew()));
+        } else { field(p, line, false)?; }
+    } else if (p.state == 4) {
+        const n = httpChunkSize(line)?;
+        if (n > p.limits.maxBodyBytes - p.bodyRead) { return fail(p, "chunk exceeds body byte limit"); }
+        p.remaining = n;
+        if (n == 0) { p.state = 7; } else { p.state = 5; }
+    } else if (p.state == 7) {
+        if (bytesLen(line) == 0) { p.state = 8; }
+        else { field(p, line, true)?; }
+    }
+    return;
+}
+
+function feed(p: Ref<HttpParser>, data: Bytes, eof: bool): HttpFeed | Error {
+    if (p.state == 9) { return err(p.failure); }
+    const events: List<HttpEvent> = listNew();
+    if (p.state == 8) { return HttpFeed { events: events, consumed: 0, done: true }; }
+    const body = bytesNew(0);
+    let at = 0;
+    while (at < bytesLen(data) && p.state != 8) {
+        if (p.state == 0 || p.state == 1 || p.state == 4 || p.state == 7) {
+            let end = at;
+            while (end < bytesLen(data) && (bytesGet(data, end) catch 0) != 10) { end = end + 1; }
+            const complete = end < bytesLen(data);
+            if (complete) { end = end + 1; }
+            const take = end - at;
+            if (take > p.limits.maxLineBytes + 2 - bytesLen(p.line)) { return fail(p, "line byte limit exceeded"); }
+            if (p.state == 0 || p.state == 1 || p.state == 7) {
+                if (take > p.limits.maxHeaderBytes - p.headerBytes) { return fail(p, "header byte limit exceeded"); }
+                p.headerBytes = p.headerBytes + take;
+            }
+            if (p.state == 4 || p.state == 7) {
+                if (take > p.limits.maxChunkOverheadBytes - p.chunkOverhead) { return fail(p, "chunk overhead byte limit exceeded"); }
+                p.chunkOverhead = p.chunkOverhead + take;
+            }
+            bytesAppend(p.line, bytesSlice(data, at, take));
+            at = end;
+            if (!complete) { break; }
+            const n = bytesLen(p.line);
+            if (n < 2 || (bytesGet(p.line, n - 2) catch 0) != 13) { return fail(p, "line must end in CRLF"); }
+            const line = bytesSlice(p.line, 0, n - 2);
+            p.line = bytesNew(0);
+            lineReady(p, line, events)?;
+        } else if (p.state == 2 || p.state == 3 || p.state == 5) {
+            let n = bytesLen(data) - at;
+            if (p.state != 3 && n > p.remaining) { n = p.remaining; }
+            if (n > p.limits.maxBodyBytes - p.bodyRead) { return fail(p, "body byte limit exceeded"); }
+            bytesAppend(body, bytesSlice(data, at, n));
+            p.bodyRead = p.bodyRead + n;
+            at = at + n;
+            if (p.state != 3) {
+                p.remaining = p.remaining - n;
+                if (p.remaining == 0) {
+                    if (p.state == 2) { p.state = 8; }
+                    else { p.state = 6; p.crlfAt = 0; }
+                }
+            }
+        } else if (p.state == 6) {
+            let want = 13;
+            if (p.crlfAt == 1) { want = 10; }
+            if ((bytesGet(data, at) catch 0) != want) { return fail(p, "missing chunk data CRLF"); }
+            if (p.chunkOverhead >= p.limits.maxChunkOverheadBytes) { return fail(p, "chunk overhead byte limit exceeded"); }
+            p.chunkOverhead = p.chunkOverhead + 1;
+            p.crlfAt = p.crlfAt + 1;
+            at = at + 1;
+            if (p.crlfAt == 2) { p.state = 4; }
+        } else { return fail(p, "invalid parser state"); }
+    }
+    if (eof && p.state != 8) {
+        if (p.state == 3) { p.state = 8; }
+        else { return fail(p, "incomplete message at EOF"); }
+    }
+    if (bytesLen(body) > 0) { listPush(events, event("body", None, body, listNew())); }
+    if (p.state == 8) { listPush(events, event("end", None, bytesNew(0), p.trailers)); }
+    return HttpFeed { events: events, consumed: at, done: p.state == 8 };
+}
+
+/// eof 只在底层正常读到 EOF 时给 true；网络失败不能作为正常 EOF 完成 close-delimited 消息。
+export function httpFeed(p: Ref<HttpParser>, data: Bytes, eof: bool): HttpFeed | Error {
+    const result = feed(p, data, eof) catch (e) {
+        if (p.state != 9) { p.failure = e.message; p.state = 9; }
+        return e;
+    };
+    return result;
+}
+
+function hexLength(n: int): string {
+    if (n == 0) { return "0"; }
+    const digits = "0123456789abcdef";
+    let value = n;
+    let out = "";
+    while (value > 0) { const d = value & 15; out = strSlice(digits, d, d + 1) + out; value = value / 16; }
+    return out;
+}
+
+/// 一个非空正文块的 chunked 编码；结束标记由 httpEndChunks 产生。
+export function httpChunkBytes(data: Bytes): Bytes | Error {
+    if (bytesLen(data) == 0) { return err("http: empty data chunk; use httpEndChunks"); }
+    const out = bytesFromStr(hexLength(bytesLen(data)) + "\r\n");
+    bytesAppend(out, data);
+    bytesAppend(out, bytesFromStr("\r\n"));
+    return out;
+}
+
+export function httpEndChunks(): Bytes { return bytesFromStr("0\r\n\r\n"); }
+
+/// 完整 HTTP/1.1 请求。Host 与 CL／TE 由此函数生成，调用方不能在 headers 中重复提供；正文可以是任意 Bytes。
+export function httpEncodeRequest(method: string, target: string, host: string, headers: List<HttpHeader>, body: Bytes, chunked: bool): Bytes | Error {
+    if (!httpToken(method) || len(target) == 0 || !targetOk(method, target)) { return err("http: invalid request line"); }
+    if (len(host) == 0 || !authorityOnly(host)) { return err("http: invalid request Host"); }
+    const out = bytesFromStr(method + " " + target + " HTTP/1.1\r\nHost: " + host + "\r\n");
+    for (h in headers) {
+        if (!httpToken(h.name) || !httpValueOk(h.value)) { return err("http: invalid outgoing field"); }
+        const lower = httpLower(h.name);
+        if (lower == "host" || lower == "content-length" || lower == "transfer-encoding") { return err("http: caller supplied automatic framing field"); }
+        bytesAppend(out, bytesFromStr(h.name + ": "));
+        bytesAppend(out, h.value);
+        bytesAppend(out, bytesFromStr("\r\n"));
+    }
+    if (chunked) {
+        bytesAppend(out, bytesFromStr("Transfer-Encoding: chunked\r\n\r\n"));
+        if (bytesLen(body) > 0) { bytesAppend(out, httpChunkBytes(body)?); }
+        bytesAppend(out, httpEndChunks());
+    } else {
+        bytesAppend(out, bytesFromStr("Content-Length: " + toStr(bytesLen(body)) + "\r\n\r\n"));
+        bytesAppend(out, body);
+    }
+    return out;
+}

@@ -10,7 +10,7 @@ import { StructuredBuffer, StructuredEntry, A64_OS_WINDOWS, asStructuredImm, asS
 import { asA64Word, asA64Here, asImgIsa, asSetIsa, asFailWith, asFailedAs, FIX_A64_CALL26, FIX_A64_JUMP26, FIX_A64_PAGE21, FIX_A64_ADD_LO12, FIX_A64_LDST8 } from "./assemble";
 import { nativeFunctionsActive, nativeFunctionsIsa, nativeFunctionBegin, nativeFunctionOwnedBegin, nativeFunctionBoundaryBegin, nativeFunctionEnd, nativeFunctionPrologueEnd, nativeFunctionEpilogueStart, nativeFunctionEvent } from "./native_function_data";
 import { a64Adr, a64AddSubImm, a64AddSubExt, a64LdStUImm, a64LdStImm9, a64LdStReg, a64Branch, a64BranchCond, a64CompareBranch, a64TestBranch, a64InvertCond, a64MoveWide, a64LogicalImm } from "./a64_encode";
-import { asListingActive, asListingA64 } from "./assemble";
+import { asListingActive, asListingA64, asFunctionBlocksOn, asWordFunctionEnd, asFallThroughCheck } from "./assemble";
 import { a64Disasm } from "./a64_disasm";
 import { ISA_A64 } from "./target";
 
@@ -296,6 +296,17 @@ export function a64BufferSubmit(buf: Ref<StructuredBuffer>): void {
         if (e.kind == 0 || e.kind == 13) { asFailWith("X86InstructionInA64Buffer:" + (listGet(a64BufferX86Sites(buf), 0) catch ""), i + 1); return; }
         i = i + 1;
     }
+    // 函数块模式（内核，assemble.tx 的 asFunctionBlocks）：各条目所属的函数＝它之前已结束的函数个数（目录没登记的空洞归后一个函数，
+    // 同 link_blocks.tx）；跳到别的函数的标号不就地解析——b／bl 登记修补，条件跳转改用长形式、第二条 b 登记修补——链接器才能按函数切块。
+    const blocks = asFunctionBlocksOn();
+    const owner: List<int> = listNew();
+    let ended = 0;
+    i = 0;
+    while (i < listLen(buf.entries)) {
+        listPush(owner, ended);
+        if (entryAt(buf, i).kind == 10) { ended = ended + 1; }
+        i = i + 1;
+    }
     const long: List<int> = listNew();
     i = 0;
     while (i < listLen(buf.entries)) { listPush(long, 0); i = i + 1; }
@@ -311,7 +322,7 @@ export function a64BufferSubmit(buf: Ref<StructuredBuffer>): void {
                 if (!mapHas(labels, e.name)) { asFailWith("ConditionalBranchTargetNotLocal:" + e.name, i + 1); return; }
                 const d = (listGet(at, mapGet(labels, e.name) catch 0) catch 0) - (listGet(at, i) catch 0);
                 const r = shortRange(e.kind);
-                if (d < -r || d >= r) { listSet(long, i, 1); changed = true; }
+                if (d < -r || d >= r || crossFunction(blocks, owner, labels, i, e.name)) { listSet(long, i, 1); changed = true; }
             }
             i = i + 1;
         }
@@ -319,6 +330,7 @@ export function a64BufferSubmit(buf: Ref<StructuredBuffer>): void {
     const at = textOffsets(buf, long, start, 0);
     const listing = asListingActive() && buf.listFn >= 0;
     const fn = buf.listFn;
+    let current = "";
     sec = 0;
     i = 0;
     while (i < listLen(buf.entries)) {
@@ -338,10 +350,11 @@ export function a64BufferSubmit(buf: Ref<StructuredBuffer>): void {
         else if (e.kind == 8) { asStructuredAddressAddend(e.name, e.value); }
         else if (e.kind == 9 || e.kind == 14) {
             if (sec != 0) { asFailWith("FunctionOutsideText", line); return; }
+            current = e.name;
             if (e.kind == 14) { nativeFunctionBoundaryBegin(e.mnemonic, e.name, e.b.label, asA64Here()); }
             else { nativeFunctionOwnedBegin(e.mnemonic, e.name, e.a.label, asA64Here()); }
         }
-        else if (e.kind == 10) { nativeFunctionEnd(asA64Here()); }
+        else if (e.kind == 10) { asWordFunctionEnd(current); nativeFunctionEnd(asA64Here()); }
         else if (e.kind == 11) { nativeFunctionPrologueEnd(asA64Here()); }
         else if (e.kind == 12) { nativeFunctionEpilogueStart(asA64Here()); }
         else if (e.kind == K_FRAME) {
@@ -350,13 +363,15 @@ export function a64BufferSubmit(buf: Ref<StructuredBuffer>): void {
         }
         else if (e.kind == 15) {
             if (sec != 0) { asFailWith("FunctionOutsideText", line); return; }
+            current = e.name;
             nativeFunctionBegin(e.value, e.name, asA64Here());
         }
         else if (e.kind >= K_WORD && e.kind <= K_TBZ) {
             if (sec != 0) { asFailWith("InstructionOutsideText", line); return; }
             const here = listGet(at, i) catch 0;
             if (asA64Here() != here) { asFailWith("A64LayoutMismatch", line); return; }
-            const local = mapHas(labels, e.name);
+            const cross = crossFunction(blocks, owner, labels, i, e.name);
+            const local = mapHas(labels, e.name) && !cross;
             let d = 0;
             if (local) { d = (listGet(at, mapGet(labels, e.name) catch 0) catch 0) - here; }
             if (e.kind == K_WORD) {
@@ -400,7 +415,10 @@ export function a64BufferSubmit(buf: Ref<StructuredBuffer>): void {
                     if (long1) { shown = ""; }
                     listWord(fn, e.line, w, -1, shown);
                 }
-                if (long1) {
+                if (long1 && cross) {
+                    asA64Word(a64Branch(0, 0), FIX_A64_JUMP26, e.name, 0);
+                    if (listing) { listWord(fn, e.line, a64Branch(0, 0), FIX_A64_JUMP26, e.name); }
+                } else if (long1) {
                     const far = a64Branch(0, d - 4);
                     if (far < 0) { asFailWith("BranchOutOfRange:" + e.name, line); return; }
                     asA64Word(far, -1, "", 0);
@@ -411,4 +429,11 @@ export function a64BufferSubmit(buf: Ref<StructuredBuffer>): void {
         i = i + 1;
     }
     if (asFailedAs() == 0 && sec == 0 && asA64Here() != (listGet(at, listLen(buf.entries)) catch -1)) { asFailWith("A64LayoutMismatch", listLen(buf.entries)); }
+    asFallThroughCheck();
+}
+
+// 函数块模式下条目 i 跳到的标号在别的函数里（见 a64BufferSubmit）。
+function crossFunction(blocks: bool, owner: List<int>, labels: Map<string, int>, i: int, name: string): bool {
+    if (!blocks || !mapHas(labels, name)) { return false; }
+    return (listGet(owner, mapGet(labels, name) catch 0) catch -1) != (listGet(owner, i) catch -2);
 }

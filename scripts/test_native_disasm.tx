@@ -1,0 +1,527 @@
+// 原生汇编清单的门（gate.tx 的 disasm 步）：源码位置、命令行失败与机器码／修补的往返。以 --toolchain 编出
+// bootstrap/selfhost/disasm-probe.tx：x86（windows、linux 两目标）上它把清单交给文本汇编器再与映像逐字节对照；aarch64-macos 没有文本
+// 汇编器可回环，它逐行对照映像（每条指令行就是代码节里依次的一个字，改写成标号、符号的操作数核对跳转距离与修补）。再对一个两模块的
+// 小程序在六个目标上核对 `taixu disasm` 的 JSON 与文本清单（目标、函数、行字段、源码行、本目标的指令名、确定性、无 main 的模块），以及
+// 用法错误、诊断、工具链内建的拦截、不执行、不留产物。
+// 运行（仓根）：taixu run --toolchain scripts/test_native_disasm.tx --compiler <taixu> [--root <仓库>]
+// FAIL 行里 JSON 值的细节写成 JSON；工作目录在系统临时目录下另建，用完删去。
+import { absolute, deleteTree, exeName, join, kindOf, nat } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { lossyText } from "./check_lib";
+import { allTargets } from "./targets";
+import { captureRaw } from "./test_lib";
+import { J_ARR, J_BOOL, J_STR, Jv, jAt, jDump, jGet, jInt, jLen, jParseBytes, jText } from "./test_json";
+import { byteSub, contains, endsWith, headChars, reprBytes, sorted } from "./test_text";
+
+const SEC: int = 1000000000;
+const MAX_OUTPUT: int = 67108864;
+const CASES: []string = [
+    "tests/cases/09-float.tx", "tests/cases/10-switch.tx", "tests/cases/11-loop-concat.tx",
+    "tests/cases/22-closure-fnarg.tx", "tests/cases/36-generics.tx", "tests/cases/38-generic-import.tx",
+    "tests/cases/async-await-any.tx", "tests/cases/async-tg-cancel.tx",
+];
+const LIB: string = "export function plus(x: int): int {\n    return x + 1;\n}\n";
+const MAIN: string = "import { plus } from \"./lib\";\n\nfunction main(args: []string): int {\n    const x = plus(2);\n    print(toStr(x));\n    return x;\n}\n";
+const EFFECT: string = "function main(args: []string): int { writeExecutable(\"side-effect\", bytesFromStr(\"x\")) catch (e) {}; return 0; }\n";
+
+struct Ctx {
+    compiler: string,
+    root: string,
+    work: string,
+    total: int,
+    failed: int,
+}
+
+struct Res {
+    code: int,
+    out: Bytes,
+    err: Bytes,
+}
+
+function check(c: Ref<Ctx>, name: string, ok: bool, detail: string): bool {
+    c.total = c.total + 1;
+    if (ok) {
+        print("PASS " + name);
+    } else {
+        c.failed = c.failed + 1;
+        print("FAIL " + name + " " + headChars(detail, 400));
+    }
+    return ok;
+}
+
+function sh(exe: string, args: List<string>, cwd: string, limit: int): Res | Error {
+    const r = captureRaw(exe, args, cwd, limit * SEC, 10 * SEC, MAX_OUTPUT)?;
+    return Res { code: r.code, out: r.out, err: r.err };
+}
+
+function startsWith(b: Bytes, p: string): bool {
+    const q = bytesFromStr(p);
+    if (bytesLen(b) < bytesLen(q)) {
+        return false;
+    }
+    let i = 0;
+    while (i < bytesLen(q)) {
+        if ((bytesGet(b, i) ?? 0) != (bytesGet(q, i) ?? 0)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function repr(b: Bytes): string {
+    return reprBytes(b, 400);
+}
+
+function args2(a: string, b: string): List<string> {
+    const xs: List<string> = listNew();
+    listPush(xs, a);
+    listPush(xs, b);
+    return xs;
+}
+
+function argsOf(xs: []string): List<string> {
+    const out: List<string> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+    }
+    return out;
+}
+
+// 探针对 case 在 target 上往返一次（cwd 为仓根）。
+function probe(c: Ref<Ctx>, exe: string, kase: string, target: string, cwd: string): Res | Error {
+    return sh(exe, args2(kase, target), cwd, 120);
+}
+
+// 清单里的全部行（各函数的 instructions 依次拼起）。
+function rowsOf(functions: Ref<Jv>): List<Ref<Jv>> {
+    const out: List<Ref<Jv>> = listNew();
+    let i = 0;
+    while (i < jLen(functions)) {
+        const f = jAt(functions, i) ?? functions;
+        const ins = jGet(f, "instructions");
+        if (ins != None) {
+            const xs = ins ?? functions;
+            let k = 0;
+            while (k < jLen(xs)) {
+                listPush(out, jAt(xs, k) ?? xs);
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+function rowOk(r: Ref<Jv>): bool {
+    if (jText(jGet(r, "fn")) == None || jText(jGet(r, "op")) == None) {
+        return false;
+    }
+    const ops = jGet(r, "operands");
+    if (ops == None || (ops ?? r).kind != J_ARR) {
+        return false;
+    }
+    const o = ops ?? r;
+    let i = 0;
+    while (i < jLen(o)) {
+        if ((jAt(o, i) ?? r).kind != J_STR) {
+            return false;
+        }
+        i = i + 1;
+    }
+    const line = jInt(jGet(r, "line"));
+    if (line == None || (line ?? -1) < 0 || jInt(jGet(r, "pc")) == None) {
+        return false;
+    }
+    const kind = jText(jGet(r, "kind")) ?? "";
+    return kind == "label" || kind == "instruction";
+}
+
+// 名为 name 的函数的各行源码行号。
+function linesOf(functions: Ref<Jv>, name: string): Map<int, bool> {
+    const out: Map<int, bool> = mapNew();
+    let i = 0;
+    while (i < jLen(functions)) {
+        const f = jAt(functions, i) ?? functions;
+        if ((jText(jGet(f, "name")) ?? "") == name) {
+            const ins = jGet(f, "instructions") ?? f;
+            let k = 0;
+            while (k < jLen(ins)) {
+                mapSet(out, jInt(jGet(jAt(ins, k) ?? ins, "line")) ?? -1, true);
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+function lineText(m: Map<int, bool>): string {
+    let s = "";
+    for (k in mapKeys(m)) {
+        if (len(s) > 0) {
+            s = s + ", ";
+        }
+        s = s + toStr(k);
+    }
+    return "{" + s + "}";
+}
+
+function hasFunction(doc: Ref<Jv>?, name: string): bool {
+    if (doc == None) {
+        return false;
+    }
+    const fs = jGet(doc ?? emptyJv(), "functions");
+    if (fs == None) {
+        return false;
+    }
+    const f = fs ?? emptyJv();
+    let i = 0;
+    while (i < jLen(f)) {
+        if ((jText(jGet(jAt(f, i) ?? f, "name")) ?? "") == name) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+function emptyArr(): Ref<Jv> {
+    return new Jv { kind: J_ARR, text: "", truth: false, items: listNew(), keys: listNew() };
+}
+
+function emptyJv(): Ref<Jv> {
+    return emptyJv();
+}
+
+function parsed(b: Bytes): Ref<Jv>? {
+    return jParseBytes(b) catch (e) {
+        return None;
+    };
+}
+
+// stderr 是带非空 diags 的 JSON。
+function hasDiags(b: Bytes): bool {
+    const v = parsed(b);
+    if (v == None) {
+        return false;
+    }
+    const d = jGet(v ?? emptyJv(), "diags");
+    if (d == None) {
+        return false;
+    }
+    const x = d ?? emptyJv();
+    return (x.kind == J_ARR && jLen(x) > 0) || (x.kind == J_STR && len(x.text) > 0) || (x.kind == J_BOOL && x.truth);
+}
+
+function writeText(path: string, text: string): void | Error {
+    writeFileBytes(path, bytesFromStr(text))?;
+}
+
+function freshDir(prefix: string): string | Error {
+    const base = osRealPath(tempDir());
+    let k = 0;
+    while (k < 1000) {
+        const p = nat(join(base, prefix + toStr(monoNs() % 1000000000) + "-" + toStr(k)));
+        if (kindOf(p) == 0) {
+            makeDir(p)?;
+            return p;
+        }
+        k = k + 1;
+    }
+    return err("建不了临时目录 " + prefix);
+}
+
+// 每种指令集的生成代码里必有的几条助记符（只随架构，不随系统）。
+function nativeOps(arch: string): []string {
+    if (arch == "aarch64") {
+        return ["stp", "ldp", "bl", "ret"];
+    }
+    if (arch == "loongarch64") {
+        return ["addi.d", "st.d", "ld.d", "bl", "jirl"];
+    }
+    if (arch == "riscv64") {
+        return ["addi", "sd", "ld", "auipc", "jalr"];
+    }
+    return ["push", "mov", "call", "ret"];
+}
+
+function targets(c: Ref<Ctx>, exe: string): void | Error {
+    const work = c.work;
+    for (tg in allTargets()) {
+        const target = tg.triple;
+        const triple = tg.triple;
+        const a64 = tg.arch == "aarch64";
+        const la64 = tg.arch == "loongarch64";
+        const rv64 = tg.arch == "riscv64";
+        const cmd: List<string> = listNew();
+        listPush(cmd, "disasm");
+        listPush(cmd, "--target=" + triple);
+        listPush(cmd, "--format=json");
+        listPush(cmd, "main.tx");
+        const p = sh(c.compiler, cmd, work, 120)?;
+        check(c, "json:" + target, p.code == 0 && bytesLen(p.err) == 0, repr(p.err));
+        if (p.code != 0) {
+            continue;
+        }
+        const docOpt = parsed(p.out);
+        if (docOpt == None) {
+            check(c, "target:" + target, false, "stdout 不是 JSON：" + repr(p.out));
+            continue;
+        }
+        const doc = docOpt ?? emptyJv();
+        const trunc = jGet(doc, "truncated");
+        check(c, "target:" + target, (jText(jGet(doc, "target")) ?? "") == triple && trunc != None && (trunc ?? doc).kind == J_BOOL
+            && !(trunc ?? doc).truth, jDump(doc));
+        const functions = jGet(doc, "functions") ?? emptyArr();
+        const names: Map<string, bool> = mapNew();
+        const idx: Map<int, bool> = mapNew();
+        let i = 0;
+        while (i < jLen(functions)) {
+            const f = jAt(functions, i) ?? functions;
+            mapSet(names, jText(jGet(f, "name")) ?? "", true);
+            mapSet(idx, jInt(jGet(f, "index")) ?? -1, true);
+            i = i + 1;
+        }
+        check(c, "functions:" + target, mapHas(names, "main") && mapHas(names, "plus") && mapLen(idx) == jLen(functions), jDump(functions));
+        const rows = rowsOf(functions);
+        let rowsGood = listLen(rows) > 0;
+        for (r in rows) {
+            if (!rowOk(r)) {
+                rowsGood = false;
+            }
+        }
+        let first = "[]";
+        if (listLen(rows) > 0) {
+            first = "[" + jDump(listGet(rows, 0) catch functions) + "]";
+        }
+        check(c, "rows:" + target, rowsGood, first);
+        const plusLines = linesOf(functions, "plus");
+        const mainLines = linesOf(functions, "main");
+        check(c, "source-lines:" + target, mapHas(plusLines, 2) && mapHas(mainLines, 4) && mapHas(mainLines, 5) && mapHas(mainLines, 6)
+            && mapHas(mainLines, 0), "(" + lineText(plusLines) + ", " + lineText(mainLines) + ")");
+        const ops: Map<string, bool> = mapNew();
+        let label = false;
+        for (r in rows) {
+            const op = jText(jGet(r, "op")) ?? "";
+            mapSet(ops, op, true);
+            if (op == ".label" && (jText(jGet(r, "kind")) ?? "") == "label") {
+                label = true;
+            }
+        }
+        let opsGood = !mapHas(ops, ".inst") && label;
+        for (op in nativeOps(tg.arch)) {
+            if (!mapHas(ops, op)) {
+                opsGood = false;
+            }
+        }
+        check(c, "native-instructions:" + target, opsGood, first);
+        const again = sh(c.compiler, cmd, work, 120)?;
+        check(c, "deterministic:" + target, lossyText(again.out) == lossyText(p.out) && bytesLen(again.out) == bytesLen(p.out)
+            && again.code == 0, repr(again.err));
+        const tcmd: List<string> = listNew();
+        listPush(tcmd, "disasm");
+        listPush(tcmd, "--target=" + triple);
+        listPush(tcmd, "main.tx");
+        const plain = sh(c.compiler, tcmd, work, 120)?;
+        const text = lossyText(plain.out);
+        let call = "call";
+        if (a64 || la64) {
+            call = "bl ";
+        } else if (rv64) {
+            call = "auipc ra";
+        }
+        check(c, "text:" + target, plain.code == 0 && contains(text, "function main") && contains(text, "function plus") && contains(text, call)
+            && contains(text, "f_"), repr(plain.err));
+        const lcmd: List<string> = listNew();
+        listPush(lcmd, "disasm");
+        listPush(lcmd, "--target=" + triple);
+        listPush(lcmd, "--format=json");
+        listPush(lcmd, "lib.tx");
+        const library = sh(c.compiler, lcmd, work, 120)?;
+        check(c, "no-main:" + target, library.code == 0 && hasFunction(parsed(library.out), "plus"), repr(library.err));
+        if (la64 || rv64) {
+            // 往返探针只认 x86 与 aarch64；龙芯、RISC-V 的编码与反汇编往返由门步 la64-encodings、rv64-encodings 核对。
+            continue;
+        }
+        let ptarget = "windows";
+        if (a64) {
+            ptarget = "aarch64";
+        } else if (tg.os == "linux") {
+            ptarget = "linux";
+        } else if (tg.os == "macos") {
+            // 往返探针的 x86 只有 windows、linux 两种取法；x86_64-macos 与 x86_64-linux 同为 SysV 生成，往返由后者覆盖。
+            continue;
+        }
+        const pr = probe(c, exe, "main.tx", ptarget, work)?;
+        check(c, "roundtrip:fixture-" + target, pr.code == 0, repr(pr.err));
+    }
+}
+
+function run(argv: []string): int | Error {
+    let compiler = "";
+    let root = "";
+    let i = 0;
+    while (i + 1 < len(argv)) {
+        if (argv[i] == "--compiler") {
+            compiler = argv[i + 1];
+        } else if (argv[i] == "--root") {
+            root = argv[i + 1];
+        } else {
+            return err("未知参数：" + argv[i]);
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0 || i != len(argv)) {
+        return err("用法：taixu run --toolchain scripts/test_native_disasm.tx --compiler <taixu> [--root <仓库>]");
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = osRealPath(absolute(nat(root)));
+    compiler = osRealPath(absolute(nat(compiler)));
+    const work = freshDir("taixu-disasm-")?;
+    const c = new Ctx { compiler: compiler, root: root, work: work, total: 0, failed: 0 };
+    const code = body(c) catch (e) {
+        deleteTree(work);
+        return e;
+    };
+    deleteTree(work);
+    return code;
+}
+
+function body(c: Ref<Ctx>): int | Error {
+    const root = c.root;
+    const work = c.work;
+    const probeDir = nat(join(work, "probe"));
+    const bargs: List<string> = listNew();
+    listPush(bargs, "build");
+    listPush(bargs, "--toolchain");
+    listPush(bargs, "bootstrap/selfhost/disasm-probe.tx");
+    listPush(bargs, "--out");
+    listPush(bargs, probeDir);
+    const build = sh(c.compiler, bargs, root, 240)?;
+    check(c, "probe-build", build.code == 0, lossyText(build.err));
+    if (build.code != 0) {
+        return 1;
+    }
+    const exe = nat(join(probeDir, exeName("disasm-probe")));
+    const fw: List<string> = listNew();
+    const a64Extra: List<string> = listNew();
+    const names = localListDir(nat(join(root, "tests/nrt-cases")), "") catch (e) {
+        return err("读不了 tests/nrt-cases：" + e.message);
+    };
+    for (n in sorted(names)) {
+        if (!endsWith(n, ".tx")) {
+            continue;
+        }
+        const stem = byteSub(n, 0, len(n) - 3);
+        if (kindOf(nat(join(join(root, "tests/nrt-cases"), stem + ".out"))) != 1) {
+            continue;
+        }
+        const fwCase = startsWith(bytesFromStr(n), "fw-") || startsWith(bytesFromStr(n), "fw2-");
+        if (fwCase) {
+            listPush(fw, n);
+        }
+        if (fwCase || startsWith(bytesFromStr(n), "ffi-macos-")) {
+            listPush(a64Extra, nat("tests/nrt-cases/" + n));
+        }
+    }
+    for (target in ["windows", "linux"]) {
+        for (kase in CASES) {
+            const p = probe(c, exe, kase, target, root)?;
+            check(c, "roundtrip:" + target + ":" + kase, p.code == 0 && startsWith(p.out, "PASS bytes="), repr(p.err));
+        }
+        for (n in fw) {
+            const p = probe(c, exe, nat(join(join(root, "tests/nrt-cases"), n)), target, root)?;
+            check(c, "roundtrip:" + target + ":" + n, p.code == 0, repr(p.err));
+        }
+        let ffi = "tests/nrt-cases/ffi-linux-syscall.tx";
+        if (target == "windows") {
+            ffi = "tests/nrt-cases/ffi-win-call.tx";
+        }
+        const p = probe(c, exe, nat(join(root, ffi)), target, root)?;
+        check(c, "roundtrip:ffi-" + target, p.code == 0, repr(p.err));
+    }
+    const a64Cases: List<string> = argsOf(CASES);
+    for (x in sorted(a64Extra)) {
+        listPush(a64Cases, x);
+    }
+    for (kase in a64Cases) {
+        const p = probe(c, exe, kase, "aarch64", root)?;
+        const tail = bytesNew(0);
+        let from = bytesLen(p.out) - 200;
+        if (from < 0) {
+            from = 0;
+        }
+        bytesAppend(tail, bytesSlice(p.out, from, bytesLen(p.out) - from));
+        bytesAppend(tail, p.err);
+        check(c, "listing:aarch64:" + kase, p.code == 0 && startsWith(p.out, "PASS a64 "), reprBytes(tail, 400));
+    }
+
+    writeText(nat(join(work, "lib.tx")), LIB)?;
+    writeText(nat(join(work, "main.tx")), MAIN)?;
+    targets(c, exe)?;
+
+    const usages: List<List<string>> = listNew();
+    listPush(usages, listNew());
+    listPush(usages, args2("--format=yaml", "main.tx"));
+    listPush(usages, args2("main.tx", "lib.tx"));
+    listPush(usages, args2("--target=other", "main.tx"));
+    for (u in usages) {
+        const args: List<string> = listNew();
+        listPush(args, "disasm");
+        let shown = "";
+        for (a in u) {
+            listPush(args, a);
+            if (len(shown) > 0) {
+                shown = shown + ", ";
+            }
+            shown = shown + "'" + a + "'";
+        }
+        const p = sh(c.compiler, args, work, 120)?;
+        check(c, "usage:[" + shown + "]", p.code == 64 && bytesLen(p.out) == 0, repr(p.err));
+    }
+    writeText(nat(join(work, "syntax.tx")), "function main( {\n")?;
+    writeText(nat(join(work, "sema.tx")), "function f(): int { return true; }\n")?;
+    for (name in ["syntax.tx", "sema.tx"]) {
+        const p = sh(c.compiler, args3("disasm", "--format=json", name), work, 120)?;
+        check(c, "diagnostic:" + name, p.code == 1 && bytesLen(p.out) == 0 && hasDiags(p.err), repr(p.err));
+    }
+    const absent = sh(c.compiler, args3("disasm", "--format=json", "absent.tx"), work, 120)?;
+    check(c, "missing", absent.code == 1 && bytesLen(absent.out) == 0 && hasDiags(absent.err), repr(absent.err));
+    writeText(nat(join(work, "effect.tx")), EFFECT)?;
+    const denied = sh(c.compiler, args2("disasm", "effect.tx"), work, 120)?;
+    const allowed = sh(c.compiler, args3("disasm", "--toolchain", "effect.tx"), work, 120)?;
+    check(c, "toolchain", denied.code == 1 && allowed.code == 0, "(" + repr(denied.err) + ", " + repr(allowed.err) + ")");
+    check(c, "not-executed", kindOf(nat(join(work, "side-effect"))) == 0, "");
+    const left = localListDir(work, "") catch (e) {
+        return err("读不了 " + work + "：" + e.message);
+    };
+    let products = false;
+    for (n in left) {
+        if (endsWith(n, ".exe") || endsWith(n, ".txc") || endsWith(n, ".s")) {
+            products = true;
+        }
+    }
+    check(c, "no-products", !products, "");
+    if (c.failed == 0) {
+        print("SUMMARY PASS (" + toStr(c.total) + " checks)");
+        return 0;
+    }
+    print("SUMMARY FAIL=" + toStr(c.failed) + " (" + toStr(c.total) + " checks)");
+    return 1;
+}
+
+function args3(a: string, b: string, x: string): List<string> {
+    const xs = args2(a, b);
+    listPush(xs, x);
+    return xs;
+}
+
+function main(argv: []string): int {
+    return run(argv) catch (e) {
+        eprint("test_native_disasm: " + e.message);
+        return 1;
+    };
+}

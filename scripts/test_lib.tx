@@ -1,6 +1,6 @@
-// 太虚写的门步共用的部分（新增门步用太虚写，现有 Python 测试脚本逐步迁移）：逐项检查的计数与输出、
-// 分开取 stdout 与 stderr 且限时的子进程运行。输出格式同 Python 门步（PASS／FAIL 逐项，末行 SUMMARY），gate.tx 只看退出码。
-import { byteSub } from "./build_lib";
+// 门步共用的部分：逐项检查的计数与输出、分开取 stdout 与 stderr 且限时的子进程运行。输出为逐项 PASS／FAIL、末行 SUMMARY，
+// gate.tx 只看退出码。
+import { byteSub, findInPath, nothing } from "./build_lib";
 
 export struct Tally {
     pass: int,
@@ -43,9 +43,76 @@ export struct Outcome {
 
 // 在 cwd 里运行 exe，同时排空 stdout 与 stderr，至多 limitNs 纳秒（超时即结束子进程）；每个流至多留 maxBytes 字节的末尾。
 export function capture(exe: string, args: List<string>, cwd: string, limitNs: int, maxBytes: int): Ref<Outcome> | Error {
+    const raw = captureRaw(exe, args, cwd, limitNs, NO_DRAIN_LIMIT, maxBytes)?;
+    const r = new Outcome { code: raw.code, out: "", err: "", timedOut: raw.timedOut, binary: false };
+    r.out = bytesToStr(raw.out) catch (e) {
+        r.binary = true;
+        return r;
+    };
+    r.err = bytesToStr(raw.err) catch (e) {
+        r.binary = true;
+        return r;
+    };
+    return r;
+}
+
+// 子进程退出后不限时地读到两个流都关闭（capture 的行为）。
+const NO_DRAIN_LIMIT: int = 4611686018427387904;
+
+// 一次子进程运行的原始结果：退出码（超时为 −1）、stdout 与 stderr 的字节（各至多留 maxBytes 字节的末尾）。
+export struct Raw {
+    code: int,
+    out: Bytes,
+    err: Bytes,
+    timedOut: bool,
+}
+
+// 同 capture，输出保留为字节；子进程退出（或超时被结束）后至多再读 drainNs 纳秒——后代进程仍占着输出管道时不再等，已读到的照留。
+export function captureRaw(exe: string, args: List<string>, cwd: string, limitNs: int, drainNs: int, maxBytes: int): Ref<Raw> | Error {
     const h = procSpawn(exe, args, cwd, 0) catch (e) {
         return err("起不了 " + exe + "：" + e.message);
     };
+    return drain(h, limitNs, drainNs, maxBytes);
+}
+
+// 同 captureRaw，子进程由 procSpawnLimited 按系统硬限额起：内存 memory 字节、CPU cpu 秒（Windows 为作业对象的总提交与逐进程提交、
+// 累计用户态 CPU、至多 32 个进程；Linux 为 RLIMIT_AS、RLIMIT_CPU、不留 core 并自成进程组；macOS 为 RLIMIT_CPU、不留 core，内存由
+// 看守线程按物理足迹事后整组 SIGKILL）。限额设不上或起不了得 Error，子进程不执行。
+export function captureLimited(exe: string, args: List<string>, cwd: string, limitNs: int, drainNs: int, maxBytes: int, memory: int,
+    cpu: int): Ref<Raw> | Error {
+    const h = procSpawnLimited(exe, args, cwd, 0, memory, cpu) catch (e) {
+        return err("起不了 " + exe + "：" + e.message);
+    };
+    return drain(h, limitNs, drainNs, maxBytes);
+}
+
+// 建 link → real 的目录链接：Windows 为目录联接（cmd 的 mklink /J，不要管理员权限），类 Unix 为符号链接（ln -s）。没建成得 Error。
+export function makeDirLink(real: string, link: string, cwd: string): void | Error {
+    const args: List<string> = listNew();
+    let exe = "";
+    if (hostTarget() == "windows") {
+        exe = getEnv("ComSpec") ?? "C:\\Windows\\System32\\cmd.exe";
+        listPush(args, "/d");
+        listPush(args, "/c");
+        listPush(args, "mklink");
+        listPush(args, "/J");
+        listPush(args, link);
+        listPush(args, real);
+    } else {
+        exe = findInPath("ln");
+        listPush(args, "-s");
+        listPush(args, real);
+        listPush(args, link);
+    }
+    const r = captureRaw(exe, args, cwd, 60 * 1000000000, 10 * 1000000000, 65536)?;
+    if (r.code != 0) {
+        return err("建不了链接 " + link + "：" + (bytesToStr(r.err) catch "?"));
+    }
+    return nothing();
+}
+
+// 排空句柄 h 的 stdout 与 stderr 直到子进程退出（或超时被结束）且两个流都关闭；退出后至多再读 drainNs 纳秒。
+function drain(h: int, limitNs: int, drainNs: int, maxBytes: int): Ref<Raw> {
     let out = bytesNew(0);
     let errs = bytesNew(0);
     const buf = bytesNew(65536);
@@ -55,19 +122,21 @@ export function capture(exe: string, args: List<string>, cwd: string, limitNs: i
     let outOpen: bool = true;
     let errOpen: bool = true;
     let ended: bool = false;
+    let endedAt: int = 0;
     while (true) {
         if (!ended) {
             const w = procWait(h, 0);
             if (w != None) {
                 code = w ?? -1;
                 ended = true;
+                endedAt = monoNs();
             }
         }
         if (!ended && !timedOut && monoNs() >= deadline) {
             timedOut = true;
             procKill(h);
         }
-        if (ended && !outOpen && !errOpen) {
+        if (ended && ((!outOpen && !errOpen) || monoNs() - endedAt >= drainNs)) {
             break;
         }
         let mask: int = 0;
@@ -100,19 +169,10 @@ export function capture(exe: string, args: List<string>, cwd: string, limitNs: i
         }
     }
     procClose(h);
-    const r = new Outcome { code: code, out: "", err: "", timedOut: timedOut, binary: false };
     if (timedOut) {
-        r.code = -1;
+        code = -1;
     }
-    r.out = bytesToStr(out) catch (e) {
-        r.binary = true;
-        return r;
-    };
-    r.err = bytesToStr(errs) catch (e) {
-        r.binary = true;
-        return r;
-    };
-    return r;
+    return new Raw { code: code, out: out, err: errs, timedOut: timedOut };
 }
 
 function keepTail(t: Bytes, chunk: Bytes, maxBytes: int): Bytes {
@@ -138,4 +198,117 @@ export function linesOf(s: string): List<string> {
         const last = listPop(out);
     }
     return out;
+}
+
+// 一批子进程里的一个：程序（完整路径）、实参、工作目录。
+export struct Job {
+    exe: string,
+    args: List<string>,
+    cwd: string,
+}
+
+struct Slot {
+    idx: int,
+    h: int,
+    out: Bytes,
+    err: Bytes,
+    outOpen: bool,
+    errOpen: bool,
+    ended: bool,
+    code: int,
+    started: int,
+    endedAt: int,
+    timedOut: bool,
+}
+
+function spawnJob(j: Job): int {
+    const h = procSpawn(j.exe, j.args, j.cwd, 0) catch (e) {
+        return -1;
+    };
+    return h;
+}
+
+// 至多 width 个并发地运行 jobs；结果按 jobs 的次序（同 captureRaw：超时退出码 −1，起不了为 −2 且 stderr 写明）。
+export function runPool(jobs: List<Job>, width: int, limitNs: int, drainNs: int, maxBytes: int): List<Ref<Raw>> {
+    const results: List<Ref<Raw>> = listNew();
+    for (j in jobs) {
+        listPush(results, new Raw { code: -2, out: bytesNew(0), err: bytesNew(0), timedOut: false });
+    }
+    const active: List<Ref<Slot>> = listNew();
+    const buf = bytesNew(65536);
+    let next: int = 0;
+    while (next < listLen(jobs) || listLen(active) > 0) {
+        while (listLen(active) < width && next < listLen(jobs)) {
+            const j = listGet(jobs, next) catch Job { exe: "", args: listNew(), cwd: "" };
+            const h = spawnJob(j);
+            if (h < 0) {
+                const r = listGet(results, next) catch new Raw { code: -2, out: bytesNew(0), err: bytesNew(0), timedOut: false };
+                r.err = bytesFromStr("起不了 " + j.exe);
+            } else {
+                listPush(active, new Slot { idx: next, h: h, out: bytesNew(0), err: bytesNew(0), outOpen: true, errOpen: true, ended: false,
+                        code: 0, started: monoNs(), endedAt: 0, timedOut: false });
+            }
+            next = next + 1;
+        }
+        let progressed: bool = false;
+        let k: int = 0;
+        while (k < listLen(active)) {
+            const s = listGet(active, k) catch new Slot { idx: 0, h: 0, out: bytesNew(0), err: bytesNew(0), outOpen: false, errOpen: false,
+                ended: true, code: 0, started: 0, endedAt: 0, timedOut: false };
+            if (s.outOpen) {
+                const n = procRead(s.h, 1, buf);
+                if (n < 0) {
+                    s.outOpen = false;
+                } else if (n > 0) {
+                    s.out = keepTail(s.out, bytesSlice(buf, 0, n), maxBytes);
+                    progressed = true;
+                }
+            }
+            if (s.errOpen) {
+                const n = procRead(s.h, 2, buf);
+                if (n < 0) {
+                    s.errOpen = false;
+                } else if (n > 0) {
+                    s.err = keepTail(s.err, bytesSlice(buf, 0, n), maxBytes);
+                    progressed = true;
+                }
+            }
+            if (!s.ended) {
+                const w = procWait(s.h, 0);
+                if (w != None) {
+                    s.code = w ?? -1;
+                    s.ended = true;
+                    s.endedAt = monoNs();
+                    progressed = true;
+                }
+            }
+            if (!s.ended && !s.timedOut && monoNs() - s.started >= limitNs) {
+                s.timedOut = true;
+                procKill(s.h);
+            }
+            if (s.ended && ((!s.outOpen && !s.errOpen) || monoNs() - s.endedAt >= drainNs)) {
+                procClose(s.h);
+                let code: int = s.code;
+                if (s.timedOut) {
+                    code = -1;
+                }
+                listSet(results, s.idx, new Raw { code: code, out: s.out, err: s.err, timedOut: s.timedOut });
+                listRemoveAt(active, k);
+                progressed = true;
+                continue;
+            }
+            k = k + 1;
+        }
+        if (!progressed && listLen(active) > 0) {
+            // 没有进展时等一小会儿：等第一个子进程的输出，它的两个流都已关闭时等它退出。
+            const first = listGet(active, 0) catch new Slot { idx: 0, h: 0, out: bytesNew(0), err: bytesNew(0), outOpen: false, errOpen: false,
+                ended: true, code: 0, started: 0, endedAt: 0, timedOut: false };
+            if (first.outOpen || first.errOpen) {
+                const ready = ioWait(first.h, 6, 5);
+            } else {
+                const waited = procWait(first.h, 5);
+            }
+        }
+    }
+    return results;
 }

@@ -1,0 +1,102 @@
+// DNS stub 协议层；不执行网络 I/O，只将关联问题名的 A／AAAA answer 交给调用方。
+import { toLower } from "./string";
+
+export struct DnsName { value: string, next: int }
+export struct DnsReply { code: int, truncated: bool, canonical: string, addresses: List<Bytes> }
+struct Record { owner: string, kind: int, address: Bytes, target: string }
+
+export function dnsName(text: string): string | Error {
+    let name = text;
+    if (len(name) > 0 && byteAt(name, len(name) - 1) == 46) { name = strSlice(name, 0, len(name) - 1); }
+    if (len(name) < 1 || len(name) > 253) { return err("dns: name length"); }
+    for (label in strSplit(name, ".")) {
+        if (len(label) < 1 || len(label) > 63) { return err("dns: label length"); }
+        for (b in label) { if (b < 33 || b > 126 || b == 92) { return err("dns: unsupported name byte"); } }
+    } return toLower(name);
+}
+function at(data: Bytes, position: int): int { return bytesGet(data, position) catch panic("dns: internal bounds"); }
+function u16(data: Bytes, position: int): int | Error {
+    if (position < 0 || position > bytesLen(data) - 2) { return err("dns: truncated integer"); } return at(data, position) * 256 + at(data, position + 1);
+}
+function put16(data: Bytes, position: int, value: int): void { bytesSet(data, position, value / 256); bytesSet(data, position + 1, value % 256); }
+
+export function dnsReadName(data: Bytes, start: int, limit: int): DnsName | Error {
+    if (start < 0 || limit < start || limit > bytesLen(data)) { return err("dns: invalid name bounds"); }
+    let bound = limit; let position = start; let end = -1; let jumps = 0; let size = 1; let name = "";
+    while (true) {
+        if (position >= bound) { return err("dns: truncated name"); } const n = at(data, position);
+        if ((n & 192) == 192) {
+            if (position + 1 >= bound) { return err("dns: truncated compression pointer"); }
+            const target = (n & 63) * 256 + at(data, position + 1);
+            if (target >= position) { return err("dns: forward or cyclic compression pointer"); }
+            if (end < 0) { end = position + 2; } jumps = jumps + 1;
+            if (jumps > 128) { return err("dns: compression depth limit"); } position = target; bound = bytesLen(data); continue;
+        }
+        if (n == 0) { if (end < 0) { end = position + 1; } break; }
+        if (n > 63 || n > bound - position - 1) { return err("dns: invalid label"); }
+        size = size + n + 1; if (size > 255) { return err("dns: expanded name limit"); }
+        const label = bytesSlice(data, position + 1, n);
+        for (b in bytesAsList(label)) { if (b < 33 as u8 || b > 126 as u8 || b == 46 as u8 || b == 92 as u8) { return err("dns: unsupported wire label byte"); } }
+        if (len(name) > 0) { name = name + "."; } name = name + (bytesToStr(label)?); position = position + n + 1;
+    }
+    return DnsName { value: toLower(name), next: end };
+}
+
+export function dnsQuery(host: string, kind: int, id: int): Bytes | Error {
+    const name = dnsName(host)?;
+    if ((kind != 1 && kind != 28) || id < 0 || id > 65535) { return err("dns: invalid query type or id"); }
+    const data = bytesNew(12); put16(data, 0, id); put16(data, 2, 256); put16(data, 4, 1);
+    for (label in strSplit(name, ".")) { listPush(bytesAsList(data), len(label) as u8); bytesAppend(data, bytesFromStr(label)); }
+    listPush(bytesAsList(data), 0 as u8); const tail = bytesNew(4); put16(tail, 0, kind); put16(tail, 2, 1); bytesAppend(data, tail); return data;
+}
+
+export function dnsParseReply(data: Bytes, host: string, kind: int, id: int): DnsReply | Error {
+    const name = dnsName(host)?;
+    if (bytesLen(data) < 12 || bytesLen(data) > 65535 || id < 0 || id > 65535 || (kind != 1 && kind != 28)) { return err("dns: invalid response size or question"); }
+    const flags = u16(data, 2)?;
+    if (u16(data, 0)? != id || (flags & 32768) == 0 || (flags & 30720) != 0 || (flags & 64) != 0 || u16(data, 4)? != 1) { return err("dns: unrelated response header"); }
+    const question = dnsReadName(data, 12, bytesLen(data))?; let position = question.next;
+    if (question.value != name || u16(data, position)? != kind || u16(data, position + 2)? != 1) { return err("dns: unrelated response question"); } position = position + 4;
+    const out = DnsReply { code: flags & 15, truncated: (flags & 512) != 0, canonical: name, addresses: listNew() };
+    if (out.truncated) { return out; }
+    const answers = u16(data, 6)?; const authorities = u16(data, 8)?; const additional = u16(data, 10)?; const total = answers + authorities + additional;
+    if (total > 4096) { return err("dns: record count limit"); }
+    const records: List<Record> = listNew(); let index = 0;
+    while (index < total) {
+        const owner = dnsReadName(data, position, bytesLen(data))?; position = owner.next;
+        if (position > bytesLen(data) - 10) { return err("dns: truncated RR fields"); }
+        const recordKind = u16(data, position)?; const class = u16(data, position + 2)?; const length = u16(data, position + 8)?; position = position + 10;
+        if (length > bytesLen(data) - position) { return err("dns: truncated RDATA"); }
+        if (index < answers && class == 1) {
+            if (recordKind == 1 || recordKind == 28) {
+                let expected = 4; if (recordKind == 28) { expected = 16; }
+                if (length != expected) { return err("dns: invalid address RDATA length"); }
+                listPush(records, Record { owner: owner.value, kind: recordKind, address: bytesSlice(data, position, length), target: "" });
+            } else if (recordKind == 5) {
+                const target = dnsReadName(data, position, position + length)?;
+                if (target.next != position + length || len(target.value) == 0) { return err("dns: invalid CNAME RDATA"); }
+                listPush(records, Record { owner: owner.value, kind: 5, address: bytesNew(0), target: target.value });
+            }
+        }
+        position = position + length; index = index + 1;
+    }
+    if (position != bytesLen(data)) { return err("dns: trailing response bytes"); }
+    if (out.code != 0) { return out; }
+    let current = name; const seen: Map<string, bool> = mapNew(); let depth = 0;
+    while (true) {
+        if (mapHas(seen, current) || depth > 16) { return err("dns: CNAME loop or depth limit"); } mapSet(seen, current, true);
+        let target = ""; const addresses: List<Bytes> = listNew();
+        for (record in records) {
+            if (record.owner != current) { continue; }
+            if (record.kind == 5) {
+                if (len(target) > 0 && target != record.target) { return err("dns: conflicting CNAME records"); } target = record.target;
+            } else if (record.kind == kind) {
+                let duplicate = false; for (existing in addresses) { if (bytesEqual(existing, record.address)) { duplicate = true; } }
+                if (!duplicate) { listPush(addresses, record.address); }
+            }
+        }
+        if (len(target) == 0) { return DnsReply { code: 0, truncated: false, canonical: current, addresses: addresses }; }
+        if (listLen(addresses) > 0) { return err("dns: CNAME and address on same owner"); } current = target; depth = depth + 1;
+    }
+    return err("dns: unreachable CNAME state");
+}

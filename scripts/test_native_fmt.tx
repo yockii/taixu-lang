@@ -1,0 +1,512 @@
+// 原生格式化门：冻结输出、语法保持、全语料幂等、CLI 读写与错误形态。
+// - 守护目录（examples、tests/cases、skill/taixu/examples、docs/design、bootstrap、spike、scripts）`fmt --check` 通过；
+// - 金样例（tests/fmt-native.json）：输出与退出码逐字节相同；词元层拒绝的不出输出且说“无法格式化”；其余再格式化一遍不变，标了 parse
+//   的经解析探针（bootstrap/selfhost/fmt-parse-probe.tx）确认格式化后仍合语法；
+// - 全语料（守护目录与 tests/nrt-cases、prelude）：冻结的非法输入（tests/fmt-native-rejects.json，按 SHA-256 认）照旧拒绝，其余格式化
+//   成功且幂等；
+// - 目录遍历、缺省不写、--write、--format=json 与用法错误。
+// 运行：taixu run --toolchain scripts/test_native_fmt.tx --compiler <taixu> [--jobs N] [--report 报告.json] [--root 仓库根]
+import { absolute, deleteTree, exeName, join, kindOf, mkdirs, nat, readBytes } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { Job, Raw, captureRaw, runPool } from "./test_lib";
+import { contains, slashes, sorted, tailChars } from "./test_text";
+import { hexOf, lossyText, sha256Of } from "./check_lib";
+import { J_ARR, J_BOOL, J_OBJ, Jv, jArray, jAt, jGet, jInt, jIsBool, jIsTrue, jLen, jNumber, jObject, jParse, jParseBytes, jPretty, jPush, jSet,
+    jString, jText } from "./test_json";
+
+const RUN_NS: int = 600000000000;
+const DRAIN_NS: int = 10000000000;
+const MAX_OUTPUT: int = 268435456;
+const GUARDED: []string = ["examples", "tests/cases", "skill/taixu/examples", "docs/design", "bootstrap", "spike", "scripts"];
+const NEW_SYNTAX: []string = ["tests/nrt-cases", "prelude"];
+
+struct Row {
+    check: string,
+    ok: bool,
+    detail: string,
+}
+
+struct Ctx {
+    root: string,
+    compiler: string,
+    rows: List<Row>,
+}
+
+function record(c: Ref<Ctx>, name: string, ok: bool, detail: string): void {
+    listPush(c.rows, Row { check: name, ok: ok, detail: detail });
+    if (!ok) {
+        print("FAIL " + name + " " + headText(detail, 500));
+    }
+}
+
+function headText(s: string, n: int): string {
+    let count = 0;
+    let i = 0;
+    while (i < len(s)) {
+        const b = byteAt(s, i) ?? 0;
+        if ((b & 0xC0) != 0x80) {
+            if (count == n) {
+                return bytesToStr(bytesSlice(bytesFromStr(s), 0, i)) catch s;
+            }
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+function run(c: Ref<Ctx>, exe: string, args: List<string>): Ref<Raw> {
+    const r = captureRaw(nat(exe), args, nat(c.root), RUN_NS, DRAIN_NS, MAX_OUTPUT) catch (e) {
+        return new Raw { code: -2, out: bytesNew(0), err: bytesFromStr(e.message), timedOut: false };
+    };
+    return r;
+}
+
+function fmtArgs(paths: List<string>): List<string> {
+    const a: List<string> = listNew();
+    listPush(a, "fmt");
+    for (p in paths) {
+        listPush(a, p);
+    }
+    return a;
+}
+
+function one(s: string): List<string> {
+    const a: List<string> = listNew();
+    listPush(a, s);
+    return a;
+}
+
+function two(a: string, b: string): List<string> {
+    const xs = one(a);
+    listPush(xs, b);
+    return xs;
+}
+
+function three(a: string, b: string, c: string): List<string> {
+    const xs = two(a, b);
+    listPush(xs, c);
+    return xs;
+}
+
+function errTail(r: Ref<Raw>, n: int): string {
+    return tailChars(lossyText(r.err), n);
+}
+
+function errText(r: Ref<Raw>): string {
+    return lossyText(r.err);
+}
+
+function writeAll(path: string, data: Bytes): bool {
+    mkdirs(dirOfSlash(path));
+    writeFileBytes(path, data) catch (e) {
+        return false;
+    };
+    return true;
+}
+
+function dirOfSlash(p: string): string {
+    const s = slashes(p);
+    let i = len(s) - 1;
+    while (i > 0 && (byteAt(s, i) ?? 0) != 47) {
+        i = i - 1;
+    }
+    return bytesToStr(bytesSlice(bytesFromStr(s), 0, i)) catch s;
+}
+
+// dir 之下的全部 .tx（相对 base，正斜杠）：先本层文件、再按名字依次进子目录（同 os.walk 的先序），跳过以点开头的目录。
+function txFiles(base: string, rel: string, out: List<string>): void {
+    const dir = join(base, rel);
+    const names = localListDir(nat(dir), "") catch noNames();
+    const dirs: List<string> = listNew();
+    for (n in sorted(names)) {
+        const k = localEntryKind(nat(dir), n);
+        if (k == 2) {
+            if ((byteAt(n, 0) ?? 0) != 46) {
+                listPush(dirs, n);
+            }
+        } else if (k == 1 && len(n) > 3 && endsWithTx(n)) {
+            listPush(out, rel + "/" + n);
+        }
+    }
+    for (d in dirs) {
+        txFiles(base, rel + "/" + d, out);
+    }
+}
+
+function endsWithTx(n: string): bool {
+    return (byteAt(n, len(n) - 3) ?? 0) == 46 && (byteAt(n, len(n) - 2) ?? 0) == 116 && (byteAt(n, len(n) - 1) ?? 0) == 120;
+}
+
+function noNames(): List<string> {
+    const xs: List<string> = listNew();
+    return xs;
+}
+
+function fixtureCase(fixture: Ref<Jv>, id: string): Ref<Jv>? {
+    const cases = jGet(fixture, "cases") ?? fixture;
+    let i = 0;
+    while (i < jLen(cases)) {
+        const c = jAt(cases, i) ?? cases;
+        if ((jText(jGet(c, "id")) ?? "") == id) {
+            return c;
+        }
+        i = i + 1;
+    }
+    return None;
+}
+
+function main(args: []string): int {
+    let root = "";
+    let compiler = "";
+    let report = "";
+    let jobs = 4;
+    let i = 0;
+    while (i < len(args)) {
+        const a = args[i];
+        if ((a == "--compiler" || a == "--report" || a == "--root" || a == "--jobs") && i + 1 < len(args)) {
+            if (a == "--compiler") {
+                compiler = args[i + 1];
+            } else if (a == "--report") {
+                report = args[i + 1];
+            } else if (a == "--root") {
+                root = args[i + 1];
+            } else {
+                jobs = intOf(args[i + 1]);
+            }
+            i = i + 2;
+        } else {
+            eprint("用法：taixu run --toolchain scripts/test_native_fmt.tx --compiler <taixu> [--jobs N] [--report 报告.json] [--root 仓库根]");
+            return 2;
+        }
+    }
+    if (len(compiler) == 0) {
+        eprint("要给 --compiler");
+        return 2;
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    if (jobs < 1) {
+        jobs = 1;
+    }
+    const c = new Ctx { root: slashes(absolute(root)), compiler: nat(absolute(compiler)), rows: listNew() };
+    const fixture = jParseBytes(readBytes(join(c.root, "tests/fmt-native.json")) catch bytesNew(0)) catch (e) {
+        eprint("读不了 tests/fmt-native.json：" + e.message);
+        return 1;
+    };
+    const rejectDoc = jParseBytes(readBytes(join(c.root, "tests/fmt-native-rejects.json")) catch bytesNew(0)) catch (e) {
+        eprint("读不了 tests/fmt-native-rejects.json：" + e.message);
+        return 1;
+    };
+    const rejects: Map<string, string> = mapNew();
+    const rc = jGet(rejectDoc, "cases") ?? rejectDoc;
+    i = 0;
+    while (i < jLen(rc)) {
+        const r = jAt(rc, i) ?? rc;
+        mapSet(rejects, jText(jGet(r, "file")) ?? "", jText(jGet(r, "source_sha256")) ?? "");
+        i = i + 1;
+    }
+    const guarded: List<string> = listNew();
+    listPush(guarded, "--check");
+    for (g in GUARDED) {
+        listPush(guarded, g);
+    }
+    let p = run(c, c.compiler, fmtArgs(guarded));
+    record(c, "guarded fmt-check", p.code == 0, errTail(p, 500));
+    const work = join(slashes(osRealPath(tempDir())), "taixu-fmt-" + toStr(monoNs()));
+    mkdirs(work);
+    const probeDir = join(work, "probe");
+    p = run(c, c.compiler, plus4x("build", "bootstrap/selfhost/fmt-parse-probe.tx", "--toolchain", "--out", nat(probeDir)));
+    record(c, "parse probe build", p.code == 0, errTail(p, 500));
+    const probe = join(probeDir, exeName("fmt-parse-probe"));
+    const probeOk = kindOf(probe) == 1;
+    const cases = jGet(fixture, "cases") ?? fixture;
+    i = 0;
+    while (i < jLen(cases)) {
+        golden(c, jAt(cases, i) ?? cases, work, probe, probeOk);
+        i = i + 1;
+    }
+    corpus(c, rejects, work, jobs);
+    directory(c, fixture, work);
+    deleteTree(work);
+    let failed = 0;
+    for (r in c.rows) {
+        if (!r.ok) {
+            failed = failed + 1;
+        }
+    }
+    if (failed == 0) {
+        print("SUMMARY PASS checks=" + toStr(listLen(c.rows)) + " failures=0");
+    } else {
+        print("SUMMARY FAIL checks=" + toStr(listLen(c.rows)) + " failures=" + toStr(failed));
+    }
+    if (len(report) > 0 && !writeReport(c, report, failed)) {
+        eprint("写不了报告 " + report);
+        return 1;
+    }
+    if (failed > 0) {
+        return 1;
+    }
+    return 0;
+}
+
+function intOf(s: string): int {
+    let v = 0;
+    let k = 0;
+    while (k < len(s)) {
+        const d = byteAt(s, k) ?? 0;
+        if (d < 48 || d > 57) {
+            return 0;
+        }
+        v = v * 10 + (d - 48);
+        k = k + 1;
+    }
+    return v;
+}
+
+function plus4(a: string, b: string, c2: string, d: string): List<string> {
+    const xs = three(a, b, c2);
+    listPush(xs, d);
+    return xs;
+}
+
+function plus4x(a: string, b: string, c2: string, d: string, e: string): List<string> {
+    const xs = plus4(a, b, c2, d);
+    listPush(xs, e);
+    return xs;
+}
+
+function golden(c: Ref<Ctx>, cs: Ref<Jv>, work: string, probe: string, probeOk: bool): void {
+    const id = jText(jGet(cs, "id")) ?? "";
+    const source = join(work, id + ".tx");
+    writeAll(source, bytesFromStr(jText(jGet(cs, "source")) ?? ""));
+    const expected = bytesFromStr(jText(jGet(cs, "expected")) ?? "");
+    const p = run(c, c.compiler, two("fmt", nat(source)));
+    const ok = p.code == (jInt(jGet(cs, "exit")) ?? -999) && bytesEqual(p.out, expected);
+    record(c, "golden " + id, ok, errTail(p, 500));
+    if (jIsTrue(jGet(cs, "lex_invalid")) || jIsTrue(jGet(cs, "rejected"))) {
+        // rejected：词元层拒绝（零空白相邻的 ++／--，D3 v0.49）。
+        record(c, "golden lexical rejection " + id, bytesLen(p.out) == 0 && contains(errText(p), "无法格式化"), "");
+    } else if (p.code == 0) {
+        const formatted = join(work, id + "-formatted.tx");
+        writeAll(formatted, p.out);
+        const second = run(c, c.compiler, two("fmt", nat(formatted)));
+        record(c, "golden idempotence " + id, second.code == 0 && bytesEqual(second.out, p.out), "");
+        if (jIsTrue(jGet(cs, "parse")) && probeOk) {
+            const pa: List<string> = listNew();
+            if (jIsTrue(jGet(cs, "parse_original"))) {
+                listPush(pa, nat(source));
+            }
+            listPush(pa, nat(formatted));
+            const parsed = run(c, probe, pa);
+            record(c, "golden syntax " + id, parsed.code == 0, errTail(parsed, 500));
+        }
+    }
+}
+
+function corpus(c: Ref<Ctx>, rejects: Map<string, string>, work: string, width: int): void {
+    const files: List<string> = listNew();
+    for (d in GUARDED) {
+        txFiles(c.root, d, files);
+    }
+    for (d in NEW_SYNTAX) {
+        txFiles(c.root, d, files);
+    }
+    const first: List<Job> = listNew();
+    for (f in files) {
+        listPush(first, Job { exe: nat(c.compiler), args: two("fmt", nat(join(c.root, f))), cwd: nat(c.root) });
+    }
+    const r1 = runPool(first, width, RUN_NS, DRAIN_NS, MAX_OUTPUT);
+    // 第二遍：成功格式化的输出再格式化一遍（幂等）。
+    const second: List<Job> = listNew();
+    const secondOf: List<int> = listNew();
+    const verdict: List<string> = listNew();
+    const passed: List<bool> = listNew();
+    let k = 0;
+    while (k < listLen(files)) {
+        const name = listGet(files, k) catch "";
+        const p = listGet(r1, k) catch new Raw { code: -2, out: bytesNew(0), err: bytesNew(0), timedOut: false };
+        listPush(secondOf, -1);
+        const want = mapGet(rejects, name) ?? "";
+        if (len(want) > 0 && hexOf(sha256Of(readBytes(join(c.root, name)) catch bytesNew(0), 0, 1073741824)) == want) {
+            const ok = p.code == 0 && bytesLen(p.out) == 0 && contains(errText(p), "无法格式化");
+            listPush(passed, ok);
+            if (ok) {
+                listPush(verdict, "frozen lexical rejection");
+            } else {
+                listPush(verdict, "frozen invalid input unexpectedly accepted");
+            }
+        } else if (p.code != 0) {
+            listPush(passed, false);
+            listPush(verdict, errTail(p, 300));
+        } else {
+            const out = join(work, "corpus-" + toStr(k) + ".tx");
+            writeAll(out, p.out);
+            listSet(secondOf, k, listLen(second));
+            listPush(second, Job { exe: nat(c.compiler), args: two("fmt", nat(out)), cwd: nat(c.root) });
+            listPush(passed, false);
+            listPush(verdict, "idempotence");
+        }
+        k = k + 1;
+    }
+    const r2 = runPool(second, width, RUN_NS, DRAIN_NS, MAX_OUTPUT);
+    k = 0;
+    while (k < listLen(files)) {
+        const j = listGet(secondOf, k) catch -1;
+        let ok = listGet(passed, k) catch false;
+        if (j >= 0) {
+            const again = listGet(r2, j) catch new Raw { code: -2, out: bytesNew(0), err: bytesNew(0), timedOut: false };
+            const p = listGet(r1, k) catch again;
+            ok = again.code == 0 && bytesEqual(again.out, p.out);
+        }
+        record(c, "corpus " + (listGet(files, k) catch ""), ok, listGet(verdict, k) catch "");
+        k = k + 1;
+    }
+    print("corpus files: " + toStr(listLen(files)));
+}
+
+// 用冻结的三个非规范输入检查目录遍历、缺省不写、--write 与 JSON。
+function directory(c: Ref<Ctx>, fixture: Ref<Jv>, work: string): void {
+    const ids = ["unit-direct-0", "unicode-comment-string", "crlf"];
+    const tree = join(work, "tree");
+    const targets = [join(tree, "a.tx"), join(tree, "nested/太虚.tx"), join(tree, "nested/b.tx")];
+    const expected: List<Bytes> = listNew();
+    let changed = 0;
+    let k = 0;
+    while (k < 3) {
+        const cs = fixtureCase(fixture, ids[k]) ?? fixture;
+        const src = jText(jGet(cs, "source")) ?? "";
+        const exp = jText(jGet(cs, "expected")) ?? "";
+        if (src != exp) {
+            changed = changed + 1;
+        }
+        writeAll(targets[k], bytesFromStr(src));
+        listPush(expected, bytesFromStr(exp));
+        k = k + 1;
+    }
+    const nonTx = join(tree, "keep.txt");
+    writeAll(nonTx, bytesFromStr("unchanged\r\n"));
+    const before: List<Bytes> = listNew();
+    k = 0;
+    while (k < 3) {
+        listPush(before, readBytes(targets[k]) catch bytesNew(0));
+        k = k + 1;
+    }
+    const keepBefore = readBytes(nonTx) catch bytesNew(0);
+    let p = run(c, c.compiler, three("fmt", "--check", nat(tree)));
+    record(c, "directory check rejects noncanonical", p.code == 1, "");
+    p = run(c, c.compiler, two("fmt", nat(tree)));
+    record(c, "directory default reports without writing", p.code == 0 && bytesLen(p.out) == 0 && countOf(errText(p), "需要格式化") == changed,
+        "");
+    let unchanged = bytesEqual(readBytes(nonTx) catch bytesNew(0), keepBefore);
+    k = 0;
+    while (k < 3) {
+        if (!bytesEqual(readBytes(targets[k]) catch bytesNew(0), listGet(before, k) catch bytesNew(0))) {
+            unchanged = false;
+        }
+        k = k + 1;
+    }
+    record(c, "default/check do not write", unchanged, "");
+    p = run(c, c.compiler, plus4("fmt", "--check", "--format=json", nat(tree)));
+    record(c, "directory JSON", directoryJson(p, changed), headText(lossyText(p.out), 500));
+    p = run(c, c.compiler, three("fmt", "--write", nat(tree)));
+    let written = p.code == 0;
+    k = 0;
+    while (k < 3) {
+        if (!bytesEqual(readBytes(targets[k]) catch bytesNew(0), listGet(expected, k) catch bytesNew(0))) {
+            written = false;
+        }
+        k = k + 1;
+    }
+    record(c, "directory write frozen bytes", written, "");
+    record(c, "directory ignores other files", bytesEqual(readBytes(nonTx) catch bytesNew(0), keepBefore), "");
+    p = run(c, c.compiler, three("fmt", "--check", nat(tree)));
+    record(c, "directory check after write", p.code == 0, "");
+    // 用法错误：没有路径、--write 与 --check 并用、不是 .tx、文件不存在。
+    p = run(c, c.compiler, one("fmt"));
+    record(c, "usage no paths", p.code == 64 && bytesLen(p.err) > 0, "");
+    p = run(c, c.compiler, plus4("fmt", "--write", "--check", nat(targets[0])));
+    record(c, "usage write+check", p.code == 64 && bytesLen(p.err) > 0, "");
+    p = run(c, c.compiler, two("fmt", nat(nonTx)));
+    record(c, "usage non-tx", p.code == 64 && bytesLen(p.err) > 0, "");
+    const missing = join(work, "missing.tx");
+    p = run(c, c.compiler, two("fmt", nat(missing)));
+    record(c, "usage missing", p.code == 1 && bytesLen(p.err) > 0, "");
+    p = run(c, c.compiler, three("fmt", "--format=json", nat(missing)));
+    record(c, "missing JSON", missingJson(p), headText(lossyText(p.out), 300));
+}
+
+function countOf(s: string, needle: string): int {
+    let n = 0;
+    let at = 0;
+    const b = bytesFromStr(s);
+    const nb = bytesFromStr(needle);
+    while (at + bytesLen(nb) <= bytesLen(b)) {
+        if (bytesEqual(bytesSlice(b, at, bytesLen(nb)), nb)) {
+            n = n + 1;
+            at = at + bytesLen(nb);
+        } else {
+            at = at + 1;
+        }
+    }
+    return n;
+}
+
+function directoryJson(p: Ref<Raw>, changed: int): bool {
+    const doc = jParseBytes(p.out) catch (e) {
+        return false;
+    };
+    const files = jGet(doc, "files") ?? doc;
+    if (p.code != 1 || files.kind != J_ARR || jLen(files) != 3) {
+        return false;
+    }
+    let k = 0;
+    while (k < 3) {
+        const f = jAt(files, k) ?? files;
+        if (!jIsTrue(jGet(f, "ok")) || !jIsBool(jGet(f, "formatted"))) {
+            return false;
+        }
+        k = k + 1;
+    }
+    const s = jGet(doc, "summary") ?? doc;
+    return (jInt(jGet(s, "needs_format")) ?? -1) == changed && (jInt(jGet(s, "failed")) ?? -1) == 0;
+}
+
+function missingJson(p: Ref<Raw>): bool {
+    const doc = jParseBytes(p.out) catch (e) {
+        return false;
+    };
+    const files = jGet(doc, "files") ?? doc;
+    if (p.code != 1 || files.kind != J_ARR || jLen(files) != 1) {
+        return false;
+    }
+    const f = jAt(files, 0) ?? files;
+    const ok = jGet(f, "ok") ?? f;
+    return ok.kind == J_BOOL && !ok.truth && len(jText(jGet(f, "msg")) ?? "") > 0;
+}
+
+// 报告：{"compiler", "rows": [{"check", "status", "detail"}], "failed"}，写法同 Python 的 json.dumps(…, ensure_ascii=False, indent=2)。
+function writeReport(c: Ref<Ctx>, path: string, failed: int): bool {
+    const rows = jArray();
+    for (r in c.rows) {
+        let status = "FAIL";
+        if (r.ok) {
+            status = "PASS";
+        }
+        const row = jObject();
+        jSet(row, "check", jString(r.check));
+        jSet(row, "status", jString(status));
+        jSet(row, "detail", jString(r.detail));
+        jPush(rows, row);
+    }
+    const doc = jObject();
+    jSet(doc, "compiler", jString(c.compiler));
+    jSet(doc, "rows", rows);
+    jSet(doc, "failed", jNumber(failed));
+    mkdirs(dirOfSlash(absolute(path)));
+    writeFileBytes(path, bytesFromStr(jPretty(doc, 2) + "\n")) catch (e) {
+        return false;
+    };
+    return true;
+}

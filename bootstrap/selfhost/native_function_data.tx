@@ -152,6 +152,9 @@ export function nativeFunctionValidate(f: Ref<NativeFunction>, arch: string): st
     if (arch == "loongarch64") { sp = 3; fp = 22; ra = 1; returnBytes = 0; fpBytes = 16; }
     if (arch == "riscv64") { sp = 2; fp = 8; ra = 1; returnBytes = 0; fpBytes = 16; }
     const proSaves: List<int> = listNew(); const proSizes: List<int> = listNew(); let mask = 0; let proDebt = 0; let allocation = -1; let framePointer = false;
+    // 重对齐帧（x86 手写例程，同 LLVM X86FrameLowering）：设帧指针之后 and rsp, −N 再分配，此后进入时的栈深未知；尾声先
+    // restore-stack-pointer（lea rsp, [rbp − k]）经帧指针复原到对齐之前，再照常弹出。fpDebt 为设帧指针时的栈深，alignedDebt 为对齐前的栈深。
+    let aligned = false; let alignedDebt = 0; let fpDebt = 0;
     let last = f.begin; let lastBefore = -1; let proLast = f.begin;
     let epIndex = -1; let epEnd = -1; let debt = 0; let released = false; let returned = false; let saveIndex = -1;
     for (e in f.events) {
@@ -176,7 +179,7 @@ export function nativeFunctionValidate(f: Ref<NativeFunction>, arch: string): st
         }
         lastBefore = e.before; last = e.after;
         if (e.kind == "push-nonvolatile") {
-            if (!pro || (!tx && !shell && !entry && !manual && !risc) || !nonvolatile(arch, e.reg) || (e.bytes != 8 && (!risc || e.bytes != 16)) || (mask & (1 << e.reg)) != 0 || allocation >= 0) { return "BadFramePush"; }
+            if (!pro || (!tx && !shell && !entry && !manual && !risc) || !nonvolatile(arch, e.reg) || (e.bytes != 8 && (!risc || e.bytes != 16)) || (mask & (1 << e.reg)) != 0 || allocation >= 0 || aligned) { return "BadFramePush"; }
             listPush(proSaves, e.reg); listPush(proSizes, e.bytes); mask = mask | (1 << e.reg); proDebt = proDebt + e.bytes;
         } else if (e.kind == "set-frame-pointer") {
             if (!pro || (!tx && !manual && !risc) || e.reg != fp || e.bytes != fpBytes || framePointer || (mask & (1 << fp)) == 0 || allocation >= 0) { return "BadFramePointer"; }
@@ -184,19 +187,26 @@ export function nativeFunctionValidate(f: Ref<NativeFunction>, arch: string): st
             const n = listLen(proSaves);
             if (risc && (n < 2 || (listGet(proSaves, n - 1) catch -1) != fp || (listGet(proSaves, n - 2) catch -1) != ra
                     || (listGet(proSizes, n - 1) catch -1) != 8 || (listGet(proSizes, n - 2) catch -1) != 8)) { return "BadFramePointer"; }
-            framePointer = true;
+            framePointer = true; fpDebt = proDebt;
         } else if (e.kind == "allocate-stack") {
             const step = (risc && e.bytes % 16 != 0) || (!risc && (allocation >= 0 || e.bytes % 8 != 0));
             if (!pro || e.reg != sp || step || e.bytes > 9223372036854775807 - proDebt) { return "BadFrameAllocation"; }
             if (allocation < 0) { allocation = 0; } allocation = allocation + e.bytes; proDebt = proDebt + e.bytes;
         } else if (e.kind == "release-stack") {
-            if (pro || e.reg != sp || released || allocation < 0 || e.bytes != allocation || e.bytes > debt) { return "BadFrameRelease"; }
+            if (pro || e.reg != sp || released || allocation < 0 || aligned || e.bytes != allocation || e.bytes > debt) { return "BadFrameRelease"; }
             released = true; debt = debt - e.bytes;
         } else if (e.kind == "pop-nonvolatile") {
-            if (pro || saveIndex < 0 || e.reg != (listGet(proSaves, saveIndex) catch -1) || e.bytes != (listGet(proSizes, saveIndex) catch -1) || (allocation >= 0 && !released)) { return "BadFramePop"; }
+            if (pro || saveIndex < 0 || e.reg != (listGet(proSaves, saveIndex) catch -1) || e.bytes != (listGet(proSizes, saveIndex) catch -1) || ((allocation >= 0 || aligned) && !released)) { return "BadFramePop"; }
             saveIndex = saveIndex - 1; debt = debt - e.bytes;
         } else if (e.kind == "return") {
-            if (pro || e.after != epEnd || e.reg != -1 || e.bytes != returnBytes || debt != 0 || saveIndex >= 0 || (allocation >= 0 && !released)) { return "BadFrameReturn"; } returned = true;
+            if (pro || e.after != epEnd || e.reg != -1 || e.bytes != returnBytes || debt != 0 || saveIndex >= 0 || ((allocation >= 0 || aligned) && !released)) { return "BadFrameReturn"; } returned = true;
+        } else if (e.kind == "align-stack") {
+            if (!pro || risc || !manual || !framePointer || aligned || allocation >= 0 || e.reg != sp || e.bytes < 16 || (e.bytes & (e.bytes - 1)) != 0) { return "BadFrameAlignment"; }
+            aligned = true; alignedDebt = proDebt;
+        } else if (e.kind == "restore-stack-pointer") {
+            // rsp = fp − bytes，即对齐之前的栈顶：须是本尾声的第一个事件（还没弹出），bytes 恰为设帧指针之后压入的字节数。
+            if (pro || !aligned || released || e.reg != sp || saveIndex != listLen(proSaves) - 1 || fpDebt + e.bytes != alignedDebt) { return "BadFrameRestore"; }
+            released = true; debt = alignedDebt;
         } else { return "UnknownFrameEvent"; }
     }
     if (proLast != f.prologueEnd || epIndex + 1 != listLen(f.epilogues) || (epIndex >= 0 && !returned)) { return "IncompleteFrameEvents"; }

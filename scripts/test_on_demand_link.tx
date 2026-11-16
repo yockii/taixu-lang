@@ -1,0 +1,537 @@
+// 运行时按需链入（docs/design/v052-runtime-on-demand-link-v0.2-20261108.md；gate.tx 的 on-demand-link 步）：
+// - 探针 bootstrap/link_blocks_probe.tx：函数块计划与查找、内核生成时落空的函数被拒绝；它链出的小 PE 在这里逐字节独立核对——.text 里
+//   程序的 ret（补 nop 到 16 字节）之后恰是用到的四个函数，按原次序紧排、调用与跳转位移正确；没用到的两个函数与它们引用的
+//   DeleteFileW 都不在产物里（没有导入）。
+// - 放入清单黄金表 tests/odl/<目标>.txt，全部产物目标（scripts/targets.tx）各一张：样例在任何宿主上交叉编出该目标，记下
+//   放入产物的内核函数（链接映射 --map-scope=functions 里来源不是程序的函数，按名字排序）、它们的字节数合计与导入（不经编译器的
+//   代码，逐个读产物：PE 的导入目录记“DLL!名”，Mach-O 记未定义的外部符号，ELF 记 .dynsym 的未定义符号），须与表完全一致——
+//   多了说明链进了不该链的，少了说明表过时，两种都失败。清单只随运行时的链接取舍与内核代码变：只优化一个目标时只有它的表变，
+//   别的目标的表变了即是意外。改了内核或链接器使清单变化时，审阅后加 --update 重写、同批提交。
+// - 整节退路（目标分层 X5e）：同一份映射里“带偏移的引用致整节放入”的引用处（split_fallbacks）须为 0；探针另造一个带偏移引用的
+//   小内核，经 PE 链接器与 ELF 一族共用的链接器各链一次，证明退路会被记下。
+// - ELF 与 Mach-O 目标的函数符号：独立读 hello 与工具链样例的函数符号（ELF 的 .symtab、Mach-O 的 LC_SYMTAB）：只供建子进程用的
+//   内核函数（MARKERS）hello 里都没有，工具链样例里都有——前者说明按需链入生效，后者说明这些名字仍是内核函数（改名时随之改表）。
+// - x86_64 Windows 宿主上运行 hello 与工具链样例，核对输出；别的宿主上记 SKIP，不记通过。
+// 运行：taixu run --toolchain scripts/test_on_demand_link.tx --compiler <taixu> --work <目录> [--root <仓库>] [--update]
+import { absolute, exeName, join, list1, mkdirs, parseDigits, plus, step, readBytes } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { Target, allTargets, productName } from "./targets";
+import { Tally, capture, check, summary, tallyNew, linesOf } from "./test_lib";
+import { jAt, jGet, jHas, jInt, jLen, jParseBytes, jText } from "./test_json";
+
+struct Sample { src: string, stem: string, toolchain: bool, debug: bool }
+
+// 只供建子进程用的内核函数：hello 用不到，工具链样例用得到。
+const MARKERS: [3]string = ["__tx_tool_proc_spawn", "__tx_tool_proc_kill", "__tx_tool_pipe"];
+
+function noStrings(): List<string> { return listNew(); }
+
+function u(b: Bytes, at: int, n: int): int {
+    let v = 0;
+    let k = n - 1;
+    while (k >= 0) {
+        v = (v << 8) | ((bytesGetLE<u8>(b, at + k) ?? 0) as int);
+        k = k - 1;
+    }
+    return v;
+}
+
+// RVA → 文件偏移（须整个落在某节的文件内容里），不在则 -1。
+function fileAt(img: Bytes, pe: int, rva: int, n: int): int {
+    const nsec = u(img, pe + 6, 2);
+    const sh = pe + 24 + u(img, pe + 20, 2);
+    let k = 0;
+    while (k < nsec) {
+        const s = sh + 40 * k;
+        let filled = u(img, s + 16, 4);
+        if (u(img, s + 8, 4) < filled) { filled = u(img, s + 8, 4); }
+        const va = u(img, s + 12, 4);
+        if (filled > 0 && rva >= va && rva + n <= va + filled) { return rva - va + u(img, s + 20, 4); }
+        k = k + 1;
+    }
+    return -1;
+}
+
+// 以 NUL 结尾的 ASCII 名字；越界或没有结尾为空串。
+function cName(img: Bytes, at: int): string {
+    if (at < 0) { return ""; }
+    let end = at;
+    while (end < bytesLen(img) && u(img, end, 1) != 0) { end = end + 1; }
+    if (end >= bytesLen(img) || end == at) { return ""; }
+    return bytesToStr(bytesSlice(img, at, end - at)) catch "";
+}
+
+// 导入目录（数据目录 1）逐个描述符、逐项读出“DLL!名”（按序号导入记“DLL!#序号”），按字节序排好；结构不对时得 Error。
+function imports(img: Bytes): List<string> | Error {
+    if (bytesLen(img) < 64 || u(img, 0, 2) != 23117) { return err("没有 MZ 签名"); }
+    const pe = u(img, 60, 4);
+    if (pe + 264 > bytesLen(img) || u(img, pe, 4) != 17744 || u(img, pe + 24, 2) != 523) { return err("不是 PE32+"); }
+    const opt = pe + 24;
+    const out: List<string> = listNew();
+    const dirRva = u(img, opt + 112 + 8, 4);
+    const dirSize = u(img, opt + 112 + 12, 4);
+    if (dirRva == 0 || dirSize == 0) { return out; }
+    let d = 0;
+    while (true) {
+        const at = fileAt(img, pe, dirRva + 20 * d, 20);
+        if (at < 0) { return err("导入描述符 " + toStr(d) + " 不在文件内容里"); }
+        const ilt = u(img, at, 4);
+        const nameRva = u(img, at + 12, 4);
+        if (ilt == 0 && nameRva == 0 && u(img, at + 16, 4) == 0) { break; }
+        const dll = cName(img, fileAt(img, pe, nameRva, 1));
+        if (len(dll) == 0) { return err("导入描述符 " + toStr(d) + " 的 DLL 名不对"); }
+        let k = 0;
+        while (true) {
+            const slot = fileAt(img, pe, ilt + 8 * k, 8);
+            if (slot < 0) { return err(dll + " 的导入名表越界"); }
+            const v = u(img, slot, 8);
+            if (v == 0) { break; }
+            if (v < 0) { listPush(out, dll + "!#" + toStr(v & 65535)); }
+            else {
+                const name = cName(img, fileAt(img, pe, v + 2, 1));
+                if (len(name) == 0) { return err(dll + " 的第 " + toStr(k) + " 项提示名不对"); }
+                listPush(out, dll + "!" + name);
+            }
+            k = k + 1;
+        }
+        d = d + 1;
+    }
+    return sorted(out);
+}
+
+// 探针链出的小 PE：.text 的内容（到 VirtualSize）须逐字节等于下面的期望。
+function probeImage(t: Ref<Tally>, img: Bytes): void {
+    const names = imports(img) catch (e) {
+        check(t, "probe:image", false, e.message);
+        return;
+    };
+    check(t, "probe:no-imports", listLen(names) == 0, "导入 " + toStr(listLen(names)) + " 项（没用到的函数的 DeleteFileW 被链进来了）");
+    const pe = u(img, 60, 4);
+    const sh = pe + 24 + u(img, pe + 20, 2);
+    const vsize = u(img, sh + 8, 4);
+    const raw = u(img, sh + 20, 4);
+    const want = bytesNew(0);
+    bytesPush(want, 0xC3);
+    while (bytesLen(want) < 16) { bytesPush(want, 0x90); }
+    // __tx_entry: call used_a; ret ｜ used_a: call used_b; jmp used_tail ｜ used_b: ret ｜ used_tail: ret
+    const kept = [0xE8, 1, 0, 0, 0, 0xC3, 0xE8, 5, 0, 0, 0, 0xE9, 1, 0, 0, 0, 0xC3, 0xC3];
+    for (b in kept) { bytesPush(want, b); }
+    while (bytesLen(want) % 16 != 0) { bytesPush(want, 0x90); }
+    const got = bytesSlice(img, raw, vsize);
+    check(t, "probe:text", u(img, sh, 4) == 2019914798 && bytesEqual(got, want),
+        ".text " + toStr(vsize) + " 字节，期望 " + toStr(bytesLen(want)) + " 字节的程序 ret＋四个用到的函数");
+}
+
+// 按字节序插入排序。
+function sorted(out: List<string>): List<string> {
+    let i = 1;
+    while (i < listLen(out)) {
+        const x = listGet(out, i) catch "";
+        let j = i - 1;
+        while (j >= 0 && strCompare(listGet(out, j) catch "", x) > 0) { listSet(out, j + 1, listGet(out, j) catch ""); j = j - 1; }
+        listSet(out, j + 1, x);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ELF64 产物 .symtab 里的 STT_FUNC 符号名；结构不对时得 Error。
+function elfFunctions(img: Bytes): List<string> | Error {
+    if (bytesLen(img) < 64 || u(img, 0, 4) != 1179403647 || u(img, 4, 1) != 2 || u(img, 5, 1) != 1) { return err("不是小端 ELF64"); }
+    const shoff = u(img, 40, 8);
+    const shnum = u(img, 60, 2);
+    if (u(img, 58, 2) != 64 || shoff <= 0 || shoff + 64 * shnum > bytesLen(img)) { return err("节头表越界"); }
+    const out: List<string> = listNew();
+    let k = 0;
+    while (k < shnum) {
+        const h = shoff + 64 * k;
+        if (u(img, h + 4, 4) == 2) {
+            const off = u(img, h + 24, 8);
+            const size = u(img, h + 32, 8);
+            const link = u(img, h + 40, 4);
+            if (link >= shnum || off + size > bytesLen(img) || u(img, h + 56, 8) != 24) { return err(".symtab 越界"); }
+            const strOff = u(img, shoff + 64 * link + 24, 8);
+            let at = off + 24;
+            while (at + 24 <= off + size) {
+                if ((u(img, at + 4, 1) & 15) == 2) {
+                    const name = cName(img, strOff + u(img, at, 4));
+                    if (len(name) == 0) { return err("函数符号名不对"); }
+                    listPush(out, name);
+                }
+                at = at + 24;
+            }
+        }
+        k = k + 1;
+    }
+    if (listLen(out) == 0) { return err("没有函数符号"); }
+    return sorted(out);
+}
+
+// Mach-O 64 产物 LC_SYMTAB 里定义在第 1 节（__text）上的符号名；结构不对时得 Error。
+function machoFunctions(img: Bytes): List<string> | Error {
+    if (bytesLen(img) < 32 || u(img, 0, 4) != 4277009103) { return err("不是 Mach-O 64"); }
+    const ncmds = u(img, 16, 4);
+    let at = 32;
+    let c = 0;
+    const out: List<string> = listNew();
+    while (c < ncmds) {
+        if (at + 8 > bytesLen(img)) { return err("加载命令越界"); }
+        const cmd = u(img, at, 4);
+        const size = u(img, at + 4, 4);
+        if (size < 8) { return err("加载命令长度不对"); }
+        if (cmd == 2) {
+            const symoff = u(img, at + 8, 4);
+            const nsyms = u(img, at + 12, 4);
+            const stroff = u(img, at + 16, 4);
+            if (symoff + 16 * nsyms > bytesLen(img)) { return err("符号表越界"); }
+            let k = 0;
+            while (k < nsyms) {
+                const e = symoff + 16 * k;
+                if ((u(img, e + 4, 1) & 14) == 14 && u(img, e + 5, 1) == 1) {
+                    const name = cName(img, stroff + u(img, e, 4));
+                    if (len(name) == 0) { return err("函数符号名不对"); }
+                    listPush(out, name);
+                }
+                k = k + 1;
+            }
+        }
+        at = at + size;
+        c = c + 1;
+    }
+    if (listLen(out) == 0) { return err("没有函数符号"); }
+    return sorted(out);
+}
+
+// Mach-O 64 的未定义外部符号（导入，带前导下划线），按名排序。
+function machoImports(img: Bytes): List<string> | Error {
+    if (bytesLen(img) < 32 || u(img, 0, 4) != 4277009103) { return err("不是 Mach-O 64"); }
+    const ncmds = u(img, 16, 4);
+    let at = 32;
+    let c = 0;
+    const out: List<string> = listNew();
+    while (c < ncmds) {
+        if (at + 8 > bytesLen(img)) { return err("加载命令越界"); }
+        const cmd = u(img, at, 4);
+        const size = u(img, at + 4, 4);
+        if (size < 8) { return err("加载命令长度不对"); }
+        if (cmd == 2) {
+            const symoff = u(img, at + 8, 4);
+            const nsyms = u(img, at + 12, 4);
+            const stroff = u(img, at + 16, 4);
+            if (symoff + 16 * nsyms > bytesLen(img)) { return err("符号表越界"); }
+            let k = 0;
+            while (k < nsyms) {
+                const e = symoff + 16 * k;
+                if ((u(img, e + 4, 1) & 14) == 0 && (u(img, e + 4, 1) & 1) == 1) {
+                    const name = cName(img, stroff + u(img, e, 4));
+                    if (len(name) == 0) { return err("导入符号名不对"); }
+                    listPush(out, name);
+                }
+                k = k + 1;
+            }
+        }
+        at = at + size;
+        c = c + 1;
+    }
+    return sorted(out);
+}
+
+// ELF64 产物 .dynsym 里未定义的符号名（动态导入），按名排序；静态产物没有 .dynsym，得空表；结构不对时得 Error。
+function elfImports(img: Bytes): List<string> | Error {
+    if (bytesLen(img) < 64 || u(img, 0, 4) != 1179403647 || u(img, 4, 1) != 2 || u(img, 5, 1) != 1) { return err("不是小端 ELF64"); }
+    const shoff = u(img, 40, 8);
+    const shnum = u(img, 60, 2);
+    if (u(img, 58, 2) != 64 || shoff <= 0 || shoff + 64 * shnum > bytesLen(img)) { return err("节头表越界"); }
+    const out: List<string> = listNew();
+    let k = 0;
+    while (k < shnum) {
+        const h = shoff + 64 * k;
+        if (u(img, h + 4, 4) == 11) {
+            const off = u(img, h + 24, 8);
+            const size = u(img, h + 32, 8);
+            const link = u(img, h + 40, 4);
+            if (link >= shnum || off + size > bytesLen(img) || u(img, h + 56, 8) != 24) { return err(".dynsym 越界"); }
+            const strOff = u(img, shoff + 64 * link + 24, 8);
+            let at = off + 24;
+            while (at + 24 <= off + size) {
+                if (u(img, at + 6, 2) == 0) {
+                    const name = cName(img, strOff + u(img, at, 4));
+                    if (len(name) == 0) { return err("导入符号名不对"); }
+                    listPush(out, name);
+                }
+                at = at + 24;
+            }
+        }
+        k = k + 1;
+    }
+    return sorted(out);
+}
+
+function hasString(xs: List<string>, x: string): bool {
+    for (y in xs) { if (y == x) { return true; } }
+    return false;
+}
+
+// 一个 ELF 或 Mach-O 目标（产物已由放入清单一节编出）：MARKERS 在 hello 的函数符号里都没有、在工具链样例里都有。macOS 另加建进程的
+// libc 蹦床 __tx_mac_posix_spawn（两个目标的蹦床都登记进了函数目录），并核对导入：hello 不导入 posix_spawn、fork、execve，工具链样例
+// 导入 posix_spawn。
+function functionMarkers(t: Ref<Tally>, dir: string, tg: Target): int | Error {
+    const target = tg.triple;
+    const macho = tg.format == "macho";
+    const helloDir = join(dir, target + "-hello");
+    const toolDir = join(dir, target + "-odl-toolchain");
+    const both: List<List<string>> = listNew();
+    const imports: List<List<string>> = listNew();
+    for (path in [join(helloDir, "hello"), join(toolDir, "odl-toolchain")]) {
+        const img = readBytes(path) catch bytesNew(0);
+        if (macho) {
+            listPush(imports, machoImports(img) catch (e) { check(t, target + ":imports", false, path + "：" + e.message); return 0; });
+        }
+        let names = noStrings();
+        if (macho) {
+            names = machoFunctions(img) catch (e) { check(t, target + ":functions", false, path + "：" + e.message); return 0; };
+        } else {
+            names = elfFunctions(img) catch (e) { check(t, target + ":functions", false, path + "：" + e.message); return 0; };
+        }
+        listPush(both, names);
+    }
+    const hello = listGet(both, 0) catch noStrings();
+    const tool = listGet(both, 1) catch noStrings();
+    const markers: List<string> = listNew();
+    for (m in MARKERS) { listPush(markers, m); }
+    if (macho) { listPush(markers, "__tx_mac_posix_spawn"); }
+    let present = "";
+    let missing = "";
+    for (m in markers) {
+        if (hasString(hello, m)) { present = present + " " + m; }
+        if (!hasString(tool, m)) { missing = missing + " " + m; }
+    }
+    check(t, target + ":hello-drops-unused", len(present) == 0, "hello 带了没用到的内核函数：" + present + "（共 " + toStr(listLen(hello)) + " 个函数符号）");
+    check(t, target + ":toolchain-keeps-used", len(missing) == 0, "工具链样例缺内核函数：" + missing + "（改名了就随之改 MARKERS）");
+    if (macho) {
+        const hi = listGet(imports, 0) catch noStrings();
+        const ti = listGet(imports, 1) catch noStrings();
+        let extra = "";
+        for (m in ["_posix_spawn", "_fork", "_execve"]) {
+            if (hasString(hi, m)) { extra = extra + " " + m; }
+        }
+        check(t, target + ":hello-imports-drop-spawn", len(extra) == 0, "hello 导入了没用到的系统函数：" + extra + "（共 " + toStr(listLen(hi)) + " 个导入）");
+        check(t, target + ":toolchain-imports-keep-spawn", hasString(ti, "_posix_spawn"), "工具链样例没有导入 _posix_spawn（共 " + toStr(listLen(ti)) + " 个导入）");
+    }
+    return 0;
+}
+
+// 黄金表：[源文件] 行之后是该样例的导入，一行一项；# 起的行是注释。
+function readTable(path: string): Map<string, List<string>> {
+    const out: Map<string, List<string>> = mapNew();
+    const text = readFile(path) catch "";
+    let current = "";
+    for (line in linesOf(text)) {
+        if (len(line) == 0 || strByteSub(line, 0, 1) == "#") { continue; }
+        if (strByteSub(line, 0, 1) == "[" && strByteSub(line, len(line) - 1, 1) == "]") {
+            current = strByteSub(line, 1, len(line) - 2);
+            mapSet(out, current, noStrings());
+            continue;
+        }
+        const rows = mapGet(out, current) ?? noStrings();
+        listPush(rows, line);
+        mapSet(out, current, rows);
+    }
+    return out;
+}
+
+function sameList(a: List<string>, b: List<string>): bool {
+    if (listLen(a) != listLen(b)) { return false; }
+    let i = 0;
+    while (i < listLen(a)) {
+        if ((listGet(a, i) catch "") != (listGet(b, i) catch "")) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 两表的差：a 有 b 没有的项。
+function minus(a: List<string>, b: List<string>): string {
+    let out = "";
+    for (x in a) {
+        let found = false;
+        for (y in b) { if (x == y) { found = true; break; } }
+        if (!found) { out = out + " " + x; }
+    }
+    return out;
+}
+
+// 产物的导入，按目标的格式读。
+function importsOf(tg: Target, img: Bytes): List<string> | Error {
+    if (tg.format == "pe") { return imports(img); }
+    if (tg.format == "macho") { return machoImports(img); }
+    return elfImports(img);
+}
+
+// 链接映射（JSON，函数视图）里放入的内核函数：来源不是程序（tx-generated）的函数，按名字排序；另返回它们的字节数合计（放在首项，
+// 写成“bytes N”）。
+function placedFunctions(mapping: Bytes): List<string> | Error {
+    const doc = jParseBytes(mapping)?;
+    const m = jGet(doc, "map") ?? doc;
+    const fs = jGet(m, "functions") ?? m;
+    const names: List<string> = listNew();
+    let total = 0;
+    let i = 0;
+    while (i < jLen(fs)) {
+        const f = jAt(fs, i) ?? fs;
+        const origin = jText(jGet(f, "origin")) ?? "";
+        if (len(origin) == 0) { return err("第 " + toStr(i) + " 个函数没有 origin"); }
+        if (origin != "tx-generated") {
+            const name = jText(jGet(f, "name")) ?? "";
+            if (len(name) == 0) { return err("第 " + toStr(i) + " 个函数没有名字"); }
+            listPush(names, "fn " + name);
+            total = total + parseDigits(jText(jGet(f, "bytes")) ?? "");
+        }
+        i = i + 1;
+    }
+    if (listLen(names) == 0) { return err("映射里没有内核函数"); }
+    const out = list1("bytes " + toStr(total));
+    for (x in sorted(names)) { listPush(out, x); }
+    return out;
+}
+
+// 整节退路（目标分层 X5e）：带偏移的引用所指的符号在切开的节里、链接器因此整节放入的引用处，逐条写成“符号@对象:节+偏移”。
+// 映射须带 split_fallbacks_total 与 split_fallbacks 数组且两者相符；样例的退路须为 0（探针另证退路会被记下）。
+function splitFallbacks(mapping: Bytes): List<string> | Error {
+    const doc = jParseBytes(mapping)?;
+    const m = jGet(doc, "map") ?? doc;
+    const total = jText(jGet(m, "split_fallbacks_total")) ?? "";
+    if (len(total) == 0 || !jHas(m, "split_fallbacks")) { return err("映射里没有 split_fallbacks"); }
+    const rows = jGet(m, "split_fallbacks") ?? m;
+    const out: List<string> = listNew();
+    let i = 0;
+    while (i < jLen(rows)) {
+        const f = jAt(rows, i) ?? rows;
+        listPush(out, (jText(jGet(f, "symbol_utf8")) ?? "?") + "@" + toStr(jInt(jGet(f, "object_index")) ?? -1) + ":"
+            + toStr(jInt(jGet(f, "input_section_index")) ?? -1) + "+" + (jText(jGet(f, "offset")) ?? "?"));
+        i = i + 1;
+    }
+    if (total != toStr(listLen(out))) { return err("split_fallbacks_total " + total + " 与条目数 " + toStr(listLen(out)) + " 不符"); }
+    return out;
+}
+
+// 一个目标的放入清单：逐个样例交叉编出（带函数视图的链接映射）、读映射与产物、对黄金表；update 时重写该表。
+function placementTable(t: Ref<Tally>, compiler: string, root: string, dir: string, tg: Target, samples: List<Sample>, update: bool): int | Error {
+    const target = tg.triple;
+    const path = "tests/odl/" + target + ".txt";
+    const table = readTable(join(root, path));
+    let rewritten = "# 运行时按需链入的放入清单（门步 on-demand-link，scripts/test_on_demand_link.tx）：各样例交叉编成 " + target + " 后放入产物的\n"
+    + "# 内核函数（fn，按名字排序）、它们的字节数合计（bytes）与导入（import）。只随运行时的链接取舍与内核代码变化；变化时审阅后加\n"
+    + "# --update 重写、同批提交。\n";
+    for (s in samples) {
+        let flags = list1("--target=" + target);
+        if (s.toolchain) { flags = plus(flags, list1("--toolchain")); }
+        if (s.debug) { flags = plus(flags, list1("--debug")); }
+        const out = join(dir, target + "-" + s.stem);
+        const mapping = join(dir, target + "-" + s.stem + ".json");
+        const mapFlags = plus(plus(list1("--map"), list1(mapping)), plus(list1("--map-format=json"), list1("--map-scope=functions")));
+        step(compiler, plus(plus(list1("build"), list1(s.src)), plus(plus(flags, mapFlags), plus(list1("--out"), list1(out)))), root)?;
+        const name = target + ":" + s.src + ":placement";
+        const fallbackName = target + ":" + s.src + ":split-fallbacks";
+        const fallbacks = splitFallbacks(readBytes(mapping) catch bytesNew(0)) catch (e) {
+            check(t, fallbackName, false, mapping + "：" + e.message);
+            continue;
+        };
+        check(t, fallbackName, listLen(fallbacks) == 0, "带偏移的引用致整节放入 " + toStr(listLen(fallbacks)) + " 处：" + minus(fallbacks, noStrings()));
+        const got = placedFunctions(readBytes(mapping) catch bytesNew(0)) catch (e) {
+            check(t, name, false, mapping + "：" + e.message);
+            continue;
+        };
+        const got2 = importsOf(tg, readBytes(join(out, productName(tg, s.stem))) catch bytesNew(0)) catch (e) {
+            check(t, name, false, "导入：" + e.message);
+            continue;
+        };
+        for (x in got2) { listPush(got, "import " + x); }
+        rewritten = rewritten + "\n[" + s.src + "]\n";
+        for (x in got) { rewritten = rewritten + x + "\n"; }
+        const expected = mapGet(table, s.src) ?? noStrings();
+        check(t, name, sameList(got, expected),
+            "多出：" + minus(got, expected) + "；缺少：" + minus(expected, got) + "（共 " + toStr(listLen(got)) + " 项，表里 " + toStr(listLen(expected)) + " 项）");
+    }
+    if (update) {
+        writeFile(join(root, path), rewritten) catch (e) { return err("写不了 " + path + "：" + e.message); };
+        print("UPDATED " + path);
+    }
+    return 0;
+}
+
+function run(args: []string): int | Error {
+    let compiler = "";
+    let work = "";
+    let root = "";
+    let update = false;
+    let i: int = 0;
+    while (i < len(args)) {
+        const a = args[i];
+        if (a == "--update") { update = true; i = i + 1; continue; }
+        if (i + 1 >= len(args)) { return err("缺少取值或未知参数：" + a); }
+        const v = args[i + 1];
+        if (a == "--compiler") { compiler = v; }
+        else if (a == "--work") { work = v; }
+        else if (a == "--root") { root = v; }
+        else { return err("未知参数：" + a); }
+        i = i + 2;
+    }
+    if (len(compiler) == 0 || len(work) == 0) {
+        return err("用法：taixu run --toolchain scripts/test_on_demand_link.tx --compiler <taixu> --work <目录> [--root <仓库>] [--update]");
+    }
+    if (len(root) == 0) { root = currentDir() catch "."; }
+    root = osRealPath(absolute(root));
+    compiler = osRealPath(absolute(compiler));
+    if (!mkdirs(absolute(work))) { return err("建不了工作目录：" + work); }
+    const dir = osRealPath(absolute(work));
+    const t = tallyNew();
+
+    // 一、探针。
+    step(compiler, plus(plus(list1("build"), list1("bootstrap/link_blocks_probe.tx")), plus(list1("--toolchain"), plus(list1("--out"), list1(join(dir, "probe"))))), root)?;
+    const mini = join(dir, "mini.exe");
+    const p = capture(join(join(dir, "probe"), exeName("link_blocks_probe")), list1(mini), dir, 120000000000, 1048576)?;
+    const want = ["ok plan:lookup", "ok plan:glue", "ok plan:reject", "ok generator:fall-through", "ok link:written", "ok fallback:pe", "ok fallback:elf"];
+    const lines = linesOf(p.out);
+    let wantList: List<string> = listNew();
+    for (w in want) { listPush(wantList, w); }
+    check(t, "probe:run", p.code == 0 && sameList(lines, wantList), "退出码 " + toStr(p.code) + "，输出 " + p.out + p.err);
+    if (p.code == 0) { probeImage(t, readBytes(mini) catch bytesNew(0)); }
+
+    // 二、放入清单黄金表（每个产物目标一张）。
+    const samples: List<Sample> = listNew();
+    listPush(samples, Sample { src: "examples/hello.tx", stem: "hello", toolchain: false, debug: false });
+    listPush(samples, Sample { src: "tests/cases/03-readfile.tx", stem: "03-readfile", toolchain: false, debug: false });
+    listPush(samples, Sample { src: "tests/cases/async-await-any.tx", stem: "async-await-any", toolchain: false, debug: false });
+    listPush(samples, Sample { src: "tests/nrt-cases/async-thread-await.tx", stem: "async-thread-await", toolchain: false, debug: false });
+    listPush(samples, Sample { src: "tests/debug/basic.tx", stem: "basic", toolchain: false, debug: true });
+    listPush(samples, Sample { src: "tests/pe/odl-toolchain.tx", stem: "odl-toolchain", toolchain: true, debug: false });
+    for (tg in allTargets()) {
+        placementTable(t, compiler, root, dir, tg, samples, update)?;
+    }
+
+    // 四、ELF 与 Mach-O 目标的函数符号（PE 产物不带符号表，它们的放入清单已在上一节）。
+    for (tg in allTargets()) {
+        if (tg.format != "pe") {
+            functionMarkers(t, dir, tg)?;
+        }
+    }
+
+    // 三、运行。
+    if (hostTarget() != "windows" || hostArch() != "x86_64") {
+        print("SKIP run：不是 Windows x86_64 宿主");
+        return summary(t, "on-demand-link");
+    }
+    const hello = capture(join(join(dir, "x86_64-windows-hello"), "hello.exe"), listNew(), dir, 60000000000, 65536)?;
+    check(t, "hello:run", hello.code == 0 && hello.out == "Hello, 太虚!\n", "退出码 " + toStr(hello.code) + "，输出 " + hello.out + hello.err);
+    const tool = capture(join(join(dir, "x86_64-windows-odl-toolchain"), "odl-toolchain.exe"), listNew(), dir, 60000000000, 65536)?;
+    check(t, "odl-toolchain:run", tool.code == 0 && tool.out == "spawned\n", "退出码 " + toStr(tool.code) + "，输出 " + tool.out + tool.err);
+    return summary(t, "on-demand-link");
+}
+
+function main(args: []string): int {
+    return run(args) catch (e) {
+        eprint("test_on_demand_link: " + e.message);
+        return 1;
+    };
+}

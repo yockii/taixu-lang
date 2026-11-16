@@ -1,0 +1,329 @@
+// 新旧编译器的编译耗时对照（ABBA 交替）：判定指标 Linux 为用户态退休指令数
+// instructions:u，macOS 为 proc_pid_rusage 的退休指令数，Windows 为子进程 CPU 周期。
+//
+// 每个负载是 `<编译器> build <源> --out <目录>`；两臂按 ABBA 交替运行，各取中位数，按负载单独判定（候选/基线 − 1 不超过 --threshold
+// 百分比）。其余读数（cycles、墙钟、CPU 时间、峰值内存）只记录不判定。--aa 让两臂都用基线，测同一二进制的噪声，用来校准门限。结果写
+// --report（JSON），不进 Git。Windows 上两臂的编译器先复制进工作目录再测（perf_lib 的 privateExe）。
+//
+//   taixu run --toolchain scripts/perf_compare.tx --base <基线编译器> (--cand <候选编译器> | --aa) [--loads lexer,parser,semamirror]
+//       [--runs N] [--warmup N] [--threshold 3.0] [--target <写法>] [--metric <读数名>] [--report <文件>] [--src-root <源码树>]
+import { PerfSample } from "./perf_os";
+import { defaultMetric, defaultRuns, fixed, isMetric, isPerfHelper, jBool, jFloat, median, metricNames, metricOf, parseDecimal, perfHelperMain,
+    perfMeasure, privateExe, sampleJson, spreadPct } from "./perf_lib";
+import { kernelsOf } from "./kernels_lib";
+import { absolute, deleteTree, dirOf, join, kindOf, mkdirs, parseDigits } from "./build_lib";
+import { Jv, jArray, jNumber, jObject, jPretty, jPush, jSet, jString } from "./test_json";
+
+const USAGE: string = "用法：perf_compare --base <基线编译器> (--cand <候选编译器> | --aa) [--loads lexer,parser,semamirror] [--runs N]"
++ " [--warmup N] [--threshold 3.0] [--target <写法>] [--metric <读数名>] [--report <文件>] [--src-root <源码树>]\n"
++ "负载：lexer、parser、semamirror、self（bootstrap/ 下的 lexer.tx、parser.tx、semamirror.tx、taixu.tx，都带 --toolchain）";
+// 一个样本至多跑这么久（毫秒）。
+const LIMIT_MS: int = 3600000;
+
+struct Opts {
+    base: string,
+    cand: string,
+    aa: bool,
+    loads: string,
+    runs: int,
+    warmup: int,
+    threshold: float,
+    target: string,
+    metric: string,
+    report: string,
+    srcRoot: string,
+}
+
+function loadArgs(name: string): List<string> | Error {
+    const out: List<string> = listNew();
+    if (name == "lexer" || name == "parser" || name == "semamirror") {
+        listPush(out, "bootstrap/" + name + ".tx");
+    } else if (name == "self") {
+        listPush(out, "bootstrap/taixu.tx");
+    } else {
+        return err("未知负载：" + name + "\n" + USAGE);
+    }
+    // 编译器源码按工具链程序编（v0.51 起 byteAt、listGet 等在两种模式下签名不同，不带 --toolchain 编不过）。
+    listPush(out, "--toolchain");
+    return out;
+}
+
+function parse(argv: []string): Ref<Opts> | Error {
+    const o = new Opts { base: "", cand: "", aa: false, loads: "lexer,parser,semamirror", runs: 0, warmup: 1, threshold: 3.0, target: "",
+        metric: "", report: "", srcRoot: "" };
+    let i = 0;
+    while (i < len(argv)) {
+        const a = argv[i];
+        if (a == "--aa") {
+            o.aa = true;
+            i = i + 1;
+            continue;
+        }
+        if (i + 1 >= len(argv)) {
+            return err(USAGE);
+        }
+        const v = argv[i + 1];
+        if (a == "--base") {
+            o.base = absolute(v);
+        } else if (a == "--cand") {
+            o.cand = absolute(v);
+        } else if (a == "--loads") {
+            o.loads = v;
+        } else if (a == "--runs") {
+            o.runs = parseDigits(v);
+            if (o.runs < 1) {
+                return err("--runs 须为正整数");
+            }
+        } else if (a == "--warmup") {
+            o.warmup = parseDigits(v);
+            if (o.warmup < 0) {
+                return err("--warmup 须为非负整数");
+            }
+        } else if (a == "--threshold") {
+            o.threshold = parseDecimal(v)?;
+        } else if (a == "--target") {
+            o.target = v;
+        } else if (a == "--metric") {
+            o.metric = v;
+        } else if (a == "--report") {
+            o.report = absolute(v);
+        } else if (a == "--src-root") {
+            o.srcRoot = absolute(v);
+        } else {
+            return err(USAGE);
+        }
+        i = i + 2;
+    }
+    if (len(o.base) == 0) {
+        return err(USAGE);
+    }
+    if (!o.aa && len(o.cand) == 0) {
+        return err("需要 --cand，或用 --aa 测噪声");
+    }
+    if (len(o.metric) == 0) {
+        o.metric = defaultMetric();
+    }
+    if (!isMetric(o.metric)) {
+        return err("本宿主没有读数 " + o.metric);
+    }
+    if (o.runs == 0) {
+        o.runs = defaultRuns();
+    }
+    if (len(o.srcRoot) == 0) {
+        o.srcRoot = absolute(currentDir() catch ".");
+    }
+    for (name in strSplit(o.loads, ",")) {
+        loadArgs(name)?;
+        if (name == "self") {
+            selfKernels(o.srcRoot)?;
+        }
+    }
+    return o;
+}
+
+// self 负载编 taixu.tx，它嵌入的内核须已在源码树里（build.tx 生成）；开跑前查，免得前面的负载跑完才失败。
+function selfKernels(root: string): void | Error {
+    const list = kernelsOf(root)?;
+    let k = 1;
+    while (k < listLen(list)) {
+        const name = listGet(list, k) catch "";
+        if (kindOf(join(join(root, "bootstrap/nrt-kernel"), name)) != 1) {
+            return err("self 负载缺内核 bootstrap/nrt-kernel/" + name + "：先在 " + root + " 跑 build.tx 生成内核");
+        }
+        k = k + 2;
+    }
+    return nothing();
+}
+
+function nothing(): void {
+}
+
+function armExe(o: Ref<Opts>, arm: string): string {
+    if (arm == "A" || o.aa) {
+        return o.base;
+    }
+    return o.cand;
+}
+
+// 跑一次：编译失败或测不了都得 Error。
+function once(o: Ref<Opts>, work: string, name: string, src: List<string>, arm: string): Ref<PerfSample> | Error {
+    const out = join(work, name + "-" + arm);
+    deleteTree(out);
+    const args: List<string> = listNew();
+    listPush(args, "build");
+    for (s in src) {
+        listPush(args, s);
+    }
+    if (len(o.target) > 0) {
+        listPush(args, "--target=" + o.target);
+    }
+    listPush(args, "--out");
+    listPush(args, out);
+    const s = perfMeasure(armExe(o, arm), args, o.srcRoot, LIMIT_MS);
+    if (len(s.error) > 0) {
+        return err(arm + " 臂测 " + name + " 失败：" + s.error);
+    }
+    if (s.exit != 0) {
+        return err(arm + " 臂 " + armExe(o, arm) + " 编译 " + name + " 失败（退出码 " + toStr(s.exit) + "）：" + s.stderr);
+    }
+    return s;
+}
+
+function values(rows: List<Ref<PerfSample>>, metric: string): List<float> {
+    const out: List<float> = listNew();
+    for (r in rows) {
+        listPush(out, metricOf(r, metric));
+    }
+    return out;
+}
+
+function pair(a: float, b: float): Ref<Jv> {
+    const o = jObject();
+    jSet(o, "A", jFloat(a));
+    jSet(o, "B", jFloat(b));
+    return o;
+}
+
+function samplesJson(rows: List<Ref<PerfSample>>): Ref<Jv> {
+    const a = jArray();
+    for (r in rows) {
+        jPush(a, sampleJson(r));
+    }
+    return a;
+}
+
+// 测一个负载，结果记进 loads；得是否在门限内。
+function compareLoad(o: Ref<Opts>, work: string, name: string, loads: Ref<Jv>): bool | Error {
+    const src = loadArgs(name)?;
+    const ra: List<Ref<PerfSample>> = listNew();
+    const rb: List<Ref<PerfSample>> = listNew();
+    let w = 0;
+    while (w < o.warmup) {
+        once(o, work, name, src, "A")?;
+        once(o, work, name, src, "B")?;
+        w = w + 1;
+    }
+    let i = 0;
+    while (i < o.runs) {
+        // 偶数轮 A 先，奇数轮 B 先。
+        if (i % 2 == 0) {
+            listPush(ra, once(o, work, name, src, "A")?);
+            listPush(rb, once(o, work, name, src, "B")?);
+        } else {
+            listPush(rb, once(o, work, name, src, "B")?);
+            listPush(ra, once(o, work, name, src, "A")?);
+        }
+        i = i + 1;
+    }
+    const ma = median(values(ra, o.metric));
+    const mb = median(values(rb, o.metric));
+    const sa = spreadPct(values(ra, o.metric), ma);
+    const sb = spreadPct(values(rb, o.metric), mb);
+    let delta = 0.0;
+    if (ma != 0.0) {
+        delta = (mb / ma - 1.0) * 100.0;
+    }
+    const ok = delta <= o.threshold;
+    const extra = jObject();
+    let notes = "";
+    for (k in metricNames()) {
+        if (k == o.metric) {
+            continue;
+        }
+        const ka = median(values(ra, k));
+        const kb = median(values(rb, k));
+        jSet(extra, k, pair(ka, kb));
+        if (ka != 0.0) {
+            if (len(notes) > 0) {
+                notes = notes + "，";
+            }
+            notes = notes + k + " " + fixed((kb / ka - 1.0) * 100.0, 2, true) + "%";
+        }
+    }
+    const row = jObject();
+    jSet(row, "median", pair(ma, mb));
+    jSet(row, "delta_pct", jFloat(delta));
+    jSet(row, "spread_pct", pair(sa, sb));
+    jSet(row, "pass", jBool(ok));
+    jSet(row, "secondary_median", extra);
+    const samples = jObject();
+    jSet(samples, "A", samplesJson(ra));
+    jSet(samples, "B", samplesJson(rb));
+    jSet(row, "samples", samples);
+    jSet(loads, name, row);
+    let verdict = "FAIL";
+    if (ok) {
+        verdict = "PASS";
+    }
+    if (len(notes) > 0) {
+        notes = "；" + notes;
+    }
+    print(verdict + " " + name + " " + o.metric + " " + fixed(delta, 3, true) + "%（基线 " + toStr(ma) + "，候选 " + toStr(mb) + "；臂内极差 A "
+        + fixed(sa, 3, false) + "% B " + fixed(sb, 3, false) + "%）" + notes);
+    return ok;
+}
+
+function main(argv: []string): int {
+    if (isPerfHelper(argv)) {
+        return perfHelperMain(argv);
+    }
+    const o = parse(argv) catch (e) {
+        eprint(e.message);
+        return 2;
+    };
+    const work = join(tempDir(), "taixu-perf-" + toStr(monoNs()));
+    if (!mkdirs(work)) {
+        eprint("建不了 " + work);
+        return 2;
+    }
+    const report = jObject();
+    jSet(report, "metric", jString(o.metric));
+    jSet(report, "threshold_pct", jFloat(o.threshold));
+    jSet(report, "runs", jNumber(o.runs));
+    jSet(report, "aa", jBool(o.aa));
+    jSet(report, "src_root", jString(o.srcRoot));
+    const arms = jObject();
+    jSet(arms, "A", jString(armExe(o, "A")));
+    jSet(arms, "B", jString(armExe(o, "B")));
+    jSet(report, "arms", arms);
+    o.base = privateExe(o.base, join(work, "arm-A")) catch (e) {
+        deleteTree(work);
+        eprint(e.message);
+        return 2;
+    };
+    if (!o.aa) {
+        o.cand = privateExe(o.cand, join(work, "arm-B")) catch (e) {
+            deleteTree(work);
+            eprint(e.message);
+            return 2;
+        };
+    }
+    const loads = jObject();
+    jSet(report, "loads", loads);
+    let failed = false;
+    for (name in strSplit(o.loads, ",")) {
+        const ok = compareLoad(o, work, name, loads) catch (e) {
+            deleteTree(work);
+            eprint(e.message);
+            return 1;
+        };
+        if (!ok) {
+            failed = true;
+        }
+    }
+    deleteTree(work);
+    jSet(report, "pass", jBool(!failed));
+    if (len(o.report) > 0) {
+        mkdirs(dirOf(o.report));
+        writeFile(o.report, jPretty(report, 2) + "\n") catch (e) {
+            eprint("写不了 " + o.report + "：" + e.message);
+            return 1;
+        };
+    }
+    if (failed) {
+        print("SUMMARY FAIL");
+        return 1;
+    }
+    print("SUMMARY PASS");
+    return 0;
+}

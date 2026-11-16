@@ -1,0 +1,739 @@
+// 编译画像（`taixu profile compile`）的门（gate.tx 的 compile-profile 步）：面向人与 AI 的契约（能力发现、帮助、
+// compile-profile/1 的字段与十进制串编码、阶段与明细、记录与桥接的分区、排序与截断、人读摘要、用法与编译错误、输出写入失败），并以
+// 独立来源核对数字——`taixu disasm` 的清单重数每个函数的指令与操作数，普通构建的产物核对哈希与字节数，探针
+// bootstrap/native_compile_profile_probe.tx（--leak-check）核对上下文、所有权、重入与 int64、字符串转义的精度。画像不写产物、不运行目标。
+// 运行（仓根）：taixu run --toolchain scripts/test_native_compile_profile.tx --compiler <taixu> --work <目录> [--root <仓库>]
+// 只读文件经系统 shell 接成标准输出（Windows 为 cmd 的 1<文件，类 Unix 为 sh；procSpawn 的 stdout 恒为管道）；FAIL 行里 JSON 值的
+// 细节写成 JSON；输出不是 JSON 时报错退出 1。
+import { absolute, exeName, join, kindOf, mkdirs, nat, readBytes } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { hexOf, lossyText, sha256Of } from "./check_lib";
+import { captureRaw } from "./test_lib";
+import { J_BOOL, J_NUM, J_STR, Jv, jArray, jDump, jObject, jParseBytes, jPretty, jPush, jQuote, jSet, jString, jText } from "./test_json";
+import { at, count, dump, falseAt, isNull, item, sameAt, sameJv, textIs, textOf, trueAt, truthy } from "./test_jv";
+import { contains, digits, endsWith, headChars, reprBytes, slashes } from "./test_text";
+
+const SEC: int = 1000000000;
+const MAX_OUTPUT: int = 67108864;
+const PHASES: []string = ["load+parse", "sema", "codegen", "records", "emit+assemble", "data+tables", "link"];
+const CODEGEN_DETAILS: []string = ["seb1-parse-diagnostics", "seb1-parse", "fab1-parse", "generate"];
+const NUMERIC_KEYS: []string = ["input_ir_words", "bridge_ir_words_copied", "bridge_fn_nodes", "bridge_const_nodes", "bridge_line_nodes",
+    "record_ir_words", "record_parts", "record_utf8_bytes", "record_wall_ns", "native_instructions", "native_operand_uses", "immediate_uses",
+    "zero_immediate_uses", "memory_operand_uses", "analysis_cells"];
+const COUNT_KEYS: []string = ["native_instructions", "native_operand_uses", "immediate_uses", "zero_immediate_uses", "memory_operand_uses"];
+
+struct Ctx {
+    compiler: string,
+    root: string,
+    work: string,
+    rows: Ref<Jv>,
+    total: int,
+    failures: int,
+}
+
+struct Res {
+    code: int,
+    out: Bytes,
+    err: Bytes,
+}
+
+struct Prof {
+    res: Res,
+    doc: Ref<Jv>,
+}
+
+function check(c: Ref<Ctx>, name: string, ok: bool, detail: string): bool {
+    const row = jObject();
+    jSet(row, "name", jString(name));
+    jSet(row, "ok", boolJv(ok));
+    jSet(row, "detail", jString(headChars(detail, 1000)));
+    jPush(c.rows, row);
+    c.total = c.total + 1;
+    if (ok) {
+        print("PASS " + name + " ");
+    } else {
+        c.failures = c.failures + 1;
+        print("FAIL " + name + " " + headChars(detail, 400));
+    }
+    return ok;
+}
+
+function boolJv(b: bool): Ref<Jv> {
+    return new Jv { kind: J_BOOL, text: "", truth: b, items: listNew(), keys: listNew() };
+}
+
+function emptyObj(): Ref<Jv> {
+    return jObject();
+}
+
+function sh(c: Ref<Ctx>, exe: string, args: List<string>, limit: int): Res | Error {
+    const r = captureRaw(exe, args, c.work, limit * SEC, 10 * SEC, MAX_OUTPUT)?;
+    return Res { code: r.code, out: r.out, err: r.err };
+}
+
+function tx(c: Ref<Ctx>, args: []string): Res | Error {
+    const xs: List<string> = listNew();
+    for (a in args) {
+        listPush(xs, a);
+    }
+    return sh(c, c.compiler, xs, 240);
+}
+
+function txList(c: Ref<Ctx>, args: List<string>): Res | Error {
+    return sh(c, c.compiler, args, 240);
+}
+
+function repr(b: Bytes): string {
+    return reprBytes(b, 400);
+}
+
+function parse(b: Bytes, what: string): Ref<Jv> | Error {
+    return jParseBytes(b) catch (e) {
+        return err(what + " 的输出不是 JSON：" + e.message + "：" + reprBytes(b, 400));
+    };
+}
+
+// profile compile <path> --format=json <flags…>；输出另存为 last-profile.stdout／stderr。
+function profile(c: Ref<Ctx>, path: string, flags: []string): Prof | Error {
+    const args: List<string> = listNew();
+    listPush(args, "profile");
+    listPush(args, "compile");
+    listPush(args, path);
+    listPush(args, "--format=json");
+    for (f in flags) {
+        listPush(args, f);
+    }
+    const r = txList(c, args)?;
+    writeFileBytes(nat(join(c.work, "last-profile.stdout")), r.out)?;
+    writeFileBytes(nat(join(c.work, "last-profile.stderr")), r.err)?;
+    return Prof { res: r, doc: parse(r.out, "profile compile")? };
+}
+
+function num(v: Ref<Jv>?, key: string): int {
+    return digits(textOf(v, key));
+}
+
+// 0 或不以 0 开头的十进制数字串（compile-profile/1 的 decimal-string/int64）。
+function isDec(v: Ref<Jv>?): bool {
+    if (v == None) {
+        return false;
+    }
+    const x = v ?? emptyObj();
+    if (x.kind != J_STR || len(x.text) == 0) {
+        return false;
+    }
+    if (x.text == "0") {
+        return true;
+    }
+    if ((byteAt(x.text, 0) ?? 0) == 48) {
+        return false;
+    }
+    let i = 0;
+    while (i < len(x.text)) {
+        const d = byteAt(x.text, i) ?? 0;
+        if (d < 48 || d > 57) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 字段是 JSON 布尔且等于 want（Python 的 x is want）。
+function boolIs(v: Ref<Jv>?, key: string, want: bool): bool {
+    if (want) {
+        return trueAt(v, key);
+    }
+    return falseAt(v, key);
+}
+
+// 名字列表与数组各元素的 name 字段逐一相等。
+function namesAre(xs: Ref<Jv>?, want: []string): bool {
+    if (count(xs) != len(want)) {
+        return false;
+    }
+    let i = 0;
+    while (i < len(want)) {
+        if (!textIs(item(xs, i), "name", want[i])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function sumOf(xs: Ref<Jv>?, key: string): int {
+    let s = 0;
+    let i = 0;
+    while (i < count(xs)) {
+        s = s + num(item(xs, i), key);
+        i = i + 1;
+    }
+    return s;
+}
+
+// 各元素 (key 的数值, −id) 非增（同 Python 的 == sorted(…, reverse=True)）。
+function rankedBy(xs: Ref<Jv>?, key: string): bool {
+    let i = 1;
+    while (i < count(xs)) {
+        const a = item(xs, i - 1);
+        const b = item(xs, i);
+        const ka = num(a, key);
+        const kb = num(b, key);
+        if (ka < kb || (ka == kb && idOf(a) > idOf(b))) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function idOf(v: Ref<Jv>?): int {
+    const x = at(v, "id");
+    if (x == None || (x ?? emptyObj()).kind != J_NUM) {
+        return -1;
+    }
+    return digits((x ?? emptyObj()).text);
+}
+
+function arrHas(xs: Ref<Jv>?, s: string): bool {
+    let i = 0;
+    while (i < count(xs)) {
+        if ((jText(item(xs, i)) ?? "") == s && jText(item(xs, i)) != None) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 操作数是十进制整数（同 Python 的 re.fullmatch(r'-?\d+', op)）；zero 时另须值为 0。
+function intOperand(op: string, zero: bool): bool {
+    let i = 0;
+    if (len(op) > 0 && (byteAt(op, 0) ?? 0) == 45) {
+        i = 1;
+    }
+    if (i >= len(op)) {
+        return false;
+    }
+    let allZero = true;
+    while (i < len(op)) {
+        const d = byteAt(op, i) ?? 0;
+        if (d < 48 || d > 57) {
+            return false;
+        }
+        if (d != 48) {
+            allZero = false;
+        }
+        i = i + 1;
+    }
+    return !zero || allZero;
+}
+
+function writeText(path: string, text: string): void | Error {
+    writeFileBytes(path, bytesFromStr(text))?;
+}
+
+function targetChecks(c: Ref<Ctx>, entry: string, sourceDir: string, marker: string, target: string): void | Error {
+    const triple = "x86_64-" + target;
+    const pr = profile(c, entry, ["--target=" + triple, "--top", "0"])?;
+    const p = pr.res;
+    const doc = pr.doc;
+    let x: Ref<Jv>? = at(doc, "profile");
+    if (!truthy(x)) {
+        x = emptyObj();
+    }
+    const functions = at(x, "functions");
+    const summary = at(x, "summary");
+    check(c, "profile:" + target, p.code == 0 && bytesLen(p.err) == 0 && trueAt(doc, "ok") && textIs(doc, "schema", "compile-profile/1")
+        && textIs(x, "target", triple), repr(p.err));
+    if (p.code != 0) {
+        return;
+    }
+    writeFileBytes(nat(join(c.work, "profile-" + target + ".json")), p.out)?;
+    let numeric = textIs(x, "numeric_encoding", "decimal-string/int64");
+    let i = 0;
+    while (i < count(functions)) {
+        for (k in NUMERIC_KEYS) {
+            if (!isDec(at(item(functions, i), k))) {
+                numeric = false;
+            }
+        }
+        i = i + 1;
+    }
+    check(c, "exact numeric encoding:" + target, numeric, "");
+    const budget = num(summary, "analysis_budget_cells");
+    let skippedOk = true;
+    let skipped = 0;
+    let maxCells = 0;
+    i = 0;
+    while (i < count(functions)) {
+        const f = item(functions, i);
+        const cells = num(f, "analysis_cells");
+        if (!boolIs(f, "analysis_skipped", cells > budget)) {
+            skippedOk = false;
+        }
+        if (trueAt(f, "analysis_skipped")) {
+            skipped = skipped + 1;
+        }
+        if (i == 0 || cells > maxCells) {
+            maxCells = cells;
+        }
+        i = i + 1;
+    }
+    check(c, "analysis budget facts:" + target, budget > 0 && skippedOk && num(summary, "analysis_skipped_functions") == skipped && skipped == 0
+        && num(summary, "analysis_max_cells") == maxCells, "");
+    let codegen = 0;
+    i = 0;
+    while (i < count(at(x, "phases"))) {
+        if (textIs(item(at(x, "phases"), i), "name", "codegen")) {
+            codegen = num(item(at(x, "phases"), i), "wall_ns");
+            break;
+        }
+        i = i + 1;
+    }
+    const hops = at(x, "text_hops");
+    check(c, "codegen details and text hops:" + target, namesAre(at(x, "codegen_details"), CODEGEN_DETAILS)
+        && sumOf(at(x, "codegen_details"), "wall_ns") <= codegen && num(hops, "seb1_utf8_bytes") > 0 && num(hops, "fab1_utf8_bytes") > 0
+        && at(hops, "record_utf8_bytes") != None && sameAt(hops, summary, "record_utf8_bytes"),
+        dump(hops));
+    check(c, "complete function list:" + target, !truthy(at(x, "truncated")) && count(functions) >= 28
+        && num(summary, "functions_total") == num(summary, "functions_returned") && num(summary, "functions_returned") == count(functions), "");
+    check(c, "default stable ranking:" + target, rankedBy(functions, "record_parts"), "");
+    const phases = at(x, "phases");
+    let phasesOk = namesAre(phases, PHASES);
+    i = 0;
+    while (i < count(phases)) {
+        if (num(item(phases, i), "wall_ns") < 0) {
+            phasesOk = false;
+        }
+        i = i + 1;
+    }
+    check(c, "complete monotonic phases:" + target, phasesOk && sumOf(phases, "wall_ns") <= num(at(x, "measurement"), "wall_ns"), "");
+    const m = at(x, "measurement");
+    const cov = at(x, "coverage");
+    check(c, "scope and unknowns:" + target, trueAt(m, "instrumented") && trueAt(m, "overhead_included") && isNull(at(m, "cpu_ns"))
+        && isNull(at(m, "peak_rss_bytes")) && isNull(at(m, "heap_allocations")) && isNull(at(m, "acceptance_verdict"))
+        && falseAt(cov, "runtime_frequencies") && arrHas(at(cov, "excluded_native_counts"), "runtime"), "");
+    check(c, "record partition:" + target, num(summary, "function_record_parts") + 4 == num(summary, "record_parts")
+        && sumOf(functions, "record_parts") == num(summary, "function_record_parts")
+        && sumOf(functions, "record_utf8_bytes") == num(summary, "function_record_utf8_bytes"), "");
+    let bridge = num(summary, "bridge_fn_nodes") == count(functions);
+    i = 0;
+    while (i < count(functions)) {
+        const f = item(functions, i);
+        if (at(f, "input_ir_words") == None || !sameJv(at(f, "input_ir_words"), at(f, "bridge_ir_words_copied"))
+            || !textIs(f, "bridge_fn_nodes", "1")) {
+            bridge = false;
+        }
+        i = i + 1;
+    }
+    check(c, "bridge partitions:" + target, bridge, "");
+
+    const d = tx(c, ["disasm", entry, "--target=" + triple, "--format=json"])?;
+    const listing = parse(d.out, "disasm")?;
+    check(c, "independent listing:" + target, d.code == 0 && falseAt(listing, "truncated"), repr(d.err));
+    const byId: Map<int, Ref<Jv>> = mapNew();
+    const lf = at(listing, "functions");
+    i = 0;
+    while (i < count(lf)) {
+        const f = item(lf, i) ?? emptyObj();
+        mapSet(byId, idx(at(f, "index")), f);
+        i = i + 1;
+    }
+    const totals: Map<string, int> = mapNew();
+    for (k in COUNT_KEYS) {
+        mapSet(totals, k, 0);
+    }
+    let mismatch = "";
+    i = 0;
+    while (i < count(functions)) {
+        const f = item(functions, i);
+        const other = mapGet(byId, idOf(f));
+        if (other == None) {
+            if (len(mismatch) == 0) {
+                mismatch = "清单里没有函数 " + toStr(idOf(f));
+            }
+            i = i + 1;
+            continue;
+        }
+        const o = other ?? emptyObj();
+        let nIns = 0;
+        let nOps = 0;
+        let nImm = 0;
+        let nZero = 0;
+        let nMem = 0;
+        const rows = at(o, "instructions");
+        let r = 0;
+        while (r < count(rows)) {
+            const row = item(rows, r);
+            if (textIs(row, "kind", "instruction")) {
+                nIns = nIns + 1;
+                const ops = at(row, "operands");
+                let q = 0;
+                while (q < count(ops)) {
+                    const op = jText(item(ops, q)) ?? "";
+                    nOps = nOps + 1;
+                    if (intOperand(op, false)) {
+                        nImm = nImm + 1;
+                        if (intOperand(op, true)) {
+                            nZero = nZero + 1;
+                        }
+                    }
+                    if (contains(op, "[")) {
+                        nMem = nMem + 1;
+                    }
+                    q = q + 1;
+                }
+            }
+            r = r + 1;
+        }
+        const expected: Map<string, int> = mapNew();
+        mapSet(expected, "native_instructions", nIns);
+        mapSet(expected, "native_operand_uses", nOps);
+        mapSet(expected, "immediate_uses", nImm);
+        mapSet(expected, "zero_immediate_uses", nZero);
+        mapSet(expected, "memory_operand_uses", nMem);
+        let bad = !sameAt(f, o, "name") || !sameAt(f, o, "module");
+        for (k in COUNT_KEYS) {
+            const v = mapGet(expected, k) ?? 0;
+            if (num(f, k) != v) {
+                bad = true;
+            }
+            mapSet(totals, k, (mapGet(totals, k) ?? 0) + v);
+        }
+        if (bad && len(mismatch) == 0) {
+            mismatch = "[" + toStr(idOf(f)) + ", " + dump(f) + "]";
+        }
+        i = i + 1;
+    }
+    check(c, "independent instruction/operand counts:" + target, len(mismatch) == 0 && mapLen(byId) == count(functions), mismatch);
+    let totalsOk = true;
+    for (k in COUNT_KEYS) {
+        if (num(summary, k) != (mapGet(totals, k) ?? -1)) {
+            totalsOk = false;
+        }
+    }
+    check(c, "unfiltered summary counts:" + target, totalsOk, "");
+    const outDir = nat(join(c.work, "ordinary-" + target));
+    const build = tx(c, ["build", entry, "--target=" + triple, "--out", outDir])?;
+    let exe = "测量";
+    if (target == "windows") {
+        exe = "测量.exe";
+    }
+    const product = nat(join(outDir, exe));
+    let identity = false;
+    if (build.code == 0 && kindOf(product) == 1) {
+        const bytes = readBytes(product)?;
+        identity = hexOf(sha256Of(bytes, 0, bytesLen(bytes))) == textOf(at(x, "product"), "sha256")
+        && bytesLen(bytes) == num(at(x, "product"), "bytes");
+    }
+    check(c, "production identity:" + target, identity, repr(build.err));
+    const topRun = profile(c, entry, ["--target=" + triple, "--top", "1", "--sort=instructions"])?;
+    const top = at(topRun.doc, "profile");
+    // 指令数最多（并列取 id 最小）的函数。
+    let best = -1;
+    let bestIns = 0;
+    i = 0;
+    while (i < count(functions)) {
+        const f = item(functions, i);
+        const n = num(f, "native_instructions");
+        if (best < 0 || n > bestIns || (n == bestIns && idOf(f) < best)) {
+            best = idOf(f);
+            bestIns = n;
+        }
+        i = i + 1;
+    }
+    check(c, "visible top and full totals:" + target, truthy(at(top, "truncated")) && count(at(top, "functions")) == 1
+        && sameAt(at(top, "summary"), summary, "functions_total") && sameAt(at(top, "summary"), summary, "native_instructions")
+        && idOf(item(at(top, "functions"), 0)) == best, "");
+    const defltRun = profile(c, entry, ["--target=" + triple])?;
+    const deflt = at(defltRun.doc, "profile");
+    check(c, "default visible cap:" + target, truthy(at(deflt, "truncated")) && textIs(at(deflt, "summary"), "functions_returned", "20"), "");
+    const timedRun = profile(c, entry, ["--target=" + triple, "--sort=record-time", "--top", "0"])?;
+    const timed = at(timedRun.doc, "profile");
+    check(c, "timed sorting:" + target, rankedBy(at(timed, "functions"), "record_wall_ns"), "");
+    const text = tx(c, ["profile", "compile", entry, "--target=" + triple, "--top", "1"])?;
+    const rendered = lossyText(text.out);
+    check(c, "human summary and scope:" + target, text.code == 0 && contains(rendered, textOf(summary, "record_parts"))
+        && contains(rendered, "记录桥接") && contains(rendered, "零立即数") && contains(rendered, "未写出、未运行")
+        && contains(rendered, "文本中转：SEB1 " + textOf(hops, "seb1_utf8_bytes"))
+        && contains(rendered, "分析预算 " + textOf(summary, "analysis_budget_cells")) && contains(rendered, "--top 0")
+        && contains(rendered, textOf(at(x, "product"), "sha256")), "");
+    let exes = false;
+    const names = localListDir(sourceDir, "") catch (e) {
+        return err("读不了 " + sourceDir + "：" + e.message);
+    };
+    for (n in names) {
+        if (endsWith(n, ".exe")) {
+            exes = true;
+        }
+    }
+    check(c, "no execution/write:" + target, kindOf(marker) == 0 && !exes && !truthy(at(at(x, "product"), "written"))
+        && !truthy(at(at(x, "product"), "executed")), "");
+}
+
+function idx(v: Ref<Jv>?): int {
+    if (v == None || (v ?? emptyObj()).kind != J_NUM) {
+        return -1;
+    }
+    return digits((v ?? emptyObj()).text);
+}
+
+function body(c: Ref<Ctx>): void | Error {
+    const work = c.work;
+    const sourceDir = nat(join(work, "画像 空间's"));
+    if (!mkdirs(sourceDir)) {
+        return err("建不了 " + sourceDir);
+    }
+    const entry = nat(join(sourceDir, "测量.tx"));
+    const marker = nat(join(work, "target-executed.txt"));
+    let src = "";
+    let i = 0;
+    while (i < 26) {
+        if (i > 0) {
+            src = src + "\n";
+        }
+        src = src + "function f" + toStr(i) + "(x: int): int { return x + " + toStr(i) + "; }";
+        i = i + 1;
+    }
+    src = src + "\nexport function main(args: []string): int {\n" + "writeFile(" + jQuote(slashes(marker)) + ", \"EXECUTED\") catch (e) {};\n"
+    + "print(toStr(f25(len(args)))); return 0;\n}\n";
+    writeText(entry, src)?;
+    const bad = nat(join(sourceDir, "错误.tx"));
+    writeText(bad, "export function main(args: []string): int { return unknownName; }\n")?;
+    const module = nat(join(sourceDir, "库.tx"));
+    writeText(module, "export function identity(x: int): int { return x; }\n")?;
+
+    const capRes = tx(c, ["capabilities", "--format=json"])?;
+    const cap = at(parse(capRes.out, "capabilities")?, "capabilities");
+    check(c, "discovery", textIs(cap, "profile", "compile") && textIs(cap, "profile_schema", "compile-profile/1")
+        && arrHas(at(cap, "schemas"), "compile-profile/1"), dump(cap));
+    const help = tx(c, ["profile", "compile", "--help"])?;
+    const helpText = lossyText(help.out);
+    check(c, "help for human and AI", help.code == 0 && contains(helpText, "--top 0") && contains(helpText, "compile-profile/1")
+        && contains(helpText, "JSON"), "");
+
+    // 目标写全三元组：arm64 宿主上裸 macos 落到 aarch64-macos，这里核对的是 x86_64 的清单与计数。
+    for (target in ["windows", "linux", "macos"]) {
+        targetChecks(c, entry, sourceDir, marker, target)?;
+    }
+    const lib = profile(c, module, ["--top", "0"])?;
+    check(c, "module without main", lib.res.code == 0 && truthy(at(lib.doc, "ok")), repr(lib.res.err));
+
+    // 超过分析预算（指令数×寄存器数）的函数整段跳过分析：3000 个局部量约 1.2 万 IR 字 × 3000 余个寄存器。
+    const big = nat(join(sourceDir, "大函数.tx"));
+    let bsrc = "export function big(x: int): int {\n    let v0 = x;";
+    i = 1;
+    while (i < 3000) {
+        bsrc = bsrc + "\n    let v" + toStr(i) + " = v" + toStr(i - 1) + " + " + toStr(i) + ";";
+        i = i + 1;
+    }
+    bsrc = bsrc + "\n    return v2999;\n}\n" + "export function main(args: []string): int { print(toStr(big(len(args)))); return 0; }\n";
+    writeText(big, bsrc)?;
+    const bp = profile(c, big, ["--top", "0"])?;
+    if (check(c, "profile:budget", bp.res.code == 0 && trueAt(bp.doc, "ok"), repr(bp.res.err))) {
+        const x = at(bp.doc, "profile");
+        const budget = num(at(x, "summary"), "analysis_budget_cells");
+        const fs = at(x, "functions");
+        let skipped = "";
+        let consistent = true;
+        let k = 0;
+        while (k < count(fs)) {
+            const f = item(fs, k);
+            if (trueAt(f, "analysis_skipped")) {
+                skipped = skipped + "," + textOf(f, "name");
+            }
+            if (!boolIs(f, "analysis_skipped", num(f, "analysis_cells") > budget)) {
+                consistent = false;
+            }
+            k = k + 1;
+        }
+        check(c, "analysis budget exceeded", skipped == ",big" && textIs(at(x, "summary"), "analysis_skipped_functions", "1")
+            && num(at(x, "summary"), "analysis_max_cells") > budget && consistent, "[" + skipped + "]");
+    }
+
+    const usages: List<List<string>> = listNew();
+    const names: List<string> = listNew();
+    listPush(names, "unknown");
+    listPush(usages, strs2("run", entry));
+    listPush(names, "missing-entry");
+    listPush(usages, strs1("compile"));
+    listPush(names, "top-negative");
+    listPush(usages, strs4("compile", entry, "--top", "-1"));
+    listPush(names, "top-overflow");
+    listPush(usages, strs4("compile", entry, "--top", "9223372036854775808"));
+    listPush(names, "bad-sort");
+    listPush(usages, strs3("compile", entry, "--sort=bogus"));
+    listPush(names, "bad-target");
+    listPush(usages, strs3("compile", entry, "--target=bogus"));
+    listPush(names, "conflicting-format");
+    listPush(usages, strs3("compile", entry, "--format=text"));
+    i = 0;
+    while (i < listLen(usages)) {
+        const args: List<string> = listNew();
+        listPush(args, "profile");
+        const empty: List<string> = listNew();
+        for (a in listGet(usages, i) catch empty) {
+            listPush(args, a);
+        }
+        listPush(args, "--format=json");
+        const p = txList(c, args)?;
+        const e = parse(p.out, "profile")?;
+        check(c, "usage:" + (listGet(names, i) catch ""), p.code == 64 && bytesLen(p.err) == 0 && textIs(e, "schema", "compile-profile/1")
+            && !truthy(at(e, "ok")) && isNull(at(e, "profile")) && textIs(at(e, "error"), "kind", "usage"), "");
+        i = i + 1;
+    }
+    compileFailure(c, "semantic", bad)?;
+    compileFailure(c, "missing-file", nat(join(work, "no-such-file.tx")))?;
+    const tf = tx(c, ["profile", "compile", bad])?;
+    check(c, "human actionable failure", tf.code == 1 && bytesLen(tf.out) == 0 && contains(lossyText(tf.err), "unknownName"), repr(tf.err));
+    outputFailure(c)?;
+
+    const probeDir = nat(join(work, "probe"));
+    const built = tx(c, ["build", nat(join(c.root, "bootstrap/native_compile_profile_probe.tx")), "--toolchain", "--leak-check", "--out",
+            probeDir])?;
+    check(c, "ownership probe build", built.code == 0, repr(built.err));
+    if (built.code == 0) {
+        for (target in ["windows", "linux"]) {
+            const pr = sh(c, nat(join(probeDir, exeName("native_compile_profile_probe"))), strs2(entry, target), 240)?;
+            const out = lossyText(pr.out);
+            check(c, "native context/ownership/reentry:" + target, pr.code == 0 && bytesLen(pr.err) == 0
+                && endsWith(rstrip(out), "PASS_PROFILE_CONTEXT_OWNERSHIP_REENTRY_PRECISION"), repr(pr.err));
+            if (pr.code == 0) {
+                const first = strSplit(out, "\n");
+                const payload = at(parse(bytesFromStr(listGet(first, 0) catch ""), "probe")?, "profile");
+                const f = item(at(payload, "functions"), 0);
+                check(c, "independent int64 and string escaping:" + target, textIs(f, "record_parts", "9007199254740993")
+                    && textIs(f, "name", "引用\"\\\n太虚") && idOf(f) == 0, "");
+            }
+        }
+    }
+}
+
+function compileFailure(c: Ref<Ctx>, name: string, path: string): void | Error {
+    const fp = profile(c, path, [])?;
+    const e = fp.doc;
+    check(c, "compile-failure:" + name, fp.res.code == 1 && bytesLen(fp.res.err) == 0 && isNull(at(e, "profile"))
+        && textIs(at(e, "error"), "kind", "compile") && at(at(e, "error"), "message") != None
+        && textOf(at(e, "error"), "message") != "编译失败", jDump(e));
+}
+
+// 标准输出是只读打开的文件时写入失败须可见：退出 3、stderr 报“输出写入失败”、文件不变。
+function outputFailure(c: Ref<Ctx>): void | Error {
+    const sink = nat(join(c.work, "read-only-stdout.txt"));
+    writeText(sink, "UNCHANGED")?;
+    let shell = "/bin/sh";
+    const args: List<string> = listNew();
+    if (hostTarget() == "windows") {
+        shell = getEnv("ComSpec") ?? "";
+        if (len(shell) == 0) {
+            shell = nat(join(getEnv("SystemRoot") ?? "C:\\Windows", "System32/cmd.exe"));
+        }
+        listPush(args, "/d");
+        listPush(args, "/c");
+        listPush(args, c.compiler);
+        listPush(args, "profile");
+        listPush(args, "compile");
+        listPush(args, "--format=json");
+        listPush(args, "1<read-only-stdout.txt");
+    } else {
+        listPush(args, "-c");
+        listPush(args, "exec \"$0\" profile compile --format=json 1<read-only-stdout.txt");
+        listPush(args, c.compiler);
+    }
+    const r = sh(c, shell, args, 30)?;
+    const kept = readBytes(sink)?;
+    check(c, "output failure is observable", r.code == 3 && contains(lossyText(r.err), "输出写入失败") && lossyText(kept) == "UNCHANGED"
+        && bytesLen(kept) == 9, repr(r.err));
+}
+
+function rstrip(s: string): string {
+    let n = len(s);
+    while (n > 0) {
+        const ch = byteAt(s, n - 1) ?? 0;
+        if (ch != 32 && ch != 9 && ch != 10 && ch != 13 && ch != 11 && ch != 12) {
+            break;
+        }
+        n = n - 1;
+    }
+    return bytesToStr(bytesSlice(bytesFromStr(s), 0, n)) catch "";
+}
+
+function strs1(a: string): List<string> {
+    const xs: List<string> = listNew();
+    listPush(xs, a);
+    return xs;
+}
+
+function strs2(a: string, b: string): List<string> {
+    const xs = strs1(a);
+    listPush(xs, b);
+    return xs;
+}
+
+function strs3(a: string, b: string, x: string): List<string> {
+    const xs = strs2(a, b);
+    listPush(xs, x);
+    return xs;
+}
+
+function strs4(a: string, b: string, x: string, y: string): List<string> {
+    const xs = strs3(a, b, x);
+    listPush(xs, y);
+    return xs;
+}
+
+function run(argv: []string): int | Error {
+    let compiler = "";
+    let work = "";
+    let root = "";
+    let i = 0;
+    while (i + 1 < len(argv)) {
+        if (argv[i] == "--compiler") {
+            compiler = argv[i + 1];
+        } else if (argv[i] == "--work") {
+            work = argv[i + 1];
+        } else if (argv[i] == "--root") {
+            root = argv[i + 1];
+        } else {
+            return err("未知参数：" + argv[i]);
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0 || len(work) == 0 || i != len(argv)) {
+        return err("用法：taixu run --toolchain scripts/test_native_compile_profile.tx --compiler <taixu> --work <目录> [--root <仓库>]");
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = osRealPath(absolute(nat(root)));
+    compiler = osRealPath(absolute(nat(compiler)));
+    if (!mkdirs(absolute(nat(work)))) {
+        return err("建不了工作目录：" + work);
+    }
+    work = osRealPath(absolute(nat(work)));
+    const c = new Ctx { compiler: compiler, root: root, work: work, rows: jArray(), total: 0, failures: 0 };
+    body(c)?;
+    const report = jObject();
+    jSet(report, "rows", c.rows);
+    jSet(report, "failures", numJv(c.failures));
+    writeText(nat(join(work, "report.json")), jPretty(report, 2) + "\n")?;
+    if (c.failures == 0) {
+        print("SUMMARY PASS " + toStr(c.total) + " checks 0 failures");
+        return 0;
+    }
+    print("SUMMARY FAIL " + toStr(c.total) + " checks " + toStr(c.failures) + " failures");
+    return 1;
+}
+
+function numJv(n: int): Ref<Jv> {
+    return new Jv { kind: J_NUM, text: toStr(n), truth: false, items: listNew(), keys: listNew() };
+}
+
+function main(argv: []string): int {
+    return run(argv) catch (e) {
+        eprint("test_native_compile_profile: " + e.message);
+        return 1;
+    };
+}

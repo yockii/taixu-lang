@@ -21,13 +21,13 @@
 //   函数（叶函数、边界）不出，系统按叶函数处理。
 import { rawNameOf } from "./binary_name";
 import { linkMapSymbolsEnabled, linkMapEnabled, linkMapDone, linkMapSynthetic } from "./link_map_data";
-import { LKO_IMAGE_LIMIT, lkoObjectMachine, lkoReject, lkoFailure, lkoAlignUp, lkoLookup, lkoSectionNamed, lkoSectionAddress, lkoSectionBytes, lkoAddress, lkoAddGlobal, lkoGlobalKind, lkoUndefinedExternal, lkoUndefinedWithPrefix, lkoBegin, lkoPlace, lkoGroupSize, lkoGroupAlign, lkoSetGroupBase, lkoDefineGlobals, lkoCacheSymbols, lkoCopySections, lkoRelocate, lkoCollectMap } from "./link_objects";
-import { lkDllOf, lkOwnedRuntime } from "./link_pe";
+import { LKO_IMAGE_LIMIT, lkoObjectMachine, lkoReject, lkoFailure, lkoAlignUp, lkoLookup, lkoSectionNamed, lkoSectionIsCode, lkoAddressIn, lkoSectionBytes, lkoAddress, lkoAddGlobal, lkoGlobalKind, lkoUndefinedExternal, lkoUndefinedWithPrefix, lkoBegin, lkoPlace, lkoGroupSize, lkoGroupAlign, lkoSetGroupBase, lkoDefineGlobals, lkoDefined, lkoCacheSymbols, lkoCopySections, lkoRelocate, lkoCollectMapInto } from "./link_objects";
+import { lkDllOf, lkMapPeSections, lkOwnedRuntime } from "./link_pe";
 import { NativeFunctionImage } from "./native_function_data";
 import { nativeObjectFunctions } from "./native_function_object";
 import { a64Unwind } from "./pe_unwind_a64";
 import { peLinkerMajor, peLinkerMinor, peFinish, peBaseRelocations } from "./pe_image";
-import { T_ARM64_WINDOWS } from "./target";
+import { T_ARM64_WINDOWS, targetName } from "./target";
 
 const BASE: int = 0x140000000;
 const PAGE: int = 4096;
@@ -126,10 +126,11 @@ function collectUnwind(objects: List<Bytes>, program: Ref<NativeFunctionImage>, 
             if (!meta.image.ok) { return "UnwindMetadata:" + meta.image.error; }
             if (meta.present) { image = meta.image; section = meta.inputSection; }
         }
-        if (section > 0 && lkoSectionAddress(o, section) >= 0) {
+        if (section > 0 && lkoSectionIsCode(o, section)) {
             const code = lkoSectionBytes(o, section);
             for (f in image.functions) {
-                if (f.stackModel != "fixed-call" || listLen(f.events) == 0) { continue; }
+                // 没放入的函数（按需链入丢弃的内核函数）不出展开信息。
+                if (f.stackModel != "fixed-call" || listLen(f.events) == 0 || lkoAddressIn(o, section, f.begin) < 0) { continue; }
                 const u = a64Unwind(f, code);
                 if (!u.ok) { return "Unwind:" + f.linkName + ":" + u.error; }
                 for (x in u.fragments) {
@@ -147,8 +148,10 @@ function collectUnwind(objects: List<Bytes>, program: Ref<NativeFunctionImage>, 
 export function linkPeObjects(objects: List<Bytes>, entry: string, guiSubsystem: int, program: Ref<NativeFunctionImage>): int {
     out = bytesNew(0);
     if (listLen(objects) == 0 || lkoObjectMachine(listGet(objects, 0) catch bytesNew(0)) != ELF_AARCH64) { return reject("PeObjectsNotAarch64"); }
-    if (lkoBegin(objects, "aarch64-windows") != 0) { return failed(); }
-    if (lkoPlace() != 0) { return failed(); }
+    if (lkoBegin(objects, targetName(T_ARM64_WINDOWS)) != 0) { return failed(); }
+    const roots: List<string> = listNew();
+    listPush(roots, entry); listPush(roots, "__tx_tls_directory");
+    if (lkoPlace(roots) != 0) { return failed(); }
     const unwind: List<Ref<UnwindRow>> = listNew();
     const unwindError = collectUnwind(objects, program, unwind);
     if (len(unwindError) > 0) { return reject(unwindError); }
@@ -222,7 +225,9 @@ export function linkPeObjects(objects: List<Bytes>, entry: string, guiSubsystem:
     const constEnd = constOff + lkoGroupSize(1);
     const importOff = lkoAlignUp(constEnd, 8);
     const xdataOff = lkoAlignUp(importOff + importSize, 4);
-    const rdEnd = xdataOff + xdataSize;
+    // 调试目录（运行时按需链入）：.xdata 之后一条 IMAGE_DEBUG_TYPE_REPRO 项，同 x86_64（link_pe.tx）。
+    const debugOff = xdataOff + lkoAlignUp(xdataSize, 4);
+    const rdEnd = debugOff + 28;
     const dataOff = lkoAlignUp(rdEnd, PAGE);
     const dataGroupOff = lkoAlignUp(dataOff, lkoGroupAlign(2));
     const dataEnd = dataGroupOff + lkoGroupSize(2);
@@ -236,13 +241,13 @@ export function linkPeObjects(objects: List<Bytes>, entry: string, guiSubsystem:
     lkoSetGroupBase(0, BASE + textOff); lkoSetGroupBase(1, BASE + constOff);
     lkoSetGroupBase(2, BASE + dataGroupOff); lkoSetGroupBase(3, BASE + bssOff);
     if (lkoDefineGlobals() != 0) { return failed(); }
-    for (n in ffi) { if (lkoLookup(n) >= 0) { return reject("FfiImportShadowed: " + n); } }
+    for (n in ffi) { if (lkoDefined(n)) { return reject("FfiImportShadowed: " + n); } }
     // 合成符号：IAT 槽与导入桩。
     q = 0;
     while (q < ni) {
         const slot = IMPORT_PREFIX + (listGet(names, q) catch "");
         const va = BASE + importOff + (listGet(slotOf, q) catch 0);
-        if (lkoLookup(slot) >= 0) { return reject("DuplicateSymbol:" + slot); }
+        if (lkoDefined(slot)) { return reject("DuplicateSymbol:" + slot); }
         lkoAddGlobal(slot, va);
         if (linkMapSymbolsEnabled()) { linkMapSynthetic(rawNameOf(slot), "iat-slot", 1, va); }
         q = q + 1;
@@ -251,7 +256,7 @@ export function linkPeObjects(objects: List<Bytes>, entry: string, guiSubsystem:
     while (k < listLen(stubs)) {
         const nm = listGet(stubs, k) catch "";
         const va = BASE + stubOff + STUB_BYTES * k;
-        if (lkoLookup(nm) >= 0) { return reject("DuplicateSymbol:" + nm); }
+        if (lkoDefined(nm)) { return reject("DuplicateSymbol:" + nm); }
         lkoAddGlobal(nm, va);
         if (linkMapSymbolsEnabled()) { linkMapSynthetic(rawNameOf(nm), "import-stub", 0, va); }
         k = k + 1;
@@ -307,8 +312,9 @@ export function linkPeObjects(objects: List<Bytes>, entry: string, guiSubsystem:
     for (row in unwind) {
         let i = 0;
         while (i < bytesLen(row.xdata)) { bytesSet(out, xdataOff + row.at + i, bytesGet(row.xdata, i) catch 0); i = i + 1; }
-        row.rva = lkoSectionAddress(row.object, row.section) + row.begin - BASE;
+        row.rva = lkoAddressIn(row.object, row.section, row.begin) - BASE;
     }
+    put(debugOff + 12, 16, 4);
     const pdata = bytesNew(0);
     let previousEnd = textOff;
     for (row in sortRows(unwind)) {
@@ -365,6 +371,7 @@ export function linkPeObjects(objects: List<Bytes>, entry: string, guiSubsystem:
         if (dir == 1) { le(h, importOff + descRel, 4); le(h, 20 * (nd + 1), 4); }
         else if (dir == 3 && pdataSize > 0) { le(h, pdataRva, 4); le(h, pdataSize, 4); }
         else if (dir == 5) { le(h, relocRva, 4); le(h, relocSize, 4); }
+        else if (dir == 6) { le(h, debugOff, 4); le(h, 28, 4); }
         else if (dir == 9 && tlsIndex >= 0) { le(h, tlsRva, 4); le(h, 40, 4); }
         else if (dir == 12) { le(h, importOff, 4); le(h, iatSize, 4); }
         else { le(h, 0, 4); le(h, 0, 4); }
@@ -381,7 +388,8 @@ export function linkPeObjects(objects: List<Bytes>, entry: string, guiSubsystem:
     let i = 0;
     while (i < bytesLen(h)) { bytesSet(out, i, bytesGet(h, i) catch 0); i = i + 1; }
     peFinish(out);
-    if (linkMapEnabled()) { lkoCollectMap(BASE, entryAddress); linkMapDone(); }
+    // 映射的输出节同 x86_64-windows 取实际节头：.text、.rdata、.data 恒为前三节，BSS 是 .data 的虚拟尾。
+    if (linkMapEnabled()) { lkMapPeSections(out, BASE); lkoCollectMapInto(BASE, entryAddress, [0, 1, 2, 2]); linkMapDone(); }
     return 0;
 }
 

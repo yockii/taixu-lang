@@ -1,0 +1,259 @@
+// HTTP 分帧的确定性向量与任意分片；RFC 9112 §6.3／§7.1。网络 I/O 不参与这些断言。
+import { HttpLimits, HttpHead, HttpHeader, HttpParser, HttpFeed, httpDefaultLimits, httpRequestParser, httpResponseParser, httpFeed,
+    httpHeaderValues, httpHeaderText } from "std/http_wire";
+import { httpEncodeRequest, httpChunkBytes, httpEndChunks } from "std/http_wire";
+
+struct Seen { heads: int, ends: int, body: Bytes, head: Ref<HttpHead>?, trailers: List<HttpHeader>, consumed: int, done: bool }
+
+function seen(): Ref<Seen> { return new Seen { heads: 0, ends: 0, body: bytesNew(0), head: None, trailers: listNew(), consumed: 0, done: false }; }
+
+function collect(s: Ref<Seen>, r: HttpFeed): void {
+    s.consumed = s.consumed + r.consumed;
+    s.done = r.done;
+    for (e in r.events) {
+        if (e.kind == "headers") { s.heads = s.heads + 1; s.head = e.head; }
+        else if (e.kind == "body") { assert(s.heads == 1 && s.ends == 0, "body event order"); bytesAppend(s.body, e.data); }
+        else if (e.kind == "end") { assert(s.heads == 1, "end event order"); s.ends = s.ends + 1; s.trailers = e.trailers; }
+        else { panic("unknown event " + e.kind); }
+    }
+}
+
+function fresh(request: bool, method: string, limits: HttpLimits): Ref<HttpParser> {
+    if (request) { return httpRequestParser(limits) catch panic("request parser"); }
+    return httpResponseParser(method, limits) catch panic("response parser");
+}
+
+function equal(a: Bytes, b: Bytes): bool {
+    if (bytesLen(a) != bytesLen(b)) { return false; }
+    let i = 0;
+    while (i < bytesLen(a)) { if (bytesGet(a, i) != bytesGet(b, i)) { return false; } i = i + 1; }
+    return true;
+}
+
+function finish(s: Ref<Seen>, body: Bytes, consumed: int): void {
+    assert(s.heads == 1 && s.ends == 1 && s.done, "one complete message");
+    assert(equal(s.body, body), "body octets");
+    assert(s.consumed == consumed, "consumed bytes " + toStr(s.consumed) + " want " + toStr(consumed));
+}
+
+function splits(wire: string, body: string, request: bool, method: string): void {
+    const data = bytesFromStr(wire);
+    let cut = 0;
+    while (cut <= bytesLen(data)) {
+        const p = fresh(request, method, httpDefaultLimits());
+        const s = seen();
+        collect(s, httpFeed(p, bytesSlice(data, 0, cut), false) catch (e) { panic("first cut " + toStr(cut) + " " + e.message); });
+        collect(s, httpFeed(p, bytesSlice(data, cut, bytesLen(data) - cut), false) catch (e) { panic("second cut " + toStr(cut) + " " + e.message); });
+        collect(s, httpFeed(p, bytesNew(0), true) catch (e) { panic("EOF cut " + toStr(cut) + " " + e.message); });
+        finish(s, bytesFromStr(body), bytesLen(data));
+        cut = cut + 1;
+    }
+    const p = fresh(request, method, httpDefaultLimits());
+    const s = seen();
+    let i = 0;
+    while (i < bytesLen(data)) { collect(s, httpFeed(p, bytesSlice(data, i, 1), false) catch panic("bytewise feed")); i = i + 1; }
+    collect(s, httpFeed(p, bytesNew(0), true) catch panic("bytewise EOF"));
+    finish(s, bytesFromStr(body), bytesLen(data));
+}
+
+test "http：定长、无正文、EOF 与 chunked 的任意分片" {
+    splits("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", "hello", false, "GET");
+    splits("HTTP/1.0 200 OK\r\n\r\nclose body", "close body", false, "GET");
+    splits("HTTP/1.1 204 No Content\r\n\r\n", "", false, "GET");
+    splits("HTTP/1.1 304 Unchanged\r\nContent-Length: 999999999\r\n\r\n", "", false, "GET");
+    splits("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4;foo=bar\r\nWiki\r\n5;q=\"a\\\"b\"\r\npedia\r\n0\r\nX-Trail: yes\r\n\r\n", "Wikipedia", false, "GET");
+    splits("POST /submit?q=a%20b HTTP/1.1\r\nHost: example.test\r\nContent-Length: 3, 003\r\nContent-Length: 3\r\n\r\nabc", "abc", true, "");
+    splits("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n", "x", true, "");
+    splits("GET / HTTP/1.1\r\nHost: x\r\n\r\n", "", true, "");
+    splits("GET / HTTP/1.0\r\n\r\n", "", true, "");
+    splits("CONNECT [::1]:443 HTTP/1.1\r\nHost: [::1]:443\r\n\r\n", "", true, "");
+    splits("OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n", "", true, "");
+    splits("GET http://example.test/path?q=x HTTP/1.1\r\nHost: example.test\r\n\r\n", "", true, "");
+    splits("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\nopaque", "opaque", false, "GET");
+}
+
+test "http：头部多值、尾部和连接持久性" {
+    const p = fresh(false, "GET", httpDefaultLimits());
+    const wire = "HTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nset-cookie: b=2\r\nConnection: keep-alive\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0;ext\r\nX-Checksum: abc\r\n\r\n";
+    const s = seen();
+    collect(s, httpFeed(p, bytesFromStr(wire), true) catch panic("headers"));
+    const h = s.head catch panic("head missing");
+    assert(h.canReuse && h.bodyFraming == "chunked" && !h.tunnel, "persistent chunked response");
+    const values = httpHeaderValues(h, "SET-cookie");
+    assert(listLen(values) == 2 && (bytesToStr(listGet(values, 0)) catch "") == "a=1" && (bytesToStr(listGet(values, 1)) catch "") == "b=2", "multi-value order");
+    assert((httpHeaderText(h, "missing") catch panic("absent")).present == false, "missing field");
+    assert((httpHeaderText(h, "set-cookie") catch panic("text")).value == "a=1", "first value");
+    assert(listLen(s.trailers) == 1 && listGet(s.trailers, 0).name == "X-Checksum", "separate trailers");
+    assert(listLen(httpHeaderValues(h, "X-Checksum")) == 0, "trailers not merged");
+    assert(listLen(h.transferCodings) == 2 && listGet(h.transferCodings, 0) == "gzip", "unprocessed transfer coding retained");
+    const old = fresh(false, "GET", httpDefaultLimits());
+    const r = httpFeed(old, bytesFromStr("HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n"), false) catch panic("old");
+    assert(old.head.canReuse && r.done, "HTTP/1.0 explicit keep-alive");
+}
+
+test "http：HEAD、100 后的最终响应、流水线和 CONNECT 余量" {
+    const first = "HTTP/1.1 100 Continue\r\n\r\n";
+    const final = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc";
+    const p = fresh(false, "POST", httpDefaultLimits());
+    const r = httpFeed(p, bytesFromStr(first + final), false) catch panic("100");
+    assert(r.done && r.consumed == len(first), "100 consumes only itself");
+    const q = fresh(false, "POST", httpDefaultLimits());
+    const s = seen();
+    collect(s, httpFeed(q, bytesSlice(bytesFromStr(first + final), r.consumed, len(final)), false) catch panic("final"));
+    finish(s, bytesFromStr("abc"), len(final));
+    const head = "HTTP/1.1 200 OK\r\nContent-Length: 12345\r\n\r\n";
+    const hp = fresh(false, "HEAD", httpDefaultLimits());
+    const hr = httpFeed(hp, bytesFromStr(head + "NEXT"), false) catch panic("HEAD");
+    assert(hr.done && hr.consumed == len(head) && hp.head.bodyFraming == "none", "HEAD leaves bytes");
+    const tunnel = "HTTP/1.1 200 Connected\r\nContent-Length: invalid\r\nTransfer-Encoding: unknown\r\n\r\n";
+    const cp = fresh(false, "CONNECT", httpDefaultLimits());
+    const cr = httpFeed(cp, bytesFromStr(tunnel + "TLS"), false) catch panic("CONNECT");
+    assert(cr.done && cr.consumed == len(tunnel) && cp.head.tunnel && cp.head.bodyFraming == "tunnel" && !cp.head.canReuse, "CONNECT ignores framing fields");
+    const request = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    const rp = fresh(true, "", httpDefaultLimits());
+    const rr = httpFeed(rp, bytesFromStr(request + request), false) catch panic("pipeline");
+    assert(rr.done && rr.consumed == len(request), "one request per parser");
+}
+
+function splitRejected(p: Ref<HttpParser>, data: Bytes, cut: int): bool {
+    httpFeed(p, bytesSlice(data, 0, cut), false) catch (e) { return true; };
+    httpFeed(p, bytesSlice(data, cut, bytesLen(data) - cut), true) catch (e) { return true; };
+    return false;
+}
+
+function invalid(wire: string, request: bool, limits: HttpLimits): bool {
+    const data = bytesFromStr(wire);
+    let cut = 0;
+    while (cut <= bytesLen(data)) {
+        const p = fresh(request, "GET", limits);
+        if (!splitRejected(p, data, cut)) { return false; }
+        cut = cut + 1;
+    }
+    return true;
+}
+
+function errorOf(p: Ref<HttpParser>, data: Bytes): string {
+    httpFeed(p, data, false) catch (e) { return e.message; };
+    return "";
+}
+
+test "http：请求走私与非法分帧拒绝" {
+    for (wire in ["HTTP/1.1 200 OK\n\n", "HTTP/1.1 200x\r\n\r\n", "HTTP/1.1 20\r\n\r\n", "HTTP/1.1 099 Bad\r\n\r\n", "HTTP/2.0 200 OK\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2,3\r\n\r\nabc", "HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 9223372036854775808\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Length : 0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\n folded: value\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Length:\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, chunked\r\n\r\n0\r\n\r\n", "HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n+1\r\nx\r\n0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;bad=\"unterminated\r\nx\r\n0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nxX\n0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nContent-Length: 3\r\n\r\n",
+            "HTTP/1.1 204 No Content\r\nContent-Length: 1\r\n\r\nx", "HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "HTTP/1.1 100 Continue\r\nContent-Length: 0\r\n\r\n"]) {
+        assert(invalid(wire, false, httpDefaultLimits()), "reject response " + wire);
+    }
+    // 常见客户端容忍的两种：省略原因短语的状态行、204 带 Content-Length: 0。
+    splits("HTTP/1.1 200\r\nContent-Length: 2\r\n\r\nok", "ok", false, "GET");
+    splits("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n", "", false, "GET");
+    for (wire in ["GET / HTTP/1.1\r\n\r\n", "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n", "GET / HTTP/1.1\r\nHost: user@host\r\n\r\n",
+            "GET /bad% HTTP/1.1\r\nHost: x\r\n\r\n", "GET * HTTP/1.1\r\nHost: x\r\n\r\n", "CONNECT [::1] HTTP/1.1\r\nHost: x\r\n\r\n",
+            "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\nx", "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked,gzip\r\n\r\nx"]) {
+        assert(invalid(wire, true, httpDefaultLimits()), "reject request " + wire);
+    }
+}
+
+test "http：截断 EOF、资源上限与粘滞错误" {
+    for (wire in ["", "HTTP/1.1 200 OK\r\n", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nx",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n"]) {
+        assert(invalid(wire, false, httpDefaultLimits()), "incomplete EOF");
+    }
+    let limits = httpDefaultLimits();
+    limits.maxBodyBytes = 2;
+    assert(invalid("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc", false, limits), "fixed limit");
+    assert(invalid("HTTP/1.0 200 OK\r\n\r\nabc", false, limits), "EOF limit");
+    assert(invalid("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n", false, limits), "chunk limit");
+    limits = httpDefaultLimits(); limits.maxLineBytes = 12;
+    assert(invalid("HTTP/1.1 200 OK\r\n\r\n", false, limits), "line limit");
+    limits = httpDefaultLimits(); limits.maxHeaderBytes = 18;
+    assert(invalid("HTTP/1.1 200 OK\r\nX: y\r\n\r\n", false, limits), "header byte limit");
+    limits = httpDefaultLimits(); limits.maxHeaders = 0;
+    assert(invalid("HTTP/1.1 200 OK\r\nX: y\r\n\r\n", false, limits), "header count limit");
+    limits = httpDefaultLimits(); limits.maxChunkOverheadBytes = 4;
+    assert(invalid("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", false, limits), "chunk overhead limit");
+    const p = fresh(false, "GET", httpDefaultLimits());
+    const first = errorOf(p, bytesFromStr("broken\n"));
+    const again = errorOf(p, bytesFromStr("HTTP/1.1 204 OK\r\n\r\n"));
+    assert(len(first) > 0 && first == again, "sticky parser failure");
+}
+
+test "http：上限相等时放行与字段控制字节" {
+    let limits = httpDefaultLimits();
+    limits.maxLineBytes = 15; limits.maxHeaderBytes = 19; limits.maxHeaders = 0; limits.maxBodyBytes = 0;
+    const p = fresh(false, "GET", limits);
+    const r = httpFeed(p, bytesFromStr("HTTP/1.1 200 OK\r\n\r\n"), true) catch panic("exact header limits");
+    assert(r.done, "exact limits accepted");
+    limits = httpDefaultLimits(); limits.maxBodyBytes = 0; limits.maxChunkOverheadBytes = 5;
+    const chunked = fresh(false, "GET", limits);
+    assert((httpFeed(chunked, bytesFromStr("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"), false) catch panic("exact chunk overhead")).done,
+        "exact chunk overhead accepted");
+    let c = 0;
+    while (c <= 127) {
+        if ((c < 32 && c != 9) || c == 127) {
+            const raw = bytesFromStr("HTTP/1.1 200 OK\r\nX: ");
+            const octet = bytesNew(1); bytesSet(octet, 0, c);
+            bytesAppend(raw, octet); bytesAppend(raw, bytesFromStr("\r\nContent-Length: 0\r\n\r\n"));
+            const bad = fresh(false, "GET", httpDefaultLimits());
+            assert(len(errorOf(bad, raw)) > 0, "control byte " + toStr(c));
+        }
+        c = c + 1;
+    }
+}
+
+function textFails(head: Ref<HttpHead>): bool {
+    httpHeaderText(head, "x-byte") catch (e) { return true; };
+    return false;
+}
+
+test "http：二进制正文与 obs-text 头值" {
+    const raw = bytesFromStr("HTTP/1.1 200 OK\r\nX-Byte: ");
+    const ff = bytesNew(1); bytesSet(ff, 0, 255);
+    bytesAppend(raw, ff);
+    bytesAppend(raw, bytesFromStr("\r\nContent-Length: 2\r\n\r\n"));
+    const payload = bytesNew(2); bytesSet(payload, 1, 255);
+    bytesAppend(raw, payload);
+    const p = fresh(false, "GET", httpDefaultLimits());
+    const s = seen();
+    collect(s, httpFeed(p, raw, true) catch panic("binary response"));
+    finish(s, payload, bytesLen(raw));
+    const h = s.head catch panic("head");
+    assert(equal(listGet(httpHeaderValues(h, "X-Byte"), 0), ff), "opaque header octets");
+    assert(textFails(h), "explicit text conversion validates UTF-8");
+}
+
+function encodeFails(name: string, value: string): bool {
+    const headers: List<HttpHeader> = listNew();
+    listPush(headers, HttpHeader { name: name, value: bytesFromStr(value) });
+    httpEncodeRequest("GET", "/", "example.test", headers, bytesNew(0), false) catch (e) { return true; };
+    return false;
+}
+
+test "http：请求序列化与头注入拒绝" {
+    const body = bytesNew(3); bytesSet(body, 1, 255); bytesSet(body, 2, 128);
+    const headers: List<HttpHeader> = listNew();
+    listPush(headers, HttpHeader { name: "X-Order", value: bytesFromStr("one") });
+    listPush(headers, HttpHeader { name: "X-Order", value: bytesFromStr("two") });
+    for (chunked in [false, true]) {
+        const wire = httpEncodeRequest("POST", "/test?q=%E4%B8%AD", "[::1]:8080", headers, body, chunked) catch panic("encode");
+        const p = fresh(true, "", httpDefaultLimits());
+        const s = seen();
+        collect(s, httpFeed(p, wire, true) catch panic("parse encoded"));
+        finish(s, body, bytesLen(wire));
+        assert(listLen(httpHeaderValues(p.head, "x-order")) == 2 && listLen(headers) == 2, "ordered headers unchanged");
+    }
+    assert(encodeFails("X-Bad\r\nInjected", "x"), "name injection");
+    assert(encodeFails("X", "value\r\nInjected: true"), "value injection");
+    assert(encodeFails("Content-Length", "3") && encodeFails("Transfer-Encoding", "chunked") && encodeFails("HOST", "other"), "framing owned by encoder");
+    const expected = "3\r\nabc\r\n";
+    assert((bytesToStr(httpChunkBytes(bytesFromStr("abc")) catch panic("chunk")) catch "") == expected, "chunk encoding");
+    assert((bytesToStr(httpEndChunks()) catch "") == "0\r\n\r\n", "end marker");
+}

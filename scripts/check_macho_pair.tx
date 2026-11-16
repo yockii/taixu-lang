@@ -1,0 +1,649 @@
+// Mach-O 目标文件的独立核对：
+// 同一汇编映像写出的 ELF64 可重定位对象与 Mach-O MH_OBJECT 各自独立解析后对照——节内容（除重定位字段）相同，重定位一一对应
+// （位置、目标符号、种类、加数），外部定义在同一节的同一偏移。判定器要与被测编译器相互独立：本文件不导入
+// bootstrap/ 的任何模块。runtime-functions 步用它。
+import { getLE } from "./check_obj";
+
+struct ESec {
+    name: string,
+    body: Bytes,
+    size: int,
+}
+
+struct ESym {
+    name: string,
+    bind: int,
+    sect: string,
+    value: int,
+}
+
+struct ERel {
+    target: string,
+    at: int,
+    typ: int,
+    name: string,
+    addend: int,
+}
+
+struct MSec {
+    name: string,
+    addr: int,
+    size: int,
+    body: Bytes,
+    reloff: int,
+    nreloc: int,
+}
+
+struct MSym {
+    name: string,
+    ntype: int,
+    nsect: int,
+    value: int,
+}
+
+struct MRel {
+    sect: string,
+    address: int,
+    typ: int,
+    pcrel: int,
+    length: int,
+    name: string,
+    addend: int,
+}
+
+struct Elf {
+    machine: int,
+    secs: List<ESec>,
+    syms: List<ESym>,
+    rels: List<ERel>,
+}
+
+struct MachO {
+    cputype: int,
+    secs: List<MSec>,
+    syms: List<MSym>,
+    rels: List<MRel>,
+}
+
+// ELF 节名 → Mach-O 节名。
+function machName(elfName: string): string {
+    if (elfName == ".text") {
+        return "__text";
+    }
+    if (elfName == ".rodata") {
+        return "__const";
+    }
+    if (elfName == ".data") {
+        return "__data";
+    }
+    if (elfName == ".bss") {
+        return "__bss";
+    }
+    return "";
+}
+
+function cstr(d: Bytes, at: int): string | Error {
+    if (at < 0 || at >= bytesLen(d)) {
+        return err("string offset " + toStr(at) + " outside the file");
+    }
+    let end = at;
+    while (end < bytesLen(d) && (bytesGet(d, end) ?? 0) != 0) {
+        end = end + 1;
+    }
+    if (end >= bytesLen(d)) {
+        return err("unterminated string at " + toStr(at));
+    }
+    return bytesToStr(bytesSlice(d, at, end - at));
+}
+
+function slice(d: Bytes, at: int, n: int): Bytes {
+    if (at < 0 || at >= bytesLen(d) || n <= 0) {
+        return bytesNew(0);
+    }
+    let m = n;
+    if (at + m > bytesLen(d)) {
+        m = bytesLen(d) - at;
+    }
+    return bytesSlice(d, at, m);
+}
+
+function sext(v: int, bits: int): int {
+    const top = 1 << (bits - 1);
+    return (v ^ top) - top;
+}
+
+function parseElf(d: Bytes): Elf | Error {
+    if (bytesLen(d) < 64 || getLE(d, 0, 4) != 0x464C457F || (bytesGet(d, 4) ?? 0) != 2 || getLE(d, 16, 2) != 1) {
+        return err("not ELF64 ET_REL");
+    }
+    const machine = getLE(d, 18, 2);
+    const shoff = getLE(d, 40, 8);
+    const shnum = getLE(d, 60, 2);
+    const shstrndx = getLE(d, 62, 2);
+    if (shoff + 64 * shnum > bytesLen(d) || shstrndx >= shnum) {
+        return err("ELF section headers outside the file");
+    }
+    const names: List<string> = listNew();
+    const shstr = getLE(d, shoff + 64 * shstrndx + 24, 8);
+    let i = 0;
+    while (i < shnum) {
+        listPush(names, cstr(d, shstr + getLE(d, shoff + 64 * i, 4))?);
+        i = i + 1;
+    }
+    const secs: List<ESec> = listNew();
+    let symtab = -1;
+    i = 0;
+    while (i < shnum) {
+        const h = shoff + 64 * i;
+        const name = listGet(names, i) catch "";
+        if (len(machName(name)) > 0) {
+            const kind = getLE(d, h + 4, 4);
+            const off = getLE(d, h + 24, 8);
+            const size = getLE(d, h + 32, 8);
+            let body = bytesNew(0);
+            if (kind != 8) {
+                body = slice(d, off, size);
+            }
+            listPush(secs, ESec { name: name, body: body, size: size });
+        }
+        if (symtab < 0 && name == ".symtab") {
+            symtab = i;
+        }
+        i = i + 1;
+    }
+    if (symtab < 0) {
+        return err("no .symtab");
+    }
+    const sh = shoff + 64 * symtab;
+    const link = getLE(d, sh + 40, 4);
+    if (link >= shnum) {
+        return err("symtab link");
+    }
+    const strings = getLE(d, shoff + 64 * link + 24, 8);
+    const symoff = getLE(d, sh + 24, 8);
+    const nsyms = getLE(d, sh + 32, 8) / 24;
+    const syms: List<ESym> = listNew();
+    i = 0;
+    while (i < nsyms) {
+        const p = symoff + 24 * i;
+        if (p + 24 > bytesLen(d)) {
+            return err("symbol table outside the file");
+        }
+        const shndx = getLE(d, p + 6, 2);
+        let sect = "";
+        if (shndx > 0 && shndx < shnum) {
+            sect = listGet(names, shndx) catch "";
+        }
+        listPush(syms, ESym { name: cstr(d, strings + getLE(d, p, 4))?, bind: getLE(d, p + 4, 1) >> 4, sect: sect, value: getLE(d, p + 8, 8) });
+        i = i + 1;
+    }
+    const rels: List<ERel> = listNew();
+    i = 0;
+    while (i < shnum) {
+        const h = shoff + 64 * i;
+        if (getLE(d, h + 4, 4) == 4) {
+            const info = getLE(d, h + 44, 4);
+            if (info >= shnum) {
+                return err("relocation target section");
+            }
+            const target = listGet(names, info) catch "";
+            const off = getLE(d, h + 24, 8);
+            const n = getLE(d, h + 32, 8) / 24;
+            let k = 0;
+            while (k < n) {
+                const p = off + 24 * k;
+                if (p + 24 > bytesLen(d)) {
+                    return err("relocations outside the file");
+                }
+                const rinfo = getLE(d, p + 8, 8);
+                const symIndex = rinfo >>> 32;
+                if (symIndex >= listLen(syms)) {
+                    return err("relocation symbol index");
+                }
+                listPush(rels, ERel { target: target, at: getLE(d, p, 8), typ: rinfo & 0xFFFFFFFF,
+                        name: (listGet(syms, symIndex) catch ESym { name: "", bind: 0, sect: "", value: 0 }).name, addend: getLE(d, p + 16, 8) });
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return Elf { machine: machine, secs: secs, syms: syms, rels: rels };
+}
+
+function nameAt(d: Bytes, at: int, n: int): string {
+    let end = n;
+    while (end > 0 && (bytesGet(d, at + end - 1) ?? 1) == 0) {
+        end = end - 1;
+    }
+    return bytesToStr(slice(d, at, end)) catch "";
+}
+
+function parseMachO(d: Bytes): MachO | Error {
+    if (bytesLen(d) < 32 || getLE(d, 0, 4) != 0xFEEDFACF || getLE(d, 12, 4) != 1) {
+        return err("not MH_OBJECT");
+    }
+    const cputype = getLE(d, 4, 4);
+    const ncmds = getLE(d, 16, 4);
+    let at = 32;
+    const secs: List<MSec> = listNew();
+    let symoff = -1;
+    let nsyms = 0;
+    let stroff = 0;
+    const dysym: List<int> = listNew();
+    let k = 0;
+    while (k < ncmds) {
+        if (at + 8 > bytesLen(d)) {
+            return err("load commands outside the file");
+        }
+        const cmd = getLE(d, at, 4);
+        const size = getLE(d, at + 4, 4);
+        if (cmd == 0x19) {
+            const n = getLE(d, at + 64, 4);
+            let j = 0;
+            while (j < n) {
+                const h = at + 72 + 80 * j;
+                const length = getLE(d, h + 40, 8);
+                const off = getLE(d, h + 48, 4);
+                const flags = getLE(d, h + 64, 4);
+                let body = bytesNew(0);
+                if ((flags & 0xff) != 1) {
+                    body = slice(d, off, length);
+                }
+                listPush(secs, MSec { name: nameAt(d, h, 16), addr: getLE(d, h + 32, 8), size: length, body: body, reloff: getLE(d, h + 56, 4),
+                        nreloc: getLE(d, h + 60, 4) });
+                j = j + 1;
+            }
+        }
+        if (cmd == 2) {
+            symoff = getLE(d, at + 8, 4);
+            nsyms = getLE(d, at + 12, 4);
+            stroff = getLE(d, at + 16, 4);
+        }
+        if (cmd == 0xB) {
+            let q = 0;
+            while (q < 6) {
+                listPush(dysym, getLE(d, at + 8 + 4 * q, 4));
+                q = q + 1;
+            }
+        }
+        at = at + size;
+        k = k + 1;
+    }
+    if (symoff < 0 || listLen(dysym) != 6) {
+        return err("no LC_SYMTAB or LC_DYSYMTAB");
+    }
+    const syms: List<MSym> = listNew();
+    let i = 0;
+    while (i < nsyms) {
+        const p = symoff + 16 * i;
+        if (p + 16 > bytesLen(d)) {
+            return err("symbol table outside the file");
+        }
+        listPush(syms, MSym { name: cstr(d, stroff + getLE(d, p, 4))?, ntype: getLE(d, p + 4, 1), nsect: getLE(d, p + 5, 1), value: getLE(d, p + 8, 8) });
+        i = i + 1;
+    }
+    const d0 = listGet(dysym, 0) catch -1;
+    const d1 = listGet(dysym, 1) catch -1;
+    const d2 = listGet(dysym, 2) catch -1;
+    const d3 = listGet(dysym, 3) catch -1;
+    const d4 = listGet(dysym, 4) catch -1;
+    const d5 = listGet(dysym, 5) catch -1;
+    if (!(d0 == 0 && d2 == d1 && d4 == d2 + d3 && d4 + d5 == nsyms)) {
+        return err("dysymtab partition");
+    }
+    const rels: List<MRel> = listNew();
+    for (s in secs) {
+        let pending = 0;
+        let r = 0;
+        while (r < s.nreloc) {
+            const p = s.reloff + 8 * r;
+            if (p + 8 > bytesLen(d)) {
+                return err("relocations outside the file");
+            }
+            const address = sext(getLE(d, p, 4), 32);
+            const w = getLE(d, p + 4, 4);
+            const symbolnum = w & 0xffffff;
+            const typ = w >> 28;
+            if (cputype == 0x0100000C && typ == 10) {
+                // ARM64_RELOC_ADDEND：r_symbolnum 为 24 位有符号加数，修饰下一条。
+                pending = sext(symbolnum, 24);
+                r = r + 1;
+                continue;
+            }
+            if (((w >> 27) & 1) != 1) {
+                return err("non-extern relocation");
+            }
+            if (symbolnum >= listLen(syms)) {
+                return err("relocation symbol index");
+            }
+            listPush(rels, MRel { sect: s.name, address: address, typ: typ, pcrel: (w >> 24) & 1, length: (w >> 25) & 3,
+                    name: (listGet(syms, symbolnum) catch MSym { name: "", ntype: 0, nsect: 0, value: 0 }).name, addend: pending });
+            pending = 0;
+            r = r + 1;
+        }
+        if (pending != 0) {
+            return err("dangling ARM64_RELOC_ADDEND");
+        }
+    }
+    return MachO { cputype: cputype, secs: secs, syms: syms, rels: rels };
+}
+
+// R_X86_64_*：1 为 64，2 为 PC32。R_AARCH64_*：257 ABS64，282 JUMP26，283 CALL26，275 ADR_PREL_PG_HI21，277 ADD_ABS_LO12_NC，
+// 278／284／285／286／299 为 LDST8／16／32／64／128_ABS_LO12_NC。得（种类, 宽度）；不认识的种类为空串。
+function relKind(a64: bool, typ: int): string {
+    if (!a64) {
+        if (typ == 1) {
+            return "UNSIGNED";
+        }
+        if (typ == 2) {
+            return "PC32";
+        }
+        return "";
+    }
+    if (typ == 257) {
+        return "UNSIGNED";
+    }
+    if (typ == 282 || typ == 283) {
+        return "BRANCH26";
+    }
+    if (typ == 275) {
+        return "PAGE21";
+    }
+    if (typ == 277 || typ == 278 || typ == 284 || typ == 285 || typ == 286 || typ == 299) {
+        return "PAGEOFF12";
+    }
+    return "";
+}
+
+function relWidth(kind: string): int {
+    if (kind == "UNSIGNED") {
+        return 8;
+    }
+    return 4;
+}
+
+function hx(v: int): string {
+    const digits = "0123456789abcdef";
+    if (v == 0) {
+        return "0x0";
+    }
+    let s = "";
+    let x = v;
+    while (x != 0) {
+        s = (bytesToStr(bytesSlice(bytesFromStr(digits), x & 15, 1)) catch "?") + s;
+        x = x >>> 4;
+    }
+    return "0x" + s;
+}
+
+function i32At(b: Bytes, at: int): int {
+    return sext(getLE(b, at, 4), 32);
+}
+
+struct Mask {
+    sect: string,
+    at: int,
+    w: int,
+}
+
+// 对照 ELF64 与 Mach-O 两个对象：返回问题列表（空即一致）。解析失败时得一条 unparseable 说明。
+export function machoPairProblems(elfBytes: Bytes, machoBytes: Bytes): List<string> {
+    const problems: List<string> = listNew();
+    const e = parseElf(elfBytes) catch (x) {
+        listPush(problems, "unparseable: " + x.message);
+        return problems;
+    };
+    const m = parseMachO(machoBytes) catch (x) {
+        listPush(problems, "unparseable: " + x.message);
+        return problems;
+    };
+    const a64 = e.machine == 183;
+    if ((a64 && m.cputype != 0x0100000C) || (!a64 && (e.machine != 62 || m.cputype != 0x01000007))) {
+        listPush(problems, "machine " + toStr(e.machine) + " vs cputype " + hx(m.cputype));
+        return problems;
+    }
+    // 重定位：按（节, 位置）对上；用过的划掉。
+    const used: List<bool> = listNew();
+    for (r in m.rels) {
+        listPush(used, false);
+    }
+    const masks: List<Mask> = listNew();
+    for (r in e.rels) {
+        const sect = machName(r.target);
+        const kind = relKind(a64, r.typ);
+        let got = -1;
+        let i = 0;
+        // 同 Python 以（节, 位置）为键建表：同一位置有多条时以后一条为准。
+        while (i < listLen(m.rels)) {
+            const q = listGet(m.rels, i) catch MRel { sect: "", address: 0, typ: 0, pcrel: 0, length: 0, name: "", addend: 0 };
+            if (q.sect == sect && q.address == r.at) {
+                got = i;
+            }
+            i = i + 1;
+        }
+        if (got >= 0 && (listGet(used, got) catch true)) {
+            got = -1;
+        }
+        if (len(kind) == 0 || got < 0) {
+            listPush(problems, "relocation " + r.target + "+" + hx(r.at) + " type " + toStr(r.typ) + " " + r.name + ": no Mach-O counterpart");
+            continue;
+        }
+        // 同 Python 的 dict.pop：同一（节, 位置）上与之重名的其余项也一并去掉。
+        i = 0;
+        while (i < listLen(m.rels)) {
+            const q = listGet(m.rels, i) catch MRel { sect: "", address: 0, typ: 0, pcrel: 0, length: 0, name: "", addend: 0 };
+            if (q.sect == sect && q.address == r.at) {
+                listSet(used, i, true);
+            }
+            i = i + 1;
+        }
+        const q = listGet(m.rels, got) catch MRel { sect: "", address: 0, typ: 0, pcrel: 0, length: 0, name: "", addend: 0 };
+        let body = bytesNew(0);
+        for (s in m.secs) {
+            if (s.name == sect) {
+                body = s.body;
+            }
+        }
+        if (q.name != "_" + r.name) {
+            listPush(problems, "relocation " + sect + "+" + hx(r.at) + " symbol " + r.name + " vs " + q.name);
+        }
+        let inplace = 0;
+        if (a64) {
+            let want = "4,0,2";
+            if (kind == "UNSIGNED") {
+                want = "0,0,3";
+            } else if (kind == "BRANCH26") {
+                want = "2,1,2";
+            } else if (kind == "PAGE21") {
+                want = "3,1,2";
+            }
+            if (toStr(q.typ) + "," + toStr(q.pcrel) + "," + toStr(q.length) != want) {
+                listPush(problems, "relocation " + sect + "+" + hx(r.at) + " kind " + kind + " vs (" + toStr(q.typ) + "," + toStr(q.pcrel) + "," + toStr(q.length) + ")");
+            }
+            inplace = q.addend;
+            if (kind == "UNSIGNED") {
+                inplace = getLE(body, r.at, 8);
+            }
+        } else {
+            let ok = q.typ == 0 && q.pcrel == 0 && q.length == 3;
+            if (kind != "UNSIGNED") {
+                ok = (q.typ == 1 || q.typ == 2) && q.pcrel == 1 && q.length == 2;
+            }
+            if (!ok) {
+                listPush(problems, "relocation " + sect + "+" + hx(r.at) + " kind " + kind + " vs (" + toStr(q.typ) + "," + toStr(q.pcrel) + "," + toStr(q.length) + ")");
+            }
+            if (kind == "UNSIGNED") {
+                inplace = getLE(body, r.at, 8);
+            } else {
+                // Mach-O 的原位加数相对字段末尾；ELF 的 RELA 以字段起点为 P，故差 4。分支（BRANCH）只出现在 call／jmp／jcc 上。
+                inplace = i32At(body, r.at) - 4;
+                let prev = bytesGet(body, r.at - 1) ?? -1;
+                if (r.at == 0) {
+                    prev = bytesGet(body, bytesLen(body) - 1) ?? -1;
+                }
+                const isBranch = prev == 0xE8 || prev == 0xE9 || (r.at >= 2 && (bytesGet(body, r.at - 2) ?? -1) == 0x0F && prev >= 0x80 && prev <= 0x8F);
+                if ((q.typ == 2) != (sect == "__text" && isBranch)) {
+                    listPush(problems, "relocation " + sect + "+" + hx(r.at) + " BRANCH vs SIGNED");
+                }
+            }
+        }
+        if (inplace != r.addend) {
+            listPush(problems, "relocation " + sect + "+" + hx(r.at) + " addend " + toStr(r.addend) + " vs " + toStr(inplace));
+        }
+        let w = relWidth(kind);
+        if (a64 && kind != "UNSIGNED") {
+            w = 0;
+        }
+        listPush(masks, Mask { sect: sect, at: r.at, w: w });
+    }
+    let i = 0;
+    while (i < listLen(m.rels)) {
+        if (!(listGet(used, i) catch true)) {
+            const q = listGet(m.rels, i) catch MRel { sect: "", address: 0, typ: 0, pcrel: 0, length: 0, name: "", addend: 0 };
+            // 同 Python 的 dict：同一（节, 位置）只报最后一条。
+            let last = true;
+            let j = i + 1;
+            while (j < listLen(m.rels)) {
+                const z = listGet(m.rels, j) catch q;
+                if (z.sect == q.sect && z.address == q.address) {
+                    last = false;
+                }
+                j = j + 1;
+            }
+            if (last) {
+                listPush(problems, "Mach-O relocation " + q.sect + "+" + hx(q.address) + " " + q.name + " without ELF counterpart");
+            }
+        }
+        i = i + 1;
+    }
+    // 节内容：重定位字段之外逐字节相同（x86 的 RELA 字段与 UNSIGNED 字段 ELF 写 0、Mach-O 写原位加数；A64 指令字相同）。
+    for (ename in [".text", ".rodata", ".data", ".bss"]) {
+        const mname = machName(ename);
+        let ebody = bytesNew(0);
+        let esize = 0;
+        for (s in e.secs) {
+            if (s.name == ename) {
+                ebody = s.body;
+                esize = s.size;
+            }
+        }
+        let found = false;
+        let msize = 0;
+        let mbody = bytesNew(0);
+        for (s in m.secs) {
+            if (s.name == mname) {
+                found = true;
+                msize = s.size;
+                mbody = s.body;
+            }
+        }
+        if (!found || msize != esize) {
+            listPush(problems, "section " + mname + " size");
+            continue;
+        }
+        const a = bytesSlice(ebody, 0, bytesLen(ebody));
+        const b = bytesSlice(mbody, 0, bytesLen(mbody));
+        for (k in masks) {
+            if (k.sect == mname) {
+                let q = 0;
+                while (q < k.w) {
+                    if (k.at + q < bytesLen(a)) {
+                        bytesSet(a, k.at + q, 0);
+                    }
+                    if (k.at + q < bytesLen(b)) {
+                        bytesSet(b, k.at + q, 0);
+                    }
+                    q = q + 1;
+                }
+            }
+        }
+        if (!bytesEqual(a, b)) {
+            listPush(problems, "section " + mname + " bytes differ");
+        }
+    }
+    // 外部定义：同名（加前导 _）、同节、同节内偏移。
+    const wantNames: List<string> = listNew();
+    const wantVals: List<string> = listNew();
+    for (s in e.syms) {
+        if (s.bind == 1 && len(machName(s.sect)) > 0) {
+            setPair(wantNames, wantVals, "_" + s.name, machName(s.sect) + "+" + toStr(s.value));
+        }
+    }
+    const haveNames: List<string> = listNew();
+    const haveVals: List<string> = listNew();
+    for (s in m.syms) {
+        if (s.ntype == 0x0F) {
+            if (s.nsect < 1 || s.nsect > listLen(m.secs)) {
+                setPair(haveNames, haveVals, s.name, "?");
+            } else {
+                const sec = listGet(m.secs, s.nsect - 1) catch MSec { name: "", addr: 0, size: 0, body: bytesNew(0), reloff: 0, nreloc: 0 };
+                setPair(haveNames, haveVals, s.name, sec.name + "+" + toStr(s.value - sec.addr));
+            }
+        }
+    }
+    if (!samePairs(wantNames, wantVals, haveNames, haveVals)) {
+        listPush(problems, "exports differ: " + toStr(listLen(wantNames)) + " vs " + toStr(listLen(haveNames)));
+    }
+    let names = "";
+    let n = 0;
+    let ok = listLen(m.secs) == 4;
+    for (want in ["__text", "__const", "__data", "__bss"]) {
+        let c = 0;
+        for (s in m.secs) {
+            if (s.name == want) {
+                c = c + 1;
+            }
+        }
+        if (c != 1) {
+            ok = false;
+        }
+    }
+    if (!ok) {
+        for (s in m.secs) {
+            if (n > 0) {
+                names = names + ", ";
+            }
+            names = names + s.name;
+            n = n + 1;
+        }
+        listPush(problems, "Mach-O sections [" + names + "]");
+    }
+    return problems;
+}
+
+// 同 Python 的 dict 赋值：同名的以后一个为准。
+function setPair(names: List<string>, vals: List<string>, name: string, val: string): void {
+    let i = 0;
+    while (i < listLen(names)) {
+        if ((listGet(names, i) catch "") == name) {
+            listSet(vals, i, val);
+            return;
+        }
+        i = i + 1;
+    }
+    listPush(names, name);
+    listPush(vals, val);
+}
+
+function samePairs(an: List<string>, av: List<string>, bn: List<string>, bv: List<string>): bool {
+    if (listLen(an) != listLen(bn)) {
+        return false;
+    }
+    let i = 0;
+    while (i < listLen(an)) {
+        const name = listGet(an, i) catch "";
+        let found = false;
+        let j = 0;
+        while (j < listLen(bn)) {
+            if ((listGet(bn, j) catch "") == name) {
+                found = (listGet(bv, j) catch "") == (listGet(av, i) catch "?");
+            }
+            j = j + 1;
+        }
+        if (!found) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}

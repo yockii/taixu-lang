@@ -1,0 +1,1081 @@
+// LSP 聚合资源预算与输出背压的门。安全审查攻关第 5 项。
+//
+// 对真实的 `taixu lsp` 进程核对：initialize 宣告的资源预算（客户端只能收紧）；打开文档的个数、合计字节、单文档字节与一条 didChange
+// 的编辑工作量超出时文档转为超预算（说明诊断、请求回 -32803 与 reason、全文变更恢复、导入方按磁盘内容分析）；上千个独立文档一轮
+// 分析的时限；连续编辑时去抖的最长等待；$/cancelRequest（排队中与正在同步分析的请求回 -32800）；分析预算与热缓存预算；单文件诊断
+// 截断；回复过大；客户端停读时服务阻塞而内存、CPU 不涨，恢复读后消息完整，阻塞中关读端即退出。
+//
+// 客户端是 test_proto.tx 的分帧模式（重名键算解析失败）。收消息与灌编辑在单线程里交替：等回复、等条件、计时时都在收消息，停读时
+// Peer.paused 只收 stderr；灌编辑以 procTryWrite 逐段写当前这一帧、写完才计数，恢复读后写完正在写的那一帧再停。进程号取 procPid，
+// 工作集与 CPU 时间取 proc_info_os_*.tx；关读端用 procCloseStream(h, 1)（D3 v0.54）。
+//
+// FAIL 行与报告里的细节是 JSON 原文或文字，报告里通过项的 detail 也写成文字。写服务 stdin 失败时不中止（该项随后的判据照常失败）。
+//
+// 运行（仓根）：taixu run --toolchain scripts/test_lsp_resources.tx --compiler <taixu> --work <目录>
+// 任何 FAIL 时退出码 1。
+import { absolute, deleteTree, join, mkdirs, nat } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { J_ARR, J_NULL, Jv, jDumpSpaced, jEq, jLen, jNull, jParse, jQuote, jSet } from "./test_json";
+import { at, count, dump, has, isObj, item, sameJv, textIs, textOf } from "./test_jv";
+import { headChars } from "./test_text";
+import { MODE_FRAMES, Peer, nap, peerClose, peerExited, peerPump, peerStart } from "./test_proto";
+import { uriOf } from "./test_lsp_session";
+import { procCpuUs, procRss } from "./proc_info_os";
+
+const MIB: int = 1048576;
+const MS: int = 1000000;
+const DEFAULTS: string = "{\"max_message_bytes\": 33554432, \"max_response_bytes\": 33554432, \"max_document_bytes\": 33554432, \"max_open_bytes\": 268435456, \"max_open_documents\": 1024, \"max_change_work_bytes\": 67108864, \"max_analysis_source_bytes\": 33554432, \"max_hot_cache_source_bytes\": 4194304, \"max_diagnostics_per_file\": 1000, \"max_diagnostics_bytes_per_file\": 1048576, \"debounce_ms\": 300, \"max_debounce_ms\": 2000, \"cancellation\": \"between_roots\", \"client_stdout_write_nonblocking\": false, \"client_stdout_write_deadline_ms\": null}";
+
+// ---------------------------------------------------------------- 逐项结果
+
+struct Row {
+    check: string,
+    ok: bool,
+    detail: string,
+}
+
+struct Ctx {
+    compiler: string,
+    rows: List<Row>,
+    bad: int,
+}
+
+// 逐项输出 'PASS 名字' 或 'FAIL 名字: 细节'（细节至多 600 字符；报告里至多 3000）。
+function check(c: Ref<Ctx>, label: string, ok: bool, detail: string): void {
+    if (ok) {
+        print("PASS " + label);
+        listPush(c.rows, Row { check: label, ok: true, detail: detail });
+        return;
+    }
+    print("FAIL " + label + ": " + headChars(detail, 600));
+    listPush(c.rows, Row { check: label, ok: false, detail: headChars(detail, 3000) });
+    c.bad = c.bad + 1;
+}
+
+function pyBool(b: bool): string {
+    if (b) {
+        return "True";
+    }
+    return "False";
+}
+
+// 秒，一位小数（同 Python 的 '%.1f'；在第二位上四舍五入）。
+function sec1(ns: int): string {
+    const t = (ns + 50 * MS) / (100 * MS);
+    return toStr(t / 10) + "." + toStr(t % 10);
+}
+
+// 秒，至多两位小数（同 Python 的 round(x, 2) 再 str：末尾的 0 去掉、至少一位小数）。
+function sec2(ns: int): string {
+    const t = (ns + 5 * MS) / (10 * MS);
+    let frac = toStr(t % 100);
+    if (t % 100 < 10) {
+        frac = "0" + frac;
+    }
+    if (t % 10 == 0) {
+        frac = toStr((t % 100) / 10);
+    }
+    return toStr(t / 100) + "." + frac;
+}
+
+function repeat(s: string, n: int): string {
+    const b = bytesNew(0);
+    const one = bytesFromStr(s);
+    let i = 0;
+    while (i < n) {
+        bytesAppend(b, one);
+        i = i + 1;
+    }
+    return bytesToStr(b) catch "";
+}
+
+function good(i: int): string {
+    return "export function main(args: []string): int {\n    let v" + toStr(i) + " = " + toStr(i) + ";\n    return v" + toStr(i) + ";\n}\n";
+}
+
+function bad(name: string): string {
+    return "export function main(args: []string): int {\n    return " + name + ";\n}\n";
+}
+
+function errors(n: int): string {
+    const b = bytesFromStr("export function main(args: []string): int {\n");
+    let i = 0;
+    while (i < n) {
+        bytesAppend(b, bytesFromStr("    let e" + toStr(i) + ": int = missing" + toStr(i) + ";\n"));
+        i = i + 1;
+    }
+    bytesAppend(b, bytesFromStr("    return 0;\n}\n"));
+    return bytesToStr(b) catch "";
+}
+
+function writeText(path: string, text: string): void {
+    writeFile(path, text) catch (e) {
+        eprint("写不了 " + path + "：" + e.message);
+    };
+}
+
+function range(sl: int, sc: int, el: int, ec: int): string {
+    return "{\"start\": {\"line\": " + toStr(sl) + ", \"character\": " + toStr(sc) + "}, \"end\": {\"line\": " + toStr(el) + ", \"character\": "
+    + toStr(ec) + "}}";
+}
+
+function fullText(text: string): string {
+    return "[{\"text\": " + jQuote(text) + "}]";
+}
+
+// ---------------------------------------------------------------- 一个 `taixu lsp` 进程
+
+struct Note {
+    t: int,
+    m: Ref<Jv>,
+}
+
+struct Lsp {
+    p: Ref<Peer>,
+    pid: int,
+    resps: Map<string, Ref<Jv>>,
+    notes: List<Note>,
+    nextId: int,
+    // 灌编辑的写线程：当前这一帧、已写出的字节、写完的帧数、版本号。
+    flood: Bytes,
+    floodAt: int,
+    written: int,
+    floodV: int,
+}
+
+function lspStart(c: Ref<Ctx>, ws: string, read: bool): Ref<Lsp> | Error {
+    const args: List<string> = listNew();
+    listPush(args, "lsp");
+    listPush(args, "--stdio");
+    listPush(args, "--workspace");
+    listPush(args, ws);
+    const p = peerStart(c.compiler, args, ws, MODE_FRAMES, true)?;
+    p.paused = !read;
+    const notes: List<Note> = listNew();
+    return new Lsp { p: p, pid: procPid(p.h), resps: mapNew<string, Ref<Jv>>(), notes: notes, nextId: 0, flood: bytesNew(0), floodAt: 0,
+        written: 0, floodV: 2 };
+}
+
+// 读线程：回复按 id（JSON 原文）收进 resps，其余（通知与服务端请求）带到达时刻收进 notes。
+function collect(l: Ref<Lsp>): void {
+    if (listLen(l.p.msgs) == 0) {
+        return;
+    }
+    const now = monoNs();
+    for (m in l.p.msgs) {
+        if (isObj(m) && has(m, "id") && !has(m, "method")) {
+            mapSet(l.resps, jDumpSpaced(at(m, "id") ?? jNull()), m);
+        } else {
+            listPush(l.notes, Note { t: now, m: m });
+        }
+    }
+    const fresh: List<Ref<Jv>> = listNew();
+    l.p.msgs = fresh;
+}
+
+function pump(l: Ref<Lsp>, ms: int): void {
+    if (!l.p.outOpen && !l.p.errOpen && l.p.done) {
+        nap(ms);
+        return;
+    }
+    const got = peerPump(l.p, ms);
+    collect(l);
+}
+
+// 计时 ms 毫秒，其间照收消息（同主线程 sleep 而读线程照读）。
+function idle(l: Ref<Lsp>, ms: int): void {
+    const end = monoNs() + ms * MS;
+    while (monoNs() < end) {
+        let left = (end - monoNs()) / MS;
+        if (left < 1) {
+            left = 1;
+        }
+        pump(l, left);
+    }
+}
+
+// 写满 data（同阻塞写）；写不进时先收消息再试。对端已关闭得假。
+function write(l: Ref<Lsp>, data: Bytes): bool {
+    let at_ = 0;
+    while (at_ < bytesLen(data)) {
+        let n = bytesLen(data) - at_;
+        if (n > 4096) {
+            n = 4096;
+        }
+        const w = procTryWrite(l.p.h, 0, bytesSlice(data, at_, n));
+        if (w < 0) {
+            return false;
+        }
+        if (w == 0) {
+            pump(l, 10);
+        } else {
+            at_ = at_ + w;
+        }
+    }
+    return true;
+}
+
+function frame(body: string): Bytes {
+    const b = bytesFromStr(body);
+    const out = bytesFromStr("Content-Length: " + toStr(bytesLen(b)) + "\r\n\r\n");
+    bytesAppend(out, b);
+    return out;
+}
+
+function send(l: Ref<Lsp>, body: string): void {
+    const ok = write(l, frame(body));
+}
+
+function newId(l: Ref<Lsp>): int {
+    l.nextId = l.nextId + 1;
+    return l.nextId;
+}
+
+function reqBody(method: string, params: string, rid: int): string {
+    return "{\"jsonrpc\": \"2.0\", \"id\": " + toStr(rid) + ", \"method\": " + jQuote(method) + ", \"params\": " + params + "}";
+}
+
+function reqFrame(method: string, params: string, rid: int): Bytes {
+    return frame(reqBody(method, params, rid));
+}
+
+// 等 id 为 rid 的回复；服务已退出时得 None。
+function wait(l: Ref<Lsp>, rid: int, timeoutMs: int): Ref<Jv>? {
+    const key = toStr(rid);
+    const end = monoNs() + timeoutMs * MS;
+    while (monoNs() < end) {
+        pump(l, 0);
+        const r = mapGet(l.resps, key);
+        if (r != None) {
+            return r;
+        }
+        if (peerExited(l.p)) {
+            return None;
+        }
+        pump(l, 5);
+    }
+    return None;
+}
+
+function request(l: Ref<Lsp>, method: string, params: string, timeoutMs: int): Ref<Jv>? {
+    const rid = newId(l);
+    send(l, reqBody(method, params, rid));
+    return wait(l, rid, timeoutMs);
+}
+
+function init(l: Ref<Lsp>, res: string): Ref<Jv>? {
+    let params = "{\"capabilities\": {\"general\": {\"positionEncodings\": [\"utf-8\"]}}";
+    if (len(res) > 0) {
+        params = params + ", \"initializationOptions\": {\"taixuResources\": " + res + "}";
+    }
+    const r = request(l, "initialize", params + "}", 120000);
+    send(l, "{\"jsonrpc\": \"2.0\", \"method\": \"initialized\", \"params\": {}}");
+    return r;
+}
+
+function openDoc(l: Ref<Lsp>, path: string, text: string): void {
+    send(l, "{\"jsonrpc\": \"2.0\", \"method\": \"textDocument/didOpen\", \"params\": {\"textDocument\": {\"uri\": " + jQuote(uriOf(path))
+        + ", \"languageId\": \"taixu\", \"version\": 1, \"text\": " + jQuote(text) + "}}}");
+}
+
+function changeBody(path: string, version: int, changes: string): string {
+    return "{\"jsonrpc\": \"2.0\", \"method\": \"textDocument/didChange\", \"params\": {\"textDocument\": {\"uri\": " + jQuote(uriOf(path))
+    + ", \"version\": " + toStr(version) + "}, \"contentChanges\": " + changes + "}}";
+}
+
+function change(l: Ref<Lsp>, path: string, version: int, changes: string): void {
+    send(l, changeBody(path, version, changes));
+}
+
+function closeDoc(l: Ref<Lsp>, path: string): void {
+    send(l, "{\"jsonrpc\": \"2.0\", \"method\": \"textDocument/didClose\", \"params\": {\"textDocument\": {\"uri\": " + jQuote(uriOf(path)) + "}}}");
+}
+
+function isPublish(m: Ref<Jv>): bool {
+    return textIs(m, "method", "textDocument/publishDiagnostics");
+}
+
+// path 的最后一次诊断（空串为任一文件）；从未发布为 None。
+function last(l: Ref<Lsp>, path: string): Ref<Jv>? {
+    const uri = uriOf(path);
+    let k = listLen(l.notes) - 1;
+    while (k >= 0) {
+        const n = listGet(l.notes, k) catch Note { t: 0, m: jNull() };
+        if (isPublish(n.m) && textIs(at(n.m, "params"), "uri", uri)) {
+            return at(at(n.m, "params"), "diagnostics");
+        }
+        k = k - 1;
+    }
+    return None;
+}
+
+function publishCount(l: Ref<Lsp>, path: string): int {
+    const uri = uriOf(path);
+    let n = 0;
+    for (x in l.notes) {
+        if (isPublish(x.m) && textIs(at(x.m, "params"), "uri", uri)) {
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+// 有非空诊断发布过的不同文件数。
+function urisWithDiags(l: Ref<Lsp>): int {
+    const seen = mapNew<string, bool>();
+    let n = 0;
+    for (x in l.notes) {
+        if (isPublish(x.m) && count(at(at(x.m, "params"), "diagnostics")) > 0) {
+            const u = textOf(at(x.m, "params"), "uri");
+            if (!mapHas(seen, u)) {
+                mapSet(seen, u, true);
+                n = n + 1;
+            }
+        }
+    }
+    return n;
+}
+
+function logs(l: Ref<Lsp>): List<string> {
+    const out: List<string> = listNew();
+    for (x in l.notes) {
+        if (textIs(x.m, "method", "window/logMessage")) {
+            listPush(out, textOf(at(x.m, "params"), "message"));
+        }
+    }
+    return out;
+}
+
+// 等到 quiet 毫秒内没有新通知（每轮用一个廉价请求确认服务在处理输入）。
+function settle(l: Ref<Lsp>, quietMs: int, timeoutMs: int): bool {
+    const start = monoNs();
+    const end = start + timeoutMs * MS;
+    while (monoNs() < end) {
+        if (request(l, "taixu/none", "{}", timeoutMs) == None) {
+            return false;
+        }
+        let lastAt = start;
+        if (listLen(l.notes) > 0) {
+            const n = listGet(l.notes, listLen(l.notes) - 1) catch Note { t: 0, m: jNull() };
+            if (n.t > lastAt) {
+                lastAt = n.t;
+            }
+        }
+        if (monoNs() - lastAt >= quietMs * MS) {
+            return true;
+        }
+        idle(l, 100);
+    }
+    return false;
+}
+
+function waitFor(l: Ref<Lsp>, pred: () => bool, timeoutMs: int): bool {
+    const end = monoNs() + timeoutMs * MS;
+    while (monoNs() < end) {
+        if (pred()) {
+            return true;
+        }
+        if (peerExited(l.p)) {
+            pump(l, 50);
+            return pred();
+        }
+        idle(l, 20);
+    }
+    return false;
+}
+
+// shutdown、exit、等退出：得退出码的文字（"0" 等）；无回复为 no-shutdown-reply:码，等不到退出为 killed (TimeoutExpired)。
+function shutdown(l: Ref<Lsp>, timeoutMs: int): string {
+    const r = request(l, "shutdown", "null", timeoutMs);
+    send(l, "{\"jsonrpc\": \"2.0\", \"method\": \"exit\"}");
+    const end = monoNs() + timeoutMs * MS;
+    while (!peerExited(l.p)) {
+        if (monoNs() >= end) {
+            procKill(l.p.h);
+            const w = procWait(l.p.h, 10000);
+            peerClose(l.p);
+            return "killed (TimeoutExpired)";
+        }
+        pump(l, 20);
+    }
+    const code = toStr(l.p.code);
+    peerClose(l.p);
+    if (r == None) {
+        return "no-shutdown-reply:" + code;
+    }
+    return code;
+}
+
+function kill(l: Ref<Lsp>): void {
+    peerClose(l.p);
+}
+
+// ---------------------------------------------------------------- 判据
+
+// 回复为 RequestFailed（或给定的 code）且 data.reason 为 reason（空串不查）。
+function failed(reply: Ref<Jv>?, reason: string, code: int): bool {
+    // 同 Python 的 bool(reply)：缺席或空对象为假。
+    if (reply == None || jLen(reply ?? jNull()) == 0) {
+        return false;
+    }
+    const e = at(reply, "error");
+    const c = at(e, "code");
+    if (c == None || jDumpSpaced(c ?? jNull()) != toStr(code)) {
+        return false;
+    }
+    return len(reason) == 0 || textIs(at(e, "data"), "reason", reason);
+}
+
+// 诊断的 code 依次为 want（个数相同、逐项相等）。
+function codesAre(diags: Ref<Jv>?, want: []string): bool {
+    if (count(diags) != len(want)) {
+        return false;
+    }
+    let i = 0;
+    while (i < len(want)) {
+        if (!textIs(item(diags, i), "code", want[i])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function isEmptyList(v: Ref<Jv>?): bool {
+    return v != None && (v ?? jNull()).kind == J_ARR && count(v) == 0;
+}
+
+function hover(l: Ref<Lsp>, path: string, line: int, ch: int): Ref<Jv>? {
+    return request(l, "textDocument/hover", "{\"textDocument\": {\"uri\": " + jQuote(uriOf(path)) + "}, \"position\": {\"line\": " + toStr(line)
+        + ", \"character\": " + toStr(ch) + "}}", 120000);
+}
+
+function hasResult(r: Ref<Jv>?): bool {
+    return r != None && has(r, "result");
+}
+
+function pair(a: string, b: string): string {
+    return "[" + a + ", " + b + "]";
+}
+
+function jsonOf(text: string): Ref<Jv> {
+    return jParse(text) catch jNull();
+}
+
+// ---------------------------------------------------------------- 各组
+
+function resources(c: Ref<Ctx>, ws: string): void | Error {
+    let l = lspStart(c, ws, true)?;
+    let r = init(l, "");
+    let got = at(at(at(at(r, "result"), "capabilities"), "experimental"), "taixuResources");
+    check(c, "resources: defaults advertised", got != None && jEq(got ?? jNull(), jsonOf(DEFAULTS)), dump(got));
+    check(c, "resources: default server exits cleanly", shutdown(l, 60000) == "0", "");
+    l = lspStart(c, ws, true)?;
+    r = init(l, "{\"max_open_documents\": 7, \"max_open_bytes\": 10737418240, \"max_diagnostics_bytes_per_file\": 10, \"max_debounce_ms\": 1, \"max_hot_cache_source_bytes\": -5, \"max_document_bytes\": \"x\"}");
+    got = at(at(at(at(r, "result"), "capabilities"), "experimental"), "taixuResources");
+    const want = jsonOf(DEFAULTS);
+    jSet(want, "max_open_documents", jsonOf("7"));
+    jSet(want, "max_diagnostics_bytes_per_file", jsonOf("4096"));
+    jSet(want, "max_debounce_ms", jsonOf("300"));
+    jSet(want, "max_hot_cache_source_bytes", jsonOf("0"));
+    check(c, "resources: client can only tighten (min, floors, wrong types ignored)", got != None && jEq(got ?? jNull(), want), dump(got));
+    check(c, "resources: tightened server exits cleanly", shutdown(l, 60000) == "0", "");
+}
+
+function documents(c: Ref<Ctx>, ws: string): void | Error {
+    const many = nat(join(ws, "many"));
+    mkdirs(many);
+    const l = lspStart(c, ws, true)?;
+    const r0 = init(l, "");
+    const t0 = monoNs();
+    let i = 0;
+    while (i < 1024) {
+        const f = nat(join(many, "m" + toStr(i) + ".tx"));
+        writeText(f, bad("missing" + toStr(i)));
+        openDoc(l, f, bad("missing" + toStr(i)));
+        i = i + 1;
+    }
+    const done = waitFor(l, (): bool => urisWithDiags(l) >= 1024, 240000);
+    const took = monoNs() - t0;
+    check(c, "documents: 1024 independent documents analysed within 120 s", done && took < 120000 * MS, "done=" + pyBool(done) + " seconds=" + sec1(took));
+    const extra = nat(join(many, "extra.tx"));
+    writeText(extra, good(1));
+    openDoc(l, extra, good(1));
+    const seen = waitFor(l, (): bool => last(l, extra) != None, 60000);
+    check(c, "documents: document 1025 is over budget with a document_budget note", codesAre(last(l, extra), ["document_budget"]), dump(last(l, extra)));
+    check(c, "documents: requests on it fail with reason document_budget", failed(hover(l, extra, 0, 16), "document_budget", -32803), "");
+    closeDoc(l, nat(join(many, "m0.tx")));
+    change(l, extra, 2, fullText(good(2)));
+    const ok = waitFor(l, (): bool => isEmptyList(last(l, extra)), 60000);
+    const sym = request(l, "textDocument/documentSymbol", "{\"textDocument\": {\"uri\": " + jQuote(uriOf(extra)) + "}}", 120000);
+    check(c, "documents: after closing one, a full-text change readmits it", ok && hasResult(sym) && count(at(sym, "result")) > 0,
+        pair(dump(last(l, extra)), dump(sym)));
+    check(c, "documents: server exits cleanly", shutdown(l, 60000) == "0", "");
+}
+
+function openBytes(c: Ref<Ctx>, ws: string): void | Error {
+    const tb = nat(join(ws, "bytes"));
+    mkdirs(tb);
+    const l = lspStart(c, ws, true)?;
+    const r0 = init(l, "{\"max_open_bytes\": 1048576, \"max_document_bytes\": 409600}");
+    const pad = "// " + repeat("p", 1000) + "\n";
+    const docs: List<string> = listNew();
+    let i = 0;
+    while (i < 3) {
+        const f = nat(join(tb, "b" + toStr(i) + ".tx"));
+        const text = good(i) + repeat(pad, 350);
+        writeText(f, text);
+        openDoc(l, f, text);
+        listPush(docs, f);
+        i = i + 1;
+    }
+    const third = listGet(docs, 2) catch "";
+    const seen = waitFor(l, (): bool => last(l, third) != None, 60000);
+    check(c, "open bytes: the third 350 KiB document is over the 1 MiB total", codesAre(last(l, third), ["document_budget"]), dump(last(l, third)));
+    const grow = listGet(docs, 1) catch "";
+    change(l, grow, 2, "[{\"range\": " + range(0, 0, 0, 0) + ", \"text\": " + jQuote(repeat(pad, 60)) + "}]");
+    const seen2 = waitFor(l, (): bool => last(l, grow) != None, 60000);
+    check(c, "document bytes: a range edit growing a document past 400 KiB puts it over budget",
+        codesAre(last(l, grow), ["document_budget"]) && failed(hover(l, grow, 0, 16), "document_budget", -32803), dump(last(l, grow)));
+    change(l, grow, 3, fullText(bad("regrown")));
+    const ok = waitFor(l, (): bool => count(last(l, grow)) == 1 && textIs(item(last(l, grow), 0), "source", "taixu"), 60000);
+    check(c, "document bytes: a small full-text change readmits it and analyses the new text", ok, dump(last(l, grow)));
+    check(c, "bytes: server exits cleanly", shutdown(l, 60000) == "0", "");
+}
+
+function changeWork(c: Ref<Ctx>, ws: string): void | Error {
+    const cw = nat(join(ws, "work"));
+    mkdirs(cw);
+    const l = lspStart(c, ws, true)?;
+    const r0 = init(l, "");
+    const big = nat(join(cw, "big.tx"));
+    let text = good(0) + repeat("// " + repeat("w", 60) + "\n", 4 * MIB / 64);
+    writeText(big, text);
+    openDoc(l, big, text);
+    const s1 = settle(l, 1500, 300000);
+    const edit = "{\"range\": " + range(0, 0, 0, 0) + ", \"text\": \" \"}";
+    let edits = "[";
+    let k = 0;
+    while (k < 100) {
+        if (k > 0) {
+            edits = edits + ", ";
+        }
+        edits = edits + edit;
+        k = k + 1;
+    }
+    const t0 = monoNs();
+    change(l, big, 2, edits + "]");
+    const r = request(l, "taixu/none", "{}", 120000);
+    const took = monoNs() - t0;
+    const seen = waitFor(l, (): bool => last(l, big) != None, 60000);
+    check(c, "change work: 100 range edits on a 4 MiB document are refused quickly (change_budget)",
+        r != None && took < 10000 * MS && codesAre(last(l, big), ["change_budget"]), "seconds=" + sec1(took) + " diags=" + dump(last(l, big)));
+    const mid = nat(join(cw, "mid.tx"));
+    text = good(0) + repeat("// " + repeat("m", 60) + "\n", MIB / 64);
+    writeText(mid, text);
+    openDoc(l, mid, text);
+    const s2 = settle(l, 1500, 300000);
+    change(l, mid, 2, "[{\"range\": " + range(2, 11, 2, 13) + ", \"text\": \"nowhere\"}]");
+    const ok = waitFor(l, (): bool => count(last(l, mid)) > 0, 60000);
+    const d = item(last(l, mid), 0);
+    const line = at(at(at(d, "range"), "start"), "line");
+    check(c, "change work: one range edit applies and is analysed at the right place", ok && line != None && jDumpSpaced(line ?? jNull()) == "2",
+        dump(last(l, mid)));
+    check(c, "change work: server exits cleanly", shutdown(l, 60000) == "0", "");
+}
+
+function heldDocument(c: Ref<Ctx>, ws: string): void | Error {
+    const imp = nat(join(ws, "imp"));
+    mkdirs(imp);
+    const a = nat(join(imp, "a.tx"));
+    const b = nat(join(imp, "b.tx"));
+    writeText(b, "export function f(): int { return 1; }\n");
+    const aText = "import { f } from \"./b\";\nexport function main(args: []string): int { return f(); }\n";
+    writeText(a, aText);
+    const l = lspStart(c, ws, true)?;
+    const r0 = init(l, "{\"max_document_bytes\": 4096}");
+    openDoc(l, a, aText);
+    openDoc(l, b, "export function g(): int { return 1; }\n");
+    let ok = waitFor(l, (): bool => count(last(l, a)) > 0, 60000);
+    check(c, "held document: the importer sees the unsaved overlay first (f missing)", ok, dump(last(l, a)));
+    change(l, b, 2, fullText("export function g(): int { return 1; }\n" + "// " + repeat("h", 5000) + "\n"));
+    ok = waitFor(l, (): bool => isEmptyList(last(l, a)) && codesAre(last(l, b), ["document_budget"]), 60000);
+    check(c, "held document: the importer is re-analysed against the disk content", ok, pair(dump(last(l, a)), dump(last(l, b))));
+    check(c, "held document: server exits cleanly", shutdown(l, 60000) == "0", "");
+}
+
+function debounce(c: Ref<Ctx>, ws: string): void | Error {
+    const st = nat(join(ws, "starve.tx"));
+    writeText(st, bad("missingStart"));
+    const l = lspStart(c, ws, true)?;
+    const r0 = init(l, "");
+    openDoc(l, st, bad("missingStart"));
+    const s = settle(l, 1500, 300000);
+    const n0 = publishCount(l, st);
+    const end = monoNs() + 6000 * MS;
+    let v = 2;
+    while (monoNs() < end) {
+        v = v + 1;
+        change(l, st, v, fullText(bad("missing" + toStr(v))));
+        idle(l, 100);
+    }
+    const during = publishCount(l, st) - n0;
+    check(c, "debounce: continuous edits still publish (max wait)", during >= 2, "publishes during 6 s of edits: " + toStr(during));
+    check(c, "debounce: server exits cleanly", shutdown(l, 60000) == "0", "");
+}
+
+function cancelCase(c: Ref<Ctx>, ws: string): void | Error {
+    const cc = nat(join(ws, "cancel"));
+    mkdirs(cc);
+    const k = nat(join(cc, "k.tx"));
+    const big = nat(join(cc, "big.tx"));
+    const a = nat(join(cc, "a.tx"));
+    const b = nat(join(cc, "b.tx"));
+    writeText(k, "export function kv(): int { return 1; }\n");
+    const body = bytesFromStr("import { kv } from \"./k\";\n");
+    let i = 0;
+    while (i < 4000) {
+        bytesAppend(body, bytesFromStr("export function f" + toStr(i) + "(x: int): int {\n    let a = x + kv();\n    let b = a * 2 + " + toStr(i)
+                + ";\n    if (b > 10) { return b - a; }\n    return a + b;\n}\n"));
+        i = i + 1;
+    }
+    writeText(big, bytesToStr(body) catch "");
+    const main = "import { f0 } from \"./big\";\nexport function main(args: []string): int { return f0(1); }\n";
+    writeText(a, main);
+    writeText(b, main);
+    const l = lspStart(c, ws, true)?;
+    const r0 = init(l, "");
+    openDoc(l, a, readFile(a) catch "");
+    openDoc(l, b, readFile(b) catch "");
+    openDoc(l, k, readFile(k) catch "");
+    let s = settle(l, 2000, 300000);
+    // 校准：k 改动后同步分析一个入口要多久（两个入口各重查 big）。
+    change(l, k, 2, fullText("export function kv(): int { return 2; }\n"));
+    const t0 = monoNs();
+    let r = hover(l, k, 0, 16);
+    const perRoot = (monoNs() - t0) / 2;
+    check(c, "cancel: calibration request answered", hasResult(r), dump(r));
+    // 正在处理的请求：请求与它的取消在同一次写入里，第一个取消点即生效。
+    change(l, k, 3, fullText("export function kv(): int { return 3; }\n"));
+    const hp = "{\"textDocument\": {\"uri\": " + jQuote(uriOf(k)) + "}, \"position\": {\"line\": 0, \"character\": 16}}";
+    const rid = newId(l);
+    let both = reqFrame("textDocument/hover", hp, rid);
+    bytesAppend(both, frame("{\"jsonrpc\": \"2.0\", \"method\": \"$/cancelRequest\", \"params\": {\"id\": " + toStr(rid) + "}}"));
+    let w = write(l, both);
+    r = wait(l, rid, 120000);
+    check(c, "cancel: the request being handled answers RequestCancelled (-32800)", failed(r, "", -32800), dump(r));
+    s = settle(l, 2000, 300000);
+    // 排队中的请求：R1 在第一个入口里分析时送来 R2 与它的取消；R1 照常答，R2 不做分析回 -32800。
+    change(l, k, 4, fullText("export function kv(): int { return 4; }\n"));
+    const r1 = newId(l);
+    w = write(l, reqFrame("textDocument/hover", hp, r1));
+    let pauseNs = perRoot / 3;
+    if (pauseNs > 300 * MS) {
+        pauseNs = 300 * MS;
+    }
+    idle(l, pauseNs / MS);
+    const r2 = newId(l);
+    both = reqFrame("textDocument/hover", hp, r2);
+    bytesAppend(both, frame("{\"jsonrpc\": \"2.0\", \"method\": \"$/cancelRequest\", \"params\": {\"id\": " + toStr(r2) + "}}"));
+    w = write(l, both);
+    const a1 = wait(l, r1, 120000);
+    const a2 = wait(l, r2, 120000);
+    check(c, "cancel: a queued request cancelled at a cancellation point answers -32800, the running one answers normally",
+        hasResult(a1) && failed(a2, "", -32800), "{\"per_root_seconds\": " + sec2(perRoot) + ", \"r1\": " + dump(a1) + ", \"r2\": " + dump(a2) + "}");
+    send(l, "{\"jsonrpc\": \"2.0\", \"method\": \"$/cancelRequest\", \"params\": {\"id\": 987654}}");
+    r = request(l, "textDocument/documentSymbol", "{\"textDocument\": {\"uri\": " + jQuote(uriOf(k)) + "}}", 120000);
+    const stray = mapHas(l.resps, "987654");
+    check(c, "cancel: cancelling an unknown id has no effect", hasResult(r) && !stray, dump(r));
+    check(c, "cancel: server exits cleanly", shutdown(l, 60000) == "0", "");
+}
+
+function budgetCase(c: Ref<Ctx>, ws: string): void | Error {
+    const bc = nat(join(ws, "budget"));
+    mkdirs(bc);
+    const p1 = nat(join(bc, "p1.tx"));
+    const p2 = nat(join(bc, "p2.tx"));
+    const t1 = good(1) + "// " + repeat("q", 3000) + "\n";
+    const t2 = "export function helper(): int { return 7; }\nexport function main(args: []string): int { return helper(); }\n" + "// " + repeat("r", 3000) + "\n";
+    writeText(p1, t1);
+    writeText(p2, t2);
+    let l = lspStart(c, ws, true)?;
+    let r0 = init(l, "{\"max_analysis_source_bytes\": 5000, \"max_hot_cache_source_bytes\": 0}");
+    openDoc(l, p1, t1);
+    let s = settle(l, 1500, 300000);
+    openDoc(l, p2, t2);
+    let ok = waitFor(l, (): bool => codesAre(last(l, p2), ["analysis_budget"]), 60000);
+    check(c, "analysis budget: the second root over the budget gets an analysis_budget note", ok, dump(last(l, p2)));
+    check(c, "analysis budget: requests on it fail with reason analysis_budget", failed(hover(l, p2, 1, 51), "analysis_budget", -32803), "");
+    let r = request(l, "textDocument/rename", "{\"textDocument\": {\"uri\": " + jQuote(uriOf(p1)) + "}, \"position\": {\"line\": 1, \"character\": 8}, \"newName\": \"w1\"}",
+        120000);
+    check(c, "analysis budget: rename refuses while a root is unanalysed", failed(r, "analysis_budget", -32803), dump(r));
+    const n = listLen(logs(l));
+    r = request(l, "textDocument/references", "{\"textDocument\": {\"uri\": " + jQuote(uriOf(p1))
+        + "}, \"position\": {\"line\": 1, \"character\": 8}, \"context\": {\"includeDeclaration\": true}}", 120000);
+    const after = logs(l);
+    let mentions = false;
+    let newer = "[";
+    let i = n;
+    while (i < listLen(after)) {
+        const m = listGet(after, i) catch "";
+        if (contains(m, "references")) {
+            mentions = true;
+        }
+        if (i > n) {
+            newer = newer + ", ";
+        }
+        newer = newer + jQuote(m);
+        i = i + 1;
+    }
+    newer = newer + "]";
+    check(c, "analysis budget: references answer with a logMessage about the unanalysed root", hasResult(r) && mentions, pair(dump(r), newer));
+    closeDoc(l, p1);
+    ok = waitFor(l, (): bool => isEmptyList(last(l, p2)), 60000);
+    const h = hover(l, p2, 1, 51);
+    check(c, "analysis budget: closing the other root re-admits it (note cleared, hover works)",
+        ok && hasResult(h) && !isNullResult(h), pair(dump(last(l, p2)), dump(h)));
+    check(c, "budget: server exits cleanly", shutdown(l, 60000) == "0", "");
+    // 热缓存预算 0：只有最近分析的入口留检查缓存。p1 先分析、p2 后分析，p1 的缓存被丢；p1 改坏、改好，诊断与 hover 同热时。
+    l = lspStart(c, ws, true)?;
+    r0 = init(l, "{\"max_hot_cache_source_bytes\": 0}");
+    openDoc(l, p1, t1);
+    s = settle(l, 1500, 300000);
+    const h1 = hover(l, p1, 1, 8);
+    openDoc(l, p2, t2);
+    s = settle(l, 1500, 300000);
+    change(l, p1, 2, fullText(replaceAll(t1, "return v1;", "return v1x;")));
+    const badSeen = waitFor(l, (): bool => count(last(l, p1)) > 0, 60000);
+    change(l, p1, 3, fullText(t1));
+    const fixed = waitFor(l, (): bool => isEmptyList(last(l, p1)), 60000);
+    const h2 = hover(l, p1, 1, 8);
+    check(c, "hot cache budget: a cold root re-checks with the same results",
+        badSeen && fixed && h1 != None && h2 != None && !isNullResult(h1) && sameJv(at(h1, "result"), at(h2, "result")),
+        "[" + dump(last(l, p1)) + ", " + dump(h1) + ", " + dump(h2) + "]");
+    check(c, "hot cache: server exits cleanly", shutdown(l, 60000) == "0", "");
+}
+
+// 回复的 result 缺席或为 null（同 Python 的 h.get('result') is None）。
+function isNullResult(r: Ref<Jv>?): bool {
+    const x = at(r, "result");
+    return x == None || (x ?? jNull()).kind == J_NULL;
+}
+
+function contains(s: string, needle: string): bool {
+    if (len(needle) == 0) {
+        return true;
+    }
+    let i = 0;
+    while (i + len(needle) <= len(s)) {
+        let k = 0;
+        while (k < len(needle) && (byteAt(s, i + k) ?? 0) == (byteAt(needle, k) ?? 1)) {
+            k = k + 1;
+        }
+        if (k == len(needle)) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+function replaceAll(s: string, a: string, b: string): string {
+    const parts = strSplit(s, a);
+    let out = listGet(parts, 0) catch "";
+    let i = 1;
+    while (i < listLen(parts)) {
+        out = out + b + (listGet(parts, i) catch "");
+        i = i + 1;
+    }
+    return out;
+}
+
+function diagnostics(c: Ref<Ctx>, ws: string): void | Error {
+    const out = nat(join(ws, "out"));
+    mkdirs(out);
+    const manyErr = nat(join(out, "errs.tx"));
+    writeText(manyErr, errors(1500));
+    let l = lspStart(c, ws, true)?;
+    let r0 = init(l, "");
+    openDoc(l, manyErr, errors(1500));
+    let seen = waitFor(l, (): bool => last(l, manyErr) != None, 120000);
+    let ds = last(l, manyErr);
+    const tail = item(ds, -1);
+    let shown = "[0, []]";
+    if (count(ds) > 0) {
+        shown = "[" + toStr(count(ds)) + ", [" + dump(tail) + "]]";
+    }
+    check(c, "diagnostics: 1500 errors are cut to 1000 entries ending with diagnostics_truncated",
+        count(ds) == 1000 && textIs(tail, "code", "diagnostics_truncated") && contains(textOf(tail, "message"), "501"), shown);
+    check(c, "diagnostics: server exits cleanly", shutdown(l, 60000) == "0", "");
+    l = lspStart(c, ws, true)?;
+    r0 = init(l, "{\"max_diagnostics_per_file\": 10, \"max_diagnostics_bytes_per_file\": 4096, \"max_response_bytes\": 8192}");
+    openDoc(l, manyErr, errors(1500));
+    seen = waitFor(l, (): bool => last(l, manyErr) != None, 120000);
+    ds = last(l, manyErr);
+    let size = 2;
+    if (ds != None) {
+        size = len(jDumpSpaced(ds ?? jNull()));
+    }
+    check(c, "diagnostics: tightened caps hold (<= 10 entries, about 4 KiB)",
+        count(ds) > 0 && count(ds) <= 10 && textIs(item(ds, -1), "code", "diagnostics_truncated") && size <= 4096,
+        "[" + toStr(count(ds)) + ", " + toStr(size) + "]");
+    const r = request(l, "textDocument/semanticTokens/full", "{\"textDocument\": {\"uri\": " + jQuote(uriOf(manyErr)) + "}}", 120000);
+    check(c, "responses: a reply over max_response_bytes becomes RequestFailed response_too_large", failed(r, "response_too_large", -32803), dump(r));
+    check(c, "responses: server exits cleanly", shutdown(l, 60000) == "0", "");
+}
+
+// ---------------------------------------------------------------- 停读
+
+struct File {
+    path: string,
+    text: string,
+}
+
+// 停读的服务：initialize、initialized 与全部文档发出后，等 CPU 时间 2 s 内不再增长（每 0.5 s 看一次，至多 120 s）。
+function blockedServer(c: Ref<Ctx>, ws: string, files: List<File>): Ref<Lsp> | Error {
+    const l = lspStart(c, ws, false)?;
+    send(l, "{\"jsonrpc\": \"2.0\", \"id\": 0, \"method\": \"initialize\", \"params\": {\"capabilities\": {}}}");
+    send(l, "{\"jsonrpc\": \"2.0\", \"method\": \"initialized\", \"params\": {}}");
+    for (f in files) {
+        openDoc(l, f.path, f.text);
+    }
+    return l;
+}
+
+function waitBlocked(l: Ref<Lsp>): bool {
+    let lastCpu = procCpuUs(l.pid);
+    let since = monoNs();
+    const end = monoNs() + 120000 * MS;
+    while (monoNs() < end) {
+        idle(l, 500);
+        const now = procCpuUs(l.pid);
+        if (now - lastCpu > 50000) {
+            lastCpu = now;
+            since = monoNs();
+        } else if (monoNs() - since >= 2000 * MS) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 写线程：写当前这一帧，至多写到 untilNs；写完一帧计数并换下一帧（版本号加一）。finish 为真时写完这一帧就停。
+function flood(l: Ref<Lsp>, path: string, untilNs: int, finish: bool): void {
+    while (true) {
+        if (bytesLen(l.flood) == 0) {
+            l.floodV = l.floodV + 1;
+            l.flood = frame(changeBody(path, l.floodV, fullText(bad("missingFlood" + toStr(l.floodV)) + "// " + repeat("f", 65536) + "\n")));
+            l.floodAt = 0;
+        }
+        while (l.floodAt < bytesLen(l.flood)) {
+            if (!finish && monoNs() >= untilNs) {
+                return;
+            }
+            let n = bytesLen(l.flood) - l.floodAt;
+            if (n > 4096) {
+                n = 4096;
+            }
+            const w = procTryWrite(l.p.h, 0, bytesSlice(l.flood, l.floodAt, n));
+            if (w < 0) {
+                return;
+            }
+            if (w == 0) {
+                pump(l, 10);
+                if (finish && monoNs() >= untilNs) {
+                    return;
+                }
+            } else {
+                l.floodAt = l.floodAt + w;
+            }
+        }
+        l.written = l.written + 1;
+        l.flood = bytesNew(0);
+        if (finish) {
+            return;
+        }
+    }
+}
+
+function stopReadCase(c: Ref<Ctx>, ws: string): void | Error {
+    const sr = nat(join(ws, "stop"));
+    mkdirs(sr);
+    const files: List<File> = listNew();
+    let i = 0;
+    while (i < 600) {
+        const f = nat(join(sr, "s" + toStr(i) + ".tx"));
+        const text = bad("missingStop" + toStr(i)) + "// " + repeat("s", 200) + "\n";
+        writeText(f, text);
+        listPush(files, File { path: f, text: text });
+        i = i + 1;
+    }
+    let l = blockedServer(c, ws, files)?;
+    let blocked = waitBlocked(l);
+    check(c, "stop reading: the server blocks on its output (CPU time stops growing)", blocked && !peerExited(l.p), "");
+    const first = listGet(files, 0) catch File { path: "", text: "" };
+    const rss0 = procRss(l.pid);
+    const cpu0 = procCpuUs(l.pid);
+    flood(l, first.path, monoNs() + 3000 * MS, false);
+    const w1 = l.written;
+    flood(l, first.path, monoNs() + 2000 * MS, false);
+    const rss1 = procRss(l.pid);
+    const cpu1 = procCpuUs(l.pid);
+    const w2 = l.written;
+    check(c, "stop reading: while blocked, memory and CPU stay flat and the client is held back",
+        rss1 - rss0 < 16 * MIB && cpu1 - cpu0 < 300000 && w2 == w1 && w2 < 200,
+        "{\"rss_delta\": " + toStr(rss1 - rss0) + ", \"cpu_delta\": " + cpu3(cpu1 - cpu0) + ", \"writes\": [" + toStr(w1) + ", " + toStr(w2) + "]}");
+    // 恢复读：写线程写完正在写的那一帧（至多 60 s，同 writer.join(60)）后停。
+    l.p.paused = false;
+    flood(l, first.path, monoNs() + 60000 * MS, true);
+    const s = settle(l, 2000, 300000);
+    const lastFlood = "missingFlood" + toStr(l.written + 2);
+    const finals: List<Ref<Jv>> = listNew();
+    for (f in files) {
+        listPush(finals, last(l, f.path) ?? jNull());
+    }
+    const badCount = listLen(l.p.bad);
+    let badHead = "[";
+    let k = 0;
+    while (k < badCount && k < 2) {
+        if (k > 0) {
+            badHead = badHead + ", ";
+        }
+        badHead = badHead + jQuote(listGet(l.p.bad, k) catch "");
+        k = k + 1;
+    }
+    badHead = badHead + "]";
+    const code = shutdown(l, 300000);
+    let allOne = true;
+    let missing = 0;
+    for (d in finals) {
+        if (count(d) == 0) {
+            missing = missing + 1;
+        }
+        if (count(d) != 1) {
+            allOne = false;
+        }
+    }
+    const f0Text = jDumpSpaced(listGet(finals, 0) catch jNull());
+    check(c, "stop reading: after resuming, every frame parses, all diagnostics arrive and the server exits 0",
+        code == "0" && badCount == 0 && allOne && contains(f0Text, lastFlood),
+        "{\"code\": " + jQuote(code) + ", \"bad\": " + badHead + ", \"missing\": " + toStr(missing) + ", \"first\": " + f0Text + ", \"want\": "
+        + jQuote(lastFlood) + "}");
+    l = blockedServer(c, ws, files)?;
+    blocked = waitBlocked(l);
+    const t0 = monoNs();
+    procCloseStream(l.p.h, 1);
+    const w = procWait(l.p.h, 10000);
+    const took = monoNs() - t0;
+    kill(l);
+    let codeText = "null";
+    if (w != None) {
+        codeText = toStr(w ?? 0);
+    }
+    check(c, "stop reading: closing the read end while blocked ends the server with exit 3 within 5 s",
+        blocked && w != None && (w ?? 0) == 3 && took < 5000 * MS,
+        "{\"blocked\": " + jsonBool(blocked) + ", \"code\": " + codeText + ", \"seconds\": " + sec2(took) + "}");
+}
+
+function jsonBool(b: bool): string {
+    if (b) {
+        return "true";
+    }
+    return "false";
+}
+
+// CPU 秒，至多三位小数（同 Python 的 round(x, 3) 再 str）。
+function cpu3(us: int): string {
+    let neg = "";
+    let v = us;
+    if (v < 0) {
+        neg = "-";
+        v = -v;
+    }
+    const ms = (v + 500) / 1000;
+    let frac = toStr(ms % 1000);
+    while (len(frac) < 3) {
+        frac = "0" + frac;
+    }
+    while (len(frac) > 1 && (byteAt(frac, len(frac) - 1) ?? 0) == 48) {
+        frac = bytesToStr(bytesSlice(bytesFromStr(frac), 0, len(frac) - 1)) catch frac;
+    }
+    return neg + toStr(ms / 1000) + "." + frac;
+}
+
+// ---------------------------------------------------------------- 入口
+
+function runAll(c: Ref<Ctx>, ws: string): void | Error {
+    resources(c, ws)?;
+    documents(c, ws)?;
+    openBytes(c, ws)?;
+    changeWork(c, ws)?;
+    heldDocument(c, ws)?;
+    debounce(c, ws)?;
+    cancelCase(c, ws)?;
+    budgetCase(c, ws)?;
+    diagnostics(c, ws)?;
+    stopReadCase(c, ws)?;
+}
+
+function oracle(c: Ref<Ctx>): void {
+    check(c, "oracle: RequestFailed with another reason fails",
+        !failed(jsonOf("{\"error\": {\"code\": -32803, \"data\": {\"reason\": \"x\"}}}"), "document_budget", -32803), "");
+    check(c, "oracle: a result is not a failure", !failed(jsonOf("{\"result\": null}"), "document_budget", -32803) && !failed(None, "", -32803),
+        "");
+    check(c, "oracle: RequestCancelled is recognised", failed(jsonOf("{\"error\": {\"code\": -32800, \"message\": \"RequestCancelled\"}}"), "", -32800),
+        "");
+    const two = jsonOf("[{\"code\": \"change_budget\"}, {}]");
+    check(c, "oracle: note codes read the code field", textIs(item(two, 0), "code", "change_budget") && !has(item(two, 1), "code") && count(two) == 2
+        && count(None) == 0, "");
+}
+
+function main(argv: []string): int {
+    let compiler = "";
+    let work = "";
+    let i = 0;
+    while (i + 1 < len(argv)) {
+        if (argv[i] == "--compiler") {
+            compiler = argv[i + 1];
+        } else if (argv[i] == "--work") {
+            work = argv[i + 1];
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0 || len(work) == 0) {
+        eprint("用法：taixu run --toolchain scripts/test_lsp_resources.tx --compiler <taixu> --work <目录>");
+        return 2;
+    }
+    compiler = absolute(nat(compiler));
+    work = absolute(nat(work));
+    deleteTree(work);
+    mkdirs(work);
+    work = osRealPath(work);
+    const ws = nat(join(work, "ws"));
+    mkdirs(ws);
+    const rows: List<Row> = listNew();
+    const c = new Ctx { compiler: compiler, rows: rows, bad: 0 };
+    oracle(c);
+    runAll(c, ws) catch (e) {
+        eprint("lsp-resources 中止：" + e.message);
+        return 1;
+    };
+    let report = "{\n \"rows\": [";
+    let k = 0;
+    for (r in c.rows) {
+        if (k > 0) {
+            report = report + ",";
+        }
+        report = report + "\n  {\n   \"check\": " + jQuote(r.check) + ",\n   \"ok\": " + jsonBool(r.ok) + ",\n   \"detail\": " + jQuote(r.detail) + "\n  }";
+        k = k + 1;
+    }
+    report = report + "\n ],\n \"failed\": " + toStr(c.bad) + "\n}";
+    writeText(nat(join(work, "lsp-resources.json")), report);
+    let status = "PASS";
+    if (c.bad > 0) {
+        status = "FAIL";
+    }
+    print("SUMMARY " + status + " lsp-resources: " + toStr(listLen(c.rows)) + " checks, " + toStr(c.bad) + " failed");
+    if (c.bad > 0) {
+        return 1;
+    }
+    return 0;
+}

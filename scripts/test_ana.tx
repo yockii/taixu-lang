@@ -1,0 +1,512 @@
+// 分析节（SEB1 ANA1）的门。经隐藏开发命令
+// `taixu dev-check --analysis`、`--analysis-check` 调用原生编译器，三组检查：
+// 1. golden：tests/ana/*.tx 各入口自检通过（见 2），输出的出现逐行等于同名 .ana（期望结果逐行人工核对过；每行是一条出现按
+//    Python json.dumps 的紧凑形式写出，见 scripts/test_json.tx 的 jDump）。位于标准库、prelude 的出现不比；键指向它们时只比模块与
+//    锚类（其行列随标准库变动）。
+// 2. corpus：tests/cases、tests/nrt-cases、examples、tests/lsp、tests/ana 的全部 .tx 与编译器自身（bootstrap/taixu.tx，工具链），按
+//    构建参数分组放进一个进程连查（--analysis-check）：每个入口先不带、再带分析节各查一次，诊断须相同、带分析节的 SEB1 须是不带时的
+//    SEB1 后接 ANA1（分析节不改其余任何字节）。
+// 3. keys：同样的入口按 --analysis 连查，每个有身份的出现，其键须在同一程序里有解析得到的声明（悬空即锚的扫法与源码对不上）。
+// 运行（仓根）：taixu run --toolchain scripts/test_ana.tx --compiler <原生 taixu> [--target windows|linux]... [--only golden,corpus,keys]
+// 任何 FAIL 时退出码 1。
+import { absolute, join, nat, readBytes } from "./build_lib";
+import { Raw, captureRaw, linesOf } from "./test_lib";
+import { contains, crlf, reprStr, slashes, sorted, tailChars } from "./test_text";
+import { lossyText } from "./check_lib";
+import { J_BOOL, J_NUM, J_STR, Jv, jDump, jGet, jHas, jParse, jSet, jString, jText } from "./test_json";
+
+const RUN_NS: int = 3600000000000;
+const DRAIN_NS: int = 10000000000;
+const MAX_OUTPUT: int = 1073741824;
+const CORPUS_DIRS: []string = ["tests/cases", "tests/nrt-cases", "examples", "tests/lsp", "tests/ana"];
+const SELF: string = "bootstrap/taixu.tx";
+
+struct Block {
+    entry: string,
+    ana: List<Ref<Jv>>,
+    // anacheck 的值（没有为 None）。
+    check: Ref<Jv>?,
+}
+
+struct Ctx {
+    root: string,
+    compiler: string,
+}
+
+struct Ran {
+    code: int,
+    out: string,
+    err: string,
+}
+
+function run(c: Ref<Ctx>, args: List<string>): Ref<Ran> {
+    const r = captureRaw(nat(c.compiler), args, nat(c.root), RUN_NS, DRAIN_NS, MAX_OUTPUT) catch (e) {
+        return new Ran { code: -2, out: "", err: e.message };
+    };
+    return new Ran { code: r.code, out: lossyText(r.out), err: lossyText(r.err) };
+}
+
+// dev-check 的输出 → 各入口的块；有一行不是 JSON 时得 Error。
+function blocksOf(stdout: string): List<Ref<Block>> | Error {
+    const out: List<Ref<Block>> = listNew();
+    for (ln in strSplit(lossyText(crlf(bytesFromStr(stdout))), "\n")) {
+        if (len(ln) == 0) {
+            continue;
+        }
+        const obj = jParse(ln)?;
+        const cur = listGet(out, listLen(out) - 1) catch new Block { entry: "", ana: listNew(), check: None };
+        if (jHas(obj, "entry")) {
+            listPush(out, new Block { entry: jText(jGet(obj, "entry")) ?? "", ana: listNew(), check: None });
+        } else if (jHas(obj, "text")) {
+            // 文本不参与比对。
+        } else if (jHas(obj, "ana")) {
+            listPush(cur.ana, obj);
+        } else if (jHas(obj, "anacheck")) {
+            cur.check = jGet(obj, "anacheck");
+        }
+    }
+    return out;
+}
+
+function blocksOr(r: Ref<Ran>, codes: []int): List<Ref<Block>> {
+    let ok = false;
+    for (x in codes) {
+        if (r.code == x) {
+            ok = true;
+        }
+    }
+    const none: List<Ref<Block>> = listNew();
+    if (!ok) {
+        return none;
+    }
+    const b = blocksOf(r.out) catch (e) {
+        return none;
+    };
+    return b;
+}
+
+// anacheck 的显示（同 Python 的 '%s'：没有写 None，字符串照原文）。
+function checkText(v: Ref<Jv>?): string {
+    if (v == None) {
+        return "None";
+    }
+    const x = v ?? jString("");
+    if (x.kind == J_STR) {
+        return x.text;
+    }
+    return jDump(x);
+}
+
+function checkOk(v: Ref<Jv>?): bool {
+    return (jText(v) ?? "") == "ok";
+}
+
+function external(module: string): bool {
+    return startsWithText(module, "std/") || startsWithText(module, "<prelude>");
+}
+
+function startsWithText(s: string, p: string): bool {
+    return len(s) >= len(p) && (bytesToStr(bytesSlice(bytesFromStr(s), 0, len(p))) catch "") == p;
+}
+
+// "a:b:c".rsplit(':', 2)[0]
+function locModule(ana: string): string {
+    const parts = strSplit(ana, ":");
+    let n = listLen(parts) - 2;
+    if (n < 1) {
+        n = 1;
+    }
+    let s = "";
+    let k = 0;
+    while (k < n && k < listLen(parts)) {
+        if (k > 0) {
+            s = s + ":";
+        }
+        s = s + (listGet(parts, k) catch "");
+        k = k + 1;
+    }
+    return s;
+}
+
+// 金样例的形式：去掉位于标准库、prelude 的出现；指向它们的键只留模块与锚类。
+function normalize(rows: List<Ref<Jv>>): List<string> {
+    const out: List<string> = listNew();
+    for (r in rows) {
+        if (external(locModule(jText(jGet(r, "ana")) ?? ""))) {
+            continue;
+        }
+        const key = jText(jGet(r, "key")) ?? "";
+        const parts = strSplit(key, ":");
+        if (len(key) > 0 && external(listGet(parts, 0) catch "")) {
+            let k2 = (listGet(parts, 0) catch "") + ":*:*";
+            let k = 3;
+            while (k < listLen(parts)) {
+                k2 = k2 + ":" + (listGet(parts, k) catch "");
+                k = k + 1;
+            }
+            jSet(r, "key", jString(k2));
+        }
+        listPush(out, jDump(r));
+    }
+    return out;
+}
+
+struct Entry {
+    toolchain: bool,
+    name: string,
+}
+
+function txIn(c: Ref<Ctx>, d: string): List<string> {
+    const dir = join(c.root, d);
+    const names = localListDir(nat(dir), "") catch noNames();
+    const out: List<string> = listNew();
+    for (n in sorted(names)) {
+        if (len(n) > 3 && endsTx(n) && localEntryKind(nat(dir), n) == 1) {
+            listPush(out, d + "/" + n);
+        }
+    }
+    return out;
+}
+
+function endsTx(n: string): bool {
+    return (byteAt(n, len(n) - 3) ?? 0) == 46 && (byteAt(n, len(n) - 2) ?? 0) == 116 && (byteAt(n, len(n) - 1) ?? 0) == 120;
+}
+
+function noNames(): List<string> {
+    const xs: List<string> = listNew();
+    return xs;
+}
+
+function corpusEntries(c: Ref<Ctx>): List<Entry> {
+    const out: List<Entry> = listNew();
+    for (d in CORPUS_DIRS) {
+        for (name in txIn(c, d)) {
+            const stem = bytesToStr(bytesSlice(bytesFromStr(name), 0, len(name) - 3)) catch name;
+            listPush(out, Entry { toolchain: isFile(c, stem + ".toolchain"), name: name });
+        }
+    }
+    listPush(out, Entry { toolchain: true, name: SELF });
+    return out;
+}
+
+function isFile(c: Ref<Ctx>, rel: string): bool {
+    const p = join(c.root, rel);
+    const parts = strSplit(slashes(p), "/");
+    const base = listGet(parts, listLen(parts) - 1) catch "";
+    const dir = bytesToStr(bytesSlice(bytesFromStr(slashes(p)), 0, len(slashes(p)) - len(base) - 1)) catch "";
+    return localEntryKind(nat(dir), base) == 1;
+}
+
+// 按构建参数分组（组按第一次出现的次序）。
+struct Group {
+    toolchain: bool,
+    names: List<string>,
+}
+
+function batches(entries: List<Entry>): List<Ref<Group>> {
+    const out: List<Ref<Group>> = listNew();
+    for (e in entries) {
+        let found = false;
+        for (g in out) {
+            if (!found && g.toolchain == e.toolchain) {
+                listPush(g.names, e.name);
+                found = true;
+            }
+        }
+        if (!found) {
+            const g = new Group { toolchain: e.toolchain, names: listNew() };
+            listPush(g.names, e.name);
+            listPush(out, g);
+        }
+    }
+    return out;
+}
+
+function flagText(g: Ref<Group>): string {
+    if (g.toolchain) {
+        return "--toolchain";
+    }
+    return "";
+}
+
+function devArgs(mode: string, toolchain: bool, target: string, names: List<string>): List<string> {
+    const a: List<string> = listNew();
+    listPush(a, "dev-check");
+    listPush(a, mode);
+    if (toolchain) {
+        listPush(a, "--toolchain");
+    }
+    listPush(a, "--target=" + target);
+    for (n in names) {
+        listPush(a, n);
+    }
+    return a;
+}
+
+function oneName(n: string): List<string> {
+    const xs: List<string> = listNew();
+    listPush(xs, n);
+    return xs;
+}
+
+function golden(c: Ref<Ctx>, target: string): int {
+    let bad = 0;
+    for (name in txIn(c, "tests/ana")) {
+        const stem = bytesToStr(bytesSlice(bytesFromStr(name), 0, len(name) - 3)) catch name;
+        const wantFile = stem + ".ana";
+        let r = run(c, devArgs("--analysis-check", false, target, oneName(name)));
+        let b = blocksOr(r, [0, 1, 3]);
+        if (listLen(b) != 1 || !checkOk((listGet(b, 0) catch new Block { entry: "", ana: listNew(), check: None }).check)) {
+            bad = bad + 1;
+            let shown = "None";
+            if (listLen(b) > 0) {
+                shown = checkText((listGet(b, 0) catch new Block { entry: "", ana: listNew(), check: None }).check);
+            }
+            print("FAIL golden " + target + " " + name + ": self-check " + shown + " (exit " + toStr(r.code) + ") " + tailChars(r.err, 300));
+            continue;
+        }
+        r = run(c, devArgs("--analysis", false, target, oneName(name)));
+        b = blocksOr(r, [0, 1]);
+        let hasGot = false;
+        let got: List<string> = listNew();
+        if (listLen(b) == 1) {
+            hasGot = true;
+            got = normalize((listGet(b, 0) catch new Block { entry: "", ana: listNew(), check: None }).ana);
+        }
+        let hasWant = false;
+        let want: List<string> = listNew();
+        if (isFile(c, wantFile)) {
+            hasWant = true;
+            want = linesOf(lossyText(readBytes(join(c.root, wantFile)) catch bytesNew(0)));
+        }
+        if (!hasGot || !hasWant || !sameLines(got, want)) {
+            bad = bad + 1;
+            const parts = strSplit(wantFile, "/");
+            print("FAIL golden " + target + " " + name + " differs from " + (listGet(parts, listLen(parts) - 1) catch wantFile));
+            let k = 0;
+            let shownLine = false;
+            while (k < listLen(got) && k < listLen(want)) {
+                const g = listGet(got, k) catch "";
+                const w = listGet(want, k) catch "";
+                if (g != w) {
+                    print("  line " + toStr(k + 1) + "\n    got  " + g + "\n    want " + w);
+                    shownLine = true;
+                    break;
+                }
+                k = k + 1;
+            }
+            if (!shownLine) {
+                print("  got " + toStr(listLen(got)) + " lines, want " + toStr(listLen(want)));
+            }
+        }
+    }
+    if (bad == 0) {
+        print("golden " + target + ": PASS");
+    } else {
+        print("golden " + target + ": FAIL=" + toStr(bad));
+    }
+    return bad;
+}
+
+function sameLines(a: List<string>, b: List<string>): bool {
+    if (listLen(a) != listLen(b)) {
+        return false;
+    }
+    let k = 0;
+    while (k < listLen(a)) {
+        if ((listGet(a, k) catch "") != (listGet(b, k) catch "")) {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+// 秒数，保留一位小数（同 Python 的 '%.1f'）。
+function secs(ns: int): string {
+    const tenths = (ns + 50000000) / 100000000;
+    return toStr(tenths / 10) + "." + toStr(tenths % 10);
+}
+
+function corpus(c: Ref<Ctx>, target: string): int {
+    let bad = 0;
+    let n = 0;
+    for (g in batches(corpusEntries(c))) {
+        const t0 = monoNs();
+        const r = run(c, devArgs("--analysis-check", g.toolchain, target, g.names));
+        const b = blocksOr(r, [0, 1, 3]);
+        if (listLen(b) != listLen(g.names)) {
+            bad = bad + 1;
+            print("FAIL corpus " + target + " " + flagText(g) + ": " + toStr(listLen(b)) + " of " + toStr(listLen(g.names)) + " entries (exit "
+                + toStr(r.code) + ") " + tailChars(r.err, 300));
+            continue;
+        }
+        let k = 0;
+        while (k < listLen(g.names)) {
+            n = n + 1;
+            const blk = listGet(b, k) catch new Block { entry: "", ana: listNew(), check: None };
+            if (!checkOk(blk.check)) {
+                bad = bad + 1;
+                print("FAIL corpus " + target + " " + (listGet(g.names, k) catch "") + ": " + checkText(blk.check));
+            }
+            k = k + 1;
+        }
+        let shown = flagText(g);
+        if (len(shown) == 0) {
+            shown = "-";
+        }
+        print("corpus " + target + " " + shown + ": " + toStr(listLen(g.names)) + " entries in " + secs(monoNs() - t0) + " s");
+    }
+    if (bad == 0) {
+        print("corpus " + target + ": " + toStr(n) + " entries, PASS");
+    } else {
+        print("corpus " + target + ": " + toStr(n) + " entries, FAIL=" + toStr(bad));
+    }
+    return bad;
+}
+
+// Python 的真值：true、非零数、非空串（null、false、0、空串为假）。
+function truthy(v: Ref<Jv>?): bool {
+    if (v == None) {
+        return false;
+    }
+    const x = v ?? jString("");
+    if (x.kind == J_BOOL) {
+        return x.truth;
+    }
+    if (x.kind == J_NUM) {
+        return x.text != "0" && x.text != "-0";
+    }
+    if (x.kind == J_STR) {
+        return len(x.text) > 0;
+    }
+    return false;
+}
+
+function keys(c: Ref<Ctx>, target: string): int {
+    let bad = 0;
+    let n = 0;
+    let occ = 0;
+    for (g in batches(corpusEntries(c))) {
+        const r = run(c, devArgs("--analysis", g.toolchain, target, g.names));
+        const b = blocksOr(r, [0, 1]);
+        if (listLen(b) != listLen(g.names)) {
+            bad = bad + 1;
+            print("FAIL keys " + target + " " + flagText(g) + ": " + toStr(listLen(b)) + " of " + toStr(listLen(g.names)) + " entries (exit "
+                + toStr(r.code) + ") " + tailChars(r.err, 300));
+            continue;
+        }
+        let k = 0;
+        while (k < listLen(g.names)) {
+            n = n + 1;
+            const blk = listGet(b, k) catch new Block { entry: "", ana: listNew(), check: None };
+            const decls: Map<string, int> = mapNew();
+            for (row in blk.ana) {
+                if (truthy(jGet(row, "decl"))) {
+                    mapSet(decls, jText(jGet(row, "key")) ?? "", 1);
+                }
+            }
+            const dangling: Map<string, int> = mapNew();
+            for (row in blk.ana) {
+                const key = jText(jGet(row, "key")) ?? "";
+                if (len(key) > 0 && !mapHas(decls, key)) {
+                    mapSet(dangling, key, 1);
+                }
+            }
+            occ = occ + listLen(blk.ana);
+            if (mapLen(dangling) > 0) {
+                bad = bad + 1;
+                const list = sorted(mapKeys(dangling));
+                let eg = "[";
+                let j = 0;
+                while (j < 3 && j < listLen(list)) {
+                    if (j > 0) {
+                        eg = eg + ", ";
+                    }
+                    eg = eg + reprStr(listGet(list, j) catch "");
+                    j = j + 1;
+                }
+                print("FAIL keys " + target + " " + (listGet(g.names, k) catch "") + ": " + toStr(mapLen(dangling)) + " dangling, e.g. " + eg
+                    + "]");
+            }
+            k = k + 1;
+        }
+    }
+    let verdict = "PASS";
+    if (bad > 0) {
+        verdict = "FAIL=" + toStr(bad);
+    }
+    print("keys " + target + ": " + toStr(n) + " entries, " + toStr(occ) + " occurrences, " + verdict);
+    return bad;
+}
+
+function main(args: []string): int {
+    let compiler = "";
+    let root = "";
+    let only = "golden,corpus,keys";
+    const targets: List<string> = listNew();
+    let i = 0;
+    while (i < len(args)) {
+        const a = args[i];
+        if (i + 1 < len(args) && (a == "--compiler" || a == "--root" || a == "--only" || a == "--target")) {
+            const v = args[i + 1];
+            if (a == "--compiler") {
+                compiler = v;
+            } else if (a == "--root") {
+                root = v;
+            } else if (a == "--only") {
+                only = v;
+            } else {
+                if (v != "windows" && v != "linux") {
+                    eprint("--target 只能是 windows 或 linux");
+                    return 2;
+                }
+                listPush(targets, v);
+            }
+            i = i + 2;
+        } else {
+            eprint("用法：taixu run --toolchain scripts/test_ana.tx --compiler <原生 taixu> [--target windows|linux]... [--only golden,corpus,keys]");
+            return 2;
+        }
+    }
+    if (len(compiler) == 0) {
+        eprint("要给 --compiler");
+        return 2;
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    if (listLen(targets) == 0) {
+        listPush(targets, "windows");
+        listPush(targets, "linux");
+    }
+    const c = new Ctx { root: slashes(absolute(root)), compiler: absolute(compiler) };
+    const groups = strSplit(only, ",");
+    let bad = 0;
+    for (t in targets) {
+        if (hasGroup(groups, "golden")) {
+            bad = bad + golden(c, t);
+        }
+        if (hasGroup(groups, "corpus")) {
+            bad = bad + corpus(c, t);
+        }
+        if (hasGroup(groups, "keys")) {
+            bad = bad + keys(c, t);
+        }
+    }
+    if (bad == 0) {
+        print("SUMMARY PASS");
+        return 0;
+    }
+    print("SUMMARY FAIL=" + toStr(bad));
+    return 1;
+}
+
+function hasGroup(groups: List<string>, g: string): bool {
+    for (x in groups) {
+        if (x == g) {
+            return true;
+        }
+    }
+    return false;
+}

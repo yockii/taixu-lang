@@ -1,0 +1,255 @@
+// 汇编字节缓冲的所有权与写出映像的独立核对（gate.tx 的 asm-output 步）：以 --toolchain --leak-check 编出
+// bootstrap/native_asm_bytes_probe.tx，它核对字节缓冲的所有权、增长、重置、非法字节与十进制回滚，再写出一个 PE 与一个 ELF 映像；这里
+// 独立解析两个映像：.text 开头的 lea rax,[rip+rel32]; ret 指向只读数据、.data 里的绝对地址等于入口、只读数据是 0..255 循环的 65541
+// 字节、BSS 至少 8192 字节。
+// 运行（仓根）：taixu run --toolchain scripts/test_native_asm_output.tx --compiler <taixu> --work <目录> [--root <仓库>]
+// 不合时打一行 FAIL 与细节、退出码 1。
+import { absolute, exeName, join, mkdirs, nat, readBytes } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { Img, i32, imgOf, lossyText, u16, u32, u64 } from "./check_lib";
+import { captureRaw } from "./test_lib";
+import { strip, tailChars } from "./test_text";
+
+const SEC: int = 1000000000;
+const MAX_OUTPUT: int = 16777216;
+const RO_BYTES: int = 65541;
+
+struct Out {
+    ok: bool,
+    text: string,
+}
+
+// 在仓根运行，须退出 0；不然打 FAIL 行。
+function exec(exe: string, args: List<string>, root: string, what: string): Out | Error {
+    const r = captureRaw(exe, args, root, 240 * SEC, 10 * SEC, MAX_OUTPUT)?;
+    const text = lossyText(r.out);
+    if (r.code != 0 || r.timedOut) {
+        print("FAIL  " + what + " exit=" + toStr(r.code) + " " + tailChars(text + lossyText(r.err), 4000));
+        return Out { ok: false, text: text };
+    }
+    return Out { ok: true, text: text };
+}
+
+function fail(what: string, detail: string): int {
+    print("FAIL  " + what + " " + detail);
+    return 1;
+}
+
+// 两种映像共同的核对：text 处为 lea rax,[rip+rel32]; ret，rel32 指向只读数据；data 处的 8 字节为入口地址；只读数据为 0..255 循环。
+function imageProblem(m: Ref<Img>, textAt: int, entry: int, roAddr: int, roAt: int, dataAt: int): string {
+    if (u16(m, textAt) != 0x8d48 || (bytesGet(m.d, textAt + 2) ?? 0) != 0x05 || (bytesGet(m.d, textAt + 7) ?? 0) != 0xc3) {
+        return ".text 开头不是 lea rax,[rip+rel32]; ret";
+    }
+    if (entry + 7 + i32(m, textAt + 3) != roAddr) {
+        return "rel32 没有指向只读数据";
+    }
+    if (u64(m, dataAt) != entry) {
+        return ".data 里的绝对地址不是入口";
+    }
+    let i = 0;
+    while (i < RO_BYTES) {
+        if ((bytesGet(m.d, roAt + i) ?? -1) != (i & 255)) {
+            return "只读数据第 " + toStr(i) + " 字节不对";
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+struct Section {
+    name: string,
+    va: int,
+    raw: int,
+    size: int,
+}
+
+struct Segment {
+    flags: int,
+    off: int,
+    va: int,
+    filesz: int,
+    memsz: int,
+}
+
+function checkPe(path: string): string | Error {
+    const m = imgOf(readBytes(path)?);
+    const header = u32(m, 60);
+    const opt = header + 24;
+    if (u16(m, 0) != 0x5a4d || u32(m, header) != 0x4550 || u16(m, opt) != 0x20b) {
+        return "不是 PE32+ 映像";
+    }
+    const base = u64(m, opt + 24);
+    const entry = base + u32(m, opt + 16);
+    const sections: List<Section> = listNew();
+    const n = u16(m, header + 6);
+    let i = 0;
+    while (i < n) {
+        const at = opt + u16(m, header + 20) + 40 * i;
+        let len8 = 0;
+        while (len8 < 8 && (bytesGet(m.d, at + len8) ?? 0) != 0) {
+            len8 = len8 + 1;
+        }
+        const name = bytesToStr(bytesSlice(m.d, at, len8)) catch "";
+        listPush(sections, Section { name: name, va: base + u32(m, at + 12), raw: u32(m, at + 20), size: u32(m, at + 8) });
+        i = i + 1;
+    }
+    const ti = section(sections, ".text");
+    const ri = section(sections, ".rdata");
+    const di = section(sections, ".data");
+    if (ti < 0 || ri < 0 || di < 0) {
+        return "缺 .text、.rdata 或 .data 节";
+    }
+    const none = Section { name: "", va: 0, raw: 0, size: 0 };
+    const t = listGet(sections, ti) catch none;
+    const r = listGet(sections, ri) catch none;
+    const d = listGet(sections, di) catch none;
+    const problem = imageProblem(m, t.raw + entry - t.va, entry, r.va, r.raw, d.raw);
+    if (m.oob) {
+        return "读越出文件（" + toStr(m.oobAt) + "）";
+    }
+    if (len(problem) > 0) {
+        return problem;
+    }
+    if (d.size < 8200) {
+        return ".data 的虚拟大小 " + toStr(d.size) + " 不足 8200";
+    }
+    return "";
+}
+
+function section(xs: List<Section>, name: string): int {
+    let k = 0;
+    while (k < listLen(xs)) {
+        if ((listGet(xs, k) catch Section { name: "", va: 0, raw: 0, size: 0 }).name == name) {
+            return k;
+        }
+        k = k + 1;
+    }
+    return -1;
+}
+
+function checkElf(path: string): string | Error {
+    const m = imgOf(readBytes(path)?);
+    if (u32(m, 0) != 0x464c457f || (bytesGet(m.d, 4) ?? 0) != 2 || (bytesGet(m.d, 5) ?? 0) != 1) {
+        return "不是 64 位小端 ELF";
+    }
+    const entry = u64(m, 24);
+    const phoff = u64(m, 32);
+    const size = u16(m, 54);
+    const count = u16(m, 56);
+    const segs: List<Segment> = listNew();
+    let i = 0;
+    while (i < count) {
+        const at = phoff + i * size;
+        if (u32(m, at) == 1) {
+            listPush(segs, Segment { flags: u32(m, at + 4), off: u64(m, at + 8), va: u64(m, at + 16), filesz: u64(m, at + 32),
+                    memsz: u64(m, at + 40) });
+        }
+        i = i + 1;
+    }
+    let ti = -1;
+    let ri = -1;
+    let di = -1;
+    let k = 0;
+    while (k < listLen(segs)) {
+        const s = listGet(segs, k) catch Segment { flags: 0, off: 0, va: 0, filesz: 0, memsz: 0 };
+        if (s.flags == 5 && ti < 0) {
+            ti = k;
+        }
+        if (s.flags == 4 && s.off != 0 && ri < 0) {
+            ri = k;
+        }
+        if (s.flags == 6 && di < 0) {
+            di = k;
+        }
+        k = k + 1;
+    }
+    if (ti < 0 || ri < 0 || di < 0) {
+        return "缺可执行、只读或可写的 PT_LOAD 段";
+    }
+    const none = Segment { flags: 0, off: 0, va: 0, filesz: 0, memsz: 0 };
+    const t = listGet(segs, ti) catch none;
+    const r = listGet(segs, ri) catch none;
+    const d = listGet(segs, di) catch none;
+    const problem = imageProblem(m, t.off + entry - t.va, entry, r.va, r.off, d.off);
+    if (m.oob) {
+        return "读越出文件（" + toStr(m.oobAt) + "）";
+    }
+    if (len(problem) > 0) {
+        return problem;
+    }
+    if (d.memsz < d.filesz + 8192) {
+        return "可写段的内存大小 " + toStr(d.memsz) + " 不足文件大小加 8192";
+    }
+    return "";
+}
+
+function run(argv: []string): int | Error {
+    let compiler = "";
+    let work = "";
+    let root = "";
+    let i = 0;
+    while (i + 1 < len(argv)) {
+        if (argv[i] == "--compiler") {
+            compiler = argv[i + 1];
+        } else if (argv[i] == "--work") {
+            work = argv[i + 1];
+        } else if (argv[i] == "--root") {
+            root = argv[i + 1];
+        } else {
+            return err("未知参数：" + argv[i]);
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0 || len(work) == 0 || i != len(argv)) {
+        return err("用法：taixu run --toolchain scripts/test_native_asm_output.tx --compiler <taixu> --work <目录> [--root <仓库>]");
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = osRealPath(absolute(nat(root)));
+    compiler = osRealPath(absolute(nat(compiler)));
+    if (!mkdirs(absolute(nat(work)))) {
+        return err("建不了工作目录：" + work);
+    }
+    work = osRealPath(absolute(nat(work)));
+    const out = nat(join(work, "probe"));
+    const bargs: List<string> = listNew();
+    listPush(bargs, "build");
+    listPush(bargs, "bootstrap/native_asm_bytes_probe.tx");
+    listPush(bargs, "--toolchain");
+    listPush(bargs, "--leak-check");
+    listPush(bargs, "--out");
+    listPush(bargs, out);
+    const b = exec(compiler, bargs, root, "build bootstrap/native_asm_bytes_probe.tx")?;
+    if (!b.ok) {
+        return 1;
+    }
+    const pargs: List<string> = listNew();
+    listPush(pargs, nat(join(work, "image")));
+    const p = exec(nat(join(out, exeName("native_asm_bytes_probe"))), pargs, root, "native_asm_bytes_probe")?;
+    if (!p.ok) {
+        return 1;
+    }
+    if (strip(p.text) != "PASS_ASM_BYTES_OWNERSHIP_ROLLBACK_PE_ELF") {
+        return fail("probe", "探针输出：" + strip(p.text));
+    }
+    print("PASS native ownership, growth, reset, invalid byte and decimal rollback");
+    const pe = checkPe(nat(join(work, "image.exe")))?;
+    if (len(pe) > 0) {
+        return fail("pe", pe);
+    }
+    print("PASS PE rel32/absolute addresses, all byte values and BSS size");
+    const elf = checkElf(nat(join(work, "image.elf")))?;
+    if (len(elf) > 0) {
+        return fail("elf", elf);
+    }
+    print("PASS ELF rel32/absolute addresses, all byte values and BSS size");
+    return 0;
+}
+
+function main(argv: []string): int {
+    return run(argv) catch (e) {
+        eprint("test_native_asm_output: " + e.message);
+        return 1;
+    };
+}

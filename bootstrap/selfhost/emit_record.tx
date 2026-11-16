@@ -23,6 +23,9 @@ import { compileProfileActive, compileProfileClock, compileProfileDetail, compil
 import { programContextValid } from "./bytecode";
 import { RT_BI_BASE, RT_BI_COUNT, isDbgBi, isToolBi, FMEM_SET, isFmemBi } from "./builtin_names";
 import { isFwOp, fwOpType } from "./fw_ops";
+import { ScalarBlock, ScalarLoops, scalarLoops } from "./scalar_loops";
+import { ScalarInstruction, ScalarEntry, ScalarCandidates, scalarCandidates } from "./scalar_candidates";
+import { scalarCachePlan, scalarCacheHotCalls } from "./scalar_cache_plan";
 
 import { planPayload } from "../regallocmirror";
 
@@ -2033,10 +2036,11 @@ function recCat(parts: List<string>, lo: int, hi: int): string {
 // —— planPayload 调用（regalloc_bridge plansViaMirror 同构）——
 // 返回 0＝成功（plansOut＝逐 run E 行原文 List<string>；r12r13 事实写出）；
 // -1＝失败（结构化拒绝）。载荷先按片段收集，末尾一次平衡拼接。
-function plansViaMirror(ir: Ref<Ir>, runsOf: List<Ref<RunTx>>, liveEnd: List<List<int>>): List<string> {
+function plansViaMirror(ir: Ref<Ir>, runsOf: List<Ref<RunTx>>, liveEnd: List<List<int>>, reserveGp: int): List<string> {
     const out: List<string> = listNew();
     const payload: List<string> = listNew();
     listPush(payload, "V 3\n"); // 载荷版本：“无槽”哨兵为 65535（无此行的早期载荷按 255）
+    if (reserveGp > 0) { listPush(payload, "R " + dec(reserveGp) + "\n"); }
     let id = 0;
     let rri = 0;
     while (rri < listLen(runsOf)) {
@@ -2150,6 +2154,9 @@ let recBorrowOn: bool = false;
 let recBorrowElig: List<int> = listNew();
 
 export function recordSetBorrow(on: bool): void { recBorrowOn = on; }
+export const SCALAR_CACHE_DEFAULT: bool = true;
+let recScalarCache: bool = SCALAR_CACHE_DEFAULT;
+export function recordSetScalarCache(on: bool): void { recScalarCache = on; }
 
 // 保守的“写槽”判定：调用/异步/内建窗口覆盖 a 及以上；控制流与写入对象的指令不写槽。
 function borrowDefines(ins: int, slot: int): bool {
@@ -2599,6 +2606,70 @@ function fnHasDbgCheckpoint(f: Ref<Fn>): bool {
     return false;
 }
 
+export struct RecordScalarAnalysis {
+    id: int, blocks: List<Ref<ScalarBlock>>, loops: ScalarLoops,
+    instructions: List<Ref<ScalarInstruction>>, candidates: ScalarCandidates, hotCalls: int, skipped: string,
+}
+function emptyScalarAnalysis(id: int, why: string): Ref<RecordScalarAnalysis> {
+    return new RecordScalarAnalysis { id: id, blocks: listNew(),
+        loops: ScalarLoops { regions: listNew(), work: 0, limited: false },
+        instructions: listNew(), candidates: ScalarCandidates { values: listNew(), work: 0, limited: false }, hotCalls: 0, skipped: why };
+}
+
+// The CFG uses terminal-aware slot analysis blocks. Header liveness comes
+// from the IR supergraph: extra edges may keep values live conservatively.
+// Both paths share exact PCs; block indices are deliberately not shared.
+function scalarFactsForFn(id: int, f: Ref<Fn>, states: Ref<SlotFlow>, ir: Ref<Ir>, maximum: int): Ref<RecordScalarAnalysis> | Error {
+    const facts = emptyScalarAnalysis(id, "");
+    for (block in states.blocks) { listPush(facts.blocks, new ScalarBlock { first: block.start, last: block.end, succs: copyAnalysisRow(block.succs) }); }
+    const roots: List<int> = listNew(); if (listLen(facts.blocks) > 0) { listPush(roots, 0); }
+    facts.loops = scalarLoops(facts.blocks, roots, maximum)?;
+    if (facts.loops.limited || listLen(facts.loops.regions) == 0) { return facts; }
+    const instructions: List<Ref<ScalarInstruction>> = listNew(); const calls: List<int> = listNew(); let pc = 0;
+    for (node in ir.nodes) {
+        const uses: List<int> = listNew(); const tags: List<int> = listNew(); let ui = 0;
+        while (ui < node.nUses) {
+            const slot = listGet(node.uses, ui) catch NO_SLOT;
+            if (slot < f.reg) { listPush(uses, slot); listPush(tags, nodeUseTag(node, ui)); } ui = ui + 1;
+        }
+        // 行只在有额外实参时取（slotRowAt 自带按块的缓存，跳过的位置不影响之后取到的行）。
+        const extras = callExtraUses(node, f.reg);
+        if (listLen(extras) > 0) {
+            const row = slotRowAt(states, pc);
+            for (slot in extras) {
+                // callExtraUses is unique; only the fixed (at most three) IR
+                // prefix overlaps it. Do not scan the growing argument list.
+                let found = false; let prefix = 0;
+                while (prefix < node.nUses) {
+                    if ((listGet(node.uses, prefix) catch NO_SLOT) == slot) { found = true; }
+                    prefix = prefix + 1;
+                }
+                if (!found) { listPush(uses, slot); listPush(tags, stateAt(row, slot)); }
+            }
+        }
+        let def = node.def; if (def == NO_SLOT) { def = -1; }
+        let kill = node.defFrom; if (kill == NO_SLOT) { kill = -1; }
+        const op = node.op;
+        if (op == 30 || op == 31 || op == 32 || op == 38 || op == 48) { listPush(calls, pc); }
+        const barrier = node.native == NK_NONE && op != 15 && op != 16 && op != 17 && op != 35;
+        listPush(instructions, new ScalarInstruction { uses: uses, useTags: tags,
+                def: def, defTag: node.outTag, killFrom: kill, barrier: barrier }); pc = pc + 1;
+    }
+    facts.instructions = instructions;
+    facts.hotCalls = scalarCacheHotCalls(facts.blocks, facts.loops.regions, calls);
+    const entries: List<Ref<ScalarEntry>> = listNew();
+    for (region in facts.loops.regions) {
+        const block = listGet(facts.blocks, region.header) catch panic("scalar header block");
+        const irNode = listGet(ir.nodes, block.first) catch dummyNode();
+        const live = listGet(ir.liveIn, irNode.block) catch emptyIntList();
+        const row = slotRowAt(states, block.first); const tags: List<int> = listNew(); let slot = 0;
+        while (slot < f.reg) { listPush(tags, stateAt(row, slot)); slot = slot + 1; }
+        listPush(entries, new ScalarEntry { tags: tags, live: copyAnalysisRow(live) });
+    }
+    facts.candidates = scalarCandidates(facts.blocks, facts.loops.regions, instructions, entries, f.reg, maximum - facts.loops.work)?;
+    return facts;
+}
+
 // 运算段出口写回集（调试保真）：正常构建＝段末 pc 的 liveAfter；调试构建另加本段定义的标量槽（融合比较的结果不落槽，
 // 除外），让检查点读到的具名变量是真值——同可移植渲染器逐定义写回、VM 参照，主流 -O0 下具名变量都可见。段只含标量运算，
 // 旧值在定义处已按 defMark 释放并写好标签，写回不涉释放，释放时点与正常构建相同。不改 liveAfter 本身（借用与移动分析也读它）。
@@ -2722,10 +2793,15 @@ function dumpFunction(prog: Ref<Program>, fnIdx: int, cfgTyped: int, out: List<s
     let irActive = 0;
     let irUses13 = 0;
     let fri: Ref<Ir> = dummyIr();
+    let cacheSlots: List<int> = listNew();
     let planLines: List<string> = listNew();
     const dbgFn = fnHasDbgCheckpoint(f);
     if (slotFlowLen(states) > 0) {
         const built = buildFnIr(prog, f, states);
+        if (recScalarCache && built.failed == 0 && !susp && !dbgFn && listLen(f.landings) == 0) {
+            const facts = scalarFactsForFn(fnIdx, f, states, built, ANALYSIS_BUDGET) catch emptyScalarAnalysis(fnIdx, "unsupported");
+            cacheSlots = scalarCachePlan(facts.candidates, facts.hotCalls);
+        }
         if (built.failed == 0 && listLen(built.runs) > 0) {
             // 逐 run 出口写回集（runWriteback：正常构建即出口活跃集）。
             const liveEnd: List<List<int>> = listNew();
@@ -2736,7 +2812,7 @@ function dumpFunction(prog: Ref<Program>, fnIdx: int, cfgTyped: int, out: List<s
                 rri = rri + 1;
             }
             g_r13 = 0;
-            planLines = plansViaMirror(built, built.runs, liveEnd);
+            planLines = plansViaMirror(built, built.runs, liveEnd, listLen(cacheSlots));
             if (listLen(planLines) == listLen(built.runs)) {
                 irActive = 1;
                 fri = built;
@@ -2755,7 +2831,11 @@ function dumpFunction(prog: Ref<Program>, fnIdx: int, cfgTyped: int, out: List<s
     const fnBorrow = recBorrowOn && (listGet(recBorrowElig, fnIdx) catch 0) == 1;
 
     // fn 记录第 3 域原为 need_pin（钉驻与 E007 已删除），恒写 0 占位，记录形不变。
+    if (listLen(cacheSlots) > 0) { irUses13 = 1; }
     listPush(out, "fn " + dec(fnIdx) + " " + dec(rc) + " 0 " + dec(escPad) + " " + dec(cachePad) + " " + dec(strbldPad) + " " + dec(vhPad) + " 0 " + dec(irActive) + " " + dec(irUses13));
+    if (listLen(cacheSlots) > 0) {
+        listPush(out, "scalar_cache " + dec(listGet(cacheSlots, 0) catch -1) + " " + dec(listGet(cacheSlots, 1) catch -1));
+    }
     // strbld 环事实（base＝56+padEsc+padCache）。
     if (listLen(sblLoops) > 0) {
         const sblBase = FRAME_PAD + escPad + cachePad;
@@ -5059,4 +5139,28 @@ export function recordProgramContext(p: Ref<ProgramContext>): string {
     const owned = contextOwnedProgram(p);
     if (compileProfileActive()) { compileProfileDetail("record-bridge", compileProfileClock() - t0); }
     return recordOwnedProgram(owned);
+}
+
+// Structured analysis entry for allocator integration and compiler probes.
+// No machine code or persistent record state is changed by this operation.
+export function recordScalarProgramContext(p: Ref<ProgramContext>, maximum: int): List<Ref<RecordScalarAnalysis>> | Error {
+    if (maximum < 0) { return err("scalar analysis: negative work limit"); }
+    if (!programContextValid(p)) { return err("scalar analysis: invalid program context"); }
+    const prog = contextOwnedProgram(p); transformLeafInline(prog);
+    const out: List<Ref<RecordScalarAnalysis>> = listNew(); let id = 0;
+    for (f in prog.funcs) {
+        let why = "";
+        if (fnConservative(f) || listLen(f.landings) > 0) { why = "suspend-or-conservative"; }
+        if (fnHasDbgCheckpoint(f)) { why = "debug"; }
+        if (listLen(f.code) * f.reg > ANALYSIS_BUDGET) { why = "analysis-budget"; }
+        if (listLen(f.code) == 0 || f.reg == 0) { why = "empty"; }
+        if (len(why) > 0) { listPush(out, emptyScalarAnalysis(id, why)); }
+        else {
+            const states = computeSlotTypes(prog, f); const ir = buildFnIr(prog, f, states);
+            if (ir.failed != 0) { return err("scalar analysis: invalid function IR"); }
+            listPush(out, scalarFactsForFn(id, f, states, ir, maximum)?);
+        }
+        id = id + 1;
+    }
+    return out;
 }

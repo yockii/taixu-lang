@@ -1,0 +1,119 @@
+// 交叉产物（目标分层 4.1 第 4、5 项）：scripts/targets.tx 里本宿主以外的每个目标，
+// 全量语料只构建、只核对构建结果（scripts/test_nrt_products.tx --build-only；Mach-O 产物另过 macho_check，aarch64-windows 的另过
+// pe_arm64_check）；本宿主自己的目标由 products 步构建并运行。代替原先按目标各开一步的 a64-products、a64-linux-products、
+// la64-linux-products、rv64-linux-products、a64-windows-products，并补上原先没有全量构建的目标（x86_64-macos；非 Linux 宿主上的
+// x86_64-linux、非 Windows 宿主上的 x86_64-windows）。产物的实际运行另记（qemu、M1、Windows ARM64 测试机）。
+// 每个目标的逐例输出写 <工作目录>/<三元组>.log、报告写 <三元组>.json；本步逐目标打印运行器的 SUMMARY 行，有目标失败即失败。
+// 运行：taixu run --toolchain scripts/test_cross_products.tx --compiler <taixu> --work <目录> [--root <仓库>]
+import { absolute, join, list1, mkdirs, nat, plus, readBytes, shaOf, startsWith } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { capture, check, linesOf, summary, tallyNew } from "./test_lib";
+import { allTargets, targetOn } from "./targets";
+import { J_ARR, J_OBJ, jArray, jGet, jLen, jNumber, jObject, jParseUnique, jPretty, jPush, jSet, jString } from "./test_json";
+import { bit, choose } from "./gate_batch_model";
+
+// 一个目标的全量构建至多这么久（每例的构建另有运行器自己的时限）。
+const TARGET_NS: int = 7200000000000;
+const MAX_OUTPUT: int = 268435456;
+
+function lastSummary(text: string): string {
+    let s = "";
+    for (line in linesOf(text)) {
+        if (startsWith(line, "SUMMARY")) {
+            s = line;
+        }
+    }
+    return s;
+}
+
+function run(args: []string): int | Error {
+    let compiler = "";
+    let work = "";
+    let root = "";
+    let report = "";
+    let includeHost = false;
+    let i: int = 0;
+    while (i < len(args)) {
+        const a = args[i];
+        if (a == "--include-host") { includeHost = true; i = i + 1; continue; }
+        if (i + 1 >= len(args)) {
+            return err("缺少取值或未知参数：" + a);
+        }
+        const v = args[i + 1];
+        if (a == "--compiler") {
+            compiler = v;
+        } else if (a == "--work") {
+            work = v;
+        } else if (a == "--root") {
+            root = v;
+        } else if (a == "--report") {
+            report = absolute(v);
+        } else {
+            return err("未知参数：" + a);
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0 || len(work) == 0) {
+        return err("用法：taixu run --toolchain scripts/test_cross_products.tx --compiler <taixu> --work <目录> [--root <仓库>]");
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = osRealPath(absolute(root));
+    compiler = osRealPath(absolute(compiler));
+    if (!mkdirs(absolute(work))) {
+        return err("建不了工作目录：" + work);
+    }
+    const dir = osRealPath(absolute(work));
+    // 宿主的组合不在目标表里时（没有本机目标），全部目标都交叉构建。
+    const host = targetOn(hostTarget(), hostArch());
+    const t = tallyNew();
+    const result = jObject();
+    jSet(result, "schema", jString("cross-products/1"));
+    jSet(result, "host_target", jString(host.triple));
+    jSet(result, "compiler_sha256", jString(shaOf(compiler)));
+    jSet(result, "include_host", jNumber(bit(includeHost)));
+    const targets = jArray();
+    jSet(result, "targets", targets);
+    for (tg in allTargets()) {
+        if (!includeHost && tg.triple == host.triple) {
+            continue;
+        }
+        const argv = plus(plus(list1("run"), plus(list1("--toolchain"), list1(nat(join(root, "scripts/test_nrt_products.tx"))))),
+            plus(plus(list1("--compiler"), list1(compiler)), plus(plus(list1("--target"), list1(tg.triple)), list1("--build-only"))));
+        const rest = plus(plus(list1("--root"), list1(nat(root))),
+            plus(plus(list1("--work"), list1(nat(join(dir, tg.triple)))), plus(list1("--report"), list1(nat(join(dir, tg.triple + ".json"))))));
+        const r = capture(compiler, plus(argv, rest), root, TARGET_NS, MAX_OUTPUT)?;
+        const log = tg.triple + ".log";
+        writeFile(join(dir, log), r.out + r.err) catch (e) {
+            return err("写不了 " + log + "：" + e.message);
+        };
+        const line = lastSummary(r.out);
+        print(tg.triple + " " + line);
+        const detailPath = join(dir, tg.triple + ".json");
+        const bytes = readBytes(detailPath) catch bytesNew(0);
+        const detail = jParseUnique(bytes) catch jObject();
+        const rows = jGet(detail, "rows") ?? jObject();
+        const counts = jGet(detail, "counts") ?? jArray();
+        const valid = rows.kind == J_ARR && jLen(rows) > 0 && counts.kind == J_OBJ;
+        check(t, tg.triple, r.code == 0 && len(line) > 0 && valid, "退出码 " + toStr(r.code) + "，逐例输出见 " + log);
+        const row = jObject();
+        jSet(row, "target", jString(tg.triple));
+        jSet(row, "exit", jNumber(r.code));
+        jSet(row, "case_count", jNumber(jLen(rows)));
+        jSet(row, "counts", counts);
+        jSet(row, "report_sha256", jString(shaOf(detailPath)));
+        jSet(row, "report", jString(detailPath));
+        jPush(targets, row);
+    }
+    jSet(result, "status", jString(choose(t.fail == 0, "PASS", "FAIL")));
+    if (len(report) > 0) { writeFile(report, jPretty(result, 2) + "\n")?; }
+    return summary(t, "cross-products");
+}
+
+function main(args: []string): int {
+    return run(args) catch (e) {
+        eprint("test_cross_products: " + e.message);
+        return 1;
+    };
+}

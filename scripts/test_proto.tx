@@ -1,0 +1,324 @@
+// 协议端到端测试的客户端：起服务子进程（stdin 走管道），不阻塞地读它的 stdout 与 stderr，把 stdout 切成
+// 消息——MCP 一行一个 JSON，LSP、DAP 按 Content-Length 分帧——以独立的 test_json.tx 解析（不用服务端的 json_parse.tx）；原样模式只收
+// 字节（帧头回归用）。写入与排空交替（服务写满输出管道时不死锁）；procCloseStream（D3 v0.54）关输入让服务读到
+// 流尾。解析不了的消息记在 bad 里（原文，非法 UTF-8 按 U+FFFD 替换，同 Python 的 decode('utf-8', 'replace')）。
+import { lossyText } from "./check_lib";
+import { Jv, jParseBytes, jParseUnique } from "./test_json";
+import { byteSub, indexOf } from "./test_text";
+
+export const MODE_LINES: int = 0;
+export const MODE_FRAMES: int = 1;
+export const MODE_RAW: int = 2;
+
+export struct Peer {
+    h: int,
+    mode: int,
+    // 为真时对象里的重名键算解析失败（jParseUnique），否则以后一个为准。
+    unique: bool,
+    // stdout 里尚未成为完整消息的字节；scan 之前已查过没有换行（行模式）。原样模式下是收到的全部字节。
+    pending: Bytes,
+    scan: int,
+    msgs: List<Ref<Jv>>,
+    bad: List<string>,
+    err: Bytes,
+    outOpen: bool,
+    errOpen: bool,
+    done: bool,
+    code: int,
+    buf: Bytes,
+    // 为真时不读 stdout（模拟客户端停读，服务写满管道后阻塞），stderr 照读。
+    paused: bool,
+}
+
+// 在 cwd 里起 exe；mode 为 MODE_LINES（一行一个 JSON）、MODE_FRAMES（Content-Length 分帧）或 MODE_RAW（只收字节）。
+export function peerStart(exe: string, args: List<string>, cwd: string, mode: int, unique: bool): Ref<Peer> | Error {
+    const h = procSpawn(exe, args, cwd, 1)?;
+    const msgs: List<Ref<Jv>> = listNew();
+    const bad: List<string> = listNew();
+    return new Peer { h: h, mode: mode, unique: unique, pending: bytesNew(0), scan: 0, msgs: msgs, bad: bad, err: bytesNew(0), outOpen: true,
+        errOpen: true, done: false, code: 0, buf: bytesNew(65536), paused: false };
+}
+
+// 一次带输入的运行（同 Python 的 subprocess.run(input=…)）：写完 data 即关输入，至多 limitMs 毫秒；超时得退出码 −1（已结束子进程）。
+// 输出原样留在 pending（stdout）与 err（stderr）。
+export function runWithInput(exe: string, args: List<string>, cwd: string, data: Bytes, limitMs: int): Ref<Peer> | Error {
+    const p = peerStart(exe, args, cwd, MODE_RAW, false)?;
+    peerSend(p, data);
+    const code = peerFinish(p, limitMs);
+    if (code == None) {
+        p.code = -1;
+    }
+    peerClose(p);
+    return p;
+}
+
+// 服务已退出（退出码在 code）。
+export function peerExited(p: Ref<Peer>): bool {
+    if (!p.done) {
+        reap(p, 0);
+    }
+    return p.done;
+}
+
+function reap(p: Ref<Peer>, ms: int): void {
+    const w = procWait(p.h, ms);
+    if (w != None) {
+        p.done = true;
+        p.code = w ?? -1;
+    }
+}
+
+// 至多等 ms 毫秒读进可读的输出并切出完整消息；读到了字节为真。两个流都已关闭时改为等进程退出。
+export function peerPump(p: Ref<Peer>, ms: int): bool {
+    let mask = 0;
+    if (p.outOpen && !p.paused) {
+        mask = mask | 2;
+    }
+    if (p.errOpen) {
+        mask = mask | 4;
+    }
+    if (mask == 0) {
+        if (!p.done) {
+            reap(p, ms);
+        }
+        return false;
+    }
+    const ready = ioWait(p.h, mask, ms);
+    let got = false;
+    if ((ready & 2) != 0) {
+        const n = procRead(p.h, 1, p.buf);
+        if (n < 0) {
+            p.outOpen = false;
+            flushTail(p);
+        } else if (n > 0) {
+            bytesAppend(p.pending, bytesSlice(p.buf, 0, n));
+            split(p);
+            got = true;
+        }
+    }
+    if ((ready & 4) != 0) {
+        const n = procRead(p.h, 2, p.buf);
+        if (n < 0) {
+            p.errOpen = false;
+        } else if (n > 0) {
+            bytesAppend(p.err, bytesSlice(p.buf, 0, n));
+            got = true;
+        }
+    }
+    return got;
+}
+
+// 读 ms 毫秒（期间到达的消息照收）；没有服务输出时作计时用。
+export function peerIdle(p: Ref<Peer>, ms: int): void {
+    const end = monoNs() + ms * 1000000;
+    while (true) {
+        const left = (end - monoNs()) / 1000000;
+        if (left <= 0) {
+            return;
+        }
+        if (!p.outOpen && !p.errOpen && p.done) {
+            nap(left);
+            return;
+        }
+        peerPump(p, left);
+    }
+}
+
+// 原样写进服务的 stdin；写不进时先排空输出再试。对端已关闭得假。
+export function peerSend(p: Ref<Peer>, data: Bytes): bool {
+    let at = 0;
+    const total = bytesLen(data);
+    while (at < total) {
+        let n = total - at;
+        if (n > 4096) {
+            n = 4096;
+        }
+        const w = procTryWrite(p.h, 0, bytesSlice(data, at, n));
+        if (w < 0) {
+            return false;
+        }
+        if (w == 0) {
+            peerPump(p, 10);
+        } else {
+            at = at + w;
+        }
+    }
+    return true;
+}
+
+// 关掉服务的 stdin（流尾），至多等 limitMs 毫秒让它退出，再至多同样久地读完两个流；超时则结束它、得 None。
+export function peerFinish(p: Ref<Peer>, limitMs: int): int? {
+    procCloseStream(p.h, 0);
+    const deadline = monoNs() + limitMs * 1000000;
+    while (!peerExited(p)) {
+        if (monoNs() >= deadline) {
+            procKill(p.h);
+            reap(p, 10000);
+            return None;
+        }
+        peerPump(p, 50);
+    }
+    const drain = monoNs() + limitMs * 1000000;
+    while ((p.outOpen || p.errOpen) && monoNs() < drain) {
+        peerPump(p, 50);
+    }
+    return p.code;
+}
+
+// 结束（若仍在运行）并释放句柄。
+export function peerClose(p: Ref<Peer>): void {
+    procClose(p.h);
+}
+
+// 没有服务可等时的计时（忙等，只用于很短的轮询间隔）。
+export function nap(ms: int): void {
+    const end = monoNs() + ms * 1000000;
+    while (monoNs() < end) {
+        const spin = 0;
+    }
+}
+
+// ---- 切消息 ----
+
+function split(p: Ref<Peer>): void {
+    if (p.mode == MODE_RAW) {
+        return;
+    }
+    if (p.mode == MODE_FRAMES) {
+        splitFrames(p);
+        return;
+    }
+    while (true) {
+        let i = p.scan;
+        const n = bytesLen(p.pending);
+        while (i < n && (bytesGet(p.pending, i) ?? 10) != 10) {
+            i = i + 1;
+        }
+        if (i >= n) {
+            p.scan = n;
+            return;
+        }
+        take(p, bytesSlice(p.pending, 0, i));
+        p.pending = bytesSlice(p.pending, i + 1, n - i - 1);
+        p.scan = 0;
+    }
+}
+
+// 流尾时不带换行的最后一行（同 Python 逐行读文件对象时的最后一项）。
+function flushTail(p: Ref<Peer>): void {
+    if (p.mode == MODE_LINES && bytesLen(p.pending) > 0) {
+        take(p, p.pending);
+        p.pending = bytesNew(0);
+        p.scan = 0;
+    }
+}
+
+// 一条消息：先按 UTF-8 解码（非法字节换成 U+FFFD）再解析。
+function take(p: Ref<Peer>, raw: Bytes): void {
+    const text = lossyText(raw);
+    const v = parseMsg(text, p.unique) catch (e) {
+        listPush(p.bad, text);
+        return;
+    };
+    listPush(p.msgs, v);
+}
+
+function parseMsg(text: string, unique: bool): Ref<Jv> | Error {
+    if (unique) {
+        return jParseUnique(bytesFromStr(text));
+    }
+    return jParseBytes(bytesFromStr(text));
+}
+
+// LSP／DAP 的帧：逐行读头（以 \n 结尾，去掉两端空白），空行结束；名字（去空白、不分大小写）为
+// content-length 的取其值；随后读该长度的正文（没有长度读 0 字节）。头或正文不完整时等下次。长度不是十进制数时记一条 bad 并跳过这组头。
+function splitFrames(p: Ref<Peer>): void {
+    while (true) {
+        const n = bytesLen(p.pending);
+        let at = 0;
+        let size = 0;
+        let badHead = "";
+        let ended = false;
+        while (!ended) {
+            let i = at;
+            while (i < n && (bytesGet(p.pending, i) ?? 10) != 10) {
+                i = i + 1;
+            }
+            if (i >= n) {
+                return;
+            }
+            const line = trimText(lossyText(bytesSlice(p.pending, at, i - at)));
+            at = i + 1;
+            if (len(line) == 0) {
+                ended = true;
+            } else {
+                const colon = indexOf(line, ":");
+                if (colon >= 0 && lower(trimText(byteSub(line, 0, colon))) == "content-length") {
+                    size = digitsOf(byteSub(line, colon + 1, len(line) - colon - 1));
+                    if (size < 0) {
+                        badHead = line;
+                    }
+                }
+            }
+        }
+        if (len(badHead) > 0) {
+            listPush(p.bad, badHead);
+            p.pending = bytesSlice(p.pending, at, n - at);
+            continue;
+        }
+        if (n - at < size) {
+            return;
+        }
+        take(p, bytesSlice(p.pending, at, size));
+        p.pending = bytesSlice(p.pending, at + size, n - at - size);
+    }
+}
+
+// 去掉两端的空白（空格、制表、回车、换行、垂直制表、换页，同 Python 的 bytes.strip）。
+function trimText(s: string): string {
+    let i = 0;
+    let j = len(s);
+    while (i < j && blank(byteAt(s, i) ?? 0)) {
+        i = i + 1;
+    }
+    while (j > i && blank(byteAt(s, j - 1) ?? 0)) {
+        j = j - 1;
+    }
+    return byteSub(s, i, j - i);
+}
+
+function blank(c: int): bool {
+    return c == 32 || c == 9 || c == 13 || c == 10 || c == 11 || c == 12;
+}
+
+function lower(s: string): string {
+    const b = bytesFromStr(s);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) ?? 0;
+        if (c >= 65 && c <= 90) {
+            bytesSet(b, i, c + 32);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(b) catch s;
+}
+
+// 去掉两端空白后的十进制非负整数；不是得 −1。
+function digitsOf(s: string): int {
+    const t = trimText(s);
+    if (len(t) == 0 || len(t) > 18) {
+        return -1;
+    }
+    let v = 0;
+    let i = 0;
+    while (i < len(t)) {
+        const c = byteAt(t, i) ?? 0;
+        if (c < 48 || c > 57) {
+            return -1;
+        }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}

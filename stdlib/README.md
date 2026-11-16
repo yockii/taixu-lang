@@ -36,7 +36,7 @@ import { jsonParse, jsonStringify } from "std/json";
 ## 测试
 
 ```sh
-python stdlib/verify.py --compiler <taixu>
+taixu run --toolchain stdlib/verify.tx --compiler <taixu>
 ```
 
 检查格式、逐个运行 `tests/` 下的用例与独立产物的期望输出，并做泄漏检查。完整门（`scripts/gate.tx`）也会运行它。

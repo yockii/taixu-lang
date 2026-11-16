@@ -1,0 +1,666 @@
+// 函数范围与帧事件的门（gate.tx 的 functions 步）：生产者声明的函数范围、序言与尾声、帧事件，对照产物的实际
+// 字节独立解码（scripts/check_frames.tx）。探针 bootstrap/native_function_probe.tx（--leak-check）核对负例、所有权、重入与近 int64
+// 上限的地址；七个目标 × 十种程序（含 --debug、--leak-check、线程、工具链、外部函数与回调）的映射核对帧、进程与线程入口的字节、
+// 回调外壳的寄存器保存、缺省范围不收符号、普通构建与带映射的产物相同、全量范围的函数表相同、与 profile／disasm 的函数身份一致与
+// 人读摘要；同进程驱动探针 bootstrap/native_function_driver_probe.tx 核对失败、清单、范围与重入。
+// 运行（仓根）：taixu run --toolchain scripts/test_native_functions.tx --compiler <taixu> --work <目录> [--baseline-compiler <上一编译器>]
+//   [--root <仓库>]
+// FAIL 行的细节写成本文件的文字；映射或探针输出不是 JSON 时记该项失败。
+import { absolute, exeName, join, kindOf, mkdirs, nat, readBytes } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { hexOf, lossyText, sha256Of } from "./check_lib";
+import { Seg, imageLayout } from "./check_obj";
+import { decAt, verifyBoundaries, verifyFunctions } from "./check_frames";
+import { captureRaw } from "./test_lib";
+import { J_ARR, J_BOOL, J_NUM, J_STR, Jv, jArray, jEq, jNull, jObject, jParseBytes, jPretty, jPush, jQuote, jSet, jString } from "./test_json";
+import { at, count, isNull, item, textIs, textOf } from "./test_jv";
+import { contains, headChars, reprBytes, slashes, strip } from "./test_text";
+
+const SEC: int = 1000000000;
+const MAX_OUTPUT: int = 67108864;
+
+struct Ctx {
+    compiler: string,
+    baseline: string,
+    root: string,
+    work: string,
+    checks: Ref<Jv>,
+    total: int,
+    failures: int,
+}
+
+struct Res {
+    code: int,
+    out: Bytes,
+    err: Bytes,
+}
+
+function check(c: Ref<Ctx>, name: string, ok: bool, detail: string): bool {
+    const row = jObject();
+    jSet(row, "name", jString(name));
+    jSet(row, "ok", boolJv(ok));
+    jPush(c.checks, row);
+    c.total = c.total + 1;
+    if (ok) {
+        print("PASS " + name + " ");
+    } else {
+        c.failures = c.failures + 1;
+        print("FAIL " + name + " " + headChars(detail, 800));
+    }
+    return ok;
+}
+
+function boolJv(b: bool): Ref<Jv> {
+    return new Jv { kind: J_BOOL, text: "", truth: b, items: listNew(), keys: listNew() };
+}
+
+function numJv(n: int): Ref<Jv> {
+    return new Jv { kind: J_NUM, text: toStr(n), truth: false, items: listNew(), keys: listNew() };
+}
+
+function sh(c: Ref<Ctx>, exe: string, args: List<string>, limit: int): Res {
+    const r = captureRaw(exe, args, c.root, limit * SEC, 10 * SEC, MAX_OUTPUT) catch (e) {
+        return Res { code: -2, out: bytesNew(0), err: bytesFromStr(e.message) };
+    };
+    return Res { code: r.code, out: r.out, err: r.err };
+}
+
+function tx(c: Ref<Ctx>, args: List<string>): Res {
+    return sh(c, c.compiler, args, 300);
+}
+
+function strs(a: []string): List<string> {
+    const xs: List<string> = listNew();
+    for (x in a) {
+        listPush(xs, x);
+    }
+    return xs;
+}
+
+function plusL(xs: List<string>, ys: List<string>): List<string> {
+    const out: List<string> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+    }
+    for (y in ys) {
+        listPush(out, y);
+    }
+    return out;
+}
+
+function parseOr(b: Bytes): Ref<Jv>? {
+    const v = jParseBytes(b) catch (e) {
+        return None;
+    };
+    return v;
+}
+
+function readOr(path: string): Bytes {
+    return readBytes(path) catch bytesNew(0);
+}
+
+function writeObj(path: string, d: Bytes): void {
+    writeFileBytes(path, d) catch (e) {};
+}
+
+function writeText(path: string, text: string): void | Error {
+    writeFileBytes(path, bytesFromStr(text))?;
+}
+
+function resText(r: Res): string {
+    return "(" + toStr(r.code) + ", " + reprBytes(r.out, 400) + ", " + reprBytes(r.err, 400) + ")";
+}
+
+function stemOf(path: string): string {
+    const b = bytesFromStr(path);
+    let start = 0;
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const ch = bytesGet(b, i) ?? 0;
+        if (ch == 47 || ch == 92) {
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    let end = bytesLen(b);
+    i = bytesLen(b) - 1;
+    while (i > start) {
+        if ((bytesGet(b, i) ?? 0) == 46) {
+            end = i;
+            break;
+        }
+        i = i - 1;
+    }
+    return bytesToStr(bytesSlice(b, start, end - start)) catch path;
+}
+
+function hasKey(xs: List<string>, k: string): bool {
+    for (x in xs) {
+        if (x == k) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function keysText(xs: List<string>): string {
+    let s = "{";
+    let i = 0;
+    for (x in xs) {
+        if (i > 0) {
+            s = s + ", ";
+        }
+        s = s + "(" + x + ")";
+        i = i + 1;
+    }
+    return s + "}";
+}
+
+function validate(c: Ref<Ctx>, name: string, doc: Ref<Jv>?, image: Bytes, segsOk: bool, segsWhy: string, segs: List<Seg>): List<string> {
+    if (!segsOk) {
+        check(c, name, false, segsWhy);
+        return listNew();
+    }
+    const saves = verifyFunctions(doc, image, segs) catch (e) {
+        check(c, name, false, e.message);
+        return listNew();
+    };
+    check(c, name, true, "");
+    return saves;
+}
+
+function arrHas(v: Ref<Jv>?, want: string): bool {
+    let i = 0;
+    while (i < count(v)) {
+        const s = item(v, i);
+        if (s != None && (s ?? jNull()).kind == J_STR && (s ?? jNull()).text == want) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+struct Case {
+    name: string,
+    source: string,
+    flags: List<string>,
+}
+
+function probeChecks(c: Ref<Ctx>): void {
+    const work = c.work;
+    const built = tx(c, strs(["build", nat(join(c.root, "bootstrap/native_function_probe.tx")), "--toolchain", "--leak-check", "--out",
+                nat(join(work, "probe"))]));
+    check(c, "producer ownership probe build", built.code == 0, reprBytes(built.err, 800));
+    if (built.code != 0) {
+        return;
+    }
+    const fixture = nat(join(work, "fixture.bin"));
+    const p = sh(c, nat(join(join(work, "probe"), exeName("native_function_probe"))), strs([fixture]), 60);
+    writeObj(nat(join(work, "probe.stdout")), p.out);
+    writeObj(nat(join(work, "probe.stderr")), p.err);
+    check(c, "producer negative checks, ownership, reentry, no leaks", p.code == 0 && bytesLen(p.err) == 0, resText(p));
+    if (p.code != 0) {
+        return;
+    }
+    const doc = parseOr(p.out);
+    const image = readOr(fixture);
+    const x = at(doc, "map");
+    const segs: List<Seg> = listNew();
+    listPush(segs, Seg { va: 9223372036854775697, off: 512, hasOff: true, file: bytesLen(image) - 512, mem: bytesLen(image) - 512 });
+    const saves = validate(c, "independent producer frame bytes and near-int64-limit address", doc, image, true, "", segs);
+    check(c, "both save sets", listLen(saves) == 2 && hasKey(saves, "5,3,14,15") && hasKey(saves, "5,3,14,15,12,13"), keysText(saves));
+    const fs = at(x, "functions");
+    const f0 = item(fs, 0);
+    const f1 = item(fs, 1);
+    let gaps = true;
+    let i = 0;
+    while (i < count(fs)) {
+        const f = item(fs, i);
+        const ep = decAt(item(at(f, "epilogues"), 0), "start_offset") catch -1;
+        const pro = decAt(f, "prologue_end_offset") catch -100;
+        if (ep - pro != 9) {
+            gaps = false;
+        }
+        i = i + 1;
+    }
+    const b0 = decAt(f0, "input_section_begin") catch -1;
+    const b1 = decAt(f1, "input_section_begin") catch -1;
+    const e0 = decAt(f0, "input_section_end") catch -1;
+    check(c, "padding excluded and internal labels not boundaries", b0 == 6 && b1 - e0 == 9 && gaps, "");
+    check(c, "escaping and human summary", textIs(f0, "module", "库/引用\"\\\n.tx") && contains(lossyText(readOr(fixture + ".txt")), "太虚函数"), "");
+}
+
+// 回调外壳逐个寄存器的压栈与逆序出栈。
+function regsOf(f: Ref<Jv>?, kind: string): string {
+    let s = "";
+    const evs = at(at(f, "frame"), "events");
+    let i = 0;
+    while (i < count(evs)) {
+        const e = item(evs, i);
+        if (textIs(e, "kind", kind)) {
+            s = s + numText(at(e, "register")) + ",";
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+function numText(v: Ref<Jv>?): string {
+    if (v == None) {
+        return "None";
+    }
+    const x = v ?? jNull();
+    if (x.kind == 0) {
+        return "None";
+    }
+    return x.text;
+}
+
+function seqText(xs: []int): string {
+    let s = "";
+    for (x in xs) {
+        s = s + toStr(x) + ",";
+    }
+    return s;
+}
+
+function rangeDown(from: int, to: int): string {
+    let s = "";
+    let r = from;
+    while (r > to) {
+        s = s + toStr(r) + ",";
+        r = r - 1;
+    }
+    return s;
+}
+
+function rangeUp(from: int, to: int): string {
+    let s = "";
+    let r = from;
+    while (r < to) {
+        s = s + toStr(r) + ",";
+        r = r + 1;
+    }
+    return s;
+}
+
+// (source_id 或 id／index, module, name) 的排序清单，比较两边是否相同。
+function identityList(fs: Ref<Jv>?, idKey: string, onlyTx: bool): List<string> {
+    const out: List<string> = listNew();
+    let i = 0;
+    while (i < count(fs)) {
+        const f = item(fs, i);
+        if (!onlyTx || textIs(f, "origin", "tx-generated")) {
+            const k = numText(at(f, idKey)) + "\n" + textOf(f, "module") + "\n" + textOf(f, "name");
+            listPush(out, k);
+            let j = listLen(out) - 1;
+            while (j > 0 && lessKey(k, listGet(out, j - 1) catch "")) {
+                listSet(out, j, listGet(out, j - 1) catch "");
+                j = j - 1;
+            }
+            listSet(out, j, k);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+function lessKey(a: string, b: string): bool {
+    let i = 0;
+    while (i < len(a) && i < len(b)) {
+        const x = byteAt(a, i) ?? 0;
+        const y = byteAt(b, i) ?? 0;
+        if (x != y) {
+            return x < y;
+        }
+        i = i + 1;
+    }
+    return len(a) < len(b);
+}
+
+function sameList(a: List<string>, b: List<string>): bool {
+    if (listLen(a) != listLen(b)) {
+        return false;
+    }
+    let i = 0;
+    while (i < listLen(a)) {
+        if ((listGet(a, i) catch "") != (listGet(b, i) catch "?")) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function targetChecks(c: Ref<Ctx>, target: string, cases: List<Case>, driverBuilt: bool, allSaves: List<string>): void | Error {
+    const work = c.work;
+    const a64 = contains(target, "aarch64-");
+    const la64 = target == "loongarch64-linux";
+    const rv64 = target == "riscv64-linux";
+    let triple = target;
+    let lib = "libSystem";
+    let callback = "ffi-macos-lib.tx";
+    if (target == "windows") {
+        triple = "x86_64-windows";
+        lib = "ucrtbase";
+        callback = "ffi-win-callback.tx";
+    } else if (contains(target, "-linux")) {
+        lib = "libc.so.6";
+        callback = "ffi-linux-callback-outside.tx";
+    }
+    const ffi = nat(join(work, "ffi-" + target + ".tx"));
+    writeText(ffi, "declare function strlen(s: string): usize from \"" + lib
+        + "\";\nexport function main(args: []string): int { print(toStr(strlen(\"abc\"))); return 0; }\n")?;
+    const all: List<Case> = listNew();
+    for (k in cases) {
+        listPush(all, k);
+    }
+    listPush(all, Case { name: "ffi", source: ffi, flags: listNew() });
+    listPush(all, Case { name: "callback", source: nat(join(c.root, "tests/nrt-cases/" + callback)), flags: listNew() });
+    for (k in all) {
+        const dest = nat(join(work, target + "-" + k.name));
+        const mapping = nat(join(work, target + "-" + k.name + ".json"));
+        const args = plusL(strs(["build", k.source, "--target=" + triple, "--out", dest]), k.flags);
+        const p = tx(c, plusL(args, strs(["--map", mapping, "--map-format=json"])));
+        check(c, "map:" + target + ":" + k.name, p.code == 0 && kindOf(mapping) == 1, reprBytes(p.err, 800));
+        if (p.code != 0) {
+            continue;
+        }
+        const doc = parseOr(readOr(mapping));
+        const x = at(doc, "map");
+        let exe = stemOf(k.source);
+        if (target == "windows") {
+            exe = exe + ".exe";
+        }
+        const product = nat(join(dest, exe));
+        const image = readOr(product);
+        const lay = imageLayout(image);
+        const saves = validate(c, "independent executable frames:" + target + ":" + k.name, doc, image, lay.ok, lay.why, lay.segs);
+        for (s in saves) {
+            if (!hasKey(allSaves, s)) {
+                listPush(allSaves, s);
+            }
+        }
+        // 运行时按需链入：只有 thread 样例用线程，链入线程入口；别的样例都不该有。
+        let boundariesOk = true;
+        verifyBoundaries(doc, image, target, k.name == "thread") catch (e) {
+            boundariesOk = false;
+        };
+        check(c, "actual special entry bytes and unknown frames:" + target + ":" + k.name, boundariesOk, "");
+        const fs = at(x, "functions");
+        if (k.name == "callback") {
+            let shells = 0;
+            let i = 0;
+            while (i < count(fs)) {
+                if (textIs(item(fs, i), "origin", "ffi-callback-shell")) {
+                    shells = shells + 1;
+                }
+                i = i + 1;
+            }
+            check(c, "callback shell declared coverage:" + target, shells > 0
+                && arrHas(at(at(x, "coverage"), "included_function_origins"), "ffi-callback-shell"), "");
+            let pushes = seqText([3, 5, 6, 7, 12, 13, 14, 15]);
+            let pops = seqText([15, 14, 13, 12, 7, 6, 5, 3]);
+            if (a64) {
+                pushes = seqText([30, 29, 20, 19, 22, 21, 24, 23, 26, 25, 28, 27]);
+                pops = seqText([27, 28, 25, 26, 23, 24, 21, 22, 19, 20, 29, 30]);
+            } else if (la64) {
+                pushes = seqText([1, 22]) + rangeUp(23, 32);
+                pops = rangeDown(31, 22) + seqText([22, 1]);
+            } else if (rv64) {
+                pushes = seqText([1, 8, 9]) + rangeUp(18, 28);
+                pops = rangeDown(27, 17) + seqText([9, 8, 1]);
+            }
+            let regsOk = shells > 0;
+            i = 0;
+            while (i < count(fs)) {
+                const f = item(fs, i);
+                if (textIs(f, "origin", "ffi-callback-shell")) {
+                    const eps = at(f, "epilogues");
+                    const endOff = decAt(item(eps, 0), "end_offset") catch -1;
+                    const bytes = decAt(f, "bytes") catch -2;
+                    if (regsOf(f, "push-nonvolatile") != pushes || regsOf(f, "pop-nonvolatile") != pops
+                        || !textIs(at(f, "frame"), "register_recovery", "saved-gpr-events") || count(eps) != 1 || endOff != bytes) {
+                        regsOk = false;
+                    }
+                }
+                i = i + 1;
+            }
+            check(c, "callback GPR saves and reverse restores:" + target, regsOk, "");
+        }
+        check(c, "default skips raw symbol collection:" + target + ":" + k.name, textIs(x, "scope", "functions") && isNull(at(x, "symbols_total"))
+            && count(at(x, "symbols")) == 0 && arrayAt(x, "symbols") && textIs(at(x, "coverage"), "symbols", "omitted-by-scope"), "");
+        let prov = true;
+        let i = 0;
+        while (i < count(fs)) {
+            const f = item(fs, i);
+            const o = textOf(f, "origin");
+            if (o != "runtime-rtfn" && o != "process-thread-entry" && o != "runtime-manual") {
+                if (target == "windows") {
+                    if (!isNull(at(f, "object_index")) || numText(at(f, "input_section_index")) != "0") {
+                        prov = false;
+                    }
+                } else if (numText(at(f, "object_index")) != "1" || numText(at(f, "input_section_index")) != "1") {
+                    prov = false;
+                }
+            }
+            i = i + 1;
+        }
+        check(c, "explicit program object provenance:" + target + ":" + k.name, prov, "");
+        const ordinary = tx(c, args);
+        check(c, "ordinary identity:" + target + ":" + k.name, ordinary.code == 0 && bytesEqual(readOr(product), image), reprBytes(ordinary.err, 800));
+        const full = nat(join(work, target + "-" + k.name + "-all.json"));
+        const pa = tx(c, plusL(args, strs(["--map", full, "--map-format=json", "--map-scope=all"])));
+        let fullOk = false;
+        if (pa.code == 0) {
+            const fd = at(parseOr(readOr(full)), "map");
+            const ffs = at(fd, "functions");
+            fullOk = bytesEqual(readOr(product), image) && ffs != None && fs != None && jEq(ffs ?? jNull(), fs ?? jNull())
+            && (decAt(fd, "symbols_total") catch 0) > 0;
+        }
+        check(c, "all scope same functions and product:" + target + ":" + k.name, fullOk, reprBytes(pa.err, 800));
+        if (len(c.baseline) > 0) {
+            const pb = sh(c, c.baseline, args, 300);
+            check(c, "previous compiler client identity:" + target + ":" + k.name, pb.code == 0 && bytesEqual(readOr(product), image),
+                reprBytes(pb.err, 800));
+        }
+        if (k.name == "basic") {
+            for (command in ["profile", "disasm"]) {
+                let cmd = strs(["disasm", k.source, "--target=" + triple, "--format=json"]);
+                if (command == "profile") {
+                    cmd = strs(["profile", "compile", k.source, "--target=" + triple, "--format=json", "--top", "0"]);
+                }
+                const po = tx(c, cmd);
+                const other = parseOr(po.out);
+                let rows = at(other, "functions");
+                let idKey = "index";
+                if (command == "profile") {
+                    rows = at(at(other, "profile"), "functions");
+                    idKey = "id";
+                }
+                check(c, "identity vs " + command + ":" + target, po.code == 0 && sameList(identityList(fs, "source_id", true),
+                        identityList(rows, idKey, false)), "");
+            }
+            const text = nat(join(work, target + ".txt"));
+            const ph = tx(c, plusL(args, strs(["--map", text])));
+            let human = "";
+            if (kindOf(text) == 1) {
+                human = lossyText(readOr(text));
+            }
+            let numbering = "x86-64-gpr";
+            if (a64) {
+                numbering = "aarch64-gpr";
+            } else if (la64) {
+                numbering = "loongarch64-gpr";
+            } else if (rv64) {
+                numbering = "riscv64-gpr";
+            }
+            let names = true;
+            let specials = false;
+            i = 0;
+            while (i < count(fs)) {
+                if (!contains(human, jQuote(textOf(item(fs, i), "name")))) {
+                    names = false;
+                }
+                if (textIs(item(fs, i), "origin", "process-thread-entry")) {
+                    specials = true;
+                }
+                i = i + 1;
+            }
+            check(c, "human function summary:" + target, ph.code == 0 && contains(human, "link-map/7") && contains(human, "右端排他")
+                && contains(human, numbering) && contains(human, "停止展开") && (contains(human, "thread-entry") || !specials)
+                && contains(human, textOf(at(x, "image"), "sha256")) && names, "");
+            const explicit = nat(join(work, target + "-explicit.json"));
+            const pe = tx(c, plusL(args, strs(["--map", explicit, "--map-format=json", "--map-scope=functions"])));
+            const ed = parseOr(readOr(explicit));
+            check(c, "explicit functions equals default:" + target, pe.code == 0 && ed != None && doc != None && jEq(ed ?? jNull(), doc ?? jNull()), "");
+        }
+    }
+    if (driverBuilt) {
+        const p = sh(c, nat(join(join(work, "driver-probe"), exeName("native_function_driver_probe"))),
+            strs([nat(join(c.root, "tests/debug/basic.tx")), target]), 120);
+        check(c, "driver failure/listing/scope/reentry/no leaks:" + target, p.code == 0 && bytesLen(p.err) == 0
+            && strip(lossyText(p.out)) == "PASS_FUNCTION_DRIVER_REENTRY_FAILURE_LISTING_SCOPES", resText(p));
+    }
+}
+
+function arrayAt(v: Ref<Jv>?, key: string): bool {
+    const x = at(v, key);
+    return x != None && (x ?? jNull()).kind == J_ARR;
+}
+
+function body(c: Ref<Ctx>): void | Error {
+    const work = c.work;
+    const capRes = tx(c, strs(["capabilities", "--format=json"]));
+    const cap = at(parseOr(capRes.out), "capabilities");
+    check(c, "discover scopes and partial coverage", textIs(cap, "link_map_schema", "link-map/7") && textIs(cap, "link_map_scopes", "functions,all")
+        && textIs(cap, "link_map_default_scope", "functions") && textIs(cap, "link_map_function_ranges", "producer-declared")
+        && textIs(cap, "link_map_frame_events", "partial-producer-declared")
+        && textIs(cap, "link_map_stack_models", "fixed-call,process-entry,thread-entry,stack-transition,stack-disposal")
+        && textIs(cap, "link_map_object_metadata", "txfn/3") && arrHas(at(cap, "schemas"), "link-map/7") && !arrHas(at(cap, "schemas"), "link-map/6") && !arrHas(at(cap, "schemas"), "link-map/5")
+        && !arrHas(at(cap, "schemas"), "link-map/2") && !arrHas(at(cap, "schemas"), "link-map/1"), "");
+    probeChecks(c);
+    const built = tx(c, strs(["build", nat(join(c.root, "bootstrap/native_function_driver_probe.tx")), "--toolchain", "--leak-check", "--out",
+                nat(join(work, "driver-probe"))]));
+    check(c, "same process driver probe build", built.code == 0, reprBytes(built.err, 800));
+    const basic = nat(join(c.root, "tests/debug/basic.tx"));
+    const cases: List<Case> = listNew();
+    listPush(cases, Case { name: "basic", source: basic, flags: listNew() });
+    listPush(cases, Case { name: "closure", source: nat(join(c.root, "tests/cases/22-closure-fnarg.tx")), flags: listNew() });
+    listPush(cases, Case { name: "generator", source: nat(join(c.root, "tests/nrt-cases/gen-basic.tx")), flags: listNew() });
+    listPush(cases, Case { name: "async", source: nat(join(c.root, "tests/cases/async-await-any.tx")), flags: listNew() });
+    listPush(cases, Case { name: "debug", source: basic, flags: strs(["--debug"]) });
+    listPush(cases, Case { name: "leak", source: basic, flags: strs(["--leak-check"]) });
+    listPush(cases, Case { name: "thread", source: nat(join(c.root, "tests/nrt-cases/thread-basic.tx")), flags: listNew() });
+    listPush(cases, Case { name: "tool", source: basic, flags: strs(["--toolchain"]) });
+    const allSaves: List<string> = listNew();
+    // 三种 Linux 与两种 macOS 在任何宿主上交叉构建、只做静态核对（产物字节与映射）。目标写三元组：不带架构的 linux 在 arm64 宿主上
+    // 取 aarch64-linux，windows 同理取 aarch64-windows。
+    for (target in ["windows", "x86_64-linux", "aarch64-linux", "loongarch64-linux", "riscv64-linux", "x86_64-macos", "aarch64-macos"]) {
+        targetChecks(c, target, cases, built.code == 0, allSaves)?;
+    }
+    let valid = listLen(allSaves) > 0;
+    for (s in allSaves) {
+        // 循环标量寄存器分配（--regalloc，缺省开）另保存两个持久寄存器：x64 r12／r13、A64 x22／x23、龙芯 s3／s4（r26／r27）、
+        // RISC-V s4／s5（x20／x21），都是各自 ABI 的被调用者保存寄存器。
+        if (s != "5,3,14,15" && s != "5,3,14,15,12,13" && s != "30,29,20,19,21" && s != "30,29,20,19,21,23,22" && s != "1,22,23,24,25"
+            && s != "1,22,23,24,25,26,27" && s != "1,8,9,18,19" && s != "1,8,9,18,19,20,21") {
+            valid = false;
+        }
+    }
+    check(c, "production save register set valid", valid, keysText(allSaves));
+    const bad = nat(join(work, "bad.json"));
+    const usages: List<List<string>> = listNew();
+    listPush(usages, strs(["--map-scope=functions"]));
+    listPush(usages, strs(["--map-scope=all"]));
+    listPush(usages, strs(["--map-scope=bogus", "--map", bad]));
+    for (flags in usages) {
+        const p = tx(c, plusL(strs(["build", basic, "--out", nat(join(work, "usage"))]), flags));
+        // 检查名里的实参表写成 Python 列表的 repr，路径实参写成 pathlib 的 repr（PosixPath('…')／WindowsPath('…')）。
+        let label = "[";
+        let i = 0;
+        for (f in flags) {
+            if (i > 0) {
+                label = label + ", ";
+            }
+            if (f == bad) {
+                let kind = "PosixPath";
+                if (hostTarget() == "windows") {
+                    kind = "WindowsPath";
+                }
+                label = label + kind + "('" + slashes(f) + "')";
+            } else {
+                label = label + "'" + f + "'";
+            }
+            i = i + 1;
+        }
+        check(c, "scope usage:" + label + "]", p.code == 64, "(" + toStr(p.code) + ", " + reprBytes(p.err, 400) + ")");
+    }
+}
+
+function run(argv: []string): int | Error {
+    let compiler = "";
+    let work = "";
+    let root = "";
+    let baseline = "";
+    let i = 0;
+    while (i + 1 < len(argv)) {
+        if (argv[i] == "--compiler") {
+            compiler = argv[i + 1];
+        } else if (argv[i] == "--work") {
+            work = argv[i + 1];
+        } else if (argv[i] == "--root") {
+            root = argv[i + 1];
+        } else if (argv[i] == "--baseline-compiler") {
+            baseline = argv[i + 1];
+        } else {
+            return err("未知参数：" + argv[i]);
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0 || len(work) == 0 || i != len(argv)) {
+        return err("用法：taixu run --toolchain scripts/test_native_functions.tx --compiler <taixu> --work <目录> [--baseline-compiler <编译器>] [--root <仓库>]");
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = osRealPath(absolute(nat(root)));
+    compiler = osRealPath(absolute(nat(compiler)));
+    if (len(baseline) > 0) {
+        baseline = osRealPath(absolute(nat(baseline)));
+    }
+    if (!mkdirs(absolute(nat(work)))) {
+        return err("建不了工作目录：" + work);
+    }
+    work = osRealPath(absolute(nat(work)));
+    const c = new Ctx { compiler: compiler, baseline: baseline, root: root, work: work, checks: jArray(), total: 0, failures: 0 };
+    body(c)?;
+    const report = jObject();
+    let status = "PASS";
+    if (c.failures > 0) {
+        status = "FAIL";
+    }
+    jSet(report, "status", jString(status));
+    jSet(report, "total", numJv(c.total));
+    jSet(report, "failed", numJv(c.failures));
+    jSet(report, "checks", c.checks);
+    let comparison = "not requested";
+    if (len(baseline) > 0) {
+        comparison = "run";
+    }
+    jSet(report, "baseline_comparison", jString(comparison));
+    writeText(nat(join(work, "report.json")), jPretty(report, 2) + "\n")?;
+    print("functions: " + toStr(c.total - c.failures) + "/" + toStr(c.total) + " PASS");
+    if (c.failures > 0) {
+        return 1;
+    }
+    return 0;
+}
+
+function main(argv: []string): int {
+    return run(argv) catch (e) {
+        eprint("test_native_functions: " + e.message);
+        return 1;
+    };
+}

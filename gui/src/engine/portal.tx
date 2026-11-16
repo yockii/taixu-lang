@@ -1,0 +1,132 @@
+// ============================================================================
+// engine/portal —— XDG 桌面门户文件选择（org.freedesktop.portal.FileChooser）的请求编组与结果解析（GUI 原生引擎 G5 第二部分；
+// 纯函数，三端都能跑；收发在 platform_linux 经 engine/busconn）。
+//
+// 接口见 https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.FileChooser.html：
+// - OpenFile(parent_window s, title s, options a{sv}) 与 SaveFile(同) 回一个请求对象路径；结果经该路径上 org.freedesktop.portal.Request
+//   的 Response(response u, results a{sv}) 信号送达，response 0 为选中、1 为取消、2 为其他。选中时 results 的 "uris"（as）是 file:// URI。
+// - options：handle_token（预知请求路径，先订阅再调用，免得信号先到）、modal、filters（a(sa(us))，种类 0 为通配；扩展名展开成
+//   不分大小写的通配，同 Chromium）、保存的 current_name。
+// - 请求路径 /org/freedesktop/portal/desktop/request/<发送者>/<token>，发送者为连接唯一名去掉开头的 ':'、'.' 换成 '_'。
+// ============================================================================
+
+import { DbusMsg, dbusReader, dwArrayOpen, dwArrayClose, dwStruct, dwStr, dwSig, dwU32, dwBool, drU32, drStr, drSig, drArrayOpen, drStruct, drSkip, unescape } from "./dbus";
+import { FdFilter, fdPortalGlob } from "./filedialog";
+
+export const PORTAL_DEST: string = "org.freedesktop.portal.Desktop";
+export const PORTAL_PATH: string = "/org/freedesktop/portal/desktop";
+export const PORTAL_FILE_CHOOSER: string = "org.freedesktop.portal.FileChooser";
+export const PORTAL_REQUEST: string = "org.freedesktop.portal.Request";
+
+/// 预知的请求对象路径。
+export function portalRequestPath(unique: string, token: string): string {
+    const b = bytesFromStr(unique);
+    const out = bytesNew(0);
+    let i: int = 0;
+    while (i < bytesLen(b)) {
+        const c: int = bytesGet(b, i) catch 0;
+        if (c == 0x2E) {
+            bytesPush(out, 0x5F);
+        } else if (!(i == 0 && c == 0x3A)) {
+            bytesPush(out, c);
+        }
+        i = i + 1;
+    }
+    return PORTAL_PATH + "/request/" + (bytesToStr(out) catch "") + "/" + token;
+}
+
+/// OpenFile／SaveFile 的正文（签名 "ssa{sv}"）：parent 为 "x11:<十六进制 XID>" 或空串；currentName 只用于保存（空串不写）。
+export function portalChooserBody(parent: string, title: string, token: string, filters: List<FdFilter>, currentName: string): Bytes {
+    const b = bytesNew(0);
+    dwStr(b, parent);
+    dwStr(b, title);
+    const at: int = dwArrayOpen(b, 8);
+    entry(b, "handle_token", "s");
+    dwStr(b, token);
+    entry(b, "modal", "b");
+    dwBool(b, true);
+    if (listLen(filters) > 0) {
+        entry(b, "filters", "a(sa(us))");
+        const fa: int = dwArrayOpen(b, 8);
+        for (f in filters) {
+            dwStruct(b);
+            dwStr(b, f.name);
+            const pa: int = dwArrayOpen(b, 8);
+            for (e in f.exts) {
+                dwStruct(b);
+                dwU32(b, 0);
+                dwStr(b, fdPortalGlob(e));
+            }
+            dwArrayClose(b, pa, 8);
+        }
+        dwArrayClose(b, fa, 8);
+    }
+    if (currentName != "") {
+        entry(b, "current_name", "s");
+        dwStr(b, currentName);
+    }
+    dwArrayClose(b, at, 8);
+    return b;
+}
+
+// 字典项的键与变体签名（值随后写）。
+function entry(b: Bytes, key: string, sig: string): void {
+    dwStruct(b);
+    dwStr(b, key);
+    dwSig(b, sig);
+}
+
+/// Response 信号的结果：code 为 response（0 选中、1 取消、2 其他；格式不对为 -1），path 为第一个 file:// URI 的本地路径。
+export struct PortalResult {
+    code: int,
+    path: string,
+}
+
+/// 解析 Response 信号（签名 "ua{sv}"）。
+export function portalResult(m: DbusMsg): PortalResult {
+    let out: PortalResult = { code: -1, path: "" };
+    if (m.sig != "ua{sv}") {
+        return out;
+    }
+    const r = dbusReader(m);
+    const code: int = drU32(r);
+    const end: int = drArrayOpen(r, 8);
+    let uri: string = "";
+    while (!r.bad && r.pos < end) {
+        drStruct(r);
+        const key: string = drStr(r);
+        const vs: string = drSig(r);
+        if (key == "uris" && vs == "as") {
+            const ue: int = drArrayOpen(r, 4);
+            if (!r.bad && r.pos < ue && uri == "") {
+                uri = drStr(r);
+            }
+            r.pos = ue;
+        } else {
+            drSkip(r, vs);
+        }
+    }
+    if (r.bad || r.pos != end) {
+        return out;
+    }
+    out.code = code;
+    if (code == 0) {
+        out.path = fileUriPath(uri);
+    }
+    return out;
+}
+
+/// file:// URI 的本地路径（主机部分须为空或 localhost，%xx 解码）；别的协议、远程主机或解出 NUL 得空串。
+export function fileUriPath(uri: string): string {
+    if (strFind(uri, "file://") != 0) {
+        return "";
+    }
+    let rest: string = strSlice(uri, 7, len(uri));
+    if (strFind(rest, "localhost/") == 0) {
+        rest = strSlice(rest, 9, len(rest));
+    }
+    if (strFind(rest, "/") != 0 || strFind(rest, "%00") >= 0) {
+        return "";
+    }
+    return unescape(rest);
+}

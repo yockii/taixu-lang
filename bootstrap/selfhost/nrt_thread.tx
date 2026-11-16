@@ -10,16 +10,14 @@
 // Linux 为 PT_TLS（模板 __tx_tls_template，8 字节、对齐 8），主程序的 TLS 块紧挨在线程指针之下，
 // 槽即 fs:[-8]——动态产物由动态加载器建立，静态产物由 _start 用 __tx_tls_static 自设（见 nrt.tx）；
 // macOS 为 TLV：链接器合成描述符 __tx_tls_tlv（link_macho.tx），叶子经 dyld 的取址函数得到槽地址。
-import { Operand, StructuredBuffer, asBufferLabel, asBufferFunctionEnd, asManualBegin, asManualLeaf, asManualFrame, asManualReturn, asBufferSection, asBufferAlign, asBufferAddress, asBufferQuad, asBufferZero, asBufferInstruction, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem, asStructuredSegMem } from "./assemble";
-import { RtFn, RtOp, L, I, A, G } from "./rtfn_base";
-import { rtBegin, rtSet, rtSetGlobal, rtOp, rtShift, rtLoad, rtAddrOf, rtIf, rtLabel, rtJump, rtStore, rtCall0, rtCall1, rtCall2, rtCall4, rtCall5, rtCallC, rtSyscall, rtLoadAcq, rtStoreRel, rtAtomicAdd, rtRet, rtRetVoid } from "./rtfn";
-import { check, text } from "./nrt_base";
-import { tPe, tElf, tKernel32, tRawSyscall, tUnix, tMacos, tA64, ISA_X86_64, ISA_A64, ISA_LA64, ISA_RV64, T_LA64_LINUX, T_RV64_LINUX } from "./target";
+import { Operand, StructuredBuffer, asBufferLabel, asBufferFunctionEnd, asManualBegin, asManualFrame, asManualReturn, asBufferSection, asBufferAlign, asBufferAddress, asBufferQuad, asBufferZero, asBufferInstruction, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem } from "./assemble";
+import { RtOp, L, I, A, G } from "./rtfn_base";
+import { rtBegin, rtSet, rtSetGlobal, rtOp, rtShift, rtLoad, rtAddrOf, rtIf, rtLabel, rtJump, rtStore, rtCall0, rtCall1, rtCall2, rtCall4, rtCall5, rtSyscall, rtLoadAcq, rtStoreRel, rtAtomicAdd, rtRet, rtRetVoid } from "./rtfn";
+import { check, text, nrtFailWith } from "./nrt_base";
+import { tPe, tElf, tKernel32, tRawSyscall, tUnix, tMacos, tA64, ISA_X86_64 } from "./target";
+import { targetAbi } from "./target_abi";
+import { abiTlsLeaves } from "./abi_emit";
 import { uxSys, uxMac, uxMapFlags } from "./unix_sys";
-import { linuxA64TlsLeaves } from "./linux_a64";
-import { windowsA64TlsLeaves } from "./windows_a64";
-import { linuxLa64TlsLeaves } from "./linux_la64";
-import { linuxRv64TlsLeaves } from "./linux_rv64";
 import { TB_REGION, TB_MASK, TB_HEADER, TB_STACK_INIT, TB_USED, TB_RESERVATION, TB_OS_TID } from "./thread_block_abi";
 
 export const NRT_THREAD_EXPORTS: string = "__tx_tls_tb_get __tx_stack_more";
@@ -220,7 +218,8 @@ function ins(b: Ref<StructuredBuffer>, mn: string, n: int, a: Ref<Operand>, c: R
     asBufferInstruction(b, mn, n, a, c, asStructuredMissing(), 1);
 }
 
-/// TLS 静态部分：Windows 的 TLS 目录、回调表（空）与模板放 .rdata；Linux 的模板放 .rdata。
+/// TLS 静态部分：Windows 的 TLS 目录、回调表（空）与模板放 .rdata；Linux 的模板放 .rdata。取、存本线程线程块的两个例程按目标发出
+/// （abi_emit.tx）。
 export function emitNrtTls(b: Ref<StructuredBuffer>, t: int): void {
     asBufferSection(b, 1, 1);
     asBufferAlign(b, 3, 1);
@@ -241,8 +240,7 @@ export function emitNrtTls(b: Ref<StructuredBuffer>, t: int): void {
     }
     if (tPe(t)) { asBufferLabel(b, "__tx_tls_template_end", 1); }
     asBufferSection(b, 0, 1);
-    if (b.isa == ISA_A64) { if (tMacos(t)) { tlsLeavesA64(b); } else if (tPe(t)) { windowsA64TlsLeaves(b); } else { linuxA64TlsLeaves(b); } }
-    else if (b.isa == ISA_LA64) { linuxLa64TlsLeaves(b); } else if (b.isa == ISA_RV64) { linuxRv64TlsLeaves(b); } else { tlsLeavesX86(b, t); }
+    abiTlsLeaves(b, t);
 
     // __tx_nrt_thread_bind()：rbx 已是新线程的线程块；登记到本线程的 TLS 槽，并记下系统线程号
     // （回调蹦床据此确认调用它的正是线程块的主人——Linux 上不带 CLONE_SETTLS 的裸 clone 线程与
@@ -256,77 +254,6 @@ export function emitNrtTls(b: Ref<StructuredBuffer>, t: int): void {
     rtStore(f, L("t"), TB_OS_TID, L("id"), 8);
     rtRetVoid(f);
     check(f);
-}
-
-function tlsLeavesX86(b: Ref<StructuredBuffer>, t: int): void {
-    const r = asStructuredReg(0, 0);
-    // __tx_tls_tb_get() → 本线程的线程块（外来线程为 0）；__tx_tls_tb_set(tb)。只写 rax/rcx/rdx。
-    // 取法随文件格式的 TLS 模型：ELF 的 PT_TLS 槽在线程指针之下（fs:[-8]），PE 的经 TEB 的 TLS 表与 __tx_tls_index，
-    // Mach-O 的 TLV：rdi＝描述符，调描述符首字（dyld 的取址函数；快路径只写 rax，本线程首次访问的慢路径由 dyld 保存
-    // 寄存器，见 M1），rax＝槽地址。rdi 自行保存；调用点：入口 rsp ≡ 8，push 后 ≡ 0。
-    // ELF、PE 的两个都是叶函数，登记为手写函数（runtime-manual，PE 规范化 P3 第 7 项）；macOS 的压栈调 dyld，仍在函数目录之外。
-    const leaf = !tMacos(t);
-    tlsBegin(b, "__tx_tls_tb_get", leaf);
-    if (tElf(t)) {
-        ins(b, "mov", 2, r, asStructuredSegMem("fs", -8));
-    } else if (tMacos(t)) {
-        tlvSlot(b);
-        ins(b, "mov", 2, r, asStructuredMem(2, 0, -1, 0, 0, 0, ""));
-    } else {
-        ins(b, "mov", 2, asStructuredReg(1, 0), asStructuredMem(1, -1, -1, 0, 0, 1, "__tx_tls_index"));
-        ins(b, "mov", 2, asStructuredReg(0, 1), asStructuredSegMem("gs", 88));
-        ins(b, "mov", 2, r, asStructuredMem(2, 1, 0, 3, 0, 0, ""));
-        ins(b, "mov", 2, r, asStructuredMem(2, 0, -1, 0, 0, 0, ""));
-    }
-    ins(b, "ret", 0, asStructuredMissing(), asStructuredMissing());
-    if (leaf) { asBufferFunctionEnd(b); }
-    tlsBegin(b, "__tx_tls_tb_set", leaf);
-    if (tElf(t)) {
-        ins(b, "mov", 2, asStructuredSegMem("fs", -8), asStructuredReg(0, 1));
-    } else if (tMacos(t)) {
-        tlvSlot(b);
-        ins(b, "mov", 2, asStructuredMem(2, 0, -1, 0, 0, 0, ""), asStructuredReg(0, 1));
-    } else {
-        ins(b, "mov", 2, asStructuredReg(1, 0), asStructuredMem(1, -1, -1, 0, 0, 1, "__tx_tls_index"));
-        ins(b, "mov", 2, asStructuredReg(0, 2), asStructuredSegMem("gs", 88));
-        ins(b, "mov", 2, asStructuredReg(0, 2), asStructuredMem(2, 2, 0, 3, 0, 0, ""));
-        ins(b, "mov", 2, asStructuredMem(2, 2, -1, 0, 0, 0, ""), asStructuredReg(0, 1));
-    }
-    ins(b, "ret", 0, asStructuredMissing(), asStructuredMissing());
-    if (leaf) { asBufferFunctionEnd(b); }
-}
-function tlsBegin(b: Ref<StructuredBuffer>, name: string, leaf: bool): void {
-    if (leaf) { asManualBegin(b, "bootstrap/selfhost/nrt_thread.tx", name); asManualLeaf(b); } else { asBufferLabel(b, name, 1); }
-}
-
-// A64（Mach-O 的 TLV）：x0＝描述符，按 C 约定调描述符首字（dyld 的取址函数），x0＝槽地址；
-// 调用方都是 rtfn 与生成代码，按私有约定看待调用即可。
-function tlvSlotA64(f: Ref<RtFn>): void {
-    rtSet(f, "p", A("__tx_tls_tlv"));
-    rtLoad(f, "fp", L("p"), 0, 8);
-    const xs: List<Ref<RtOp>> = listNew(); listPush(xs, L("p"));
-    const cls: List<int> = listNew(); listPush(cls, 0);
-    rtCallC(f, "p", "", "fp", xs, cls, true);
-}
-function tlsLeavesA64(b: Ref<StructuredBuffer>): void {
-    let f = rtBegin(b, "__tx_tls_tb_get", "", "p fp", 1, "bootstrap/selfhost/nrt_thread.tx");
-    tlvSlotA64(f);
-    rtLoad(f, "p", L("p"), 0, 8);
-    rtRet(f, L("p")); check(f);
-    f = rtBegin(b, "__tx_tls_tb_set", "tb", "p fp", 1, "bootstrap/selfhost/nrt_thread.tx");
-    tlvSlotA64(f);
-    rtStore(f, L("p"), 0, L("tb"), 8);
-    rtRetVoid(f); check(f);
-}
-
-// rax ＝ 本线程 TLV 槽的地址（rdi 保存恢复；TLV 取址函数不改其他寄存器）。
-function tlvSlot(b: Ref<StructuredBuffer>): void {
-    const rdi = asStructuredReg(0, 7);
-    asBufferInstruction(b, "push", 1, rdi, asStructuredMissing(), asStructuredMissing(), 1);
-    ins(b, "lea", 2, rdi, asStructuredMem(2, -1, -1, 0, 0, 1, "__tx_tls_tlv"));
-    ins(b, "mov", 2, asStructuredReg(0, 0), asStructuredMem(2, 7, -1, 0, 0, 0, ""));
-    asBufferInstruction(b, "call", 1, asStructuredReg(0, 0), asStructuredMissing(), asStructuredMissing(), 1);
-    asBufferInstruction(b, "pop", 1, rdi, asStructuredMissing(), asStructuredMissing(), 1);
 }
 
 /// __tx_nrt_die_enter()：进程级致命锁。trap、内核 fatal 与内存不足终局在输出
@@ -406,7 +333,9 @@ export function nrtThreadBss(b: Ref<StructuredBuffer>, t: int): void {
     asBufferLabel(b, "__tx_nrt_die_tid", 1); asBufferZero(b, 8, 1);
     if (tElf(t)) {
         asBufferLabel(b, "__tx_tls_static", 1);
-        if (tA64(t)) { asBufferZero(b, 24, 1); } else if (t == T_LA64_LINUX || t == T_RV64_LINUX) { asBufferZero(b, 8, 1); } else { asBufferZero(b, 16, 1); }
+        const bytes = targetAbi(t).tlsStatic;
+        if (bytes <= 0) { nrtFailWith("NoStaticTlsLayout:" + toStr(t)); return; }
+        asBufferZero(b, bytes, 1);
     }
     // aarch64 的 Linux 与 Windows：CPU 有 LSE 原子指令时为 1（Linux 由 _start 从 AT_HWCAP 置，见 linux_a64.tx；Windows 由
     // __tx_native_entry 经 IsProcessorFeaturePresent 置，见 kernel_entry_generic.tx；rtfn_a64 的原子操作据此分支）。

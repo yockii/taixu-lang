@@ -14,12 +14,14 @@
 import { asImgText, asImgRdata, asImgData, asImgBssSize, asImgAlignPow, asFailedAs, asSymCountL, asSymIndexL, asSymNameL, asSymSecL, asSymOffL, asSymNeededL, asFixCountL, asFixSecL, asFixAtL, asFixKindL, asFixSymL, asFixAddendL } from "./assemble";
 
 import { BinaryName, rawName, rawNameOf, rawNameEmpty, rawNameNone, rawNameSize, rawNameByte, rawNamePrefix, rawNameEqual, rawNameLess, rawNameText, rawNameTextHash, rawNameEqualText } from "./binary_name";
-import { linkMapSymbolsEnabled, linkMapAddPlacement, linkMapEnabled, linkMapBegin, linkMapFail, linkMapDone, linkMapLayout, linkMapAddSection, linkMapRow, linkMapInput, linkMapAdd, linkMapSynthetic } from "./link_map_data";
+import { linkMapSymbolsEnabled, linkMapAddPlacement, linkMapAddBlockPlacement, linkMapEnabled, linkMapBegin, linkMapFail, linkMapDone, linkMapLayout, linkMapAddSection, linkMapRow, linkMapInput, linkMapAdd, linkMapSynthetic, linkMapAddFallback } from "./link_map_data";
 import { peLinkerMajor, peLinkerMinor, peFinish, peBaseRelocations } from "./pe_image";
 import { NativeFunctionImage, NativeFunction } from "./native_function_data";
 import { nativeObjectFunctions } from "./native_function_object";
 import { x64Unwind } from "./pe_unwind_x64";
-import { T_X64_WINDOWS } from "./target";
+import { T_X64_WINDOWS, targetName } from "./target";
+import { BlockPlan, blockPlanOf, blockCount, blockBegin, blockEnd, blockPinned, blockAt, blockOfRange } from "./link_blocks";
+import { NativeObjectFunctions } from "./native_function_object";
 
 function dec(v: int): string {
     return toStr(v);
@@ -78,6 +80,10 @@ struct CoffSection {
     vsize: int,
     relocs: List<Ref<CoffReloc>>,
     alignBytes: int,
+    // 按函数目录切出的块（运行时按需链入，link_blocks.tx）：blockOf 为函数在目录里的序号（-1 为整节），blockBase 为块在原节里的
+    // 偏移，funcBegin／funcEnd 为函数在原节里的范围（块可能在函数之前并有目录没登记的空洞），pinned 为含空洞、须总是放入的块；
+    // sectionAlign 为原节的对齐（块之间不补齐，只在一串相邻块之前按它对齐）。
+    blockOf: int, blockBase: int, funcBegin: int, funcEnd: int, pinned: bool, sectionAlign: int,
 }
 
 struct CoffSymbol {
@@ -86,6 +92,7 @@ struct CoffSymbol {
     secno: int, // 1 基；0＝外部未定义
     storageClass: int,
     originObject: int, originIndex: int, originSection: int, symbolType: int,
+    originValue: int, // 解析时的节内偏移（节切成块后 value 改为块内偏移，链接映射照旧列原值）
 }
 
 struct CoffObj {
@@ -94,7 +101,8 @@ struct CoffObj {
 }
 
 function dummyCoffSection(): Ref<CoffSection> {
-    return new CoffSection { originObject: -1, originIndex: -1, nameSpan: rawNameEmpty(), rawSource: bytesNew(0), rawAt: 0, byteCount: 0, zeroFill: 0, vsize: 0, relocs: listNew(), alignBytes: 16 };
+    return new CoffSection { originObject: -1, originIndex: -1, nameSpan: rawNameEmpty(), rawSource: bytesNew(0), rawAt: 0, byteCount: 0, zeroFill: 0, vsize: 0, relocs: listNew(), alignBytes: 16,
+        blockOf: -1, blockBase: 0, funcBegin: 0, funcEnd: 0, pinned: false, sectionAlign: 16 };
 }
 
 // 解析时仅登记字节范围；边界/重定位仍全量校验，可达性决定后才复制。
@@ -110,7 +118,7 @@ function appendCoffBytes(dst: Bytes, sec: Ref<CoffSection>): void {
 
 function dummyCoffSymbol(): Ref<CoffSymbol> {
     return new CoffSymbol { nameSpan: rawNameEmpty(), value: 0, secno: 0, storageClass: 0,
-        originObject: -1, originIndex: -1, originSection: 0, symbolType: 0 };
+        originObject: -1, originIndex: -1, originSection: 0, symbolType: 0, originValue: 0 };
 }
 
 function rdU16(data: Bytes, off: int): int {
@@ -251,7 +259,8 @@ function parseCoff(data: Bytes, originObject: int): Ref<CoffObj> {
         if (isBss == 1) {
             if (vsize > byteCount) { byteCount = vsize; }
         }
-        const sec = new CoffSection { originObject: originObject, originIndex: si, nameSpan: nameSpan, rawSource: data, rawAt: rawptr, byteCount: byteCount, zeroFill: isBss, vsize: vsize, relocs: listNew(), alignBytes: 16 };
+        const sec = new CoffSection { originObject: originObject, originIndex: si, nameSpan: nameSpan, rawSource: data, rawAt: rawptr, byteCount: byteCount, zeroFill: isBss, vsize: vsize, relocs: listNew(), alignBytes: 16,
+            blockOf: -1, blockBase: 0, funcBegin: 0, funcEnd: 0, pinned: false, sectionAlign: 16 };
         let ri = 0;
         while (ri < nrel) {
             const ro = relptr + ri * 10;
@@ -269,6 +278,7 @@ function parseCoff(data: Bytes, originObject: int): Ref<CoffObj> {
             sec.alignBytes = shl1n2(a - 1);
         }
         if (a == 15 || sec.alignBytes > SEC_ALIGN) { lkFail("UnsupportedSectionAlignment"); return obj; }
+        sec.sectionAlign = sec.alignBytes;
         listPush(obj.sections, sec);
         off = off + 40;
         si = si + 1;
@@ -324,7 +334,7 @@ function parseCoff(data: Bytes, originObject: int): Ref<CoffObj> {
             if (rdU32(data, e + 8) > extent) { lkFail("BadSymbolValue"); return obj; }
         }
         listPush(obj.symbols, new CoffSymbol { nameSpan: nameSpan, value: rdU32(data, e + 8), secno: secno, storageClass: bytesGet(data, e + 16) catch 0,
-                originObject: originObject, originIndex: i, originSection: secno, symbolType: rdU16(data, e + 14) });
+                originObject: originObject, originIndex: i, originSection: secno, symbolType: rdU16(data, e + 14), originValue: rdU32(data, e + 8) });
         i = i + 1;
     }
     for (section in obj.sections) {
@@ -696,11 +706,111 @@ function unwindRow(rows: List<Ref<UnwindRow>>, f: Ref<NativeFunction>, code: Byt
     return "";
 }
 
+// 一个按函数目录切开的代码节：原节在 co.sections 里换成 count 个相邻的块（从 first 起，次序同目录）；image 为该对象的函数目录，
+// code 为原节的字节（展开信息按原节偏移解码）。
+struct SplitSection { object: int, input: int, first: int, count: int, image: Ref<NativeFunctionImage>, code: Bytes }
+
+function relocWidth(typ: int): int {
+    if (typ == 1) { return 8; }
+    return 4;
+}
+
+function noMeta(): Ref<NativeObjectFunctions> { return new NativeObjectFunctions { present: false, inputSection: -1, codeSize: 0, image: new NativeFunctionImage { ok: false, error: "", isa: "", functions: listNew() } }; }
+
+// 运行时按需链入（docs/design/v052-runtime-on-demand-link-v0.2-20261108.md 第二节）：带函数目录的对象，其代码节按目录换成函数块
+// （link_blocks.tx）——节号随之重排，符号改指所在的块、值改为块内偏移，重定位分到所在的块、位置改为块内偏移。之后照常按节求可达，
+// 放入的就只是够得着的函数。目录不完整、有重定位跨函数时不切，整节照旧。
+function splitByFunctions(co: Ref<CoffObj>, metas: List<Ref<NativeObjectFunctions>>): List<Ref<SplitSection>> {
+    const splits: List<Ref<SplitSection>> = listNew();
+    const n = listLen(co.sections);
+    const none = blockPlanOf(0, listNew());
+    const plans: List<Ref<BlockPlan>> = listNew();
+    let i = 0;
+    while (i < n) { listPush(plans, none); i = i + 1; }
+    let any = false;
+    let uo = 0;
+    while (uo < listLen(metas)) {
+        const meta = listGet(metas, uo) catch noMeta();
+        if (meta.present && meta.image.ok) {
+            let m = 0;
+            while (m < n) {
+                const candidate = listGet(co.sections, m) catch dummyCoffSection();
+                if (candidate.originObject == uo && candidate.originIndex == meta.inputSection) { break; }
+                m = m + 1;
+            }
+            const cs = listGet(co.sections, m) catch dummyCoffSection();
+            if (m < n && secKindOfL(cs.nameSpan) == 0 && cs.zeroFill == 0) {
+                const plan = blockPlanOf(cs.byteCount, meta.image.functions);
+                let fits = plan.ok;
+                for (r in cs.relocs) { if (fits && blockOfRange(plan, r.va, relocWidth(r.typ)) < 0) { fits = false; } }
+                if (fits) { listSet(plans, m, plan); any = true; }
+            }
+        }
+        uo = uo + 1;
+    }
+    if (!any) { return splits; }
+    const sections: List<Ref<CoffSection>> = listNew();
+    const firstOf: List<int> = listNew(); // 原节号 → 新节号（切开的为首块）
+    let m = 0;
+    while (m < n) {
+        const cs = listGet(co.sections, m) catch dummyCoffSection();
+        const plan = listGet(plans, m) catch none;
+        listPush(firstOf, listLen(sections));
+        if (!plan.ok) { listPush(sections, cs); m = m + 1; continue; }
+        const first = listLen(sections);
+        const meta = listGet(metas, cs.originObject) catch noMeta();
+        listPush(splits, new SplitSection { object: cs.originObject, input: cs.originIndex, first: first, count: blockCount(plan), image: meta.image,
+                code: bytesSlice(cs.rawSource, cs.rawAt, cs.byteCount) });
+        let b = 0;
+        for (f in meta.image.functions) {
+            const begin = blockBegin(plan, b);
+            let align = 1;
+            if (b == 0) { align = cs.alignBytes; }
+            listPush(sections, new CoffSection { originObject: cs.originObject, originIndex: cs.originIndex, nameSpan: cs.nameSpan, rawSource: cs.rawSource,
+                    rawAt: cs.rawAt + begin, byteCount: blockEnd(plan, b) - begin, zeroFill: 0, vsize: 0, relocs: listNew(), alignBytes: align,
+                    blockOf: b, blockBase: begin, funcBegin: f.begin, funcEnd: f.end, pinned: blockPinned(plan, b), sectionAlign: cs.alignBytes });
+            b = b + 1;
+        }
+        for (r in cs.relocs) {
+            const block = blockOfRange(plan, r.va, relocWidth(r.typ));
+            const owner = listGet(sections, first + block) catch dummyCoffSection();
+            r.va = r.va - blockBegin(plan, block);
+            listPush(owner.relocs, r);
+        }
+        m = m + 1;
+    }
+    for (symbol in co.symbols) {
+        if (symbol.secno <= 0) { continue; }
+        const old = symbol.secno - 1;
+        const plan = listGet(plans, old) catch none;
+        const base = listGet(firstOf, old) catch 0;
+        if (plan.ok) {
+            const block = blockAt(plan, symbol.value);
+            symbol.secno = base + block + 1;
+            symbol.value = symbol.value - blockBegin(plan, block);
+        } else {
+            symbol.secno = base + 1;
+        }
+    }
+    co.sections = sections;
+    return splits;
+}
+
+function splitOf(splits: List<Ref<SplitSection>>, object: int, input: int): int {
+    let i = 0;
+    while (i < listLen(splits)) {
+        const split = listGet(splits, i) catch new SplitSection { object: -1, input: -1, first: 0, count: 0, image: noMeta().image, code: bytesNew(0) };
+        if (split.object == object && split.input == input) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
 // 外部静态对象是冻结执行宿主的字节输入，不参与编译算法代算。
 // 将各对象的节/符号索引重基后交给同一可达性和重定位管线。
 // program：程序函数的目录（驱动在汇编时收集，偏移以程序 .text 为准；ok 为假时程序函数不出展开信息）。
 export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: List<Bytes>, program: Ref<NativeFunctionImage>): int {
-    linkMapBegin("x86_64-windows");
+    linkMapBegin(targetName(T_X64_WINDOWS));
     lk_failed = 0;
     lk_missing = "";
     // 每次链接独立建表；不能让上一映像的名字或 VA 污染下一映像。
@@ -718,7 +828,6 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
     const co = parseCoff(shimObj, 0);
     if (lk_failed == 1) { return 1; }
     if (asFailedAs() != 0) { lkFail("AssemblerFailed"); return 1; }
-    const shimSymbols = listLen(co.symbols);
     let oi = 0;
     while (oi < listLen(objectBytes)) {
         const extra = parseCoff(listGet(objectBytes, oi) catch bytesNew(0), oi + 1);
@@ -747,6 +856,18 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
         oi = oi + 1;
     }
     listPush(coffs, co);
+    // 各对象的函数目录（.txfn）：先按目录把代码节切成函数块，之后的可达性、放入与展开信息都按块。
+    const metas: List<Ref<NativeObjectFunctions>> = listNew();
+    let mo = 0;
+    while (mo <= listLen(objectBytes)) {
+        let objectData = shimObj;
+        if (mo > 0) { objectData = listGet(objectBytes, mo - 1) catch bytesNew(0); }
+        const meta = nativeObjectFunctions(objectData, T_X64_WINDOWS);
+        if (!meta.image.ok) { lkFail("UnwindMetadata:" + meta.image.error); return 1; }
+        listPush(metas, meta);
+        mo = mo + 1;
+    }
+    const splits = splitByFunctions(co, metas);
 
     // 只登记正节号 EXTERNAL(2) 定义：COFF STATIC(3) 局部符号仅由所在对象的
     // 重定位符号索引/节号解析，不进跨对象查名（作用域修复）；
@@ -789,7 +910,8 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
         ci = ci + 1;
     }
 
-    // —— gc-sections BFS（根 1＝prog fixup 目标；根 2＝shim 导出 scl2）——
+    // —— gc-sections BFS（根：程序映像引用的符号、进程入口 __tx_entry 与 TLS 目录 __tx_tls_directory）——
+    // 运行时按需链入：内核的其余全局符号不再当根，只放入从这些根经重定位够得着的函数块。
     const reach: List<int> = listNew(); // allSecs 序的可达位
     let z = 0;
     while (z < listLen(allSecs)) { listPush(reach, 0); z = z + 1; }
@@ -800,52 +922,75 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
     let fi = 0;
     while (fi < asFixCountL()) {
         const m = markByText(co, allByCoff, asFixSymL(fi));
-        if (m >= 0 && (listGet(reach, m) catch 0) == 0) {
-            listSet(reach, m, 1);
-            listPush(queue, m);
-        }
+        const exact = asFixAddendL(fi) == 0;
+        if (!exact) { noteFallback(co, allSecs, m, -1, asFixSecL(fi), asFixAtL(fi), asFixKindL(fi), asFixAddendL(fi), rawNameOf(asFixSymL(fi))); }
+        markReach(co, allSecs, allByCoff, m, exact, reach, queue);
         fi = fi + 1;
     }
-    let si2 = 0;
-    while (si2 < shimSymbols) {
-        const sym = listGet(co.symbols, si2) catch dummyCoffSymbol();
-        if (sym.secno <= 0 || sym.storageClass != 2) { si2 = si2 + 1; continue; }
-        const m = markByName(co, allByCoff, sym.nameSpan);
+    const roots = ["__tx_entry", "__tx_tls_directory"];
+    for (root in roots) {
+        const m = markByText(co, allByCoff, root);
         if (m >= 0 && (listGet(reach, m) catch 0) == 0) {
             listSet(reach, m, 1);
             listPush(queue, m);
         }
-        si2 = si2 + 1;
     }
-    const reachSecs: List<Ref<BlobSec>> = listNew(); // BFS 弹出序＝节合并序（COFF 序过滤会整体错位 rel32）
+    // 内核对象没按函数目录切开（不带目录或目录不能切）时照旧：它的全部导出都是根，与 ELF 一族不切的对象整节放入同理。
+    let shimSplit = false;
+    for (sp in splits) { if (sp.object == 0) { shimSplit = true; } }
+    let exported = 0;
+    while (!shimSplit && exported < listLen(co.symbols)) {
+        const sym = listGet(co.symbols, exported) catch dummyCoffSymbol();
+        if (sym.originObject == 0 && sym.secno > 0 && sym.storageClass == 2) {
+            markReach(co, allSecs, allByCoff, listGet(allByCoff, sym.secno - 1) catch -1, true, reach, queue);
+        }
+        exported = exported + 1;
+    }
+    // 含目录没登记的字节的块钉住（link_blocks.tx）。
+    let pin = 0;
+    while (pin < listLen(allSecs)) {
+        const pinned = listGet(allSecs, pin) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
+        if ((listGet(co.sections, pinned.coffIdx) catch dummyCoffSection()).pinned && (listGet(reach, pin) catch 0) == 0) {
+            listSet(reach, pin, 1);
+            listPush(queue, pin);
+        }
+        pin = pin + 1;
+    }
     while (listLen(queue) > 0) {
         const cur = listGet(queue, listLen(queue) - 1) catch 0;
         listRemoveAt(queue, listLen(queue) - 1);
         const bs = listGet(allSecs, cur) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
-        listSet(reachByCoff, bs.coffIdx, listLen(reachSecs));
-        listPush(reachSecs, bs);
         const cs = listGet(co.sections, bs.coffIdx) catch dummyCoffSection();
         let ri = 0;
         while (ri < listLen(cs.relocs)) {
             const r = listGet(cs.relocs, ri) catch new CoffReloc { va: 0, sym: 0, typ: 0 };
             const sym = listGet(co.symbols, r.sym) catch dummyCoffSymbol();
+            const exact = inPlaceAddend(cs, r) == 0;
             if (sym.secno > 0) {
-                const m = (listGet(allByCoff, sym.secno - 1) catch -1);
-                if (m >= 0 && (listGet(reach, m) catch 0) == 0) {
-                    listSet(reach, m, 1);
-                    listPush(queue, m);
-                }
+                const m = listGet(allByCoff, sym.secno - 1) catch -1;
+                if (!exact) { noteFallback(co, allSecs, m, cs.originObject, cs.originIndex, r.va + cs.blockBase, r.typ, inPlaceAddend(cs, r), sym.nameSpan); }
+                markReach(co, allSecs, allByCoff, m, exact, reach, queue);
             } else if (rawNameSize(sym.nameSpan) > 0) {
                 let nm = sym.nameSpan;
                 if (nameStarts(nm, "__imp_") == 1) { nm = coffNameSlice(nm, 6, rawNameSize(nm) - 6); }
                 const m = markByName(co, allByCoff, nm);
-                if (m >= 0 && (listGet(reach, m) catch 0) == 0) {
-                    listSet(reach, m, 1);
-                    listPush(queue, m);
-                }
+                if (!exact) { noteFallback(co, allSecs, m, cs.originObject, cs.originIndex, r.va + cs.blockBase, r.typ, inPlaceAddend(cs, r), sym.nameSpan); }
+                markReach(co, allSecs, allByCoff, m, exact, reach, queue);
             }
             ri = ri + 1;
         }
+    }
+    // 放入次序＝输入次序（对象序、节序；切开的节按函数在原节里的次序），与求可达的先后无关：同一节的块紧排，相邻的块保持原来的
+    // 相对位置；全部够得着时与整节放入逐字节相同。
+    const reachSecs: List<Ref<BlobSec>> = listNew();
+    let ra = 0;
+    while (ra < listLen(allSecs)) {
+        if ((listGet(reach, ra) catch 0) == 1) {
+            const bs = listGet(allSecs, ra) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
+            listSet(reachByCoff, bs.coffIdx, listLen(reachSecs));
+            listPush(reachSecs, bs);
+        }
+        ra = ra + 1;
     }
     // —— 宿主 text 节 ——
     const text: Bytes = bytesNew(0);
@@ -878,15 +1023,19 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
     let bi = 0;
     while (bytesLen(text) % 16 != 0) { bytesPush(text, 0x90); }
     bi = 0;
+    let previousText = dummyCoffSection();
     while (bi < listLen(reachSecs)) {
         const bs = listGet(reachSecs, bi) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
         const cs = listGet(co.sections, bs.coffIdx) catch dummyCoffSection();
         if (bs.kind != 0) { bi = bi + 1; continue; }
-        let al = cs.alignBytes;
+        let al = cs.sectionAlign;
         if (al < 16) { al = 16; }
+        // 同一节切出的块接着上一块放，不补齐（块里没有对齐要求：内核代码节不含对齐指令，函数本来就逐字节紧排）。
+        if (cs.blockOf >= 0 && previousText.blockOf >= 0 && previousText.originObject == cs.originObject && previousText.originIndex == cs.originIndex) { al = 1; }
         while (bytesLen(text) % al != 0) { bytesPush(text, 0x90); }
         bs.off = bytesLen(text);
         appendCoffBytes(text, cs);
+        previousText = cs;
         bi = bi + 1;
     }
     while (bytesLen(text) % 16 != 0) { bytesPush(text, 0x90); }
@@ -1133,6 +1282,13 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
         z = 0;
         while (z < 40) { bytesPush(rdata, 0); z = z + 1; }
     }
+    // 调试目录（运行时按需链入）：一条 IMAGE_DEBUG_DIRECTORY（28 字节，4 字节对齐），类型 IMAGE_DEBUG_TYPE_REPRO（16）、不带数据，
+    // 声明时间戳是内容哈希（同 lld-link /Brepro）；时间戳由 peFinish 与 COFF 头一并填入。不生成 PDB，也就没有 CodeView 项。
+    while (bytesLen(rdata) % 4 != 0) { bytesPush(rdata, 0); }
+    const debugDirOff = bytesLen(rdata);
+    z = 0;
+    while (z < 28) { bytesPush(rdata, 0); z = z + 1; }
+    writeU32At(rdata, debugDirOff + 12, 16);
     // 展开信息（PE 规范化 P3）：程序函数（偏移以合成 .text 的开头为准）与各对象 .txfn 里带帧事件的函数各一份 UNWIND_INFO（与位置
     // 无关）；.pdata、.xdata 各成一节，接在 .data 之后（同 gcc、Go），展开信息的有无不挪动代码与数据的布局。对象的节被裁掉时它的
     // 函数不出。
@@ -1145,11 +1301,23 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
     }
     let uo = 0;
     while (uo <= listLen(objectBytes)) {
-        let objectData = shimObj;
-        if (uo > 0) { objectData = listGet(objectBytes, uo - 1) catch bytesNew(0); }
-        const meta = nativeObjectFunctions(objectData, T_X64_WINDOWS);
-        if (!meta.image.ok) { lkFail("UnwindMetadata:" + meta.image.error); return 1; }
-        if (meta.present) {
+        const meta = listGet(metas, uo) catch noMeta();
+        const split = splitOf(splits, uo, meta.inputSection);
+        if (meta.present && split >= 0) {
+            // 切开的节：每个放入的块出它那个函数的展开信息（块在合成 .text 里的位置减去块在原节里的起点）。
+            const sp = listGet(splits, split) catch new SplitSection { object: -1, input: -1, first: 0, count: 0, image: meta.image, code: bytesNew(0) };
+            let fk = 0;
+            for (f in sp.image.functions) {
+                const reach = listGet(reachByCoff, sp.first + fk) catch -1;
+                if (reach >= 0) {
+                    const bs = listGet(reachSecs, reach) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };
+                    const block = listGet(co.sections, sp.first + fk) catch dummyCoffSection();
+                    const problem = unwindRow(unwind, f, sp.code, bs.off - block.blockBase);
+                    if (len(problem) > 0) { lkFail(problem); return 1; }
+                }
+                fk = fk + 1;
+            }
+        } else if (meta.present) {
             let m = 0;
             while (m < listLen(co.sections)) {
                 const cs = listGet(co.sections, m) catch dummyCoffSection();
@@ -1226,7 +1394,7 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
         uniPut(asSymNameL(ai), va);
         ai = ai + 1;
     }
-    si2 = 0;
+    let si2 = 0;
     while (si2 < listLen(co.symbols)) {
         const sym = listGet(co.symbols, si2) catch dummyCoffSymbol();
         if (sym.secno <= 0 || sym.storageClass != 2) { si2 = si2 + 1; continue; }
@@ -1549,6 +1717,9 @@ export function linkExeObjects(shimObj: Bytes, guiSubsystem: int, objectBytes: L
         } else if (d2 == 5 && bytesLen(reloc) > 0) {
             w32L(hdr, relocRva);
             w32L(hdr, bytesLen(reloc));
+        } else if (d2 == 6) {
+            w32L(hdr, rdataRva + debugDirOff);
+            w32L(hdr, 28);
         } else if (d2 == 9 && tlsRva != 0) {
             w32L(hdr, tlsRva);
             w32L(hdr, 40);
@@ -1601,6 +1772,49 @@ function padTo(b: Bytes, n: int): void {
 }
 
 // —— 辅助（查名/写域/节表）——
+// 重定位的就地加数（COFF 的 REL32_1～5 把位移之后的立即数长度放在类型里，加数本身不含 PC 偏置）；越界为 −1。
+function inPlaceAddend(cs: Ref<CoffSection>, r: Ref<CoffReloc>): int {
+    const width = relocWidth(r.typ);
+    const at = cs.rawAt + r.va;
+    if (at < 0 || at + width > bytesLen(cs.rawSource)) { return -1; }
+    let v = 0; let k = width - 1;
+    while (k >= 0) { v = (v << 8) | (bytesGet(cs.rawSource, at + k) catch 0); k = k - 1; }
+    return v;
+}
+
+// 引用带偏移、所指的 m 是切出的块时 markReach 退回整节放入：把引用处记进链接映射（目标分层 X5e），on-demand-link 断言样例里
+// 没有这样的引用。引用处为原对象号、原节号与原节里的偏移；程序映像的对象号为 -1、种类为汇编层的修补种类。
+function noteFallback(co: Ref<CoffObj>, allSecs: List<Ref<BlobSec>>, m: int, object: int, section: int, offset: int, kind: int, addend: int, name: Ref<BinaryName>): void {
+    if (!linkMapEnabled() || m < 0) { return; }
+    const target = listGet(co.sections, (listGet(allSecs, m) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 }).coffIdx) catch dummyCoffSection();
+    if (target.blockOf < 0) { return; }
+    linkMapAddFallback(object, section, offset, kind, addend, name, target.originObject, target.originIndex);
+}
+
+// 标记 allSecs 序的 m 够得着。exact 为假（引用带偏移，目标不一定在符号所在的块里）且 m 是切出的块时，同一原节的块全部够得着，
+// 等于整节放入。
+function markReach(co: Ref<CoffObj>, allSecs: List<Ref<BlobSec>>, allByCoff: List<int>, m: int, exact: bool, reach: List<int>, queue: List<int>): void {
+    if (m < 0) { return; }
+    const target = listGet(co.sections, (listGet(allSecs, m) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 }).coffIdx) catch dummyCoffSection();
+    if (!exact && target.blockOf >= 0) {
+        let ci = 0;
+        while (ci < listLen(co.sections)) {
+            const cs = listGet(co.sections, ci) catch dummyCoffSection();
+            const k = listGet(allByCoff, ci) catch -1;
+            if (k >= 0 && cs.blockOf >= 0 && cs.originObject == target.originObject && cs.originIndex == target.originIndex && (listGet(reach, k) catch 0) == 0) {
+                listSet(reach, k, 1);
+                listPush(queue, k);
+            }
+            ci = ci + 1;
+        }
+        return;
+    }
+    if ((listGet(reach, m) catch 0) == 0) {
+        listSet(reach, m, 1);
+        listPush(queue, m);
+    }
+}
+
 function markByName(co: Ref<CoffObj>, allByCoff: List<int>, nm: Ref<BinaryName>): int {
     const i = siGet(nm);
     if (i < 0) { return -1; }
@@ -1775,22 +1989,31 @@ export function lkGetMissing(): string {
     return lk_missing;
 }
 
+/// 映射的输出节取 PE 产物的实际节头（两个 PE 目标共用；链接映射的约定）：名字、地址、文件偏移、文件字节、内存字节。
+export function lkMapPeSections(image: Bytes, base: int): void {
+    const pe = rdU32(image, 60); const opt = pe + 24;
+    const count = rdU16(image, pe + 6); const headers = opt + rdU16(image, pe + 20);
+    let i = 0;
+    while (i < count) {
+        const at = headers + i * 40;
+        linkMapAddSection(i, coffShortName(image, at), base + rdU32(image, at + 12), rdU32(image, at + 20), rdU32(image, at + 16), rdU32(image, at + 8)); i = i + 1;
+    }
+}
+
 // Collect from actual placements; never infer function ranges from labels.
 function collectPeMap(co: Ref<CoffObj>, reachByCoff: List<int>, reached: List<Ref<BlobSec>>,
     textVa: int, rdataVa: int, dataVa: int, programBssOff: int): void {
     const pe = rdU32(exeBytes, 60); const opt = pe + 24; const base = rdU64(exeBytes, opt + 24);
     linkMapLayout(base, base + rdU32(exeBytes, opt + 16));
-    const count = rdU16(exeBytes, pe + 6); const headers = opt + rdU16(exeBytes, pe + 20);
+    lkMapPeSections(exeBytes, base);
+    const count = rdU16(exeBytes, pe + 6);
     let i = 0;
-    while (i < count) {
-        const at = headers + i * 40;
-        linkMapAddSection(i, coffShortName(exeBytes, at), base + rdU32(exeBytes, at + 12), rdU32(exeBytes, at + 20), rdU32(exeBytes, at + 16), rdU32(exeBytes, at + 8)); i = i + 1;
-    }
     linkMapAddPlacement(-1, 0, 0, textVa, bytesLen(asImgText()));
     for (bs in reached) {
         const cs = listGet(co.sections, bs.coffIdx) catch dummyCoffSection();
         let va = textVa; if (bs.kind == 1) { va = rdataVa; } if (bs.kind == 2) { va = dataVa; }
-        linkMapAddPlacement(cs.originObject, cs.originIndex, bs.kind, va + bs.off, cs.byteCount);
+        if (cs.blockOf >= 0) { linkMapAddBlockPlacement(cs.originObject, cs.originIndex, cs.blockOf, bs.kind, va + bs.off + cs.funcBegin - cs.blockBase, cs.funcEnd - cs.funcBegin); }
+        else { linkMapAddPlacement(cs.originObject, cs.originIndex, bs.kind, va + bs.off, cs.byteCount); }
     }
     if (!linkMapSymbolsEnabled()) { return; }
     const names = [".text", ".rdata", ".data", ".bss"];
@@ -1814,8 +2037,8 @@ function collectPeMap(co: Ref<CoffObj>, reachByCoff: List<int>, reached: List<Re
         if (s.storageClass == 2) { row.binding = "global"; } else if (s.storageClass == 3) { row.binding = "local"; }
         if (s.secno > 0) {
             const section = listGet(co.sections, s.secno - 1) catch dummyCoffSection();
-            linkMapInput(row, s.originSection, section.nameSpan, s.value);
-            row.valueKind = "section-relative"; row.value = s.value; row.state = "discarded";
+            linkMapInput(row, s.originSection, section.nameSpan, s.originValue);
+            row.valueKind = "section-relative"; row.value = s.originValue; row.state = "discarded";
             const m = listGet(reachByCoff, s.secno - 1) catch -1;
             if (m >= 0) {
                 const bs = listGet(reached, m) catch new BlobSec { obj: -1, coffIdx: -1, kind: -1, off: 0 };

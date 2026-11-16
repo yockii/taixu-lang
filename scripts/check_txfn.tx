@@ -1,0 +1,327 @@
+// 函数目录（.txfn，txfn/3）的独立解码与改写：按 COFF 节表或 ELF 节头找到 .txfn 与它登记的代码节，逐项读出函数（模块、名字、
+// 来源、栈模型、起止与序言、尾声、帧事件）并记下各字段在对象里的位置（供定点损坏）；去掉目录、复制一份目录节、改成 COFF 长节名。
+// runtime-functions 与 object-fuzz 两步共用。判定器要与被测编译器相互独立：本文件不导入 bootstrap/ 的任何模块。
+import { hexOf, sha256Of } from "./check_lib";
+import { getLE, setLE } from "./check_obj";
+
+// 对象里的一个节：序号、节头位置、名字、内容的偏移与字节数、标志；ELF 另记名字在节名表里的位置。
+export struct OSec {
+    index: int,
+    header: int,
+    name: string,
+    at: int,
+    size: int,
+    flags: int,
+    nameAt: int,
+}
+
+function cstr(d: Bytes, at: int, limit: int): string {
+    let end = at;
+    while (end < limit && end < bytesLen(d) && (bytesGet(d, end) ?? 0) != 0) {
+        end = end + 1;
+    }
+    if (at < 0 || at > bytesLen(d)) {
+        return "";
+    }
+    return bytesToStr(bytesSlice(d, at, end - at)) catch "\u{fffd}";
+}
+
+function decimal(s: string): int {
+    let n = 0;
+    let i = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) ?? 0;
+        if (c < 48 || c > 57) {
+            return -1;
+        }
+        n = n * 10 + c - 48;
+        i = i + 1;
+    }
+    return n;
+}
+
+// 对象的节表：target 为 windows 时按 COFF 节表（/n 长名查字符串表），否则按 ELF64 节头。
+export function objSections(d: Bytes, target: string): List<OSec> {
+    const rows: List<OSec> = listNew();
+    if (target == "windows") {
+        const count = getLE(d, 2, 2);
+        const sym = getLE(d, 8, 4);
+        const nsyms = getLE(d, 12, 4);
+        const strings = sym + nsyms * 18;
+        let i = 0;
+        while (i < count) {
+            const h = 20 + i * 40;
+            let name = cstr(d, h, h + 8);
+            if (len(name) > 0 && (byteAt(name, 0) ?? 0) == 47) {
+                const off = decimal(bytesToStr(bytesSlice(bytesFromStr(name), 1, len(name) - 1)) catch "");
+                name = cstr(d, strings + off, bytesLen(d));
+            }
+            listPush(rows, OSec { index: i, header: h, name: name, at: getLE(d, h + 20, 4), size: getLE(d, h + 16, 4), flags: getLE(d, h + 36, 4),
+                    nameAt: 0 });
+            i = i + 1;
+        }
+        return rows;
+    }
+    const headers = getLE(d, 40, 8);
+    const count = getLE(d, 60, 2);
+    const namesIndex = getLE(d, 62, 2);
+    const namesAt = getLE(d, headers + namesIndex * 64 + 24, 8);
+    const namesSize = getLE(d, headers + namesIndex * 64 + 32, 8);
+    let i = 0;
+    while (i < count) {
+        const h = headers + i * 64;
+        const name = getLE(d, h, 4);
+        listPush(rows, OSec { index: i, header: h, name: cstr(d, namesAt + name, namesAt + namesSize), at: getLE(d, h + 24, 8),
+                size: getLE(d, h + 32, 8), flags: getLE(d, h + 8, 8), nameAt: namesAt + name });
+        i = i + 1;
+    }
+    return rows;
+}
+
+// 一条帧事件：起止偏移（相对代码节）、种类、寄存器（原值减 1）、字节数，以及这条记录在对象里的位置。
+export struct FEv {
+    before: int,
+    after: int,
+    kind: string,
+    reg: int,
+    bytes: int,
+    position: int,
+}
+
+// 一个函数：模块、名字、来源、栈模型（及其在对象里的位置）、起止与序言结束（及起点字段的位置）、尾声、帧事件。
+export struct FRow {
+    module: string,
+    name: string,
+    origin: string,
+    model: string,
+    modelPosition: int,
+    begin: int,
+    end: int,
+    prologue: int,
+    beginPosition: int,
+    epStart: List<int>,
+    epEnd: List<int>,
+    events: List<FEv>,
+}
+
+export struct Meta {
+    meta: OSec,
+    text: OSec,
+    rows: List<FRow>,
+}
+
+struct Rd {
+    b: Bytes,
+    at: int,
+    bad: bool,
+}
+
+function rd(r: Ref<Rd>, w: int): int {
+    if (r.at + w > bytesLen(r.b)) {
+        r.bad = true;
+        r.at = r.at + w;
+        return 0;
+    }
+    const v = getLE(r.b, r.at, w);
+    r.at = r.at + w;
+    return v;
+}
+
+function rdText(r: Ref<Rd>): string {
+    const n = rd(r, 4);
+    if (r.bad || r.at + n > bytesLen(r.b) || n < 0) {
+        r.bad = true;
+        return "";
+    }
+    const s = bytesToStr(bytesSlice(r.b, r.at, n)) catch (e) {
+        r.bad = true;
+        return "";
+    };
+    r.at = r.at + n;
+    return s;
+}
+
+const KINDS: []string = ["", "allocate-stack", "release-stack", "return", "push-nonvolatile", "pop-nonvolatile", "set-frame-pointer", "align-stack",
+    "restore-stack-pointer"];
+
+// 解码并核对函数目录：恰好一个 .txfn；魔数 TXFN、版本 3、代码节号与长度、代码的 SHA-256、节标志（COFF 0x100a00，ELF 0）、
+// 逐项函数与帧事件，读完恰到节尾。不合时得 Error。
+export function txfnMetadata(d: Bytes, target: string): Meta | Error {
+    const layout = objSections(d, target);
+    let found = 0;
+    let meta = OSec { index: -1, header: 0, name: "", at: 0, size: 0, flags: 0, nameAt: 0 };
+    for (s in layout) {
+        if (s.name == ".txfn") {
+            meta = s;
+            found = found + 1;
+        }
+    }
+    if (found != 1) {
+        return err(toStr(found) + " .txfn sections");
+    }
+    if (meta.at < 0 || meta.at + meta.size > bytesLen(d)) {
+        return err(".txfn outside the object");
+    }
+    const blob = bytesSlice(d, meta.at, meta.size);
+    if (bytesLen(blob) < 88 || getLE(blob, 0, 4) != 0x4E465854 || getLE(blob, 4, 4) != 3) {
+        return err("TXFN magic or version");
+    }
+    const textIndex = getLE(blob, 8, 4);
+    const size = getLE(blob, 12, 8);
+    if (textIndex >= listLen(layout)) {
+        return err("text section index");
+    }
+    const text = listGet(layout, textIndex) catch meta;
+    if (text.at < 0 || text.at + text.size > bytesLen(d)) {
+        return err("text section outside the object");
+    }
+    const code = bytesSlice(d, text.at, text.size);
+    const digest = bytesToStr(bytesSlice(blob, 20, 64)) catch "";
+    if (size != bytesLen(code) || digest != hexOf(sha256Of(code, 0, bytesLen(code)))) {
+        return err("code size or digest");
+    }
+    let flags = 0;
+    if (target == "windows") {
+        flags = 0x100a00;
+    }
+    if (meta.flags != flags) {
+        return err(".txfn section flags");
+    }
+    const count = getLE(blob, 84, 4);
+    const r = new Rd { b: blob, at: 88, bad: false };
+    const rows: List<FRow> = listNew();
+    let i = 0;
+    while (i < count && !r.bad) {
+        const module = rdText(r);
+        const name = rdText(r);
+        const origin = rdText(r);
+        const modelPosition = meta.at + r.at + 4;
+        const model = rdText(r);
+        const beginPosition = meta.at + r.at;
+        const begin = rd(r, 8);
+        const end = rd(r, 8);
+        const prologue = rd(r, 8);
+        const epStart: List<int> = listNew();
+        const epEnd: List<int> = listNew();
+        const neps = rd(r, 4);
+        let k = 0;
+        while (k < neps && !r.bad) {
+            listPush(epStart, rd(r, 8));
+            listPush(epEnd, rd(r, 8));
+            k = k + 1;
+        }
+        const events: List<FEv> = listNew();
+        const nev = rd(r, 4);
+        k = 0;
+        while (k < nev && !r.bad) {
+            const position = meta.at + r.at;
+            const before = rd(r, 8);
+            const after = rd(r, 8);
+            const kind = rd(r, 1);
+            const register = rd(r, 1);
+            const amount = rd(r, 8);
+            if (kind < 1 || kind >= len(KINDS)) {
+                return err("unknown frame event kind " + toStr(kind));
+            }
+            listPush(events, FEv { before: before, after: after, kind: KINDS[kind], reg: register - 1, bytes: amount, position: position });
+            k = k + 1;
+        }
+        if (r.bad) {
+            return err("truncated function metadata");
+        }
+        if (!(0 <= begin && begin < end && end <= bytesLen(code) && begin <= prologue && prologue <= end)) {
+            return err(name + ": range");
+        }
+        if (model != "fixed-call" && (prologue != begin || neps != 0 || nev != 0)) {
+            return err(name + ": boundary facts");
+        }
+        listPush(rows, FRow { module: module, name: name, origin: origin, model: model, modelPosition: modelPosition, begin: begin, end: end,
+                prologue: prologue, beginPosition: beginPosition, epStart: epStart, epEnd: epEnd, events: events });
+        i = i + 1;
+    }
+    if (r.bad || r.at != bytesLen(blob)) {
+        return err("function metadata length");
+    }
+    return Meta { meta: meta, text: text, rows: rows };
+}
+
+function txfnSection(d: Bytes, target: string): OSec {
+    for (s in objSections(d, target)) {
+        if (s.name == ".txfn") {
+            return s;
+        }
+    }
+    return OSec { index: -1, header: 0, name: "", at: 0, size: 0, flags: 0, nameAt: 0 };
+}
+
+// 把 .txfn 的名字改成 .none（目录缺席）。
+export function absent(d: Bytes, target: string): Bytes {
+    const out = bytesSlice(d, 0, bytesLen(d));
+    const meta = txfnSection(d, target);
+    let at = meta.nameAt;
+    if (target == "windows") {
+        at = meta.header;
+    }
+    const none = bytesFromStr(".none");
+    bytesCopy(out, at, none, 0, 5);
+    return out;
+}
+
+// 节表里再登记一份 .txfn（内容复制到文件尾）。
+export function duplicate(d: Bytes, target: string): Bytes | Error {
+    const layout = objSections(d, target);
+    const meta = txfnSection(d, target);
+    const n = listLen(layout);
+    let out = bytesNew(0);
+    if (target == "windows") {
+        const boundary = 20 + 40 * n;
+        bytesAppend(out, bytesSlice(d, 0, boundary));
+        bytesAppend(out, bytesSlice(d, meta.header, 40));
+        bytesAppend(out, bytesSlice(d, boundary, bytesLen(d) - boundary));
+        setLE(out, 2, 2, n + 1);
+        setLE(out, 8, 4, getLE(d, 8, 4) + 40);
+        let i = 0;
+        while (i < n + 1) {
+            for (off in [20, 24, 28]) {
+                const at = 20 + i * 40 + off;
+                const old = getLE(out, at, 4);
+                if (old != 0) {
+                    setLE(out, at, 4, old + 40);
+                }
+            }
+            i = i + 1;
+        }
+        setLE(out, boundary + 20, 4, bytesLen(out));
+    } else {
+        if (bytesLen(d) != getLE(d, 40, 8) + 64 * n) {
+            return err("ELF section headers are not at the end of the object");
+        }
+        bytesAppend(out, d);
+        bytesAppend(out, bytesSlice(d, meta.header, 64));
+        setLE(out, 60, 2, n + 1);
+        setLE(out, bytesLen(d) + 24, 8, bytesLen(out));
+    }
+    bytesAppend(out, bytesSlice(d, meta.at, meta.size));
+    return out;
+}
+
+// COFF：.txfn 改用字符串表里的长名（/n）。
+export function longCoffName(d: Bytes): Bytes | Error {
+    const out = bytesSlice(d, 0, bytesLen(d));
+    const meta = txfnSection(d, "windows");
+    const strings = getLE(d, 8, 4) + 18 * getLE(d, 12, 4);
+    const size = getLE(d, strings, 4);
+    if (strings + size != bytesLen(d)) {
+        return err("COFF string table is not at the end of the object");
+    }
+    bytesAppend(out, bytesFromStr(".txfn"));
+    bytesPush(out, 0);
+    setLE(out, strings, 4, size + 6);
+    const name = bytesFromStr("/" + toStr(size));
+    let i = 0;
+    while (i < 8) {
+        bytesSet(out, meta.header + i, bytesGet(name, i) ?? 0);
+        i = i + 1;
+    }
+    return out;
+}

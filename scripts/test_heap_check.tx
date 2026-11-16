@@ -1,0 +1,829 @@
+// 测试专用页堆的正负控制（gate.tx 的 heap-check 步）。由给定编译器编出内核生成器，生成本宿主目标的页堆内核
+// （--generic=heapcheck），分四部分检查：
+//   driver   C 驱动（tests/runtime-security/heap-check.c）直接链接页堆内核：分配器本身（ok）与九个正控制——重复释放、非法释放、
+//            内部指针释放、块尾空隙写、块头之前写、改块头尺寸（账本与哨兵，报 4012），越过保护页写、释放后写、重分配后写旧址
+//            （访问违例）。内核的 __tx_trap 要读线程块，C 调用方没有，链接前经 objcopy 弱化（连同 Linux 内核自带的 _start、main），
+//            由驱动的定义代替。
+//   product  太虚产物经外部库（heap-probe.c / heap-probe.tx）越过 Bytes 末尾写、写块尾空隙、释放后写：`--heap-check`（编译器内嵌的
+//            检测内核：页堆＋对象号隔离）下须查出；标准内核下照常跑完（说明控制确实做了坏访问，而生产内核看不见）。
+//   mutants  去掉保护页、去掉释放时的解除提交（隔离失效）、去掉块尾哨兵核对的三个变异页堆，须分别让对应控制漏检——证明控制能区分
+//            检测器有没有效。变异按锚点改 bootstrap 副本里的 kernel_alloc_check.tx；锚点不唯一即失败，不静默变成空变异。
+//   corpus   全量语料（SKIP 清单除外）以 `--heap-check` 构建，与标准内核逐例同结果。标准结果可由 --standard-normal／--standard-leak／
+//            --standard-debug 给出已有报告（门里复用 products 步的报告），否则就地跑一遍。
+// 宿主为 Windows、Linux（x86_64 或 aarch64，产物随宿主架构）或 Apple silicon 的 macOS（产物为 aarch64-macos）。macOS 没有 GNU objcopy，
+// 内核又是交给太虚链接器的 ELF 对象：驱动与变异体改链只含页堆的 Mach-O 目标文件（bootstrap/native_heap_check_probe.tx，不含
+// __tx_trap，libSystem 调用由驱动定义），arm64 原生与 x86_64（Rosetta）各跑一遍。aarch64 Linux 同样改链只含页堆的 ELF 目标文件：A64
+// 写出器把对象内的调用在汇编时解析（内核对 __tx_trap 的调用没有重定位），objcopy 弱化改不到它们；envp 与 LSE 标志由驱动设好。
+// C 编译器取 TAIXU_TEST_CC，否则 PATH 上的 cc／gcc／clang；objcopy（Windows、Linux）取 TAIXU_TEST_OBJCOPY，否则 C 编译器旁边或
+// PATH 上的。缺工具即失败，不记通过。
+// 运行（仓根）：taixu run --toolchain scripts/test_heap_check.tx --compiler <taixu> --work <目录> [--leak-check] [--debug]
+//   [--standard-normal <报告>] [--standard-leak <报告>] [--standard-debug <报告>] [--root <仓库>] [driver|product|mutants|corpus …]
+// 外部库的搜索路径（Linux 的 LD_LIBRARY_PATH）经 setEnv 设在本进程、用完设回原值（原先没有时设为空串；setEnv 不能删变量）；
+// 子进程超时记为该项失败；每遍语料至多 6 小时。
+import { absolute, baseOf, copyFile, deleteTree, dirOf, exeName, findInPath, join, kindOf, mkdirs, nat } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { Jv, jArray, jNumber, jObject, jPretty, jPush, jSet, jString } from "./test_json";
+import { lossyText } from "./check_lib";
+import { captureRaw } from "./test_lib";
+import { Rows, loadRows, rowsNew, runCorpus } from "./test_corpus";
+import { contains, endsWith, headChars, reprStr, sorted, tailChars } from "./test_text";
+import { noTarget, targetNamed } from "./targets";
+
+const SEC: int = 1000000000;
+const MAX_OUTPUT: int = 16777216;
+// 内核生成器 runtime_memory_gen 编出完整内核的开关（同语料运行器 scripts/test_nrt_products.tx）。
+const KERNEL_FLAGS: []string = ["--with-move", "--with-alloc", "--with-rc", "--with-str", "--with-strb", "--with-zero", "--with-list",
+    "--with-file", "--with-argv", "--with-store-slots", "--with-nrt"];
+// 页堆模式下按清单跳过的语料用例（设计 三-6）：写明为何不跑，不静默放宽。
+const SKIP_CASE: string = "tests/nrt-cases/thread-many.tx";
+const SKIP_WHY: string = "382 个线程各分配两万个字符串（约 760 万块），页堆每块一次映射、解除提交与归还，超过单例 120 秒时限（2026-10-24 不限时跑完约 10 分钟，输出与期望相同）";
+// 驱动控制与期望：消息为 4012 报告里须含的文字，空串为访问违例。
+const DRIVER_NAMES: []string = ["double-free", "invalid-free", "interior-free", "slack-write", "left-write", "header-write", "guard-write",
+    "use-after-free", "realloc-stale"];
+const DRIVER_WANT: []string = ["重复释放", "释放了不是分配器给出的指针", "释放了不是分配器给出的指针", "块外的字节被改写", "块外的字节被改写",
+    "块头被改写", "", "", ""];
+const PARTS: []string = ["driver", "product", "mutants", "corpus"];
+
+struct Host {
+    windows: bool,
+    macos: bool,
+    a64Linux: bool,
+    // 内核与驱动的目标、语料运行器的 --target、内核对象的文件名。
+    target: string,
+    productsTarget: string,
+    kernel: string,
+    // 驱动与变异体改链只含页堆的目标文件（macOS、aarch64 Linux）时的架构：三元组、cc 的架构参数、名字后缀。
+    probeTriples: List<string>,
+    probeFlags: List<List<string>>,
+    probeTags: List<string>,
+}
+
+struct Mutant {
+    name: string,
+    missed: string,
+    olds: List<string>,
+    news: List<string>,
+}
+
+struct Ctx {
+    compiler: string,
+    root: string,
+    work: string,
+    host: Host,
+    cc: string,
+    objcopy: string,
+    rows: Ref<Jv>,
+    total: int,
+    bad: int,
+}
+
+struct Res {
+    code: int,
+    out: string,
+    err: string,
+}
+
+// 一个待链的页堆对象：路径、cc 的架构参数、名字后缀。
+struct Obj {
+    path: string,
+    flags: List<string>,
+    tag: string,
+}
+
+function hostOf(): Host {
+    const windows = hostTarget() == "windows";
+    const macos = hostTarget() == "macos";
+    const a64Linux = hostTarget() == "linux" && hostArch() == "aarch64";
+    let h = Host { windows: windows, macos: macos, a64Linux: a64Linux, target: "x86_64-linux", productsTarget: "linux",
+        kernel: "", probeTriples: listNew(), probeFlags: listNew(), probeTags: listNew() };
+    if (windows) {
+        h.target = "x86_64-windows";
+        h.productsTarget = "windows";
+    } else if (macos) {
+        h.target = "aarch64-macos";
+        h.productsTarget = "aarch64-macos";
+        listPush(h.probeTriples, "aarch64-macos");
+        listPush(h.probeFlags, listNew());
+        listPush(h.probeTags, "-aarch64");
+        const x86: List<string> = listNew();
+        listPush(x86, "-arch");
+        listPush(x86, "x86_64");
+        listPush(h.probeTriples, "x86_64-macos");
+        listPush(h.probeFlags, x86);
+        listPush(h.probeTags, "-x86_64");
+    } else if (a64Linux) {
+        h.target = "aarch64-linux";
+        h.productsTarget = "aarch64-linux";
+        listPush(h.probeTriples, "aarch64-linux");
+        listPush(h.probeFlags, listNew());
+        listPush(h.probeTags, "");
+    }
+    h.kernel = (targetNamed(h.target) ?? noTarget()).kernel;
+    return h;
+}
+
+function probeHost(c: Ref<Ctx>): bool {
+    return listLen(c.host.probeTriples) > 0;
+}
+
+function mutants(): List<Mutant> {
+    const out: List<Mutant> = listNew();
+    const g = Mutant { name: "guard", missed: "guard-write", olds: listNew(), news: listNew() };
+    listPush(g.olds, "rtCall4(f, \"x\", \"VirtualAlloc\", L(\"base\"), L(\"total\"), I(MEM_COMMIT), I(PAGE_RW));");
+    listPush(g.news, "rtCall4(f, \"x\", \"VirtualAlloc\", L(\"base\"), L(\"maplen\"), I(MEM_COMMIT), I(PAGE_RW));");
+    listPush(g.olds, "uxSys(f, t, \"\", 10, ops3(L(\"x\"), page, I(0)));");
+    listPush(g.news, "uxSys(f, t, \"\", 10, ops3(L(\"x\"), page, I(3)));");
+    listPush(out, g);
+    const q = Mutant { name: "quarantine", missed: "use-after-free", olds: listNew(), news: listNew() };
+    listPush(q.olds, "rtCall3(f, \"\", \"VirtualFree\", L(\"base\"), L(\"total\"), I(MEM_DECOMMIT));");
+    listPush(q.news, "");
+    listPush(q.olds, "uxSys(f, t, \"\", 10, ops3(L(\"base\"), L(\"total\"), I(0)));");
+    listPush(q.news, "");
+    listPush(out, q);
+    const k = Mutant { name: "canary", missed: "slack-write", olds: listNew(), news: listNew() };
+    listPush(k.olds, "rtIf(f, L(\"w\"), \"ne\", I(165), \"canary\");");
+    listPush(k.news, "");
+    listPush(out, k);
+    return out;
+}
+
+function check(c: Ref<Ctx>, label: string, ok: bool, detail: string): bool {
+    const row = jObject();
+    jSet(row, "check", jString(label));
+    jSet(row, "ok", boolJv(ok));
+    if (ok) {
+        jSet(row, "detail", jString(detail));
+    } else {
+        jSet(row, "detail", jString(headChars(detail, 2000)));
+    }
+    jPush(c.rows, row);
+    c.total = c.total + 1;
+    if (ok) {
+        print("PASS " + label);
+    } else {
+        c.bad = c.bad + 1;
+        print("FAIL " + label + ": " + headChars(detail, 400));
+    }
+    return ok;
+}
+
+function boolJv(b: bool): Ref<Jv> {
+    return new Jv { kind: 1, text: "", truth: b, items: listNew(), keys: listNew() };
+}
+
+// 运行并按 UTF-8（非法字节替换）取两路输出；超时退出码为 −1。Windows 的 NTSTATUS 退出码按无符号 32 位记（同 Python）。
+function sh(c: Ref<Ctx>, exe: string, args: List<string>, cwd: string, limit: int): Res | Error {
+    const r = captureRaw(exe, args, cwd, limit * SEC, 10 * SEC, MAX_OUTPUT)?;
+    let code = r.code;
+    if (c.host.windows && code < -1) {
+        code = code + 4294967296;
+    }
+    return Res { code: code, out: lossyText(r.out), err: lossyText(r.err) };
+}
+
+function accessViolation(c: Ref<Ctx>, code: int): bool {
+    if (c.host.windows) {
+        return code == 3221225477;
+    }
+    // macOS 上访问不可访问页多报 SIGBUS。
+    return code == -11 || (c.host.macos && code == -10);
+}
+
+function detail(r: Res): string {
+    return "exit=" + toStr(r.code) + " stdout=" + reprStr(tailChars(r.out, 300)) + " stderr=" + reprStr(tailChars(r.err, 300));
+}
+
+// 环境变量所指的工具，否则依次在 near 旁边与 PATH 上找各个名字。
+function tool(envName: string, names: []string, near: string): string {
+    const v = getEnv(envName) ?? "";
+    if (len(v) > 0) {
+        return v;
+    }
+    for (n in names) {
+        if (len(near) > 0) {
+            const cand = nat(join(dirOf(near), exeName(n)));
+            if (kindOf(cand) == 1) {
+                return cand;
+            }
+        }
+        const found = findInPath(n);
+        if (len(found) > 0) {
+            return nat(found);
+        }
+    }
+    return "";
+}
+
+// 工具路径（同 shutil.which：带目录的照用、存在才算；否则在 PATH 上找）。
+function which(p: string): string {
+    if (len(p) == 0) {
+        return "";
+    }
+    if (contains(p, "/") || contains(p, "\\")) {
+        if (kindOf(nat(p)) == 1) {
+            return nat(p);
+        }
+        return "";
+    }
+    return findInPath(p);
+}
+
+function rel(c: Ref<Ctx>, path: string): string {
+    const w = nat(c.work);
+    if (len(path) > len(w) + 1) {
+        return bytesToStr(bytesSlice(bytesFromStr(path), len(w) + 1, len(path) - len(w) - 1)) catch path;
+    }
+    return path;
+}
+
+function list1(a: string): List<string> {
+    const xs: List<string> = listNew();
+    listPush(xs, a);
+    return xs;
+}
+
+function generator(c: Ref<Ctx>, srcRoot: string, out: string): string | Error {
+    const args: List<string> = listNew();
+    listPush(args, "build");
+    listPush(args, "bootstrap/runtime_memory_gen.tx");
+    listPush(args, "--toolchain");
+    listPush(args, "--runtime=native");
+    if (!c.host.windows && !c.host.macos) {
+        listPush(args, "--target=" + c.host.target);
+    }
+    listPush(args, "--out");
+    listPush(args, out);
+    const r = sh(c, c.compiler, args, srcRoot, 600)?;
+    if (!check(c, "generator build " + baseOf(out), r.code == 0, r.out + r.err)) {
+        return "";
+    }
+    return nat(join(out, exeName("runtime_memory_gen")));
+}
+
+function kernel(c: Ref<Ctx>, gen: string, out: string, generic: string): string | Error {
+    if (!mkdirs(dirOf(out))) {
+        return err("建不了 " + dirOf(out));
+    }
+    const args: List<string> = listNew();
+    listPush(args, "--target");
+    listPush(args, c.host.target);
+    listPush(args, out);
+    for (f in KERNEL_FLAGS) {
+        listPush(args, f);
+    }
+    if (len(generic) > 0) {
+        listPush(args, "--generic=" + generic);
+    }
+    const r = sh(c, gen, args, c.root, 600)?;
+    if (check(c, "kernel " + rel(c, out), r.code == 0 && kindOf(out) == 1, r.out + r.err)) {
+        return out;
+    }
+    return "";
+}
+
+// macOS、aarch64 Linux：由 srcRoot 的源码编出页堆探针生成器，为每个架构各出一个目标文件。
+function probes(c: Ref<Ctx>, srcRoot: string, out: string): List<Obj> | Error {
+    const objs: List<Obj> = listNew();
+    if (!mkdirs(out)) {
+        return err("建不了 " + out);
+    }
+    const args: List<string> = listNew();
+    listPush(args, "build");
+    listPush(args, "bootstrap/native_heap_check_probe.tx");
+    listPush(args, "--toolchain");
+    listPush(args, "--out");
+    listPush(args, nat(join(out, "probe-gen")));
+    const r = sh(c, c.compiler, args, srcRoot, 600)?;
+    if (!check(c, "probe generator build " + rel(c, out), r.code == 0, r.out + r.err)) {
+        return objs;
+    }
+    let i = 0;
+    while (i < listLen(c.host.probeTriples)) {
+        const tag = listGet(c.host.probeTags, i) catch "";
+        const obj = nat(join(out, "heap-check" + tag + ".o"));
+        const pargs: List<string> = listNew();
+        listPush(pargs, "--target");
+        listPush(pargs, listGet(c.host.probeTriples, i) catch "");
+        listPush(pargs, obj);
+        const p = sh(c, nat(join(join(out, "probe-gen"), "native_heap_check_probe")), pargs, c.root, 600)?;
+        if (check(c, "probe " + rel(c, obj), p.code == 0 && kindOf(obj) == 1, p.out + p.err)) {
+            const empty: List<string> = listNew();
+            listPush(objs, Obj { path: obj, flags: listGet(c.host.probeFlags, i) catch empty, tag: tag });
+        }
+        i = i + 1;
+    }
+    return objs;
+}
+
+function driver(c: Ref<Ctx>, o: Obj, name: string): string | Error {
+    let linked = o.path;
+    if (probeHost(c)) {
+        // 探针对象不含 __tx_trap，无须弱化。
+        if (!check(c, "tools: C compiler", len(c.cc) > 0, "cc=None")) {
+            return "";
+        }
+    } else {
+        let ccShown = c.cc;
+        let ocShown = c.objcopy;
+        if (len(ccShown) == 0) {
+            ccShown = "None";
+        }
+        if (len(ocShown) == 0) {
+            ocShown = "None";
+        }
+        if (!check(c, "tools: C compiler and objcopy", len(c.cc) > 0 && len(c.objcopy) > 0, "cc=" + ccShown + " objcopy=" + ocShown)) {
+            return "";
+        }
+        const base = baseOf(o.path);
+        let dot = len(base);
+        let k = len(base) - 1;
+        while (k >= 0) {
+            if ((byteAt(base, k) ?? 0) == 46) {
+                dot = k;
+                break;
+            }
+            k = k - 1;
+        }
+        const stem = bytesToStr(bytesSlice(bytesFromStr(base), 0, dot)) catch base;
+        const suffix = bytesToStr(bytesSlice(bytesFromStr(base), dot, len(base) - dot)) catch "";
+        linked = nat(join(dirOf(o.path), stem + "-weak" + suffix));
+        const args: List<string> = listNew();
+        for (a in ["-W", "__tx_trap", "-W", "_start", "-W", "main"]) {
+            listPush(args, a);
+        }
+        listPush(args, o.path);
+        listPush(args, linked);
+        const r = sh(c, c.objcopy, args, c.root, 600)?;
+        if (!check(c, "objcopy " + name, r.code == 0, r.out + r.err)) {
+            return "";
+        }
+    }
+    const dir = dirOf(o.path);
+    if (!copyFile(nat(join(c.root, "tests/runtime-security/heap-check.c")), nat(join(dir, "heap-check.c")), false)) {
+        return err("拷不了 heap-check.c 到 " + dir);
+    }
+    const args: List<string> = listNew();
+    for (a in ["-O2", "-Wall", "-Wextra"]) {
+        listPush(args, a);
+    }
+    for (f in o.flags) {
+        listPush(args, f);
+    }
+    listPush(args, "heap-check.c");
+    listPush(args, baseOf(linked));
+    listPush(args, "-o");
+    listPush(args, exeName(name));
+    const r = sh(c, c.cc, args, dir, 600)?;
+    if (check(c, "driver build " + name, r.code == 0, r.out + r.err)) {
+        return nat(join(dir, exeName(name)));
+    }
+    return "";
+}
+
+// want："pass"、"missed"、消息（4012 报告）或空串（访问违例）。
+function control(c: Ref<Ctx>, exe: string, name: string, want: string, label: string): void | Error {
+    const r = sh(c, exe, list1(name), dirOf(exe), 300)?;
+    let ok = false;
+    if (want == "pass") {
+        ok = r.code == 0 && contains(r.out, "PASS heapcheck: allocator");
+    } else if (want == "missed") {
+        ok = r.code == 1 && contains(r.out, "MISSED heapcheck control " + name);
+    } else if (len(want) == 0) {
+        ok = accessViolation(c, r.code);
+    } else {
+        ok = r.code == 88 && contains(r.out, "TRAP code=4012 heapcheck: " + want);
+    }
+    check(c, label, ok, detail(r));
+}
+
+function driverPart(c: Ref<Ctx>, heap: string): void | Error {
+    let objs: List<Obj> = listNew();
+    if (probeHost(c)) {
+        objs = probes(c, c.root, nat(join(c.work, "probe")))?;
+    } else {
+        listPush(objs, Obj { path: heap, flags: listNew(), tag: "" });
+    }
+    for (o in objs) {
+        const exe = driver(c, o, "heap-check" + o.tag)?;
+        if (len(exe) == 0) {
+            continue;
+        }
+        control(c, exe, "ok", "pass", "driver" + o.tag + ": allocator")?;
+        let i = 0;
+        while (i < len(DRIVER_NAMES)) {
+            control(c, exe, DRIVER_NAMES[i], DRIVER_WANT[i], "driver" + o.tag + ": " + DRIVER_NAMES[i])?;
+            i = i + 1;
+        }
+    }
+}
+
+function productPart(c: Ref<Ctx>): void | Error {
+    if (!check(c, "tools: C compiler", len(c.cc) > 0, "cc=None")) {
+        return;
+    }
+    const pw = nat(join(c.work, "product"));
+    if (!mkdirs(pw)) {
+        return err("建不了 " + pw);
+    }
+    let library = "libheap_probe.so";
+    const flags: List<string> = listNew();
+    if (c.host.windows) {
+        library = "heap_probe.dll";
+        listPush(flags, "-shared");
+        listPush(flags, "-static-libgcc");
+    } else {
+        if (c.host.macos) {
+            library = "libheap_probe.dylib";
+        }
+        listPush(flags, "-shared");
+        listPush(flags, "-fPIC");
+    }
+    if (!copyFile(nat(join(c.root, "tests/runtime-security/heap-probe.c")), nat(join(pw, "heap-probe.c")), false)) {
+        return err("拷不了 heap-probe.c");
+    }
+    const largs: List<string> = listNew();
+    for (a in ["-O2", "-Wall", "-Wextra"]) {
+        listPush(largs, a);
+    }
+    for (f in flags) {
+        listPush(largs, f);
+    }
+    listPush(largs, "heap-probe.c");
+    listPush(largs, "-o");
+    listPush(largs, library);
+    const lr = sh(c, c.cc, largs, pw, 600)?;
+    if (!check(c, "product: library build", lr.code == 0, lr.out + lr.err)) {
+        return;
+    }
+    const source = nat(join(pw, "heap-probe.tx"));
+    // macOS 按 LC_LOAD_DYLIB 绑定库路径，给绝对路径；其余宿主产物旁边的库即可。
+    let named = library;
+    if (c.host.macos) {
+        named = nat(join(pw, library));
+    }
+    const fixture = readFile(nat(join(c.root, "tests/runtime-security/heap-probe.tx")))?;
+    writeFileBytes(source, bytesFromStr(replaceAll(fixture, "from \"heap_probe\"", "from \"" + named + "\"")))?;
+    // 检测形态经用户旗标 --heap-check（编译器内嵌的检测内核，即用户拿到的那一份）。
+    for (kind in ["standard", "heapcheck"]) {
+        const out = nat(join(pw, kind));
+        const bargs: List<string> = listNew();
+        listPush(bargs, "build");
+        listPush(bargs, source);
+        if (c.host.macos) {
+            listPush(bargs, "--target=aarch64-macos");
+        }
+        if (kind == "heapcheck") {
+            listPush(bargs, "--heap-check");
+        }
+        listPush(bargs, "--out");
+        listPush(bargs, out);
+        const br = sh(c, c.compiler, bargs, c.root, 600)?;
+        if (!check(c, "product: build " + kind, br.code == 0, br.out + br.err)) {
+            continue;
+        }
+        if (!copyFile(nat(join(pw, library)), nat(join(out, library)), false)) {
+            return err("拷不了 " + library);
+        }
+        const exe = nat(join(out, exeName("heap-probe")));
+        // Linux 按 DT_NEEDED 加载外部库，产物目录不在搜索路径里：运行期间把它设进本进程的 LD_LIBRARY_PATH，子进程随之继承。
+        const linux = !c.host.windows && !c.host.macos;
+        const saved = getEnv("LD_LIBRARY_PATH") ?? "";
+        if (linux) {
+            setEnv("LD_LIBRARY_PATH", out)?;
+        }
+        for (mode in ["clean", "slack", "guard", "use-after-free"]) {
+            const r = sh(c, exe, list1(mode), out, 120) catch (e) {
+                if (linux) {
+                    setEnv("LD_LIBRARY_PATH", saved) catch (x) {};
+                }
+                return e;
+            };
+            let ok = false;
+            if (kind == "standard" || mode == "clean") {
+                ok = r.code == 0 && contains(r.out, "PASS_HEAP_PROBE " + mode);
+            } else if (mode == "slack") {
+                ok = r.code == 3 && contains(r.err, "heapcheck: 块外的字节被改写") && !contains(r.out, "PASS_HEAP_PROBE");
+            } else {
+                ok = accessViolation(c, r.code) && !contains(r.out, "PASS_HEAP_PROBE");
+            }
+            check(c, "product: " + kind + " " + mode, ok, detail(r));
+        }
+        if (linux) {
+            setEnv("LD_LIBRARY_PATH", saved)?;
+        }
+    }
+}
+
+function replaceAll(s: string, old: string, rep: string): string {
+    const parts = strSplit(s, old);
+    let out = "";
+    let i = 0;
+    while (i < listLen(parts)) {
+        if (i > 0) {
+            out = out + rep;
+        }
+        out = out + (listGet(parts, i) catch "");
+        i = i + 1;
+    }
+    return out;
+}
+
+function occurrences(s: string, needle: string): int {
+    return listLen(strSplit(s, needle)) - 1;
+}
+
+// 整棵目录树复制（不跟随链接）。
+function copyTree(from: string, to: string): bool {
+    if (!mkdirs(to)) {
+        return false;
+    }
+    const names = localListDir(nat(from), "") catch (e) {
+        return false;
+    };
+    for (n in names) {
+        const k = localEntryKind(nat(from), n);
+        if (k == 2) {
+            if (!copyTree(nat(join(from, n)), nat(join(to, n)))) {
+                return false;
+            }
+        } else if (k == 1) {
+            if (!copyFile(nat(join(from, n)), nat(join(to, n)), false)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+function mutantsPart(c: Ref<Ctx>): void | Error {
+    for (m in mutants()) {
+        const tree = nat(join(c.work, "mutant-" + m.name));
+        if (kindOf(tree) != 0 && !deleteTree(tree)) {
+            return err("删不掉上次的 " + tree);
+        }
+        if (!copyTree(nat(join(c.root, "bootstrap")), nat(join(tree, "bootstrap")))) {
+            return err("复制不了 bootstrap 到 " + tree);
+        }
+        const module = nat(join(tree, "bootstrap/selfhost/kernel_alloc_check.tx"));
+        let text = readFile(module)?;
+        let anchored = true;
+        let i = 0;
+        while (i < listLen(m.olds)) {
+            const old = listGet(m.olds, i) catch "";
+            const n = occurrences(text, old);
+            anchored = check(c, "mutant " + m.name + ": anchor " + headChars(old, 48), n == 1, "count=" + toStr(n)) && anchored;
+            text = replaceAll(text, old, listGet(m.news, i) catch "");
+            i = i + 1;
+        }
+        if (!anchored) {
+            continue;
+        }
+        writeFileBytes(module, bytesFromStr(text))?;
+        let objs: List<Obj> = listNew();
+        if (probeHost(c)) {
+            objs = probes(c, tree, nat(join(tree, "probe")))?;
+        } else {
+            const mgen = generator(c, tree, nat(join(tree, "gen")))?;
+            if (len(mgen) > 0) {
+                const mk = kernel(c, mgen, nat(join(join(tree, "kernel"), c.host.kernel)), "heapcheck")?;
+                if (len(mk) > 0) {
+                    listPush(objs, Obj { path: mk, flags: listNew(), tag: "" });
+                }
+            }
+        }
+        for (o in objs) {
+            const exe = driver(c, o, "heap-check-" + m.name + o.tag)?;
+            if (len(exe) > 0) {
+                control(c, exe, m.missed, "missed", "mutant " + m.name + o.tag + ": " + m.missed + " goes undetected")?;
+            }
+        }
+    }
+}
+
+// 语料运行器缺省跑的用例（同 scripts/test_nrt_products.tx）：三个目录里带 .out 或 .err 的 .tx，相对仓库根。
+function corpusCases(root: string): List<string> | Error {
+    const found: List<string> = listNew();
+    for (d in ["tests/cases", "tests/nrt-cases", "examples"]) {
+        const dir = nat(join(root, d));
+        const names = localListDir(dir, "") catch (e) {
+            return err("读不了 " + dir + "：" + e.message);
+        };
+        for (n in sorted(names)) {
+            if (!endsWith(n, ".tx")) {
+                continue;
+            }
+            const stem = bytesToStr(bytesSlice(bytesFromStr(n), 0, len(n) - 3)) catch "";
+            if (kindOf(nat(join(dir, stem + ".out"))) != 0 || kindOf(nat(join(dir, stem + ".err"))) != 0) {
+                listPush(found, d + "/" + n);
+            }
+        }
+    }
+    return found;
+}
+
+// 经语料运行器跑给定用例，返回用例 → 状态（报告不在时为空）。用例以相对路径交给它（命令行长度）。
+function corpus(c: Ref<Ctx>, label: string, extra: List<string>, mode: List<string>, cases: List<string>): Ref<Rows> | Error {
+    const report = nat(join(c.work, "corpus-" + label + ".json"));
+    const args: List<string> = listNew();
+    listPush(args, "--target");
+    listPush(args, c.host.productsTarget);
+    for (x in extra) {
+        listPush(args, x);
+    }
+    for (x in mode) {
+        listPush(args, x);
+    }
+    for (x in cases) {
+        listPush(args, x);
+    }
+    runCorpus(c.compiler, c.root, nat(join(c.work, "run-" + label)), report, args)?;
+    if (kindOf(report) != 1) {
+        return rowsNew();
+    }
+    return loadRows(report);
+}
+
+function corpusPart(c: Ref<Ctx>, leak: bool, debug: bool, normalReport: string, leakReport: string, debugReport: string): void | Error {
+    const cases = corpusCases(c.root)?;
+    print("SKIP " + SKIP_CASE + ": " + SKIP_WHY);
+    const kept: List<string> = listNew();
+    for (x in cases) {
+        if (x != SKIP_CASE) {
+            listPush(kept, x);
+        }
+    }
+    const labels: List<string> = listNew();
+    const given: List<string> = listNew();
+    listPush(labels, "normal");
+    listPush(given, normalReport);
+    if (leak) {
+        listPush(labels, "leak");
+        listPush(given, leakReport);
+    }
+    if (debug) {
+        listPush(labels, "debug");
+        listPush(given, debugReport);
+    }
+    let i = 0;
+    while (i < listLen(labels)) {
+        const label = listGet(labels, i) catch "";
+        const g = listGet(given, i) catch "";
+        const mode: List<string> = listNew();
+        if (label == "leak") {
+            listPush(mode, "--leak-check");
+        } else if (label == "debug") {
+            listPush(mode, "--debug");
+        }
+        let std = rowsNew();
+        if (len(g) > 0 && kindOf(nat(g)) == 1) {
+            std = loadRows(nat(g))?;
+        } else {
+            std = corpus(c, "standard-" + label, listNew(), mode, kept)?;
+        }
+        const got = corpus(c, "heapcheck-" + label, list1("--build-flag=--heap-check"), mode, kept)?;
+        const counts: Map<string, int> = mapNew();
+        for (k in mapKeys(got.status)) {
+            const s = mapGet(got.status, k) ?? "";
+            mapSet(counts, s, (mapGet(counts, s) ?? 0) + 1);
+        }
+        let line = "corpus " + label + ":";
+        for (s in sorted(mapKeys(counts))) {
+            line = line + " " + s + "=" + toStr(mapGet(counts, s) ?? 0);
+        }
+        print(line);
+        let diffs = "";
+        let ndiff = 0;
+        for (x in sorted(kept)) {
+            const a = mapGet(std.status, x);
+            const b = mapGet(got.status, x);
+            if ((a == None) != (b == None) || (a ?? "") != (b ?? "")) {
+                if (ndiff < 40) {
+                    if (ndiff > 0) {
+                        diffs = diffs + ", ";
+                    }
+                    diffs = diffs + reprStr(x + " standard=" + (a ?? "None") + " heapcheck=" + (b ?? "None"));
+                }
+                ndiff = ndiff + 1;
+            }
+        }
+        check(c, "corpus " + label + ": " + toStr(listLen(kept)) + " cases, page heap same as standard (1 skipped)",
+            ndiff == 0 && mapLen(got.status) == listLen(kept), "[" + diffs + "]");
+        i = i + 1;
+    }
+}
+
+function finish(c: Ref<Ctx>): int | Error {
+    const report = jObject();
+    jSet(report, "rows", c.rows);
+    jSet(report, "failed", jNumber(c.bad));
+    writeFileBytes(nat(join(c.work, "heap-check.json")), bytesFromStr(jPretty(report, 1)))?;
+    if (c.bad == 0) {
+        print("SUMMARY PASS heap-check: " + toStr(c.total) + " checks, 0 failed");
+        return 0;
+    }
+    print("SUMMARY FAIL heap-check: " + toStr(c.total) + " checks, " + toStr(c.bad) + " failed");
+    return 1;
+}
+
+function run(argv: []string): int | Error {
+    let compiler = "";
+    let work = "";
+    let root = "";
+    let leak = false;
+    let debug = false;
+    let normalReport = "";
+    let leakReport = "";
+    let debugReport = "";
+    const parts: Map<string, bool> = mapNew();
+    let i = 0;
+    while (i < len(argv)) {
+        const a = argv[i];
+        if (a == "--leak-check") {
+            leak = true;
+            i = i + 1;
+            continue;
+        }
+        if (a == "--debug") {
+            debug = true;
+            i = i + 1;
+            continue;
+        }
+        if (a == "driver" || a == "product" || a == "mutants" || a == "corpus") {
+            mapSet(parts, a, true);
+            i = i + 1;
+            continue;
+        }
+        if (i + 1 >= len(argv)) {
+            return err("未知参数或缺值：" + a);
+        }
+        const v = argv[i + 1];
+        if (a == "--compiler") {
+            compiler = v;
+        } else if (a == "--work") {
+            work = v;
+        } else if (a == "--root") {
+            root = v;
+        } else if (a == "--standard-normal") {
+            normalReport = v;
+        } else if (a == "--standard-leak") {
+            leakReport = v;
+        } else if (a == "--standard-debug") {
+            debugReport = v;
+        } else {
+            return err("未知参数：" + a);
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0 || len(work) == 0) {
+        return err("用法：taixu run --toolchain scripts/test_heap_check.tx --compiler <taixu> --work <目录> [--leak-check] [--debug] "
+            + "[--standard-normal|--standard-leak|--standard-debug <报告>] [--root <仓库>] [driver|product|mutants|corpus …]");
+    }
+    if (mapLen(parts) == 0) {
+        for (p in PARTS) {
+            mapSet(parts, p, true);
+        }
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = osRealPath(absolute(nat(root)));
+    compiler = osRealPath(absolute(nat(compiler)));
+    if (!mkdirs(absolute(nat(work)))) {
+        return err("建不了工作目录：" + work);
+    }
+    work = osRealPath(absolute(nat(work)));
+    const host = hostOf();
+    const cc = tool("TAIXU_TEST_CC", ["cc", "gcc", "clang"], "");
+    const objcopy = tool("TAIXU_TEST_OBJCOPY", ["objcopy", "llvm-objcopy"], which(cc));
+    const c = new Ctx { compiler: compiler, root: root, work: work, host: host, cc: cc, objcopy: objcopy, rows: jArray(), total: 0, bad: 0 };
+
+    const gen = generator(c, root, nat(join(work, "gen")))?;
+    if (len(gen) == 0) {
+        return finish(c);
+    }
+    const standard = kernel(c, gen, nat(join(join(work, "standard"), host.kernel)), "")?;
+    const heap = kernel(c, gen, nat(join(join(work, "heapcheck"), host.kernel)), "heapcheck")?;
+    if (len(standard) == 0 || len(heap) == 0) {
+        return finish(c);
+    }
+    if (mapHas(parts, "driver")) {
+        driverPart(c, heap)?;
+    }
+    if (mapHas(parts, "product")) {
+        productPart(c)?;
+    }
+    if (mapHas(parts, "mutants")) {
+        mutantsPart(c)?;
+    }
+    if (mapHas(parts, "corpus")) {
+        corpusPart(c, leak, debug, normalReport, leakReport, debugReport)?;
+    }
+    return finish(c);
+}
+
+function main(argv: []string): int {
+    return run(argv) catch (e) {
+        eprint("test_heap_check: " + e.message);
+        return 1;
+    };
+}

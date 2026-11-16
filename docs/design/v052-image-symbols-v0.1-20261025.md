@@ -33,7 +33,7 @@ Instruments）都靠可执行文件里的符号表把地址归到函数。实测
    动态产物的 `.interp`、`.dynamic`、`.dynsym`、`.dynstr`、`.got` 等），加 `.symtab`、`.strtab`、`.shstrtab`。每个函数一个
    `STT_FUNC`、`STB_LOCAL` 符号，大小到下一个函数的起点或 `.text` 末端。节头与符号表不在任何 `PT_LOAD` 里，装载与执行不受影响。
 4. **Mach-O**：本地符号补齐 TXFN 里的内核内部例程，程序函数用可读名代替 `f_N`；`LC_FUNCTION_STARTS` 覆盖全部函数。符号表
-   的分区（本地、外部定义、未定义）不变，`macho_check.py` 照常核对。
+   的分区（本地、外部定义、未定义）不变，`scripts/macho_check.tx` 照常核对。
 5. **`--strip`**：不写函数符号——ELF 不写节头与符号表，Mach-O 只留必需的 `__mh_execute_header` 与未定义符号、function starts
    照旧（它不含名字）。缺省带符号（同上表各家）。
 6. **Windows**：不变；PDB（CodeView）另立跟进。
@@ -66,6 +66,6 @@ Instruments）都靠可执行文件里的符号表把地址归到函数。实测
 - 映像的可装载部分逐字节不变：ELF 的全部 `PT_LOAD` 段、Mach-O 的 `__TEXT`／`__DATA_CONST`／`__DATA` 段与基线相同（只多了文件
   末尾的节头与符号表、`__LINKEDIT` 里的符号与签名）。
 - 独立核对：ELF 由 Python 解析节头与 `.symtab`（每个函数恰有一个符号、值落在 `.text` 内、大小不越界、名字与 `--map` 一致）；
-  Mach-O 由 `macho_check.py`（本地符号覆盖全部 function starts）。
+  Mach-O 由 `scripts/macho_check.tx`（本地符号覆盖全部 function starts）。
 - 端到端：测试机上 `atos` 把递归函数里的地址解析成 `s.deep`；Linux 上按 `.symtab` 把同一地址解析成同名。
 - `--strip`：ELF 没有节头，Mach-O 没有函数符号，可装载部分与不带 `--strip` 的相同。

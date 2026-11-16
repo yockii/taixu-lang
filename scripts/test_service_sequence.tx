@@ -1,0 +1,1538 @@
+// 服务状态序列 fuzz。安全审查攻关第 4 项。
+//
+// 对真实的 `taixu mcp` 进程跑带种子的请求序列：每条请求随机切片写入（偶尔两条并进一次写入），失败与正常随机交替；每步对照抽象模型
+// 核对回复（恰一条、id 对得上、严格 JSON、类别符合命令），并观察服务的后代进程与临时目录里本服务的 worker 根（只允许当前一代，
+// 代数与模型一致）。序列末随机选关停时机（空闲、在途请求、刚触发硬超时）关 stdin，服务须在时限内退出，之后无后代、无残留 worker
+// 根。另有确定性的 cleanup_pending 正例：在 worker 根里放陌生文件使其清不掉，两代之后新请求须以 cleanup_pending 拒绝，移走后经空闲
+// 清扫恢复。失败的序列按步缩小。LSP 部分以同样的切片写入与粘包跑 didOpen／didChange／didClose、请求与坏帧，最后核对诊断与当前文本
+// 一致、shutdown／exit 后退出 0。
+//
+// 随机数用 test_random.tx（与 Python 的 random.Random 逐值相同），种子定下命令序列、切片与关停时机。后代进程与存活取
+// proc_info_os_*.tx（Windows 的 Toolhelp 快照与创建时间，Linux 的 /proc，macOS 的 pgrep／ps），服务的进程号取 procPid（D3 v0.54）。
+// 单线程收消息：等回复、写入的间隙与计时时都在收。
+//
+// FAIL 行与报告的细节写 JSON 原文或文字（报告里通过项写成对象，命令序列可直接对照）；
+// MCP 服务的 TMP／TEMP／TMPDIR 以 setEnv 临时改为本序列的临时目录、起服务后改回（太虚的 setEnv 只作用于本进程与此后起的子进程）。
+//
+// 运行（仓根）：taixu run --toolchain scripts/test_service_sequence.tx --compiler <taixu> --work <目录> [--sequences N] [--steps N] [--seed S]
+// 任何 FAIL 时退出码 1。
+import { absolute, deleteTree, join, kindOf, mkdirs, nat, onWindows } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { J_ARR, J_BOOL, J_NULL, J_NUM, J_OBJ, J_STR, Jv, jDumpSpaced, jEq, jLen, jNull, jParse, jParseUnique, jQuote } from "./test_json";
+import { at, count, dump, has, isObj, item, textIs, textOf } from "./test_jv";
+import { MODE_FRAMES, MODE_LINES, Peer, nap, peerClose, peerExited, peerPump, peerStart } from "./test_proto";
+import { uriOf } from "./test_lsp_session";
+import { headChars } from "./test_text";
+import { procAlive, procDescendants } from "./proc_info_os";
+import { Rng, rngBelow, rngNew, rngRandint, rngRandom, rngWeighted } from "./test_random";
+
+const SEED: int = 20261025;
+const BUDGET: int = 32768;
+const MS: int = 1000000;
+const NO_ID: int = -1;
+
+// ---------------------------------------------------------------- 结果
+
+struct Row {
+    check: string,
+    ok: bool,
+    detail: string,
+    // 通过项写进报告的对象（JSON 原文）；空串时写 detail 文字。
+    json: string,
+}
+
+struct Ctx {
+    compiler: string,
+    work: string,
+    rows: List<Row>,
+    bad: int,
+}
+
+function check(c: Ref<Ctx>, label: string, ok: bool, detail: string, json: string): void {
+    if (ok) {
+        print("PASS " + label);
+        listPush(c.rows, Row { check: label, ok: true, detail: detail, json: json });
+        return;
+    }
+    print("FAIL " + label + ": " + headChars(detail, 600));
+    listPush(c.rows, Row { check: label, ok: false, detail: headChars(detail, 3000), json: "" });
+    c.bad = c.bad + 1;
+}
+
+function pyBool(b: bool): string {
+    if (b) {
+        return "True";
+    }
+    return "False";
+}
+
+function intList(xs: List<int>): string {
+    let s = "[";
+    let k = 0;
+    for (x in xs) {
+        if (k > 0) {
+            s = s + ", ";
+        }
+        s = s + toStr(x);
+        k = k + 1;
+    }
+    return s + "]";
+}
+
+function sortInts(xs: List<int>): List<int> {
+    const out: List<int> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+        let k = listLen(out) - 1;
+        while (k > 0 && x < (listGet(out, k - 1) catch 0)) {
+            listSet(out, k, listGet(out, k - 1) catch 0);
+            k = k - 1;
+        }
+        listSet(out, k, x);
+    }
+    return out;
+}
+
+function inInts(xs: List<int>, v: int): bool {
+    for (x in xs) {
+        if (x == v) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function addAll(into: List<int>, xs: List<int>): void {
+    for (x in xs) {
+        if (!inInts(into, x)) {
+            listPush(into, x);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 预算行
+
+// json_envelope.tx 的 jsonEnvelopeWithin 计数规则（引号外的结构符、每个串与原子各一）。
+function tokens(data: Bytes): int {
+    let t = 0;
+    let quoted = false;
+    let escaped = false;
+    let atom = false;
+    let i = 0;
+    while (i < bytesLen(data)) {
+        const c = bytesGet(data, i) ?? 0;
+        i = i + 1;
+        if (quoted) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == 92) {
+                escaped = true;
+            } else if (c == 34) {
+                quoted = false;
+            }
+        } else if (c == 34) {
+            quoted = true;
+            atom = false;
+            t = t + 1;
+        } else if (c == 123 || c == 91 || c == 125 || c == 93 || c == 58 || c == 44) {
+            t = t + 1;
+            atom = false;
+        } else if (c == 32 || c == 9 || c == 10 || c == 13) {
+            atom = false;
+        } else if (!atom) {
+            atom = true;
+            t = t + 1;
+        }
+    }
+    return t;
+}
+
+function padLine(rid: int, k: int, odd: bool): Bytes {
+    const b = bytesFromStr("{\"jsonrpc\":\"2.0\",\"id\":" + toStr(rid) + ",\"method\":\"tools/list\",\"params\":{\"pad\":[");
+    let i = 0;
+    while (i < k) {
+        if (i > 0) {
+            bytesPush(b, 44);
+        }
+        bytesPush(b, 48);
+        i = i + 1;
+    }
+    if (odd) {
+        if (k > 0) {
+            bytesPush(b, 44);
+        }
+        bytesAppend(b, bytesFromStr("[]"));
+    }
+    bytesAppend(b, bytesFromStr("]}}"));
+    return b;
+}
+
+// 结构记号恰为 total 的 tools/list 请求：params 里垫一个数组，每多一个 0 恰多 2 个记号（逗号与原子），末尾加不加 [] 改奇偶。
+function budgetLine(rid: int, total: int): Bytes {
+    for (odd in [false, true]) {
+        const gap = total - tokens(padLine(rid, 1, odd));
+        if (gap >= 0 && gap % 2 == 0) {
+            const out = padLine(rid, 1 + gap / 2, odd);
+            bytesPush(out, 10);
+            return out;
+        }
+    }
+    return bytesFromStr("\n");
+}
+
+// ---------------------------------------------------------------- 服务进程
+
+struct Srv {
+    p: Ref<Peer>,
+    pid: int,
+    lsp: bool,
+    msgs: List<Ref<Jv>>,
+    notes: List<Ref<Jv>>,
+}
+
+function srvStart(exe: string, args: List<string>, cwd: string, lsp: bool): Ref<Srv> | Error {
+    let mode = MODE_LINES;
+    if (lsp) {
+        mode = MODE_FRAMES;
+    }
+    const p = peerStart(exe, args, cwd, mode, true)?;
+    const msgs: List<Ref<Jv>> = listNew();
+    const notes: List<Ref<Jv>> = listNew();
+    return new Srv { p: p, pid: procPid(p.h), lsp: lsp, msgs: msgs, notes: notes };
+}
+
+// MCP 服务：临时目录经 TMP／TEMP／TMPDIR 指到 tmp。
+function mcpStart(c: Ref<Ctx>, ws: string, tmp: string): Ref<Srv> | Error {
+    const args: List<string> = listNew();
+    for (a in ["mcp", "--trust-workspace", "--workspace", ws, "--request-timeout-ms", "4000", "--worker-cpu-s", "20", "--worker-memory-mib", "1024"]) {
+        listPush(args, a);
+    }
+    const names: []string = ["TMP", "TEMP", "TMPDIR"];
+    const saved: List<string> = listNew();
+    for (n in names) {
+        listPush(saved, getEnv(n) ?? "");
+        setEnv(n, tmp)?;
+    }
+    const s = srvStart(c.compiler, args, ws, false);
+    let k = 0;
+    for (n in names) {
+        setEnv(n, listGet(saved, k) catch "")?;
+        k = k + 1;
+    }
+    return s;
+}
+
+function collect(s: Ref<Srv>): void {
+    if (listLen(s.p.msgs) == 0) {
+        return;
+    }
+    for (m in s.p.msgs) {
+        if (s.lsp && !has(m, "id")) {
+            listPush(s.notes, m);
+        } else {
+            listPush(s.msgs, m);
+        }
+    }
+    const fresh: List<Ref<Jv>> = listNew();
+    s.p.msgs = fresh;
+}
+
+function pump(s: Ref<Srv>, ms: int): void {
+    if (!s.p.outOpen && !s.p.errOpen && s.p.done) {
+        nap(ms);
+        return;
+    }
+    const got = peerPump(s.p, ms);
+    collect(s);
+}
+
+// 计时 ns 纳秒，其间照收消息。
+function pumpFor(s: Ref<Srv>, ns: int): void {
+    const end = monoNs() + ns;
+    while (monoNs() < end) {
+        let left = (end - monoNs()) / MS;
+        if (left < 0) {
+            left = 0;
+        }
+        pump(s, left);
+    }
+}
+
+// 写满 data（同阻塞写）。对端已关闭得假。
+function writeAll(s: Ref<Srv>, data: Bytes): bool {
+    let at_ = 0;
+    while (at_ < bytesLen(data)) {
+        let n = bytesLen(data) - at_;
+        if (n > 4096) {
+            n = 4096;
+        }
+        const w = procTryWrite(s.p.h, 0, bytesSlice(data, at_, n));
+        if (w < 0) {
+            return false;
+        }
+        if (w == 0) {
+            pump(s, 5);
+        } else {
+            at_ = at_ + w;
+        }
+    }
+    return true;
+}
+
+// 按片写入：每片 1..4096 字节（randint），三成机会随后停 0..3 ms。
+function write(s: Ref<Srv>, data: Bytes, rng: Ref<Rng>): bool {
+    let at_ = 0;
+    while (at_ < bytesLen(data)) {
+        const n = rngRandint(rng, 1, 4096);
+        let take = n;
+        if (at_ + take > bytesLen(data)) {
+            take = bytesLen(data) - at_;
+        }
+        if (!writeAll(s, bytesSlice(data, at_, take))) {
+            return false;
+        }
+        at_ = at_ + n;
+        if (rngRandom(rng) < 0.3) {
+            pumpFor(s, (rngRandom(rng) * 3000000.0) as int);
+        }
+    }
+    return true;
+}
+
+// id 等于 rid（类型也相同：整数；NO_ID 为缺席或 null，同 Python 的 m.get('id') == None）。
+function idIs(m: Ref<Jv>, rid: int): bool {
+    const v = at(m, "id");
+    if (rid == NO_ID) {
+        return v == None || (v ?? jNull()).kind == J_NULL;
+    }
+    return v != None && (v ?? jNull()).kind == J_NUM && (v ?? jNull()).text == toStr(rid);
+}
+
+function takeFrom(s: Ref<Srv>, rid: int): Ref<Jv>? {
+    let i = 0;
+    while (i < listLen(s.msgs)) {
+        const m = listGet(s.msgs, i) catch jNull();
+        if (idIs(m, rid)) {
+            listRemoveAt(s.msgs, i);
+            return m;
+        }
+        i = i + 1;
+    }
+    return None;
+}
+
+function take(s: Ref<Srv>, rid: int): Ref<Jv>? {
+    const end = monoNs() + 30000 * MS;
+    while (monoNs() < end) {
+        pump(s, 0);
+        const m = takeFrom(s, rid);
+        if (m != None) {
+            return m;
+        }
+        if (peerExited(s.p)) {
+            pumpFor(s, 50 * MS);
+            return takeFrom(s, rid);
+        }
+        pump(s, 5);
+    }
+    return None;
+}
+
+// 关 stdin（MCP）后至多等 10 s 退出；超时结束它、得 None。随后至多 5 s 读完两个流。
+function close(s: Ref<Srv>, closeInput: bool): int? {
+    if (closeInput) {
+        procCloseStream(s.p.h, 0);
+    }
+    const end = monoNs() + 10000 * MS;
+    while (!peerExited(s.p)) {
+        if (monoNs() >= end) {
+            procKill(s.p.h);
+            const w = procWait(s.p.h, 10000);
+            return None;
+        }
+        pump(s, 20);
+    }
+    const drain = monoNs() + 5000 * MS;
+    while ((s.p.outOpen || s.p.errOpen) && monoNs() < drain) {
+        pump(s, 20);
+    }
+    return s.p.code;
+}
+
+function badHead(s: Ref<Srv>): string {
+    let t = "[";
+    let k = 0;
+    while (k < listLen(s.p.bad) && k < 2) {
+        if (k > 0) {
+            t = t + ", ";
+        }
+        t = t + jQuote(headChars(listGet(s.p.bad, k) catch "", 300));
+        k = k + 1;
+    }
+    return t + "]";
+}
+
+// ---------------------------------------------------------------- 回复的判据
+
+// tools/call 回复 → (structuredContent, isError, error)，同 mcp-debug-e2e 的 Mcp.tool。
+struct ToolResult {
+    s: Ref<Jv>?,
+    // isError：0 缺席（None），1 恰为 true，2 其他真值，3 假值。
+    e: int,
+    err: string,
+    hasErr: bool,
+    errIsText: bool,
+}
+
+function truthyJv(v: Ref<Jv>?): bool {
+    if (v == None) {
+        return false;
+    }
+    const x = v ?? jNull();
+    if (x.kind == J_NULL) {
+        return false;
+    }
+    if (x.kind == J_BOOL) {
+        return x.truth;
+    }
+    if (x.kind == J_NUM) {
+        return x.text != "0" && x.text != "0.0" && x.text != "-0";
+    }
+    if (x.kind == J_STR) {
+        return len(x.text) > 0;
+    }
+    return jLen(x) > 0;
+}
+
+function isTrue(v: Ref<Jv>?): bool {
+    return v != None && (v ?? jNull()).kind == J_BOOL && (v ?? jNull()).truth;
+}
+
+function isFalse(v: Ref<Jv>?): bool {
+    return v != None && (v ?? jNull()).kind == J_BOOL && !(v ?? jNull()).truth;
+}
+
+function isZero(v: Ref<Jv>?): bool {
+    return v != None && (((v ?? jNull()).kind == J_NUM && (v ?? jNull()).text == "0") || isFalse(v));
+}
+
+function toolResult(r: Ref<Jv>?): ToolResult {
+    if (r == None) {
+        return ToolResult { s: None, e: 0, err: "'no reply'", hasErr: true, errIsText: true };
+    }
+    if (has(r, "error")) {
+        return ToolResult { s: None, e: 0, err: dump(at(r, "error")), hasErr: true, errIsText: false };
+    }
+    const res = at(r, "result");
+    if (!has(res, "structuredContent")) {
+        const content = at(res, "content");
+        if (isTrue(at(res, "isError")) && content != None && (content ?? jNull()).kind == J_ARR && count(content) == 1
+            && textIs(item(content, 0), "type", "text")) {
+            return ToolResult { s: None, e: 1, err: textOf(item(content, 0), "text"), hasErr: true, errIsText: true };
+        }
+        return ToolResult { s: None, e: 0, err: "invalid result " + dump(res), hasErr: true, errIsText: true };
+    }
+    const sc = at(res, "structuredContent") ?? jNull();
+    const text = textOf(item(at(res, "content"), 0), "text");
+    const parsed = jParseUnique(bytesFromStr(text)) catch (e) {
+        return ToolResult { s: None, e: 0, err: "content text is not strict JSON: " + e.message, hasErr: true, errIsText: true };
+    };
+    if (!jEq(parsed, sc)) {
+        return ToolResult { s: None, e: 0, err: "content text differs from structuredContent", hasErr: true, errIsText: true };
+    }
+    let e = 3;
+    const ie = at(res, "isError");
+    if (isTrue(ie)) {
+        e = 1;
+    } else if (truthyJv(ie)) {
+        e = 2;
+    }
+    return ToolResult { s: sc, e: e, err: "", hasErr: false, errIsText: false };
+}
+
+struct Model {
+    generation: int,
+    worker: bool,
+}
+
+function needsWorker(m: Ref<Model>): void {
+    if (!m.worker) {
+        m.generation = m.generation + 1;
+        m.worker = true;
+    }
+}
+
+// 去掉 stdout、stderr 两个键（run-flood 的说明）。
+function withoutOutput(s: Ref<Jv>?): string {
+    if (s == None) {
+        return "None";
+    }
+    const x = s ?? jNull();
+    let out = "{";
+    let k = 0;
+    let n = 0;
+    while (k < listLen(x.keys)) {
+        const key = listGet(x.keys, k) catch "";
+        if (key != "stdout" && key != "stderr") {
+            if (n > 0) {
+                out = out + ",";
+            }
+            out = out + jQuote(key) + ":" + dump(listGet(x.items, k) catch jNull());
+            n = n + 1;
+        }
+        k = k + 1;
+    }
+    return out + "}";
+}
+
+// 工具回复的判据；通过为空串。
+function judgeTool(kind: string, r: Ref<Jv>?, model: Ref<Model>): string {
+    const t = toolResult(r);
+    if (kind == "bad-timeout") {
+        if (t.s == None && t.e == 1 && t.hasErr && t.errIsText && contains(t.err, "timeout_ms")) {
+            return "";
+        }
+        return "bad-timeout: " + dump(t.s) + " " + toStr(t.e) + " " + t.err;
+    }
+    if (t.hasErr) {
+        return "tool reply: " + t.err;
+    }
+    const s = t.s;
+    if (kind == "compile-ok") {
+        needsWorker(model);
+        if (textIs(s, "schema", "compile/1") && isTrue(at(s, "ok")) && t.e == 3) {
+            return "";
+        }
+        return "compile-ok: " + dump(s);
+    }
+    if (kind == "compile-error" || kind == "compile-missing") {
+        needsWorker(model);
+        if (textIs(s, "schema", "compile/1") && isFalse(at(s, "ok")) && (t.e == 1 || t.e == 2) && truthyJv(at(s, "diags"))) {
+            return "";
+        }
+        return kind + ": " + dump(s);
+    }
+    if (kind == "run-ok") {
+        needsWorker(model);
+        if (textIs(s, "schema", "run/1") && isZero(at(s, "exit_code")) && textIs(s, "stdout", "safe\n")) {
+            return "";
+        }
+        return "run-ok: " + dump(s);
+    }
+    if (kind == "run-spin") {
+        needsWorker(model);
+        if (textIs(s, "schema", "run/1") && isTrue(at(s, "timed_out"))) {
+            return "";
+        }
+        return "run-spin: " + dump(s);
+    }
+    if (kind == "run-flood") {
+        needsWorker(model);
+        if (textIs(s, "schema", "run/1") && isZero(at(s, "exit_code")) && isTrue(at(s, "truncated"))) {
+            return "";
+        }
+        return "run-flood: " + withoutOutput(s);
+    }
+    if (kind == "hard-timeout") {
+        needsWorker(model);
+        if (textIs(s, "schema", "compile/1") && isTrue(at(s, "ok"))) {
+            return "";
+        }
+        if (!textIs(s, "schema", "tool-error/1") || !textIs(s, "reason", "request_timeout") || !isTrue(at(s, "termination_requested"))) {
+            return "hard-timeout: " + dump(s);
+        }
+        const g = at(s, "worker_generation");
+        if (g == None || (g ?? jNull()).kind != J_NUM || (g ?? jNull()).text != toStr(model.generation)) {
+            return "generation " + dump(g) + ", model " + toStr(model.generation);
+        }
+        model.worker = false;
+        const pendingEmpty = !truthyJv(at(s, "cleanup_pending_paths"));
+        const cleaned = at(s, "artifacts_cleaned");
+        const cleanedOk = (pendingEmpty && isTrue(cleaned)) || (!pendingEmpty && isFalse(cleaned));
+        if (!isTrue(at(s, "reaped")) || !cleanedOk) {
+            return "cleanup fields inconsistent: " + dump(s);
+        }
+        return "";
+    }
+    return "unknown kind " + kind;
+}
+
+// JSON-RPC 回复的判据：resultKey 非空时须有 result.<键>；否则按 code（0 不查）与 message（空串不查）。
+function judgeRpc(r: Ref<Jv>?, code: int, message: string, resultKey: string): string {
+    if (r == None) {
+        return "no reply";
+    }
+    if (len(resultKey) > 0) {
+        if (has(at(r, "result"), resultKey)) {
+            return "";
+        }
+        return "expected result." + resultKey + ": " + dump(r);
+    }
+    const e = at(r, "error");
+    if (code != 0) {
+        const c = at(e, "code");
+        if (c == None || jDumpSpaced(c ?? jNull()) != toStr(code)) {
+            return "expected error " + toStr(code) + ": " + dump(r);
+        }
+    }
+    if (len(message) > 0 && !textIs(e, "message", message)) {
+        return "expected " + message + ": " + dump(r);
+    }
+    return "";
+}
+
+// ---------------------------------------------------------------- 命令
+
+const CMD_NAMES: []string = ["discover", "list", "compile-ok", "compile-error", "compile-missing", "run-ok", "run-spin", "run-flood", "hard-timeout",
+    "bad-timeout", "unknown-method", "bad-json", "not-object", "literal-cr", "budget-at", "budget-over"];
+const CMD_WEIGHTS: []int = [2, 2, 6, 3, 2, 3, 2, 1, 3, 2, 2, 2, 1, 1, 1, 1];
+
+function weights(): List<int> {
+    const out: List<int> = listNew();
+    for (w in CMD_WEIGHTS) {
+        listPush(out, w);
+    }
+    return out;
+}
+
+// 同 Python 的 json.dumps(m, ensure_ascii=False)（缺省分隔符）。
+function call(rid: int, method: string, params: string): Bytes {
+    let s = "{\"jsonrpc\": \"2.0\", \"id\": " + toStr(rid) + ", \"method\": " + jQuote(method);
+    if (len(params) > 0) {
+        s = s + ", \"params\": " + params;
+    }
+    return bytesFromStr(s + "}\n");
+}
+
+function tool(rid: int, name: string, args: string): Bytes {
+    return call(rid, "tools/call", "{\"name\": " + jQuote(name) + ", \"arguments\": " + args + "}");
+}
+
+struct Built {
+    body: Bytes,
+    reply: int,
+}
+
+const BAD_TIMEOUTS: []string = ["0", "-1", "true", "1.5", "\"1\"", "null"];
+
+function build(c: int, rid: int): Built {
+    const name = CMD_NAMES[c];
+    if (name == "discover") {
+        return Built { body: call(rid, "server/discover", ""), reply: rid };
+    }
+    if (name == "list") {
+        return Built { body: call(rid, "tools/list", ""), reply: rid };
+    }
+    if (name == "compile-ok") {
+        return Built { body: tool(rid, "compile", "{\"path\": \"main.tx\"}"), reply: rid };
+    }
+    if (name == "compile-error") {
+        return Built { body: tool(rid, "compile", "{\"path\": \"invalid.tx\"}"), reply: rid };
+    }
+    if (name == "compile-missing") {
+        return Built { body: tool(rid, "compile", "{\"path\": \"nope.tx\"}"), reply: rid };
+    }
+    if (name == "run-ok") {
+        return Built { body: tool(rid, "run", "{\"path\": \"main.tx\"}"), reply: rid };
+    }
+    if (name == "run-spin") {
+        return Built { body: tool(rid, "run", "{\"path\": \"spin.tx\", \"timeout_ms\": 300}"), reply: rid };
+    }
+    if (name == "run-flood") {
+        return Built { body: tool(rid, "run", "{\"path\": \"flood.tx\"}"), reply: rid };
+    }
+    if (name == "hard-timeout") {
+        return Built { body: tool(rid, "compile", "{\"path\": \"main.tx\", \"timeout_ms\": 1}"), reply: rid };
+    }
+    if (name == "bad-timeout") {
+        const v = BAD_TIMEOUTS[rngBelow(rngNew(rid), 6)];
+        return Built { body: tool(rid, "compile", "{\"path\": \"main.tx\", \"timeout_ms\": " + v + "}"), reply: rid };
+    }
+    if (name == "unknown-method") {
+        return Built { body: call(rid, "no/such", ""), reply: rid };
+    }
+    if (name == "bad-json") {
+        return Built { body: bytesFromStr("{\"jsonrpc\":\"2.0\",\"id\":" + toStr(rid) + ",\"method\":\n"), reply: NO_ID };
+    }
+    if (name == "not-object") {
+        return Built { body: bytesFromStr("[1,2,3]\n"), reply: NO_ID };
+    }
+    if (name == "literal-cr") {
+        return Built { body: bytesFromStr("{\"jsonrpc\":\"2.0\",\"id\":" + toStr(rid) + ",\"method\":\"pi\rng\"}\n"), reply: NO_ID };
+    }
+    if (name == "budget-at") {
+        return Built { body: budgetLine(rid, BUDGET), reply: rid };
+    }
+    return Built { body: budgetLine(rid, BUDGET + 1), reply: NO_ID };
+}
+
+function judge(c: int, r: Ref<Jv>?, model: Ref<Model>): string {
+    const name = CMD_NAMES[c];
+    if (name == "discover") {
+        return judgeRpc(r, 0, "", "identity");
+    }
+    if (name == "list") {
+        return judgeRpc(r, 0, "", "tools");
+    }
+    if (name == "unknown-method") {
+        return judgeRpc(r, -32601, "", "");
+    }
+    if (name == "bad-json" || name == "literal-cr") {
+        return judgeRpc(r, -32700, "", "");
+    }
+    if (name == "not-object") {
+        return judgeRpc(r, -32600, "", "");
+    }
+    if (name == "budget-at") {
+        if (r != None && !textIs(at(r, "error"), "message", "RequestTooComplex")) {
+            return "";
+        }
+        return "budget-at: " + dump(r);
+    }
+    if (name == "budget-over") {
+        return judgeRpc(r, 0, "RequestTooComplex", "");
+    }
+    return judgeTool(name, r, model);
+}
+
+// ---------------------------------------------------------------- 工作区与 worker 根
+
+function writeText(path: string, text: string): void {
+    writeFile(path, text) catch (e) {
+        eprint("写不了 " + path + "：" + e.message);
+    };
+}
+
+function workspace(seq: string): string {
+    const ws = nat(join(seq, "ws"));
+    mkdirs(ws);
+    writeText(nat(join(ws, "main.tx")), "export function main(args: []string): int { print(\"safe\"); return 0; }\n");
+    writeText(nat(join(ws, "invalid.tx")), "function main(args: []string): int { return missing; }\n");
+    writeText(nat(join(ws, "spin.tx")), "function main(args: []string): int { let n = 0; while (true) { n = n + 1; } return n; }\n");
+    writeText(nat(join(ws, "flood.tx")),
+        "function main(args: []string): int { let i = 0; while (i < 40000) { print(\"0123456789012345678901234567890123456789012345678901234567890123\"); i = i + 1; } return 0; }\n");
+    return ws;
+}
+
+struct WorkerRoot {
+    gen: int,
+    name: string,
+}
+
+// 名字为 ^taixu-mcp-worker-\d+-(\d+)-\d+$ 时得第二段的数，否则 −1。
+function rootGen(name: string): int {
+    const prefix = "taixu-mcp-worker-";
+    const head = bytesToStr(bytesSlice(bytesFromStr(name), 0, len(prefix))) catch "";
+    if (len(name) <= len(prefix) || head != prefix) {
+        return -1;
+    }
+    const parts = strSplit(bytesToStr(bytesSlice(bytesFromStr(name), len(prefix), len(name) - len(prefix))) catch "", "-");
+    if (listLen(parts) != 3) {
+        return -1;
+    }
+    let gen = -1;
+    let k = 0;
+    for (p in parts) {
+        if (len(p) == 0) {
+            return -1;
+        }
+        let n = 0;
+        let i = 0;
+        while (i < len(p)) {
+            const c = byteAt(p, i) ?? 0;
+            if (c < 48 || c > 57) {
+                return -1;
+            }
+            n = n * 10 + (c - 48);
+            i = i + 1;
+        }
+        if (k == 1) {
+            gen = n;
+        }
+        k = k + 1;
+    }
+    return gen;
+}
+
+function roots(tmp: string): List<WorkerRoot> {
+    const out: List<WorkerRoot> = listNew();
+    const none: List<string> = listNew();
+    const names = localListDir(tmp, "") catch none;
+    for (n in names) {
+        const g = rootGen(n);
+        if (g >= 0) {
+            const r = WorkerRoot { gen: g, name: n };
+            listPush(out, r);
+            let k = listLen(out) - 1;
+            while (k > 0 && rootLess(r, listGet(out, k - 1) catch r)) {
+                listSet(out, k, listGet(out, k - 1) catch r);
+                k = k - 1;
+            }
+            listSet(out, k, r);
+        }
+    }
+    return out;
+}
+
+function rootLess(a: WorkerRoot, b: WorkerRoot): bool {
+    if (a.gen != b.gen) {
+        return a.gen < b.gen;
+    }
+    return strLess(a.name, b.name);
+}
+
+function strLess(a: string, b: string): bool {
+    let i = 0;
+    while (i < len(a) && i < len(b)) {
+        const x = byteAt(a, i) ?? 0;
+        const y = byteAt(b, i) ?? 0;
+        if (x != y) {
+            return x < y;
+        }
+        i = i + 1;
+    }
+    return len(a) < len(b);
+}
+
+// Python 的 repr：[(代, '名字'), …]。
+function rootsRepr(rs: List<WorkerRoot>): string {
+    let s = "[";
+    let k = 0;
+    for (r in rs) {
+        if (k > 0) {
+            s = s + ", ";
+        }
+        s = s + "(" + toStr(r.gen) + ", '" + r.name + "')";
+        k = k + 1;
+    }
+    return s + "]";
+}
+
+// 空闲清扫（≤50 ms 一轮）之后：后代至多一个（当前 worker），worker 根只剩当前一代。随机序列里不该出现清不掉的根。
+function settle(s: Ref<Srv>, tmp: string, model: Ref<Model>): string {
+    const end = monoNs() + 3000 * MS;
+    while (true) {
+        const kids = procDescendants(s.pid, false);
+        const have = roots(tmp);
+        let bad = "";
+        let allowed = 0;
+        if (model.worker) {
+            allowed = 1;
+        }
+        if (listLen(kids) > allowed) {
+            bad = "descendants " + intList(sortInts(kids));
+        }
+        let gensOk = listLen(have) == allowed;
+        if (gensOk && allowed == 1) {
+            gensOk = (listGet(have, 0) catch WorkerRoot { gen: -1, name: "" }).gen == model.generation;
+        }
+        if (!gensOk) {
+            if (len(bad) > 0) {
+                bad = bad + "; ";
+            }
+            bad = bad + "worker roots " + rootsRepr(have) + " (model generation " + toStr(model.generation) + ", worker " + pyBool(model.worker) + ")";
+        }
+        if (len(bad) == 0 || monoNs() > end) {
+            return bad;
+        }
+        pumpFor(s, 50 * MS);
+    }
+    return "";
+}
+
+// ---------------------------------------------------------------- MCP 序列
+
+struct SeqResult {
+    failure: string,
+    names: List<string>,
+}
+
+function planOf(seed: int, steps: int): List<int> {
+    const rng = rngNew(seed);
+    const ws = weights();
+    const plan: List<int> = listNew();
+    let i = 0;
+    while (i < steps) {
+        listPush(plan, rngWeighted(rng, ws));
+        i = i + 1;
+    }
+    return plan;
+}
+
+function freshSeq(c: Ref<Ctx>, label: string): string {
+    const seq = nat(join(c.work, label));
+    if (kindOf(seq) != 0) {
+        deleteTree(seq);
+    }
+    return seq;
+}
+
+function replay(c: Ref<Ctx>, seed: int, plan: List<int>, label: string): SeqResult {
+    const rng = rngNew(seed * 7919 + listLen(plan));
+    const seq = freshSeq(c, label);
+    const tmp = nat(join(seq, "tmp"));
+    mkdirs(tmp);
+    const ws = workspace(seq);
+    const names: List<string> = listNew();
+    for (p in plan) {
+        listPush(names, CMD_NAMES[p]);
+    }
+    const server = mcpStart(c, ws, tmp) catch (e) {
+        return SeqResult { failure: "start: " + e.message, names: names };
+    };
+    const model = new Model { generation: 0, worker: false };
+    let rid = 0;
+    let failure = "";
+    const remembered: List<int> = listNew();
+    let i = 0;
+    while (i < listLen(plan) && len(failure) == 0) {
+        const batch: List<int> = listNew();
+        listPush(batch, listGet(plan, i) catch 0);
+        if (i + 1 < listLen(plan) && rngRandom(rng) < 0.15) {
+            // 两条并进一次写入。
+            listPush(batch, listGet(plan, i + 1) catch 0);
+        }
+        const data = bytesNew(0);
+        const waits: List<Built> = listNew();
+        for (cmd in batch) {
+            rid = rid + 1;
+            const b = build(cmd, rid);
+            bytesAppend(data, b.body);
+            listPush(waits, b);
+        }
+        if (!write(server, data, rng)) {
+            failure = "write failed at step " + toStr(i);
+            break;
+        }
+        let k = 0;
+        while (k < listLen(waits)) {
+            const cmd = listGet(batch, k) catch 0;
+            const r = take(server, (listGet(waits, k) catch Built { body: bytesNew(0), reply: NO_ID }).reply);
+            const why = judge(cmd, r, model);
+            if (len(why) > 0) {
+                failure = "step " + toStr(i) + " " + CMD_NAMES[cmd] + ": " + why;
+                break;
+            }
+            k = k + 1;
+        }
+        i = i + listLen(batch);
+        if (len(failure) == 0) {
+            addAll(remembered, procDescendants(server.pid, true));
+            const why = settle(server, tmp, model);
+            if (len(why) > 0) {
+                failure = "after step " + toStr(i - 1) + ": " + why;
+            }
+        }
+        if (listLen(server.p.bad) > 0 && len(failure) == 0) {
+            failure = "non-JSON output " + badHead(server);
+        }
+        let stray = "";
+        let n = 0;
+        for (m in server.msgs) {
+            if (!idIs(m, NO_ID) && n < 2) {
+                if (n > 0) {
+                    stray = stray + ", ";
+                }
+                stray = stray + dump(m);
+                n = n + 1;
+            }
+        }
+        if (n > 0 && len(failure) == 0) {
+            failure = "unexpected replies [" + stray + "]";
+        }
+    }
+    // 关停时机：空闲、在途请求、刚触发硬超时。
+    const modes: []string = ["idle", "inflight", "after-timeout"];
+    const mode = modes[rngBelow(rng, 3)];
+    if (len(failure) == 0 && mode != "idle") {
+        rid = rid + 1;
+        let body = tool(rid, "compile", "{\"path\": \"main.tx\", \"timeout_ms\": 1}");
+        if (mode == "inflight") {
+            body = tool(rid, "run", "{\"path\": \"spin.tx\", \"timeout_ms\": 2000}");
+        }
+        const w = write(server, body, rng);
+        pumpFor(server, (rngRandom(rng) * 200000000.0) as int);
+    }
+    addAll(remembered, procDescendants(server.pid, true));
+    const code = close(server, true);
+    if (len(failure) == 0) {
+        if (code == None) {
+            failure = "shutdown (" + mode + "): did not exit within 10 s";
+        } else if (listLen(server.p.bad) > 0) {
+            failure = "shutdown (" + mode + "): non-JSON output " + badHead(server);
+        }
+    }
+    const end = monoNs() + 5000 * MS;
+    while (monoNs() < end && (anyAlive(remembered) || listLen(roots(tmp)) > 0)) {
+        nap(50);
+    }
+    if (len(failure) == 0 && anyAlive(remembered)) {
+        const left: List<int> = listNew();
+        for (p in remembered) {
+            if (procAlive(p)) {
+                listPush(left, p);
+            }
+        }
+        failure = "shutdown (" + mode + "): descendants left " + intList(sortInts(left));
+    }
+    if (len(failure) == 0 && listLen(roots(tmp)) > 0) {
+        failure = "shutdown (" + mode + "): worker roots left " + rootsRepr(roots(tmp));
+    }
+    peerClose(server.p);
+    return SeqResult { failure: failure, names: names };
+}
+
+function anyAlive(pids: List<int>): bool {
+    for (p in pids) {
+        if (procAlive(p)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 按步删减：逐条去掉命令，仍失败则保留删减。
+function shrink(c: Ref<Ctx>, seed: int, plan: List<int>, label: string): List<int> {
+    let cur: List<int> = listNew();
+    for (p in plan) {
+        listPush(cur, p);
+    }
+    let i = 0;
+    while (i < listLen(cur)) {
+        const trial: List<int> = listNew();
+        let k = 0;
+        for (p in cur) {
+            if (k != i) {
+                listPush(trial, p);
+            }
+            k = k + 1;
+        }
+        const r = replay(c, seed, trial, label + "-shrink");
+        if (len(r.failure) > 0) {
+            cur = trial;
+        } else {
+            i = i + 1;
+        }
+    }
+    return cur;
+}
+
+// ---------------------------------------------------------------- cleanup_pending 正例
+
+function pendingCase(c: Ref<Ctx>): void {
+    const seq = freshSeq(c, "pending");
+    const tmp = nat(join(seq, "tmp"));
+    mkdirs(tmp);
+    const ws = workspace(seq);
+    const rng = rngNew(SEED);
+    const server = mcpStart(c, ws, tmp) catch (e) {
+        check(c, "pending: clean shutdown", false, "start: " + e.message, "");
+        return;
+    };
+    const planted: List<string> = listNew();
+    pendingBody(c, server, tmp, rng, planted);
+    const code = close(server, true);
+    let codeText = "None";
+    if (code != None) {
+        codeText = toStr(code ?? 0);
+    }
+    let errTail = server.p.err;
+    if (bytesLen(errTail) > 300) {
+        errTail = bytesSlice(errTail, bytesLen(errTail) - 300, 300);
+    }
+    check(c, "pending: clean shutdown", code != None && (code ?? 1) == 0 && listLen(server.p.bad) == 0,
+        "[" + codeText + ", " + badHead(server) + ", " + jQuote(bytesToStr(errTail) catch "") + "]", "");
+    peerClose(server.p);
+}
+
+struct Rid {
+    n: int,
+}
+
+function doTool(server: Ref<Srv>, rng: Ref<Rng>, rid: Ref<Rid>, name: string, args: string): ToolResult {
+    rid.n = rid.n + 1;
+    const w = write(server, tool(rid.n, name, args), rng);
+    return toolResult(take(server, rid.n));
+}
+
+function trRepr(t: ToolResult, tail: string): string {
+    let err = "None";
+    if (t.hasErr) {
+        err = t.err;
+    }
+    return "[" + dump(t.s) + ", " + err + tail + "]";
+}
+
+function pendingBody(c: Ref<Ctx>, server: Ref<Srv>, tmp: string, rng: Ref<Rng>, planted: List<string>): void {
+    const rid = new Rid { n: 0 };
+    let gen = 1;
+    while (gen <= 2) {
+        let t = doTool(server, rng, rid, "compile", "{\"path\": \"main.tx\"}");
+        const have: List<string> = listNew();
+        for (r in roots(tmp)) {
+            if (r.gen == gen) {
+                listPush(have, r.name);
+            }
+        }
+        check(c, "pending: generation " + toStr(gen) + " starts", !t.hasErr && isTrue(at(t.s, "ok")) && listLen(have) == 1,
+            trRepr(t, ", " + rootsRepr(roots(tmp))), "");
+        if (listLen(have) == 0) {
+            return;
+        }
+        const first = listGet(have, 0) catch "";
+        const marker = nat(join(nat(join(tmp, first)), "unknown.txt"));
+        writeText(marker, "not a product");
+        listPush(planted, marker);
+        t = doTool(server, rng, rid, "compile", "{\"path\": \"main.tx\", \"timeout_ms\": 1}");
+        let listed = false;
+        const paths = at(t.s, "cleanup_pending_paths");
+        let k = 0;
+        while (k < count(paths)) {
+            if (containsJv(item(paths, k), first)) {
+                listed = true;
+            }
+            k = k + 1;
+        }
+        check(c, "pending: generation " + toStr(gen) + " terminated, root reported pending",
+            !t.hasErr && textIs(t.s, "reason", "request_timeout") && isFalse(at(t.s, "artifacts_cleaned")) && listed, trRepr(t, ""), "");
+        gen = gen + 1;
+    }
+    let t = doTool(server, rng, rid, "compile", "{\"path\": \"main.tx\"}");
+    check(c, "pending: at two uncleaned roots a new worker is refused with cleanup_pending",
+        !t.hasErr && textIs(t.s, "schema", "tool-error/1") && textIs(t.s, "reason", "cleanup_pending") && t.e == 1
+        && count(at(t.s, "cleanup_pending_paths")) == 2, trRepr(t, ""), "");
+    const kids = procDescendants(server.pid, false);
+    check(c, "pending: refusal starts no worker", listLen(kids) == 0 && listLen(roots(tmp)) == 2,
+        "[" + intList(kids) + ", " + rootsRepr(roots(tmp)) + "]", "");
+    for (m in planted) {
+        removeFile(m) catch (e) {
+            eprint("删不了 " + m + "：" + e.message);
+        };
+    }
+    const end = monoNs() + 5000 * MS;
+    while (monoNs() < end && listLen(roots(tmp)) > 0) {
+        pumpFor(server, 50 * MS);
+    }
+    check(c, "pending: idle sweep cleans the roots once the strangers are gone", listLen(roots(tmp)) == 0, rootsRepr(roots(tmp)), "");
+    t = doTool(server, rng, rid, "compile", "{\"path\": \"main.tx\"}");
+    const rs = roots(tmp);
+    check(c, "pending: recovery with the next generation", !t.hasErr && isTrue(at(t.s, "ok")) && listLen(rs) == 1
+        && (listGet(rs, 0) catch WorkerRoot { gen: 0, name: "" }).gen == 3, trRepr(t, ", " + rootsRepr(rs)), "");
+}
+
+// 字符串值里含 needle（textOf 取的是字段；这里直接看值本身）。
+function containsJv(v: Ref<Jv>?, needle: string): bool {
+    if (v == None || (v ?? jNull()).kind != J_STR) {
+        return false;
+    }
+    return contains((v ?? jNull()).text, needle);
+}
+
+function contains(s: string, needle: string): bool {
+    if (len(needle) == 0) {
+        return true;
+    }
+    let i = 0;
+    while (i + len(needle) <= len(s)) {
+        let k = 0;
+        while (k < len(needle) && (byteAt(s, i + k) ?? 0) == (byteAt(needle, k) ?? 1)) {
+            k = k + 1;
+        }
+        if (k == len(needle)) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------- LSP 序列
+
+const GOOD_SRC: string = "export function main(args: []string): int {\n    let x = 1;\n    return x;\n}\n";
+const BAD_SRC: string = "export function main(args: []string): int {\n    return missing;\n}\n";
+
+function frame(body: Bytes): Bytes {
+    const out = bytesFromStr("Content-Length: " + toStr(bytesLen(body)) + "\r\n\r\n");
+    bytesAppend(out, body);
+    return out;
+}
+
+function frameText(body: string): Bytes {
+    return frame(bytesFromStr(body));
+}
+
+struct Doc {
+    uri: string,
+    version: int,
+    bad: bool,
+}
+
+// 仍打开的文档里，末次诊断与当前文本（有错／无错）不符的 URI。从未发布等同于空。
+function mismatch(docs: List<Doc>, notes: List<Ref<Jv>>): List<string> {
+    const out: List<string> = listNew();
+    for (d in docs) {
+        let nonEmpty = false;
+        for (n in notes) {
+            if (textIs(n, "method", "textDocument/publishDiagnostics") && textIs(at(n, "params"), "uri", d.uri)) {
+                nonEmpty = count(at(at(n, "params"), "diagnostics")) > 0;
+            }
+        }
+        if (nonEmpty != d.bad) {
+            listPush(out, d.uri);
+        }
+    }
+    return out;
+}
+
+function strList(xs: List<string>): string {
+    let s = "[";
+    let k = 0;
+    for (x in xs) {
+        if (k > 0) {
+            s = s + ", ";
+        }
+        s = s + jQuote(x);
+        k = k + 1;
+    }
+    return s + "]";
+}
+
+function docIndex(docs: List<Doc>, uri: string): int {
+    let i = 0;
+    for (d in docs) {
+        if (d.uri == uri) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+function lspSequence(c: Ref<Ctx>, seed: int, steps: int, label: string): string {
+    const rng = rngNew(seed);
+    const seq = freshSeq(c, label);
+    const ws = nat(join(seq, "ws"));
+    mkdirs(ws);
+    const wsReal = osRealPath(ws);
+    const docs: List<Doc> = listNew();
+    const names: []string = ["a.tx", "b.tx"];
+    const uris: List<string> = listNew();
+    for (n in names) {
+        writeText(nat(join(ws, n)), GOOD_SRC);
+        listPush(uris, uriOf(nat(join(wsReal, n))));
+    }
+    const args: List<string> = listNew();
+    listPush(args, "lsp");
+    listPush(args, "--stdio");
+    listPush(args, "--workspace");
+    listPush(args, ws);
+    const server = srvStart(c.compiler, args, ws, true) catch (e) {
+        return "start: " + e.message;
+    };
+    const rid = new Rid { n: 0 };
+    let failure = lspRequest(server, rng, rid, "initialize", "{\"processId\": null, \"rootUri\": " + jQuote(uriOf(wsReal)) + ", \"capabilities\": {}}", 1);
+    let w = write(server, frameText("{\"jsonrpc\": \"2.0\", \"method\": \"initialized\", \"params\": {}}"), rng);
+    const kinds: []string = ["open", "change", "close", "symbols", "hover", "format", "unknown", "bad-json", "budget-at", "budget-over"];
+    const kw: List<int> = listNew();
+    for (x in [3, 6, 1, 2, 2, 2, 1, 1, 1, 1]) {
+        listPush(kw, x);
+    }
+    let step = 0;
+    while (step < steps && len(failure) == 0) {
+        const kind = kinds[rngWeighted(rng, kw)];
+        const ni = rngBelow(rng, 2);
+        const uri = listGet(uris, ni) catch "";
+        const badText = rngRandom(rng) < 0.5;
+        let text = GOOD_SRC;
+        if (badText) {
+            text = BAD_SRC;
+        }
+        const di = docIndex(docs, uri);
+        if (kind == "open" && di < 0) {
+            listPush(docs, Doc { uri: uri, version: 1, bad: badText });
+            w = write(server, frameText("{\"jsonrpc\": \"2.0\", \"method\": \"textDocument/didOpen\", \"params\": {\"textDocument\": {\"uri\": " + jQuote(uri)
+                    + ", \"languageId\": \"taixu\", \"version\": 1, \"text\": " + jQuote(text) + "}}}"), rng);
+        } else if (kind == "change" && di >= 0) {
+            const version = (listGet(docs, di) catch Doc { uri: "", version: 0, bad: false }).version + 1;
+            listSet(docs, di, Doc { uri: uri, version: version, bad: badText });
+            w = write(server, frameText("{\"jsonrpc\": \"2.0\", \"method\": \"textDocument/didChange\", \"params\": {\"textDocument\": {\"uri\": " + jQuote(uri)
+                    + ", \"version\": " + toStr(version) + "}, \"contentChanges\": [{\"text\": " + jQuote(text) + "}]}}"), rng);
+        } else if (kind == "close" && di >= 0) {
+            listRemoveAt(docs, di);
+            w = write(server, frameText("{\"jsonrpc\": \"2.0\", \"method\": \"textDocument/didClose\", \"params\": {\"textDocument\": {\"uri\": " + jQuote(uri)
+                    + "}}}"), rng);
+        } else if (kind == "symbols" && di >= 0) {
+            failure = lspRequest(server, rng, rid, "textDocument/documentSymbol", "{\"textDocument\": {\"uri\": " + jQuote(uri) + "}}", 2);
+        } else if (kind == "hover" && di >= 0) {
+            failure = lspRequest(server, rng, rid, "textDocument/hover", "{\"textDocument\": {\"uri\": " + jQuote(uri)
+                + "}, \"position\": {\"line\": 1, \"character\": 8}}", 3);
+        } else if (kind == "format" && di >= 0) {
+            failure = lspRequest(server, rng, rid, "textDocument/formatting", "{\"textDocument\": {\"uri\": " + jQuote(uri)
+                + "}, \"options\": {\"tabSize\": 4, \"insertSpaces\": true}}", 2);
+        } else if (kind == "unknown") {
+            failure = lspRequest(server, rng, rid, "no/such", "{}", 4);
+        } else if (kind == "bad-json") {
+            w = write(server, frameText("{\"jsonrpc\":\"2.0\",\"id\":"), rng);
+            const r = take(server, NO_ID);
+            if (!(truthyJv(r) && jDumpSpaced(at(at(r, "error"), "code") ?? jNull()) == "-32700")) {
+                failure = "bad-json: " + dump(r);
+            }
+        } else if (kind == "budget-at" || kind == "budget-over") {
+            rid.n = rid.n + 1;
+            let total = BUDGET;
+            if (kind == "budget-over") {
+                total = BUDGET + 1;
+            }
+            const line = budgetLine(rid.n, total);
+            const body = replaceText(bytesToStr(bytesSlice(line, 0, bytesLen(line) - 1)) catch "", "\"tools/list\"", "\"no/such\"");
+            w = write(server, frameText(body), rng);
+            if (kind == "budget-at") {
+                const r = take(server, rid.n);
+                if (!(truthyJv(r) && jDumpSpaced(at(at(r, "error"), "code") ?? jNull()) == "-32601")) {
+                    failure = "budget-at: " + dump(r);
+                }
+            } else {
+                const r = take(server, NO_ID);
+                if (!(truthyJv(r) && textIs(at(r, "error"), "message", "RequestTooComplex"))) {
+                    failure = "budget-over: " + dump(r);
+                }
+            }
+        }
+        if (listLen(server.p.bad) > 0 && len(failure) == 0) {
+            failure = "non-JSON frame " + badHead(server);
+        }
+        step = step + 1;
+    }
+    // 每个仍打开的文档：最后一次诊断须与其当前文本一致（去抖之后）。
+    if (len(failure) == 0) {
+        const end = monoNs() + 5000 * MS;
+        let left = mismatch(docs, server.notes);
+        while (listLen(left) > 0 && monoNs() < end) {
+            pumpFor(server, 50 * MS);
+            left = mismatch(docs, server.notes);
+        }
+        if (listLen(left) > 0) {
+            failure = "final diagnostics disagree for " + strList(left);
+        }
+    }
+    if (len(failure) == 0) {
+        failure = lspRequest(server, rng, rid, "shutdown", "", 5);
+    }
+    w = write(server, frameText("{\"jsonrpc\": \"2.0\", \"method\": \"exit\"}"), rng);
+    const code = close(server, false);
+    if (len(failure) == 0 && (code == None || (code ?? 1) != 0)) {
+        let shown = "None";
+        if (code != None) {
+            shown = toStr(code ?? 0);
+        }
+        failure = "exit code " + shown + " after shutdown/exit";
+    }
+    if (len(failure) == 0 && listLen(server.p.bad) > 0) {
+        failure = "non-JSON frame " + badHead(server);
+    }
+    peerClose(server.p);
+    return failure;
+}
+
+function replaceText(s: string, a: string, b: string): string {
+    const parts = strSplit(s, a);
+    let out = listGet(parts, 0) catch "";
+    let i = 1;
+    while (i < listLen(parts)) {
+        out = out + b + (listGet(parts, i) catch "");
+        i = i + 1;
+    }
+    return out;
+}
+
+// 发请求、等回复并按 expect 判：1 有 result.capabilities，2 result 为 null 或数组，3 有 result，4 错误码 −32601，5 result 为 null。
+function lspRequest(s: Ref<Srv>, rng: Ref<Rng>, rid: Ref<Rid>, method: string, params: string, expect: int): string {
+    rid.n = rid.n + 1;
+    let body = "{\"jsonrpc\": \"2.0\", \"id\": " + toStr(rid.n) + ", \"method\": " + jQuote(method) + ", \"params\": ";
+    if (len(params) == 0) {
+        body = body + "null}";
+    } else {
+        body = body + params + "}";
+    }
+    const w = write(s, frameText(body), rng);
+    const r = take(s, rid.n);
+    if (r != None && expectOk(r ?? jNull(), expect)) {
+        return "";
+    }
+    return method + ": " + dump(r);
+}
+
+function expectOk(r: Ref<Jv>, expect: int): bool {
+    const res = at(r, "result");
+    if (expect == 1) {
+        return has(res, "capabilities");
+    }
+    if (expect == 2) {
+        return res != None && ((res ?? jNull()).kind == J_NULL || (res ?? jNull()).kind == J_ARR);
+    }
+    if (expect == 3) {
+        return res != None;
+    }
+    if (expect == 4) {
+        return jDumpSpaced(at(at(r, "error"), "code") ?? jNull()) == "-32601";
+    }
+    return res != None && (res ?? jNull()).kind == J_NULL;
+}
+
+// ---------------------------------------------------------------- 入口
+
+function oracle(c: Ref<Ctx>): void {
+    check(c, "budget lines hit the boundary exactly", tokens(budgetLine(1, BUDGET)) == BUDGET && tokens(budgetLine(1, BUDGET + 1)) == BUDGET + 1, "", "");
+    const m = new Model { generation: 0, worker: false };
+    check(c, "oracle: missing reply fails", len(judgeTool("compile-ok", None, m)) > 0, "", "");
+    const sc = "{\"schema\": \"tool-error/1\", \"reason\": \"request_timeout\", \"termination_requested\": true, \"worker_generation\": 5, \"reaped\": true, \"artifacts_cleaned\": true, \"cleanup_pending_paths\": []}";
+    const reply = jParse("{\"result\": {\"structuredContent\": " + sc + ", \"content\": [{\"type\": \"text\", \"text\": " + jQuote(sc) + "}], \"isError\": true}}")
+    catch jNull();
+    check(c, "oracle: generation jump fails", len(judgeTool("hard-timeout", reply, new Model { generation: 0, worker: false })) > 0, "", "");
+    check(c, "oracle: wrong error code fails", len(judgeRpc(jParse("{\"error\": {\"code\": -32600}}") catch jNull(), -32700, "", "")) > 0, "", "");
+    const badDoc: List<Doc> = listNew();
+    listPush(badDoc, Doc { uri: "u", version: 1, bad: true });
+    const fixedDoc: List<Doc> = listNew();
+    listPush(fixedDoc, Doc { uri: "u", version: 2, bad: false });
+    const noNotes: List<Ref<Jv>> = listNew();
+    const one: List<Ref<Jv>> = listNew();
+    listPush(one, note(1));
+    const cleared: List<Ref<Jv>> = listNew();
+    listPush(cleared, note(1));
+    listPush(cleared, note(0));
+    check(c, "oracle: erroneous text without diagnostics fails", strList(mismatch(badDoc, noNotes)) == "[\"u\"]", "", "");
+    check(c, "oracle: fixed text whose error was never cleared fails", strList(mismatch(fixedDoc, one)) == "[\"u\"]", "", "");
+    check(c, "oracle: cleared or never-published fixed text passes", listLen(mismatch(fixedDoc, cleared)) == 0 && listLen(mismatch(fixedDoc, noNotes)) == 0,
+        "", "");
+}
+
+function note(n: int): Ref<Jv> {
+    let ds = "[";
+    let i = 0;
+    while (i < n) {
+        if (i > 0) {
+            ds = ds + ", ";
+        }
+        ds = ds + "{}";
+        i = i + 1;
+    }
+    return jParse("{\"method\": \"textDocument/publishDiagnostics\", \"params\": {\"uri\": \"u\", \"diagnostics\": " + ds + "]}}") catch jNull();
+}
+
+function namesJson(xs: List<string>): string {
+    return strList(xs);
+}
+
+function digits(s: string): int {
+    let n = 0;
+    let neg = false;
+    let i = 0;
+    if (len(s) > 0 && (byteAt(s, 0) ?? 0) == 45) {
+        neg = true;
+        i = 1;
+    }
+    while (i < len(s)) {
+        n = n * 10 + ((byteAt(s, i) ?? 48) - 48);
+        i = i + 1;
+    }
+    if (neg) {
+        return -n;
+    }
+    return n;
+}
+
+function main(argv: []string): int {
+    let compiler = "";
+    let work = "";
+    let sequences = 8;
+    let steps = 24;
+    let seed = SEED;
+    let i = 0;
+    while (i + 1 < len(argv)) {
+        const a = argv[i];
+        const v = argv[i + 1];
+        if (a == "--compiler") {
+            compiler = v;
+        } else if (a == "--work") {
+            work = v;
+        } else if (a == "--sequences") {
+            sequences = digits(v);
+        } else if (a == "--steps") {
+            steps = digits(v);
+        } else if (a == "--seed") {
+            seed = digits(v);
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0 || len(work) == 0) {
+        eprint("用法：taixu run --toolchain scripts/test_service_sequence.tx --compiler <taixu> --work <目录> [--sequences N] [--steps N] [--seed S]");
+        return 2;
+    }
+    compiler = absolute(nat(compiler));
+    work = absolute(nat(work));
+    deleteTree(work);
+    mkdirs(work);
+    work = osRealPath(work);
+    const rows: List<Row> = listNew();
+    const c = new Ctx { compiler: compiler, work: work, rows: rows, bad: 0 };
+    oracle(c);
+    pendingCase(c);
+    let n = 0;
+    while (n < sequences) {
+        const s = seed + n;
+        const r = replay(c, s, planOf(s, steps), "seq-" + toStr(n));
+        let detail = "{\"seed\": " + toStr(s) + ", \"commands\": " + namesJson(r.names) + ", \"failure\": ";
+        if (len(r.failure) == 0) {
+            detail = detail + "null";
+        } else {
+            detail = detail + jQuote(r.failure);
+            const small = shrink(c, s, planOf(s, steps), "seq-" + toStr(n));
+            const smallNames: List<string> = listNew();
+            for (p in small) {
+                listPush(smallNames, CMD_NAMES[p]);
+            }
+            detail = detail + ", \"minimal\": " + namesJson(smallNames);
+        }
+        detail = detail + "}";
+        check(c, "sequence seed " + toStr(s) + " (" + toStr(steps) + " steps)", len(r.failure) == 0, detail, detail);
+        n = n + 1;
+    }
+    n = 0;
+    while (n < sequences) {
+        const s = seed + 1000 + n;
+        const failure = lspSequence(c, s, steps, "lsp-" + toStr(n));
+        check(c, "lsp sequence seed " + toStr(s) + " (" + toStr(steps) + " steps)", len(failure) == 0, failure, "null");
+        n = n + 1;
+    }
+    let report = "{\n \"seed\": " + toStr(seed) + ",\n \"rows\": [";
+    let k = 0;
+    for (r in c.rows) {
+        if (k > 0) {
+            report = report + ",";
+        }
+        let detail = jQuote(r.detail);
+        if (r.ok && len(r.json) > 0) {
+            detail = r.json;
+        }
+        report = report + "\n  {\n   \"check\": " + jQuote(r.check) + ",\n   \"ok\": " + jsonBool(r.ok) + ",\n   \"detail\": " + detail + "\n  }";
+        k = k + 1;
+    }
+    report = report + "\n ],\n \"failed\": " + toStr(c.bad) + "\n}";
+    writeText(nat(join(work, "service-sequence.json")), report);
+    let status = "PASS";
+    if (c.bad > 0) {
+        status = "FAIL";
+    }
+    print("SUMMARY " + status + " service-sequence: " + toStr(listLen(c.rows)) + " checks, " + toStr(c.bad) + " failed");
+    if (c.bad > 0) {
+        return 1;
+    }
+    return 0;
+}
+
+function jsonBool(b: bool): string {
+    if (b) {
+        return "true";
+    }
+    return "false";
+}

@@ -1,0 +1,306 @@
+// ============================================================================
+// engine/glyph —— 字形光栅（GUI 原生引擎 G1）：轮廓 → 8 位覆盖度位图。
+//
+// 不做 hinting。曲线按误差上限 0.1 像素均匀分段展平（段数用整数比较求得，不开方）；覆盖度用
+// 有向面积累积（font-rs、fontdue 的做法）：每条线段把它在各像素格里扫过的有向面积记入累积缓冲，
+// 再按行优先做前缀和，取 min(1, |和|) 即覆盖度，等价于非零环绕规则。全程 IEEE 双精度、不融合乘加，
+// 各平台逐位相同。位图边长不超过 4096。
+// ============================================================================
+
+export struct GlyphBm {
+    w: int,
+    h: int,
+    left: int, // 位图左列相对笔位的像素偏移（向右为正）
+    top: int, // 位图首行相对基线的像素偏移（向下为正）
+    cov: Bytes, // w*h 个覆盖度 0..255
+}
+
+const MAX_SIDE: int = 4096;
+
+function floorI(v: float): int {
+    const t: int = v as int;
+    if ((t as float) > v) {
+        return t - 1;
+    }
+    return t;
+}
+
+function ceilI(v: float): int {
+    const t: int = v as int;
+    if ((t as float) < v) {
+        return t + 1;
+    }
+    return t;
+}
+
+// 均匀分段数：最小的 n（≤64）使 n^4 ≥ k·dd。
+function segments(k: float, dd: float): int {
+    let n: int = 1;
+    while (n < 64) {
+        const n4: float = ((n * n * n * n) as float);
+        if (n4 >= k * dd) {
+            return n;
+        }
+        n = n + 1;
+    }
+    return 64;
+}
+
+function seg(out: List<float>, x0: float, y0: float, x1: float, y1: float): void {
+    listPush(out, x0);
+    listPush(out, y0);
+    listPush(out, x1);
+    listPush(out, y1);
+}
+
+// 轮廓（字体单位，y 向上）→ 像素坐标（y 向下）的线段表 [x0,y0,x1,y1]×n，各轮廓首尾闭合。
+function flatten(path: List<float>, scale: float): List<float> {
+    const out: List<float> = listNew();
+    const n: int = listLen(path);
+    let i: int = 0;
+    let cx: float = 0.0;
+    let cy: float = 0.0;
+    let sx: float = 0.0;
+    let sy: float = 0.0;
+    let open: bool = false;
+    while (i < n) {
+        const cmd: int = (listTryGet(path, i) catch 0.0) as int;
+        if (cmd == 0) {
+            if (open && (cx != sx || cy != sy)) {
+                seg(out, cx, cy, sx, sy);
+            }
+            cx = (listTryGet(path, i + 1) catch 0.0) * scale;
+            cy = -(listTryGet(path, i + 2) catch 0.0) * scale;
+            sx = cx;
+            sy = cy;
+            open = true;
+            i = i + 3;
+        } else if (cmd == 1) {
+            const x: float = (listTryGet(path, i + 1) catch 0.0) * scale;
+            const y: float = -(listTryGet(path, i + 2) catch 0.0) * scale;
+            seg(out, cx, cy, x, y);
+            cx = x;
+            cy = y;
+            i = i + 3;
+        } else if (cmd == 2) {
+            const qx: float = (listTryGet(path, i + 1) catch 0.0) * scale;
+            const qy: float = -(listTryGet(path, i + 2) catch 0.0) * scale;
+            const x: float = (listTryGet(path, i + 3) catch 0.0) * scale;
+            const y: float = -(listTryGet(path, i + 4) catch 0.0) * scale;
+            const ddx: float = cx - 2.0 * qx + x;
+            const ddy: float = cy - 2.0 * qy + y;
+            const k: int = segments(6.25, ddx * ddx + ddy * ddy);
+            let px: float = cx;
+            let py: float = cy;
+            let j: int = 1;
+            while (j <= k) {
+                const t: float = (j as float) / (k as float);
+                const u: float = 1.0 - t;
+                let nx: float = u * u * cx + 2.0 * u * t * qx + t * t * x;
+                let ny: float = u * u * cy + 2.0 * u * t * qy + t * t * y;
+                if (j == k) {
+                    nx = x;
+                    ny = y;
+                }
+                seg(out, px, py, nx, ny);
+                px = nx;
+                py = ny;
+                j = j + 1;
+            }
+            cx = x;
+            cy = y;
+            i = i + 5;
+        } else if (cmd == 3) {
+            const ax: float = (listTryGet(path, i + 1) catch 0.0) * scale;
+            const ay: float = -(listTryGet(path, i + 2) catch 0.0) * scale;
+            const bx: float = (listTryGet(path, i + 3) catch 0.0) * scale;
+            const by: float = -(listTryGet(path, i + 4) catch 0.0) * scale;
+            const x: float = (listTryGet(path, i + 5) catch 0.0) * scale;
+            const y: float = -(listTryGet(path, i + 6) catch 0.0) * scale;
+            const d1x: float = cx - 2.0 * ax + bx;
+            const d1y: float = cy - 2.0 * ay + by;
+            const d2x: float = ax - 2.0 * bx + x;
+            const d2y: float = ay - 2.0 * by + y;
+            let dd: float = d1x * d1x + d1y * d1y;
+            const dd2: float = d2x * d2x + d2y * d2y;
+            if (dd2 > dd) {
+                dd = dd2;
+            }
+            const k: int = segments(56.25, dd);
+            let px: float = cx;
+            let py: float = cy;
+            let j: int = 1;
+            while (j <= k) {
+                const t: float = (j as float) / (k as float);
+                const u: float = 1.0 - t;
+                let nx: float = u * u * u * cx + 3.0 * u * u * t * ax + 3.0 * u * t * t * bx + t * t * t * x;
+                let ny: float = u * u * u * cy + 3.0 * u * u * t * ay + 3.0 * u * t * t * by + t * t * t * y;
+                if (j == k) {
+                    nx = x;
+                    ny = y;
+                }
+                seg(out, px, py, nx, ny);
+                px = nx;
+                py = ny;
+                j = j + 1;
+            }
+            cx = x;
+            cy = y;
+            i = i + 7;
+        } else {
+            i = n;
+        }
+    }
+    if (open && (cx != sx || cy != sy)) {
+        seg(out, cx, cy, sx, sy);
+    }
+    return out;
+}
+
+function addAt(acc: List<float>, i: int, v: float): void {
+    listSet(acc, i, (listTryGet(acc, i) catch 0.0) + v);
+}
+
+// 一条线段的有向面积记入累积缓冲（坐标已平移到位图内，0 ≤ x ≤ w，0 ≤ y ≤ h）。
+function accLine(acc: List<float>, w: int, h: int, x0: float, y0: float, x1: float, y1: float): void {
+    if (y0 == y1) {
+        return;
+    }
+    let dir: float = 1.0;
+    let ax: float = x0;
+    let ay: float = y0;
+    let bx: float = x1;
+    let by: float = y1;
+    if (y0 > y1) {
+        dir = -1.0;
+        ax = x1;
+        ay = y1;
+        bx = x0;
+        by = y0;
+    }
+    const dxdy: float = (bx - ax) / (by - ay);
+    let x: float = ax;
+    let y: int = floorI(ay);
+    const yEnd: int = ceilI(by);
+    while (y < yEnd && y < h) {
+        const ls: int = y * w;
+        let top: float = y as float;
+        if (ay > top) {
+            top = ay;
+        }
+        let bot: float = (y + 1) as float;
+        if (by < bot) {
+            bot = by;
+        }
+        const dy: float = bot - top;
+        const xnext: float = x + dxdy * dy;
+        const d: float = dy * dir;
+        let xa: float = x;
+        let xb: float = xnext;
+        if (xnext < x) {
+            xa = xnext;
+            xb = x;
+        }
+        const xai: int = floorI(xa);
+        const xbi: int = ceilI(xb);
+        if (xbi <= xai + 1) {
+            const xmf: float = 0.5 * (x + xnext) - (xai as float);
+            addAt(acc, ls + xai, d - d * xmf);
+            addAt(acc, ls + xai + 1, d * xmf);
+        } else {
+            const s: float = 1.0 / (xb - xa);
+            const x0f: float = xa - (xai as float);
+            const a0: float = 0.5 * s * (1.0 - x0f) * (1.0 - x0f);
+            const x1f: float = xb - (xbi as float) + 1.0;
+            const am: float = 0.5 * s * x1f * x1f;
+            addAt(acc, ls + xai, d * a0);
+            if (xbi == xai + 2) {
+                addAt(acc, ls + xai + 1, d * (1.0 - a0 - am));
+            } else {
+                const a1: float = s * (1.5 - x0f);
+                addAt(acc, ls + xai + 1, d * (a1 - a0));
+                let xi: int = xai + 2;
+                while (xi < xbi - 1) {
+                    addAt(acc, ls + xi, d * s);
+                    xi = xi + 1;
+                }
+                const a2: float = a1 + ((xbi - xai - 3) as float) * s;
+                addAt(acc, ls + xbi - 1, d * (1.0 - a2 - am));
+            }
+            addAt(acc, ls + xbi, d * am);
+        }
+        x = xnext;
+        y = y + 1;
+    }
+}
+
+/// 轮廓按 scale（像素/字体单位）光栅化；空轮廓或超出边长上限得 0×0 位图。
+export function rasterize(path: List<float>, scale: float): GlyphBm {
+    const segs: List<float> = flatten(path, scale);
+    const n: int = listLen(segs) / 4;
+    if (n == 0) {
+        return { w: 0, h: 0, left: 0, top: 0, cov: bytesNew(0) };
+    }
+    let minX: float = listTryGet(segs, 0) catch 0.0;
+    let maxX: float = minX;
+    let minY: float = listTryGet(segs, 1) catch 0.0;
+    let maxY: float = minY;
+    let i: int = 0;
+    while (i < n * 4) {
+        const x: float = listTryGet(segs, i) catch 0.0;
+        const y: float = listTryGet(segs, i + 1) catch 0.0;
+        if (x < minX) {
+            minX = x;
+        }
+        if (x > maxX) {
+            maxX = x;
+        }
+        if (y < minY) {
+            minY = y;
+        }
+        if (y > maxY) {
+            maxY = y;
+        }
+        i = i + 2;
+    }
+    if (minX < -1000000.0 || maxX > 1000000.0 || minY < -1000000.0 || maxY > 1000000.0) {
+        return { w: 0, h: 0, left: 0, top: 0, cov: bytesNew(0) };
+    }
+    const x0: int = floorI(minX);
+    const y0: int = floorI(minY);
+    const w: int = ceilI(maxX) - x0;
+    const h: int = ceilI(maxY) - y0;
+    if (w <= 0 || h <= 0 || w > MAX_SIDE || h > MAX_SIDE) {
+        return { w: 0, h: 0, left: 0, top: 0, cov: bytesNew(0) };
+    }
+    const acc: List<float> = listNew();
+    i = 0;
+    while (i < w * h + 2) {
+        listPush(acc, 0.0);
+        i = i + 1;
+    }
+    const fx: float = x0 as float;
+    const fy: float = y0 as float;
+    i = 0;
+    while (i < n) {
+        const at: int = i * 4;
+        accLine(acc, w, h, (listTryGet(segs, at) catch 0.0) - fx, (listTryGet(segs, at + 1) catch 0.0) - fy, (listTryGet(segs, at + 2) catch 0.0) - fx, (listTryGet(segs, at + 3) catch 0.0) - fy);
+        i = i + 1;
+    }
+    const cov = bytesNew(w * h);
+    let sum: float = 0.0;
+    i = 0;
+    while (i < w * h) {
+        sum = sum + (listTryGet(acc, i) catch 0.0);
+        let a: float = sum;
+        if (a < 0.0) {
+            a = -a;
+        }
+        if (a > 1.0) {
+            a = 1.0;
+        }
+        bytesSet(cov, i, (a * 255.0 + 0.5) as int);
+        i = i + 1;
+    }
+    return { w: w, h: h, left: x0, top: y0, cov: cov };
+}

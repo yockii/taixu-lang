@@ -1,0 +1,105 @@
+// Public controls, real products and the independent scalar-analysis suites.
+import { absolute, exeName, join, mkdirs, nat, readBytes } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { captureRaw, Raw, Tally, tallyNew, check, summary } from "./test_lib";
+import { hexOf, sha256Of, lossyText } from "./check_lib";
+import { jParseBytes } from "./test_json";
+import { at, count, textOf, trueAt } from "./test_jv";
+
+const SECOND: int = 1000000000;
+struct Ctx { compiler: string, root: string, work: string, tally: Ref<Tally> }
+function args(values: []string): List<string> { const out: List<string> = listNew(); for (value in values) { listPush(out, value); } return out; }
+function eq(a: Bytes, b: Bytes): bool {
+    if (bytesLen(a) != bytesLen(b)) { return false; } let i = 0;
+    while (i < bytesLen(a)) { if ((bytesGet(a, i) catch -1) != (bytesGet(b, i) catch -2)) { return false; } i = i + 1; } return true;
+}
+function hash(path: string): string | Error { const data = readBytes(path)?; return hexOf(sha256Of(data, 0, bytesLen(data))); }
+function sh(c: Ref<Ctx>, label: string, exe: string, argv: List<string>): Ref<Raw> | Error {
+    const r = captureRaw(exe, argv, c.root, 240 * SECOND, 2 * SECOND, 8 * 1024 * 1024)?;
+    writeFileBytes(nat(join(c.work, label + ".stdout")), r.out)?;
+    writeFileBytes(nat(join(c.work, label + ".stderr")), r.err)?;
+    return r;
+}
+function tx(c: Ref<Ctx>, label: string, argv: List<string>): Ref<Raw> | Error { return sh(c, label, c.compiler, argv); }
+function built(c: Ref<Ctx>, stem: string, label: string, flags: List<string>): string | Error {
+    const dest = nat(join(c.work, label)); if (!mkdirs(dest)) { return err("cannot create " + dest); }
+    const argv = args(["build", nat(join(c.root, "tests/" + stem + ".tx")), "-o", dest]);
+    for (flag in flags) { listPush(argv, flag); }
+    const r = tx(c, label + "-build", argv)?;
+    if (!check(c.tally, label + ":build", r.code == 0, lossyText(r.err))) { return err(label + " build failed"); }
+    return nat(join(dest, exeName(stem)));
+}
+function output(c: Ref<Ctx>, stem: string, label: string, binary: string): void | Error {
+    const r = sh(c, label + "-execute", binary, listNew())?;
+    const expected = readBytes(nat(join(c.root, "tests/" + stem + ".out")))?;
+    check(c.tally, label + ":literal-output", r.code == 0 && eq(r.out, expected) && bytesLen(r.err) == 0, lossyText(r.err));
+}
+function body(c: Ref<Ctx>): void | Error {
+    const cap = tx(c, "capabilities", args(["capabilities", "--format=json"]))?;
+    const doc = jParseBytes(cap.out)?; const caps = at(doc, "capabilities");
+    check(c.tally, "capabilities:policy-default-control", cap.code == 0 && textOf(caps, "program_regalloc") == "scalar-loops-auto"
+        && trueAt(caps, "program_regalloc_default") && textOf(caps, "program_regalloc_flag") == "--regalloc"
+        && textOf(caps, "program_regalloc_controls") == "on,off"
+        && textOf(caps, "program_regalloc_commands") == "build,run,test,disasm,profile-compile", lossyText(cap.out));
+    for (suite in ["scalar_loops", "scalar_candidates", "scalar_cache_plan", "x64_scalar_pool"]) {
+        const r = tx(c, "unit-" + suite, args(["test", "--toolchain", "--heap-check", "--leak-check", nat(join(c.root, "scripts/test_" + suite + ".tx"))]))?;
+        check(c.tally, "unit:" + suite, r.code == 0, lossyText(r.err));
+    }
+    const trailing = tx(c, "test-trailing-off", args(["test", nat(join(c.root, "scripts/test_scalar_cache_plan.tx")), "--toolchain", "--regalloc=off", "--heap-check", "--leak-check"]))?;
+    check(c.tally, "test:trailing-off", trailing.code == 0, lossyText(trailing.err));
+    for (stem in ["scalar-plan", "scalar-cache-pressure", "scalar-cache-pressure-one", "scalar-cache-call-cost"]) {
+        for (backend in ["native", "portable"]) {
+            const onFlags = args(["--regalloc=on", "--heap-check", "--leak-check"]);
+            const offFlags = args(["--regalloc=off", "--heap-check", "--leak-check"]);
+            if (backend == "portable") { listPush(onFlags, "--codegen=portable"); listPush(offFlags, "--codegen=portable"); }
+            const label = stem + "-" + backend;
+            const on = built(c, stem, label + "-on", onFlags)?; output(c, stem, label + "-on", on)?;
+            const off = built(c, stem, label + "-off", offFlags)?; output(c, stem, label + "-off", off)?;
+            if (stem == "scalar-plan") { check(c.tally, label + ":actual-code-change", hash(on)? != hash(off)?, "selected loop must change machine code"); }
+        }
+    }
+    const stem = "scalar-plan"; const entry = nat(join(c.root, "tests/" + stem + ".tx"));
+    const enabled = built(c, stem, "normal-on", args(["--regalloc=on"]))?;
+    const disabled = built(c, stem, "normal-off", args(["--regalloc=off"]))?;
+    const normal = built(c, stem, "normal-default", listNew())?;
+    check(c.tally, "default:actually-enabled", hash(normal)? == hash(enabled)? && hash(enabled)? != hash(disabled)?, "default must match on and differ from off");
+    for (mode in ["on", "off"]) {
+        const control = "--regalloc=" + mode;
+        const run = tx(c, "run-" + mode, args(["run", control, "--heap-check", "--leak-check", entry]))?;
+        check(c.tally, "run:" + mode, run.code == 0 && eq(run.out, readBytes(nat(join(c.root, "tests/" + stem + ".out")))?), lossyText(run.err));
+        const debug = built(c, stem, "debug-" + mode, args(["--debug", control]))?;
+        output(c, stem, "debug-" + mode, debug)?;
+        const profile = tx(c, "profile-" + mode, args(["profile", "compile", entry, control, "--format=json", "--top", "0"]))?;
+        const pd = jParseBytes(profile.out)?;
+        let product = disabled; if (mode == "on") { product = enabled; }
+        check(c.tally, "profile:" + mode + ":build-identity", profile.code == 0 && textOf(at(at(pd, "profile"), "product"), "sha256") == hash(product)?, lossyText(profile.err));
+        const listing = tx(c, "disasm-" + mode, args(["disasm", entry, control, "--format=json"]))?;
+        const ld = jParseBytes(listing.out)?;
+        check(c.tally, "disasm:" + mode, listing.code == 0 && textOf(ld, "schema") == "disasm/1" && count(at(ld, "functions")) > 0, lossyText(listing.err));
+    }
+    check(c.tally, "debug:unchanged-by-control", hash(nat(join(c.work, "debug-on/" + exeName(stem))))? == hash(nat(join(c.work, "debug-off/" + exeName(stem))))?, "debug retains value slots");
+    for (bad in ["--regalloc", "--regalloc=", "--regalloc=bad"]) {
+        for (command in ["build", "run", "test", "disasm"]) {
+            const r = tx(c, "bad-" + command + "-" + toStr(len(bad)), args([command, bad, entry]))?;
+            check(c.tally, command + ":reject:" + bad, r.code == 64, lossyText(r.err));
+        }
+        const r = tx(c, "bad-profile-" + toStr(len(bad)), args(["profile", "compile", entry, bad, "--format=json"]))?;
+        const e = jParseBytes(r.out)?;
+        check(c.tally, "profile:reject:" + bad, r.code == 64 && textOf(at(e, "error"), "kind") == "usage", lossyText(r.err));
+    }
+}
+function run(argv: []string): int | Error {
+    let compiler = ""; let root = absolute("."); let work = ""; let i = 0;
+    while (i < len(argv)) {
+        if (i + 1 >= len(argv)) { return 2; }
+        if (argv[i] == "--compiler") { compiler = absolute(argv[i + 1]); }
+        else if (argv[i] == "--root") { root = absolute(argv[i + 1]); }
+        else if (argv[i] == "--work") { work = absolute(argv[i + 1]); }
+        else { return 2; } i = i + 2;
+    }
+    if (compiler == "" || work == "" || !mkdirs(work)) { return 2; }
+    root = osRealPath(root); work = osRealPath(work);
+    const c = new Ctx { compiler: nat(compiler), root: nat(root), work: nat(work), tally: tallyNew() };
+    body(c)?; return summary(c.tally, "program-regalloc");
+}
+function main(argv: []string): int { return run(argv) catch (e) { eprint("program-regalloc: " + e.message); return 1; }; }

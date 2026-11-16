@@ -1,0 +1,247 @@
+// 严格 JSON 解析的门：以 --toolchain 编出
+// bootstrap/selfhost/json-probe.tx，对每个用例打一行规范形，与入库的已知答案 tests/vectors/json.txt 逐行比较。被测的 json_parse.tx 是
+// 严格解析器（调试协议等用它解析命令）：重复键、尾随内容、串里的非法 UTF-8、原样的控制字符与落单的 \u 代理项都算错；数字没有 . e E、
+// 不是 -0 且在 i64 之内为整数，否则保留原文。用例为各类合法与非法的固定输入、带种子的随机文档（随机空白与转义）及其随机字节变异，
+// 答案由独立参照按上述规则生成后入库；极深的嵌套（5000 与 100000 层）的期望在这里直接构造。
+// 运行（仓根）：taixu run --toolchain scripts/test_native_json.tx --compiler <taixu> [--work <目录>] [--root <仓库>]
+// 随机文档的个数随答案文件固定；探针的环境里照留 TAIXU_*（setEnv 不能删变量，探针不读环境变量）；构建或探针超时记为失败。
+import { absolute, deleteTree, exeName, join, kindOf, mkdirs, nat } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { lossyText } from "./check_lib";
+import { captureRaw } from "./test_lib";
+import { byteSub, headChars, padRight, reprBytes, tailChars } from "./test_text";
+
+const SEC: int = 1000000000;
+const MAX_OUTPUT: int = 268435456;
+
+struct Case {
+    hex: string,
+    want: string,
+}
+
+function hexValue(c: int): int {
+    if (c >= 48 && c <= 57) {
+        return c - 48;
+    }
+    if (c >= 97 && c <= 102) {
+        return c - 87;
+    }
+    return 0;
+}
+
+function unhex(h: string): Bytes {
+    const out = bytesNew(0);
+    let i = 0;
+    while (i + 1 < len(h)) {
+        bytesPush(out, hexValue(byteAt(h, i) ?? 0) * 16 + hexValue(byteAt(h, i + 1) ?? 0));
+        i = i + 2;
+    }
+    return out;
+}
+
+function hexOf(b: Bytes): string {
+    const digits = "0123456789abcdef";
+    const out = bytesNew(0);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) ?? 0;
+        bytesPush(out, byteAt(digits, c >> 4) ?? 48);
+        bytesPush(out, byteAt(digits, c & 15) ?? 48);
+        i = i + 1;
+    }
+    return bytesToStr(out) catch "";
+}
+
+function repeat(unit: string, n: int, out: Bytes): void {
+    const u = bytesFromStr(unit);
+    let k = 0;
+    while (k < n) {
+        bytesAppend(out, u);
+        k = k + 1;
+    }
+}
+
+function text(b: Bytes): string {
+    return bytesToStr(b) catch "";
+}
+
+// 深于常见递归上限（如 Python 缺省的 1000 层）的三种嵌套。
+function deepCases(cases: List<Case>): void {
+    for (depth in [5000, 100000]) {
+        const open = bytesNew(0);
+        repeat("[", depth, open);
+        const ok = bytesNew(0);
+        bytesAppend(ok, open);
+        repeat("]", depth, ok);
+        listPush(cases, Case { hex: hexOf(ok), want: text(ok) });
+        const short = bytesNew(0);
+        bytesAppend(short, open);
+        repeat("]", depth - 1, short);
+        listPush(cases, Case { hex: hexOf(short), want: "ERR" });
+        const obj = bytesNew(0);
+        repeat("{\"a\":", depth, obj);
+        bytesAppend(obj, bytesFromStr("null"));
+        repeat("}", depth, obj);
+        const want = bytesNew(0);
+        repeat("{61:", depth, want);
+        bytesPush(want, 110);
+        repeat("}", depth, want);
+        listPush(cases, Case { hex: hexOf(obj), want: text(want) });
+    }
+}
+
+function run(argv: []string): int | Error {
+    let compiler = "";
+    let work = "";
+    let root = "";
+    let i = 0;
+    while (i + 1 < len(argv)) {
+        if (argv[i] == "--compiler") {
+            compiler = argv[i + 1];
+        } else if (argv[i] == "--work") {
+            work = argv[i + 1];
+        } else if (argv[i] == "--root") {
+            root = argv[i + 1];
+        } else {
+            return err("未知参数：" + argv[i]);
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0 || i != len(argv)) {
+        return err("用法：taixu run --toolchain scripts/test_native_json.tx --compiler <taixu> [--work <目录>] [--root <仓库>]");
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = osRealPath(absolute(nat(root)));
+    compiler = osRealPath(absolute(nat(compiler)));
+    if (len(work) == 0) {
+        work = freshDir("tx-json-")?;
+    }
+    if (!mkdirs(absolute(nat(work)))) {
+        return err("建不了工作目录：" + work);
+    }
+    work = osRealPath(absolute(nat(work)));
+    const out = nat(join(work, "probe"));
+    if (kindOf(out) != 0) {
+        deleteTree(out);
+    }
+    const bargs: List<string> = listNew();
+    listPush(bargs, "build");
+    listPush(bargs, "bootstrap/selfhost/json-probe.tx");
+    listPush(bargs, "--toolchain");
+    listPush(bargs, "--out");
+    listPush(bargs, out);
+    const b = captureRaw(compiler, bargs, root, 1200 * SEC, 10 * SEC, MAX_OUTPUT)?;
+    const probe = nat(join(out, exeName("json-probe")));
+    if (b.code != 0 || b.timedOut || kindOf(probe) != 1) {
+        const both = bytesNew(0);
+        bytesAppend(both, b.out);
+        bytesAppend(both, b.err);
+        print("FAIL  probe-build  " + tailChars(lossyText(both), 600));
+        print("SUMMARY FAIL=1");
+        return 1;
+    }
+    const cases: List<Case> = listNew();
+    const table = readFile(nat(join(root, "tests/vectors/json.txt")))?;
+    for (line in strSplit(table, "\n")) {
+        if (len(line) == 0 || (byteAt(line, 0) ?? 0) == 35) {
+            continue;
+        }
+        const sp = strSplit(line, " ");
+        const h = listGet(sp, 0) catch "";
+        if (listLen(sp) != 2 || len(h) == 0 || (byteAt(h, 0) ?? 0) != 120) {
+            return err("向量行写法不对：" + headChars(line, 120));
+        }
+        listPush(cases, Case { hex: byteSub(h, 1, len(h) - 1), want: listGet(sp, 1) catch "" });
+    }
+    deepCases(cases);
+    const file = bytesNew(0);
+    for (c in cases) {
+        bytesPush(file, 120);
+        bytesAppend(file, bytesFromStr(c.hex));
+        bytesPush(file, 10);
+    }
+    const caseFile = nat(join(work, "cases.hex"));
+    writeFileBytes(caseFile, file)?;
+    const pargs: List<string> = listNew();
+    listPush(pargs, caseFile);
+    const r = captureRaw(probe, pargs, work, 1200 * SEC, 10 * SEC, MAX_OUTPUT)?;
+    const got = strSplit(lossyText(r.out), "\n");
+    let n = listLen(got);
+    let k = 0;
+    while (k < n) {
+        const l = listGet(got, k) catch "";
+        if (len(l) > 0 && (byteAt(l, len(l) - 1) ?? 0) == 13) {
+            listSet(got, k, byteSub(l, 0, len(l) - 1));
+        }
+        k = k + 1;
+    }
+    if (n > 0 && len(listGet(got, n - 1) catch "x") == 0) {
+        n = n - 1;
+    }
+    let fails = 0;
+    let accepted = 0;
+    for (c in cases) {
+        if (c.want != "ERR") {
+            accepted = accepted + 1;
+        }
+    }
+    if (r.code != 0 || r.timedOut || n != listLen(cases)) {
+        const tail = bytesSlice(r.err, bytesLen(r.err) - min(bytesLen(r.err), 400), min(bytesLen(r.err), 400));
+        print("FAIL  probe-run    exit=" + toStr(r.code) + " lines=" + toStr(n) + " cases=" + toStr(listLen(cases)) + " stderr="
+            + reprBytes(tail, 400));
+        fails = fails + 1;
+    }
+    k = 0;
+    while (k < listLen(cases)) {
+        const c = listGet(cases, k) catch Case { hex: "", want: "" };
+        let have = "<missing>";
+        if (k < n) {
+            have = listGet(got, k) catch "";
+        }
+        if (have != c.want) {
+            fails = fails + 1;
+            if (fails <= 12) {
+                print("FAIL  case " + padRight(toStr(k), 5) + " input=" + reprBytes(unhex(byteSub(c.hex, 0, min(len(c.hex), 160))), 80) + " want="
+                    + headChars(c.want, 80) + " got=" + headChars(have, 80));
+            }
+        }
+        k = k + 1;
+    }
+    print("cases=" + toStr(listLen(cases)) + " accepted=" + toStr(accepted) + " rejected=" + toStr(listLen(cases) - accepted));
+    if (fails == 0) {
+        print("SUMMARY PASS");
+        return 0;
+    }
+    print("SUMMARY FAIL=" + toStr(fails));
+    return 1;
+}
+
+function freshDir(prefix: string): string | Error {
+    const base = osRealPath(tempDir());
+    let k = 0;
+    while (k < 1000) {
+        const p = nat(join(base, prefix + toStr(monoNs() % 1000000000) + "-" + toStr(k)));
+        if (kindOf(p) == 0) {
+            makeDir(p)?;
+            return p;
+        }
+        k = k + 1;
+    }
+    return err("建不了临时目录 " + prefix);
+}
+
+function min(a: int, b: int): int {
+    if (a < b) {
+        return a;
+    }
+    return b;
+}
+
+function main(argv: []string): int {
+    return run(argv) catch (e) {
+        eprint("test_native_json: " + e.message);
+        return 1;
+    };
+}

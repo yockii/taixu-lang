@@ -4,6 +4,7 @@ import { asImgText, asImgRdata, asImgData, asImgBssSize, asImgAlignPow, asFailed
 import { NativeFunctionImage } from "./native_function_data";
 import { nativeFunctionEncode } from "./native_function_codec";
 import { ISA_A64, ISA_LA64, ISA_RV64 } from "./target";
+import { BlockPlan, blockPlanOf, blockAt } from "./link_blocks";
 
 struct ElfObjectResult { ok: int, bytes: Bytes, error: string }
 struct ElfSection { name: string, kind: int, flags: int, alignment: int, entrySize: int, link: int, info: int, size: int, offset: int, nameAt: int, bytes: Bytes }
@@ -93,6 +94,12 @@ function rv64RelocType(kind: int): int {
     return -1;
 }
 // 写出前能就地定下的修补：x86 的同节 PC32，A64 的同节 CALL26／JUMP26，龙芯的同节 B26，RISC-V 的同节 CALL_PLT（与相对位置无关）。
+// 带函数目录写出（内核）时只在同一函数内就地定下：链接器按函数目录切块取舍（运行时按需链入），函数之间的引用须留成重定位。
+let localPlan: Ref<BlockPlan> = blockPlanOf(0, listNew());
+function sameFunction(s: int, at: int, def: int): bool {
+    if (!localPlan.ok || s != 0) { return true; }
+    return blockAt(localPlan, at) == blockAt(localPlan, asSymOffL(def));
+}
 function bindsLocally(kind: int, isa: int): bool {
     if (isa == ISA_A64) { return kind == 2 || kind == 3; }
     if (isa == ISA_LA64) { return kind == 11; }
@@ -117,6 +124,10 @@ export function elfWriteObjectFunctions(exports: List<string>, functions: Ref<Na
 }
 function write(exports: List<string>, functions: Ref<NativeFunctionImage>): Ref<ElfObjectResult> {
     if (asFailedAs() != 0) { return fail("AssemblerFailed"); }
+    localPlan = blockPlanOf(0, listNew());
+    if (functions.ok) {
+        localPlan = blockPlanOf(bytesLen(asImgText()), functions.functions);
+    }
     const isa = asImgIsa();
     const a64 = isa == ISA_A64;
     const la64 = isa == ISA_LA64;
@@ -164,7 +175,8 @@ function write(exports: List<string>, functions: Ref<NativeFunctionImage>): Ref<
         if (found < 0) { found = add(names, name, -1, 1); }
         const def = listGet(names.definitions, found) catch -1;
         // Only LOCAL same-section PC32 (A64: CALL26/JUMP26; LoongArch: B26; RISC-V: CALL_PLT) can bind before final section layout.
-        if (!bindsLocally(asFixKindL(i), isa) || def < 0 || (listGet(names.globals, found) catch 0) != 0 || asSymSecL(def) != asFixSecL(i)) {
+        if (!bindsLocally(asFixKindL(i), isa) || def < 0 || (listGet(names.globals, found) catch 0) != 0 || asSymSecL(def) != asFixSecL(i)
+            || !sameFunction(asFixSecL(i), asFixAtL(i), def)) {
             listSet(names.required, found, 1);
         }
         i = i + 1;
@@ -221,7 +233,7 @@ function write(exports: List<string>, functions: Ref<NativeFunctionImage>): Ref<
         if (r.kind == 0) { return fail("BadSection"); }
         const found = find(names, asFixSymL(i)); const index = listGet(names.indices, found) catch 0;
         const def = listGet(names.definitions, found) catch -1;
-        if (rv64 && bindsLocally(kind, isa) && def >= 0 && (listGet(names.globals, found) catch 0) == 0 && asSymSecL(def) == s) {
+        if (rv64 && bindsLocally(kind, isa) && def >= 0 && (listGet(names.globals, found) catch 0) == 0 && asSymSecL(def) == s && sameFunction(s, at, def)) {
             // 同节的调用：auipc 取 (d+0x800)>>12，jalr 取低 12 位（按符号）。
             const delta = asSymOffL(def) + addend - at;
             if (delta < -2147485696 || delta > 2147481599) { return fail("RelativeRelocationOutOfRange"); }
@@ -232,7 +244,7 @@ function write(exports: List<string>, functions: Ref<NativeFunctionImage>): Ref<
             const v1 = (w1 & 4095) | (hi << 12);
             const v2 = (w2 & 1048575) | (lo << 20);
             let j = 0; while (j < 4) { bytesSet(owner.bytes, at + j, (v1 >>> (j * 8)) & 255); bytesSet(owner.bytes, at + 4 + j, (v2 >>> (j * 8)) & 255); j = j + 1; }
-        } else if ((a64 || la64) && bindsLocally(kind, isa) && def >= 0 && (listGet(names.globals, found) catch 0) == 0 && asSymSecL(def) == s) {
+        } else if ((a64 || la64) && bindsLocally(kind, isa) && def >= 0 && (listGet(names.globals, found) catch 0) == 0 && asSymSecL(def) == s && sameFunction(s, at, def)) {
             const delta = asSymOffL(def) + addend - at;
             if (delta % 4 != 0 || delta < -134217728 || delta > 134217724) { return fail("RelativeRelocationOutOfRange"); }
             const insn = (bytesGet(owner.bytes, at) catch 0) | ((bytesGet(owner.bytes, at + 1) catch 0) << 8) | ((bytesGet(owner.bytes, at + 2) catch 0) << 16) | ((bytesGet(owner.bytes, at + 3) catch 0) << 24);
@@ -240,7 +252,7 @@ function write(exports: List<string>, functions: Ref<NativeFunctionImage>): Ref<
             // 龙芯的 26 位偏移拆成两段：低 16 位在 25:10、高 10 位在 9:0。
             if (la64) { const w = (delta / 4) & 67108863; value = (insn & 4227858432) | ((w & 65535) << 10) | (w >>> 16); }
             let j = 0; while (j < 4) { bytesSet(owner.bytes, at + j, (value >>> (j * 8)) & 255); j = j + 1; }
-        } else if (kind == 0 && !a64 && def >= 0 && (listGet(names.globals, found) catch 0) == 0 && asSymSecL(def) == s) {
+        } else if (kind == 0 && !a64 && def >= 0 && (listGet(names.globals, found) catch 0) == 0 && asSymSecL(def) == s && sameFunction(s, at, def)) {
             const delta = asSymOffL(def) - at;
             if (addend < -2147483648 - delta || addend > 2147483647 - delta) { return fail("RelativeRelocationOutOfRange"); }
             const value = delta + addend;

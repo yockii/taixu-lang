@@ -1,0 +1,728 @@
+// 公开元数据、模式名与兼容登记的回归门：
+// capabilities 与产品版本的单一来源（bootstrap/selfhost/toolchain.tx）一致、模式名清单、changes 登记（SHA、条目、迁移不冒充自动、
+// 两条字面量迁移的实际行为）、各命令的 JSON 模式、用户输出原样、MCP 与 LSP 报的版本、诊断码清单、登记文件只用原生字面量 AST、
+// 派生的 AI 兼容文档；最后跑工具安全与服务边界（tool_security.tx、service_security.tx）。报告写 --report（缺省 <work>/report.json）。
+// 运行（仓根）：taixu run --toolchain scripts/test_toolchain_contract.tx --compiler <原生 taixu> --work <目录> [--report 文件]
+import { absolute, exeName, join, mkdirs, nat, readBytes, startsWith } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { linesOf, summary, tallyNew } from "./test_lib";
+import { runWithInput } from "./test_proto";
+import { strip } from "./test_text";
+import { J_ARR, J_NUM, J_OBJ, J_STR, Jv, jAt, jGet, jInt, jLen, jObject, jPretty, jQuote, jSet, jString, jText } from "./test_json";
+import { at, count, dump, has, isObj, item, textIs, textOf } from "./test_jv";
+import { Ctx, Run, added, chk, ctxNew, joinWith, lf, readJ, replaceAll, runAt, runC, shaHex, source, strs, text } from "./contract_lib";
+import { toolSecurity } from "./tool_security";
+
+const SCHEMAS: []string = ["capabilities/1", "changes/1", "diag/1", "tests/1", "fmt/1", "doc/1", "bench/1", "disasm/1", "compile/1", "run/1",
+    "mcp-disasm/1", "compile-profile/1", "link-map/7", "tool-error/1"];
+const LITERALS: []string = ["lang.literal-left-fixed-width", "lang.literal-left-f32"];
+const AST_KINDS: []string = ["struct", "field", "tnamed", "tslice", "const", "ty", "tarray", "array_lit", "struct_lit", "finit", "int", "string",
+    "float", "bool"];
+
+// ---------------------------------------------------------------- 版本串
+
+function isDigit(c: int): bool {
+    return c >= 48 && c <= 57;
+}
+
+function isAlnumDash(c: int): bool {
+    return isDigit(c) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45;
+}
+
+// 非空的十进制数字串；strict 时不许前导零（"0" 本身可以）。
+function isNumber(s: string, strict: bool): bool {
+    if (len(s) == 0) {
+        return false;
+    }
+    let i = 0;
+    while (i < len(s)) {
+        if (!isDigit(byteAt(s, i) ?? 0)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return !strict || len(s) == 1 || (byteAt(s, 0) ?? 0) != 48;
+}
+
+// 非空，只含字母、数字与连字符；semver 时还须是不带前导零的数，或含字母、连字符（SemVer 2.0.0 的预发布标识符）。
+function isIdent(s: string, semver: bool): bool {
+    if (len(s) == 0) {
+        return false;
+    }
+    let letter = false;
+    let i = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) ?? 0;
+        if (!isAlnumDash(c)) {
+            return false;
+        }
+        if (!isDigit(c)) {
+            letter = true;
+        }
+        i = i + 1;
+    }
+    return !semver || letter || isNumber(s, true);
+}
+
+function idents(s: string, semver: bool): bool {
+    for (part in strSplit(s, ".")) {
+        if (!isIdent(part, semver)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 三段不带前导零的数。
+function core3(s: string): bool {
+    const parts = strSplit(s, ".");
+    if (listLen(parts) != 3) {
+        return false;
+    }
+    for (p in parts) {
+        if (!isNumber(p, true)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function firstOf(s: string, c: int): int {
+    let i = 0;
+    while (i < len(s)) {
+        if ((byteAt(s, i) ?? 0) == c) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+function sub(s: string, from: int, n: int): string {
+    return bytesToStr(bytesSlice(bytesFromStr(s), from, n)) catch "";
+}
+
+// 版本串：core[-pre][+build]。full 为 SemVer 2.0.0 全文（同 toolchain_docs.tx 的 semverOk：预发布标识符的数不带前导零，许构建
+// 元数据）；否则同门的版本检查（预发布标识符只查字符，不许构建元数据）。
+function semverOk(v: string, full: bool): bool {
+    let rest = v;
+    const plus = firstOf(rest, 43);
+    if (plus >= 0) {
+        if (!full || !idents(sub(rest, plus + 1, len(rest) - plus - 1), false)) {
+            return false;
+        }
+        rest = sub(rest, 0, plus);
+    }
+    const dash = firstOf(rest, 45);
+    if (dash < 0) {
+        return core3(rest);
+    }
+    return core3(sub(rest, 0, dash)) && idents(sub(rest, dash + 1, len(rest) - dash - 1), full);
+}
+
+// 登记里的 since：\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?（数可带前导零）。
+function sinceOk(v: string): bool {
+    let rest = v;
+    const dash = firstOf(rest, 45);
+    if (dash >= 0) {
+        const tail = sub(rest, dash + 1, len(rest) - dash - 1);
+        if (len(tail) == 0) {
+            return false;
+        }
+        let i = 0;
+        while (i < len(tail)) {
+            const c = byteAt(tail, i) ?? 0;
+            if (!isAlnumDash(c) && c != 46) {
+                return false;
+            }
+            i = i + 1;
+        }
+        rest = sub(rest, 0, dash);
+    }
+    const parts = strSplit(rest, ".");
+    if (listLen(parts) != 3) {
+        return false;
+    }
+    for (p in parts) {
+        if (!isNumber(p, false)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 产品版本的单一来源：toolchain.tx 里恰有一行 `export const TOOLCHAIN_VERSION: string = "…";`，值为 SemVer；否则得空串（版本一致的
+// 检查随之失败）。
+function productVersion(root: string): string {
+    const src = readFile(join(root, "bootstrap/selfhost/toolchain.tx")) catch "";
+    const head = "export const TOOLCHAIN_VERSION: string = \"";
+    let found = "";
+    let n = 0;
+    for (raw in strSplit(src, "\n")) {
+        const line = raw;
+        if (startsWith(line, head) && len(line) > len(head) + 2 && sub(line, len(line) - 2, 2) == "\";") {
+            const value = sub(line, len(head), len(line) - len(head) - 2);
+            if (firstOf(value, 34) < 0 && firstOf(value, 13) < 0 && len(value) > 0) {
+                found = value;
+                n = n + 1;
+            }
+        }
+    }
+    if (n != 1 || !semverOk(found, true)) {
+        return "";
+    }
+    return found;
+}
+
+// ---------------------------------------------------------------- 小工具
+
+function texts(v: Ref<Jv>?): List<string> {
+    const out: List<string> = listNew();
+    let i = 0;
+    while (i < count(v)) {
+        const s = jText(item(v, i));
+        if (s != None) {
+            listPush(out, s ?? "");
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+function hasText(xs: List<string>, x: string): bool {
+    for (y in xs) {
+        if (y == x) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function hasTextArr(xs: []string, x: string): bool {
+    for (y in xs) {
+        if (y == x) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function contains(s: string, needle: string): bool {
+    return strFind(s, needle) >= 0;
+}
+
+function intAt(v: Ref<Jv>?, key: string): int? {
+    return jInt(at(v, key));
+}
+
+function show(r: Ref<Run>): string {
+    return "(" + toStr(r.code) + ", " + text(r.out) + ", " + text(r.err) + ")";
+}
+
+// 文件存在（是普通文件）。
+function isFile(path: string): bool {
+    const b = readBytes(path) catch (e) {
+        return false;
+    };
+    return true;
+}
+
+// ---------------------------------------------------------------- 主体
+
+function contract(c: Ref<Ctx>): void {
+    const cap = runC(c, strs(["capabilities", "--format=json"]), 180);
+    const data = readJ(cap.out);
+    const caps = at(data, "capabilities");
+    const v = textOf(caps, "toolchain_version");
+    chk(c, "product version agrees with single source", len(v) > 0 && v == productVersion(c.root), v);
+    chk(c, "capabilities schema", cap.code == 0 && textIs(data, "schema", "capabilities/1"), text(cap.out));
+    // 产品版本为 SemVer，可带预发布后缀（0.3.0-beta.1；开发线另加 -dev）。
+    chk(c, "product is SemVer version", semverOk(v, false), v);
+    // 顶层绑定：未标注且推断不了时只报 3020，不再以占位类型另报 3002；写了标注的类型不符照报 3002。
+    const globals = source(c, "global-unannotated", "const greeting = \"a\" + \"b\";\nconst bad: int = \"x\";\nexport function main(args: []string): int { return 0; }\n");
+    const gr = runC(c, strs(["run", "--format=json", globals]), 180);
+    const gd = at(readJ(gr.err), "diags");
+    let line1 = ""; let line2 = ""; let gi = 0;
+    while (gi < count(gd)) {
+        const code = toStr(intAt(item(gd, gi), "code") ?? 0);
+        if ((intAt(item(gd, gi), "line") ?? 0) == 1) { line1 = line1 + code + " "; }
+        if ((intAt(item(gd, gi), "line") ?? 0) == 2) { line2 = line2 + code + " "; }
+        gi = gi + 1;
+    }
+    chk(c, "unannotated top-level binding reports only 3020", gr.code == 1 && line1 == "3020 " && line2 == "3002 ", text(gr.err));
+    chk(c, "no internal gate field", !has(caps, "version_gate"), dump(caps));
+    const listed = texts(at(caps, "schemas"));
+    let inventory = listLen(listed) == len(SCHEMAS) && count(at(caps, "schemas")) == len(SCHEMAS);
+    for (s in SCHEMAS) {
+        if (!hasText(listed, s)) {
+            inventory = false;
+        }
+    }
+    for (s in listed) {
+        if (!hasTextArr(SCHEMAS, s)) {
+            inventory = false;
+        }
+    }
+    chk(c, "schema inventory", inventory, dump(caps));
+    const ver = runC(c, strs(["--version"]), 180);
+    chk(c, "version CLI agrees", len(v) > 0 && contains(text(ver.out), "taixu " + v + " "), text(ver.out));
+    const plain = runC(c, strs(["capabilities"]), 180);
+    chk(c, "human metadata agrees", len(v) > 0 && contains(text(plain.out), "toolchain_version=" + v) && contains(text(plain.out), "diagnostic_version=1"),
+        text(plain.out));
+    chk(c, "diagnostic version", textIs(caps, "diagnostic_version", "1"), dump(caps));
+
+    const registry = runC(c, strs(["changes", "--format=json"]), 180);
+    const changes = readJ(registry.out);
+    const entries = at(changes, "changes");
+    chk(c, "changes schema and version", registry.code == 0 && textIs(changes, "schema", "changes/1") && textIs(changes, "toolchain_version", v),
+        text(registry.out));
+    const summaryRow = at(caps, "change_registry");
+    const digest = shaHex(readBytes(join(c.root, "bootstrap/changes.tx")) catch bytesNew(0));
+    chk(c, "registry SHA and count", (intAt(summaryRow, "count") ?? -1) == count(entries) && count(entries) >= 2 && textIs(summaryRow, "sha256", digest),
+        dump(summaryRow));
+    const ids: List<string> = listNew();
+    let unique = true;
+    let k = 0;
+    while (k < count(entries)) {
+        const id = textOf(item(entries, k), "id");
+        if (hasText(ids, id)) {
+            unique = false;
+        }
+        listPush(ids, id);
+        k = k + 1;
+    }
+    chk(c, "registry identities", hasText(ids, LITERALS[0]) && hasText(ids, LITERALS[1]) && unique, dump(entries));
+    k = 0;
+    while (k < count(entries)) {
+        const e = item(entries, k);
+        const id = textOf(e, "id");
+        chk(c, "migration is not falsely automatic " + id, textIs(e, "applicability", "unavailable") && textIs(e, "gate", "alpha")
+            && sinceOk(textOf(e, "since")) && len(textOf(e, "fix")) > 0 && len(textOf(e, "implementedIn")) > 0, "");
+        for (key in ["d3", "llmGuide"]) {
+            const doc = textOf(e, key);
+            let file = doc;
+            const hash = firstOf(doc, 35);
+            if (hash >= 0) {
+                file = sub(doc, 0, hash);
+            }
+            chk(c, "registry document " + id + " " + key, len(file) > 0 && isFile(join(c.root, file)), doc);
+        }
+        if (hasTextArr(LITERALS, id)) {
+            const kind = intAt(e, "kind") ?? -1;
+            for (side in ["before", "after"]) {
+                const path = source(c, replaceAll(id, ".", "-") + "-" + side,
+                    "export function main(args: []string): int { " + textOf(e, side) + " return 0; }\n");
+                const p = runC(c, strs(["run", "--format=json", path]), 180);
+                if (kind == 2 && side == "before") {
+                    const d = readJ(p.err);
+                    let rejected = false;
+                    const diags = at(d, "diags");
+                    let j = 0;
+                    while (j < count(diags)) {
+                        if ((intAt(item(diags, j), "code") ?? 0) == 3034) {
+                            rejected = true;
+                        }
+                        j = j + 1;
+                    }
+                    chk(c, "fixed-width left literal remains rejected", p.code == 1 && textIs(d, "schema", "diag/1") && rejected, text(p.err));
+                } else {
+                    let want = "false\n";
+                    if (!((kind == 2 || kind == 3) && side == "before") && kind == 3) {
+                        want = "true\n";
+                    }
+                    chk(c, "migration behavior " + id + " " + side, p.code == 0 && text(lf(p.out)) == want && bytesLen(p.err) == 0, show(p));
+                }
+            }
+        }
+        k = k + 1;
+    }
+    rejects(c, strs(["changes", "bad"]));
+    rejects(c, strs(["changes", "--format=json", "bad"]));
+
+    schemas(c);
+
+    const raw = source(c, "raw-output", "export function main(args: []string): int { print(\"{\\\"schema\\\":\\\"user\\\"}\"); return 0; }\n");
+    const p = runC(c, strs(["run", "--format=json", raw]), 180);
+    chk(c, "user stdout is raw", p.code == 0 && text(lf(p.out)) == "{\"schema\":\"user\"}\n" && bytesLen(p.err) == 0, show(p));
+
+    protocols(c, v, raw);
+    inventoryCheck(c, caps);
+    astCheck(c);
+
+    const path = join(c.root, "docs/ai/toolchain-changes.md");
+    const human = runC(c, strs(["changes"]), 180);
+    const want = bytesFromStr(stripNewlines(text(lf(human.out))) + "\n");
+    const have = readBytes(path) catch bytesNew(0);
+    chk(c, "AI changes generated from registry", isFile(path) && human.code == 0 && bytesEqual(have, want), headOf(text(human.out), 200));
+}
+
+function rejects(c: Ref<Ctx>, args: List<string>): void {
+    const p = runC(c, args, 180);
+    chk(c, "changes rejects invalid args " + joinWith(args, " "), p.code == 64 && bytesLen(p.out) == 0, show(p));
+}
+
+function stripNewlines(s: string): string {
+    let n = len(s);
+    while (n > 0 && (byteAt(s, n - 1) ?? 0) == 10) {
+        n = n - 1;
+    }
+    return sub(s, 0, n);
+}
+
+function headOf(s: string, n: int): string {
+    if (len(s) <= n) {
+        return s;
+    }
+    return sub(s, 0, n);
+}
+
+// 各命令的 JSON 模式（stream 0 为 stdout、1 为 stderr；code −1 为不查退出码）。
+function schemas(c: Ref<Ctx>): void {
+    const names: []string = ["doc", "fmt", "bench", "disasm", "test-pass", "test-fail", "compile-error", "runtime-error"];
+    const wantSchema: []string = ["doc/1", "fmt/1", "bench/1", "disasm/1", "tests/1", "tests/1", "diag/1", "diag/1"];
+    const codes: []int = [0, -1, 0, 0, 0, 2, 1, 3];
+    const streams: []int = [0, 0, 0, 0, 0, 0, 1, 1];
+    let i = 0;
+    while (i < len(names)) {
+        const name = names[i];
+        let args = strs(["doc", "--format=json"]);
+        if (name == "fmt") {
+            args = strs(["fmt", "--check", "--format=json"]);
+        } else if (name == "bench") {
+            args = strs(["bench", "--rounds", "2", "--format=json"]);
+        } else if (name == "disasm") {
+            args = strs(["disasm", "--format=json"]);
+        } else if (name == "test-pass" || name == "test-fail") {
+            args = strs(["test", "--format=json"]);
+        } else if (name == "compile-error" || name == "runtime-error") {
+            args = strs(["run", "--format=json"]);
+        }
+        let body = "export function main(args: []string): int { print(\"user-output\"); return 0; }\n";
+        if (name == "bench") {
+            body = "export function main(args: []string): int { return 0; }\n";
+        }
+        if (name == "test-pass") {
+            body = "test \"contract\" { assert(true, \"contract\"); }\n";
+        } else if (name == "test-fail") {
+            body = "test \"contract\" { assert(false, \"contract\"); }\n";
+        } else if (name == "compile-error") {
+            body = "export function main(args: []string): int { return missing; }\n";
+        } else if (name == "runtime-error") {
+            body = "export function main(args: []string): int { assert(false, \"contract\"); return 0; }\n";
+        }
+        const path = source(c, name, body);
+        const p = runC(c, added(args, path), 180);
+        let stream = p.out;
+        if (streams[i] == 1) {
+            stream = p.err;
+        }
+        const doc = readJ(stream);
+        chk(c, "JSON schema " + name, (codes[i] < 0 || p.code == codes[i]) && textIs(doc, "schema", wantSchema[i]), show(p));
+        if (name == "test-pass" || name == "test-fail") {
+            chk(c, "test retains summary " + name, (intAt(at(doc, "summary"), "total") ?? -1) == 1 && count(at(doc, "tests")) == 1, dump(doc));
+        }
+        i = i + 1;
+    }
+}
+
+// MCP（一行一个 JSON）与 LSP（Content-Length 分帧）报的版本与应用模式名。
+function protocols(c: Ref<Ctx>, v: string, path: string): void {
+    const q = jQuote(path);
+    const lines: []string = [
+        "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"initialize\", \"params\": {\"protocolVersion\": \"2025-11-25\", \"capabilities\": {}, \"clientInfo\": {\"name\": \"contract\", \"version\": \"1\"}}}",
+        "{\"jsonrpc\": \"2.0\", \"id\": 2, \"method\": \"tools/call\", \"params\": {\"name\": \"compile\", \"arguments\": {\"path\": " + q + "}}}",
+        "{\"jsonrpc\": \"2.0\", \"id\": 3, \"method\": \"tools/call\", \"params\": {\"name\": \"run\", \"arguments\": {\"path\": " + q + "}}}",
+        "{\"jsonrpc\": \"2.0\", \"id\": 4, \"method\": \"tools/call\", \"params\": {\"name\": \"test\", \"arguments\": {\"path\": " + jQuote(join(c.work, "test-pass.tx")) + "}}}",
+        "{\"jsonrpc\": \"2.0\", \"id\": 6, \"method\": \"tools/call\", \"params\": {\"name\": \"run\", \"arguments\": {\"path\": " + jQuote(join(c.work, "runtime-error.tx")) + "}}}",
+        "{\"jsonrpc\": \"2.0\", \"id\": 5, \"method\": \"tools/call\", \"params\": {\"name\": \"disasm\", \"arguments\": {\"path\": " + q + "}}}"];
+    let input = "";
+    for (line in lines) {
+        input = input + line + "\n";
+    }
+    const args = strs(["mcp", "--trust-workspace", "--workspace", c.root, "--workspace", c.work]);
+    let code = -2;
+    let out = bytesNew(0);
+    let errText = "";
+    const m = runWithInput(c.compiler, args, c.root, bytesFromStr(input), 180000) catch (e) {
+        errText = e.message;
+        return;
+    };
+    code = m.code;
+    out = m.pending;
+    errText = text(m.err);
+    const responses: List<Ref<Jv>> = listNew();
+    for (line in linesOf(text(out))) {
+        const r = readJ(bytesFromStr(line));
+        if (isObj(r)) {
+            listPush(responses, r ?? jObject());
+        }
+    }
+    const init = byId(responses, 1);
+    chk(c, "MCP protocol and version", code == 0 && textIs(at(at(init, "result"), "serverInfo"), "version", v) && len(v) > 0, errText);
+    const ids: []int = [2, 3, 4, 5];
+    const names: []string = ["compile/1", "run/1", "tests/1", "mcp-disasm/1"];
+    let i = 0;
+    while (i < len(ids)) {
+        const r = byId(responses, ids[i]);
+        chk(c, "MCP application schema " + names[i], textIs(r, "jsonrpc", "2.0") && !has(r, "schema")
+            && textIs(at(at(r, "result"), "structuredContent"), "schema", names[i]), dump(r));
+        i = i + 1;
+    }
+    const trapped = at(at(byId(responses, 6), "result"), "structuredContent");
+    chk(c, "MCP trap diagnostic schema", textIs(readJ(bytesFromStr(textOf(trapped, "stderr"))), "schema", "diag/1"), dump(trapped));
+
+    const bodies: []string = ["{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"initialize\", \"params\": {\"capabilities\": {}}}",
+        "{\"jsonrpc\": \"2.0\", \"id\": 2, \"method\": \"shutdown\", \"params\": null}", "{\"jsonrpc\": \"2.0\", \"method\": \"exit\"}"];
+    const wire = bytesNew(0);
+    for (b in bodies) {
+        bytesAppend(wire, bytesFromStr("Content-Length: " + toStr(len(b)) + "\r\n\r\n" + b));
+    }
+    let lcode = -2;
+    let lout = bytesNew(0);
+    let lerr = "";
+    const l = runWithInput(c.compiler, strs(["lsp"]), c.root, wire, 180000) catch (e) {
+        lerr = e.message;
+        return;
+    };
+    lcode = l.code;
+    lout = l.pending;
+    lerr = text(l.err);
+    const frames = framesOf(lout);
+    const linit = byId(frames, 1);
+    chk(c, "LSP protocol and version", lcode == 0 && len(v) > 0 && textIs(at(at(linit, "result"), "serverInfo"), "version", v) && !has(linit, "schema"),
+        "(" + toStr(lcode) + ", " + toStr(listLen(frames)) + " frames, " + dump(linit) + ", " + lerr + ")");
+}
+
+function byId(xs: List<Ref<Jv>>, id: int): Ref<Jv>? {
+    for (x in xs) {
+        const got = jInt(at(x, "id"));
+        if (got != None && (got ?? -1) == id && (at(x, "id") ?? x).kind == J_NUM) {
+            return x;
+        }
+    }
+    return None;
+}
+
+// 同 Python 的 re.findall(rb'Content-Length: \d+\r\n\r\n(.*?)(?=Content-Length: |\Z)')：每个头之后到下一个头（或末尾）之间的字节按
+// JSON 读，读不了的跳过。按字节找，不经字符串位置。
+function framesOf(b: Bytes): List<Ref<Jv>> {
+    const out: List<Ref<Jv>> = listNew();
+    const head = bytesFromStr("Content-Length: ");
+    let at0 = findBytes(b, head, 0);
+    while (at0 >= 0) {
+        let p = at0 + bytesLen(head);
+        let digitsSeen = 0;
+        while (p < bytesLen(b) && isDigit(bytesGet(b, p) ?? 0)) {
+            p = p + 1;
+            digitsSeen = digitsSeen + 1;
+        }
+        const next = findBytes(b, head, at0 + bytesLen(head));
+        let end = bytesLen(b);
+        if (next >= 0) {
+            end = next;
+        }
+        const sep = digitsSeen > 0 && p + 4 <= end && (bytesGet(b, p) ?? 0) == 13 && (bytesGet(b, p + 1) ?? 0) == 10
+        && (bytesGet(b, p + 2) ?? 0) == 13 && (bytesGet(b, p + 3) ?? 0) == 10;
+        if (sep) {
+            const r = readJ(bytesSlice(b, p + 4, end - p - 4));
+            if (isObj(r)) {
+                listPush(out, r ?? jObject());
+            }
+        }
+        at0 = next;
+    }
+    return out;
+}
+
+// needle 在 b 里从 from 起第一次出现的位置；没有为 −1。
+function findBytes(b: Bytes, needle: Bytes, from: int): int {
+    let i = from;
+    while (i + bytesLen(needle) <= bytesLen(b)) {
+        let j = 0;
+        while (j < bytesLen(needle) && (bytesGet(b, i + j) ?? -1) == (bytesGet(needle, j) ?? -2)) {
+            j = j + 1;
+        }
+        if (j == bytesLen(needle)) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 诊断码清单：`taixu explain` 每行开头的“dddd [类:级]”与 tests/diagnostic-codes.json 的 codes、version 一致。
+function inventoryCheck(c: Ref<Ctx>, caps: Ref<Jv>?): void {
+    const inv = readJ(readBytes(join(c.root, "tests/diagnostic-codes.json")) catch bytesNew(0));
+    const codes = at(inv, "codes");
+    const p = runC(c, strs(["explain"]), 180);
+    const keys: List<string> = listNew();
+    const values: List<string> = listNew();
+    for (line in linesOf(text(p.out))) {
+        if (len(line) >= 8 && isNumber(sub(line, 0, 4), false) && sub(line, 4, 2) == " [") {
+            const close = firstOf(line, 93);
+            const body = sub(line, 6, close - 6);
+            const colon = firstOf(body, 58);
+            if (close > 6 && colon > 0 && colon < len(body) - 1 && isWord(sub(body, 0, colon)) && isWord(sub(body, colon + 1, len(body) - colon - 1))) {
+                const code = sub(line, 0, 4);
+                let replaced = false;
+                let i = 0;
+                while (i < listLen(keys)) {
+                    if ((listGet(keys, i) catch "") == code) {
+                        listSet(values, i, body);
+                        replaced = true;
+                    }
+                    i = i + 1;
+                }
+                if (!replaced) {
+                    listPush(keys, code);
+                    listPush(values, body);
+                }
+            }
+        }
+    }
+    let same = isObj(codes) && jLen(codes ?? jObject()) == listLen(keys);
+    let first = "";
+    let i = 0;
+    while (same && i < listLen(keys)) {
+        if (!textIs(codes, listGet(keys, i) catch "", listGet(values, i) catch "")) {
+            same = false;
+            first = (listGet(keys, i) catch "") + " " + (listGet(values, i) catch "") + " vs " + textOf(codes, listGet(keys, i) catch "");
+        }
+        i = i + 1;
+    }
+    chk(c, "current diagnostic inventory and version agree", same && textIs(caps, "diagnostic_version", textOf(inv, "version")) && has(inv, "version"),
+        toStr(listLen(keys)) + " codes, " + toStr(jLen(codes ?? jObject())) + " listed, first mismatch: " + first + ", version " + textOf(inv, "version"));
+}
+
+// Python 正则的 \w+：非空，只含字母、数字、下划线（含非 ASCII 字母；这里把非 ASCII 字节都算作字母）。
+function isWord(s: string): bool {
+    if (len(s) == 0) {
+        return false;
+    }
+    let i = 0;
+    while (i < len(s)) {
+        const ch = byteAt(s, i) ?? 0;
+        if (!(isDigit(ch) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 95 || ch >= 128)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 兼容登记 bootstrap/changes.tx 只用原生字面量 AST（结构与常量；字段、类型、数组与结构体字面量、标量）：用工具链编出的
+// change-data-probe 读，三种越界写法（函数、调用、导入）须被拒。
+function astCheck(c: Ref<Ctx>): void {
+    const out = join(c.work, "ast");
+    const built = runC(c, strs(["build", "bootstrap/selfhost/change-data-probe.tx", "--toolchain", "--out", out]), 180);
+    chk(c, "native AST reader builds", built.code == 0, text(built.err));
+    if (built.code != 0) {
+        return;
+    }
+    const probe = join(out, exeName("change-data-probe"));
+    chk(c, "registry is native literal AST", allowed(c, probe, join(c.root, "bootstrap/changes.tx")), "");
+    const cases: []string = ["function", "call", "import"];
+    const bodies: []string = ["function f(): int { return 1; }\nconst x: int = 1;\n", "const x: int = f();\n",
+        "import { x } from \"./x\";\nconst y: int = 1;\n"];
+    let i = 0;
+    while (i < len(cases)) {
+        chk(c, "data dialect rejects " + cases[i], !allowed(c, probe, source(c, "reject-" + cases[i], bodies[i])), "");
+        i = i + 1;
+    }
+}
+
+function allowed(c: Ref<Ctx>, probe: string, path: string): bool {
+    const p = runAt(probe, strs([path]), c.root, 60);
+    const tops: List<string> = listNew();
+    const kinds: List<string> = listNew();
+    for (line in linesOf(text(p.out))) {
+        const stripped = strip(line);
+        if (len(stripped) > 0) {
+            listPush(kinds, firstWord(stripped));
+        }
+        if (len(line) > 0 && (byteAt(line, 0) ?? 0) != 32) {
+            listPush(tops, firstWord(line));
+        }
+    }
+    if (p.code != 0 || listLen(tops) == 0) {
+        return false;
+    }
+    for (t in tops) {
+        if (t != "struct" && t != "const") {
+            return false;
+        }
+    }
+    for (k in kinds) {
+        if (!hasTextArr(AST_KINDS, k)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function firstWord(s: string): string {
+    const sp = firstOf(s, 32);
+    if (sp < 0) {
+        return s;
+    }
+    return sub(s, 0, sp);
+}
+
+function run(args: []string): int | Error {
+    let compiler = "";
+    let work = "";
+    let report = "";
+    let root = "";
+    let i = 0;
+    while (i < len(args)) {
+        const a = args[i];
+        if (i + 1 >= len(args)) {
+            return err("缺少取值或未知参数：" + a);
+        }
+        if (a == "--compiler") {
+            compiler = args[i + 1];
+        } else if (a == "--work") {
+            work = args[i + 1];
+        } else if (a == "--report") {
+            report = args[i + 1];
+        } else if (a == "--root") {
+            root = args[i + 1];
+        } else {
+            return err("未知参数：" + a);
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0 || len(work) == 0) {
+        return err("用法：taixu run --toolchain scripts/test_toolchain_contract.tx --compiler <原生 taixu> --work <目录> [--report 文件]");
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    if (!mkdirs(absolute(work))) {
+        return err("建不了工作目录：" + work);
+    }
+    const t = tallyNew();
+    const c = ctxNew(t, nat(osRealPath(absolute(compiler))), osRealPath(absolute(root)), osRealPath(absolute(work)));
+    contract(c);
+    toolSecurity(c);
+    const result = jObject();
+    jSet(result, "compiler_sha256", jString(shaHex(readBytes(c.compiler) catch bytesNew(0))));
+    jSet(result, "rows", c.rows);
+    let status = "PASS";
+    if (t.fail > 0) {
+        status = "FAIL";
+    }
+    jSet(result, "status", jString(status));
+    if (len(report) == 0) {
+        report = join(c.work, "report.json");
+    }
+    writeFile(report, jPretty(result, 2) + "\n")?;
+    return summary(t, "toolchain-contract");
+}
+
+function main(args: []string): int {
+    return run(args) catch (e) {
+        eprint("test_toolchain_contract: " + e.message);
+        return 2;
+    };
+}

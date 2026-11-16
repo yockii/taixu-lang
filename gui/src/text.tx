@@ -1,0 +1,139 @@
+// ============================================================================
+// gui/text —— 组件级真实文本轨（前置项）。
+//
+// **双轨制**：框架默认占位块（gui/components 8×10 块投影——零文本栈拉入，
+// min 产物故事不伤）；本模块选用**真实文本**——引用才拉栈：仅 import 本模块并把
+// realPainter()/textCanvas() 接入画布的 app 承担文本栈（字体解析、光栅、嵌入字体约 1 MB）的
+// 体积；框架层模块零引用本模块。
+//
+// 2026-10-26 起（GUI 原生引擎 G1）：文字栈为本库 engine/text（纯太虚：sfnt＋glyf／CFF 解析、
+// 无 hinting 的面积覆盖光栅、cmap＋hmtx＋GPOS kern 排版），取代旧宿主的 FreeType＋HarfBuzz；
+// 同字体同输入三端逐字节相同。字体数据是二进制，FontBundle.data 为 Bytes。
+//
+// 折行（multiline）由框架经本轨 width 回调（textMeasure）预先完成——行不越界。
+// ============================================================================
+
+import { TextPainter, Canvas, canvasWithPainter, canvasDpi, paintTextWidth } from "gui/components";
+import { dipToPxK } from "gui/surface";
+import { textFontLoad, textFontLoadFace, textFontFree, textMeasure, textDraw, textEmbedded, textSystemFace } from "./engine/text";
+
+/// 字体束：句柄＋字体字节（引擎载入时已自留一份拷贝，data 供调用方查看或另用）。
+export struct FontBundle {
+    handle: int,
+    data: Bytes,
+}
+
+/// 从候选路径逐个加载字体（测试 cwd 与仓根两种布局都命中的写法）。
+/// 返回字体束；全部候选失败得 Error（显式通道——红线 5 精神）。
+export function fontLoad(candidates: List<string>): Ref<FontBundle> | Error {
+    for (p in candidates) {
+        const bytes = readFileBytes(p) catch bytesNew(0);
+        if (bytesLen(bytes) == 0) {
+            continue;
+        }
+        const h: int = textFontLoad(bytes);
+        if (h > 0) {
+            return new FontBundle { handle: h, data: bytes };
+        }
+    }
+    return err("fontLoad: 无候选字体可读（格式不支持或路径缺失）");
+}
+
+/// 嵌入字体束（臂⑤）：随程序内嵌的 CJK 子集
+/// （ASCII＋GB2312 一级 3755＋常用标点/全角，共 3996 码位）——免随包字体
+/// 文件、免系统字体依赖，跨机确定性（回放/golden 恒此字体）。
+export function fontEmbedded(): Ref<FontBundle> | Error {
+    const bytes = textEmbedded();
+    const h: int = textFontLoad(bytes);
+    if (h <= 0) {
+        return err("fontEmbedded: 嵌入字体加载失败");
+    }
+    return new FontBundle { handle: h, data: bytes };
+}
+
+/// fontFamily 混合解析：
+/// 列表按序搜索系统字体（族名中英文都认，如 "Microsoft YaHei" 或 "微软雅黑"；字体集合按面号载入），全部未命中回落
+/// 嵌入字体（保底线，永不低于此），嵌入亦失败才 Error。回放/帧定格态恒未命中——
+/// **回放/golden 恒嵌入字体红线在引擎单点强制**（engine/text）；未装中文字体的系统，嵌入子集外的字面方块属
+/// 正常（安装中文字体并指定后即正常显示——语义判据）。
+export function fontFromFamilies(families: List<string>): Ref<FontBundle> | Error {
+    for (f in families) {
+        const face = textSystemFace(f);
+        if (len(face.path) == 0) {
+            continue;
+        }
+        const bytes = readFileBytes(face.path) catch bytesNew(0);
+        if (bytesLen(bytes) == 0) {
+            continue;
+        }
+        const h: int = textFontLoadFace(bytes, face.index);
+        if (h > 0) {
+            return new FontBundle { handle: h, data: bytes };
+        }
+    }
+    return fontEmbedded();
+}
+
+/// 界面字体的族名栈：各平台常见、含中文字形的无衬线界面字体，按序取第一个装了的——
+/// Windows 微软雅黑 UI；macOS 苹方、冬青黑体；Linux 思源黑体（Noto Sans CJK／Source Han Sans）、文泉驿。
+/// 取向同 CSS 的 system-ui 字体栈；只收含中文字形的字体，因为本轨不做逐字回退（栈里排 Segoe UI 之类
+/// 西文字体会让中文全成方块）。可在前面插入自己的首选再交给 fontFromFamilies。
+export function uiFontFamilies(): List<string> {
+    const out: List<string> = listNew();
+    for (f in ["Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", "Source Han Sans SC", "WenQuanYi Micro Hei"]) {
+        listPush(out, f);
+    }
+    return out;
+}
+
+/// 界面字体：fontFromFamilies(uiFontFamilies())——真窗用系统的中文界面字体，都没装则用嵌入字体；
+/// 重放与定格态恒为嵌入字体（golden 不随机器变）。
+export function fontUi(): Ref<FontBundle> | Error {
+    return fontFromFamilies(uiFontFamilies());
+}
+
+export function fontFree(bundle: Ref<FontBundle>): void {
+    textFontFree(bundle.handle);
+}
+
+/// 真实轨画笔（font/size 经闭包值快照携带——捕获只读，语义天然适配）。
+/// draw 形状＝TextPainter 冻结契约（canvas, x, y, color, body——内容坐标）；
+/// 可见性判界后单次 draw（逐像素裁剪为 engine setClip 同款可选优化位）。
+export function realPainter(font: int, size: int): Ref<TextPainter> {
+    return realPainterK(font, size, 100);
+}
+
+/// 帧级 DPI 画笔（臂①）：k＝DPI 比例 x100——位置与字号
+/// 按 k 出物理像素（字形随字号重渲染＝真缩放非位图拉伸）；width 度量恒
+/// DIP（布局空间不变——组件坐标不缩放）。k=100 与 realPainter 恒等。
+export function realPainterK(font: int, size: int, k: int): Ref<TextPainter> {
+    const draw = (c: Ref<Canvas>, x: int, y: int, color: int, body: string): void => {
+        const sx: int = dipToPxK(x - c.off_x, c.k);
+        const sy: int = dipToPxK(y - c.off_y, c.k);
+        const wpx: int = dipToPxK(paintTextWidth(c, body), c.k);
+        if (sx + wpx < c.clip_x || sx >= c.clip_x + c.clip_w) {
+            return;
+        }
+        if (sy + dipToPxK(14, c.k) < c.clip_y || sy >= c.clip_y + c.clip_h) {
+            return;
+        }
+        textDraw(c.h, font, dipToPxK(size, c.k), body, sx, sy, color);
+    };
+    const width = (body: string): int => {
+        return textMeasure(font, size, body);
+    };
+    return new TextPainter { draw: draw, width: width };
+}
+
+/// 真实轨画布一步构造（`App({text:true})` 语义开关的实现形态：把本模块
+/// 接入画布即整 app 切真实文本轨；不 import 本模块的 app 恒占位块轨）。
+export function textCanvas(surface: int, w: int, h: int, font: int, size: int): Ref<Canvas> {
+    return canvasWithPainter(surface, w, h, realPainter(font, size));
+}
+
+/// 帧级 DPI 画布一步构造（臂①）：w/h 为 DIP（与 app.w/h 同单位
+/// ——clip 由内部按 k 出物理面），size 为 DIP 字号——真实轨按 k 出物理像素。
+/// k=100 时与 textCanvas 逐字节等价（回放/golden 恒等锚）。
+export function textCanvasK(surface: int, w: int, h: int, font: int, size: int, k: int): Ref<Canvas> {
+    return canvasDpi(surface, dipToPxK(w, k), dipToPxK(h, k), realPainterK(font, size, k), k);
+}

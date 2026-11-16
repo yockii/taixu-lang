@@ -1,0 +1,112 @@
+// AES-128-GCM，SP 800-38D；固定 96 位 nonce 与 128 位 tag。相同密钥不可重复 nonce。
+import { aes128Expand, aes128Block } from "./aes_impl";
+import { constantTimeEqual } from "./subtle";
+
+struct GHash { h0: int, h1: int, h2: int, h3: int, y0: int, y1: int, y2: int, y3: int }
+
+function at(data: Bytes, index: int): int { return bytesGet(data, index) catch panic("gcm: internal bounds"); }
+
+function word(data: Bytes, offset: int, end: int): int {
+    let out = 0; let i = 0;
+    while (i < 4) {
+        let b = 0;
+        if (offset + i < end) { b = at(data, offset + i); }
+        out = (out << 8) | b; i = i + 1;
+    }
+    return out;
+}
+
+function putWord(data: Bytes, offset: int, value: int): void {
+    let i = 0;
+    while (i < 4) { bytesSet(data, offset + i, (value >> ((3 - i) * 8)) & 255); i = i + 1; }
+}
+
+function update(h: Ref<GHash>, x0: int, x1: int, x2: int, x3: int): void {
+    const w0 = x0 ^ h.y0; const w1 = x1 ^ h.y1; const w2 = x2 ^ h.y2; const w3 = x3 ^ h.y3;
+    let v0 = h.h0; let v1 = h.h1; let v2 = h.h2; let v3 = h.h3;
+    let z0 = 0; let z1 = 0; let z2 = 0; let z3 = 0;
+    let i = 0;
+    while (i < 128) {
+        let w = w0;
+        if (i >= 96) { w = w3; } else if (i >= 64) { w = w2; } else if (i >= 32) { w = w1; }
+        const mask = -((w >> (31 - i % 32)) & 1);
+        z0 = z0 ^ (v0 & mask); z1 = z1 ^ (v1 & mask); z2 = z2 ^ (v2 & mask); z3 = z3 ^ (v3 & mask);
+        const low = v3 & 1;
+        v3 = (v3 >> 1) | ((v2 & 1) << 31);
+        v2 = (v2 >> 1) | ((v1 & 1) << 31);
+        v1 = (v1 >> 1) | ((v0 & 1) << 31);
+        v0 = (v0 >> 1) ^ (3774873600 & -low);
+        i = i + 1;
+    }
+    h.y0 = z0; h.y1 = z1; h.y2 = z2; h.y3 = z3;
+}
+
+function consume(h: Ref<GHash>, data: Bytes): void {
+    let offset = 0;
+    const end = bytesLen(data);
+    while (offset < end) {
+        update(h, word(data, offset, end), word(data, offset + 4, end), word(data, offset + 8, end), word(data, offset + 12, end));
+        offset = offset + 16;
+    }
+}
+
+function tag(schedule: Bytes, nonce: Bytes, aad: Bytes, ciphertext: Bytes): Bytes {
+    const subkey = aes128Block(schedule, bytesNew(16));
+    const h = new GHash { h0: word(subkey, 0, 16), h1: word(subkey, 4, 16), h2: word(subkey, 8, 16), h3: word(subkey, 12, 16),
+        y0: 0, y1: 0, y2: 0, y3: 0 };
+    consume(h, aad); consume(h, ciphertext);
+    const a = bytesLen(aad); const c = bytesLen(ciphertext);
+    update(h, a / 536870912, (a % 536870912) * 8, c / 536870912, (c % 536870912) * 8);
+    const initial = bytesNew(16);
+    bytesCopy(initial, 0, nonce, 0, 12); bytesSet(initial, 15, 1);
+    const out = aes128Block(schedule, initial);
+    const hash = bytesNew(16);
+    putWord(hash, 0, h.y0); putWord(hash, 4, h.y1); putWord(hash, 8, h.y2); putWord(hash, 12, h.y3);
+    let i = 0;
+    while (i < 16) { bytesSet(out, i, at(out, i) ^ at(hash, i)); i = i + 1; }
+    return out;
+}
+
+function crypt(schedule: Bytes, nonce: Bytes, data: Bytes): Bytes {
+    const out = bytesNew(bytesLen(data));
+    const counter = bytesNew(16);
+    bytesCopy(counter, 0, nonce, 0, 12);
+    let index = 2; let offset = 0;
+    while (offset < bytesLen(data)) {
+        putWord(counter, 12, index);
+        const stream = aes128Block(schedule, counter);
+        let n = bytesLen(data) - offset;
+        if (n > 16) { n = 16; }
+        let i = 0;
+        while (i < n) { bytesSet(out, offset + i, at(data, offset + i) ^ at(stream, i)); i = i + 1; }
+        offset = offset + n; index = index + 1;
+    }
+    return out;
+}
+
+function valid(key: Bytes, nonce: Bytes, aad: Bytes, length: int): void | Error {
+    if (bytesLen(key) != 16 || bytesLen(nonce) != 12) { return err("gcm: requires 16-byte key and 12-byte nonce"); }
+    if (length < 0 || length > 68719476704 || bytesLen(aad) > 2305843009213693951) { return err("gcm: input exceeds GCM length limit"); }
+    return done();
+}
+
+export function aes128GcmSeal(key: Bytes, nonce: Bytes, aad: Bytes, plaintext: Bytes): Bytes | Error {
+    valid(key, nonce, aad, bytesLen(plaintext))?;
+    const schedule = aes128Expand(key);
+    const ciphertext = crypt(schedule, nonce, plaintext);
+    bytesAppend(ciphertext, tag(schedule, nonce, aad, ciphertext));
+    return ciphertext;
+}
+
+// 认证失败只交出 Error，不分配或返回明文缓冲。
+export function aes128GcmOpen(key: Bytes, nonce: Bytes, aad: Bytes, sealed: Bytes): Bytes | Error {
+    const length = bytesLen(sealed) - 16;
+    valid(key, nonce, aad, length)?;
+    const schedule = aes128Expand(key);
+    const ciphertext = bytesSlice(sealed, 0, length);
+    const received = bytesSlice(sealed, length, 16);
+    if (!constantTimeEqual(received, tag(schedule, nonce, aad, ciphertext))) { return err("gcm: authentication failed"); }
+    return crypt(schedule, nonce, ciphertext);
+}
+
+function done(): void {}

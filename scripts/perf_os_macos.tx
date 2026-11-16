@@ -1,0 +1,129 @@
+// 性能测量取子进程读数的 macOS 部分（导出面同 perf_os_linux.tx、perf_os_windows.tx）：子进程退出后、回收之前（waitid 带 WNOWAIT，
+// 期间照常排空它的输出）取 proc_pid_rusage(RUSAGE_INFO_V4) 的 ri_instructions 与 ri_cycles（Apple 芯片由性能计数器给出，不需要 root；
+// Rosetta 下数的是翻译后的 arm64 指令，跨架构对照改用 cycles），再由 procWait 回收。CPU 时间与峰值常驻内存取
+// getrusage(RUSAGE_CHILDREN)（macOS 的 ru_maxrss 以字节计）；调用方须是新起的小进程（perf_lib.tx 的 --perf-helper），只有这一个子进程。
+// 在 Rosetta 下运行的帮手经 posix_spawn 起通用二进制时选 x86_64 切片（M1 上实测 /usr/bin/true 由约 750 万条指令变成约 2 亿），被测的
+// 太虚编译器是单架构的，不受影响。
+// 偏移按 Apple 的 sys/resource.h 与 sys/wait.h：rusage_info_v4 共 296 字节，instructions 在 248、cycles 在 256；siginfo_t 104 字节，si_pid
+// 在 12；P_PID 1、WEXITED 4、WNOHANG 1、WNOWAIT 32；struct rusage 的 ru_utime、ru_stime 各为 i64 秒＋i32 微秒（补齐到 16 字节），ru_maxrss
+// 在 32。
+import { lossyText } from "./check_lib";
+import { pipesNew, pipesOpen, pump, pumpRest } from "./perf_child";
+
+declare function waitid(idtype: i32, id: u32, info: Bytes, options: i32): i32 from "libSystem";
+declare function proc_pid_rusage(pid: i32, flavor: i32, buf: Bytes): i32 from "libSystem";
+declare function getrusage(who: i32, usage: Bytes): i32 from "libSystem";
+declare function usleep(us: u32): i32 from "libSystem";
+declare function clock_gettime(clock: i32, ts: Bytes): i32 from "libSystem";
+
+export struct PerfSample {
+    exit: int,
+    wallNs: int,
+    cpuNs: int,
+    peakKib: int,
+    // 用户态退休指令数与周期数（Linux、macOS）；Windows 为 −1。
+    instructions: int,
+    cycles: int,
+    // QueryProcessCycleTime 的周期（Windows）；别处为 −1。
+    cycleTime: int,
+    // 子进程刚起来时允许它运行的逻辑 CPU，逗号分隔；macOS 为空。
+    cpus: string,
+    // 非空时本样本作废（起不来、超时、计数器多路复用等）。
+    error: string,
+    // 子进程的 stderr（非法 UTF-8 按 U+FFFD 替换）。
+    stderr: string,
+}
+
+const P_PID: int = 1;
+const WAIT_FLAGS: int = 37;
+const SIGINFO_SIZE: int = 104;
+const SI_PID_AT: int = 12;
+const RUSAGE_INFO_V4: int = 4;
+const RUSAGE_INFO_SIZE: int = 296;
+const INSTRUCTIONS_AT: int = 248;
+const CYCLES_AT: int = 256;
+const RUSAGE_CHILDREN: int = -1;
+const MAXRSS_AT: int = 32;
+const SEC: int = 1000000000;
+const DRAIN_MS: int = 10000;
+
+function fail(why: string): Ref<PerfSample> {
+    return new PerfSample { exit: -1, wallNs: 0, cpuNs: 0, peakKib: 0, instructions: -1, cycles: -1, cycleTime: -1, cpus: "", error: why,
+        stderr: "" };
+}
+
+// 在 cwd 里运行 exe（stdin 接空设备，stdout 丢弃，stderr 留在样本里），至多 limitMs 毫秒。
+export function perfRun(exe: string, args: List<string>, cwd: string, limitMs: int): Ref<PerfSample> {
+    const t0 = monoNs();
+    const h = procSpawn(exe, args, cwd, 0) catch (e) {
+        return fail("spawn " + e.message);
+    };
+    const pid = procPid(h);
+    const p = pipesNew(h);
+    const info = bytesNew(SIGINFO_SIZE);
+    const deadline = t0 + limitMs * 1000000;
+    let exited = false;
+    while (!exited) {
+        if (pipesOpen(p)) {
+            pump(p, 20);
+        } else {
+            usleep(1000);
+        }
+        // WEXITED｜WNOHANG｜WNOWAIT：子进程还没退出时立即返回 0，si_pid 保持 0。
+        bytesSetLE<i32>(info, SI_PID_AT, 0);
+        if (waitid(P_PID as i32, pid as u32, info, WAIT_FLAGS as i32) != 0) {
+            procKill(h);
+            procClose(h);
+            return fail("waitid");
+        }
+        exited = (bytesGetLE<i32>(info, SI_PID_AT) ?? 0) != 0;
+        if (!exited && monoNs() > deadline) {
+            procKill(h);
+            procClose(h);
+            return fail("timeout");
+        }
+    }
+    const s = fail("");
+    s.wallNs = monoNs() - t0;
+    const ri = bytesNew(RUSAGE_INFO_SIZE);
+    if (proc_pid_rusage(pid as i32, RUSAGE_INFO_V4 as i32, ri) == 0) {
+        s.instructions = bytesGetLE<int>(ri, INSTRUCTIONS_AT) ?? -1;
+        s.cycles = bytesGetLE<int>(ri, CYCLES_AT) ?? -1;
+    } else {
+        s.error = "proc_pid_rusage";
+    }
+    pumpRest(p, DRAIN_MS);
+    const code = procWait(h, 5000);
+    procClose(h);
+    s.stderr = lossyText(p.err);
+    if (code == None) {
+        s.error = "child not reaped";
+        return s;
+    }
+    s.exit = code ?? -1;
+    const ru = bytesNew(144);
+    if (getrusage(RUSAGE_CHILDREN as i32, ru) == 0) {
+        s.cpuNs = ((bytesGetLE<int>(ru, 0) ?? 0) + (bytesGetLE<int>(ru, 16) ?? 0)) * SEC
+        + (((bytesGetLE<i32>(ru, 8) ?? 0) as int) + ((bytesGetLE<i32>(ru, 24) ?? 0) as int)) * 1000;
+        s.peakKib = (bytesGetLE<int>(ru, MAXRSS_AT) ?? 0) / 1024;
+    } else {
+        s.error = "getrusage";
+    }
+    return s;
+}
+
+// 当前时间的 Unix 秒（CLOCK_REALTIME）。
+export function unixSeconds(): int {
+    const ts = bytesNew(16);
+    clock_gettime(0, ts);
+    return bytesGetLE<int>(ts, 0) ?? 0;
+}
+
+// macOS 没有 CPU 亲和接口（只有线程级的亲和提示），记空。
+export function ownCpus(): string {
+    return "";
+}
+
+export function pinCpu(cpu: int): void | Error {
+    return err("macOS 不能把进程固定在某个逻辑 CPU 上");
+}

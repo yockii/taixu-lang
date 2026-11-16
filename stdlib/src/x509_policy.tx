@@ -1,0 +1,117 @@
+import { X509Certificate } from "./x509_types";
+import { DerValue, derRead, derChildren, derContents, derPositiveInteger, derBitString } from "./crypto/der";
+import { x509Oid } from "./x509_der";
+import { X509NameConstraints, x509NoNameConstraints, x509ParseNameConstraints } from "./x509_constraints";
+
+export struct X509PathPolicy {
+    basicPresent: bool, ca: bool, pathLen: int,
+    keyUsagePresent: bool, digitalSignature: bool, certSign: bool,
+    serverAuth: bool, constraints: X509NameConstraints,
+}
+
+function root(data: Bytes, tag: int): DerValue | Error {
+    const value = derRead(data, 0, bytesLen(data))?;
+    if (value.tag != tag || value.end != bytesLen(data)) { return err("x509: invalid extension encoding"); } return value;
+}
+function basic(data: Bytes, policy: Ref<X509PathPolicy>): void | Error {
+    const fields = derChildren(data, root(data, 48)?, 2)?; let at = 0;
+    policy.basicPresent = true;
+    if (listLen(fields) > 0 && listGet(fields, 0).tag == 1) {
+        const raw = derContents(data, listGet(fields, 0))?;
+        if (bytesLen(raw) != 1 || (bytesGet(raw, 0) catch 0) != 255) { return err("x509: invalid or explicit default CA boolean"); }
+        policy.ca = true; at = 1;
+    }
+    if (at < listLen(fields)) {
+        const raw = derPositiveInteger(data, listGet(fields, at), 4)?; let n = 0; let i = 0;
+        while (i < bytesLen(raw)) { n = n * 256 + (bytesGet(raw, i) catch 0); i = i + 1; }
+        if (!policy.ca) { return err("x509: pathLen requires CA"); } policy.pathLen = n; at = at + 1;
+    }
+    if (at != listLen(fields)) { return err("x509: extra BasicConstraints fields"); } return done();
+}
+
+function usage(data: Bytes, policy: Ref<X509PathPolicy>): void | Error {
+    // 同 Go 与 OpenSSL：未用的填充位必须为 0，但不要求命名位的最短编码（Trustwave 两张 ECC 根证书用 03 03 07 06 00）。
+    const bits = derBitString(data, root(data, 3)?)?; const n = bytesLen(bits.data);
+    if (n < 1 || n > 2) { return err("x509: invalid KeyUsage bits"); }
+    const last = bytesGet(bits.data, n - 1) catch 0;
+    if ((last & ((1 << bits.unused) - 1)) != 0) { return err("x509: KeyUsage padding bits"); }
+    const first = bytesGet(bits.data, 0) catch 0; let second = 0; if (n == 2) { second = bytesGet(bits.data, 1) catch 0; }
+    if (second != 0 && second != 128) { return err("x509: invalid KeyUsage bits"); }
+    if (first == 0 && second == 0) { return err("x509: empty KeyUsage"); }
+    if (((first & 1) != 0 || second == 128) && (first & 8) == 0) { return err("x509: encipherOnly or decipherOnly requires keyAgreement"); }
+    policy.keyUsagePresent = true; policy.digitalSignature = (first & 128) != 0; policy.certSign = (first & 4) != 0;
+    return done();
+}
+
+function extended(data: Bytes, policy: Ref<X509PathPolicy>): void | Error {
+    const fields = derChildren(data, root(data, 48)?, 128)?;
+    if (listLen(fields) == 0) { return err("x509: empty ExtendedKeyUsage"); }
+    policy.serverAuth = false; const seen: List<string> = listNew();
+    for (field in fields) {
+        const oid = x509Oid(data, field)?;
+        for (existing in seen) { if (existing == oid) { return err("x509: duplicate ExtendedKeyUsage"); } } listPush(seen, oid);
+        if (oid == "2b06010505070301" || oid == "551d2500") { policy.serverAuth = true; }
+    }
+    return done();
+}
+
+function subjectKey(data: Bytes): void | Error {
+    const value = root(data, 4)?;
+    if (value.end == value.content) { return err("x509: empty subjectKeyIdentifier"); } return done();
+}
+function authorityKey(data: Bytes): void | Error {
+    const fields = derChildren(data, root(data, 48)?, 3)?; let previous = -1; let issuer = false; let serial = false;
+    for (field in fields) {
+        let order = -1; if (field.tag == 128) { order = 0; } else if (field.tag == 161) { order = 1; } else if (field.tag == 130) { order = 2; }
+        if (order < 0 || order <= previous || field.end == field.content) { return err("x509: invalid authorityKeyIdentifier"); } previous = order;
+        if (order == 1) { issuer = true; const names = derChildren(data, field, 128)?; if (listLen(names) == 0) { return err("x509: empty authority issuer"); } }
+        if (order == 2) { serial = true; let integer = field; integer.tag = 2; derPositiveInteger(data, integer, 128)?; }
+    }
+    if (issuer != serial) { return err("x509: authority issuer and serial must occur together"); } return done();
+}
+
+function policies(data: Bytes, critical: bool): void | Error {
+    const entries = derChildren(data, root(data, 48)?, 128)?;
+    if (listLen(entries) == 0) { return err("x509: empty certificatePolicies"); }
+    const seen: List<string> = listNew();
+    for (entry in entries) {
+        if (entry.tag != 48) { return err("x509: invalid PolicyInformation"); }
+        const fields = derChildren(data, entry, 2)?; if (listLen(fields) == 0) { return err("x509: missing policy OID"); }
+        const oid = x509Oid(data, listGet(fields, 0))?;
+        for (existing in seen) { if (existing == oid) { return err("x509: duplicate certificate policy"); } } listPush(seen, oid);
+        if (listLen(fields) == 2) {
+            const qualifiers = listGet(fields, 1);
+            if (qualifiers.tag != 48) { return err("x509: invalid policy qualifiers"); }
+            const items = derChildren(data, qualifiers, 128)?;
+            if (listLen(items) == 0) { return err("x509: empty policy qualifiers"); }
+            for (item in items) {
+                if (item.tag != 48) { return err("x509: invalid PolicyQualifierInfo"); }
+                const pair = derChildren(data, item, 2)?;
+                if (listLen(pair) != 2) { return err("x509: invalid policy qualifier fields"); }
+                const qualifier = x509Oid(data, listGet(pair, 0))?;
+                if (critical && qualifier != "2b06010505070201" && qualifier != "2b06010505070202") { return err("x509: unsupported critical policy qualifier"); }
+            }
+        }
+    }
+    return done();
+}
+
+export function x509ReadPathPolicy(cert: Ref<X509Certificate>): Ref<X509PathPolicy> | Error {
+    const policy = new X509PathPolicy { basicPresent: false, ca: false, pathLen: -1, keyUsagePresent: false, digitalSignature: false, certSign: false, serverAuth: true, constraints: x509NoNameConstraints() };
+    for (extension in cert.extensions) {
+        const oid = extension.oidHex; const data = extension.value;
+        if (oid == "551d13") { basic(data, policy)?; }
+        else if (oid == "551d0f") { usage(data, policy)?; }
+        else if (oid == "551d25") { extended(data, policy)?; }
+        else if (oid == "551d1e") { policy.constraints = x509ParseNameConstraints(data)?; }
+        else if (oid == "551d0e") { subjectKey(data)?; }
+        else if (oid == "551d23") { authorityKey(data)?; }
+        else if (oid == "551d20") { policies(data, extension.critical)?; }
+        else if (oid == "551d21" || oid == "551d24" || oid == "551d36") { return err("x509: policy mapping or constraint requires policy-tree support"); }
+        else if (oid != "551d11" && extension.critical) { return err("x509: unhandled critical extension " + oid); }
+    }
+    if (!policy.ca && (listLen(policy.constraints.permitted) > 0 || listLen(policy.constraints.excluded) > 0)) { return err("x509: nameConstraints requires CA"); }
+    return policy;
+}
+
+function done(): void {}

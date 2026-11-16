@@ -1,0 +1,822 @@
+// ============================================================================
+// engine/x11 —— X11 线协议客户端（纯太虚；GUI 原生引擎 G3，只供 platform_linux 使用）。
+//
+// - 经 from syscall 用 Unix 域套接字直连 X 服务器（同 Go xgb、Rust x11rb 的纯语言连接），产物保持静态、不依赖 libX11／libxcb；
+//   Xorg、Xwayland、WSLg 都能连。DISPLAY 为 ":n"、":n.s"、"unix:n" 时先连 /tmp/.X11-unix/Xn，不通再试抽象套接字
+//   "\0/tmp/.X11-unix/Xn"（同 libxcb 的两种地址）；主机名形式（TCP、ssh -X 转发）暂不支持。
+// - 认证：读 XAUTHORITY（缺省 ~/.Xauthority）里本机名或通配、显示号相符的 MIT-MAGIC-COOKIE-1；没有文件或没有条目时不带认证
+//   （WSLg、本机 Xwayland 常见）。
+// - X 服务器的数据按半可信输入处理：逐字段读、越界读作 0，回复长度、键盘映射、属性大小都有上限；连接断开、5 秒等不到回复或
+//   数据坏时整个连接作废（xAlive 为假，平台层给窗口发关闭事件），不 trap——Xlib 的缺省错误处理会直接退出进程，这里不学。
+// - 请求立即写出（套接字为阻塞式）；带回复的请求同步等回复，期间到达的事件入队。序号按 16 位回绕比对。
+// ============================================================================
+
+import { getenv } from "std/os";
+
+// 系统调用写名字；通用表架构（aarch64、龙芯、riscv64）没有 poll，各架构统一用 ppoll（同 glibc 在这些架构上
+// 的 poll）。
+declare function lxSocket(domain: int, kind: int, proto: int): int from syscall "socket";
+declare function lxConnect(fd: int, addr: Bytes, alen: int): int from syscall "connect";
+declare function lxSendto(fd: int, buf: Bytes, n: int, flags: int, addr: int, alen: int): int from syscall "sendto";
+declare function lxRecvfrom(fd: int, buf: Bytes, n: int, flags: int, addr: int, alen: int): int from syscall "recvfrom";
+declare function lxPpoll(fds: Bytes, n: int, ts: Bytes, sigmask: int, sigsetsize: int): int from syscall "ppoll";
+declare function lxClose(fd: int): int from syscall "close";
+declare function lxUname(buf: Bytes): int from syscall "uname";
+declare function lxClockGettime(clock: int, ts: Bytes): int from syscall "clock_gettime";
+
+const AF_UNIX: int = 1;
+const STREAM_CLOEXEC: int = 524289; // SOCK_STREAM | SOCK_CLOEXEC
+const MSG_NOSIGNAL: int = 16384;
+const EINTR: int = 4;
+const MAX_PACKET: int = 67108864; // 单个回复至多 64 MiB
+const REPLY_WAIT_MS: int = 5000;
+
+let xfd: int = -1;
+let xTried: bool = false;
+let xDead: bool = false;
+let xSeq: int = 0;
+let idBase: int = 0;
+let idMask: int = 0;
+let idNext: int = 1;
+let maxReq: int = 16384; // 单个请求的最大字节数
+let xRoot: int = 0;
+let xVisual: int = 0;
+let xDepth: int = 0;
+let xBpp: int = 0;
+let xRootW: int = 0;
+let xRootH: int = 0;
+let xMsb: bool = false; // 服务器的图像字节序为高位在前
+let minKey: int = 8;
+let maxKey: int = 255;
+let keysPer: int = 0;
+let keymap: List<int> = listNew();
+let inbuf: Bytes = bytesNew(0);
+let inpos: int = 0;
+let pending: List<Bytes> = listNew(); // 已读到、尚未取走的事件（各 32 字节）
+let atomNames: List<string> = listNew();
+let atomIds: List<int> = listNew();
+
+// —— 编码与读取（X 按连接时声明的字节序；本客户端声明小端）——
+
+export function w8(b: Bytes, v: int): void {
+    bytesPush(b, v & 255);
+}
+
+export function w16(b: Bytes, v: int): void {
+    bytesPush(b, v & 255);
+    bytesPush(b, (v >> 8) & 255);
+}
+
+export function w32(b: Bytes, v: int): void {
+    w16(b, v & 0xFFFF);
+    w16(b, (v >> 16) & 0xFFFF);
+}
+
+export function pad4(b: Bytes): void {
+    while (bytesLen(b) % 4 != 0) {
+        bytesPush(b, 0);
+    }
+}
+
+export function r8(b: Bytes, o: int): int {
+    return bytesGet(b, o) catch 0;
+}
+
+export function r16(b: Bytes, o: int): int {
+    const v: int = bytesGetLE<u16>(b, o) catch 0;
+    return v;
+}
+
+export function s16(b: Bytes, o: int): int {
+    const v: int = bytesGetLE<i16>(b, o) catch 0;
+    return v;
+}
+
+export function r32(b: Bytes, o: int): int {
+    const v: int = bytesGetLE<u32>(b, o) catch 0;
+    return v;
+}
+
+function rbe16(b: Bytes, o: int): int {
+    const v: int = bytesGetBE<u16>(b, o) catch 0;
+    return v;
+}
+
+/// 单调时钟毫秒。
+export function xNowMs(): int {
+    const ts = bytesNew(16);
+    lxClockGettime(1, ts);
+    const s: int = bytesGetLE<i64>(ts, 0) catch 0;
+    const ns: int = bytesGetLE<i64>(ts, 8) catch 0;
+    return s * 1000 + ns / 1000000;
+}
+
+function kill(): void {
+    if (xfd >= 0) {
+        lxClose(xfd);
+    }
+    xfd = -1;
+    xDead = true;
+    pending = listNew();
+    inbuf = bytesNew(0);
+    inpos = 0;
+}
+
+/// 连接是否可用。
+export function xAlive(): bool {
+    return xfd >= 0 && !xDead;
+}
+
+function sendAll(b: Bytes): bool {
+    if (!xAlive()) {
+        return false;
+    }
+    const n: int = bytesLen(b);
+    let off: int = 0;
+    while (off < n) {
+        let part: Bytes = b;
+        if (off > 0) {
+            part = bytesSlice(b, off, n - off);
+        }
+        const r: int = lxSendto(xfd, part, n - off, MSG_NOSIGNAL, 0, 0);
+        if (r == 0 - EINTR) {
+            continue;
+        }
+        if (r <= 0) {
+            kill();
+            return false;
+        }
+        off = off + r;
+    }
+    return true;
+}
+
+/// 发一条请求：操作码、头部数据字节、请求体（须已按 4 字节补齐）。返回该请求的序号（失败 -1）。
+export function xReq(op: int, data: int, body: Bytes): int {
+    const n: int = 4 + bytesLen(body);
+    if (n % 4 != 0 || n > maxReq) {
+        return -1;
+    }
+    const h = bytesNew(0);
+    w8(h, op);
+    w8(h, data);
+    w16(h, n / 4);
+    if (!sendAll(h) || (bytesLen(body) > 0 && !sendAll(body))) {
+        return -1;
+    }
+    xSeq = (xSeq + 1) & 0xFFFF;
+    return xSeq;
+}
+
+/// 单个请求的最大字节数。
+export function xMaxReq(): int {
+    return maxReq;
+}
+
+// 至多等 timeoutMs 毫秒读一批数据；读到得 true。
+function fill(timeoutMs: int): bool {
+    if (!xAlive()) {
+        return false;
+    }
+    const pfd = bytesNew(8);
+    bytesSetLE<i32>(pfd, 0, xfd as i32);
+    bytesSetLE<i16>(pfd, 4, 1);
+    let t: int = timeoutMs;
+    if (t < 0) {
+        t = 0;
+    }
+    // ppoll 的超时是 timespec（秒、纳秒）；不改信号掩码（sigmask 为空，sigsetsize 照 glibc 给 8）。
+    const ts = bytesNew(16);
+    bytesSetLE<i64>(ts, 0, t / 1000);
+    bytesSetLE<i64>(ts, 8, (t % 1000) * 1000000);
+    const r: int = lxPpoll(pfd, 1, ts, 0, 8);
+    if (r <= 0) {
+        return false;
+    }
+    const buf = bytesNew(65536);
+    const got: int = lxRecvfrom(xfd, buf, 65536, 0, 0, 0);
+    if (got == 0 - EINTR) {
+        return false;
+    }
+    if (got <= 0) {
+        kill();
+        return false;
+    }
+    if (inpos > 0 && inpos == bytesLen(inbuf)) {
+        inbuf = bytesNew(0);
+        inpos = 0;
+    }
+    bytesAppend(inbuf, bytesSlice(buf, 0, got));
+    return true;
+}
+
+// 取一个完整的包（事件、错误 32 字节；回复与通用事件 32＋4×长度）；不够时得空 Bytes。
+function nextPacket(): Bytes {
+    const avail: int = bytesLen(inbuf) - inpos;
+    if (avail < 32) {
+        return bytesNew(0);
+    }
+    const t: int = r8(inbuf, inpos) & 0x7F;
+    let total: int = 32;
+    if (t == 1 || t == 35) {
+        const extra: int = r32(inbuf, inpos + 4);
+        if (extra > MAX_PACKET / 4) {
+            kill();
+            return bytesNew(0);
+        }
+        total = 32 + extra * 4;
+    }
+    if (avail < total) {
+        return bytesNew(0);
+    }
+    const p = bytesSlice(inbuf, inpos, total);
+    inpos = inpos + total;
+    if (inpos > 65536) {
+        inbuf = bytesSlice(inbuf, inpos, bytesLen(inbuf) - inpos);
+        inpos = 0;
+    }
+    return p;
+}
+
+// 把已读到的完整包分拣：事件入队，异步错误与无人等的回复丢弃。
+function sortAvailable(): void {
+    let p = nextPacket();
+    while (bytesLen(p) > 0) {
+        if ((r8(p, 0) & 0x7F) >= 2) {
+            listPush(pending, p);
+        }
+        p = nextPacket();
+    }
+}
+
+/// 发请求并等它的回复；出错、超时或连接断开得空 Bytes。
+export function xReqReply(op: int, data: int, body: Bytes): Bytes {
+    const seq: int = xReq(op, data, body);
+    if (seq < 0) {
+        return bytesNew(0);
+    }
+    const deadline: int = xNowMs() + REPLY_WAIT_MS;
+    while (xAlive()) {
+        let p = nextPacket();
+        while (bytesLen(p) > 0) {
+            const t: int = r8(p, 0) & 0x7F;
+            const ps: int = r16(p, 2);
+            if (t == 1 && ps == seq) {
+                return p;
+            }
+            if (t == 0 && ps == seq) {
+                return bytesNew(0);
+            }
+            if (t >= 2) {
+                listPush(pending, p);
+            }
+            p = nextPacket();
+        }
+        const left: int = deadline - xNowMs();
+        if (left <= 0) {
+            kill();
+            return bytesNew(0);
+        }
+        fill(left);
+    }
+    return bytesNew(0);
+}
+
+/// 取下一条事件（32 字节），至多等 timeoutMs 毫秒；没有得空 Bytes。
+export function xNextEvent(timeoutMs: int): Bytes {
+    if (listLen(pending) == 0) {
+        sortAvailable();
+    }
+    if (listLen(pending) == 0 && xAlive()) {
+        while (fill(0)) {
+            sortAvailable();
+        }
+    }
+    if (listLen(pending) == 0 && timeoutMs > 0 && xAlive()) {
+        if (fill(timeoutMs)) {
+            sortAvailable();
+            while (fill(0)) {
+                sortAvailable();
+            }
+        }
+    }
+    if (listLen(pending) == 0) {
+        return bytesNew(0);
+    }
+    const e = listTryGet(pending, 0) catch bytesNew(0);
+    listRemoveAt(pending, 0);
+    return e;
+}
+
+/// 看一眼下一条已到达的事件（不取走，不等待）；没有得空 Bytes。
+export function xPeekEvent(): Bytes {
+    if (listLen(pending) == 0) {
+        sortAvailable();
+        while (listLen(pending) == 0 && fill(0)) {
+            sortAvailable();
+        }
+    }
+    return listTryGet(pending, 0) catch bytesNew(0);
+}
+
+/// 新的资源号。
+export function xNewId(): int {
+    const id: int = idBase | (idNext & idMask);
+    idNext = idNext + 1;
+    return id;
+}
+
+export function xRootWindow(): int {
+    return xRoot;
+}
+
+export function xRootVisual(): int {
+    return xVisual;
+}
+
+export function xRootDepth(): int {
+    return xDepth;
+}
+
+export function xRootSize(): List<int> {
+    const out: List<int> = listNew();
+    listPush(out, xRootW);
+    listPush(out, xRootH);
+    return out;
+}
+
+/// 屏幕像素格式能否直接收 BGRX：深度 24 或 32、每像素 32 位。
+export function xPixelsOk(): bool {
+    return (xDepth == 24 || xDepth == 32) && xBpp == 32;
+}
+
+/// 服务器图像字节序是不是高位在前（是则呈现时须逐像素翻转）。
+export function xImageMsb(): bool {
+    return xMsb;
+}
+
+// —— 连接与认证 ——
+
+function digitsOnly(s: string): bool {
+    if (len(s) == 0) {
+        return false;
+    }
+    let i: int = 0;
+    while (i < len(s)) {
+        const c: int = byteTryAt(s, i) catch 0;
+        if (c < 48 || c > 57) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function toInt(s: string): int {
+    let v: int = 0;
+    let i: int = 0;
+    while (i < len(s) && i < 6) {
+        v = v * 10 + (byteTryAt(s, i) catch 48) - 48;
+        i = i + 1;
+    }
+    return v;
+}
+
+function byteRange(s: string, a: int, b: int): string {
+    if (a < 0 || b < a || b > len(s)) {
+        return "";
+    }
+    return bytesToStr(bytesSlice(bytesFromStr(s), a, b - a)) catch "";
+}
+
+// DISPLAY → [显示号, 屏幕号]；不支持的形式得空表。
+function parseDisplay(d: string): List<int> {
+    const out: List<int> = listNew();
+    let s: string = d;
+    if (len(s) > 5 && byteRange(s, 0, 5) == "unix:") {
+        s = byteRange(s, 4, len(s));
+    }
+    if (len(s) < 2 || (byteTryAt(s, 0) catch 0) != 58) {
+        return out;
+    }
+    let dot: int = -1;
+    let i: int = 1;
+    while (i < len(s)) {
+        if ((byteTryAt(s, i) catch 0) == 46) {
+            dot = i;
+            break;
+        }
+        i = i + 1;
+    }
+    let num: string = byteRange(s, 1, len(s));
+    let scr: string = "0";
+    if (dot > 0) {
+        num = byteRange(s, 1, dot);
+        scr = byteRange(s, dot + 1, len(s));
+    }
+    if (!digitsOnly(num) || !digitsOnly(scr)) {
+        return out;
+    }
+    listPush(out, toInt(num));
+    listPush(out, toInt(scr));
+    return out;
+}
+
+function connectUnix(path: string, abs: bool): int {
+    const p = bytesFromStr(path);
+    if (bytesLen(p) > 100) {
+        return -1;
+    }
+    const sa = bytesNew(110);
+    bytesSet(sa, 0, AF_UNIX);
+    let at: int = 2;
+    if (abs) {
+        at = 3;
+    }
+    let i: int = 0;
+    while (i < bytesLen(p)) {
+        bytesSet(sa, at + i, bytesGet(p, i) catch 0);
+        i = i + 1;
+    }
+    let alen: int = at + bytesLen(p);
+    if (!abs) {
+        alen = alen + 1;
+    }
+    const fd: int = lxSocket(AF_UNIX, STREAM_CLOEXEC, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    let r: int = lxConnect(fd, sa, alen);
+    while (r == 0 - EINTR) {
+        r = lxConnect(fd, sa, alen);
+    }
+    if (r != 0) {
+        lxClose(fd);
+        return -1;
+    }
+    return fd;
+}
+
+function hostName(): string {
+    const u = bytesNew(390);
+    if (lxUname(u) != 0) {
+        return "";
+    }
+    let n: int = 0;
+    while (n < 65 && (bytesGet(u, 65 + n) catch 0) != 0) {
+        n = n + 1;
+    }
+    return bytesToStr(bytesSlice(u, 65, n)) catch "";
+}
+
+// Xauthority 里与本机、显示号相符的 MIT-MAGIC-COOKIE-1（得 [名字, 数据]，没有得空表）。条目字段为大端长度＋字节。
+function findCookie(display: int): List<Bytes> {
+    const out: List<Bytes> = listNew();
+    let path: string = getenv("XAUTHORITY");
+    if (len(path) == 0) {
+        const home: string = getenv("HOME");
+        if (len(home) == 0) {
+            return out;
+        }
+        path = home + "/.Xauthority";
+    }
+    const f: Bytes = readFileBytes(path) catch bytesNew(0);
+    if (bytesLen(f) == 0 || bytesLen(f) > 1048576) {
+        return out;
+    }
+    const host = bytesFromStr(hostName());
+    const want = bytesFromStr(toStr(display));
+    let o: int = 0;
+    while (o + 2 <= bytesLen(f)) {
+        const family: int = rbe16(f, o);
+        o = o + 2;
+        const fields: List<Bytes> = listNew();
+        let k: int = 0;
+        while (k < 4) {
+            const n: int = rbe16(f, o);
+            if (o + 2 + n > bytesLen(f)) {
+                return out;
+            }
+            listPush(fields, bytesSlice(f, o + 2, n));
+            o = o + 2 + n;
+            k = k + 1;
+        }
+        const addr = listTryGet(fields, 0) catch bytesNew(0);
+        const num = listTryGet(fields, 1) catch bytesNew(0);
+        const name = listTryGet(fields, 2) catch bytesNew(0);
+        const data = listTryGet(fields, 3) catch bytesNew(0);
+        const hostOk: bool = family == 65535 || (family == 256 && bytesEqual(addr, host));
+        const numOk: bool = bytesLen(num) == 0 || bytesEqual(num, want);
+        if (hostOk && numOk && bytesEqual(name, bytesFromStr("MIT-MAGIC-COOKIE-1"))) {
+            listPush(out, name);
+            listPush(out, data);
+            return out;
+        }
+    }
+    return out;
+}
+
+// 读到至少 n 字节（至多等 REPLY_WAIT_MS）。
+function readAtLeast(n: int): bool {
+    const deadline: int = xNowMs() + REPLY_WAIT_MS;
+    while (bytesLen(inbuf) - inpos < n) {
+        const left: int = deadline - xNowMs();
+        if (left <= 0 || !xAlive()) {
+            return false;
+        }
+        fill(left);
+    }
+    return true;
+}
+
+/// 连接 DISPLAY 指的 X 服务器（只试一次，之后复用）。成功得 true。
+export function xConnect(): bool {
+    if (xTried) {
+        return xAlive();
+    }
+    xTried = true;
+    const d: List<int> = parseDisplay(getenv("DISPLAY"));
+    if (listLen(d) < 2) {
+        return false;
+    }
+    const num: int = listTryGet(d, 0) catch 0;
+    const scr: int = listTryGet(d, 1) catch 0;
+    const path: string = "/tmp/.X11-unix/X" + toStr(num);
+    let fd: int = connectUnix(path, false);
+    if (fd < 0) {
+        fd = connectUnix(path, true);
+    }
+    if (fd < 0) {
+        return false;
+    }
+    xfd = fd;
+    const cookie: List<Bytes> = findCookie(num);
+    const an = listTryGet(cookie, 0) catch bytesNew(0);
+    const ad = listTryGet(cookie, 1) catch bytesNew(0);
+    const s = bytesNew(0);
+    w8(s, 0x6C); // 'l'：小端
+    w8(s, 0);
+    w16(s, 11);
+    w16(s, 0);
+    w16(s, bytesLen(an));
+    w16(s, bytesLen(ad));
+    w16(s, 0);
+    bytesAppend(s, an);
+    pad4(s);
+    bytesAppend(s, ad);
+    pad4(s);
+    if (!sendAll(s) || !readAtLeast(8)) {
+        kill();
+        return false;
+    }
+    const total: int = 8 + 4 * r16(inbuf, inpos + 6);
+    if (total > MAX_PACKET || !readAtLeast(total)) {
+        kill();
+        return false;
+    }
+    const r = bytesSlice(inbuf, inpos, total);
+    inpos = inpos + total;
+    if (r8(r, 0) != 1 || !parseSetup(r, scr)) {
+        kill();
+        return false;
+    }
+    loadKeymap();
+    return xAlive();
+}
+
+// 连接建立的回复：资源号区间、最大请求长度、像素格式、所选屏幕的根窗口与视觉。
+function parseSetup(r: Bytes, scr: int): bool {
+    idBase = r32(r, 12);
+    idMask = r32(r, 16);
+    const vendorLen: int = r16(r, 24);
+    maxReq = r16(r, 26) * 4;
+    const nScreens: int = r8(r, 28);
+    const nFormats: int = r8(r, 29);
+    xMsb = r8(r, 30) == 1;
+    minKey = r8(r, 34);
+    maxKey = r8(r, 35);
+    let o: int = 40 + ((vendorLen + 3) / 4) * 4;
+    const fmtAt: int = o;
+    o = o + nFormats * 8;
+    if (scr >= nScreens || o > bytesLen(r)) {
+        return false;
+    }
+    let s: int = 0;
+    while (s < scr) {
+        const nDepths: int = r8(r, o + 39);
+        o = o + 40;
+        let d: int = 0;
+        while (d < nDepths && o + 8 <= bytesLen(r)) {
+            o = o + 8 + r16(r, o + 2) * 24;
+            d = d + 1;
+        }
+        s = s + 1;
+    }
+    if (o + 40 > bytesLen(r)) {
+        return false;
+    }
+    xRoot = r32(r, o);
+    xRootW = r16(r, o + 20);
+    xRootH = r16(r, o + 22);
+    xVisual = r32(r, o + 32);
+    xDepth = r8(r, o + 38);
+    let f: int = 0;
+    while (f < nFormats) {
+        if (r8(r, fmtAt + f * 8) == xDepth) {
+            xBpp = r8(r, fmtAt + f * 8 + 1);
+        }
+        f = f + 1;
+    }
+    return maxReq >= 4096 && xRoot != 0;
+}
+
+// —— 原子、键盘映射、属性 ——
+
+/// 原子（InternAtom，结果缓存）；失败得 0。
+export function xAtom(name: string): int {
+    let i: int = 0;
+    while (i < listLen(atomNames)) {
+        if ((listTryGet(atomNames, i) catch "") == name) {
+            return listTryGet(atomIds, i) catch 0;
+        }
+        i = i + 1;
+    }
+    const b = bytesNew(0);
+    w16(b, len(name));
+    w16(b, 0);
+    bytesAppend(b, bytesFromStr(name));
+    pad4(b);
+    const r = xReqReply(16, 0, b);
+    const a: int = r32(r, 8);
+    if (a != 0) {
+        listPush(atomNames, name);
+        listPush(atomIds, a);
+    }
+    return a;
+}
+
+/// 重新取键盘映射（连接时、收到 MappingNotify 时）。
+export function loadKeymap(): void {
+    const count: int = maxKey - minKey + 1;
+    if (count < 1 || count > 248) {
+        return;
+    }
+    const b = bytesNew(0);
+    w8(b, minKey);
+    w8(b, count);
+    w16(b, 0);
+    const r = xReqReply(101, 0, b);
+    const per: int = r8(r, 1);
+    if (bytesLen(r) < 32 || per < 1 || per > 16) {
+        return;
+    }
+    const m: List<int> = listNew();
+    let i: int = 0;
+    while (i < count * per) {
+        listPush(m, r32(r, 32 + i * 4));
+        i = i + 1;
+    }
+    keymap = m;
+    keysPer = per;
+}
+
+/// 键码在第 col 列的 keysym（0 无）。
+export function xKeysym(keycode: int, col: int): int {
+    if (keycode < minKey || keycode > maxKey || col < 0 || col >= keysPer) {
+        return 0;
+    }
+    return listTryGet(keymap, (keycode - minKey) * keysPer + col) catch 0;
+}
+
+/// keysym 对应的键码（找不到得 0；测试投递按键用）。
+export function xKeycodeOf(keysym: int): int {
+    let k: int = minKey;
+    while (k <= maxKey) {
+        if (xKeysym(k, 0) == keysym || xKeysym(k, 1) == keysym) {
+            return k;
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+/// 读属性（GetProperty，类型不限，至多 maxBytes 字节；del 为真时读后删除）。得 [类型, 格式] 与数据；失败得空数据。
+export function xGetProperty(win: int, prop: int, maxBytes: int, del: bool): List<Bytes> {
+    const out: List<Bytes> = listNew();
+    const b = bytesNew(0);
+    w32(b, win);
+    w32(b, prop);
+    w32(b, 0);
+    w32(b, 0);
+    w32(b, (maxBytes + 3) / 4);
+    let delFlag: int = 0;
+    if (del) {
+        delFlag = 1;
+    }
+    const r = xReqReply(20, delFlag, b);
+    if (bytesLen(r) < 32) {
+        return out;
+    }
+    const fmt: int = r8(r, 1);
+    const ty: int = r32(r, 8);
+    const units: int = r32(r, 16);
+    let n: int = units;
+    if (fmt == 16) {
+        n = units * 2;
+    } else if (fmt == 32) {
+        n = units * 4;
+    }
+    if (32 + n > bytesLen(r)) {
+        n = bytesLen(r) - 32;
+    }
+    const meta = bytesNew(0);
+    w32(meta, ty);
+    w32(meta, fmt);
+    listPush(out, meta);
+    listPush(out, bytesSlice(r, 32, n));
+    return out;
+}
+
+/// 写属性（ChangeProperty，Replace）。format 为 8、16 或 32，data 的长度须是 format／8 的倍数。
+export function xChangeProperty(win: int, prop: int, ty: int, format: int, data: Bytes): int {
+    const unit: int = format / 8;
+    if (unit < 1 || bytesLen(data) % unit != 0) {
+        return -1;
+    }
+    const b = bytesNew(0);
+    w32(b, win);
+    w32(b, prop);
+    w32(b, ty);
+    w8(b, format);
+    w8(b, 0);
+    w16(b, 0);
+    w32(b, bytesLen(data) / unit);
+    bytesAppend(b, data);
+    pad4(b);
+    return xReq(18, 0, b);
+}
+
+/// 发合成事件（SendEvent）：destination 窗口、事件掩码、32 字节事件。
+export function xSendEvent(dest: int, mask: int, ev: Bytes): int {
+    const b = bytesNew(0);
+    w32(b, dest);
+    w32(b, mask);
+    bytesAppend(b, ev);
+    while (bytesLen(b) < 40) {
+        bytesPush(b, 0);
+    }
+    return xReq(25, 0, b);
+}
+
+/// ClientMessage（格式 32，五个数据字）。
+export function xClientMessage(win: int, ty: int, d0: int, d1: int, d2: int, d3: int): Bytes {
+    const e = bytesNew(0);
+    w8(e, 33);
+    w8(e, 32);
+    w16(e, 0);
+    w32(e, win);
+    w32(e, ty);
+    w32(e, d0);
+    w32(e, d1);
+    w32(e, d2);
+    w32(e, d3);
+    w32(e, 0);
+    return e;
+}
+
+/// 根窗口 RESOURCE_MANAGER 里的 Xft.dpi（没有得 96）。
+export function xDpi(): int {
+    if (!xAlive()) {
+        return 96;
+    }
+    const p: List<Bytes> = xGetProperty(xRoot, 23, 1048576, false);
+    const data = listTryGet(p, 1) catch bytesNew(0);
+    const text: string = bytesToStr(data) catch "";
+    const key: string = "Xft.dpi:";
+    let i: int = 0;
+    while (i + len(key) <= len(text)) {
+        if (byteRange(text, i, i + len(key)) == key && (i == 0 || (byteTryAt(text, i - 1) catch 0) == 10)) {
+            let j: int = i + len(key);
+            while (j < len(text) && ((byteTryAt(text, j) catch 0) == 32 || (byteTryAt(text, j) catch 0) == 9)) {
+                j = j + 1;
+            }
+            let v: int = 0;
+            let n: int = 0;
+            while (j < len(text) && n < 4) {
+                const c: int = byteTryAt(text, j) catch 0;
+                if (c < 48 || c > 57) {
+                    break;
+                }
+                v = v * 10 + c - 48;
+                j = j + 1;
+                n = n + 1;
+            }
+            if (v >= 48 && v <= 960) {
+                return v;
+            }
+            return 96;
+        }
+        i = i + 1;
+    }
+    return 96;
+}

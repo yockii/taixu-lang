@@ -1,0 +1,78 @@
+import { httpAddress, httpClientRequest, httpClientReceiver, httpClientFeed, httpClientFinish, httpClientRedirect } from "std/http_client";
+import { httpDefaultLimits } from "std/http_wire";
+import { gzipDecode } from "std/gzip";
+import { p256Hex } from "std/crypto/p256_field";
+import { uriString } from "std/url";
+
+function vector(name: string): Bytes {
+    for (line in strSplit(readFile("tests/vectors/http-client.txt") catch panic("fixture"), "\n")) {
+        if (len(line) == 0 || byteAt(line, 0) == 35) { continue; } const parts = strSplit(line, " "); if (listGet(parts, 0) == name) { return p256Hex(listGet(parts, 1)); }
+    } panic("missing vector " + name);
+}
+function badGzip(data: Bytes, maximum: int): bool { gzipDecode(data, maximum) catch (e) { return true; }; return false; }
+function badAddress(text: string): bool { httpAddress(text) catch (e) { return true; }; return false; }
+function badResponse(text: string): bool {
+    const state = httpClientReceiver("GET", httpDefaultLimits()) catch panic("receiver");
+    httpClientFeed(state, bytesFromStr(text), true) catch (e) { return true; }; httpClientFinish(state) catch (e) { return true; }; return false;
+}
+
+test "HTTP 客户端：地址规范化、请求与非法目标" {
+    const address = httpAddress("HTTPS://[::1]:8443/a/../b?x=1#tag") catch panic("address");
+    assert(address.secure && address.host == "::1" && address.port == 8443 && address.authority == "[::1]:8443" && address.target == "/b?x=1", "network target excludes fragment");
+    const request = bytesToStr(httpClientRequest(address) catch panic("request")) catch panic("request text");
+    assert(strFind(request, "GET /b?x=1 HTTP/1.1\r\nHost: [::1]:8443\r\n") == 0 && strFind(request, "Accept-Encoding: gzip\r\n") > 0, "HTTP request");
+    const normal = httpAddress("http://EXAMPLE.test:080") catch panic("normal"); assert(uriString(normal.uri) == "http://example.test/", "host, port and empty path normalized");
+    for (text in ["ftp://example.test/", "/relative", "http://user:pass@example.test/", "http://example.test:0/", "http://example.test:/", "http://example.test:65536/", "http://127.1/", "http://0177.0.0.1/", "http://a..b/", "http://evil%40host/", "http://[v1.future]/"]) { assert(badAddress(text), "rejected target " + text); }
+}
+
+test "gzip：独立 stored／fixed／dynamic、完整可选头与连续成员" {
+    const plain = vector("plain");
+    for (name in ["gzip0", "gzip1", "gzip9", "headers"]) { assert(bytesEqual(gzipDecode(vector(name), bytesLen(plain)) catch panic(name), plain), "independent " + name); }
+    assert(bytesLen(gzipDecode(vector("empty"), 0) catch panic("empty")) == 0, "empty stream at zero output limit");
+    const both = bytesSlice(plain, 0, bytesLen(plain)); bytesAppend(both, plain);
+    assert(bytesEqual(gzipDecode(vector("multi"), bytesLen(both)) catch panic("multi"), both), "concatenated members");
+    assert(bytesEqual(gzipDecode(vector("dynamic"), 20000) catch panic("dynamic"), vector("dynamic-plain")), "dynamic Huffman stream");
+}
+
+test "gzip：截断、头与正文校验、尾随垃圾和膨胀上限" {
+    const wire = vector("headers"); let n = 0; while (n < bytesLen(wire)) { assert(badGzip(bytesSlice(wire, 0, n), 20000), "every truncated prefix"); n = n + 1; }
+    const badHeader = bytesSlice(wire, 0, bytesLen(wire)); bytesSet(badHeader, 10, 4); assert(badGzip(badHeader, 20000), "header CRC");
+    const checksum = vector("gzip9"); bytesSet(checksum, bytesLen(checksum) - 8, 255); assert(badGzip(checksum, 20000), "body CRC");
+    const trailing = vector("gzip9"); listPush(bytesAsList(trailing), 0 as u8); assert(badGzip(trailing, 20000), "trailing nonmember data");
+    assert(badGzip(vector("gzip0"), 8) && badGzip(vector("gzip9"), 8) && badGzip(vector("dynamic"), 8), "output capped during all block decoders");
+    assert(badGzip(vector("multi"), bytesLen(vector("plain"))), "combined member output limit");
+}
+
+test "HTTP 客户端：1xx、chunked 与 gzip 每个切点一致" {
+    const compressed = vector("gzip9"); const message = bytesFromStr("HTTP/1.1 103 Early Hints\r\nLink: </style>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: " + toStr(bytesLen(compressed)) + "\r\n\r\n"); bytesAppend(message, compressed);
+    let cut = 0;
+    while (cut <= bytesLen(message)) {
+        const state = httpClientReceiver("GET", httpDefaultLimits()) catch panic("receiver");
+        httpClientFeed(state, bytesSlice(message, 0, cut), false) catch panic("first"); httpClientFeed(state, bytesSlice(message, cut, bytesLen(message) - cut), true) catch panic("second");
+        const result = httpClientFinish(state) catch panic("finish"); assert(result.head.status == 200 && state.informational == 1 && bytesEqual(result.body, vector("plain")), "split invariance"); cut = cut + 1;
+    }
+    const state = httpClientReceiver("GET", httpDefaultLimits()) catch panic("chunk receiver");
+    const chunked = bytesFromStr("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n1\r\nc\r\n0\r\nX-End: yes\r\n\r\n");
+    let i = 0; while (i < bytesLen(chunked)) { httpClientFeed(state, bytesSlice(chunked, i, 1), false) catch panic("chunk byte"); i = i + 1; }
+    const result = httpClientFinish(state) catch panic("chunk finish"); assert(bytesEqual(result.body, bytesFromStr("abc")) && listLen(result.trailers) == 1, "chunked trailers");
+}
+
+test "HTTP 客户端：重定向、错误状态与无正文响应" {
+    const address = httpAddress("https://example.test/a/index#old") catch panic("base");
+    const state = httpClientReceiver("GET", httpDefaultLimits()) catch panic("redirect receiver");
+    httpClientFeed(state, bytesFromStr("HTTP/1.1 302 Found\r\nLocation: ../next?q=1\r\nContent-Length: 0\r\n\r\n"), false) catch panic("redirect feed");
+    const next = (httpClientRedirect(address, httpClientFinish(state) catch panic("redirect finish")) catch panic("redirect")).next;
+    assert(next != None && uriString(next.uri) == "https://example.test/next?q=1#old", "relative redirect inherits fragment");
+    for (method in ["HEAD", "GET"]) {
+        let status = "204 No Content"; if (method == "HEAD") { status = "200 OK"; }
+        const empty = httpClientReceiver(method, httpDefaultLimits()) catch panic("empty receiver");
+        httpClientFeed(empty, bytesFromStr("HTTP/1.1 " + status + "\r\nContent-Encoding: gzip\r\n\r\n"), false) catch panic("empty feed");
+        assert(bytesLen((httpClientFinish(empty) catch panic("empty finish")).body) == 0, "no body needs no gzip member");
+    }
+    // 带 Content-Encoding: gzip、正文为空的重定向按空正文处理（浏览器同样）；非空的坏 gzip 正文仍报错。
+    const gzipRedirect = httpClientReceiver("GET", httpDefaultLimits()) catch panic("gzip redirect receiver");
+    httpClientFeed(gzipRedirect, bytesFromStr("HTTP/1.1 301 Moved\r\nLocation: /b\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\n\r\n"), false) catch panic("gzip redirect feed");
+    assert(bytesLen((httpClientFinish(gzipRedirect) catch panic("empty gzip redirect")).body) == 0, "empty gzip-coded redirect body");
+    assert(badResponse("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 1\r\n\r\nx"), "non-empty invalid gzip body rejected");
+    for (wire in ["HTTP/1.1 101 Switching Protocols\r\n\r\n", "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nab", "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nx", "HTTP/1.1 200 OK\r\nContent-Encoding: br\r\nContent-Length: 0\r\n\r\n"]) { assert(badResponse(wire), "invalid response rejected"); }
+}

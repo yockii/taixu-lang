@@ -10,10 +10,10 @@
 
 | 平台 | 发布包 |
 |---|---|
-| Windows x86_64 | `taixu-0.3.0-beta.1-x86_64-windows.zip` |
-| Linux x86_64 | `taixu-0.3.0-beta.1-x86_64-linux.tar.gz` |
-| macOS x86_64 | `taixu-0.3.0-beta.1-x86_64-macos.tar.gz` |
-| macOS arm64（Apple 芯片） | `taixu-0.3.0-beta.1-aarch64-macos.tar.gz` |
+| Windows x86_64 | `taixu-0.3.0-beta.2-x86_64-windows.zip` |
+| Linux x86_64 | `taixu-0.3.0-beta.2-x86_64-linux.tar.gz` |
+| macOS x86_64 | `taixu-0.3.0-beta.2-x86_64-macos.tar.gz` |
+| macOS arm64（Apple 芯片） | `taixu-0.3.0-beta.2-aarch64-macos.tar.gz` |
 
 只支持上面四个目标。包内结构：
 
@@ -36,7 +36,7 @@ taixu --version
 输出形如：
 
 ```text
-taixu 0.3.0-beta.1 native bootstrap compiler (x86_64-windows)
+taixu 0.3.0-beta.2 native bootstrap compiler (x86_64-windows)
 ```
 
 括号里是本机目标（如 `x86_64-linux`、`aarch64-macos`）。

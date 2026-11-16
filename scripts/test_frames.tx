@@ -1,0 +1,153 @@
+// LSP／DAP 共用的有界帧头回归：每例起一次服务，把整段输入写进 stdin 后关掉（同 subprocess.run(input=…)），不发送文件或程序执行
+// 请求。接受的例子须回 id 7 的响应（LSP 未 shutdown 即读到流尾退出 1，DAP 退出 0）；拒绝的例子须退出 3 且 stderr 有 BadFrame
+// （长度 999999999999999999 为 MessageTooLong）。
+import { runWithInput } from "./test_proto";
+import { reprBytes } from "./test_text";
+
+function b(s: string): Bytes {
+    return bytesFromStr(s);
+}
+
+function cat2(x: Bytes, y: Bytes): Bytes {
+    const out = bytesNew(0);
+    bytesAppend(out, x);
+    bytesAppend(out, y);
+    return out;
+}
+
+function cat3(x: Bytes, y: Bytes, z: Bytes): Bytes {
+    return cat2(cat2(x, y), z);
+}
+
+function repeat(s: string, n: int): Bytes {
+    const one = b(s);
+    const out = bytesNew(0);
+    let i = 0;
+    while (i < n) {
+        bytesAppend(out, one);
+        i = i + 1;
+    }
+    return out;
+}
+
+function head(x: Bytes, n: int): Bytes {
+    if (bytesLen(x) <= n) {
+        return x;
+    }
+    return bytesSlice(x, 0, n);
+}
+
+function tail(x: Bytes, n: int): Bytes {
+    if (bytesLen(x) <= n) {
+        return x;
+    }
+    return bytesSlice(x, bytesLen(x) - n, n);
+}
+
+// 去掉 x 里的全部 \r。
+function noCr(x: Bytes): Bytes {
+    const out = bytesNew(0);
+    let i = 0;
+    while (i < bytesLen(x)) {
+        const c = bytesGet(x, i) ?? 0;
+        if (c != 13) {
+            bytesPush(out, c);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+export function bytesHas(hay: Bytes, needle: Bytes): bool {
+    const n = bytesLen(needle);
+    let i = 0;
+    while (i + n <= bytesLen(hay)) {
+        let k = 0;
+        while (k < n && (bytesGet(hay, i + k) ?? 0) == (bytesGet(needle, k) ?? 0)) {
+            k = k + 1;
+        }
+        if (k == n) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+struct Case {
+    name: string,
+    data: Bytes,
+    accepted: bool,
+}
+
+function add(cases: List<Case>, name: string, data: Bytes, accepted: bool): void {
+    listPush(cases, Case { name: name, data: data, accepted: accepted });
+}
+
+// service 为 "lsp" 或 "dap"；check 记一项（名字、是否通过、细节）。
+export function framingCases(exe: string, service: string, cwd: string, check: (string, bool, string) => bool): void {
+    let request = "{\"seq\": 7, \"type\": \"request\", \"command\": \"initialize\", \"arguments\": {}}";
+    if (service == "lsp") {
+        request = "{\"jsonrpc\": \"2.0\", \"id\": 7, \"method\": \"initialize\", \"params\": {}}";
+    }
+    const body = b(request);
+    const n = bytesLen(body);
+    const hd = b("Content-Length: " + toStr(n) + "\r\n\r\n");
+    // head[:-2]：去掉最后的空行，只剩一个头行。
+    const line = bytesSlice(hd, 0, bytesLen(hd) - 2);
+    const cases: List<Case> = listNew();
+    add(cases, "ordinary", cat2(hd, body), true);
+    add(cases, "lf", cat2(noCr(hd), body), true);
+    const sizes: []int = [65535, 65536, 65537];
+    for (size in sizes) {
+        const prefix = cat3(b("X: "), repeat("a", size - bytesLen(hd) - 5), b("\r\n"));
+        add(cases, "header-" + toStr(size), cat3(prefix, hd, body), size <= 65536);
+    }
+    add(cases, "short-lines-total", cat3(repeat("X: a\r\n", 11000), hd, body), false);
+    add(cases, "complete-long-line", cat3(cat3(b("X: "), repeat("a", 70000), b("\r\n")), hd, body), false);
+    add(cases, "duplicate-same", cat3(line, b("content-length: " + toStr(n) + "\r\n\r\n"), body), false);
+    add(cases, "duplicate-different", cat3(line, b("Content-Length: 1\r\n\r\n"), body), false);
+    add(cases, "duplicate-space-case", cat3(line, b(" CONTENT-LENGTH \t: 1\r\n\r\n"), body), false);
+    add(cases, "interior-cr", cat2(b("Content-Le\rngth: " + toStr(n) + "\r\n\r\n"), body), false);
+    const ff = b("Content-Length: 5?\r\n");
+    bytesSet(ff, 17, 255);
+    add(cases, "non-utf8-duplicate", cat3(ff, hd, body), false);
+    add(cases, "non-ascii-header", cat3(b("X-Note: 中\r\n"), hd, body), false);
+    add(cases, "control-byte", cat3(b("X: a\u{1}\r\n"), hd, body), false);
+    add(cases, "missing-length", cat2(b("X: a\r\n\r\n"), body), false);
+    add(cases, "truncated-header", b("Content-Length: 2\r\n"), false);
+    add(cases, "truncated-body", cat2(hd, bytesSlice(body, 0, n - 1)), false);
+    const values: []string = ["", "-1", "+1", "1e3", "18446744073709551616", "999999999999999999"];
+    for (v in values) {
+        add(cases, "length-b'" + v + "'", b("Content-Length: " + v + "\r\n\r\n"), false);
+    }
+    let marker = b("\"request_seq\":7");
+    let acceptCode = 0;
+    if (service == "lsp") {
+        marker = b("\"id\":7");
+        acceptCode = 1;
+    }
+    for (k in cases) {
+        oneCase(exe, service, cwd, k, marker, acceptCode, check);
+    }
+}
+
+function oneCase(exe: string, service: string, cwd: string, k: Case, marker: Bytes, acceptCode: int, check: (string, bool, string) => bool): void {
+    const args: List<string> = listNew();
+    listPush(args, service);
+    const p = runWithInput(exe, args, cwd, k.data, 15000) catch (e) {
+        check("framing:" + k.name, false, e.message);
+        return;
+    };
+    let good = false;
+    if (k.accepted) {
+        good = p.code == acceptCode && bytesHas(p.pending, marker);
+    } else {
+        let want = b("BadFrame");
+        if (k.name == "length-b'999999999999999999'") {
+            want = b("MessageTooLong");
+        }
+        good = p.code == 3 && bytesHas(p.err, want);
+    }
+    check("framing:" + k.name, good, "(" + toStr(p.code) + ", " + reprBytes(tail(p.err, 200), 200) + ", " + reprBytes(head(p.pending, 200), 200) + ")");
+}

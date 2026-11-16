@@ -1,0 +1,152 @@
+// 在一个宿主执行批次阶段；收据最后输出，先核对快照，再记录实际编译器与真实 gate 报告。
+import { absolute, exeName, join, kindOf, list1, mkdirs, nat, plus, readBytes, runInFor, shaOf } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { Jv, jArray, jDump, jNull, jObject, jParseUnique, jSet, jString } from "./test_json";
+import { RECEIPT, choose, contains, field, hex, identifier, stringArray, txt, unit } from "./gate_batch_model";
+import { inputIdentity, sourceIdentity } from "./gate_batch_inputs";
+import { allTargets, targetOn } from "./targets";
+
+struct Opts {
+    root: string, compiler: string, stdlib: string, gui: string, work: string,
+    phase: string, runId: string, host: string, witness: bool, steps: List<string>,
+}
+function flags(xs: []string): List<string> { const a: List<string> = listNew(); for (x in xs) { listPush(a, x); } return a; }
+function readJson(path: string): Ref<Jv> | Error { return jParseUnique(readBytes(path)?); }
+function writeJson(path: string, v: Ref<Jv>): void | Error { writeFile(path, jDump(v) + "\n")?; return unit(); }
+
+function parse(args: []string): Ref<Opts> | Error {
+    const o = new Opts { root: "", compiler: "", stdlib: "", gui: "", work: "", phase: "", runId: "", host: "", witness: false, steps: listNew() };
+    let i = 0;
+    while (i < len(args)) {
+        if (i + 1 >= len(args)) { return err("缺少参数取值：" + args[i]); }
+        const a = args[i]; const v = args[i + 1];
+        if (a == "--root") { o.root = osRealPath(absolute(v)); }
+        else if (a == "--compiler") { o.compiler = osRealPath(absolute(v)); }
+        else if (a == "--stdlib") { o.stdlib = osRealPath(absolute(v)); }
+        else if (a == "--gui") { o.gui = osRealPath(absolute(v)); }
+        else if (a == "--work") { o.work = osRealPath(absolute(v)); }
+        else if (a == "--phase") { o.phase = v; }
+        else if (a == "--run-id") { o.runId = v; }
+        else if (a == "--host") { o.host = v; }
+        else if (a == "--witness") { if (v != "on" && v != "off") { return err("witness 须为 on/off"); } o.witness = v == "on"; }
+        else if (a == "--steps") { if (v != "none") { o.steps = strSplit(v, ","); } }
+        else { return err("未知参数：" + a); }
+        i = i + 2;
+    }
+    if (len(o.root) == 0 || len(o.compiler) == 0 || len(o.work) == 0 || !identifier(o.runId)) { return err("须给 root、compiler、work、run-id"); }
+    if (o.phase != "native" && o.phase != "full" && o.phase != "cross" && o.phase != "shared-cross") { return err("未知批次阶段"); }
+    if (o.host != targetOn(hostTarget(), hostArch()).triple) { return err("实际宿主与清单不符"); }
+    if (len(o.stdlib) == 0) { o.stdlib = join(o.root, "stdlib"); }
+    if (len(o.gui) == 0) { o.gui = join(o.root, "gui"); }
+    if (o.phase == "full" && listLen(o.steps) != 0) { return err("完整阶段不能选步"); }
+    return o;
+}
+
+// 阶段命令的时限同批次层的阶段上限（6 小时）：完整门要两小时以上，build_lib 缺省的 1 小时会把里程碑阶段中途杀掉。
+const PHASE_NS: int = 21600000000000;
+
+function launch(o: Ref<Opts>, args: List<string>): void | Error {
+    const r = runInFor(o.compiler, args, o.root, false, true, PHASE_NS)?;
+    if (r.code != 0) { return err("阶段命令退出 " + toStr(r.code)); }
+    return unit();
+}
+function comma(xs: List<string>): string {
+    let s = ""; for (x in xs) { if (len(s) > 0) { s = s + ","; } s = s + x; } return s;
+}
+function sourcesEqual(a: Ref<Jv>, b: Ref<Jv>): bool {
+    return txt(a, "core_tree") == txt(b, "core_tree") && txt(a, "stdlib_tree") == txt(b, "stdlib_tree") && txt(a, "gui_tree") == txt(b, "gui_tree");
+}
+
+function execute(o: Ref<Opts>, receipt: Ref<Jv>): void | Error {
+    if (!mkdirs(o.work)) { return err("建不了批次目录"); }
+    o.work = osRealPath(o.work);
+    const phaseDir = join(o.work, o.phase);
+    if (kindOf(phaseDir) != 0) { return err("阶段目录已存在，不能复用旧运行：" + phaseDir); }
+    if (!mkdirs(phaseDir)) { return err("建不了阶段目录"); }
+    setEnv("TAIXU_STDLIB", nat(join(o.stdlib, "src")))?;
+    setEnv("TAIXU_GUI_ROOT", nat(join(o.gui, "src")))?;
+    const before = sourceIdentity(o.root, o.stdlib, o.gui)?;
+    jSet(receipt, "source_before", before);
+    if (o.phase == "native" || o.phase == "full") {
+        const mirror = join(phaseDir, "gate.json");
+        if (o.phase == "full" || listLen(o.steps) > 0) {
+            // 导出步扫描的就是被测的索引树（不是各仓 HEAD）。
+            const a = flags(["run", "--toolchain", nat(join(o.root, "scripts/gate.tx")), "--compiler", o.compiler, "--root", o.root,
+                    "--stdlib", o.stdlib, "--gui", o.gui, "--work", join(phaseDir, "gates"), "--report", mirror, "--jobs", "1",
+                    "--export-commit", txt(before, "core_tree"), "--export-stdlib-commit", txt(before, "stdlib_tree"),
+                    "--export-gui-commit", txt(before, "gui_tree")]);
+            if (o.phase == "native") { listPush(a, "--only"); listPush(a, comma(o.steps)); }
+            launch(o, a)?;
+            const report = readJson(mirror)?;
+            jSet(receipt, "gate_report", report);
+            if (txt(report, "status") != "PASS") { return err("gate 报告未通过"); }
+            o.compiler = txt(report, "compiler");
+            if (len(o.compiler) == 0 || shaOf(o.compiler) != txt(report, "compiler_sha256")) { return err("gate 最终编译器不存在或已变化"); }
+        }
+        if (o.witness) {
+            const dest = join(phaseDir, "common-windows");
+            launch(o, flags(["build", "bootstrap/taixu.tx", "--toolchain", "--target=x86_64-windows", "--out", dest]))?;
+            const proof = shaOf(join(dest, "taixu.exe"));
+            if (!hex(proof, 64)) { return err("共同目标见证不存在"); }
+            jSet(receipt, "witness_sha256", jString(proof));
+        }
+    } else {
+        const native = readJson(join(o.work, "native-receipt.json"))?;
+        if (txt(native, "status") != "PASS" || txt(native, "run_id") != o.runId || txt(native, "host") != o.host) { return err("缺少本批成功的 native 收据"); }
+        const input = inputIdentity(o.root, sourceIdentity(o.root, o.stdlib, o.gui)?)?;
+        if (txt(input, "id") != txt(native, "input_id")) { return err("native 后输入发生变化"); }
+        o.compiler = txt(native, "compiler");
+        if (len(o.compiler) == 0 || shaOf(o.compiler) != txt(native, "compiler_sha256")) { return err("native 后编译器发生变化"); }
+        jSet(receipt, "witness_sha256", field(native, "witness_sha256"));
+        const reportPath = join(phaseDir, "cross.json");
+        const a = flags(["run", "--toolchain", nat(join(o.root, "scripts/test_cross_products.tx")), "--compiler", o.compiler,
+                "--root", o.root, "--work", join(phaseDir, "products"), "--report", reportPath]);
+        if (o.phase == "shared-cross") { listPush(a, "--include-host"); }
+        launch(o, a)?;
+        const report = readJson(reportPath)?;
+        jSet(receipt, "cross_report", report);
+        if (txt(report, "status") != "PASS") { return err("交叉构建报告未通过"); }
+    }
+    const after = sourceIdentity(o.root, o.stdlib, o.gui)?;
+    if (!sourcesEqual(before, after)) { return err("验证期间源码树发生变化"); }
+    const input = inputIdentity(o.root, after)?;
+    if (o.phase == "cross" || o.phase == "shared-cross") {
+        const native = readJson(join(o.work, "native-receipt.json"))?;
+        if (txt(input, "id") != txt(native, "input_id")) { return err("交叉构建期间内核发生变化"); }
+    }
+    jSet(receipt, "input", field(input, "sources"));
+    jSet(receipt, "input_id", field(input, "id"));
+    jSet(receipt, "compiler", jString(o.compiler));
+    jSet(receipt, "compiler_sha256", jString(shaOf(o.compiler)));
+    jSet(receipt, "status", jString("PASS"));
+    return unit();
+}
+
+function run(args: []string): int | Error {
+    const o = parse(args)?;
+    if (kindOf(join(o.work, o.phase + "-receipt.json")) != 0) { return err("收据已存在，不能重用或覆盖旧阶段"); }
+    const receipt = jObject();
+    jSet(receipt, "schema", jString("gate-batch-receipt/1")); jSet(receipt, "status", jString("FAIL"));
+    jSet(receipt, "host", jString(o.host)); jSet(receipt, "phase", jString(o.phase)); jSet(receipt, "run_id", jString(o.runId));
+    jSet(receipt, "requested", stringArray(o.steps)); jSet(receipt, "witness_sha256", jString(""));
+    execute(o, receipt) catch (e) { jSet(receipt, "error", jString(e.message)); };
+    jSet(receipt, "work", jString(o.work));
+    if (txt(receipt, "status") != "PASS") {
+        const dir = join(o.work, o.phase);
+        for (file in ["gate.json", "cross.json"]) {
+            const path = join(dir, file);
+            if (kindOf(path) == 1) {
+                const failed = readJson(path) catch jNull();
+                if (file == "gate.json") { jSet(receipt, "gate_report", failed); }
+                else { jSet(receipt, "cross_report", failed); }
+            }
+        }
+    }
+    if (!mkdirs(o.work)) { return err("写不了工作目录"); }
+    writeJson(join(o.work, o.phase + "-receipt.json"), receipt)?;
+    print(RECEIPT + jDump(receipt));
+    if (txt(receipt, "status") == "PASS") { return 0; } return 1;
+}
+export function main(args: []string): int {
+    return run(args) catch (e) { eprint("gate_batch_worker: " + e.message); return 1; };
+}

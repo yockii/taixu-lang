@@ -1,0 +1,77 @@
+// Persistent payload bits in r12/r13; all value-slot writes remain visible.
+import { Operand, asProducerInstruction, asStructuredReg, asStructuredMem, asStructuredMissing } from "./assemble";
+import { VALUE_BYTES, VALUE_PAYLOAD_OFFSET } from "./value_abi";
+
+export struct X64ScalarCache { first: int, second: int, conflict: int }
+export function x64ScalarCacheNew(): Ref<X64ScalarCache> { return new X64ScalarCache { first: -1, second: -1, conflict: 0 }; }
+function persistent(cache: Ref<X64ScalarCache>, reg: int): bool { return (reg == 12 && cache.first >= 0) || (reg == 13 && cache.second >= 0); }
+function reserved(cache: Ref<X64ScalarCache>, op: Ref<Operand>): bool {
+    if (op.kind == 0 && op.cls >= 0 && op.cls <= 2) { return persistent(cache, op.num); }
+    if (op.kind == 2) { return persistent(cache, op.memBase) || persistent(cache, op.memIndex); }
+    return false;
+}
+function off(slot: int): int { return slot * VALUE_BYTES + VALUE_PAYLOAD_OFFSET; }
+function exact(cache: Ref<X64ScalarCache>, m: Ref<Operand>): int {
+    if (m.kind != 2 || m.memSize != 2 || m.memBase != 3 || m.memIndex != -1 || m.hasRip != 0) { return -1; }
+    if (cache.first >= 0 && m.disp == off(cache.first)) { return 12; }
+    if (cache.second >= 0 && m.disp == off(cache.second)) { return 13; }
+    return -1;
+}
+function load(body: int, reg: int, slot: int, line: int): void {
+    if (slot >= 0) {
+        asProducerInstruction(body, "mov", 2, asStructuredReg(0, reg), asStructuredMem(2, 3, -1, 0, off(slot), 0, ""), asStructuredMissing(), line);
+    }
+}
+function reload(cache: Ref<X64ScalarCache>, body: int, line: int): void { load(body, 12, cache.first, line); load(body, 13, cache.second, line); }
+export function x64ScalarCacheEntry(cache: Ref<X64ScalarCache>, line: int): void { reload(cache, 0, line); }
+function width(m: Ref<Operand>): int {
+    if (m.memSize == 0) { return 1; } if (m.memSize == 1) { return 4; } if (m.memSize == 3) { return 2; } return 8;
+}
+function afterWrite(cache: Ref<X64ScalarCache>, m: Ref<Operand>, body: int, line: int): void {
+    if (m.memBase == 4 || m.memBase == 5) { return; } // CPU stack, separate from W.
+    if (m.memBase != 3 || m.memIndex != -1 || m.hasRip != 0) { reload(cache, body, line); return; }
+    const size = width(m);
+    if (cache.first >= 0 && m.disp < off(cache.first) + 8 && m.disp + size > off(cache.first)) { load(body, 12, cache.first, line); }
+    if (cache.second >= 0 && m.disp < off(cache.second) + 8 && m.disp + size > off(cache.second)) { load(body, 13, cache.second, line); }
+}
+function integerRead(mn: string): bool {
+    return mn == "add" || mn == "sub" || mn == "and" || mn == "or" || mn == "xor" || mn == "cmp" || mn == "test" || mn == "imul" || mn == "idiv";
+}
+function known(mn: string): bool {
+    return integerRead(mn) || mn == "mov" || mn == "movsd" || mn == "movq" || mn == "movzx" || mn == "movsx"
+    || mn == "lea" || mn == "push" || mn == "pop" || mn == "neg" || mn == "not" || mn == "shl" || mn == "shr" || mn == "sar"
+    || mn == "addsd" || mn == "subsd" || mn == "mulsd" || mn == "divsd" || mn == "ucomisd" || mn == "cvtsi2sd" || mn == "cvttsd2si"
+    || mn == "sete" || mn == "setne" || mn == "setnp";
+}
+function readsA(mn: string): bool { return mn == "cmp" || mn == "test" || mn == "idiv" || mn == "push"; }
+
+export function x64ScalarCacheInstruction(cache: Ref<X64ScalarCache>, body: int, mn: string, nops: int,
+    a: Ref<Operand>, b: Ref<Operand>, c: Ref<Operand>, line: int): void {
+    if (body != 1 || cache.first < 0) { asProducerInstruction(body, mn, nops, a, b, c, line); return; }
+    // Persistent operands are introduced only below, never by the run lowerer.
+    // A bad reservation must fail the compilation instead of corrupting code.
+    if (reserved(cache, a) || reserved(cache, b) || reserved(cache, c)) { cache.conflict = line; }
+    let count = 0; if (a.kind == 2) { count = count + 1; } if (b.kind == 2) { count = count + 1; } if (c.kind == 2) { count = count + 1; }
+    let aa = a; let bb = b; let name = mn;
+    const ar = exact(cache, a); const br = exact(cache, b);
+    if (count == 1) {
+        if (ar >= 0 && readsA(mn) && integerRead(mn)) { aa = asStructuredReg(0, ar); }
+        if (br >= 0 && a.kind == 0 && a.cls == 0 && (mn == "mov" || integerRead(mn))) { bb = asStructuredReg(0, br); }
+        if (br >= 0 && a.kind == 0 && a.cls == 3 && (mn == "movsd" || mn == "movq")) { name = "movq"; bb = asStructuredReg(0, br); }
+    }
+    asProducerInstruction(body, name, nops, aa, bb, c, line);
+    if (mn == "call" || mn == "syscall") { reload(cache, body, line); return; }
+    if (count == 0) { return; }
+    if (!known(mn)) { reload(cache, body, line); return; }
+    if (a.kind == 2 && !readsA(mn)) {
+        if (ar >= 0 && (mn == "mov" || mn == "movsd" || mn == "movq")) {
+            if ((b.kind == 0 && b.cls == 0) || b.kind == 1) {
+                asProducerInstruction(body, "mov", 2, asStructuredReg(0, ar), b, asStructuredMissing(), line); return;
+            }
+            if (b.kind == 0 && b.cls == 3) {
+                asProducerInstruction(body, "movq", 2, asStructuredReg(0, ar), b, asStructuredMissing(), line); return;
+            }
+        }
+        afterWrite(cache, a, body, line);
+    }
+}

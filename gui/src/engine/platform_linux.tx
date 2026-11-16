@@ -1,0 +1,1262 @@
+// ============================================================================
+// engine/platform_linux —— Linux 真窗后端（GUI 原生引擎 G3）：纯太虚 X11 线协议（engine/x11），产物保持静态、无 libc。
+// 导出面同 platform_windows；DISPLAY 没设、连不上 X 服务器或像素格式不是 32 位 TrueColor 时 platAvailable 为假，框架退回脚本窗。
+//
+// - 事件沿用表：键（keysym 换成 Windows 虚拟键码，同 Windows 后端只发低 8 位）、字符（keysym 换 Unicode，无 Ctrl／Alt 时
+//   发；产生字符的键不另发按下事件，同 Windows）、左键按下／抬起／移动（X 按下时自动抓取指针，拖出窗外也收得到抬起）、尺寸、
+//   关窗（WM_DELETE_WINDOW）。X 的自动重复发成“抬起＋按下”对，同一时刻、同一键码的抬起丢掉（同 GLFW），按下照发——与
+//   Windows 的重复 WM_KEYDOWN 一致。坐标按 Xft.dpi 换成 DIP。
+// - 呈现：BGRX 面按行分块 PutImage（ZPixmap，每块不超过服务器的最大请求长度）；保留最近一帧，Expose 时重画；面没盖住的
+//   右、下边带清成背景黑。
+// - 窗口管理经 EWMH／ICCCM 提示（_NET_WM_STATE、WM_NORMAL_HINTS、_MOTIF_WM_HINTS、_NET_WM_WINDOW_OPACITY）；X 没有原生
+//   菜单栏，platMenuAdd 得 -1；没有亚克力等效果，platSetEffect 得 0。
+// - 剪贴板：CLIPBOARD 选区（UTF8_STRING、STRING、TARGETS），由一个不显示的 InputOnly 窗口持有；大于一个请求的内容（INCR）
+//   暂不收发。
+// - 文件对话框（G5 第二部分）：XDG 桌面门户的 FileChooser（OpenFile／SaveFile），经会话总线（engine/busconn，纯太虚 D-Bus 客户端；
+//   编组在 engine/dbus，请求与结果在 engine/portal）。第一次用到时连会话总线、读门户 FileChooser 接口的 version 属性（门户按需
+//   激活），读到且不小于 1 才算可用（cap 7）；没有会话总线或门户（WSLg、极简窗口管理器常见）时不可用，对话框得空串。每次调用
+//   用新的 handle_token、先订阅预知请求路径上的 Response 再调用（旧版门户回的路径不同时改等它给的路径），模态、属主为
+//   "x11:<XID>"；等结果期间不处理本程序窗口的事件（同 Windows、macOS 的模态循环之外：窗口不重画）。
+// ============================================================================
+
+import { xConnect, xAlive, xReq, xReqReply, xNextEvent, xPeekEvent, xNewId, xRootWindow, xRootDepth, xRootSize, xPixelsOk, xImageMsb, xMaxReq, xAtom, xKeysym, xKeycodeOf, loadKeymap, xGetProperty, xChangeProperty, xSendEvent, xClientMessage, xDpi, xNowMs, w8, w16, w32, pad4, r8, r16, s16, r32 } from "./x11";
+import { FdFilter } from "./filedialog";
+import { DbusMsg, dbusMsg, dbusReader, dwStr, drSig, drStr, drU32, DBUS_CALL, DBUS_RETURN } from "./dbus";
+import { BusConn, busNone, busOpen, busSessionAddress, busCall, busWaitSignal } from "./busconn";
+import { PortalResult, PORTAL_DEST, PORTAL_PATH, PORTAL_FILE_CHOOSER, PORTAL_REQUEST, portalRequestPath, portalChooserBody, portalResult } from "./portal";
+
+const EV_KEY_DOWN: int = 1;
+const EV_KEY_UP: int = 2;
+const EV_MOUSE_DOWN: int = 3;
+const EV_MOUSE_UP: int = 4;
+const EV_MOUSE_MOVE: int = 5;
+const EV_CLOSE: int = 6;
+const EV_RESIZE: int = 7;
+const EV_TEXT: int = 8;
+const EV_SCROLL: int = 9;
+const MOD_SHIFT: int = 1;
+const MOD_CTRL: int = 2;
+const MOD_ALT: int = 4;
+const WFLAG_FRAMELESS: int = 1;
+const WFLAG_MAXIMIZED: int = 2;
+const WFLAG_TOPMOST: int = 4;
+const WFLAG_CENTERED: int = 8;
+const WFLAG_HIDDEN: int = 16;
+const QUEUE_MAX: int = 64;
+// KeyPress、KeyRelease、ButtonPress、ButtonRelease、PointerMotion、Exposure、StructureNotify、FocusChange。
+const EVENT_MASK: int = 0x22804F;
+const ROOT_MSG_MASK: int = 0x180000; // SubstructureNotify | SubstructureRedirect
+const ATOM_ATOM: int = 4;
+const ATOM_CARDINAL: int = 6;
+const ATOM_STRING: int = 31;
+const ATOM_WM_NAME: int = 39;
+const ATOM_WM_NORMAL_HINTS: int = 40;
+const ATOM_WM_SIZE_HINTS: int = 41;
+const ATOM_WM_CLASS: int = 67;
+const CLIP_MAX: int = 1048576;
+
+struct LWin {
+    id: int,
+    xid: int,
+    gc: int,
+    scale: int,
+    frameless: bool,
+    centered: bool,
+    x: int,
+    y: int,
+    minW: int, // 客户区 DIP；0＝未约束
+    minH: int,
+    maxW: int,
+    maxH: int,
+    cursor: int,
+    q: List<int>, // 每条 5 项：kind、target、x、y、mods
+    head: int,
+    px: Bytes, // 最近一次呈现的像素（Expose 时重画）
+    pw: int,
+    ph: int,
+    cw: int, // 当前客户区（物理像素）
+    ch: int,
+    closed: bool, // 连接断开后已补发关闭事件
+}
+
+let wins: List<Ref<LWin>> = listNew();
+let sysScale: int = 0;
+let cursorFont: int = 0;
+let cursorArrow: int = 0;
+let cursorIbeam: int = 0;
+let clipWin: int = 0;
+let clipOwned: bool = false;
+let clipText: string = "";
+
+function dipToPx(v: int, k: int): int {
+    if (k == 100) {
+        return v;
+    }
+    return (v * k + 50) / 100;
+}
+
+function pxToDip(v: int, k: int): int {
+    if (k == 100) {
+        return v;
+    }
+    return (v * 100 + k / 2) / k;
+}
+
+function maxInt(a: int, b: int): int {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+function minInt(a: int, b: int): int {
+    if (a < b) {
+        return a;
+    }
+    return b;
+}
+
+// 串里有 NUL 字节时只取其前（同 Windows 后端，标题里的 NUL 不 trap）。
+function cText(s: string): string {
+    const b = bytesFromStr(s);
+    let i: int = 0;
+    while (i < bytesLen(b)) {
+        if ((bytesGet(b, i) catch 1) == 0) {
+            return bytesToStr(bytesSlice(b, 0, i)) catch "";
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+function idxOfId(id: int): int {
+    let i: int = 0;
+    while (i < listLen(wins)) {
+        const w: Ref<LWin> = listGet(wins, i);
+        if (w.id == id) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+function idxOfXid(xid: int): int {
+    let i: int = 0;
+    while (i < listLen(wins)) {
+        const w: Ref<LWin> = listGet(wins, i);
+        if (w.xid == xid) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+function winAt(i: int): Ref<LWin> {
+    return listGet(wins, i);
+}
+
+function queued(w: Ref<LWin>): int {
+    return (listLen(w.q) - w.head) / 5;
+}
+
+function push(w: Ref<LWin>, kind: int, target: int, x: int, y: int, m: int): void {
+    if ((kind == EV_MOUSE_MOVE || kind == EV_RESIZE) && queued(w) > 0) {
+        const at: int = listLen(w.q) - 5;
+        if ((listTryGet(w.q, at) catch 0) == kind) {
+            listSet(w.q, at + 2, x);
+            listSet(w.q, at + 3, y);
+            listSet(w.q, at + 4, m);
+            return;
+        }
+    }
+    if (queued(w) >= QUEUE_MAX) {
+        return;
+    }
+    if (w.head > 0 && w.head == listLen(w.q)) {
+        w.q = listNew();
+        w.head = 0;
+    }
+    listPush(w.q, kind);
+    listPush(w.q, target);
+    listPush(w.q, x);
+    listPush(w.q, y);
+    listPush(w.q, m);
+}
+
+// X 的修饰位（Shift 1、Lock 2、Control 4、Mod1 8）→ 事件 mods。
+function modsOf(state: int): int {
+    let m: int = 0;
+    if ((state & 1) != 0) {
+        m = m + MOD_SHIFT;
+    }
+    if ((state & 4) != 0) {
+        m = m + MOD_CTRL;
+    }
+    if ((state & 8) != 0) {
+        m = m + MOD_ALT;
+    }
+    return m;
+}
+
+// 产生字符的键（同 Windows 后端的判定）。
+function printableVk(vk: int): bool {
+    return vk == 0x20 || (vk >= 0x30 && vk <= 0x39) || (vk >= 0x41 && vk <= 0x5A) || (vk >= 0xBA && vk <= 0xC0) || (vk >= 0xDB && vk <= 0xDF) || vk == 0xE2 || (vk >= 0x60 && vk <= 0x6F && vk != 0x6C);
+}
+
+function isKeypadDigit(ks: int): bool {
+    return (ks >= 0xFFB0 && ks <= 0xFFB9) || ks == 0xFFAE;
+}
+
+// keysym → Windows 虚拟键码（0＝不认识，不发键事件）。
+function vkOfKeysym(ks: int): int {
+    if (ks >= 0x61 && ks <= 0x7A) {
+        return ks - 32;
+    }
+    if ((ks >= 0x41 && ks <= 0x5A) || (ks >= 0x30 && ks <= 0x39) || ks == 0x20) {
+        return ks;
+    }
+    if (ks >= 0xFFBE && ks <= 0xFFC9) {
+        return 0x70 + ks - 0xFFBE; // F1..F12
+    }
+    if (ks >= 0xFFB0 && ks <= 0xFFB9) {
+        return 0x60 + ks - 0xFFB0; // 小键盘数字
+    }
+    const from: []int = [0xFF08, 0xFF09, 0xFF0D, 0xFF8D, 0xFF1B, 0xFFFF, 0xFF63, 0xFF50, 0xFF57, 0xFF55, 0xFF56, 0xFF51, 0xFF52, 0xFF53, 0xFF54, 0xFFE1, 0xFFE2, 0xFFE3, 0xFFE4, 0xFFE9, 0xFFEA, 0xFFE5, 0xFF13, 0xFF61, 0xFF14, 0xFF7F, 0xFF67, 0xFFAA, 0xFFAB, 0xFFAD, 0xFFAE, 0xFFAF, 0xFF95, 0xFF96, 0xFF97, 0xFF98, 0xFF99, 0xFF9A, 0xFF9B, 0xFF9C, 0xFF9E, 0xFF9F, 0x3B, 0x3D, 0x2C, 0x2D, 0x2E, 0x2F, 0x60, 0x5B, 0x5C, 0x5D, 0x27];
+    const to: []int = [0x08, 0x09, 0x0D, 0x0D, 0x1B, 0x2E, 0x2D, 0x24, 0x23, 0x21, 0x22, 0x25, 0x26, 0x27, 0x28, 0x10, 0x10, 0x11, 0x11, 0x12, 0x12, 0x14, 0x13, 0x2C, 0x91, 0x90, 0x5D, 0x6A, 0x6B, 0x6D, 0x6E, 0x6F, 0x24, 0x25, 0x26, 0x27, 0x28, 0x21, 0x22, 0x23, 0x2D, 0x2E, 0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF, 0xC0, 0xDB, 0xDC, 0xDD, 0xDE];
+    let i: int = 0;
+    while (i < len(from)) {
+        if (from[i] == ks) {
+            return to[i];
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 键码＋修饰位 → 虚拟键码：取第 0 列（不带 Shift）的 keysym；NumLock（Mod2）开时小键盘取数字列。
+function vkOf(kc: int, state: int): int {
+    const ks0: int = xKeysym(kc, 0);
+    const ks1: int = xKeysym(kc, 1);
+    if ((state & 16) != 0 && isKeypadDigit(ks1)) {
+        return vkOfKeysym(ks1);
+    }
+    return vkOfKeysym(ks0);
+}
+
+// keysym → Unicode 码位（0＝不产生字符）。
+function cpOfKeysym(ks: int): int {
+    if ((ks >= 0x20 && ks <= 0x7E) || (ks >= 0xA0 && ks <= 0xFF)) {
+        return ks;
+    }
+    if ((ks & 0xFF000000) == 0x01000000) {
+        return ks & 0x00FFFFFF;
+    }
+    if (ks >= 0xFFB0 && ks <= 0xFFB9) {
+        return 0x30 + ks - 0xFFB0;
+    }
+    const from: []int = [0xFF80, 0xFFAA, 0xFFAB, 0xFFAD, 0xFFAE, 0xFFAF, 0xFFBD, 0x20AC];
+    const to: []int = [0x20, 0x2A, 0x2B, 0x2D, 0x2E, 0x2F, 0x3D, 0x20AC];
+    let i: int = 0;
+    while (i < len(from)) {
+        if (from[i] == ks) {
+            return to[i];
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 按下的键产生的字符：Shift 取第 1 列；CapsLock 只翻转字母大小写；NumLock 开时小键盘取数字列（ICCCM／XKB 的常用子集）。
+function textOf(kc: int, state: int): int {
+    const ks0: int = xKeysym(kc, 0);
+    let ks1: int = xKeysym(kc, 1);
+    const letter: bool = ks0 >= 0x61 && ks0 <= 0x7A;
+    if (ks1 == 0) {
+        ks1 = ks0;
+        if (letter) {
+            ks1 = ks0 - 32;
+        }
+    }
+    const shift: bool = (state & 1) != 0;
+    const caps: bool = (state & 2) != 0;
+    if ((state & 16) != 0 && isKeypadDigit(ks1)) {
+        if (shift) {
+            return cpOfKeysym(ks0);
+        }
+        return cpOfKeysym(ks1);
+    }
+    let ks: int = ks0;
+    if (shift != (caps && letter)) {
+        ks = ks1;
+    }
+    return cpOfKeysym(ks);
+}
+
+// —— 原子 ——
+
+function atom(name: string): int {
+    return xAtom(name);
+}
+
+function atomList(names: []string): Bytes {
+    const b = bytesNew(0);
+    let i: int = 0;
+    while (i < len(names)) {
+        w32(b, atom(names[i]));
+        i = i + 1;
+    }
+    return b;
+}
+
+// —— 呈现 ——
+
+function swapped(px: Bytes): Bytes {
+    const out = bytesNew(bytesLen(px));
+    let i: int = 0;
+    while (i + 3 < bytesLen(px)) {
+        bytesSet(out, i, bytesGet(px, i + 3) catch 0);
+        bytesSet(out, i + 1, bytesGet(px, i + 2) catch 0);
+        bytesSet(out, i + 2, bytesGet(px, i + 1) catch 0);
+        bytesSet(out, i + 3, bytesGet(px, i) catch 0);
+        i = i + 4;
+    }
+    return out;
+}
+
+function clearArea(w: Ref<LWin>, x: int, y: int, cw: int, ch: int): void {
+    if (cw < 1 || ch < 1) {
+        return;
+    }
+    const b = bytesNew(0);
+    w32(b, w.xid);
+    w16(b, x);
+    w16(b, y);
+    w16(b, cw);
+    w16(b, ch);
+    xReq(61, 0, b);
+}
+
+function blit(w: Ref<LWin>): bool {
+    if (w.pw > 0 && w.ph > 0) {
+        const row: int = w.pw * 4;
+        const rows: int = (xMaxReq() - 28) / row;
+        if (rows < 1) {
+            return false;
+        }
+        let y: int = 0;
+        while (y < w.ph) {
+            const n: int = minInt(rows, w.ph - y);
+            const b = bytesNew(0);
+            w32(b, w.xid);
+            w32(b, w.gc);
+            w16(b, w.pw);
+            w16(b, n);
+            w16(b, 0);
+            w16(b, y);
+            w8(b, 0);
+            w8(b, xRootDepth());
+            w16(b, 0);
+            let data: Bytes = bytesSlice(w.px, y * row, n * row);
+            if (xImageMsb()) {
+                data = swapped(data);
+            }
+            bytesAppend(b, data);
+            if (xReq(72, 2, b) < 0) {
+                return false;
+            }
+            y = y + n;
+        }
+    }
+    clearArea(w, w.pw, 0, w.cw - w.pw, w.ch);
+    clearArea(w, 0, w.ph, minInt(w.cw, w.pw), w.ch - w.ph);
+    return true;
+}
+
+// —— 窗口管理提示 ——
+
+function writeNormalHints(w: Ref<LWin>): void {
+    const k: int = w.scale;
+    let flags: int = 0;
+    if (w.centered) {
+        flags = flags | 1 | 4; // USPosition | PPosition
+    }
+    if (w.minW > 0 || w.minH > 0) {
+        flags = flags | 16; // PMinSize
+    }
+    if (w.maxW > 0 || w.maxH > 0) {
+        flags = flags | 32; // PMaxSize
+    }
+    const b = bytesNew(0);
+    w32(b, flags);
+    w32(b, w.x);
+    w32(b, w.y);
+    w32(b, w.cw);
+    w32(b, w.ch);
+    w32(b, dipToPx(w.minW, k));
+    w32(b, dipToPx(w.minH, k));
+    let mw: int = 32767;
+    let mh: int = 32767;
+    if (w.maxW > 0) {
+        mw = dipToPx(w.maxW, k);
+    }
+    if (w.maxH > 0) {
+        mh = dipToPx(w.maxH, k);
+    }
+    w32(b, mw);
+    w32(b, mh);
+    let i: int = 0;
+    while (i < 9) {
+        w32(b, 0); // 增量、宽高比、基准尺寸、重力
+        i = i + 1;
+    }
+    xChangeProperty(w.xid, ATOM_WM_NORMAL_HINTS, ATOM_WM_SIZE_HINTS, 32, b);
+}
+
+function setTitle(w: Ref<LWin>, title: string): void {
+    const t = bytesFromStr(cText(title));
+    xChangeProperty(w.xid, atom("_NET_WM_NAME"), atom("UTF8_STRING"), 8, t);
+    xChangeProperty(w.xid, ATOM_WM_NAME, ATOM_STRING, 8, t);
+}
+
+// _NET_WM_STATE 的增删改（action 0 去、1 加、2 切换），发给根窗口由窗口管理器执行。
+function netState(w: Ref<LWin>, action: int, a1: int, a2: int): int {
+    const ev = xClientMessage(w.xid, atom("_NET_WM_STATE"), action, a1, a2, 1);
+    if (xSendEvent(xRootWindow(), ROOT_MSG_MASK, ev) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/// 系统 DPI×100（Xft.dpi；连不上 X 时 100）。
+export function platSystemScale(): int {
+    if (sysScale == 0) {
+        sysScale = 100;
+        if (xConnect()) {
+            sysScale = xDpi() * 100 / 96;
+        }
+    }
+    return sysScale;
+}
+
+/// 有没有可用的窗口系统（DISPLAY 可连、像素格式为 32 位 TrueColor）。
+export function platAvailable(): bool {
+    return xConnect() && xPixelsOk();
+}
+
+/// 开真窗，引擎编号 id；flags 为 WFLAG_* 位集（16＝不显示，测试用）。成功得 true。
+export function platCreate(id: int, title: string, w: int, h: int, flags: int): bool {
+    if (!platAvailable() || w < 1 || h < 1) {
+        return false;
+    }
+    const k: int = platSystemScale();
+    const pw: int = minInt(dipToPx(w, k), 32767);
+    const ph: int = minInt(dipToPx(h, k), 32767);
+    let x: int = 0;
+    let y: int = 0;
+    const centered: bool = (flags & WFLAG_CENTERED) != 0;
+    if (centered) {
+        const rs: List<int> = xRootSize();
+        x = maxInt(0, ((listTryGet(rs, 0) catch 0) - pw) / 2);
+        y = maxInt(0, ((listTryGet(rs, 1) catch 0) - ph) / 2);
+    }
+    const xid: int = xNewId();
+    const b = bytesNew(0);
+    w32(b, xid);
+    w32(b, xRootWindow());
+    w16(b, x);
+    w16(b, y);
+    w16(b, pw);
+    w16(b, ph);
+    w16(b, 0); // 边框
+    w16(b, 1); // InputOutput
+    w32(b, 0); // 视觉随父窗口
+    w32(b, 0x2 | 0x800); // BackPixel | EventMask
+    w32(b, 0); // 背景黑
+    w32(b, EVENT_MASK);
+    if (xReq(1, xRootDepth(), b) < 0) {
+        return false;
+    }
+    const gc: int = xNewId();
+    const g = bytesNew(0);
+    w32(g, gc);
+    w32(g, xid);
+    w32(g, 0x10000); // GraphicsExposures
+    w32(g, 0);
+    xReq(55, 0, g);
+    const win = new LWin { id: id, xid: xid, gc: gc, scale: k, frameless: (flags & WFLAG_FRAMELESS) != 0, centered: centered, x: x, y: y, minW: 0, minH: 0, maxW: 0, maxH: 0, cursor: 0, q: listNew(), head: 0, px: bytesNew(0), pw: 0, ph: 0, cw: pw, ch: ph, closed: false };
+    listPush(wins, win);
+    xChangeProperty(xid, atom("WM_PROTOCOLS"), ATOM_ATOM, 32, atomList(["WM_DELETE_WINDOW"]));
+    xChangeProperty(xid, ATOM_WM_CLASS, ATOM_STRING, 8, bytesFromStr("taixu" + (bytesToStr(bytesNew(1)) catch "") + "Taixu" + (bytesToStr(bytesNew(1)) catch "")));
+    setTitle(win, title);
+    writeNormalHints(win);
+    if (win.frameless) {
+        const m = bytesNew(0);
+        w32(m, 2); // flags：只给 decorations
+        w32(m, 0);
+        w32(m, 0); // 不要窗框
+        w32(m, 0);
+        w32(m, 0);
+        xChangeProperty(xid, atom("_MOTIF_WM_HINTS"), atom("_MOTIF_WM_HINTS"), 32, m);
+    }
+    const states = bytesNew(0);
+    if ((flags & WFLAG_MAXIMIZED) != 0) {
+        w32(states, atom("_NET_WM_STATE_MAXIMIZED_VERT"));
+        w32(states, atom("_NET_WM_STATE_MAXIMIZED_HORZ"));
+    }
+    if ((flags & WFLAG_TOPMOST) != 0) {
+        w32(states, atom("_NET_WM_STATE_ABOVE"));
+    }
+    if (bytesLen(states) > 0) {
+        xChangeProperty(xid, atom("_NET_WM_STATE"), ATOM_ATOM, 32, states);
+    }
+    if ((flags & WFLAG_HIDDEN) == 0) {
+        const mp = bytesNew(0);
+        w32(mp, xid);
+        xReq(8, 0, mp);
+    }
+    return xAlive();
+}
+
+/// 是不是本模块开的真窗。
+export function platIsReal(id: int): bool {
+    return idxOfId(id) >= 0;
+}
+
+/// 关真窗（幂等）。
+export function platDestroy(id: int): void {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return;
+    }
+    const w: Ref<LWin> = winAt(i);
+    const g = bytesNew(0);
+    w32(g, w.gc);
+    xReq(60, 0, g);
+    const d = bytesNew(0);
+    w32(d, w.xid);
+    xReq(4, 0, d);
+    listRemoveAt(wins, i);
+}
+
+// —— 事件 ——
+
+function evWindow(e: Bytes, t: int): int {
+    if (t >= 2 && t <= 6) {
+        return r32(e, 12);
+    }
+    if (t == 12 || t == 33) {
+        return r32(e, 4);
+    }
+    if (t == 22) {
+        return r32(e, 8);
+    }
+    return 0;
+}
+
+// 选区请求：持有 CLIPBOARD 时按目标类型写到请求方的属性，再回 SelectionNotify（属性 0＝拒绝）。
+function serveSelection(e: Bytes): void {
+    const time: int = r32(e, 4);
+    const requestor: int = r32(e, 12);
+    const selection: int = r32(e, 16);
+    const target: int = r32(e, 20);
+    let prop: int = r32(e, 24);
+    if (prop == 0) {
+        prop = target; // 旧客户端
+    }
+    let ok: bool = false;
+    if (clipOwned && selection == atom("CLIPBOARD")) {
+        if (target == atom("TARGETS")) {
+            ok = xChangeProperty(requestor, prop, ATOM_ATOM, 32, atomList(["TARGETS", "UTF8_STRING", "STRING"])) >= 0;
+        } else if (target == atom("UTF8_STRING") || target == ATOM_STRING || target == atom("TEXT")) {
+            const data = bytesFromStr(clipText);
+            if (bytesLen(data) + 64 <= xMaxReq()) {
+                let ty: int = target;
+                if (target == atom("TEXT")) {
+                    ty = atom("UTF8_STRING");
+                }
+                ok = xChangeProperty(requestor, prop, ty, 8, data) >= 0;
+            }
+        }
+    }
+    const n = bytesNew(0);
+    w8(n, 31);
+    w8(n, 0);
+    w16(n, 0);
+    w32(n, time);
+    w32(n, requestor);
+    w32(n, selection);
+    w32(n, target);
+    if (ok) {
+        w32(n, prop);
+    } else {
+        w32(n, 0);
+    }
+    xSendEvent(requestor, 0, n);
+}
+
+function dispatch(e: Bytes): void {
+    const t: int = r8(e, 0) & 0x7F;
+    if (t == 30) {
+        serveSelection(e);
+        return;
+    }
+    if (t == 29) {
+        if (r32(e, 12) == atom("CLIPBOARD")) {
+            clipOwned = false;
+        }
+        return;
+    }
+    if (t == 34) {
+        if (r8(e, 4) == 1) {
+            loadKeymap();
+        }
+        return;
+    }
+    const i: int = idxOfXid(evWindow(e, t));
+    if (i < 0) {
+        return;
+    }
+    const w: Ref<LWin> = winAt(i);
+    const k: int = w.scale;
+    if (t == 2 || t == 3) {
+        const kc: int = r8(e, 1);
+        const state: int = r16(e, 28);
+        if (t == 3) {
+            // 自动重复：紧跟着同一时刻、同一键码、同一窗口的按下，这条抬起丢掉。
+            const nx = xPeekEvent();
+            if (bytesLen(nx) > 0 && (r8(nx, 0) & 0x7F) == 2 && r8(nx, 1) == kc && r32(nx, 4) == r32(e, 4) && r32(nx, 12) == w.xid) {
+                return;
+            }
+        }
+        const m: int = modsOf(state);
+        const vk: int = vkOf(kc, state);
+        let kind: int = EV_KEY_UP;
+        if (t == 2) {
+            kind = EV_KEY_DOWN;
+        }
+        if (vk != 0 && !(kind == EV_KEY_DOWN && printableVk(vk) && (m & (MOD_CTRL | MOD_ALT)) == 0)) {
+            push(w, kind, vk & 0xFF, 0, 0, m);
+        }
+        if (kind == EV_KEY_DOWN && (m & (MOD_CTRL | MOD_ALT)) == 0) {
+            const cp: int = textOf(kc, state);
+            if (cp >= 0x20 && cp != 0x7F) {
+                push(w, EV_TEXT, cp, 0, 0, m);
+            }
+        }
+        return;
+    }
+    if (t == 4 || t == 5) {
+        const button = r8(e, 1);
+        if (button == 4 || button == 5) {
+            if (t == 4) {
+                let delta = -40;
+                if (button == 5) { delta = 40; }
+                push(w, EV_SCROLL, delta, pxToDip(s16(e, 24), k), pxToDip(s16(e, 26), k), modsOf(r16(e, 28)));
+            }
+            return;
+        }
+        if (r8(e, 1) != 1) {
+            return; // 只认左键（同 Windows 后端）
+        }
+        let kind: int = EV_MOUSE_UP;
+        if (t == 4) {
+            kind = EV_MOUSE_DOWN;
+        }
+        push(w, kind, 1, pxToDip(s16(e, 24), k), pxToDip(s16(e, 26), k), modsOf(r16(e, 28)));
+        return;
+    }
+    if (t == 6) {
+        push(w, EV_MOUSE_MOVE, 0, pxToDip(s16(e, 24), k), pxToDip(s16(e, 26), k), modsOf(r16(e, 28)));
+        return;
+    }
+    if (t == 12) {
+        if (r16(e, 16) == 0) {
+            blit(w);
+        }
+        return;
+    }
+    if (t == 22) {
+        const cw: int = r16(e, 20);
+        const ch: int = r16(e, 22);
+        if (cw > 0 && ch > 0 && (cw != w.cw || ch != w.ch)) {
+            w.cw = cw;
+            w.ch = ch;
+            push(w, EV_RESIZE, 0, pxToDip(cw, k), pxToDip(ch, k), 0);
+        }
+        return;
+    }
+    if (t == 33) {
+        if (r32(e, 8) == atom("WM_PROTOCOLS") && r32(e, 12) == atom("WM_DELETE_WINDOW")) {
+            push(w, EV_CLOSE, 0, 0, 0, 0);
+        }
+        return;
+    }
+}
+
+// 连接断开：每个窗口补发一次关闭事件（不 trap，程序按正常关窗收尾）。
+function closeAllOnDeath(): void {
+    if (xAlive()) {
+        return;
+    }
+    for (w in wins) {
+        if (!w.closed) {
+            w.closed = true;
+            push(w, EV_CLOSE, 0, 0, 0, 0);
+        }
+    }
+}
+
+function zeros5(): List<int> {
+    const r: List<int> = listNew();
+    let i: int = 0;
+    while (i < 5) {
+        listPush(r, 0);
+        i = i + 1;
+    }
+    return r;
+}
+
+function drain(): void {
+    let e = xNextEvent(0);
+    while (bytesLen(e) > 0) {
+        dispatch(e);
+        e = xNextEvent(0);
+    }
+    closeAllOnDeath();
+}
+
+/// 取下一条事件 [kind、target、x、y、mods]（kind 0＝至多等 timeoutMs 毫秒仍无事件）。
+export function platWait(id: int, timeoutMs: int): List<int> {
+    const none: List<int> = zeros5();
+    if (idxOfId(id) < 0) {
+        return none;
+    }
+    drain();
+    if (timeoutMs > 0) {
+        const deadline: int = xNowMs() + timeoutMs;
+        while (idxOfId(id) >= 0 && queued(winAt(idxOfId(id))) == 0 && xAlive()) {
+            const left: int = deadline - xNowMs();
+            if (left <= 0) {
+                break;
+            }
+            const e = xNextEvent(left);
+            if (bytesLen(e) == 0) {
+                break;
+            }
+            dispatch(e);
+            drain();
+        }
+        closeAllOnDeath();
+    }
+    const j: int = idxOfId(id);
+    if (j < 0) {
+        return none;
+    }
+    const w: Ref<LWin> = winAt(j);
+    if (queued(w) == 0) {
+        return none;
+    }
+    const rec: List<int> = listNew();
+    let s: int = 0;
+    while (s < 5) {
+        listPush(rec, listTryGet(w.q, w.head + s) catch 0);
+        s = s + 1;
+    }
+    w.head = w.head + 5;
+    return rec;
+}
+
+/// 呈现：像素（BGRX，宽 pw、高 ph）交给窗口，并留作重画用。失败得 -1。
+export function platPresent(id: int, px: Bytes, pw: int, ph: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0 || pw < 1 || ph < 1 || pw > 32767 || ph > 32767 || bytesLen(px) < pw * ph * 4) {
+        return -1;
+    }
+    const w: Ref<LWin> = winAt(i);
+    w.px = px;
+    w.pw = pw;
+    w.ph = ph;
+    if (!blit(w)) {
+        return -1;
+    }
+    return 0;
+}
+
+/// 窗口 DPI×100（X 只有一个全局 Xft.dpi）。
+export function platScale(id: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return 100;
+    }
+    return winAt(i).scale;
+}
+
+export function platSetTitle(id: int, title: string): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return -1;
+    }
+    setTitle(winAt(i), title);
+    if (!xAlive()) {
+        return -1;
+    }
+    return 0;
+}
+
+/// 相对移动（DIP 增量）：按客户区在根窗口上的位置算新位置。
+export function platMove(id: int, dx: int, dy: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return -1;
+    }
+    const w: Ref<LWin> = winAt(i);
+    const b = bytesNew(0);
+    w32(b, w.xid);
+    w32(b, xRootWindow());
+    w16(b, 0);
+    w16(b, 0);
+    const r = xReqReply(40, 0, b);
+    if (bytesLen(r) < 16) {
+        return -1;
+    }
+    const nx: int = s16(r, 12) + dipToPx(dx, w.scale);
+    const ny: int = s16(r, 14) + dipToPx(dy, w.scale);
+    const c = bytesNew(0);
+    w32(c, w.xid);
+    w16(c, 1 | 2);
+    w16(c, 0);
+    w32(c, nx);
+    w32(c, ny);
+    if (xReq(12, 0, c) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+export function platMinimize(id: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return -1;
+    }
+    const ev = xClientMessage(winAt(i).xid, atom("WM_CHANGE_STATE"), 3, 0, 0, 0); // IconicState
+    if (xSendEvent(xRootWindow(), ROOT_MSG_MASK, ev) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+export function platMaximizeToggle(id: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return -1;
+    }
+    return netState(winAt(i), 2, atom("_NET_WM_STATE_MAXIMIZED_VERT"), atom("_NET_WM_STATE_MAXIMIZED_HORZ"));
+}
+
+/// 客户区尺寸（DIP）。
+export function platClientResize(id: int, cw: int, ch: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0 || cw < 1 || ch < 1) {
+        return -1;
+    }
+    const w: Ref<LWin> = winAt(i);
+    const c = bytesNew(0);
+    w32(c, w.xid);
+    w16(c, 4 | 8);
+    w16(c, 0);
+    w32(c, minInt(dipToPx(cw, w.scale), 32767));
+    w32(c, minInt(dipToPx(ch, w.scale), 32767));
+    if (xReq(12, 0, c) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/// 客户区的最小、最大尺寸（DIP；0＝不约束），经 WM_NORMAL_HINTS 交给窗口管理器。
+export function platSetMinMax(id: int, minW: int, minH: int, maxW: int, maxH: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return -1;
+    }
+    const w: Ref<LWin> = winAt(i);
+    w.minW = maxInt(minW, 0);
+    w.minH = maxInt(minH, 0);
+    w.maxW = maxInt(maxW, 0);
+    w.maxH = maxInt(maxH, 0);
+    writeNormalHints(w);
+    return 0;
+}
+
+export function platSetTopmost(id: int, on: bool): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return -1;
+    }
+    let action: int = 0;
+    if (on) {
+        action = 1;
+    }
+    return netState(winAt(i), action, atom("_NET_WM_STATE_ABOVE"), 0);
+}
+
+/// X 没有原生菜单栏：得 -1。
+export function platMenuAdd(id: int, item: int, label: string): int {
+    id;
+    item;
+    label;
+    return -1;
+}
+
+// 光标字体（cursor）里的字形：left_ptr 68、xterm 152，掩码为下一个字形。
+function glyphCursor(ch: int): int {
+    if (cursorFont == 0) {
+        cursorFont = xNewId();
+        const f = bytesNew(0);
+        w32(f, cursorFont);
+        w16(f, 6);
+        w16(f, 0);
+        bytesAppend(f, bytesFromStr("cursor"));
+        pad4(f);
+        xReq(45, 0, f);
+    }
+    const cid: int = xNewId();
+    const b = bytesNew(0);
+    w32(b, cid);
+    w32(b, cursorFont);
+    w32(b, cursorFont);
+    w16(b, ch);
+    w16(b, ch + 1);
+    w16(b, 0);
+    w16(b, 0);
+    w16(b, 0);
+    w16(b, 0xFFFF);
+    w16(b, 0xFFFF);
+    w16(b, 0xFFFF);
+    xReq(94, 0, b);
+    return cid;
+}
+
+/// 客户区光标：0 箭头、1 I 形。
+export function platSetCursor(id: int, kind: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0 || kind < 0 || kind > 1) {
+        return -1;
+    }
+    const w: Ref<LWin> = winAt(i);
+    w.cursor = kind;
+    if (cursorArrow == 0) {
+        cursorArrow = glyphCursor(68);
+        cursorIbeam = glyphCursor(152);
+    }
+    let c: int = cursorArrow;
+    if (kind == 1) {
+        c = cursorIbeam;
+    }
+    const b = bytesNew(0);
+    w32(b, w.xid);
+    w32(b, 0x4000); // Cursor
+    w32(b, c);
+    if (xReq(2, 0, b) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/// 窗口整体不透明度 0..255（_NET_WM_WINDOW_OPACITY，由合成器生效）。
+export function platSetOpacity(id: int, opacity: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0 || opacity < 0 || opacity > 255) {
+        return -1;
+    }
+    const b = bytesNew(0);
+    w32(b, opacity * 0x01010101);
+    if (xChangeProperty(winAt(i).xid, atom("_NET_WM_WINDOW_OPACITY"), ATOM_CARDINAL, 32, b) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/// 窗口效果：X 下没有，恒得 0（plain）。
+export function platSetEffect(id: int, effect: int): int {
+    id;
+    effect;
+    return 0;
+}
+
+/// 真窗会话的动画毫秒（单调时钟）。
+export function platAnimMs(): int {
+    return xNowMs();
+}
+
+// —— 剪贴板（CLIPBOARD 选区）——
+
+function ensureClipWin(): int {
+    if (clipWin == 0) {
+        clipWin = xNewId();
+        const b = bytesNew(0);
+        w32(b, clipWin);
+        w32(b, xRootWindow());
+        w16(b, 0);
+        w16(b, 0);
+        w16(b, 1);
+        w16(b, 1);
+        w16(b, 0);
+        w16(b, 2); // InputOnly
+        w32(b, 0);
+        w32(b, 0);
+        xReq(1, 0, b);
+    }
+    return clipWin;
+}
+
+/// 剪贴板可用（连得上 X 服务器）。
+export function platClipAvailable(): bool {
+    return platAvailable();
+}
+
+/// 写剪贴板（取得 CLIPBOARD 选区）。不可用得 -1。
+export function platClipSet(text: string): int {
+    if (!platAvailable()) {
+        return -1;
+    }
+    const owner: int = ensureClipWin();
+    const sel: int = atom("CLIPBOARD");
+    const b = bytesNew(0);
+    w32(b, owner);
+    w32(b, sel);
+    w32(b, 0);
+    xReq(22, 0, b);
+    const q = bytesNew(0);
+    w32(q, sel);
+    const r = xReqReply(23, 0, q);
+    if (r32(r, 8) != owner) {
+        return -1;
+    }
+    clipOwned = true;
+    clipText = text;
+    return 0;
+}
+
+/// 读剪贴板（自己持有时直接给；否则向持有者要 UTF8_STRING，至多等 1 秒）。不可用或没有内容得空串。
+export function platClipGet(): string {
+    if (!platAvailable()) {
+        return "";
+    }
+    if (clipOwned) {
+        return clipText;
+    }
+    const req: int = ensureClipWin();
+    const prop: int = atom("TAIXU_CLIPBOARD");
+    const b = bytesNew(0);
+    w32(b, req);
+    w32(b, atom("CLIPBOARD"));
+    w32(b, atom("UTF8_STRING"));
+    w32(b, prop);
+    w32(b, 0);
+    if (xReq(24, 0, b) < 0) {
+        return "";
+    }
+    const deadline: int = xNowMs() + 1000;
+    while (xAlive()) {
+        const left: int = deadline - xNowMs();
+        if (left <= 0) {
+            return "";
+        }
+        const e = xNextEvent(left);
+        if (bytesLen(e) == 0) {
+            return "";
+        }
+        if ((r8(e, 0) & 0x7F) == 31 && r32(e, 8) == req) {
+            if (r32(e, 20) == 0) {
+                return "";
+            }
+            const p: List<Bytes> = xGetProperty(req, prop, CLIP_MAX, true);
+            const meta = listTryGet(p, 0) catch bytesNew(0);
+            if (r32(meta, 0) == atom("INCR")) {
+                return ""; // 分段传输暂不支持
+            }
+            return bytesToStr(listTryGet(p, 1) catch bytesNew(0)) catch "";
+        }
+        dispatch(e);
+    }
+    return "";
+}
+
+/// 测试用：同步发 Windows 消息（platform_windows 的 SendMessageW）；本平台没有，得 -1。
+export function platDebugSend(id: int, msg: int, wp: int, lp: int): int {
+    id;
+    msg;
+    wp;
+    lp;
+    return -1;
+}
+
+/// 测试用：给真窗投递一条合成事件（经 X 服务器 SendEvent 回到本连接，同真实输入走事件分派）。type 为 X 事件号：2／3 键
+/// （detail 为 keysym）、4／5 按钮（detail 为按钮号）、6 移动，lp 低 16 位 x、次 16 位 y、再 16 位修饰位；22 尺寸（lp 低 16 位宽、
+/// 次 16 位高）；33 关窗（WM_DELETE_WINDOW）。
+export function platDebugPost(id: int, type: int, detail: int, lp: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return -1;
+    }
+    const w: Ref<LWin> = winAt(i);
+    const e = bytesNew(0);
+    if (type >= 2 && type <= 6) {
+        let d: int = detail;
+        if (type == 2 || type == 3) {
+            d = xKeycodeOf(detail);
+            if (d == 0) {
+                return -1;
+            }
+        }
+        w8(e, type);
+        w8(e, d);
+        w16(e, 0);
+        w32(e, xNowMs() & 0xFFFFFFFF);
+        w32(e, xRootWindow());
+        w32(e, w.xid);
+        w32(e, 0);
+        w16(e, lp & 0xFFFF);
+        w16(e, (lp >> 16) & 0xFFFF);
+        w16(e, lp & 0xFFFF);
+        w16(e, (lp >> 16) & 0xFFFF);
+        w16(e, (lp >> 32) & 0xFFFF);
+        w8(e, 1);
+        w8(e, 0);
+    } else if (type == 22) {
+        w8(e, 22);
+        w8(e, 0);
+        w16(e, 0);
+        w32(e, w.xid);
+        w32(e, w.xid);
+        w32(e, 0);
+        w16(e, 0);
+        w16(e, 0);
+        w16(e, lp & 0xFFFF);
+        w16(e, (lp >> 16) & 0xFFFF);
+        w16(e, 0);
+        w8(e, 0);
+        w8(e, 0);
+        while (bytesLen(e) < 32) {
+            w8(e, 0);
+        }
+    } else if (type == 33) {
+        bytesAppend(e, xClientMessage(w.xid, atom("WM_PROTOCOLS"), atom("WM_DELETE_WINDOW"), 0, 0, 0));
+    } else {
+        return -1;
+    }
+    if (xSendEvent(w.xid, 0, e) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/// 文件对话框可用：会话总线上有 XDG 门户的 FileChooser（version 不小于 1）。
+export function platDialogAvailable(): bool {
+    return portalReady();
+}
+
+/// 打开文件对话框（门户 OpenFile）：选中得路径，取消、失败或门户不可用得空串。
+export function platDialogOpen(id: int, title: string, filters: List<FdFilter>): string {
+    return portalChoose(id, "OpenFile", title, filters, "");
+}
+
+/// 保存文件对话框（门户 SaveFile）：defaultName 作建议文件名（current_name）；选中得路径，取消、失败或门户不可用得空串。
+export function platDialogSave(id: int, title: string, filters: List<FdFilter>, defaultName: string): string {
+    return portalChoose(id, "SaveFile", title, filters, cText(defaultName));
+}
+
+let bus: Ref<BusConn> = busNone();
+let busTried: bool = false;
+let portalOk: bool = false;
+let tokenN: int = 0;
+
+// 第一次用到时连会话总线，读门户 FileChooser 接口的 version 属性。
+function portalReady(): bool {
+    if (!busTried) {
+        busTried = true;
+        bus = busOpen(busSessionAddress());
+        if (!bus.dead) {
+            let m: DbusMsg = dbusMsg(DBUS_CALL, PORTAL_DEST, PORTAL_PATH, "org.freedesktop.DBus.Properties", "Get");
+            m.sig = "ss";
+            dwStr(m.body, PORTAL_FILE_CHOOSER);
+            dwStr(m.body, "version");
+            const rep: DbusMsg = busCall(bus, m, 25000);
+            if (rep.kind == DBUS_RETURN && rep.sig == "v") {
+                const r = dbusReader(rep);
+                if (drSig(r) == "u") {
+                    const v: int = drU32(r);
+                    portalOk = !r.bad && v >= 1;
+                }
+            }
+        }
+    }
+    return portalOk && !bus.dead;
+}
+
+function portalChoose(id: int, method: string, title: string, filters: List<FdFilter>, currentName: string): string {
+    if (!portalReady()) {
+        return "";
+    }
+    tokenN = tokenN + 1;
+    const token: string = "taixu" + toStr(tokenN);
+    let path: string = portalRequestPath(bus.unique, token);
+    const rule: string = matchRule(path);
+    if (!busMatch("AddMatch", rule)) {
+        return "";
+    }
+    let parent: string = "";
+    const i: int = idxOfId(id);
+    if (i >= 0) {
+        parent = "x11:" + hexOf(winAt(i).xid);
+    }
+    let m: DbusMsg = dbusMsg(DBUS_CALL, PORTAL_DEST, PORTAL_PATH, PORTAL_FILE_CHOOSER, method);
+    m.sig = "ssa{sv}";
+    m.body = portalChooserBody(parent, cText(title), token, filters, currentName);
+    const rep: DbusMsg = busCall(bus, m, 25000);
+    let out: string = "";
+    if (rep.kind == DBUS_RETURN && rep.sig == "o") {
+        const got: string = drStr(dbusReader(rep));
+        let other: string = "";
+        if (got != "" && got != path) {
+            other = matchRule(got);
+            busMatch("AddMatch", other);
+            path = got;
+        }
+        const res: PortalResult = portalResult(busWaitSignal(bus, path, PORTAL_REQUEST, "Response", -1));
+        out = res.path;
+        if (other != "") {
+            busMatch("RemoveMatch", other);
+        }
+    }
+    busMatch("RemoveMatch", rule);
+    return out;
+}
+
+function matchRule(path: string): string {
+    return "type='signal',sender='" + PORTAL_DEST + "',interface='" + PORTAL_REQUEST + "',member='Response',path='" + path + "'";
+}
+
+function busMatch(member: string, rule: string): bool {
+    let m: DbusMsg = dbusMsg(DBUS_CALL, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", member);
+    m.sig = "s";
+    dwStr(m.body, rule);
+    return busCall(bus, m, 5000).kind == DBUS_RETURN;
+}
+
+function hexOf(v: int): string {
+    const digits: string = "0123456789abcdef";
+    if (v <= 0) {
+        return "0";
+    }
+    let s: string = "";
+    let x: int = v;
+    while (x > 0) {
+        const d: int = x & 15;
+        s = strSlice(digits, d, d + 1) + s;
+        x = x >> 4;
+    }
+    return s;
+}

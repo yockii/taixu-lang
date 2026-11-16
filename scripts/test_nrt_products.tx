@@ -1,0 +1,892 @@
+// 语料运行器（逐例输出状态行，末行 SUMMARY，可另写报告 JSON）：
+// 把 tests/cases、tests/nrt-cases、examples 里带期望的用例逐个以 --runtime=native 构建并运行，对照声明式伴文件（tests/README.md）。
+//
+// 期望：`.out`＝退出 0 且 stdout 逐字节相同；`.err`＝首行 `exit=N`，其余各行须出现在 stderr 或 stdout 里。NRT 契约以外的用例
+// （运行期的 GUI／宿主外部函数、runflags、json/test 变体）按规则跳过；编译期拒绝（`.err` 且 exit=1）不需要宿主，外部函数标记不使它跳过。
+// 未实现的 NRT 入口以“taixu NRT: 未实现”失败，记 PENDING，不记通过。`<用例>.windows`／`.linux`／`.macos` 标记只在该操作系统上跑的用例
+// （针对某个平台的库或系统调用的 FFI），在别的目标上按名字跳过；`.x86_64`／`.aarch64`／`.loongarch64`／`.riscv64` 同样按架构挑选。
+// `<用例>.buildflags` 每行一个附加构建选项（如 `--static`）；`<用例>.argv` 每行一个运行实参；`<用例>.toolchain` 按工具链程序构建。
+//
+// --leak-check：每个用例带该选项构建（退出时的泄漏检查，第一步），结果照旧须相符，且运行不得打印泄漏报告（`[runtime:leak]`），
+// 除非用例自己的期望里写了它（有意泄漏的用例）；`<用例>.leakok`（一行：程序为何有意留住对象）使它不带该选项构建。
+// --debug：每个用例按插桩调试构建；不在调试会话里时检查点不起作用，结果须与普通构建完全相同（语义透明门）。
+// `.buildflags` 要 --leak-check 的用例按名字跳过（两选项互斥）。
+// --build-only：只构建、只核对构建结果（产物，或预期的编译期拒绝）；构建成功的记 BUILT，不运行。门用它核对本宿主跑不了的目标。
+//
+// --target：缺省为宿主自己的目标（按操作系统与处理器）。取值是 scripts/targets.tx 里的三元组，x86_64 也可只写系统名；
+// 只构建时任何宿主都可以给任何目标。
+// - linux 在 Windows 宿主上经 wsl.exe 运行 ELF 产物；
+// - macos、aarch64-macos（M4c）：每个 Mach-O 产物先过独立核对器 scripts/macho_check.tx，不合格记 BUILD_FAIL；在 macOS
+//   宿主上（--remote 缺省为 local）就地运行，否则一批经 ssh 送测试机（--remote <ssh 主机>，缺省 $TAIXU_MACOS_HOST）；macOS 目标仍拒绝的
+//   特性说“macOS 目标暂不支持”／“aarch64-macos 暂不支持”，记 PENDING；
+// - aarch64-linux、loongarch64-linux、riscv64-linux（A5e）：同架构的 Linux 宿主上直接运行，否则经 qemu-user
+//   （--qemu <路径>，缺省 $TAIXU_QEMU_AARCH64／$TAIXU_QEMU_LOONGARCH64／$TAIXU_QEMU_RISCV64；Windows 宿主上路径在 WSL 里，产物以
+//   `wsl.exe -e <qemu> <产物>` 运行）；用户态 qemu 下产物再起另一个同架构程序（procSpawn 自己）需要宿主的 binfmt_misc，这样的失败照常报出；
+// - aarch64-windows：每个产物先过独立核对器 scripts/pe_arm64_check.tx，不合格记 BUILD_FAIL；在 Windows ARM64 宿主上直接
+//   运行，否则一批经 ssh 送 Windows ARM64 测试机（--winarm <ssh 实参串>，缺省 $TAIXU_WINARM_HOST），或用 --build-only。
+//
+// 环境：产物继承本进程的环境，另设 getEnv 的正例夹具 TAIXU_SYS_PROC_FIXTURE（Windows 宿主上并入 WSLENV，经 wsl.exe 运行的产物也看得到）。
+// 产物的行为不能取决于测试者的环境，而 setEnv 只能设不能删，所以启动时检查：用例源码里出现的 TAIXU_ 名字与运行时读的几个
+// （TAIXU_DEBUG_CHANNEL 等）若已在环境里设了，就拒绝运行并列出；TAIXU_STDLIB、TAIXU_GUI_ROOT 与上述夹具变量除外。
+//
+// 运行：taixu run --toolchain scripts/test_nrt_products.tx --compiler <taixu> [--work 目录] [--report 报告.json] [--target T]
+//   [--kernel 内核对象] [--qemu 路径] [--remote ssh 主机] [--winarm ssh 实参串] [--leak-check | --debug] [--build-flag 选项]...
+//   [--build-only] [--root 仓库根] [用例.tx...]
+// 在仓库根运行（缺省以当前目录为仓库根）。退出码：有 FAIL、BUILD_FAIL 或 REJECT_MISMATCH 为 1，用法错误为 2。
+import { absolute, baseOf, dirOf, findInPath, isAbs, join, kindOf, mkdirs, nat, onWindows, readBytes, startsWith } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { Raw, captureRaw, linesOf } from "./test_lib";
+import { lossyText } from "./check_lib";
+import { byteSub, contains, crlf, digits, endsWith, headChars, indexOf, isSpace, padRight, reprBytes, reprStr, slashes, sorted, strip, tail,
+    tailChars } from "./test_text";
+import { machoCheck } from "./macho_check";
+import { PeReport, peArm64Check } from "./pe_arm64_check";
+import { remoteBatch, RemoteItem } from "./remote_batch";
+import { allTargets, targetOn, targetSpelled, targetSpelling } from "./targets";
+import { jsonQuote } from "../bootstrap/selfhost/json_text";
+import { caseSpace, testSpace } from "./test_space";
+import { sha256Hex } from "../bootstrap/selfhost/sha256";
+
+const BUILD_NS: int = 600000000000;
+const RUN_NS: int = 120000000000;
+// 子进程退出后，后代仍占着输出管道时至多再读这么久。
+const DRAIN_NS: int = 10000000000;
+const MAX_OUTPUT: int = 268435456;
+const FIXTURE_VAR: string = "TAIXU_SYS_PROC_FIXTURE";
+const FIXTURE_VALUE: string = "fixture 中文 🦊";
+
+struct Opts {
+    root: string,
+    compiler: string,
+    kernel: string,
+    work: string,
+    report: string,
+    target: string,
+    qemu: string,
+    remote: string,
+    winarm: string,
+    leak: bool,
+    debug: bool,
+    buildOnly: bool,
+    buildFlags: List<string>,
+    cases: List<string>,
+}
+
+struct Expect {
+    isOut: bool,
+    exit: int,
+    stdout: Bytes,
+    needles: List<string>,
+}
+
+struct Row {
+    name: string,
+    status: string,
+    reason: string,
+    detail: string,
+    sha: string,
+}
+
+// 送测试机一批运行的产物（macOS 或 Windows ARM64）。
+struct Pending {
+    row: Ref<Row>,
+    exp: Ref<Expect>,
+    exe: string,
+    argv: List<string>,
+    tree: string,
+}
+
+function usage(msg: string): int {
+    eprint("test_nrt_products：" + msg);
+    eprint("用法：taixu run --toolchain scripts/test_nrt_products.tx --compiler <taixu> [--work 目录] [--report 报告.json] [--target T]");
+    eprint("  [--kernel 内核对象] [--qemu 路径] [--remote ssh 主机] [--winarm ssh 实参串] [--leak-check | --debug] [--build-flag 选项]...");
+    eprint("  [--build-only] [--root 仓库根] [用例.tx...]");
+    return 2;
+}
+
+// 宿主自己的目标（按操作系统与处理器，取自 scripts/targets.tx）；表里没有这个组合时取该系统的 x86_64。
+function hostDefault(): string {
+    const t = targetOn(hostTarget(), hostArch());
+    if (len(t.triple) == 0) {
+        return hostTarget();
+    }
+    return targetSpelling(t);
+}
+
+function targetChoices(): string {
+    let s = "";
+    for (t in allTargets()) {
+        if (len(s) > 0) {
+            s = s + "、";
+        }
+        s = s + t.triple;
+    }
+    return s;
+}
+
+// 取 `--名字 值` 或 `--名字=值` 的值；不是该选项得 None。
+function optValue(args: []string, i: Ref<Idx>, name: string): string? {
+    const a = args[i.v];
+    if (a == name) {
+        if (i.v + 1 >= len(args)) {
+            return None;
+        }
+        i.v = i.v + 1;
+        return args[i.v];
+    }
+    if (startsWith(a, name + "=")) {
+        return tail(a, len(name) + 1);
+    }
+    return None;
+}
+
+struct Idx {
+    v: int,
+}
+
+function parse(args: []string): Ref<Opts> | Error {
+    const o = new Opts { root: "", compiler: "", kernel: "", work: "", report: "", target: hostDefault(), qemu: "", remote: "", winarm: "",
+        leak: false, debug: false, buildOnly: false, buildFlags: listNew(), cases: listNew() };
+    if (hostTarget() == "macos") {
+        o.remote = "local";
+    } else {
+        o.remote = getEnv("TAIXU_MACOS_HOST") ?? "";
+    }
+    o.winarm = getEnv("TAIXU_WINARM_HOST") ?? "";
+    const i = new Idx { v: 0 };
+    const valued = ["--root", "--compiler", "--kernel", "--work", "--report", "--target", "--qemu", "--remote", "--winarm", "--build-flag"];
+    while (i.v < len(args)) {
+        const a = args[i.v];
+        let taken = false;
+        for (name in valued) {
+            if (taken) {
+                break;
+            }
+            if (a == name || startsWith(a, name + "=")) {
+                const v = optValue(args, i, name);
+                if (v == None) {
+                    return err(name + " 缺值");
+                }
+                setOpt(o, name, v ?? "");
+                taken = true;
+            }
+        }
+        if (!taken) {
+            if (a == "--leak-check") {
+                o.leak = true;
+            } else if (a == "--debug") {
+                o.debug = true;
+            } else if (a == "--build-only") {
+                o.buildOnly = true;
+            } else if (startsWith(a, "--")) {
+                return err("不认识的选项 " + a);
+            } else {
+                listPush(o.cases, a);
+            }
+        }
+        i.v = i.v + 1;
+    }
+    if (len(o.compiler) == 0) {
+        return err("要给 --compiler");
+    }
+    const tg = targetSpelled(o.target);
+    if (len(tg.triple) == 0) {
+        return err("--target 只能是 " + targetChoices() + "（x86_64 也可只写系统名）");
+    }
+    // 规整成传给编译器的写法（x86_64 只写系统名），下游按它判断与传参。
+    o.target = targetSpelling(tg);
+    if (len(o.root) == 0) {
+        o.root = currentDir() catch ".";
+    }
+    o.root = slashes(absolute(o.root));
+    o.compiler = absolute(o.compiler);
+    if (len(o.kernel) > 0) {
+        o.kernel = absolute(o.kernel);
+    }
+    return o;
+}
+
+function setOpt(o: Ref<Opts>, name: string, v: string): void {
+    if (name == "--root") {
+        o.root = v;
+    } else if (name == "--compiler") {
+        o.compiler = v;
+    } else if (name == "--kernel") {
+        o.kernel = v;
+    } else if (name == "--work") {
+        o.work = v;
+    } else if (name == "--report") {
+        o.report = v;
+    } else if (name == "--target") {
+        o.target = v;
+    } else if (name == "--qemu") {
+        o.qemu = v;
+    } else if (name == "--remote") {
+        o.remote = v;
+    } else if (name == "--winarm") {
+        o.winarm = v;
+    } else if (name == "--build-flag") {
+        listPush(o.buildFlags, v);
+    }
+}
+
+function exists(p: string): bool {
+    return kindOf(p) == 1;
+}
+
+function withSuffix(tx: string, suffix: string): string {
+    return byteSub(tx, 0, len(tx) - 3) + suffix;
+}
+
+function stemOf(tx: string): string {
+    const b = baseOf(tx);
+    return byteSub(b, 0, len(b) - 3);
+}
+
+// 选定的用例（绝对路径，正斜杠；须带 .out 或 .err，否则得 Error）；没选时扫三个目录里带 .out 或 .err 的 .tx。
+function caseList(o: Ref<Opts>): List<string> | Error {
+    const found: List<string> = listNew();
+    if (listLen(o.cases) > 0) {
+        for (c in o.cases) {
+            const p = slashes(absolute(c));
+            if (!exists(withSuffix(p, ".out")) && !exists(withSuffix(p, ".err"))) {
+                return err("用例 " + c + " 没有 .out 或 .err 期望");
+            }
+            listPush(found, p);
+        }
+        return found;
+    }
+    const dirs = ["tests/cases", "tests/nrt-cases", "examples"];
+    for (d in dirs) {
+        const dir = join(o.root, d);
+        const names = localListDir(nat(dir), "") catch noNames();
+        const txs: List<string> = listNew();
+        for (n in names) {
+            if (endsWith(n, ".tx")) {
+                const p = join(dir, n);
+                if (exists(withSuffix(p, ".out")) || exists(withSuffix(p, ".err"))) {
+                    listPush(txs, p);
+                }
+            }
+        }
+        for (p in sorted(txs)) {
+            listPush(found, p);
+        }
+    }
+    return found;
+}
+
+function noNames(): List<string> {
+    const xs: List<string> = listNew();
+    return xs;
+}
+
+// 用例名：相对仓库根、正斜杠。
+function caseName(o: Ref<Opts>, tx: string): string {
+    if (startsWith(tx, o.root + "/")) {
+        return tail(tx, len(o.root) + 1);
+    }
+    return tx;
+}
+
+function readText(p: string): string {
+    const b = readBytes(p) catch bytesNew(0);
+    return lossyText(b);
+}
+
+// 目标专属标记的名字取目标表里的系统名与架构名（同名重复出现只多查一次，首次出现的次序即判定次序）。
+function skipReason(tx: string, os: string, arch: string): string {
+    for (t in allTargets()) {
+        if (exists(withSuffix(tx, "." + t.os)) && os != t.os) {
+            return "target-only:" + t.os;
+        }
+    }
+    for (t in allTargets()) {
+        if (exists(withSuffix(tx, "." + t.arch)) && arch != t.arch) {
+            return "target-only:" + t.arch;
+        }
+    }
+    if (exists(withSuffix(tx, ".runflags"))) {
+        return "runflags";
+    }
+    const errFile = withSuffix(tx, ".err");
+    if (exists(errFile) && indexOf(readText(errFile), "retained by kind") >= 0) {
+        return "interpreter-mem-report";
+    }
+    return "";
+}
+
+function expected(tx: string): Ref<Expect> {
+    const outFile = withSuffix(tx, ".out");
+    if (exists(outFile)) {
+        return new Expect { isOut: true, exit: 0, stdout: crlf(readBytes(outFile) catch bytesNew(0)), needles: listNew() };
+    }
+    const lines = strSplit(lossyText(crlf(readBytes(withSuffix(tx, ".err")) catch bytesNew(0))), "\n");
+    const first = listGet(lines, 0) catch "";
+    const eq = indexOf(first, "=");
+    let code = 0;
+    if (eq >= 0) {
+        code = digits(tail(first, eq + 1));
+    }
+    const needles: List<string> = listNew();
+    let k = 1;
+    while (k < listLen(lines)) {
+        const l = listGet(lines, k) catch "";
+        if (len(l) > 0) {
+            listPush(needles, l);
+        }
+        k = k + 1;
+    }
+    return new Expect { isOut: false, exit: code, stdout: bytesNew(0), needles: needles };
+}
+
+// ---- 按字符（码点）截取与 Python repr 风格的显示，只用于 detail ----
+
+// ---- 判定与输出 ----
+
+function judge(row: Ref<Row>, exp: Ref<Expect>, code: int, out: Bytes, errb: Bytes, leakCheck: bool): void {
+    const outN = crlf(out);
+    const errN = crlf(errb);
+    const both = bytesSlice(outN, 0, bytesLen(outN));
+    bytesAppend(both, errN);
+    const text = lossyText(both);
+    if (contains(text, "taixu NRT: 未实现")) {
+        row.status = "PENDING";
+        row.detail = tailChars(strip(text), 200);
+        return;
+    }
+    if (leakCheck && contains(text, "[runtime:leak]") && !(!exp.isOut && anyNeedle(exp, "[runtime:leak]"))) {
+        row.status = "FAIL";
+        row.detail = "leak: " + headChars(tail(text, indexOf(text, "[runtime:leak]")), 300);
+        return;
+    }
+    if (exp.isOut) {
+        if (code == 0 && bytesEqual(outN, exp.stdout)) {
+            row.status = "PASS";
+        } else {
+            row.status = "FAIL";
+            row.detail = "exit=" + toStr(code) + " stdout=" + reprBytes(outN, 200) + " stderr=" + reprBytes(errN, 200);
+        }
+        return;
+    }
+    let ok = code == exp.exit;
+    for (n in exp.needles) {
+        if (!contains(text, n)) {
+            ok = false;
+        }
+    }
+    if (ok) {
+        row.status = "PASS";
+    } else {
+        row.status = "FAIL";
+        row.detail = "exit=" + toStr(code) + " want=" + toStr(exp.exit) + " text=" + reprStr(headChars(text, 300));
+    }
+}
+
+function anyNeedle(exp: Ref<Expect>, s: string): bool {
+    for (n in exp.needles) {
+        if (contains(n, s)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function reportRow(row: Ref<Row>): void {
+    let line = padRight(row.status, 14) + " " + row.name;
+    if (row.status == "FAIL" || row.status == "BUILD_FAIL" || row.status == "REJECT_MISMATCH") {
+        line = line + "  " + reprStr(headChars(row.detail, 160));
+    }
+    print(line);
+}
+
+function bump(counts: Map<string, int>, status: string): void {
+    mapSet(counts, status, (mapGet(counts, status) ?? 0) + 1);
+}
+
+// ---- 环境 ----
+
+// 产物与编译器在运行期读的 TAIXU_ 变量（用例源码里出现的另行扫描）。
+const RUNTIME_VARS: []string = ["TAIXU_DEBUG_CHANNEL", "TAIXU_TEST_FAIL_PAGES", "TAIXU_PROBE_FORMAT", "TAIXU_RC_SCALAR", "TAIXU_REPLAY",
+    "TAIXU_FRAME", "TAIXU_OUT_DIR"];
+
+// 用例源码里出现的 TAIXU_ 名字（大写字母、数字、下划线）。
+function taixuNames(text: string, into: Map<string, int>): void {
+    let at = indexOf(text, "TAIXU_");
+    let rest = text;
+    while (at >= 0) {
+        let end = at + 6;
+        while (end < len(rest) && nameByte(byteAt(rest, end) ?? 0)) {
+            end = end + 1;
+        }
+        if (end > at + 6) {
+            mapSet(into, byteSub(rest, at, end - at), 1);
+        }
+        rest = tail(rest, end);
+        at = indexOf(rest, "TAIXU_");
+    }
+}
+
+function nameByte(c: int): bool {
+    return (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95;
+}
+
+// 设夹具；有会改变产物行为的 TAIXU_ 变量已在环境里时得 Error（列出名字）。
+function prepareEnv(cases: List<string>): void | Error {
+    const names: Map<string, int> = mapNew();
+    for (v in RUNTIME_VARS) {
+        mapSet(names, v, 1);
+    }
+    for (tx in cases) {
+        taixuNames(readText(tx), names);
+    }
+    let set = "";
+    for (n in sorted(mapKeys(names))) {
+        if (n == FIXTURE_VAR || n == "TAIXU_STDLIB" || n == "TAIXU_GUI_ROOT") {
+            continue;
+        }
+        if (getEnv(n) != None) {
+            if (len(set) > 0) {
+                set = set + "、";
+            }
+            set = set + n;
+        }
+    }
+    if (len(set) > 0) {
+        return err("环境里设了会改变产物行为的变量：" + set + "（产物的行为不能取决于测试者的环境；太虚的 setEnv 不能删变量，先在外面清掉再跑）");
+    }
+    setEnv(FIXTURE_VAR, FIXTURE_VALUE)?;
+    if (onWindows()) {
+        // 经 wsl.exe 运行的 Linux 产物只看得到 WSLENV 列出的变量。
+        const cur = getEnv("WSLENV") ?? "";
+        let listed = false;
+        for (n in strSplit(cur, ":")) {
+            if (n == FIXTURE_VAR) {
+                listed = true;
+            }
+        }
+        if (!listed) {
+            if (len(cur) == 0) {
+                setEnv("WSLENV", FIXTURE_VAR)?;
+            } else {
+                setEnv("WSLENV", cur + ":" + FIXTURE_VAR)?;
+            }
+        }
+    }
+}
+
+// ---- 路径 ----
+
+// to 相对 from 目录的路径（两者都是绝对路径、正斜杠，须在同一盘）。
+function relPath(to: string, from: string): string {
+    const a = strSplit(to, "/");
+    const b = strSplit(from, "/");
+    let k = 0;
+    while (k < listLen(a) && k < listLen(b) && (listGet(a, k) catch "") == (listGet(b, k) catch "")) {
+        k = k + 1;
+    }
+    let out = "";
+    let i = k;
+    while (i < listLen(b)) {
+        if (len(listGet(b, i) catch "") > 0) {
+            out = join(out, "..");
+        }
+        i = i + 1;
+    }
+    i = k;
+    while (i < listLen(a)) {
+        out = join(out, listGet(a, i) catch "");
+        i = i + 1;
+    }
+    return out;
+}
+
+function runIn(exe: string, args: List<string>, cwd: string, limitNs: int): Ref<Raw> {
+    const r = captureRaw(nat(exe), args, nat(cwd), limitNs, DRAIN_NS, MAX_OUTPUT) catch (e) {
+        return new Raw { code: -2, out: bytesNew(0), err: bytesFromStr(e.message), timedOut: false };
+    };
+    return r;
+}
+
+// ---- 主流程 ----
+
+function main(args: []string): int {
+    const o = parse(args) catch (e) {
+        return usage(e.message);
+    };
+    if (o.debug && o.leak) {
+        eprint("--debug and --leak-check are exclusive");
+        return 1;
+    }
+    // 目标的系统与架构取自 scripts/targets.tx；t 是传给编译器的写法（parse 已规整）。
+    const t = o.target;
+    const tg = targetSpelled(t);
+    const x64Win = tg.os == "windows" && tg.arch == "x86_64";
+    if (x64Win && !onWindows() && !o.buildOnly) {
+        eprint("running x86_64-windows products needs a Windows host, or --build-only");
+        return 1;
+    }
+    const a64Win = tg.os == "windows" && tg.arch == "aarch64";
+    const nativeWin = a64Win && onWindows() && hostArch() == "aarch64";
+    if (a64Win && !o.buildOnly && !nativeWin && len(o.winarm) == 0) {
+        eprint("running aarch64-windows products needs a Windows ARM64 host, --winarm <ssh arguments> (or TAIXU_WINARM_HOST), "
+            + "or --build-only");
+        return 1;
+    }
+    const macos = tg.os == "macos";
+    if (macos && !o.buildOnly && len(o.remote) == 0) {
+        eprint("running macOS products from this host needs --remote <ssh host> (or TAIXU_MACOS_HOST)");
+        return 1;
+    }
+    const linux = tg.os == "linux";
+    // x86_64 以外的 Linux：产物在同架构宿主上直接跑，否则经 qemu-user。
+    const crossLinux = linux && tg.arch != "x86_64";
+    // 目标专属用例按操作系统挑选，两种 macOS 架构共用 .macos；.x86_64／.aarch64／.loongarch64／.riscv64 按架构挑选。
+    const os = tg.os;
+    const arch = tg.arch;
+    const viaWsl = linux && onWindows();
+    const onLinux = hostTarget() == "linux";
+    const nativeCross = onLinux && crossLinux && hostArch() == arch;
+    const qemuEnv = tg.qemuEnv;
+    if (len(o.qemu) == 0 && crossLinux) {
+        o.qemu = getEnv(qemuEnv) ?? "";
+    }
+    if (crossLinux && !nativeCross && !o.buildOnly && len(o.qemu) == 0) {
+        eprint("running " + t + " products off that architecture needs --qemu <qemu-user> (or " + qemuEnv + ")");
+        return 1;
+    }
+    // macOS 宿主上就地运行（--remote local）；不在 macOS 宿主上时经 ssh 一批送测试机。
+    const macRemote = macos && !(o.remote == "local" && hostTarget() == "macos");
+    let work = o.work;
+    if (len(work) == 0) {
+        work = join(osRealPath(tempDir()), "taixu-nrt-" + toStr(monoNs()));
+    }
+    work = slashes(absolute(work));
+    if (!mkdirs(work)) {
+        eprint("建不了工作目录 " + work);
+        return 1;
+    }
+    const space = testSpace(join(work, "run")) catch (e) { return usage(e.message); };
+    const cases = caseList(o) catch (e) {
+        return usage(e.message);
+    };
+    prepareEnv(cases) catch (e) {
+        eprint(e.message);
+        return 2;
+    };
+    // 产物经 wsl.exe 或 qemu 运行（只构建时不需要）。
+    let wsl = "";
+    if (viaWsl && !o.buildOnly) {
+        wsl = findInPath("wsl");
+        if (len(wsl) == 0) {
+            eprint("PATH 里没有 wsl.exe");
+            return 1;
+        }
+    }
+    let qemu = "";
+    if (crossLinux && !nativeCross && !o.buildOnly) {
+        qemu = o.qemu;
+        if (!viaWsl && !isAbs(qemu)) {
+            qemu = findInPath(qemu);
+        }
+    }
+    // Windows 宿主上构建 x86_64-windows 产物不带 --target（编译器的缺省），其余一律带。
+    let targetFlag = "--target=" + t;
+    if (x64Win && onWindows()) {
+        targetFlag = "";
+    }
+    const rows: List<Ref<Row>> = listNew();
+    const counts: Map<string, int> = mapNew();
+    const remote: List<Pending> = listNew();
+    for (tx in cases) {
+        const name = caseName(o, tx);
+        const row = new Row { name: name, status: "", reason: "", detail: "", sha: "" };
+        listPush(rows, row);
+        const reason = skipReason(tx, os, arch);
+        if (len(reason) > 0) {
+            row.status = "SKIP";
+            row.reason = reason;
+            bump(counts, row.status);
+            reportRow(row);
+            continue;
+        }
+        const exp = expected(tx);
+        const stem = stemOf(tx);
+        const outdir = join(work, stem);
+        mkdirs(outdir);
+        // `<用例>.toolchain` 按工具链程序构建（D3 v0.21 工具链专用的系统内建）。
+        const tool: List<string> = listNew();
+        if (exists(withSuffix(tx, ".toolchain"))) {
+            listPush(tool, "--toolchain");
+        }
+        const flagsFile = withSuffix(tx, ".buildflags");
+        if (exists(flagsFile)) {
+            for (l in linesOf(readText(flagsFile))) {
+                const s = strip(l);
+                if (len(s) > 0) {
+                    listPush(tool, s);
+                }
+            }
+        }
+        for (f in o.buildFlags) {
+            listPush(tool, f);
+        }
+        if (o.leak && !hasItem(tool, "--leak-check") && !exists(withSuffix(tx, ".leakok"))) {
+            listPush(tool, "--leak-check");
+        }
+        if (o.debug) {
+            if (hasItem(tool, "--leak-check")) {
+                row.status = "SKIP";
+                row.reason = "--debug excludes the --leak-check build flag";
+                bump(counts, row.status);
+                print(padRight(row.status, 14) + " " + name);
+                continue;
+            }
+            listPush(tool, "--debug");
+        }
+        const argv: List<string> = listNew();
+        listPush(argv, "build");
+        listPush(argv, nat(tx));
+        listPush(argv, "--runtime=native");
+        for (f in tool) {
+            listPush(argv, f);
+        }
+        if (len(targetFlag) > 0) {
+            listPush(argv, targetFlag);
+        }
+        if (len(o.kernel) > 0) {
+            listPush(argv, "--link-object");
+            listPush(argv, nat(o.kernel));
+        }
+        listPush(argv, "--out");
+        listPush(argv, nat(outdir));
+        const b = runIn(o.compiler, argv, o.root, BUILD_NS);
+        if (b.code != 0) {
+            // 编译期拒绝是很多 .err 用例的预期行为。
+            const both = bytesSlice(b.out, 0, bytesLen(b.out));
+            bytesAppend(both, b.err);
+            const text = lossyText(both);
+            if (macos && (contains(text, "macOS 目标暂不支持") || contains(text, "aarch64-macos 暂不支持"))) {
+                row.status = "PENDING";
+                row.detail = tailChars(strip(text), 200);
+            } else if (linux && (arch == "loongarch64" || arch == "riscv64") && contains(text, tg.triple + " 暂不支持")) {
+                // 随后一批补齐的部分（龙芯 A4f、RISC-V A5f：外部函数回调、按值结构体）。
+                row.status = "PENDING";
+                row.detail = tailChars(strip(text), 200);
+            } else if (!exp.isOut && exp.exit == 1) {
+                // 诊断须带期望的文本，不只是退出码。
+                let all = true;
+                for (n in exp.needles) {
+                    if (!contains(text, n)) {
+                        all = false;
+                    }
+                }
+                if (all) {
+                    row.status = "COMPILE_REJECT";
+                } else {
+                    row.status = "REJECT_MISMATCH";
+                    row.detail = tailChars(text, 400);
+                }
+            } else {
+                row.status = "BUILD_FAIL";
+                row.detail = tailChars(text, 400);
+            }
+            bump(counts, row.status);
+            reportRow(row);
+            continue;
+        }
+        let exe = join(outdir, stem);
+        if (!linux && !macos) {
+            exe = exe + ".exe";
+        }
+        // 供 gate.tx --baseline-compiler 比较新旧编译器的产物是否逐字节相同。
+        const data = readBytes(exe) catch bytesNew(0);
+        row.sha = sha256Hex(data);
+        const extra: List<string> = listNew();
+        const argvFile = withSuffix(tx, ".argv");
+        if (exists(argvFile)) {
+            for (l in linesOf(readText(argvFile))) {
+                listPush(extra, l);
+            }
+        }
+        if (macos) {
+            // 每个 Mach-O 产物先过独立核对器（arm64 另逐字解码分支与 ADRP），不合格记构建失败、不送测试机。
+            const why = machoProblem(data);
+            if (len(why) > 0) {
+                row.status = "BUILD_FAIL";
+                row.detail = "macho_check: " + why;
+                bump(counts, row.status);
+                reportRow(row);
+                continue;
+            }
+        }
+        if (a64Win) {
+            // 每个 ARM64 PE 产物先过独立核对器（头、导入、基址重定位、TLS、展开信息），不合格记构建失败、不运行。
+            const rep = peArm64Check(data, true);
+            if (listLen(rep.errors) > 0) {
+                row.status = "BUILD_FAIL";
+                row.detail = "pe_arm64_check: " + firstErrors(rep.errors, 3);
+                bump(counts, row.status);
+                reportRow(row);
+                continue;
+            }
+        }
+        if (o.buildOnly) {
+            row.status = "BUILT";
+            bump(counts, row.status);
+            reportRow(row);
+            continue;
+        }
+        if (macRemote || (a64Win && !nativeWin)) {
+            listPush(remote, Pending { row: row, exp: exp, exe: exe, argv: extra, tree: baseOf(dirOf(tx)) });
+            continue;
+        }
+        let launch = exe;
+        const runArgs: List<string> = listNew();
+        const caseDir = caseSpace(space, dirOf(tx)) catch (e) {
+            row.status = "FAIL";
+            row.detail = e.message;
+            bump(counts, row.status);
+            reportRow(row);
+            continue;
+        };
+        if (viaWsl) {
+            launch = wsl;
+            listPush(runArgs, "-e");
+            if (len(qemu) > 0) {
+                listPush(runArgs, qemu);
+            }
+            listPush(runArgs, relPath(exe, caseDir));
+        } else if (len(qemu) > 0) {
+            launch = qemu;
+            listPush(runArgs, nat(exe));
+        }
+        for (x in extra) {
+            listPush(runArgs, x);
+        }
+        const r = runIn(launch, runArgs, caseDir, RUN_NS);
+        if (r.timedOut) {
+            judge(row, exp, -1, bytesNew(0), bytesFromStr("TIMEOUT"), o.leak);
+        } else {
+            judge(row, exp, r.code, r.out, r.err, o.leak);
+        }
+        bump(counts, row.status);
+        reportRow(row);
+    }
+    if (listLen(remote) > 0) {
+        // 产物在测试机上一批运行：用例目录整棵带过去，产物在各自的用例目录里运行（同本地，夹具按相对路径找到）；getEnv 的正例夹具
+        // 一并带过去。
+        const items: List<RemoteItem> = listNew();
+        const trees: Map<string, string> = mapNew();
+        for (p in remote) {
+            listPush(items, RemoteItem { key: p.row.name, exe: p.exe, argv: p.argv, tree: p.tree });
+            mapSet(trees, p.tree, join(o.root, dirOf(p.row.name)));
+        }
+        let kind = "macos";
+        let host = o.remote;
+        if (a64Win) {
+            kind = "windows";
+            host = o.winarm;
+        }
+        const results = remoteBatch(o.compiler, o.root, kind, t, host, items, trees, work, FIXTURE_VAR, FIXTURE_VALUE, RUN_NS) catch (e) {
+            eprint("远程批量运行失败：" + e.message);
+            return 1;
+        };
+        for (p in remote) {
+            const got = mapGet(results, p.row.name);
+            if (got == None) {
+                judge(p.row, p.exp, -2, bytesNew(0), bytesFromStr("REMOTE_MISSING"), o.leak);
+            } else {
+                const r = got ?? new Raw { code: -2, out: bytesNew(0), err: bytesNew(0), timedOut: false };
+                judge(p.row, p.exp, r.code, r.out, r.err, o.leak);
+            }
+            bump(counts, p.row.status);
+            reportRow(p.row);
+        }
+    }
+    let summary = "SUMMARY";
+    for (k in sorted(mapKeys(counts))) {
+        summary = summary + " " + k + "=" + toStr(mapGet(counts, k) ?? 0);
+    }
+    print(summary);
+    if (len(o.report) > 0) {
+        if (!writeReport(o.report, counts, rows)) {
+            eprint("写不了报告 " + o.report);
+            return 1;
+        }
+    }
+    if ((mapGet(counts, "FAIL") ?? 0) > 0 || (mapGet(counts, "BUILD_FAIL") ?? 0) > 0 || (mapGet(counts, "REJECT_MISMATCH") ?? 0) > 0) {
+        return 1;
+    }
+    return 0;
+}
+
+function hasItem(xs: List<string>, s: string): bool {
+    for (x in xs) {
+        if (x == s) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function firstErrors(errors: List<string>, n: int): string {
+    let s = "";
+    let k = 0;
+    while (k < n && k < listLen(errors)) {
+        if (k > 0) {
+            s = s + "; ";
+        }
+        s = s + (listGet(errors, k) catch "");
+        k = k + 1;
+    }
+    return s;
+}
+
+function machoProblem(data: Bytes): string {
+    const info = machoCheck(data) catch (e) {
+        return e.message;
+    };
+    return "";
+}
+
+// 报告：{"counts": {状态: 数}, "rows": [{"case", "status", 另有 "reason"／"detail"／"product_sha256" 时写}]}。
+function writeReport(path: string, counts: Map<string, int>, rows: List<Ref<Row>>): bool {
+    const out = bytesNew(0);
+    bytesAppend(out, bytesFromStr("{\n \"counts\": {"));
+    let first = true;
+    for (k in mapKeys(counts)) {
+        if (!first) {
+            bytesAppend(out, bytesFromStr(","));
+        }
+        first = false;
+        bytesAppend(out, bytesFromStr("\n  " + jsonQuote(k) + ": " + toStr(mapGet(counts, k) ?? 0)));
+    }
+    bytesAppend(out, bytesFromStr("\n },\n \"rows\": ["));
+    first = true;
+    for (r in rows) {
+        if (!first) {
+            bytesAppend(out, bytesFromStr(","));
+        }
+        first = false;
+        let line = "\n  {\"case\": " + jsonQuote(r.name);
+        if (len(r.sha) > 0) {
+            line = line + ", \"product_sha256\": " + jsonQuote(r.sha);
+        }
+        line = line + ", \"status\": " + jsonQuote(r.status);
+        if (len(r.reason) > 0) {
+            line = line + ", \"reason\": " + jsonQuote(r.reason);
+        }
+        if (len(r.detail) > 0) {
+            line = line + ", \"detail\": " + jsonQuote(r.detail);
+        }
+        bytesAppend(out, bytesFromStr(line + "}"));
+    }
+    bytesAppend(out, bytesFromStr("\n ]\n}\n"));
+    const parent = dirOf(slashes(absolute(path)));
+    mkdirs(parent);
+    writeFileBytes(path, out) catch (e) {
+        return false;
+    };
+    return true;
+}

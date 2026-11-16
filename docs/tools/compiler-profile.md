@@ -8,6 +8,7 @@ taixu profile compile app.tx --sort=instructions --top 10
 taixu profile compile app.tx --format=json --top 0
 taixu profile compile bootstrap/taixu.tx --toolchain --format=json --top 0
 taixu profile compile app.tx --target=linux
+taixu profile compile app.tx --regalloc=off --format=json --top 0
 taixu profile compile --help
 ```
 
@@ -38,6 +39,8 @@ taixu profile compile --help
 | `profile.product` | 与普通 build 可核对的最终字节数和 SHA-256，`written=false`、`executed=false` |
 
 比较两份报告时先核对目标、工具链、输入与度量范围，再按函数工作量提出假设。构建内 ID 用来核对本次 disasm，不单独作为跨构建匹配键。JSON 保留完整精度；文本使用毫秒显示便于阅读。
+
+`--regalloc=on|off` 控制[循环标量寄存器分配](register-allocation.md)，与 `build` 使用同一个设置。使用相同设置与其余选项时，画像的产物哈希应与普通构建相同。
 
 ## 指标边界
 

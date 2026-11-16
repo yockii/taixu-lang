@@ -1,0 +1,898 @@
+// aarch64-windows 产物的独立 PE 核对：
+// 不经编译器的代码（不导入 bootstrap/），按 PE 格式与 B18 的约定逐项读产物。
+//
+//   taixu run --toolchain scripts/pe_arm64_check.tx [--no-unwind] <产物.exe>…
+//
+// --no-unwind 用于不带函数目录的手写映像（bootstrap/a64w_image_probe.tx）：没有异常目录不算错，有则照常核对。编译器的产物总带内核
+// 的展开信息，不加此项。
+//
+// 核对项：DOS／PE 签名；COFF 头（机器号 0xAA64、可执行、未剥离重定位、大地址）；PE32+ 可选头（对齐、SizeOfImage、SizeOfHeaders、
+// DllCharacteristics 含 DYNAMIC_BASE｜NX_COMPAT｜HIGH_ENTROPY_VA——ARM64 不能关 ASLR）；节按地址排列、互不重叠、文件内容在文件内、
+// 属性合乎各节（.text 可执行不可写，.rdata 只读，.data 可读写，.reloc 可丢弃）；入口在 .text；导入表（描述符、DLL 名、导入名表与
+// IAT 初值相同、提示名项）；基址重定位（块头、DIR64／ABSOLUTE 以外的类型即错、每处落在有文件内容的节里、所存的 VA 指向映像内）；
+// TLS 目录的四个 VA 都有 DIR64、索引槽在可写节；.text 里每个导入桩（adrp x16／ldr x16, [x16]／br x16）都指向 IAT 的槽；展开信息
+// （B18）：.pdata 在自己的只读节里、按函数起点升序、互不重叠、函数都在 .text 里、只用完整形式，每份 .xdata 在只读节里、头的版本
+// 与异常处理位为 0、尾声范围在函数里，展开码逐个解开、按指令对照——序言码逆序对函数开头的指令，尾声码顺序对尾声的指令（ret 即 end），
+// 每个码须与所对的指令相符（只认产物会用到的码与指令）；超过 1 MiB 的函数的后续分片码以 end_c 开头（幻影序言，不对指令）、须紧接
+// 前一片，E＝1 而起点指向 end_c 表示本片没有尾声；.text 里每条 stp x29, x30, [sp, #-16]! 都须是某个 .pdata 函数的第一条指令。
+// 退出码：0 全部通过，1 有不合。
+// 库用法：peArm64Check(映像字节, 要求展开信息) 得 PeReport（errors 为空即通过；summary 为摘要）。
+import { Img, b8, hx, hxu, hxw, imgOf, u16, u32, u64 } from "./check_lib";
+
+const IMAGE_FILE_MACHINE_ARM64: int = 0xAA64;
+const DYNAMIC_BASE: int = 0x40;
+const NX_COMPAT: int = 0x100;
+const HIGH_ENTROPY_VA: int = 0x20;
+const EXEC: int = 0x20000000;
+const READ: int = 0x40000000;
+const WRITE: int = 0x80000000;
+const DISCARD: int = 0x02000000;
+const CODE: int = 0x20;
+const IDATA: int = 0x40;
+// stp x29, x30, [sp, #-16]!
+const STP_FP_LR: int = 0xA9BF7BFD;
+const RET: int = 0xD65F03C0;
+
+export struct PeReport {
+    errors: List<string>,
+    summary: string,
+}
+
+struct PeSec {
+    name: string,
+    vs: int,
+    va: int,
+    raw: int,
+    ptr: int,
+    ch: int,
+}
+
+// 一个展开码：名字、参数（save_regp_x／save_reg_x 为寄存器与偏移，其余只用 a）、在码串里的起点。
+struct Op {
+    name: string,
+    a: int,
+    b: int,
+    at: int,
+}
+
+struct Pe {
+    m: Ref<Img>,
+    errors: List<string>,
+    secs: List<PeSec>,
+}
+
+function fail(p: Ref<Pe>, msg: string): void {
+    listPush(p.errors, msg);
+}
+
+function secAt(p: Ref<Pe>, i: int): PeSec {
+    return listGet(p.secs, i) catch PeSec { name: "", vs: 0, va: 0, raw: 0, ptr: 0, ch: 0 };
+}
+
+function maxOf(a: int, b: int): int {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+function minOf(a: int, b: int): int {
+    if (a < b) {
+        return a;
+    }
+    return b;
+}
+
+// rva 起 size 字节所在的节的下标，没有得 −1。
+function sectionOf(p: Ref<Pe>, rva: int, size: int): int {
+    let i = 0;
+    while (i < listLen(p.secs)) {
+        const s = secAt(p, i);
+        if (s.va <= rva && rva + size <= s.va + maxOf(s.vs, s.raw)) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// rva 起 size 字节在文件里的偏移（须整个落在节的文件内容里），没有得 −1。
+function fileAt(p: Ref<Pe>, rva: int, size: int): int {
+    const i = sectionOf(p, rva, size);
+    if (i < 0) {
+        return -1;
+    }
+    const s = secAt(p, i);
+    if (rva + size > s.va + s.raw) {
+        return -1;
+    }
+    return s.ptr + (rva - s.va);
+}
+
+// rva 处以 NUL 结尾的串（字节）；不在文件内容里或没有 NUL 得 None。
+function cstr(p: Ref<Pe>, rva: int): Bytes? {
+    const at = fileAt(p, rva, 1);
+    if (at < 0) {
+        return None;
+    }
+    let end = at;
+    while (end < p.m.size && b8(p.m, end) != 0) {
+        end = end + 1;
+    }
+    if (end >= p.m.size) {
+        return None;
+    }
+    return bytesSlice(p.m.d, at, end - at);
+}
+
+// 同 Python 的 '%s' % bytes（报错里的 DLL 名），None 写 None。
+function pyBytes(b: Bytes?): string {
+    if (b == None) {
+        return "None";
+    }
+    const v = b ?? bytesNew(0);
+    const out = bytesNew(0);
+    bytesPush(out, 98);
+    bytesPush(out, 39);
+    let i = 0;
+    while (i < bytesLen(v)) {
+        const c = bytesGet(v, i) catch 0;
+        if (c == 92 || c == 39) {
+            bytesPush(out, 92);
+            bytesPush(out, c);
+        } else if (c >= 32 && c < 127) {
+            bytesPush(out, c);
+        } else {
+            const t = "\\x" + byteHex(c);
+            bytesAppend(out, bytesFromStr(t));
+        }
+        i = i + 1;
+    }
+    bytesPush(out, 39);
+    return bytesToStr(out) catch "";
+}
+
+function byteHex(c: int): string {
+    const s = hxw(c, 2);
+    return bytesToStr(bytesSlice(bytesFromStr(s), 2, 2)) catch "";
+}
+
+// 节名：去掉末尾的 NUL，非 ASCII 字节换成 U+FFFD（同 Python 的 decode('ascii', 'replace')）。
+function secName(m: Ref<Img>, at: int): string {
+    let n = 8;
+    while (n > 0 && b8(m, at + n - 1) == 0) {
+        n = n - 1;
+    }
+    const out = bytesNew(0);
+    let i = 0;
+    while (i < n) {
+        const c = b8(m, at + i);
+        if (c < 128) {
+            bytesPush(out, c);
+        } else {
+            bytesPush(out, 0xEF);
+            bytesPush(out, 0xBF);
+            bytesPush(out, 0xBD);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(out) catch "";
+}
+
+function opAt(ops: List<Op>, i: int): Op {
+    return listGet(ops, i) catch Op { name: "", a: 0, b: 0, at: 0 };
+}
+
+function noOps(): List<Op> {
+    const ops: List<Op> = listNew();
+    return ops;
+}
+
+function hasEndC(ops: List<Op>, from: int): bool {
+    let i = from;
+    while (i < listLen(ops)) {
+        if (opAt(ops, i).name == "end_c") {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+function codeAt(codes: Bytes, i: int): int {
+    return bytesGet(codes, i) catch 0;
+}
+
+// 从 at 起解开展开码直到 end（含）；不认识的码或没有 end 得 None。
+function unwindOps(codes: Bytes, start: int): List<Op>? {
+    const ops: List<Op> = listNew();
+    let at = start;
+    const n = bytesLen(codes);
+    while (at < n) {
+        const b0 = codeAt(codes, at);
+        let b1 = 0;
+        if (at + 1 < n) {
+            b1 = codeAt(codes, at + 1);
+        }
+        if (b0 < 0x20) {
+            listPush(ops, Op { name: "alloc", a: b0 * 16, b: 0, at: at });
+            at = at + 1;
+        } else if (b0 < 0x40) {
+            listPush(ops, Op { name: "save_r19r20_x", a: (b0 & 31) * 8, b: 0, at: at });
+            at = at + 1;
+        } else if (b0 >= 0x80 && b0 < 0xC0) {
+            listPush(ops, Op { name: "save_fplr_x", a: ((b0 & 63) + 1) * 8, b: 0, at: at });
+            at = at + 1;
+        } else if (b0 >= 0xC0 && b0 < 0xC8) {
+            listPush(ops, Op { name: "alloc", a: (((b0 & 7) << 8) | b1) * 16, b: 0, at: at });
+            at = at + 2;
+        } else if (b0 >= 0xCC && b0 < 0xD0) {
+            listPush(ops, Op { name: "save_regp_x", a: 19 + (((b0 & 3) << 2) | (b1 >> 6)), b: ((b1 & 63) + 1) * 8, at: at });
+            at = at + 2;
+        } else if (b0 >= 0xD4 && b0 < 0xD6) {
+            listPush(ops, Op { name: "save_reg_x", a: 19 + (((b0 & 1) << 3) | (b1 >> 5)), b: ((b1 & 31) + 1) * 8, at: at });
+            at = at + 2;
+        } else if (b0 == 0xE0) {
+            if (at + 3 >= n) {
+                return None;
+            }
+            const big = (codeAt(codes, at + 1) << 16) | (codeAt(codes, at + 2) << 8) | codeAt(codes, at + 3);
+            listPush(ops, Op { name: "alloc", a: big * 16, b: 0, at: at });
+            at = at + 4;
+        } else if (b0 == 0xE1) {
+            listPush(ops, Op { name: "set_fp", a: 0, b: 0, at: at });
+            at = at + 1;
+        } else if (b0 == 0xE2) {
+            listPush(ops, Op { name: "add_fp", a: b1 * 8, b: 0, at: at });
+            at = at + 2;
+        } else if (b0 == 0xE3) {
+            listPush(ops, Op { name: "nop", a: 0, b: 0, at: at });
+            at = at + 1;
+        } else if (b0 == 0xE4) {
+            listPush(ops, Op { name: "end", a: 0, b: 0, at: at });
+            return ops;
+        } else if (b0 == 0xE5) {
+            listPush(ops, Op { name: "end_c", a: 0, b: 0, at: at });
+            at = at + 1;
+        } else {
+            return None;
+        }
+    }
+    return None;
+}
+
+function stpPre(r1: int, r2: int, off: int): int {
+    return 0xA9800000 | ((((0 - off) / 8) & 127) << 15) | (r2 << 10) | (31 << 5) | r1;
+}
+
+function ldpPost(r1: int, r2: int, off: int): int {
+    return 0xA8C00000 | (((off / 8) & 127) << 15) | (r2 << 10) | (31 << 5) | r1;
+}
+
+// sub／add sp, sp, #imm{, lsl #12} 的字节数，不是则 −1。
+function spImm(word: int, sub: bool): int {
+    let want = 0x910003FF;
+    if (sub) {
+        want = 0xD10003FF;
+    }
+    if ((word & 0xFF8003FF) != want) {
+        return -1;
+    }
+    return ((word >> 10) & 0xFFF) << (12 * ((word >> 22) & 1));
+}
+
+function pick(prolog: bool, a: int, b: int): int {
+    if (prolog) {
+        return a;
+    }
+    return b;
+}
+
+function opMatches(op: Op, word: int, prolog: bool, hasX15: bool, x15: int): bool {
+    const arg = op.a;
+    if (op.name == "alloc") {
+        if (prolog && word == 0xCB2F73FF) {
+            return hasX15 && x15 * 16 == arg;
+        }
+        return spImm(word, prolog) == arg;
+    }
+    if (op.name == "save_fplr_x") {
+        return word == pick(prolog, stpPre(29, 30, arg), ldpPost(29, 30, arg));
+    }
+    if (op.name == "save_r19r20_x") {
+        return word == pick(prolog, stpPre(19, 20, arg), ldpPost(19, 20, arg));
+    }
+    if (op.name == "save_regp_x") {
+        return word == pick(prolog, stpPre(op.a, op.a + 1, op.b), ldpPost(op.a, op.a + 1, op.b));
+    }
+    if (op.name == "save_reg_x") {
+        if (prolog) {
+            return word == (0xF8000C00 | (((0 - op.b) & 511) << 12) | (31 << 5) | op.a);
+        }
+        return word == (0xF8400400 | ((op.b & 511) << 12) | (31 << 5) | op.a);
+    }
+    if (op.name == "set_fp") {
+        return word == pick(prolog, 0x910003FD, 0x910003BF);
+    }
+    if (op.name == "add_fp") {
+        return word == (pick(prolog, 0x910003FD, 0xD10003BF) | (arg << 10));
+    }
+    if (op.name == "nop") {
+        // 栈探测的 mov／movk x15 与 bl __tx_chkstk。
+        return prolog && ((word & 0xFF80001F) == 0xD280000F || (word & 0xFF80001F) == 0xF280000F || (word & 0xFC000000) == 0x94000000);
+    }
+    if (op.name == "end") {
+        return !prolog && word == RET;
+    }
+    return false;
+}
+
+// 序言里 at 之前的 movz／movk x15 给出的值（栈探测）；hasX15 为假即没有。
+struct X15 {
+    has: bool,
+    v: int,
+}
+
+function x15Before(m: Ref<Img>, start: int, at: int): X15 {
+    let has = false;
+    let v = 0;
+    let a = start;
+    while (a < at) {
+        const w = u32(m, a);
+        const sh = 16 * ((w >> 21) & 3);
+        if ((w & 0xFF80001F) == 0xD280000F) {
+            v = ((w >> 5) & 0xFFFF) << sh;
+            has = true;
+        } else if ((w & 0xFF80001F) == 0xF280000F && has) {
+            v = (v & ~(0xFFFF << sh)) | (((w >> 5) & 0xFFFF) << sh);
+        }
+        a = a + 4;
+    }
+    return X15 { has: has, v: v };
+}
+
+function printable(b: Bytes): bool {
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) catch 0;
+        if (!(c > 32 && c < 127)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function dirRva(dirs: List<int>, i: int): int {
+    return listGet(dirs, 2 * i) catch 0;
+}
+
+function dirSize(dirs: List<int>, i: int): int {
+    return listGet(dirs, 2 * i + 1) catch 0;
+}
+
+// 核对一个映像。
+export function peArm64Check(data: Bytes, needUnwind: bool): Ref<PeReport> {
+    const p = new Pe { m: imgOf(data), errors: listNew(), secs: listNew() };
+    const rep = new PeReport { errors: p.errors, summary: "" };
+    checkInto(p, needUnwind, rep);
+    if (p.m.oob) {
+        fail(p, "读越出文件（" + hx(p.m.oobAt) + "）");
+    }
+    return rep;
+}
+
+function checkInto(p: Ref<Pe>, needUnwind: bool, rep: Ref<PeReport>): void {
+    const m = p.m;
+    if (!(m.size >= 2 && b8(m, 0) == 0x4D && b8(m, 1) == 0x5A)) {
+        fail(p, "DOS 签名不是 MZ");
+        return;
+    }
+    const pe = u32(m, 0x3C);
+    if (pe % 4 != 0 || pe + 4 > m.size || u32(m, pe) != 0x4550) {
+        fail(p, "PE 签名不对");
+        return;
+    }
+    const machine = u16(m, pe + 4);
+    const nsec = u16(m, pe + 6);
+    const optsz = u16(m, pe + 20);
+    const chars = u16(m, pe + 22);
+    if (machine != IMAGE_FILE_MACHINE_ARM64) {
+        fail(p, "机器号 " + hx(machine) + " 不是 0xAA64");
+    }
+    if ((chars & 0x2) == 0 || (chars & 0x1) != 0 || (chars & 0x20) == 0) {
+        fail(p, "COFF 特征 " + hx(chars) + "：须可执行、带重定位、大地址");
+    }
+    const o = pe + 24;
+    if (optsz != 240 || u16(m, o) != 0x20B) {
+        fail(p, "不是 240 字节的 PE32+ 可选头");
+        return;
+    }
+    const entry = u32(m, o + 16);
+    const base = u64(m, o + 24);
+    const salign = u32(m, o + 32);
+    const falign = u32(m, o + 36);
+    const sizeImage = u32(m, o + 56);
+    const sizeHeaders = u32(m, o + 60);
+    const subsystem = u16(m, o + 68);
+    const dllch = u16(m, o + 70);
+    const ndirs = u32(m, o + 108);
+    // 数据目录：rva、size 交替存放。可选头 240 字节恰容 16 项；更多的项会读进节表或越出文件，判不合，只读前 16 项。
+    if (ndirs > 16) {
+        fail(p, "数据目录数 " + toStr(ndirs) + " 超出可选头（至多 16）");
+    }
+    const dirs: List<int> = listNew();
+    let i = 0;
+    while (i < minOf(ndirs, 16) && o + 112 + 8 * i + 8 <= m.size) {
+        listPush(dirs, u32(m, o + 112 + 8 * i));
+        listPush(dirs, u32(m, o + 116 + 8 * i));
+        i = i + 1;
+    }
+    if (salign != 0x1000 || falign < 0x200 || falign > salign || (falign & (falign - 1)) != 0) {
+        fail(p, "对齐不合：节 " + hx(salign) + "、文件 " + hx(falign));
+    }
+    if (salign == 0 || falign == 0) {
+        return;
+    }
+    if (base % 0x10000 != 0) {
+        fail(p, "映像基址 " + hxu(base) + " 不是 64 KiB 的倍数");
+    }
+    const want = DYNAMIC_BASE | NX_COMPAT | HIGH_ENTROPY_VA;
+    if ((dllch & want) != want) {
+        fail(p, "DllCharacteristics " + hx(dllch) + " 缺 DYNAMIC_BASE／NX_COMPAT／HIGH_ENTROPY_VA");
+    }
+    if (subsystem != 2 && subsystem != 3) {
+        fail(p, "子系统 " + toStr(subsystem) + " 不是 GUI(2) 或控制台(3)");
+    }
+    const sh = o + optsz;
+    i = 0;
+    while (i < nsec) {
+        const at = sh + 40 * i;
+        listPush(p.secs, PeSec { name: secName(m, at), vs: u32(m, at + 8), va: u32(m, at + 12), raw: u32(m, at + 16), ptr: u32(m, at + 20),
+                ch: u32(m, at + 36) });
+        i = i + 1;
+    }
+    if (sh + 40 * nsec > sizeHeaders || sizeHeaders % falign != 0) {
+        fail(p, "节表超出 SizeOfHeaders 或其未按文件对齐");
+    }
+    let prevEnd = sizeHeaders;
+    i = 0;
+    while (i < listLen(p.secs)) {
+        const s = secAt(p, i);
+        if (s.va % salign != 0 || s.va < prevEnd) {
+            fail(p, "节 " + s.name + " 的地址 " + hx(s.va) + " 未对齐或与前节重叠");
+        }
+        if (s.raw % falign != 0 || (s.raw != 0 && (s.ptr % falign != 0 || s.ptr + s.raw > m.size))) {
+            fail(p, "节 " + s.name + " 的文件内容越界或未对齐");
+        }
+        prevEnd = s.va + ((maxOf(s.vs, s.raw) + salign - 1) / salign) * salign;
+        i = i + 1;
+    }
+    if (sizeImage != prevEnd) {
+        fail(p, "SizeOfImage " + hx(sizeImage) + " 不等于末节结束 " + hx(prevEnd));
+    }
+    let textIdx = -1;
+    i = 0;
+    while (i < listLen(p.secs)) {
+        const s = secAt(p, i);
+        let need = -1;
+        let forbid = 0;
+        if (s.name == ".text") {
+            need = EXEC | READ | CODE;
+            forbid = WRITE;
+        } else if (s.name == ".rdata" || s.name == ".pdata") {
+            need = READ | IDATA;
+            forbid = WRITE | EXEC;
+        } else if (s.name == ".data") {
+            need = READ | WRITE;
+            forbid = EXEC;
+        } else if (s.name == ".reloc") {
+            need = READ | DISCARD;
+            forbid = WRITE | EXEC;
+        }
+        if (need < 0) {
+            fail(p, "多出的节 " + s.name);
+        } else if ((s.ch & need) != need || (s.ch & forbid) != 0) {
+            fail(p, "节 " + s.name + " 的属性 " + hx(s.ch) + " 不合");
+        }
+        if (textIdx < 0 && s.name == ".text") {
+            textIdx = i;
+        }
+        i = i + 1;
+    }
+    const text = secAt(p, textIdx);
+    if (textIdx < 0 || !(text.va <= entry && entry < text.va + text.vs)) {
+        fail(p, "入口 " + hx(entry) + " 不在 .text 里");
+    }
+
+    // 导入表。
+    let iatLo = 0;
+    let iatHi = 0;
+    let impRva = 0;
+    let impSize = 0;
+    if (ndirs > 1) {
+        impRva = dirRva(dirs, 1);
+        impSize = dirSize(dirs, 1);
+    }
+    if (ndirs > 12) {
+        iatLo = dirRva(dirs, 12);
+        iatHi = iatLo + dirSize(dirs, 12);
+    }
+    if (impSize != 0) {
+        let k = 0;
+        while (true) {
+            const at = fileAt(p, impRva + 20 * k, 20);
+            if (at < 0) {
+                fail(p, "导入描述符 " + toStr(k) + " 越界");
+                break;
+            }
+            const ilt = u32(m, at);
+            const nameRva = u32(m, at + 12);
+            const iat = u32(m, at + 16);
+            if (ilt == 0 && nameRva == 0 && iat == 0) {
+                break;
+            }
+            const dll = cstr(p, nameRva);
+            const shown = pyBytes(dll);
+            if (dll == None || bytesLen(dll ?? bytesNew(0)) == 0 || !printable(dll ?? bytesNew(0))) {
+                fail(p, "导入描述符 " + toStr(k) + " 的 DLL 名不对");
+            }
+            let j = 0;
+            while (true) {
+                const a1 = fileAt(p, ilt + 8 * j, 8);
+                const a2 = fileAt(p, iat + 8 * j, 8);
+                if (a1 < 0 || a2 < 0) {
+                    fail(p, "导入名表或 IAT 越界（" + shown + "）");
+                    break;
+                }
+                const v1 = u64(m, a1);
+                const v2 = u64(m, a2);
+                if (v1 != v2) {
+                    fail(p, "导入名表与 IAT 初值不同（" + shown + " 第 " + toStr(j) + " 项）");
+                }
+                if (v1 == 0) {
+                    break;
+                }
+                if (v1 < 0) {
+                    fail(p, "按序号导入（" + shown + " 第 " + toStr(j) + " 项）");
+                } else {
+                    const hint = cstr(p, v1 + 2);
+                    if (hint == None || bytesLen(hint ?? bytesNew(0)) == 0) {
+                        fail(p, "提示名项越界（" + shown + " 第 " + toStr(j) + " 项）");
+                    }
+                }
+                if (iatHi != 0 && !(iatLo <= iat + 8 * j && iat + 8 * j < iatHi)) {
+                    fail(p, "IAT 项不在数据目录 12 的范围里");
+                }
+                j = j + 1;
+            }
+            k = k + 1;
+        }
+    } else {
+        fail(p, "没有导入表");
+    }
+
+    // 基址重定位。
+    let relRva = 0;
+    let relSize = 0;
+    if (ndirs > 5) {
+        relRva = dirRva(dirs, 5);
+        relSize = dirSize(dirs, 5);
+    }
+    const dir64: Map<int, int> = mapNew();
+    let at = -1;
+    if (relSize != 0) {
+        at = fileAt(p, relRva, relSize);
+    }
+    if (at < 0) {
+        fail(p, "没有基址重定位（ARM64 映像须带 .reloc）");
+    } else {
+        const end = at + relSize;
+        while (at < end) {
+            const page = u32(m, at);
+            const size = u32(m, at + 4);
+            if (size < 8 || size % 4 != 0 || at + size > end || page % 0x1000 != 0) {
+                fail(p, "基址重定位块头不对（页 " + hx(page) + "、长 " + toStr(size) + "）");
+                break;
+            }
+            let e = 8;
+            while (e < size) {
+                const w = u16(m, at + e);
+                const typ = w >> 12;
+                const off = w & 0xFFF;
+                e = e + 2;
+                if (typ == 0) {
+                    continue;
+                }
+                if (typ != 10) {
+                    fail(p, "基址重定位类型 " + toStr(typ) + " 不是 DIR64");
+                    continue;
+                }
+                const rva = page + off;
+                const fa = fileAt(p, rva, 8);
+                if (fa < 0) {
+                    fail(p, "DIR64 " + hx(rva) + " 不在有文件内容的节里");
+                    continue;
+                }
+                const v = u64(m, fa);
+                if (!(base <= v && v < base + sizeImage)) {
+                    fail(p, "DIR64 " + hx(rva) + " 处的值 " + hxu(v) + " 不在映像内");
+                }
+                mapSet(dir64, rva, 1);
+            }
+            at = at + size;
+        }
+    }
+
+    // TLS 目录。
+    if (ndirs > 9 && dirSize(dirs, 9) != 0) {
+        const tlsRva = dirRva(dirs, 9);
+        const ta = fileAt(p, tlsRva, 40);
+        if (ta < 0) {
+            fail(p, "TLS 目录越界");
+        } else {
+            const start = u64(m, ta);
+            const tend = u64(m, ta + 8);
+            const index = u64(m, ta + 16);
+            const names = ["StartAddressOfRawData", "EndAddressOfRawData", "AddressOfIndex", "AddressOfCallBacks"];
+            let k2 = 0;
+            while (k2 < 4) {
+                if (!mapHas(dir64, tlsRva + 8 * k2)) {
+                    fail(p, "TLS 目录的 " + names[k2] + " 没有 DIR64");
+                }
+                k2 = k2 + 1;
+            }
+            if (!(base <= start && start <= tend && tend < base + sizeImage)) {
+                fail(p, "TLS 模板范围不对");
+            }
+            const si = sectionOf(p, index - base, 4);
+            if (si < 0 || (secAt(p, si).ch & WRITE) == 0) {
+                fail(p, "TLS 索引槽不在可写节里");
+            }
+        }
+    }
+
+    // 导入桩：adrp x16 ／ ldr x16, [x16, #imm] ／ br x16。
+    let stubs = 0;
+    if (textIdx >= 0 && text.raw != 0) {
+        const t0 = text.ptr;
+        const tn = minOf(text.raw, text.vs);
+        let off = 0;
+        while (off < tn - 11) {
+            const w0 = u32(m, t0 + off);
+            const w1 = u32(m, t0 + off + 4);
+            const w2 = u32(m, t0 + off + 8);
+            if ((w0 & 0x9F00001F) == 0x90000010 && (w1 & 0xFFC003FF) == 0xF9400210 && w2 == 0xD61F0200) {
+                const site = text.va + off;
+                let imm = (((w0 >> 5) & 0x7FFFF) << 2) | ((w0 >> 29) & 3);
+                if ((imm & (1 << 20)) != 0) {
+                    imm = imm - (1 << 21);
+                }
+                const slot = ((site & ~0xFFF) + (imm << 12)) + ((w1 >> 10) & 0xFFF) * 8;
+                if (!(iatLo <= slot && slot < iatHi) || (slot - iatLo) % 8 != 0) {
+                    fail(p, "导入桩 " + hx(site) + " 指向 " + hx(slot) + "，不是 IAT 的槽");
+                }
+                stubs = stubs + 1;
+            }
+            off = off + 4;
+        }
+    }
+    const funcs = checkUnwind(p, dirs, textIdx, needUnwind);
+    rep.summary = "sections " + toStr(nsec) + ", imports dir " + toStr(impSize) + ", dir64 " + toStr(mapLen(dir64)) + ", stubs "
+    + toStr(stubs) + ", unwind " + toStr(funcs);
+}
+
+function checkUnwind(p: Ref<Pe>, dirs: List<int>, textIdx: int, needUnwind: bool): int {
+    const m = p.m;
+    let exRva = 0;
+    let exSize = 0;
+    if (listLen(dirs) > 6) {
+        exRva = dirRva(dirs, 3);
+        exSize = dirSize(dirs, 3);
+    }
+    if (exSize == 0) {
+        if (needUnwind) {
+            fail(p, "没有异常目录（.pdata）");
+        }
+        return 0;
+    }
+    const ps = sectionOf(p, exRva, exSize);
+    const at = fileAt(p, exRva, exSize);
+    if (ps < 0 || secAt(p, ps).name != ".pdata" || at < 0 || exSize % 8 != 0) {
+        fail(p, "异常目录不在 .pdata 节里或长度不是 8 的倍数");
+        return 0;
+    }
+    if (textIdx < 0) {
+        return 0;
+    }
+    const text = secAt(p, textIdx);
+    const tLo = text.va;
+    const tHi = text.va + text.vs;
+    const starts: Map<int, int> = mapNew();
+    let prevEnd = tLo;
+    let k = 0;
+    while (k < exSize / 8) {
+        const begin = u32(m, at + 8 * k);
+        const x = u32(m, at + 8 * k + 4);
+        const where = ".pdata 第 " + toStr(k) + " 项（" + hx(begin) + "）";
+        k = k + 1;
+        if ((x & 3) != 0) {
+            fail(p, where + "用了压缩形式");
+            continue;
+        }
+        if (!(tLo <= begin && begin < tHi) || begin % 4 != 0) {
+            fail(p, where + "的函数起点不在 .text 里");
+            continue;
+        }
+        if (begin < prevEnd) {
+            fail(p, where + "未按地址升序或与前一函数重叠");
+        }
+        const prevBeginEnd = prevEnd;
+        const xs = sectionOf(p, x, 8);
+        const xa = fileAt(p, x, 8);
+        if (xs < 0 || xa < 0 || (secAt(p, xs).ch & (WRITE | EXEC)) != 0 || x % 4 != 0) {
+            fail(p, where + "的 .xdata 不在只读数据节里或未对齐");
+            continue;
+        }
+        const h = u32(m, xa);
+        const flen = (h & 0x3FFFF) * 4;
+        const vers = (h >> 18) & 3;
+        const xbit = (h >> 20) & 1;
+        const ebit = (h >> 21) & 1;
+        let ecount = (h >> 22) & 31;
+        let cwords = (h >> 27) & 31;
+        let q = xa + 4;
+        if (ecount == 0 && cwords == 0) {
+            const h2 = u32(m, q);
+            ecount = h2 & 0xFFFF;
+            cwords = (h2 >> 16) & 0xFF;
+            q = q + 4;
+        }
+        if (vers != 0 || xbit != 0 || flen == 0 || begin + flen > tHi) {
+            fail(p, where + "的 .xdata 头不对（版本 " + toStr(vers) + "、异常处理 " + toStr(xbit) + "、函数长 " + toStr(flen) + "）");
+            continue;
+        }
+        prevEnd = begin + flen;
+        mapSet(starts, begin, 1);
+        // 尾声范围：（函数内偏移, 码起点）。
+        const scopeOff: List<int> = listNew();
+        const scopeIdx: List<int> = listNew();
+        if (ebit == 0) {
+            let e = 0;
+            while (e < ecount) {
+                const w = u32(m, q);
+                listPush(scopeOff, (w & 0x3FFFF) * 4);
+                listPush(scopeIdx, w >> 22);
+                q = q + 4;
+                e = e + 1;
+            }
+        }
+        // 展开码（同 Python 的切片：越出文件的部分不算，起点在文件外得空串）。
+        let codes = bytesNew(0);
+        if (q >= 0 && q < m.size) {
+            codes = bytesSlice(m.d, q, minOf(4 * cwords, m.size - q));
+        }
+        const fa = fileAt(p, begin, flen);
+        if (fa < 0) {
+            fail(p, where + "的函数没有文件内容");
+            continue;
+        }
+        const pro = unwindOps(codes, 0);
+        if (pro == None) {
+            fail(p, where + "的序言展开码不认识或没有 end");
+            continue;
+        }
+        let prolog: List<Op> = pro ?? noOps();
+        const fragment = opAt(prolog, 0).name == "end_c";
+        if (fragment) {
+            // 分片：本片没有序言，end_c 之后是幻影序言（从片里展开用），须紧接前一片。
+            if (begin != prevBeginEnd) {
+                fail(p, where + "是没有序言的分片，却不紧接前一片");
+            }
+            if (hasEndC(prolog, 1)) {
+                fail(p, where + "的幻影序言里又有 end_c");
+            }
+            prolog = noOps();
+        } else if (hasEndC(prolog, 0)) {
+            fail(p, where + "的序言码里有 end_c");
+            continue;
+        }
+        const n = maxOf(listLen(prolog) - 1, 0);
+        if (4 * n > flen) {
+            fail(p, where + "的序言长于函数");
+            continue;
+        }
+        let i = 0;
+        while (i < listLen(prolog) - 1) {
+            const op = opAt(prolog, i);
+            const ia = fa + 4 * (n - 1 - i);
+            const w = u32(m, ia);
+            const xv = x15Before(m, fa, ia);
+            if (!opMatches(op, w, true, xv.has, xv.v)) {
+                fail(p, where + "的序言码 " + op.name + " 与指令 " + hxw(w, 8) + "（+" + toStr(4 * (n - 1 - i)) + "）不符");
+            }
+            i = i + 1;
+        }
+        if (ebit != 0) {
+            const eo = unwindOps(codes, ecount);
+            const ops: List<Op> = eo ?? noOps();
+            const endC = eo != None && opAt(ops, 0).name == "end_c";
+            if (eo != None && !endC) {
+                listPush(scopeOff, flen - 4 * listLen(ops));
+                listPush(scopeIdx, ecount);
+            }
+            if (eo == None) {
+                fail(p, where + "的尾声展开码不认识");
+            } else if (endC && !(fragment && ecount == 0)) {
+                fail(p, where + "的尾声起点指向 end_c，却不是没有序言的分片");
+            }
+        }
+        let s = 0;
+        while (s < listLen(scopeOff)) {
+            const off = listGet(scopeOff, s) catch 0;
+            const idx = listGet(scopeIdx, s) catch 0;
+            s = s + 1;
+            const eo = unwindOps(codes, idx);
+            const ops: List<Op> = eo ?? noOps();
+            if (eo == None || hasEndC(ops, 0) || off < 4 * n || off + 4 * listLen(ops) > flen) {
+                fail(p, where + "的尾声（+" + toStr(off) + "，码起点 " + toStr(idx) + "）越界或展开码不认识");
+                continue;
+            }
+            i = 0;
+            while (i < listLen(ops)) {
+                const op = opAt(ops, i);
+                const w = u32(m, fa + off + 4 * i);
+                if (!opMatches(op, w, false, false, 0)) {
+                    fail(p, where + "的尾声码 " + op.name + " 与指令 " + hxw(w, 8) + "（+" + toStr(off + 4 * i) + "）不符");
+                }
+                i = i + 1;
+            }
+        }
+    }
+    // 覆盖：每个建帧记录的序言首条指令都有 .pdata。
+    const t0 = text.ptr;
+    const tn = minOf(text.raw, text.vs);
+    let off = 0;
+    while (off < tn - 3) {
+        if (u32(m, t0 + off) == STP_FP_LR && !mapHas(starts, text.va + off)) {
+            fail(p, hx(text.va + off) + " 处建帧（stp x29, x30, [sp, #-16]!）却不是 .pdata 函数的起点");
+        }
+        off = off + 4;
+    }
+    return mapLen(starts);
+}
+
+function main(args: []string): int {
+    let needUnwind = true;
+    for (a in args) {
+        if (a == "--no-unwind") {
+            needUnwind = false;
+        }
+    }
+    let bad = 0;
+    for (path in args) {
+        if (path == "--no-unwind") {
+            continue;
+        }
+        bad = bad | checkFile(path, needUnwind);
+    }
+    return bad;
+}
+
+function checkFile(path: string, needUnwind: bool): int {
+    const data = readFileBytes(path) catch (e) {
+        print("FAIL " + path);
+        print("  " + e.message);
+        return 1;
+    };
+    const rep = peArm64Check(data, needUnwind);
+    if (listLen(rep.errors) > 0) {
+        print("FAIL " + path);
+        for (e in rep.errors) {
+            print("  " + e);
+        }
+        return 1;
+    }
+    print("PASS " + path + " (" + rep.summary + ")");
+    return 0;
+}

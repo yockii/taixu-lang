@@ -1,0 +1,104 @@
+// Exercise scalar analysis through the production frontend and owned IR bridge.
+import { drvSetPrelude, drvSetKernel, drvSetToolchain, drvDebugContext, drvDiagOut, drvDisasm, drvDisasmRelease, drvLastContext } from "./selfhost/driver";
+import { recordScalarProgramContext } from "./selfhost/emit_record";
+import { scalarCachePlan } from "./selfhost/scalar_cache_plan";
+import { T_X64_WINDOWS } from "./selfhost/target";
+
+function ints(): List<int> { return listNew(); }
+function at(xs: List<int>, i: int): int { return listGet(xs, i) catch panic("probe instruction index"); }
+export function main(args: []string): int {
+    if (len(args) < 1) { return 64; }
+    drvSetPrelude(bytesToStr(embedBytes("../prelude/collections.tx")) catch panic("prelude UTF-8"));
+    drvSetKernel(embedBytes("nrt-kernel/kernel-x86_64-windows.obj"));
+    const debug = len(args) > 1 && args[1] == "debug";
+    const inspect = len(args) > 1 && args[1] == "inspect";
+    drvSetToolchain(len(args) > 2 && args[2] == "toolchain");
+    let rc = 0;
+    if (debug) { rc = drvDebugContext(args[0], T_X64_WINDOWS); }
+    else { rc = drvDisasm(args[0], T_X64_WINDOWS, 0); }
+    if (rc != 0) { eprint(drvDiagOut()); return 1; }
+    const ctx = drvLastContext() catch panic("fixture context");
+    const saved: List<List<int>> = listNew();
+    for (code in ctx.fnCode) { const copy: List<int> = listNew(); for (word in code) { listPush(copy, word); } listPush(saved, copy); }
+    const plans = recordScalarProgramContext(ctx, 16777216) catch (e) { eprint(e.message); return 1; };
+    assert(listLen(plans) == listLen(ctx.fnCode), "one plan per real function");
+    if (inspect) {
+        for (plan in plans) {
+            if (listLen(plan.loops.regions) == 0 && plan.skipped == "") { continue; }
+            const nameId = listGet(ctx.fnNameIdx, plan.id) catch -1;
+            const name = listGet(ctx.cgStrings, nameId) catch "?";
+            let selected = ""; for (slot in scalarCachePlan(plan.candidates, plan.hotCalls)) { selected = selected + " " + toStr(slot); }
+            print("FN " + toStr(plan.id) + " " + name + " selected=" + selected + " skipped=" + plan.skipped + " limited=" + toStr(plan.candidates.limited) + " hotcalls=" + toStr(plan.hotCalls));
+            for (value in plan.candidates.values) {
+                const region = listGet(plan.loops.regions, value.region) catch panic("inspect region");
+                print("VALUE " + toStr(value.region) + " slot=" + toStr(value.slot) + " depth=" + toStr(region.depth)
+                    + " tag=" + toStr(value.tag) + " reads=" + toStr(value.reads) + " writes=" + toStr(value.writes) + " barriers=" + toStr(value.barriers));
+            }
+        }
+        drvDisasmRelease(); return 0;
+    }
+    let regions = 0; let candidates = 0;
+    for (plan in plans) {
+        const nameId = listGet(ctx.fnNameIdx, plan.id) catch -1;
+        const name = listGet(ctx.cgStrings, nameId) catch "?";
+        print("FN " + name + " blocks=" + toStr(listLen(plan.blocks)) + " loops=" + toStr(listLen(plan.loops.regions)) + " candidates=" + toStr(listLen(plan.candidates.values)) + " skipped=" + plan.skipped);
+        assert(!plan.loops.limited && !plan.candidates.limited, "fixture fits work limit");
+        if (debug) { assert(plan.skipped == "debug" && listLen(plan.candidates.values) == 0, "debug keeps all slots"); }
+        else {
+            const nc = listLen(plan.candidates.values); const nl = listLen(plan.loops.regions);
+            if (name == "carry" || name == "floating" || name == "helper") {
+                assert(nl == 1 && nc == 2, "scalar induction and accumulator");
+                assert(plan.hotCalls == 0, "ordinary scalar fallback is not an explicit loop call");
+            }
+            if (name == "floating") {
+                const value = listGet(plan.candidates.values, 1) catch panic("float accumulator"); assert(value.tag == 2, "retain float bit type");
+            }
+            if (name == "nested") { assert(nl == 2 && nc == 4, "header liveness across two different block numberings"); }
+            if (name == "calling") {
+                assert(nl == 1 && nc == 1, "call-written window is excluded");
+                assert(plan.hotCalls > 0, "real call contributes to automatic selection cost");
+                const value = listGet(plan.candidates.values, 0) catch panic("call survivor"); assert(value.barriers > 0, "call boundary retained");
+                let call = false;
+                for (ins in plan.instructions) {
+                    if (ins.killFrom >= 0 && listLen(ins.uses) >= 6) {
+                        call = true; assert(ins.barrier, "call observes value slots"); let arg = 1;
+                        while (arg <= 5) {
+                            let found = false; let ui = 0;
+                            for (used in ins.uses) {
+                                if (used == ins.killFrom + arg) { assert(at(ins.useTags, ui) == 1, "all argument type facts"); found = true; } ui = ui + 1;
+                            }
+                            assert(found, "callee reads every argument including fourth and fifth"); arg = arg + 1;
+                        }
+                    }
+                }
+                assert(call, "fixture must contain actual five-argument call");
+            }
+            if (name == "overwrite") { assert(nl == 1 && nc == 1, "defined-before-read scratch is not carried"); }
+            if (name == "exits") {
+                assert(nl == 1 && nc == 2, "break continue and return loop");
+                const loop = listGet(plan.loops.regions, 0) catch panic("exit loop"); let terminal = false; let branch = false;
+                for (next in loop.exitTo) { if (next == -1) { terminal = true; } else { branch = true; } }
+                assert(terminal && branch, "actual return and branch exit edges");
+            }
+            if (name == "suspending") { assert(plan.skipped == "suspend-or-conservative" && nc == 0, "resume entries retain slots"); }
+        }
+        regions = regions + listLen(plan.loops.regions); candidates = candidates + listLen(plan.candidates.values);
+        for (value in plan.candidates.values) {
+            print("VALUE " + toStr(value.region) + " " + toStr(value.slot) + " " + toStr(value.tag) + " " + toStr(value.reads) + " " + toStr(value.writes) + " " + toStr(value.barriers));
+        }
+    }
+    if (debug) { assert(regions == 0 && candidates == 0, "debug aggregate"); }
+    else { assert(regions == 8 && candidates == 14, "complete fixture coverage"); }
+    const low = recordScalarProgramContext(ctx, 0) catch panic("zero optimization budget");
+    for (plan in low) { assert(listLen(plan.candidates.values) == 0, "zero budget has no partial candidate plan"); }
+    let fi = 0;
+    for (code in ctx.fnCode) {
+        const original = listGet(saved, fi) catch ints(); assert(listLen(code) == listLen(original), "analysis changed source IR size"); let pc = 0;
+        for (word in code) { assert(word == at(original, pc), "analysis changed source IR word"); pc = pc + 1; } fi = fi + 1;
+    }
+    let retained = 0; for (plan in plans) { retained = retained + listLen(plan.candidates.values); }
+    assert(retained == candidates, "reentry changed retained analysis");
+    print("TOTAL " + toStr(regions) + " " + toStr(candidates));
+    print("PASS_SCALAR_CONTEXT_TYPES_LIVENESS_CALLS_EXITS_BUDGET_OWNERSHIP");
+    drvDisasmRelease(); return 0;
+}

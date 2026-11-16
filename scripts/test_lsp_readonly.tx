@@ -1,0 +1,658 @@
+// 原生 LSP 只读的源码层检查。§四-1。
+//
+// LSP 的代码路径不运行程序、不起进程、不访问网络、不写文件。从 bootstrap/selfhost/lsp.tx 的 lspServe 出发，沿 import 收集可达模块，
+// 在这些模块里按名字求闭包：函数体里出现的任何与某个函数同名的标识符都算可达（不只是调用——函数可以当作值传递；同名即算，宁多
+// 勿漏），闭包里任何函数调用了下列内建即失败：procSpawnLimited、procSpawn、procWrite、procTryWrite、procCloseStream、procKill、
+// runProcess、writeFile、writeFileBytes、writeExecutable、removeFile、makeDir、setEnv。stdoutWrite（协议输出本身）与 readFile、
+// entryKind、fileSize（读）不在其列。按名字求闭包是完整的：S1 的内建不能当作值（3001），import 改名的本地名只在本模块里。
+// 另检查：LSP 自己的模块（lsp*.tx、frame_io.tx、check_diag.tx、ana_index.tx 等）里一处也不出现这些名字；并列出可达模块里调用了这些
+// 内建、但不在闭包里的函数（不在 drvCheck 的路径上，供核对）。
+//
+// 文本处理：注释（行内 // 之后，双引号串里的除外）与双引号串的内容先去掉；函数头为行首的
+// `[export ][async ]function[*] 名`；标识符两侧不是字母、数字与下划线（非 ASCII 的字母与数字按 Unicode 的 \w 算，标点不算）。
+//
+// 运行（仓根）：taixu run --toolchain scripts/test_lsp_readonly.tx [--root 仓库根]
+// 任何 FAIL 时退出码 1。
+import { join, nat, readBytes, startsWith } from "./build_lib";
+import { byteSub, indexOf, sorted } from "./test_text";
+import { lossyText } from "./check_lib";
+
+const ENTRY: string = "bootstrap/selfhost/lsp.tx";
+const FORBIDDEN: []string = ["procSpawnLimited", "procSpawn", "procWrite", "procTryWrite", "procCloseStream", "procKill", "runProcess", "writeFile",
+    "writeFileBytes", "writeExecutable", "removeFile", "makeDir", "setEnv"];
+// LSP 自己的模块：lsp*.tx 按前缀全认，另加分帧、检查诊断与分析索引。
+const OWN_EXTRA: []string = ["frame_io.tx", "check_diag.tx", "check_model.tx", "check_graph.tx", "source_cache.tx", "ana_index.tx"];
+const SUFFIXES: []string = ["windows", "linux", "macos", "unix", "windows_x86_64", "windows_aarch64", "linux_x86_64", "linux_aarch64", "macos_x86_64",
+    "macos_aarch64"];
+
+struct Fn {
+    name: string,
+    path: string,
+    body: string,
+}
+
+function tail(s: string, from: int): string {
+    return byteSub(s, from, len(s) - from);
+}
+
+// needle 在 s 里从字节位置 from 起首次出现的位置，缺席 −1（不复制 s）。
+function findFrom(s: string, needle: string, from: int): int {
+    const n = len(needle);
+    const first = byteAt(needle, 0) ?? 0;
+    let i = from;
+    while (i + n <= len(s)) {
+        if ((byteAt(s, i) ?? 0) == first) {
+            let k = 1;
+            while (k < n && (byteAt(s, i + k) ?? 0) == (byteAt(needle, k) ?? 0)) {
+                k = k + 1;
+            }
+            if (k == n) {
+                return i;
+            }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// s 在字节位置 at 处以 word 开头。
+function startsAt(s: string, at: int, word: string): bool {
+    if (at + len(word) > len(s)) {
+        return false;
+    }
+    let k = 0;
+    while (k < len(word)) {
+        if ((byteAt(s, at + k) ?? 0) != (byteAt(word, k) ?? 0)) {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+function readText(root: string, rel: string): string {
+    const b = readBytes(nat(join(root, rel))) catch (e) {
+        return "";
+    };
+    return lossyText(b);
+}
+
+function baseName(p: string): string {
+    let i = len(p) - 1;
+    while (i >= 0 && (byteAt(p, i) ?? 0) != 47) {
+        i = i - 1;
+    }
+    return tail(p, i + 1);
+}
+
+function dirName(p: string): string {
+    let i = len(p) - 1;
+    while (i >= 0 && (byteAt(p, i) ?? 0) != 47) {
+        i = i - 1;
+    }
+    if (i < 0) {
+        return "";
+    }
+    return byteSub(p, 0, i);
+}
+
+// 相对仓根的路径（/ 分隔）去掉 . 与 ..（同 Path.resolve 对这些段的处理）。
+function normPath(p: string): string {
+    const parts: List<string> = listNew();
+    for (seg in strSplit(p, "/")) {
+        if (len(seg) == 0 || seg == ".") {
+            continue;
+        }
+        if (seg == ".." && listLen(parts) > 0) {
+            listRemoveAt(parts, listLen(parts) - 1);
+            continue;
+        }
+        listPush(parts, seg);
+    }
+    let out = "";
+    for (seg in parts) {
+        if (len(out) > 0) {
+            out = out + "/";
+        }
+        out = out + seg;
+    }
+    return out;
+}
+
+// Path.with_suffix('.tx')：名字里有 . 时换掉最后一个 . 起的后缀，否则补上。
+function withTx(p: string): string {
+    const name = baseName(p);
+    let i = len(name) - 1;
+    while (i > 0 && (byteAt(name, i) ?? 0) != 46) {
+        i = i - 1;
+    }
+    if (i > 0) {
+        return byteSub(p, 0, len(p) - len(name) + i) + ".tx";
+    }
+    return p + ".tx";
+}
+
+function exists(root: string, rel: string): bool {
+    return entryKind(nat(join(root, rel))) != 0;
+}
+
+function isSpaceByte(c: int): bool {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12;
+}
+
+// `import { … } from "说明符"`：行首的 import、可跨行的花括号（同正则 ^import\s*\{[^}]*\}\s*from\s*"([^"]+)"）。
+function importSpecs(text: string): List<string> {
+    const out: List<string> = listNew();
+    let at = 0;
+    while (at < len(text)) {
+        if (startsAt(text, at, "import")) {
+            let i = at + 6;
+            while (i < len(text) && isSpaceByte(byteAt(text, i) ?? 0)) {
+                i = i + 1;
+            }
+            if ((byteAt(text, i) ?? 0) == 123) {
+                const close = findFrom(text, "}", i);
+                if (close >= 0) {
+                    i = close + 1;
+                    while (i < len(text) && isSpaceByte(byteAt(text, i) ?? 0)) {
+                        i = i + 1;
+                    }
+                    if (startsAt(text, i, "from")) {
+                        i = i + 4;
+                        while (i < len(text) && isSpaceByte(byteAt(text, i) ?? 0)) {
+                            i = i + 1;
+                        }
+                        if ((byteAt(text, i) ?? 0) == 34) {
+                            const q = findFrom(text, "\"", i + 1);
+                            if (q > i + 1) {
+                                listPush(out, byteSub(text, i + 1, q - i - 1));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        const nl = findFrom(text, "\n", at);
+        if (nl < 0) {
+            break;
+        }
+        at = nl + 1;
+    }
+    return out;
+}
+
+function inList(xs: List<string>, x: string): bool {
+    for (y in xs) {
+        if (y == x) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 从 lsp.tx 沿 import 可达的模块（连同各目标文件的变体），按深度优先（栈）的次序。
+function modules(root: string): List<string> {
+    const seen: List<string> = listNew();
+    const todo: List<string> = listNew();
+    listPush(todo, ENTRY);
+    while (listLen(todo) > 0) {
+        const p = listGet(todo, listLen(todo) - 1) catch "";
+        listRemoveAt(todo, listLen(todo) - 1);
+        if (inList(seen, p) || !exists(root, p)) {
+            continue;
+        }
+        listPush(seen, p);
+        for (spec in importSpecs(readText(root, p))) {
+            const base = dirName(p) + "/" + spec;
+            const cands: List<string> = listNew();
+            listPush(cands, withTx(base));
+            for (s in SUFFIXES) {
+                listPush(cands, dirName(base) + "/" + baseName(base) + "_" + s + ".tx");
+            }
+            for (cand in cands) {
+                const n = normPath(cand);
+                if (exists(root, n)) {
+                    listPush(todo, n);
+                }
+            }
+        }
+    }
+    return seen;
+}
+
+// 去掉注释：逐行，双引号串之外的 // 起到行尾去掉（串里的反斜杠跳过下一个字符）。
+function stripComments(text: string): string {
+    const lines = strSplit(text, "\n");
+    const out = bytesNew(0);
+    let k = 0;
+    for (line in lines) {
+        let i = 0;
+        let inStr = false;
+        let cut = len(line);
+        while (i < len(line)) {
+            const c = byteAt(line, i) ?? 0;
+            if (inStr) {
+                if (c == 92) {
+                    i = i + 2;
+                    continue;
+                }
+                if (c == 34) {
+                    inStr = false;
+                }
+            } else if (c == 34) {
+                inStr = true;
+            } else if (c == 47 && (byteAt(line, i + 1) ?? 0) == 47 && i + 1 < len(line)) {
+                cut = i;
+                break;
+            }
+            i = i + 1;
+        }
+        if (k > 0) {
+            bytesPush(out, 10);
+        }
+        bytesAppend(out, bytesSlice(bytesFromStr(line), 0, cut));
+        k = k + 1;
+    }
+    return bytesToStr(out) catch text;
+}
+
+// 同 re.sub(r'"(?:\\.|[^"\\])*"', '""', text)：可跨行的双引号串换成 ""；反斜杠后是换行或到文末仍未闭合的不算串。
+function stripStrings(text: string): string {
+    const out = bytesNew(0);
+    let i = 0;
+    const n = len(text);
+    let last = 0;
+    while (i < n) {
+        if ((byteAt(text, i) ?? 0) != 34) {
+            i = i + 1;
+            continue;
+        }
+        let j = i + 1;
+        let closed = -1;
+        while (j < n) {
+            const c = byteAt(text, j) ?? 0;
+            if (c == 34) {
+                closed = j;
+                break;
+            }
+            if (c == 92) {
+                if (j + 1 >= n || (byteAt(text, j + 1) ?? 0) == 10) {
+                    break;
+                }
+                j = j + 2;
+            } else {
+                j = j + 1;
+            }
+        }
+        if (closed < 0) {
+            i = i + 1;
+            continue;
+        }
+        bytesAppend(out, bytesFromStr(byteSub(text, last, i - last)));
+        bytesAppend(out, bytesFromStr("\"\""));
+        i = closed + 1;
+        last = i;
+    }
+    bytesAppend(out, bytesFromStr(tail(text, last)));
+    return bytesToStr(out) catch text;
+}
+
+function identStart(c: int): bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+}
+
+function identChar(c: int): bool {
+    return identStart(c) || (c >= 48 && c <= 57);
+}
+
+// 从字节位置 i 起的 UTF-8 码点与它的字节数。
+function codeAt(s: string, i: int): int {
+    const c = byteAt(s, i) ?? 0;
+    if (c < 0x80) {
+        return c;
+    }
+    let n = 1;
+    let v = c & 0x1F;
+    if (c >= 0xF0) {
+        n = 3;
+        v = c & 0x07;
+    } else if (c >= 0xE0) {
+        n = 2;
+        v = c & 0x0F;
+    }
+    let k = 1;
+    while (k <= n) {
+        v = (v << 6) | ((byteAt(s, i + k) ?? 0x80) & 0x3F);
+        k = k + 1;
+    }
+    return v;
+}
+
+// Python 的 Unicode \w 的近似：ASCII 字母、数字、下划线；非 ASCII 里除空白、标点与符号区之外的都算。
+function wordCode(v: int): bool {
+    if (v < 0x80) {
+        return identChar(v);
+    }
+    if (v <= 0xBF) {
+        return v == 0xAA || v == 0xB2 || v == 0xB3 || v == 0xB5 || v == 0xB9 || v == 0xBA || v == 0xBC || v == 0xBD || v == 0xBE;
+    }
+    if (v == 0xD7 || v == 0xF7) {
+        return false;
+    }
+    if ((v >= 0x2000 && v <= 0x2BFF) || (v >= 0x3000 && v <= 0x303F) || (v >= 0xFE10 && v <= 0xFE6F)) {
+        return false;
+    }
+    if ((v >= 0xFF01 && v <= 0xFF0F) || (v >= 0xFF1A && v <= 0xFF20) || (v >= 0xFF3B && v <= 0xFF40) || (v >= 0xFF5B && v <= 0xFF65)) {
+        return false;
+    }
+    if (v >= 0x1F000) {
+        return false;
+    }
+    return true;
+}
+
+function utf8Len(c: int): int {
+    if (c >= 0xF0) {
+        return 4;
+    }
+    if (c >= 0xE0) {
+        return 3;
+    }
+    if (c >= 0xC0) {
+        return 2;
+    }
+    return 1;
+}
+
+// 同 re.findall(r'\b([A-Za-z_][A-Za-z0-9_]*)\b')：每段最长的“词字符”串，整段是 ASCII 标识符形时取它。
+function idents(text: string): List<string> {
+    const out: List<string> = listNew();
+    let i = 0;
+    const n = len(text);
+    while (i < n) {
+        const c = byteAt(text, i) ?? 0;
+        let w = utf8Len(c);
+        if (!wordCode(codeAt(text, i))) {
+            i = i + w;
+            continue;
+        }
+        const start = i;
+        let ascii = true;
+        while (i < n) {
+            const d = byteAt(text, i) ?? 0;
+            if (!wordCode(codeAt(text, i))) {
+                break;
+            }
+            if (d >= 0x80) {
+                ascii = false;
+            }
+            i = i + utf8Len(d);
+        }
+        if (ascii && identStart(byteAt(text, start) ?? 0)) {
+            listPush(out, byteSub(text, start, i - start));
+        }
+    }
+    return out;
+}
+
+// 文本里有没有 name 作整词出现；needCall 为真时须后随（可有空白的）左括号（同 \bname\s*\( 与 \bname\b）。
+function hasWord(text: string, name: string, needCall: bool): bool {
+    let from = 0;
+    while (true) {
+        const at = findFrom(text, name, from);
+        if (at < 0) {
+            return false;
+        }
+        let before = true;
+        if (at > 0) {
+            let p = at - 1;
+            while (p > 0 && ((byteAt(text, p) ?? 0) & 0xC0) == 0x80) {
+                p = p - 1;
+            }
+            before = !wordCode(codeAt(text, p));
+        }
+        const end = at + len(name);
+        if (before) {
+            if (needCall) {
+                let j = end;
+                while (j < len(text) && isSpaceByte(byteAt(text, j) ?? 0)) {
+                    j = j + 1;
+                }
+                if (j < len(text) && (byteAt(text, j) ?? 0) == 40) {
+                    return true;
+                }
+            } else if (end >= len(text) || !wordCode(codeAt(text, end))) {
+                return true;
+            }
+        }
+        from = at + 1;
+    }
+    return false;
+}
+
+// 行首的函数头 `[export\s+][async\s+]function[*]\s+名`。
+function functions(text: string, path: string, out: List<Fn>): void {
+    const starts: List<int> = listNew();
+    const names: List<string> = listNew();
+    let at = 0;
+    while (at < len(text)) {
+        const name = funcAt(text, at);
+        if (len(name) > 0) {
+            listPush(starts, at);
+            listPush(names, name);
+        }
+        const nl = findFrom(text, "\n", at);
+        if (nl < 0) {
+            break;
+        }
+        at = nl + 1;
+    }
+    let k = 0;
+    while (k < listLen(starts)) {
+        const s = listGet(starts, k) catch 0;
+        let e = len(text);
+        if (k + 1 < listLen(starts)) {
+            e = listGet(starts, k + 1) catch e;
+        }
+        listPush(out, Fn { name: listGet(names, k) catch "", path: path, body: byteSub(text, s, e - s) });
+        k = k + 1;
+    }
+}
+
+function skipWord(text: string, at: int, word: string): int {
+    if (!startsAt(text, at, word)) {
+        return -1;
+    }
+    let i = at + len(word);
+    const s = i;
+    while (i < len(text) && isSpaceByte(byteAt(text, i) ?? 0)) {
+        i = i + 1;
+    }
+    if (i == s) {
+        return -1;
+    }
+    return i;
+}
+
+function funcAt(text: string, at: int): string {
+    let i = at;
+    const e = skipWord(text, i, "export");
+    if (e >= 0) {
+        i = e;
+    }
+    const a = skipWord(text, i, "async");
+    if (a >= 0) {
+        i = a;
+    }
+    if (!startsAt(text, i, "function")) {
+        return "";
+    }
+    i = i + 8;
+    if ((byteAt(text, i) ?? 0) == 42) {
+        i = i + 1;
+    }
+    const s = i;
+    while (i < len(text) && isSpaceByte(byteAt(text, i) ?? 0)) {
+        i = i + 1;
+    }
+    if (i == s || !identStart(byteAt(text, i) ?? 0)) {
+        return "";
+    }
+    const n0 = i;
+    while (i < len(text) && identChar(byteAt(text, i) ?? 0)) {
+        i = i + 1;
+    }
+    return byteSub(text, n0, i - n0);
+}
+
+// 名字对应的函数下标；没有得空表。
+function idsOf(byName: Map<string, List<int>>, name: string): List<int> {
+    const none: List<int> = listNew();
+    return mapGet(byName, name) ?? none;
+}
+
+function own(name: string): bool {
+    if (startsWith(name, "lsp")) {
+        return true;
+    }
+    for (x in OWN_EXTRA) {
+        if (x == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 仓根下的相对路径按本机写法（同 Python 打印 Path.relative_to 的 str）。
+function shown(p: string): string {
+    if (hostTarget() == "windows") {
+        const b = bytesFromStr(p);
+        let i = 0;
+        while (i < bytesLen(b)) {
+            if ((bytesGet(b, i) ?? 0) == 47) {
+                bytesSet(b, i, 92);
+            }
+            i = i + 1;
+        }
+        return bytesToStr(b) catch p;
+    }
+    return p;
+}
+
+function main(args: []string): int {
+    let root = "";
+    let i = 0;
+    while (i + 1 < len(args)) {
+        if (args[i] == "--root") {
+            root = args[i + 1];
+        }
+        i = i + 2;
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    let bad = 0;
+    const mods = modules(root);
+    const table: List<Fn> = listNew();
+    const texts: List<string> = listNew();
+    for (m in mods) {
+        const text = stripStrings(stripComments(readText(root, m)));
+        listPush(texts, text);
+        functions(text, m, table);
+    }
+    // 名字 → table 里的下标（同名的按出现序）。
+    const byName = mapNew<string, List<int>>();
+    const tableNames: List<string> = listNew();
+    let fi = 0;
+    while (fi < listLen(table)) {
+        const f = listGet(table, fi) catch Fn { name: "", path: "", body: "" };
+        if (!mapHas(byName, f.name)) {
+            const idx: List<int> = listNew();
+            mapSet(byName, f.name, idx);
+            listPush(tableNames, f.name);
+        }
+        const idx = idsOf(byName, f.name);
+        listPush(idx, fi);
+        fi = fi + 1;
+    }
+    const reachSet = mapNew<string, bool>();
+    const reach: List<string> = listNew();
+    const todo: List<string> = listNew();
+    listPush(todo, "lspServe");
+    while (listLen(todo) > 0) {
+        const name = listGet(todo, listLen(todo) - 1) catch "";
+        listRemoveAt(todo, listLen(todo) - 1);
+        if (mapHas(reachSet, name) || !mapHas(byName, name)) {
+            continue;
+        }
+        mapSet(reachSet, name, true);
+        listPush(reach, name);
+        for (j in idsOf(byName, name)) {
+            const f = listGet(table, j) catch Fn { name: "", path: "", body: "" };
+            for (callee in idents(f.body)) {
+                if (mapHas(byName, callee) && !mapHas(reachSet, callee)) {
+                    listPush(todo, callee);
+                }
+            }
+        }
+    }
+    for (name in sorted(reach)) {
+        for (j in idsOf(byName, name)) {
+            const f = listGet(table, j) catch Fn { name: "", path: "", body: "" };
+            for (x in FORBIDDEN) {
+                if (hasWord(f.body, x, true)) {
+                    bad = bad + 1;
+                    print("FAIL  " + name + " 经 " + shown(f.path) + "（lspServe）可达，调用了 " + x);
+                }
+            }
+        }
+    }
+    let owned = 0;
+    let k = 0;
+    while (k < listLen(mods)) {
+        const m = listGet(mods, k) catch "";
+        if (own(baseName(m))) {
+            owned = owned + 1;
+            const text = listGet(texts, k) catch "";
+            for (x in FORBIDDEN) {
+                if (hasWord(text, x, false)) {
+                    bad = bad + 1;
+                    print("FAIL  " + shown(m) + " 出现 " + x);
+                }
+            }
+        }
+        k = k + 1;
+    }
+    const off: List<string> = listNew();
+    for (name in sorted(tableNames)) {
+        if (mapHas(reachSet, name)) {
+            continue;
+        }
+        for (j in idsOf(byName, name)) {
+            const f = listGet(table, j) catch Fn { name: "", path: "", body: "" };
+            let hits = "";
+            for (x in FORBIDDEN) {
+                if (hasWord(f.body, x, true)) {
+                    if (len(hits) > 0) {
+                        hits = hits + "、";
+                    }
+                    hits = hits + x;
+                }
+            }
+            if (len(hits) > 0) {
+                listPush(off, f.path + ":" + name + "（" + hits + "）");
+            }
+        }
+    }
+    for (x in off) {
+        print("OFFPATH  " + x);
+    }
+    print("modules=" + toStr(listLen(mods)) + " own=" + toStr(owned) + " reachable-functions=" + toStr(listLen(reach)) + " offpath-writers="
+        + toStr(listLen(off)));
+    if (bad == 0) {
+        print("SUMMARY PASS");
+        return 0;
+    }
+    print("SUMMARY FAIL=" + toStr(bad));
+    return 1;
+}

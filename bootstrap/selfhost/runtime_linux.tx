@@ -1,5 +1,8 @@
 // Linux x86-64 OS boundary for the existing private-window native kernel.
-import { Operand, StructuredBuffer, asBufferInstruction, asBufferSection, asBufferLabel, asBufferByte, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem } from "./assemble";
+// 这里的例程都登记进函数目录（来源 runtime-manual，目标分层 X5c；规则见 assemble.tx 的 asManualBegin）。
+import { Operand, StructuredBuffer, asBufferInstruction, asBufferSection, asBufferLabel, asBufferByte, asBufferFrame, asBufferFunctionEnd, asBufferFunctionPrologueEnd, asBufferFunctionEpilogueStart, asManualBegin, asManualFrame, asManualReturn, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem } from "./assemble";
+
+const MODULE: string = "bootstrap/selfhost/runtime_linux.tx";
 
 function reg(n: int): Ref<Operand> { return asStructuredReg(0, n); }
 function imm(n: int): Ref<Operand> { return asStructuredImm(n); }
@@ -18,24 +21,36 @@ export function linuxMemoryExports(b: Ref<StructuredBuffer>, withMove: bool): vo
     let i = 0;
     while (i < listLen(names)) {
         const n = listGet(names, i) catch "";
-        label(b, n);
-        // SysV (rdi,rsi,rdx) -> private (rcx,rdx,r8), with shadow space.
+        // SysV (rdi,rsi,rdx) -> private (rcx,rdx,r8), with shadow space：入口先分配（序言事件须从入口起），再搬实参。
+        asManualBegin(b, MODULE, n); asManualFrame(b, 40);
         emit(b, "mov", 2, reg(1), reg(7)); emit(b, "mov", 2, reg(8), reg(2));
-        emit(b, "mov", 2, reg(2), reg(6)); emit(b, "sub", 2, reg(4), imm(40));
+        emit(b, "mov", 2, reg(2), reg(6));
         one(b, "call", name("__tx_linux_" + n));
-        emit(b, "add", 2, reg(4), imm(40)); zero(b, "ret"); i = i + 1;
+        asManualReturn(b, 40); asBufferFunctionEnd(b); i = i + 1;
     }
+}
+
+// 页适配器的帧：rdi、rsi 是私有约定的被调方保存寄存器，入口压栈，唯一出口逆序弹出。
+function saveArgs(b: Ref<StructuredBuffer>, entry: string): void {
+    asManualBegin(b, MODULE, entry);
+    asBufferFrame(b, "push-nonvolatile", 7, 8); asBufferFrame(b, "push-nonvolatile", 6, 8);
+    asBufferFunctionPrologueEnd(b);
+}
+function restoreArgs(b: Ref<StructuredBuffer>): void {
+    asBufferFunctionEpilogueStart(b);
+    asBufferFrame(b, "pop-nonvolatile", 6, 8); asBufferFrame(b, "pop-nonvolatile", 7, 8);
+    asBufferFrame(b, "return", -1, 8);
+    asBufferFunctionEnd(b);
 }
 
 export function linuxPageAdapters(b: Ref<StructuredBuffer>): void {
     asBufferSection(b, 0, 1);
-    label(b, "__tx_linux_page_alloc");
     // mmap(0, length, PROT_READ|WRITE, MAP_PRIVATE|ANONYMOUS, -1, 0).
     // Mappings up to 256KB (small-block pages, which carving touches at once,
     // and mid-size blocks) add MAP_POPULATE: one syscall builds the page
     // table instead of one fault per page. Contents stay all zero.
     // rdi/rsi are nonvolatile in the private ABI; syscall destroys rcx/r11.
-    one(b, "push", reg(7)); one(b, "push", reg(6));
+    saveArgs(b, "__tx_linux_page_alloc");
     emit(b, "mov", 2, reg(6), reg(2)); emit(b, "xor", 2, reg(7), reg(7));
     emit(b, "mov", 2, reg(2), imm(3)); emit(b, "mov", 2, reg(10), imm(34));
     emit(b, "cmp", 2, reg(6), imm(262144)); one(b, "ja", name("__tx_linux_map_lazy"));
@@ -44,26 +59,27 @@ export function linuxPageAdapters(b: Ref<StructuredBuffer>): void {
     emit(b, "mov", 2, reg(0), imm(9)); zero(b, "syscall");
     emit(b, "cmp", 2, reg(0), imm(-4095)); one(b, "jb", name("__tx_linux_map_ok"));
     emit(b, "xor", 2, reg(0), reg(0)); label(b, "__tx_linux_map_ok");
-    one(b, "pop", reg(6)); one(b, "pop", reg(7)); zero(b, "ret");
+    restoreArgs(b);
 
-    label(b, "__tx_linux_page_free");
-    one(b, "push", reg(7)); one(b, "push", reg(6));
+    saveArgs(b, "__tx_linux_page_free");
     emit(b, "mov", 2, reg(7), reg(1)); emit(b, "mov", 2, reg(6), reg(2));
     emit(b, "mov", 2, reg(0), imm(11)); zero(b, "syscall");
-    one(b, "pop", reg(6)); one(b, "pop", reg(7)); zero(b, "ret");
+    restoreArgs(b);
 }
 
 export function linuxMemoryPanic(b: Ref<StructuredBuffer>, entry: string, data: string, message: string): void {
     linuxAbort(b, entry, data, message, 134);
 }
 
+// 致命终局（Linux）：stderr 写 message 与换行后 exit_group(status)，以 ud2 结束。接在调用方已起的登记函数的帧后
+// （runtime_memory_gen.tx 的 panicEntry），entry 只是标号；发完结束该函数，消息字节放进只读数据。
 export function linuxAbort(b: Ref<StructuredBuffer>, entry: string, data: string, message: string, status: int): void {
     asBufferSection(b, 0, 1); label(b, entry);
     emit(b, "mov", 2, reg(0), imm(1)); emit(b, "mov", 2, reg(7), imm(2));
     emit(b, "lea", 2, reg(6), asStructuredMem(2, -1, -1, 0, 0, 1, data));
     emit(b, "mov", 2, reg(2), imm(len(message) + 1)); zero(b, "syscall");
     emit(b, "mov", 2, reg(0), imm(231)); emit(b, "mov", 2, reg(7), imm(status)); zero(b, "syscall");
-    zero(b, "ud2");
+    zero(b, "ud2"); asBufferFunctionEnd(b);
     asBufferSection(b, 1, 1); label(b, data);
     let i = 0;
     while (i < len(message)) { asBufferByte(b, byteAt(message, i) catch 0, 1); i = i + 1; }

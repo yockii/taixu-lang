@@ -1,0 +1,349 @@
+// ============================================================================
+// engine/busconn —— D-Bus 连接（Linux；GUI 原生引擎 G5 第二部分）：Unix 域套接字经 from syscall（同 engine/x11，产物保持静态）、
+// SASL EXTERNAL 认证、Hello，按序号等回复、按路径与成员等信号。消息的编组与解组在 engine/dbus。
+//
+// - 地址取 DBUS_SESSION_BUS_ADDRESS 里第一个 unix 传输（path 或 abstract）；没设时用 $XDG_RUNTIME_DIR/bus（sd-bus、GDBus 同此）。
+// - 认证：先发一个 NUL 字节与 "AUTH EXTERNAL <uid 的十六进制>"，收到 "OK <guid>" 后发 "BEGIN"（凭据由内核经 SO_PEERCRED 交给
+//   总线，不另发 SCM_CREDENTIALS）；不协商传文件描述符。之后 Hello 取得唯一名。
+// - 等回复或信号期间收到的别的消息暂存（至多 256 条，满了丢最早的），之后按序取用。连接断开或收到不合格式的数据即 dead，
+//   此后的收发都失败；失败的取消息得 kind 为 0 的空消息。
+// ============================================================================
+
+import { getenv } from "std/os";
+import { DbusMsg, dbusMsg, dbusEncode, dbusDecode, dbusFrameLen, dbusAuthLine, dbusUnixAddr, dbusReader, drStr, DBUS_CALL, DBUS_RETURN, DBUS_ERROR, DBUS_SIGNAL } from "./dbus";
+
+declare function bcSocket(domain: int, kind: int, proto: int): int from syscall "socket";
+declare function bcConnect(fd: int, addr: Bytes, alen: int): int from syscall "connect";
+declare function bcSendto(fd: int, buf: Bytes, n: int, flags: int, addr: int, alen: int): int from syscall "sendto";
+declare function bcRecvfrom(fd: int, buf: Bytes, n: int, flags: int, addr: int, alen: int): int from syscall "recvfrom";
+declare function bcPpoll(fds: Bytes, n: int, ts: Bytes, sigmask: int, sigsetsize: int): int from syscall "ppoll";
+declare function bcClose(fd: int): int from syscall "close";
+declare function bcGetuid(): int from syscall "getuid";
+declare function bcClockGettime(clock: int, ts: Bytes): int from syscall "clock_gettime";
+
+const AF_UNIX: int = 1;
+const STREAM_CLOEXEC: int = 524289; // SOCK_STREAM | SOCK_CLOEXEC
+const MSG_NOSIGNAL: int = 0x4000;
+const EINTR: int = 4;
+const CLOCK_MONOTONIC: int = 1;
+const HELD_MAX: int = 256;
+const LINE_MAX: int = 1024;
+
+/// 一条总线连接。
+export struct BusConn {
+    fd: int,
+    inbuf: Bytes,
+    inpos: int,
+    serial: int,
+    unique: string,
+    dead: bool,
+    held: List<DbusMsg>,
+}
+
+/// 没连上的占位连接（dead）。
+export function busNone(): Ref<BusConn> {
+    return new BusConn { fd: -1, inbuf: bytesNew(0), inpos: 0, serial: 0, unique: "", dead: true, held: listNew() };
+}
+
+/// 包装一个已连好的套接字，不认证（测试里的假总线作服务端用）。
+export function busFromFd(fd: int): Ref<BusConn> {
+    const c = busNone();
+    c.fd = fd;
+    c.dead = fd < 0;
+    return c;
+}
+
+/// 会话总线的地址（环境变量，否则 $XDG_RUNTIME_DIR/bus）；都没有得空串。
+export function busSessionAddress(): string {
+    const a: string = getenv("DBUS_SESSION_BUS_ADDRESS");
+    if (a != "") {
+        return a;
+    }
+    const rt: string = getenv("XDG_RUNTIME_DIR");
+    if (rt != "") {
+        return "unix:path=" + rt + "/bus";
+    }
+    return "";
+}
+
+/// 连上总线、认证并 Hello；失败得 dead 的连接。
+export function busOpen(addr: string): Ref<BusConn> {
+    const u: List<string> = dbusUnixAddr(addr);
+    if (listLen(u) < 2) {
+        return busNone();
+    }
+    const c = busFromFd(connectUnix(listTryGet(u, 1) catch "", (listTryGet(u, 0) catch "") == "abstract"));
+    if (c.dead) {
+        return c;
+    }
+    const auth = bytesNew(1);
+    bytesAppend(auth, bytesFromStr(dbusAuthLine(bcGetuid())));
+    if (!busWriteRaw(c, auth) || strFind(busReadLine(c, 5000), "OK ") != 0 || !busWriteRaw(c, bytesFromStr("BEGIN\r\n"))) {
+        busClose(c);
+        return c;
+    }
+    const rep: DbusMsg = busCall(c, dbusMsg(DBUS_CALL, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "Hello"), 5000);
+    if (rep.kind == DBUS_RETURN && rep.sig == "s") {
+        c.unique = drStr(dbusReader(rep));
+    }
+    if (c.unique == "") {
+        busClose(c);
+    }
+    return c;
+}
+
+export function busClose(c: Ref<BusConn>): void {
+    if (c.fd >= 0) {
+        bcClose(c.fd);
+    }
+    c.fd = -1;
+    c.dead = true;
+}
+
+/// 发原始字节（认证阶段）。
+export function busWriteRaw(c: Ref<BusConn>, b: Bytes): bool {
+    if (c.dead) {
+        return false;
+    }
+    const n: int = bytesLen(b);
+    let off: int = 0;
+    while (off < n) {
+        let part: Bytes = b;
+        if (off > 0) {
+            part = bytesSlice(b, off, n - off);
+        }
+        const r: int = bcSendto(c.fd, part, n - off, MSG_NOSIGNAL, 0, 0);
+        if (r == 0 - EINTR) {
+            continue;
+        }
+        if (r <= 0) {
+            busClose(c);
+            return false;
+        }
+        off = off + r;
+    }
+    return true;
+}
+
+/// 读一行（认证阶段；至多等 timeoutMs 毫秒，行长至多 1024 字节），不含行尾 "\r\n"；失败得空串。
+export function busReadLine(c: Ref<BusConn>, timeoutMs: int): string {
+    const until: int = nowMs() + timeoutMs;
+    while (!c.dead) {
+        let i: int = c.inpos;
+        while (i + 1 < bytesLen(c.inbuf)) {
+            if ((bytesGet(c.inbuf, i) catch 0) == 13 && (bytesGet(c.inbuf, i + 1) catch 0) == 10) {
+                const line = bytesSlice(c.inbuf, c.inpos, i - c.inpos);
+                c.inpos = i + 2;
+                return bytesToStr(line) catch "";
+            }
+            i = i + 1;
+        }
+        if (bytesLen(c.inbuf) - c.inpos > LINE_MAX) {
+            busClose(c);
+            return "";
+        }
+        const left: int = until - nowMs();
+        if (left <= 0) {
+            return "";
+        }
+        fill(c, left);
+    }
+    return "";
+}
+
+/// 发一条消息，序号自动分配；得序号，失败得 -1。
+export function busSend(c: Ref<BusConn>, m: DbusMsg): int {
+    if (c.dead) {
+        return -1;
+    }
+    c.serial = c.serial + 1;
+    if (!busWriteRaw(c, dbusEncode(m, c.serial))) {
+        return -1;
+    }
+    return c.serial;
+}
+
+/// 取下一条消息：先取暂存的，否则至多等 timeoutMs 毫秒（负数为一直等）；等不到或连接断开得 kind 为 0 的空消息。
+export function busRecv(c: Ref<BusConn>, timeoutMs: int): DbusMsg {
+    if (listLen(c.held) > 0) {
+        const m: DbusMsg = listTryGet(c.held, 0) catch noMsg();
+        listRemoveAt(c.held, 0);
+        return m;
+    }
+    return readMsg(c, timeoutMs);
+}
+
+/// 方法调用并等它的回复（返回或错误）；等不到或连接断开得 kind 为 0 的空消息。期间收到的别的消息暂存。
+export function busCall(c: Ref<BusConn>, m: DbusMsg, timeoutMs: int): DbusMsg {
+    const s: int = busSend(c, m);
+    if (s < 0) {
+        return noMsg();
+    }
+    const until: int = nowMs() + timeoutMs;
+    while (true) {
+        const left: int = until - nowMs();
+        if (left <= 0) {
+            return noMsg();
+        }
+        const r: DbusMsg = readMsg(c, left);
+        if (r.kind == 0) {
+            return r;
+        }
+        if ((r.kind == DBUS_RETURN || r.kind == DBUS_ERROR) && r.replyTo == s) {
+            return r;
+        }
+        hold(c, r);
+    }
+    return noMsg();
+}
+
+/// 等对象路径 path 上接口 iface 的信号 member（timeoutMs 负数为一直等，直到连接断开）；先查暂存的。
+export function busWaitSignal(c: Ref<BusConn>, path: string, iface: string, member: string, timeoutMs: int): DbusMsg {
+    let i: int = 0;
+    while (i < listLen(c.held)) {
+        const m: DbusMsg = listTryGet(c.held, i) catch noMsg();
+        if (isSignal(m, path, iface, member)) {
+            listRemoveAt(c.held, i);
+            return m;
+        }
+        i = i + 1;
+    }
+    const until: int = nowMs() + timeoutMs;
+    while (!c.dead) {
+        let left: int = -1;
+        if (timeoutMs >= 0) {
+            left = until - nowMs();
+            if (left <= 0) {
+                return noMsg();
+            }
+        }
+        const r: DbusMsg = readMsg(c, left);
+        if (isSignal(r, path, iface, member)) {
+            return r;
+        }
+        if (r.kind != 0) {
+            hold(c, r);
+        }
+    }
+    return noMsg();
+}
+
+function isSignal(m: DbusMsg, path: string, iface: string, member: string): bool {
+    return m.kind == DBUS_SIGNAL && m.path == path && m.iface == iface && m.member == member;
+}
+
+function hold(c: Ref<BusConn>, m: DbusMsg): void {
+    if (listLen(c.held) >= HELD_MAX) {
+        listRemoveAt(c.held, 0);
+    }
+    listPush(c.held, m);
+}
+
+function noMsg(): DbusMsg {
+    return dbusMsg(0, "", "", "", "");
+}
+
+// 读出一条完整的消息；timeoutMs 负数为一直等。
+function readMsg(c: Ref<BusConn>, timeoutMs: int): DbusMsg {
+    const until: int = nowMs() + timeoutMs;
+    while (!c.dead) {
+        const n: int = dbusFrameLen(c.inbuf, c.inpos);
+        if (n < 0) {
+            busClose(c);
+            return noMsg();
+        }
+        if (n > 0) {
+            const p = bytesSlice(c.inbuf, c.inpos, n);
+            c.inpos = c.inpos + n;
+            if (c.inpos == bytesLen(c.inbuf)) {
+                c.inbuf = bytesNew(0);
+                c.inpos = 0;
+            } else if (c.inpos > 65536) {
+                c.inbuf = bytesSlice(c.inbuf, c.inpos, bytesLen(c.inbuf) - c.inpos);
+                c.inpos = 0;
+            }
+            const m: DbusMsg = dbusDecode(p) catch noMsg();
+            if (m.kind == 0) {
+                busClose(c);
+            }
+            return m;
+        }
+        let wait: int = 1000;
+        if (timeoutMs >= 0) {
+            wait = until - nowMs();
+            if (wait <= 0) {
+                return noMsg();
+            }
+        }
+        fill(c, wait);
+    }
+    return noMsg();
+}
+
+// 至多等 waitMs 毫秒读一批数据；对端关闭或出错即 dead。
+function fill(c: Ref<BusConn>, waitMs: int): void {
+    if (c.dead) {
+        return;
+    }
+    const pfd = bytesNew(8);
+    bytesSetLE<i32>(pfd, 0, c.fd as i32);
+    bytesSetLE<i16>(pfd, 4, 1);
+    const ts = bytesNew(16);
+    bytesSetLE<i64>(ts, 0, waitMs / 1000);
+    bytesSetLE<i64>(ts, 8, (waitMs % 1000) * 1000000);
+    if (bcPpoll(pfd, 1, ts, 0, 8) <= 0) {
+        return;
+    }
+    const buf = bytesNew(65536);
+    const got: int = bcRecvfrom(c.fd, buf, 65536, 0, 0, 0);
+    if (got == 0 - EINTR) {
+        return;
+    }
+    if (got <= 0) {
+        busClose(c);
+        return;
+    }
+    bytesAppend(c.inbuf, bytesSlice(buf, 0, got));
+}
+
+function nowMs(): int {
+    const ts = bytesNew(16);
+    bcClockGettime(CLOCK_MONOTONIC, ts);
+    return (bytesGetLE<i64>(ts, 0) catch 0) * 1000 + (bytesGetLE<i64>(ts, 8) catch 0) / 1000000;
+}
+
+// 连 Unix 域套接字（abs 为抽象名字空间）；失败得 -1。
+function connectUnix(path: string, abs: bool): int {
+    const p = bytesFromStr(path);
+    if (bytesLen(p) == 0 || bytesLen(p) > 100) {
+        return -1;
+    }
+    const sa = bytesNew(110);
+    bytesSet(sa, 0, AF_UNIX);
+    let at: int = 2;
+    if (abs) {
+        at = 3;
+    }
+    let i: int = 0;
+    while (i < bytesLen(p)) {
+        bytesSet(sa, at + i, bytesGet(p, i) catch 0);
+        i = i + 1;
+    }
+    let alen: int = at + bytesLen(p);
+    if (!abs) {
+        alen = alen + 1;
+    }
+    const fd: int = bcSocket(AF_UNIX, STREAM_CLOEXEC, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    let r: int = bcConnect(fd, sa, alen);
+    while (r == 0 - EINTR) {
+        r = bcConnect(fd, sa, alen);
+    }
+    if (r != 0) {
+        bcClose(fd);
+        return -1;
+    }
+    return fd;
+}

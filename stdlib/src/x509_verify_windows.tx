@@ -1,0 +1,101 @@
+// Windows 系统证书路径与 SSL 服务策略；只使用内存 store，不安装根。
+import { x509CheckServerInputs } from "./x509_verify_common";
+
+declare type CertStore;
+declare type CertContext;
+declare type ChainContext;
+declare type ChainEngine;
+declare struct EngineOut { value: ChainEngine }
+declare struct ChainOut { value: ChainContext }
+declare struct EnhKeyUsage { count: u32, ids: usize }
+declare struct UsageMatch { kind: u32, usage: EnhKeyUsage }
+declare struct ChainPara { size: u32, usage: UsageMatch, issuance: UsageMatch, urlTimeout: u32, checkFresh: i32, freshness: u32, cacheResync: usize, strongSignPara: usize, strongSignFlags: u32 }
+declare struct EngineConfig { size: u32, restrictedRoot: CertStore, restrictedTrust: CertStore, restrictedOther: CertStore, additionalCount: u32, additionalStores: usize, flags: u32, urlTimeout: u32, maxCache: u32, cycle: u32, exclusiveRoot: CertStore, exclusiveTrusted: CertStore, exclusiveFlags: u32 }
+declare struct PolicyPara { size: u32, flags: u32, extra: usize }
+declare struct PolicyStatus { size: u32, error: u32, chainIndex: i32, elementIndex: i32, extra: usize }
+declare struct SslExtra { size: u32, auth: u32, checks: u32, name: usize }
+declare struct PointerSlot { value: usize }
+
+declare function CertOpenStore(provider: usize, encoding: u32, crypt: usize, flags: u32, parameter: usize): CertStore? from "crypt32";
+declare function CertCloseStore(store: CertStore, flags: u32): i32 from "crypt32";
+declare function CertAddEncodedCertificateToStore(store: CertStore, encoding: u32, data: Bytes, size: u32, disposition: u32, context: usize): i32 from "crypt32";
+declare function CertCreateCertificateContext(encoding: u32, data: Bytes, size: u32): CertContext? from "crypt32";
+declare function CertFreeCertificateContext(context: CertContext): i32 from "crypt32";
+declare function CertCreateCertificateChainEngine(config: Ref<EngineConfig>, output: Ref<EngineOut>): i32 from "crypt32";
+declare function CertFreeCertificateChainEngine(engine: ChainEngine): void from "crypt32";
+declare function CertGetCertificateChain(engine: ChainEngine, cert: CertContext, time: Bytes, additional: CertStore, parameters: Ref<ChainPara>, flags: u32, reserved: usize, output: Ref<ChainOut>): i32 from "crypt32";
+declare function CertFreeCertificateChain(chain: ChainContext): void from "crypt32";
+declare function CertVerifyCertificateChainPolicy(policy: usize, chain: ChainContext, parameters: Ref<PolicyPara>, status: Ref<PolicyStatus>): i32 from "crypt32";
+declare function LocalAlloc(flags: u32, size: usize): usize from "kernel32";
+declare function LocalFree(memory: usize): usize from "kernel32";
+declare function GetLastError(): u32 from "kernel32";
+
+function nativeError(operation: string): Error { return err("x509: Windows " + operation + " failed " + toStr(GetLastError())); }
+function openMemory(): CertStore | Error {
+    const store = CertOpenStore(2 as usize, 0 as u32, 0 as usize, 0 as u32, 0 as usize);
+    if (store == None) { return nativeError("CertOpenStore"); } return store;
+}
+function add(store: CertStore, data: Bytes): void | Error {
+    if (CertAddEncodedCertificateToStore(store, 1 as u32, data, bytesLen(data) as u32, 4 as u32, 0 as usize) == 0) { return nativeError("CertAddEncodedCertificateToStore"); }
+    return done();
+}
+
+function little64(value: int): Bytes {
+    const data = bytesNew(8); let i = 0;
+    while (i < 8) { bytesSet(data, i, (value >> (i * 8)) & 255); i = i + 1; } return data;
+}
+
+// nowSecs 是调用方时钟的 Unix 秒；空 roots 使用 OS 信任，非空 roots 完全替换信任锚。
+// 不启用在线 CRL/OCSP 查询；未实现吊销服务并不等于已验证未吊销。
+export function x509VerifyServer(chain: List<Bytes>, hostname: string, nowSecs: int, roots: List<Bytes>): void | Error {
+    x509CheckServerInputs(chain, hostname, roots)?;
+    if (nowSecs < -11644473600 || nowSecs > 253402300799) { return err("x509: time outside Windows FILETIME range"); }
+    const rootStore = openMemory()?; defer { CertCloseStore(rootStore, 0 as u32); }
+    for (root in roots) { add(rootStore, root)?; }
+    let engine = handleFromBits<ChainEngine>(0);
+    if (listLen(roots) > 0) {
+        const zero = handleFromBits<CertStore>(0);
+        const config = new EngineConfig { size: 88 as u32, restrictedRoot: zero, restrictedTrust: zero, restrictedOther: zero, additionalCount: 0 as u32, additionalStores: 0 as usize, flags: 0 as u32, urlTimeout: 15000 as u32, maxCache: 0 as u32, cycle: 0 as u32, exclusiveRoot: rootStore, exclusiveTrusted: zero, exclusiveFlags: 0 as u32 };
+        const output = new EngineOut { value: engine };
+        if (CertCreateCertificateChainEngine(config, output) == 0) { return nativeError("CertCreateCertificateChainEngine"); }
+        engine = output.value;
+    }
+    defer { if (handleBits(engine) != 0) { CertFreeCertificateChainEngine(engine); } }
+    const additional = openMemory()?; defer { CertCloseStore(additional, 0 as u32); }
+    let i = 1; while (i < listLen(chain)) { add(additional, listGet(chain, i))?; i = i + 1; }
+    const der = listGet(chain, 0);
+    const leaf = CertCreateCertificateContext(1 as u32, der, bytesLen(der) as u32);
+    if (leaf == None) { return nativeError("CertCreateCertificateContext"); }
+    defer { CertFreeCertificateContext(leaf); }
+
+    // 外部所有的固定块保存指针数组与 OID；没有把 Bytes 的临时借用地址逃出调用。
+    const oid = bytesFromStr("1.3.6.1.5.5.7.3.1"); const usageSize = 8 + bytesLen(oid) + 1;
+    const usageMemory = LocalAlloc(64 as u32, usageSize as usize);
+    if (usageMemory == 0 as usize) { return nativeError("LocalAlloc usage"); } defer { LocalFree(usageMemory); }
+    const usageView = ffiMem(usageMemory as int, usageSize, true)?;
+    ffiMemSet<PointerSlot>(usageView, 0, PointerSlot { value: usageMemory + (8 as usize) }); ffiMemWrite(usageView, 8, oid); ffiMemEnd(usageView);
+    const none = UsageMatch { kind: 0 as u32, usage: EnhKeyUsage { count: 0 as u32, ids: 0 as usize } };
+    const parameters = new ChainPara { size: 96 as u32, usage: UsageMatch { kind: 0 as u32, usage: EnhKeyUsage { count: 1 as u32, ids: usageMemory } }, issuance: none, urlTimeout: 15000 as u32, checkFresh: 0 as i32, freshness: 0 as u32, cacheResync: 0 as usize, strongSignPara: 0 as usize, strongSignFlags: 0 as u32 };
+    const output = new ChainOut { value: handleFromBits<ChainContext>(0) };
+    const fileTime = little64((nowSecs + 11644473600) * 10000000);
+    if (CertGetCertificateChain(engine, leaf, fileTime, additional, parameters, 0 as u32, 0 as usize, output) == 0) { return nativeError("CertGetCertificateChain"); }
+    defer { CertFreeCertificateChain(output.value); }
+
+    let host = hostname;
+    if (len(host) > 0 && byteAt(host, len(host) - 1) == 46) { host = strSlice(host, 0, len(host) - 1); }
+    const extraSize = 24 + (len(host) + 1) * 2;
+    const extraMemory = LocalAlloc(64 as u32, extraSize as usize);
+    if (extraMemory == 0 as usize) { return nativeError("LocalAlloc policy"); } defer { LocalFree(extraMemory); }
+    const extraView = ffiMem(extraMemory as int, extraSize, true)?;
+    ffiMemSet<SslExtra>(extraView, 0, SslExtra { size: 24 as u32, auth: 2 as u32, checks: 0 as u32, name: extraMemory + (24 as usize) });
+    const wide = bytesNew((len(host) + 1) * 2); i = 0;
+    while (i < len(host)) { bytesSet(wide, i * 2, byteAt(host, i)); i = i + 1; }
+    ffiMemWrite(extraView, 24, wide); ffiMemEnd(extraView);
+    const policy = new PolicyPara { size: 16 as u32, flags: 0 as u32, extra: extraMemory };
+    const status = new PolicyStatus { size: 24 as u32, error: 0 as u32, chainIndex: 0 as i32, elementIndex: 0 as i32, extra: 0 as usize };
+    if (CertVerifyCertificateChainPolicy(4 as usize, output.value, policy, status) == 0) { return nativeError("CertVerifyCertificateChainPolicy"); }
+    if (status.error != 0 as u32) { return err("x509: Windows SSL policy rejected certificate " + toStr(status.error)); }
+    return done();
+}
+
+function done(): void {}

@@ -1,0 +1,215 @@
+// 门按进程号取另一个进程的资源用量（procPid，D3 v0.54）的 macOS 部分（导出面同 proc_info_os_windows.tx、proc_info_os_linux.tx）：
+// macOS 没有 /proc，经 ps 取 rss（KiB）与 time（[[天-]时:]分:秒.百分秒）。
+import { captureRaw } from "./test_lib";
+import { lossyText } from "./check_lib";
+import { osRealPath } from "./build_os";
+
+// 后代进程经 pgrep -P 逐层找，ps -o lstart 取不到的视为已不在，至多 64 个；存活为 kill(pid, 0) 成功（同 os.kill）。
+declare function kill(pid: i32, sig: i32): i32 from "libSystem";
+
+const SEC: int = 1000000000;
+const MAX_OUTPUT: int = 65536;
+
+function psField(field: string, pid: int): string {
+    const args: List<string> = listNew();
+    listPush(args, "-o");
+    listPush(args, field + "=");
+    listPush(args, "-p");
+    listPush(args, toStr(pid));
+    return runText("/bin/ps", args);
+}
+
+// 运行并得去掉两端空白的 stdout；起不来或退出码非 0 得空串。
+function runText(exe: string, args: List<string>): string {
+    const r = captureRaw(exe, args, "/", 10 * SEC, SEC, MAX_OUTPUT) catch (e) {
+        return "";
+    };
+    if (r.code != 0) {
+        return "";
+    }
+    return trimmed(lossyText(r.out));
+}
+
+function trimmed(s: string): string {
+    let a = 0;
+    let b = len(s);
+    while (a < b && isBlank(byteAt(s, a) ?? 0)) {
+        a = a + 1;
+    }
+    while (b > a && isBlank(byteAt(s, b - 1) ?? 0)) {
+        b = b - 1;
+    }
+    return bytesToStr(bytesSlice(bytesFromStr(s), a, b - a)) catch "";
+}
+
+function isBlank(c: int): bool {
+    return c == 32 || c == 9 || c == 10 || c == 13;
+}
+
+// pid 的常驻内存（字节）；进程已不在或取不到得 −1。
+export function procRss(pid: int): int {
+    const s = psField("rss", pid);
+    if (len(s) == 0) {
+        return -1;
+    }
+    let n = 0;
+    let i = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) ?? 0;
+        if (c < 48 || c > 57) {
+            return -1;
+        }
+        n = n * 10 + (c - 48);
+        i = i + 1;
+    }
+    return n * 1024;
+}
+
+// pid 用掉的 CPU 时间（用户加内核，微秒）；进程已不在或取不到得 −1。天按 24 时、时与分按 60 进位，秒的小数部分到微秒。
+export function procCpuUs(pid: int): int {
+    const s = psField("time", pid);
+    if (len(s) == 0) {
+        return -1;
+    }
+    let days = 0;
+    let whole = 0;
+    let part = 0;
+    let frac = 0;
+    let scale = 100000;
+    let inFrac = false;
+    let i = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) ?? 0;
+        if (c == 45) {
+            days = part;
+            part = 0;
+        } else if (c == 58) {
+            whole = whole * 60 + part;
+            part = 0;
+        } else if (c == 46) {
+            inFrac = true;
+        } else if (c >= 48 && c <= 57) {
+            if (inFrac) {
+                frac = frac + (c - 48) * scale;
+                scale = scale / 10;
+            } else {
+                part = part * 10 + (c - 48);
+            }
+        } else {
+            return -1;
+        }
+        i = i + 1;
+    }
+    whole = whole * 60 + part;
+    return (days * 86400 + whole) * 1000000 + frac;
+}
+
+// 直接子进程（pgrep -P）。
+function children(pid: int): List<int> {
+    const args: List<string> = listNew();
+    listPush(args, "-P");
+    listPush(args, toStr(pid));
+    const out: List<int> = listNew();
+    const s = runText("/usr/bin/pgrep", args);
+    let n = -1;
+    let i = 0;
+    while (i <= len(s)) {
+        const c = byteAt(s, i) ?? 32;
+        if (c >= 48 && c <= 57) {
+            if (n < 0) {
+                n = 0;
+            }
+            n = n * 10 + (c - 48);
+        } else if (n >= 0) {
+            listPush(out, n);
+            n = -1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// pid 的后代进程号（不含 pid 自己，至多 64 个）；hosts 只在 Windows 上有意义。
+export function procDescendants(pid: int, hosts: bool): List<int> {
+    const out: List<int> = listNew();
+    const pending: List<int> = listNew();
+    listPush(pending, pid);
+    while (listLen(pending) > 0 && listLen(out) < 64) {
+        const p = listGet(pending, listLen(pending) - 1) catch 0;
+        listRemoveAt(pending, listLen(pending) - 1);
+        for (c in children(p)) {
+            if (len(psField("lstart", c)) > 0) {
+                listPush(out, c);
+                listPush(pending, c);
+            }
+        }
+    }
+    return out;
+}
+
+// 进程仍在（含未回收的僵尸，同 os.kill(pid, 0)）。
+export function procAlive(pid: int): bool {
+    return kill(pid as i32, 0) == 0;
+}
+
+// 启动标记（ps -o lstart，同原 proc_probe.start）；进程已不在为空串。
+export function procStartMark(pid: int): string {
+    return psField("lstart", pid);
+}
+
+// 命令行（ps -o args 以空白拼接，含空白的实参会被拆开；只用来认可执行文件与标志，同原 proc_probe.argv）。
+function argvOf(pid: int): List<string> {
+    const out: List<string> = listNew();
+    const s = psField("args", pid);
+    let start = -1;
+    let i = 0;
+    while (i <= len(s)) {
+        if (i == len(s) || isBlank(byteAt(s, i) ?? 0)) {
+            if (start >= 0) {
+                listPush(out, bytesToStr(bytesSlice(bytesFromStr(s), start, i - start)) catch "");
+                start = -1;
+            }
+        } else if (start < 0) {
+            start = i;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+function hasArg(xs: List<string>, want: string): bool {
+    for (x in xs) {
+        if (x == want) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 只终止私有 MCP 实例 parent 的那个 worker：没有 pidfd，先记启动标记、再按命令行
+// 认出 worker（含 mcp 与 --worker-generation、可执行文件即 compiler），恰有一个才动手；发 SIGKILL 前核对标记未变。
+export function killOwnedWorker(parent: int, compiler: string): bool {
+    const want = osRealPath(compiler);
+    const found: List<int> = listNew();
+    const marks: List<string> = listNew();
+    for (c in children(parent)) {
+        const stamp = psField("lstart", c);
+        const a = argvOf(c);
+        if (len(stamp) > 0 && listLen(a) > 0 && hasArg(a, "mcp") && hasArg(a, "--worker-generation") && osRealPath(listGet(a, 0) catch "") == want) {
+            listPush(found, c);
+            listPush(marks, stamp);
+        }
+    }
+    if (listLen(found) != 1) {
+        return false;
+    }
+    killIfSame(listGet(found, 0) catch 0, listGet(marks, 0) catch "");
+    return true;
+}
+
+// 启动标记仍是 mark 时发 SIGKILL（不误杀复用了 PID 的进程）。
+export function killIfSame(pid: int, mark: string): void {
+    if (len(mark) > 0 && psField("lstart", pid) == mark) {
+        const r = kill(pid as i32, 9);
+    }
+}

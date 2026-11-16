@@ -1,0 +1,169 @@
+// 与 socket 无关的 TLS 1.3 客户端；调用方按返回顺序发送 outbound，连接时钟／信任根由调用方提供。
+import { Tls13Client, Tls13Progress, tls13Progress, tls13Fail, tls13Transcript, tls13Wipe, tls13RetireKeys } from "./tls13_state";
+import { tls13NewClient, tls13Begin, tls13AcceptHello } from "./tls13_hello";
+import { tls13Cursor, tls13Read, tls13Take, tls13End, tls13Integer, tls13Message, tls13PlainRecord } from "./tls13_wire";
+import { tls13EncryptedExtensions, tls13CertificateRequest, tls13ServerCertificate, tls13ServerCertificateVerify, tls13NewSessionTicket } from "./tls13_auth";
+import { tls13Open, tls13Seal, tls13TrafficKeys } from "./tls13_record";
+import { tls13Finished, tls13ApplicationSecrets, tls13UpdateSecret } from "./tls13_kdf";
+import { sha256Sum } from "./hash";
+import { constantTimeEqual } from "./crypto/subtle";
+
+export function tls13Client(host: string, nowSecs: int, roots: List<Bytes>): Ref<Tls13Client> | Error { return tls13NewClient(host, nowSecs, roots); }
+export function tls13Start(state: Ref<Tls13Client>): Bytes | Error {
+    return tls13Begin(state) catch (e) { return tls13Fail(state, e.message); };
+}
+
+function finish(state: Ref<Tls13Client>, body: Bytes, message: Bytes, progress: Tls13Progress): void | Error {
+    if (!constantTimeEqual(tls13Finished(state.serverHandshake, sha256Sum(state.transcript))?, body)) { return err("tls13: invalid server Finished"); }
+    tls13Transcript(state, message)?;
+    const app = tls13ApplicationSecrets(state.handshakeSecret, sha256Sum(state.transcript))?;
+    tls13Wipe(app.master);
+    const keys = state.writeKeys; if (keys == None) { return err("tls13: missing handshake write keys"); }
+    if (!state.sentCcs) { listPush(progress.outbound, tls13PlainRecord(20, tls13Integer(1, 1), 771)); state.sentCcs = true; }
+    const flight = bytesNew(0);
+    if (state.clientAuth) {
+        const empty = tls13Message(11, bytesNew(4)); bytesAppend(flight, empty); tls13Transcript(state, empty)?;
+    }
+    const client = tls13Message(20, tls13Finished(state.clientHandshake, sha256Sum(state.transcript))?);
+    bytesAppend(flight, client); listPush(progress.outbound, tls13Seal(keys, 22, flight, 0)?);
+    const nextRead = tls13TrafficKeys(app.server)?; const nextWrite = tls13TrafficKeys(app.client)?;
+    tls13RetireKeys(state.readKeys); tls13RetireKeys(state.writeKeys);
+    state.serverTraffic = app.server; state.clientTraffic = app.client;
+    state.readKeys = nextRead; state.writeKeys = nextWrite;
+    tls13Wipe(state.handshakeSecret); tls13Wipe(state.clientHandshake); tls13Wipe(state.serverHandshake);
+    state.handshakeSecret = bytesNew(0); state.clientHandshake = bytesNew(0); state.serverHandshake = bytesNew(0); state.transcript = bytesNew(0);
+    state.phase = 6; return done();
+}
+
+function sendUpdate(state: Ref<Tls13Client>, outbound: List<Bytes>): void | Error {
+    const keys = state.writeKeys; if (keys == None) { return err("tls13: missing application write keys"); }
+    listPush(outbound, tls13Seal(keys, 22, tls13Message(24, tls13Integer(0, 1)), 0)?);
+    const secret = tls13UpdateSecret(state.clientTraffic)?; const next = tls13TrafficKeys(secret)?;
+    tls13Wipe(state.clientTraffic); tls13RetireKeys(state.writeKeys); state.clientTraffic = secret; state.writeKeys = next; return done();
+}
+
+function handshakeMessage(state: Ref<Tls13Client>, kind: int, body: Bytes, message: Bytes, last: bool, progress: Tls13Progress): void | Error {
+    if (state.phase == 1 && kind == 2) {
+        if (!last) { return err("tls13: ServerHello must end its record"); } return tls13AcceptHello(state, body, message, progress);
+    }
+    if (state.phase == 2 && kind == 8) { tls13EncryptedExtensions(state, body)?; tls13Transcript(state, message)?; state.phase = 3; return done(); }
+    if (state.phase == 3 && kind == 13 && !state.clientAuth) {
+        tls13CertificateRequest(body)?; state.clientAuth = true; tls13Transcript(state, message)?; return done();
+    }
+    if (state.phase == 3 && kind == 11) { tls13ServerCertificate(state, body)?; tls13Transcript(state, message)?; state.phase = 4; return done(); }
+    if (state.phase == 4 && kind == 15) { tls13ServerCertificateVerify(state, body)?; tls13Transcript(state, message)?; state.phase = 5; return done(); }
+    if (state.phase == 5 && kind == 20) {
+        if (!last) { return err("tls13: Finished must end its record"); } return finish(state, body, message, progress);
+    }
+    if (state.phase == 6 && kind == 4) { return tls13NewSessionTicket(body); }
+    if (state.phase == 6 && kind == 24) {
+        if (!last || bytesLen(body) != 1) { return err("tls13: invalid KeyUpdate boundary or length"); }
+        const requested = bytesGet(body, 0) catch 2;
+        if (requested > 1) { return err("tls13: invalid KeyUpdate request"); }
+        const secret = tls13UpdateSecret(state.serverTraffic)?; const next = tls13TrafficKeys(secret)?;
+        tls13Wipe(state.serverTraffic); tls13RetireKeys(state.readKeys); state.serverTraffic = secret; state.readKeys = next;
+        if (requested == 1 && !state.localClosed) { sendUpdate(state, progress.outbound)?; } return done();
+    }
+    return err("tls13: unexpected handshake message " + toStr(kind) + " in phase " + toStr(state.phase));
+}
+
+function handshakes(state: Ref<Tls13Client>, content: Bytes, progress: Tls13Progress): void | Error {
+    if (bytesLen(state.handshake) > 1064964 - bytesLen(content)) { return err("tls13: handshake buffer limit"); } bytesAppend(state.handshake, content);
+    while (bytesLen(state.handshake) >= 4) {
+        const cursor = tls13Cursor(state.handshake); const kind = tls13Read(cursor, 1)?; const size = tls13Read(cursor, 3)?;
+        if (size > 1048576) { return err("tls13: handshake message limit"); }
+        if (size > bytesLen(state.handshake) - 4) { break; }
+        const message = bytesSlice(state.handshake, 0, size + 4); const body = bytesSlice(message, 4, size);
+        state.handshake = bytesSlice(state.handshake, size + 4, bytesLen(state.handshake) - size - 4);
+        handshakeMessage(state, kind, body, message, bytesLen(state.handshake) == 0, progress)?;
+    }
+    return done();
+}
+
+function alert(state: Ref<Tls13Client>, data: Bytes): void | Error {
+    if (bytesLen(data) != 2) { return err("tls13: invalid alert length"); }
+    const level = bytesGet(data, 0) catch 0; const code = bytesGet(data, 1) catch 255;
+    if (level != 1 && level != 2) { return err("tls13: invalid alert level"); }
+    if (code == 0) {
+        if (state.phase != 6 || bytesLen(state.handshake) > 0) { return err("tls13: close_notify before handshake completed"); } state.peerClosed = true; return done();
+    }
+    if (code == 90) { return done(); } return err("tls13: peer alert " + toStr(code));
+}
+
+function record(state: Ref<Tls13Client>, data: Bytes, progress: Tls13Progress): void | Error {
+    if (state.peerClosed) { return done(); }
+    const cursor = tls13Cursor(data); const kind = tls13Read(cursor, 1)?;
+    if (tls13Read(cursor, 2)? != 771) { return err("tls13: invalid record legacy version"); }
+    const length = tls13Read(cursor, 2)?; const content = tls13Take(cursor, length)?; tls13End(cursor)?;
+    if (kind == 20) {
+        if (state.phase < 1 || state.phase > 5 || bytesLen(content) != 1 || (bytesGet(content, 0) catch 0) != 1) { return err("tls13: invalid compatibility CCS"); } return done();
+    }
+    const readKeys = state.readKeys;
+    if (readKeys == None) {
+        if (kind != 22 && bytesLen(state.handshake) > 0) { return err("tls13: interrupted plaintext handshake message"); }
+        if (length > 16384) { return err("tls13: plaintext record overflow"); }
+        if (kind == 22 && length > 0) { return handshakes(state, content, progress); }
+        if (kind == 21) { return alert(state, content); } return err("tls13: unexpected plaintext record");
+    }
+    if (kind != 23) { return err("tls13: unprotected record after ServerHello"); }
+    const plain = tls13Open(readKeys, data)?;
+    if (plain.contentType != 22 && bytesLen(state.handshake) > 0) { return err("tls13: interrupted handshake message"); }
+    if (plain.contentType == 22) { return handshakes(state, plain.content, progress); }
+    if (plain.contentType == 21) { return alert(state, plain.content); }
+    if (state.phase != 6) { return err("tls13: application data before server authentication"); }
+    if (bytesLen(plain.content) > 0) { listPush(progress.application, plain.content); } return done();
+}
+
+function receive(state: Ref<Tls13Client>, input: Bytes, eof: bool): Tls13Progress | Error {
+    if (state.failed || state.phase == 0) { return err("tls13: inactive or failed client"); }
+    let progress = tls13Progress(); let offset = 0;
+    while (offset < bytesLen(input)) {
+        // 已验证关闭后不再解释或交出后续输入（RFC 8446 §6.1）。
+        if (state.peerClosed) { state.incoming = bytesNew(0); break; }
+        let needed = 5 - bytesLen(state.incoming);
+        if (needed <= 0) {
+            const header = tls13Cursor(state.incoming); tls13Take(header, 3)?; const length = tls13Read(header, 2)?;
+            if (length > 16640) { return err("tls13: record overflow"); } needed = length + 5 - bytesLen(state.incoming);
+        }
+        let count = bytesLen(input) - offset; if (count > needed) { count = needed; }
+        bytesAppend(state.incoming, bytesSlice(input, offset, count)); offset = offset + count;
+        if (bytesLen(state.incoming) >= 5) {
+            const header = tls13Cursor(state.incoming); tls13Take(header, 3)?; const length = tls13Read(header, 2)?;
+            if (length > 16640) { return err("tls13: record overflow"); }
+            if (bytesLen(state.incoming) == length + 5) { const complete = state.incoming; state.incoming = bytesNew(0); record(state, complete, progress)?; }
+        }
+    }
+    if (eof && (!state.peerClosed || bytesLen(state.incoming) != 0 || bytesLen(state.handshake) != 0)) { return err("tls13: truncated connection without close_notify"); }
+    progress.ready = state.phase == 6; progress.peerClosed = state.peerClosed; return progress;
+}
+
+export function tls13Receive(state: Ref<Tls13Client>, input: Bytes, eof: bool): Tls13Progress | Error {
+    return receive(state, input, eof) catch (e) { return tls13Fail(state, e.message); };
+}
+
+function write(state: Ref<Tls13Client>, data: Bytes, close: bool): List<Bytes> | Error {
+    if (state.failed || state.phase != 6) { return err("tls13: application write before handshake completed"); }
+    const out: List<Bytes> = listNew();
+    if (state.localClosed) { if (close) { return out; } return err("tls13: application write after close_notify"); }
+    let offset = 0;
+    while (offset < bytesLen(data) || close) {
+        const current = state.writeKeys; if (current == None) { return err("tls13: missing application write keys"); }
+        if (current.sequence >= 16777215) { sendUpdate(state, out)?; }
+        const keys = state.writeKeys; if (keys == None) { return err("tls13: missing updated keys"); }
+        if (close) {
+            const notification = bytesNew(2); bytesSet(notification, 0, 1); listPush(out, tls13Seal(keys, 21, notification, 0)?); state.localClosed = true; break;
+        }
+        let count = bytesLen(data) - offset; if (count > 16384) { count = 16384; }
+        listPush(out, tls13Seal(keys, 23, bytesSlice(data, offset, count), 0)?); offset = offset + count;
+    }
+    return out;
+}
+
+export function tls13Write(state: Ref<Tls13Client>, data: Bytes): List<Bytes> | Error { return write(state, data, false) catch (e) { return tls13Fail(state, e.message); }; }
+export function tls13Close(state: Ref<Tls13Client>): List<Bytes> | Error { return write(state, bytesNew(0), true) catch (e) { return tls13Fail(state, e.message); }; }
+
+// 不发送记录；丢弃连接前清零状态持有的密钥缓冲，并让状态不可再用。可重复调用。
+export function tls13Dispose(state: Ref<Tls13Client>): void {
+    tls13Fail(state, "disposed"); state.localClosed = true; state.peerClosed = true;
+}
+function done(): void {}

@@ -1,11 +1,11 @@
 // 公开仓导出（§六）：按清单 release/export.txt，从本仓与 taixu-stdlib 的
-// 已提交内容（git archive，不读工作树）生成公开仓 taixu-lang 的树——同 Copybara 的白名单加确定性变换。标准库整体放到 stdlib/；
+// 已提交内容（git archive，不读工作树）生成公开仓 taixu-lang 的树——同 Copybara 的白名单加确定性变换。标准库整体放到 stdlib/，GUI 放到 gui/；
 // 指向未导出文件的 Markdown 链接改为纯文本；按清单的擦除规则改写注释与 Markdown 正文（不增删行、不动注释之前的代码与字符串），
 // 按字节进了编译器、被门逐字节比对或按 SHA-256 冻结的文件（清单 keep）原样导出。最后按清单查泄漏（擦除与只查的全部模式、
 // forbid 的本机痕迹）、超大文件与规范版本。
 // 目标目录整体替换（只保留 .git），不提交、不推送；自检不过即以 1 退出。擦除的字样都写在不导出的清单里，本文件不含它们。
 // 用法（在本仓根运行）：taixu run --toolchain scripts/export.tx --out <目录> [--stdlib <taixu-stdlib 仓>] [--commit <提交>]
-//   [--stdlib-commit <提交>] [--manifest <清单>] [--report <文件>]
+//   [--stdlib-commit <提交>] [--gui <GUI 仓>] [--gui-commit <提交>] [--manifest <清单>] [--report <文件>]
 // --report 写出逐行的改写（- 原行、+ 新行）与每处泄漏，供审阅；格式同擦除引擎的参照实现。
 import { absolute, byteSub, deleteTree, dirOf, findInPath, join, kindOf, list1, mkdirs, nat, nothing, paxPath, plus, readBytes, runIn, safeRel,
     startsWith, tarField, tarOctal, trimLine } from "./build_lib";
@@ -20,8 +20,10 @@ struct Opts {
     root: string,
     out: string,
     stdlib: string,
+    gui: string,
     commit: string,
     stdlibCommit: string,
+    guiCommit: string,
     manifest: string,
     report: string,
 }
@@ -34,12 +36,12 @@ struct Rule {
 }
 
 function usage(): int {
-    eprint("用法：taixu run --toolchain scripts/export.tx --out <目录> [--stdlib <taixu-stdlib 仓>] [--commit <提交>] [--stdlib-commit <提交>] [--manifest <清单>] [--report <文件>]");
+    eprint("用法：taixu run --toolchain scripts/export.tx --out <目录> [--stdlib <taixu-stdlib 仓>] [--commit <提交>] [--stdlib-commit <提交>] [--gui <GUI 仓>] [--gui-commit <提交>] [--manifest <清单>] [--report <文件>]");
     return 64;
 }
 
 function parseOpts(args: []string): Ref<Opts> | Error {
-    const o = new Opts { root: osRealPath(currentDir() catch "."), out: "", stdlib: "", commit: "HEAD", stdlibCommit: "HEAD", manifest: "release/export.txt",
+    const o = new Opts { root: osRealPath(currentDir() catch "."), out: "", stdlib: "", gui: "", commit: "HEAD", stdlibCommit: "HEAD", guiCommit: "HEAD", manifest: "release/export.txt",
         report: "" };
     let i = 0;
     while (i < len(args)) {
@@ -52,6 +54,10 @@ function parseOpts(args: []string): Ref<Opts> | Error {
             o.out = absolute(v);
         } else if (a == "--stdlib") {
             o.stdlib = absolute(v);
+        } else if (a == "--gui") {
+            o.gui = absolute(v);
+        } else if (a == "--gui-commit") {
+            o.guiCommit = v;
         } else if (a == "--commit") {
             o.commit = v;
         } else if (a == "--stdlib-commit") {
@@ -74,6 +80,7 @@ function parseOpts(args: []string): Ref<Opts> | Error {
     if (len(o.stdlib) == 0) {
         o.stdlib = join(dirOf(o.root), "taixu-stdlib");
     }
+    if (len(o.gui) == 0) { o.gui = join(dirOf(o.root), "taixu-gui"); }
     return o;
 }
 
@@ -104,7 +111,7 @@ function parseManifest(text: string, sr: Ref<Rules>): List<Ref<Rule>> | Error {
             listPush(out, new Rule { source: src, verb: src, path: listGet(w, 1) catch "", to: "" });
             continue;
         }
-        if (src != "core" && src != "stdlib") {
+        if (src != "core" && src != "stdlib" && src != "gui") {
             const ok = scrubLine(src, restOf(line, src), sr) catch (e) {
                 return err("清单第 " + toStr(n) + " 行：" + e.message);
             };
@@ -250,6 +257,29 @@ function removePath(out: string, rel: string): void | Error {
         return err("exclude 没有命中：" + rel);
     }
     return nothing();
+}
+
+// hay 里是否含 needle（按字节；先比首字节，文件至多 10 MB）。
+function bytesHas(hay: Bytes, needle: Bytes): bool {
+    const n = bytesLen(needle);
+    if (n == 0) {
+        return false;
+    }
+    const first = bytesGet(needle, 0) catch 0;
+    let i = 0;
+    while (i + n <= bytesLen(hay)) {
+        if ((bytesGet(hay, i) catch 0) == first) {
+            let k = 1;
+            while (k < n && (bytesGet(hay, i + k) catch 0) == (bytesGet(needle, k) catch 0)) {
+                k = k + 1;
+            }
+            if (k == n) {
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+    return false;
 }
 
 // 递归列出 dir 之下的文件（相对路径，正斜杠）；不跟随链接。
@@ -484,6 +514,12 @@ function finish(out: string, rep: Ref<Report>, forbid: List<string>, sr: Ref<Rul
         }
         const text = bytesToStr(b) catch "";
         if (len(text) == 0) {
+            // 非 UTF-8 的文件（图片、字体等）不擦除，但照样按字节查本机痕迹：二进制里也可能嵌着开发机路径或用户名。
+            for (needle in forbid) {
+                if (bytesHas(b, bytesFromStr(needle))) {
+                    listPush(rep.problems, "含本机痕迹 " + needle + "：" + rel);
+                }
+            }
             continue;
         }
         for (needle in forbid) {
@@ -582,7 +618,7 @@ function run(args: []string): int | Error {
     };
     const rep = new Report { files: 0, executables: listNew(), rewritten: 0, problems: listNew(), scrubbedFiles: 0, scrubbedLines: 0,
         leaks: 0, allowed: 0, log: bytesNew(0), leakLog: bytesNew(0) };
-    for (src in strSplit("core stdlib", " ")) {
+    for (src in strSplit("core stdlib gui", " ")) {
         let repo = o.root;
         let commit = o.commit;
         let prefix = "";
@@ -590,6 +626,10 @@ function run(args: []string): int | Error {
             repo = o.stdlib;
             commit = o.stdlibCommit;
             prefix = "stdlib/";
+        } else if (src == "gui") {
+            repo = o.gui;
+            commit = o.guiCommit;
+            prefix = "gui/";
         }
         const inc: List<string> = listNew();
         for (r in rules) {

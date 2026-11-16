@@ -1,0 +1,1197 @@
+// ============================================================================
+// gui/app —— 应用骨架与窗口语义面（
+// 事件链消费层）。
+//
+// **WindowSpec 一致性接口原则（增补②）**：平台装饰面只暴露语义
+// 参数——按钮可用性/frameless/menu 声明/effect；**按钮位序、标题栏归属、
+// 菜单栏挂载点为平台约定，不设参数**（杜绝反平台泄漏；macOS〔E3 两步走〕
+// 落地时 .tx 零改动——接口不携带 win32 语义）。
+//
+// **响应式布局（增补①）**：窗口 resize 后布局根可用尺寸自动
+// 更新——resize 即失效、下一帧重排重绘；.tx 侧默认零手写即自适应（自定义
+// 响应经 onResize 订阅）。resize 事件＝kind 7（x＝宽 y＝高）——16B 事件
+// 记录零变更（冻结不破），重放脚本可直接注入。
+//
+// **窗口管理基线（增补③）**：minSize/maxSize（拖拽与程序化同
+// 守——引擎面 WM_GETMINMAXINFO 先于重排生效）、初始几何/showState/
+// alwaysOnTop 语义声明、setTitle 运行时面。headless 通道恒 scale 1.0
+//（确定性锚——golden 不涉 DPI；真窗 DPI 行为走宿主探针）。
+//
+// **事件链消费层**：pump 消费面从 {3,6,7} 扩至
+// {1..7}——KEY_DOWN/UP 路由焦点栈顶；MOUSE_DOWN 锚定拖拽会话＋焦点入栈；
+// MOUSE_UP 提交会话；MOUSE_MOVE 跟踪会话与 hover；模态激活期拦截一切
+// 事件（app-drawn messageBox）。三通道（真窗/重放/脚本注入）分诊单点在
+// pump 不变（先例延续）；kind 1/2/4/5 已在重放值域——16B 记录零格式
+// 变更（冻结不破）。**修饰键限制（解除）**：事件记录
+// 携带 mods 位集（shift=1/ctrl=2/alt=4）——input 大小写/组合键与 onHotkey
+// 两级分发自此可用（重放行第六字段〔v1 兼容缺省 0〕）。
+// ============================================================================
+
+// ============================================================================
+// 分节导航：应用事件与控件装配位于同一模块；
+// app 消费 components 契约随 components 拆分联动的连锁面不拆。
+// 本标头为 AI/维护导航面。）
+//   §1 应用骨架（runApp 主循环/帧泵/重放通道消费）
+//   §2 输入分发（事件路由→命中扫描→控件回调）
+//   §3 组件装配（窗口/对话框/多窗游标/DPI 缩放消费面）
+// ============================================================================
+
+import { windowOpen, windowOpenEx, eventWindowOpen, windowWaitEvent, windowPresent, eventWindowPushMods, eventWindowTarget, eventWindowX, eventWindowY, eventWindowMods, windowClose, windowSetTitle, windowMove, windowMinimize, windowMaximizeToggle, windowClientResize, windowSetMinMax, windowSetTopmost, windowSetEffect, windowScale, windowMenuAdd, windowSetCursor, CURSOR_ARROW, CURSOR_TEXT, clipboardSetText, clipboardGetText, guiQuery, CAP_CLIPBOARD, WFLAG_FRAMELESS, WFLAG_MAXIMIZED, WFLAG_TOPMOST, WFLAG_CENTERED } from "gui/surface";
+import { EV_KEY_DOWN, EV_KEY_UP, EV_MOUSE_DOWN, EV_MOUSE_UP, EV_MOUSE_MOVE, EV_CLOSE, EV_RESIZE, EV_TEXT, EV_SCROLL, EV_MOD_SHIFT, EV_MOD_CTRL, EV_MOD_ALT, KEY_BACK, KEY_RETURN, KEY_ESC, KEY_UP, KEY_DOWN, keyCharMods } from "gui/components";
+import { Canvas, Input, Checkbox, RadioGroup, Dropdown, Slider, ScrollView, Tooltip, MessageBox, HitZone, TitleBar, titleBar, drawTitleBar, hitTitleBar, TITLE_HIT_NONE, TITLE_HIT_DRAG, TITLE_HIT_CLOSE, TITLE_HIT_MAX, TITLE_HIT_MIN, Table, table, tableRow, drawTable, hitTableRow, hitTableColEdge, tableColX, TabBar, tabBar, drawTabBar, hitTabBar, tabWidth, messageBoxDefault, inputValue, hitRadioGroup, radioSelect, hitDropdown, dropdownToggle, dropdownSelect, sliderValueAt, hitScrollbar, scrollClamp, modalHit, modHas, KEY_LEFT, KEY_RIGHT, inputBackspace, inputDeleteSelection, inputInsertChar, inputPrefixWidth, taInsert, taBackspace, taMove, taScrollFollow, taLineLen, taSlice, cpNext, paintTextWidth, drawTextAreaC, TextArea, TaSel, Popup, popupNew, popupHit, drawPopupC } from "gui/components";
+import { ListenerTable, EventRecord, listenersNew, on, dispatch } from "std/events";
+
+// —— 窗口效果三档（增补②；能力探测降级链＝transparent→acrylic→mica→plain
+// 由引擎面按系统版本选择——headless 恒 plain 占位色，特效不入 golden）——
+export const EFFECT_PLAIN: int = 0;
+export const EFFECT_TRANSPARENT: int = 1;
+export const EFFECT_ACRYLIC: int = 2;
+export const EFFECT_MICA: int = 3;
+
+/// 窗口语义声明（一致性接口——位序/挂载点平台约定不设参）。
+export struct WindowSpec {
+    title: string,
+    w: int,
+    h: int,
+    min_w: int,
+    min_h: int,
+    max_w: int,
+    max_h: int,
+    centered: bool,
+    maximized: bool,
+    always_on_top: bool,
+    resizable: bool,
+    close_btn: bool,
+    minimize_btn: bool,
+    maximize_btn: bool,
+    frameless: bool,
+    menu_declared: bool,
+    effect: int,
+}
+
+/// 缺省 spec（居中、可缩放、三钮全开、有框、plain、min/max 跟随初始尺寸）。
+export function defaultSpec(title: string, w: int, h: int): Ref<WindowSpec> {
+    return new WindowSpec {
+        title: title,
+        w: w,
+        h: h,
+        min_w: w / 2,
+        min_h: h / 2,
+        max_w: w * 4,
+        max_h: h * 4,
+        centered: true,
+        maximized: false,
+        always_on_top: false,
+        resizable: true,
+        close_btn: true,
+        minimize_btn: true,
+        maximize_btn: true,
+        frameless: false,
+        menu_declared: false,
+        effect: EFFECT_PLAIN,
+    };
+}
+
+/// 平台能力查询（结构化；不受支持面＝false——声明越界时框架层给出结构化
+/// 降级提示，非 panic 非静默，红线 5）。headless/脚本通道恒能力受限面。
+export struct Capabilities {
+    window_system: bool,
+    resize_events: bool,
+    effects: bool,
+    menus: bool,
+    frameless: bool,
+    dpi_scale_x100: int,
+    clipboard: bool,
+}
+
+export function capabilities(): Ref<Capabilities> {
+    // 面：resize 事件（kind 7）全通道可用；特效/菜单/frameless 的
+    // 引擎实现随 E3 两步走推进——headless 探测恒 false（结构化、非静默：
+    // 声明越界时 appRun 报告降级）。clipboard＝引擎绑定面
+    //（txp_clipboard_* 经 guiQuery(5) 实探——真窗 1/headless 0）。
+    return new Capabilities {
+        window_system: false,
+        resize_events: true,
+        effects: false,
+        menus: false,
+        frameless: false,
+        dpi_scale_x100: 100,
+        clipboard: guiQuery(CAP_CLIPBOARD) == 1,
+    };
+}
+
+/// 剪贴板文本写入（扩面位——引擎绑定门面）。全局 OS 状态＝
+/// I/O 边界：脚本化重放不模拟板面；golden 纪律＝帧内容不依赖板面值
+///（应用只回显动作与字符数——文本工具消费面）。
+export function clipboardSet(text: string): bool {
+    return clipboardSetText(text) == 0;
+}
+
+/// 剪贴板文本读取（非文本/无窗口系统＝空串）。
+export function clipboardGet(): string {
+    return clipboardGetText();
+}
+
+/// resize 订阅条目（增补①：handler 签名＝(新宽, 新高)）。
+export struct ResizeListener {
+    handler: (int, int) => void,
+}
+
+/// 命中区（真窗点击→组件 id 的判定数据面：HitZone 定义上移 gui/components
+/// ——模态按钮区等布局命中共用同一载体）。
+
+/// 应用会话（组件回调共享的上下文——捕获名只读，可变态经 Ref）。
+/// 新增：drag_target（拖拽会话锚）／focus（焦点栈）／hover 与指针位／
+/// modal（app-drawn 模态域位——inactive 哑值起）。新增：
+/// hotkeys（全局快捷键表——onHotkey 注册，pump 键事件第一级分发）。
+export struct App {
+    hwnd: int,
+    w: int,
+    h: int,
+    running: bool,
+    dirty: bool,
+    scripted: bool,
+    spec: Ref<WindowSpec>,
+    listeners: Ref<ListenerTable>,
+    resize_listeners: List<Ref<ResizeListener>>,
+    hits: List<Ref<HitZone>>,
+    resize_count: int,
+    drag_target: int,
+    focus: List<int>,
+    hover_id: int,
+    mouse_x: int,
+    mouse_y: int,
+    modal: Ref<MessageBox>,
+    popup: Ref<Popup>,
+    hotkeys: List<Ref<Hotkey>>,
+    titlebar: Ref<TitleBar>,
+    title_drag: bool,
+    anim_ticks: int, // 真窗焦点期动画节拍（v0.1.4 反馈 #7 追加——pump 超时置脏的计数器）
+    text_ids: List<int>, // 文本光标区（v0.1.4 反馈 #10——textCursor 声明；pump 鼠标移动驱动 I-beam）
+    k: int, // DPI 比例 x100（臂①；appNew/pump(resize) 经 windowScale 装配；回放态＝脚本 scale 声明值）
+}
+
+/// 菜单项 id 下限（真窗通道 raw target＝MOUSE_LEFT(1)/VK 码——与组件 id/
+/// 键码冲突规避：菜单项 id 须 ≥ 本值，pump 直达分发的判定依据）。
+export const MENU_ID_BASE: int = 100;
+
+/// 快捷键条目（mods 位集＋VK 码→回调；全局表）。
+export struct Hotkey {
+    mods: int,
+    key: int,
+    handler: () => void,
+}
+
+/// 应用装配（无窗口系统目标/重放态自动回退脚本化事件窗口——双通道同构
+/// 零感知：重放态宿主 windowOpen 恒 0〔〕，本处回退即入无头
+/// 确定性通道；scripted 语义＝事件 target 已是组件 id，真窗 raw 记录
+/// target=MOUSE_LEFT/VK 码须经命中测试/焦点栈换算——pump 单点分诊）。
+export function appNew(spec: Ref<WindowSpec>): Ref<App> {
+    // 引擎深度装配：frameless/maximized/topmost/
+    // centered 位集走扩展创建；无位集＝旧 create（零回归）。重放态宿主
+    // windowOpenEx 恒 0——回退脚本化事件窗口（双通道同构零感知不变）。
+    let flags: int = 0;
+    if (spec.frameless) {
+        flags = flags + WFLAG_FRAMELESS;
+    }
+    if (spec.maximized) {
+        flags = flags + WFLAG_MAXIMIZED;
+    }
+    if (spec.always_on_top) {
+        flags = flags + WFLAG_TOPMOST;
+    }
+    if (spec.centered) {
+        flags = flags + WFLAG_CENTERED;
+    }
+    let hwnd: int = 0;
+    if (flags == 0) {
+        hwnd = windowOpen(spec.title, spec.w, spec.h);
+    } else {
+        hwnd = windowOpenEx(spec.title, spec.w, spec.h, flags);
+    }
+    let scripted: bool = false;
+    if (hwnd == 0) {
+        hwnd = eventWindowOpen(spec.title, spec.w, spec.h);
+        scripted = true;
+    }
+    if (!scripted) {
+        // min/max 约束、置顶、效果三档——真窗引擎面（脚本通道 no-op 语义
+        // 由绑定面保证；min/max 缺省值（w/2、w*4）恒合法即恒挂）。
+        windowSetMinMax(hwnd, spec.min_w, spec.min_h, spec.max_w, spec.max_h);
+        if (spec.always_on_top) {
+            windowSetTopmost(hwnd, true);
+        }
+        if (spec.effect != EFFECT_PLAIN) {
+            windowSetEffect(hwnd, spec.effect);
+        }
+    }
+    return new App {
+        hwnd: hwnd,
+        w: spec.w,
+        h: spec.h,
+        running: true,
+        dirty: true,
+        scripted: scripted,
+        spec: spec,
+        listeners: listenersNew(),
+        resize_listeners: listNew(),
+        hits: listNew(),
+        resize_count: 0,
+        drag_target: 0,
+        focus: listNew(),
+        hover_id: 0,
+        mouse_x: 0,
+        mouse_y: 0,
+        modal: messageBoxDefault(),
+        popup: popupNew(0, 0, 0, listNew()),
+        hotkeys: listNew(),
+        titlebar: titleBar(spec.title, spec.minimize_btn, spec.maximize_btn, spec.close_btn),
+        title_drag: false,
+        anim_ticks: 0,
+        text_ids: listNew(),
+        k: windowScale(hwnd),
+    };
+}
+
+/// frameless 自绘标题栏随帧绘制（render 首个调用——tb.w 随 app.w 更新；
+/// 非 frameless app 调用为 no-op——装配面单点）。
+export function appFrameChrome(app: Ref<App>, cv: Ref<Canvas>): void {
+    if (!app.spec.frameless) {
+        return;
+    }
+    app.titlebar.w = app.w;
+    drawTitleBar(cv, app.titlebar);
+}
+
+/// DPI 缩放查询（x100——headless 恒 100 确定性锚；增补③ gui.scale() 面）。
+export function scale(app: Ref<App>): int {
+    return windowScale(app.hwnd);
+}
+
+/// 菜单挂载（逐项；id ≥ MENU_ID_BASE——pump 直达分发判定）。
+export function menuAdd(app: Ref<App>, id: int, label: string): int {
+    return windowMenuAdd(app.hwnd, id, label);
+}
+
+/// 页签切换装配（MOUSE_DOWN 命中→active 更新＋onChange）。
+export function onTabSelect(app: Ref<App>, tb: Ref<TabBar>, handler: (int) => void): void {
+    onEvent(app, tb.id, (rec: EventRecord): void => {
+            if (rec.kind != EV_MOUSE_DOWN) {
+                return;
+            }
+            const idx: int = hitTabBar(tb, rec.x, rec.y);
+            if (idx < 0 || tb.active == idx) {
+                return;
+            }
+            tb.active = idx;
+            app.dirty = true;
+            handler(idx);
+        });
+}
+
+/// 列宽回写（List 无元素写内建——重建列宽表；拖拽会话逐 move 调用，
+/// RC 面旧表即弃——确定性无碍）。
+function tableSetColW(t: Ref<Table>, idx: int, w: int): void {
+    const ws: List<int> = listNew();
+    let i: int = 0;
+    while (i < listLen(t.col_ws)) {
+        if (i == idx) {
+            listPush(ws, w);
+        } else {
+            listPush(ws, listTryGet(t.col_ws, i) catch 0);
+        }
+        i = i + 1;
+    }
+    t.col_ws = ws;
+}
+
+/// 表格装配：行选中（MOUSE_DOWN）＋列宽拖拽（down 锚定列边→move 回写→
+/// up 提交——slider 同款拖拽会话形态）；onSelect＝行选中回调。
+export function onTableEvents(app: Ref<App>, t: Ref<Table>, onSelect: (int) => void): void {
+    onEvent(app, t.id, (rec: EventRecord): void => {
+            if (rec.kind == EV_MOUSE_DOWN) {
+                const edge: int = hitTableColEdge(t, rec.x, rec.y);
+                if (edge >= 0) {
+                    t.drag_col = edge;
+                    t.drag_base_x = rec.x;
+                    t.drag_base_w = listTryGet(t.col_ws, edge + 1) catch 0;
+                    return;
+                }
+                const row: int = hitTableRow(t, rec.x, rec.y);
+                if (row >= 0) {
+                    t.selected = row;
+                    app.dirty = true;
+                    onSelect(row);
+                }
+                return;
+            }
+            if (rec.kind == EV_MOUSE_MOVE) {
+                if (t.drag_col < 0) {
+                    return;
+                }
+                let nw: int = t.drag_base_w + (rec.x - t.drag_base_x);
+                if (nw < 24) {
+                    nw = 24;
+                }
+                tableSetColW(t, t.drag_col + 1, nw);
+                app.dirty = true;
+                return;
+            }
+            if (rec.kind == EV_MOUSE_UP) {
+                t.drag_col = -1;
+                return;
+            }
+        });
+}
+
+/// 命中区登记（真窗通道点击判定——render 定位组件后随帧更新；同 id
+/// 覆盖写保持定容）。脚本通道 target 已是组件 id，无需登记。
+export function hitZone(app: Ref<App>, id: int, x: int, y: int, w: int, h: int): void {
+    if (id <= 0 || w <= 0 || h <= 0) {
+        return;
+    }
+    let i: int = 0;
+    while (i < listLen(app.hits)) {
+        const hz = listTryGet(app.hits, i) catch new HitZone { id: 0, x: 0, y: 0, w: 0, h: 0 };
+        if (hz.id == id) {
+            hz.x = x;
+            hz.y = y;
+            hz.w = w;
+            hz.h = h;
+            return;
+        }
+        i = i + 1;
+    }
+    listPush(app.hits, new HitZone { id: id, x: x, y: y, w: w, h: h });
+}
+
+/// onResize 订阅（增补①自定义响应入口；handler(新宽, 新高)）。默认零手写
+/// 即自适应（pump 已更新布局根尺寸）——本订阅供自定义响应追加。
+export function onResize(app: Ref<App>, handler: (int, int) => void): void {
+    listPush(app.resize_listeners, new ResizeListener { handler: handler });
+}
+
+/// 组件事件订阅（通用面：target＝组件 id，一切 kind 到达同一 handler——
+/// std/events 冻结契约；handler 签名冻结 (EventRecord) => void）。
+export function onEvent(app: Ref<App>, target: int, handler: (EventRecord) => void): void {
+    const token: int = on(app.listeners, target, handler);
+    if (token < 0) {
+        app.running = false;
+    }
+}
+
+/// 点击订阅：只在该组件收到鼠标按下（kind 3，含菜单项）时调用 handler。重放脚本里一次点击就是一条按下；真窗一次
+/// 点击是按下加抬起（G2 起有真窗），抬起、移动与路由到焦点组件的键事件都不算点击（原先是 onEvent 的别名，真窗上一次
+/// 点击会调两次）。要收全部事件用 onEvent。
+export function onClick(app: Ref<App>, target: int, handler: (EventRecord) => void): void {
+    onEvent(app, target, (rec: EventRecord): void => {
+            if (rec.kind == EV_MOUSE_DOWN) {
+                handler(rec);
+            }
+        });
+}
+
+/// 注入一条事件（**脚本通道专用**——hwnd 须为脚本化事件窗口〔重放态/
+/// 无窗口系统目标回退产物〕；真窗句柄返回非 0〔INVALID〕——真窗交互
+/// 事件由平台层产生，点击判定走 hitZone）。resize＝kind 7 携 x/y＝新
+/// 尺寸；key＝kind 1/2 携 target＝VK 码（pump 路由焦点栈顶）；拖拽序列
+/// ＝down/move/up 同码注入——全部已在重放值域（冻结不破）。
+/// **签名不变（内审修正 B）**：S1 无缺省参数——本包装保持五参，
+/// 内部经 eventWindowPushMods 以 mods=0 补缺省；带修饰位的注入走
+/// pushEventMods（六参）。
+export function pushEvent(app: Ref<App>, kind: int, target: int, x: int, y: int): int {
+    return eventWindowPushMods(app.hwnd, kind, target, x, y, 0);
+}
+
+/// 注入一条带修饰位的事件（mods 位集 shift/ctrl/alt）。
+export function pushEventMods(app: Ref<App>, kind: int, target: int, x: int, y: int, mods: int): int {
+    return eventWindowPushMods(app.hwnd, kind, target, x, y, mods);
+}
+
+/// 快捷键订阅：mods 位集＋VK 码→回调。**两级分发
+/// 的全局级**——pump 键事件先查本表（mods 全等匹配），命中即消费（不再
+/// 路由焦点栈）；未命中落焦点级（焦点控件 inputOnKeys 等既有键消费面）。
+/// 焦点无关：焦点栈为空时同样命中（app 级快捷键语义）。
+export function onHotkey(app: Ref<App>, mods: int, key: int, handler: () => void): void {
+    listPush(app.hotkeys, new Hotkey { mods: mods, key: key, handler: handler });
+}
+
+/// 动态标题（增补③运行时面；返回 0＝OK——脚本通道恒 0，真窗走
+/// SetWindowTextW；标题面不入 golden 断言）。
+export function setTitle(app: Ref<App>, title: string): int {
+    return windowSetTitle(app.hwnd, title);
+}
+
+// ============================================================================
+// 焦点栈 / hover / 模态 / 控件事件装配（单点在 pump）
+// ============================================================================
+
+/// 焦点入栈（点击自动调；重复顶不入——栈深＝点击序列有界）。
+export function focusPushId(app: Ref<App>, id: int): void {
+    if (id <= 0) {
+        return;
+    }
+    if (focusTopId(app) == id) {
+        return;
+    }
+    listPush(app.focus, id);
+}
+
+/// 焦点栈顶（空栈 0＝无焦点——键事件吞掉）。
+export function focusTopId(app: Ref<App>): int {
+    const v = listTryGet(app.focus, listLen(app.focus) - 1) catch 0;
+    return v;
+}
+
+/// 焦点出栈（input ESC 消费面；空栈 0）。
+export function focusPopId(app: Ref<App>): int {
+    const v = listTryPop(app.focus) catch 0;
+    return v;
+}
+
+/// hover 查询（pump 由 MOUSE_MOVE 维护；id 0 恒 false）。
+export function isHover(app: Ref<App>, id: int): bool {
+    return id != 0 && app.hover_id == id;
+}
+
+/// 输入框焦点同步（渲染前调——focused 态驱动光标绘制）。
+export function syncFocus(app: Ref<App>, inp: Ref<Input>): void {
+    inp.focused = focusTopId(app) == inp.id;
+}
+
+/// 复选框装配：点击翻转＋onChange（翻转语义框架承担——app 只管响应）。
+export function onCheck(app: Ref<App>, cb: Ref<Checkbox>, handler: (bool) => void): void {
+    onEvent(app, cb.id, (rec: EventRecord): void => {
+            if (rec.kind != EV_MOUSE_DOWN) {
+                return;
+            }
+            cb.checked = !cb.checked;
+            handler(cb.checked);
+        });
+}
+
+/// 单选组装配：行命中→互斥选择＋onChange。
+export function onRadioSelect(app: Ref<App>, rg: Ref<RadioGroup>, handler: (int) => void): void {
+    onEvent(app, rg.id, (rec: EventRecord): void => {
+            if (rec.kind != EV_MOUSE_DOWN) {
+                return;
+            }
+            const idx: int = hitRadioGroup(rg, rec.x, rec.y);
+            if (idx < 0) {
+                return;
+            }
+            radioSelect(rg, idx);
+            handler(idx);
+        });
+}
+
+/// 下拉装配：字段点击展开/收起；条目点击选中回填＋onChange。
+export function onDropdownSelect(app: Ref<App>, dd: Ref<Dropdown>, handler: (int) => void): void {
+    onEvent(app, dd.id, (rec: EventRecord): void => {
+            if (rec.kind != EV_MOUSE_DOWN) {
+                return;
+            }
+            const code: int = hitDropdown(dd, rec.x, rec.y);
+            if (code == -1) {
+                dropdownToggle(dd);
+                return;
+            }
+            if (code >= 0) {
+                dropdownSelect(dd, code);
+                handler(code);
+            }
+        });
+}
+
+/// 滑杆装配：down 锚定→move 跟踪→up 提交（拖拽会话由 pump 路由——
+/// 本装配只消费换算与 onChange）。
+export function sliderOnEvents(app: Ref<App>, s: Ref<Slider>, onChange: (int) => void): void {
+    onEvent(app, s.id, (rec: EventRecord): void => {
+            if (rec.kind == EV_MOUSE_DOWN) {
+                s.dragging = true;
+                s.value = sliderValueAt(s, rec.x);
+                onChange(s.value);
+                return;
+            }
+            if (rec.kind == EV_MOUSE_MOVE) {
+                if (!s.dragging) {
+                    return;
+                }
+                s.value = sliderValueAt(s, rec.x);
+                onChange(s.value);
+                return;
+            }
+            if (rec.kind == EV_MOUSE_UP) {
+                s.dragging = false;
+                return;
+            }
+        });
+}
+
+/// 输入框装配：KEY_DOWN 消费——可打印入缓冲／退格弹出／回车 onEnter／
+/// ESC 失焦（焦点出栈）。**修饰位感知**：
+/// shift＋键→大写/上位符号（keyCharMods）；ctrl+A＝真全选（anchor=0/
+/// cursor=len——shift 移动延伸选区）；ctrl＋退格＝删词（向栈顶弹到上一个
+/// 分隔符——光标模型下从 cursor 处向栈顶弹）；ctrl/alt 组合不产字符
+///（组合键归 onHotkey）。
+/// （input 选区）：LEFT/RIGHT/Home/End 光标移动〔shift 按住＝
+/// 延伸选区〔anchor 保持；无 anchor 先锚定原位〕；无 shift＝清选区〕；
+/// 退格/键入经选区感知编辑面（inputBackspace/inputInsertChar——有选区先删）。
+export function inputOnKeys(app: Ref<App>, inp: Ref<Input>, onEnter: (string) => void): void {
+    onEvent(app, inp.id, (rec: EventRecord): void => {
+            // EV_TEXT（v0.1.4 反馈 #7——IME 文本通道）：x＝Unicode 码位直插
+            //（不走 keyCharMods——那是 VK 语义；中文/符号经此臂入缓冲）。
+            if (rec.kind == EV_TEXT) {
+                const ch: string = utf8Encode(rec.x) catch "";
+                if (len(ch) > 0) {
+                    inputInsertChar(inp, ch);
+                    inp.select = false;
+                }
+                return;
+            }
+            if (rec.kind != EV_KEY_DOWN) {
+                return;
+            }
+            if (rec.x == KEY_BACK) {
+                if (modHas(rec.mods, EV_MOD_CTRL)) {
+                    inputDeleteWord(inp);
+                } else {
+                    inputBackspace(inp);
+                }
+                return;
+            }
+            if (rec.x == KEY_RETURN) {
+                onEnter(inputValue(inp));
+                return;
+            }
+            if (rec.x == KEY_ESC) {
+                focusPopId(app);
+                return;
+            }
+            if (rec.x == KEY_LEFT || rec.x == KEY_RIGHT || rec.x == 36 || rec.x == 35) {
+                // 36=HOME 35=END；shift＝延伸选区（anchor 缺省锚定原光标位）。
+                const shift = modHas(rec.mods, EV_MOD_SHIFT);
+                if (shift && inp.anchor < 0) {
+                    inp.anchor = inp.cursor;
+                }
+                if (rec.x == KEY_LEFT) {
+                    inp.cursor = inputClamp(inp, inp.cursor - 1);
+                } else if (rec.x == KEY_RIGHT) {
+                    inp.cursor = inputClamp(inp, inp.cursor + 1);
+                } else if (rec.x == 36) {
+                    inp.cursor = 0;
+                } else {
+                    inp.cursor = listLen(inp.chars);
+                }
+                if (!shift) {
+                    inp.anchor = -1;
+                }
+                inp.select = false;
+                return;
+            }
+            if (modHas(rec.mods, EV_MOD_CTRL) || modHas(rec.mods, EV_MOD_ALT)) {
+                // 组合键最小集：ctrl+A 真全选（anchor=0/cursor=len——shift
+                // 方向键延伸、键入替换，语义为替换位的真选区超集）。
+                if (modHas(rec.mods, EV_MOD_CTRL) && rec.x == 'A') {
+                    inp.anchor = 0;
+                    inp.cursor = listLen(inp.chars);
+                }
+                return;
+            }
+            const ch: string = keyCharMods(rec.x, rec.mods);
+            if (len(ch) > 0) {
+                inputInsertChar(inp, ch);
+                inp.select = false;
+            }
+        });
+}
+
+/// 输入框鼠标装配（拖选扩面位——升格兑现）：
+/// DOWN＝聚焦＋选区锚定（x→字符位换算）；MOVE＝拖拽会话延伸（cursor
+/// 跟随——pump 的 drag_target 会话路由使 MOVE/UP 直达本组件）；UP＝提交。
+/// 换算面＝inputPrefixWidth 单调性线性扫（输入框短文本，O(n²) 无虞；
+/// 与 shift 键选同一选区模型——anchor/cursor 语义单一事实源）。
+/// 真窗/脚本化双通道同构（rec.x＝客户区坐标；脚本注入拖选脚本直接可用）。
+export function inputOnMouse(app: Ref<App>, inp: Ref<Input>, cv: Ref<Canvas>, inp_x: int, inp_y: int): void {
+    onEvent(app, inp.id, (rec: EventRecord): void => {
+            if (rec.kind == EV_MOUSE_DOWN) {
+                const pos: int = inputCharAtX(cv, inp, rec.x - inp_x);
+                inp.cursor = pos;
+                inp.anchor = pos;
+                inp.select = false;
+                return;
+            }
+            if (rec.kind == EV_MOUSE_MOVE) {
+                if (app.drag_target != inp.id) {
+                    return;
+                }
+                inp.cursor = inputCharAtX(cv, inp, rec.x - inp_x);
+                return;
+            }
+        });
+}
+
+/// 像素位→字符位（前缀宽单调线性扫：返回 prefixWidth<=px 的最大位；
+/// inp_x/inp_y 为组件左上角窗口坐标——rec.x 由调用方先减 inp_x）。
+function inputCharAtX(cv: Ref<Canvas>, inp: Ref<Input>, px: int): int {
+    const n: int = listLen(inp.chars);
+    let i: int = 0;
+    while (i < n) {
+        if (inputPrefixWidth(cv, inp, i + 1) > px) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// 光标位夹取（0..len——负下标/越界防护单点）。
+function inputClamp(inp: Ref<Input>, pos: int): int {
+    if (pos < 0) {
+        return 0;
+    }
+    const n: int = listLen(inp.chars);
+    if (pos > n) {
+        return n;
+    }
+    return pos;
+}
+
+/// 删词（ctrl＋退格；光标模型：从 cursor 向栈顶弹连续字母数字〔词干〕；
+/// 词干为空时退化为单字符删除——确定性最小集，分隔符不入词；有选区先删）。
+function inputDeleteWord(inp: Ref<Input>): void {
+    const del = inputDeleteSelection(inp);
+    if (del) {
+        return;
+    }
+    let start: int = inp.cursor;
+    while (start > 0) {
+        const c: string = listTryGet(inp.chars, start - 1) catch " ";
+        const b = byteTryAt(c, 0) catch 32;
+        if ((b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57)) {
+            start = start - 1;
+        } else {
+            break;
+        }
+    }
+    if (start == inp.cursor && inp.cursor > 0) {
+        start = inp.cursor - 1;
+    }
+    const fresh: List<string> = listNew();
+    let i: int = 0;
+    while (i < start) {
+        listPush(fresh, listTryGet(inp.chars, i) catch "");
+        i = i + 1;
+    }
+    i = inp.cursor;
+    while (i < listLen(inp.chars)) {
+        listPush(fresh, listTryGet(inp.chars, i) catch "");
+        i = i + 1;
+    }
+    inp.chars = fresh;
+    inp.cursor = start;
+    inp.anchor = -1;
+}
+
+/// 滚动视图装配：拇指拖拽（down 锚定增量基点→move 增量滚动→up 提交）。
+export function scrollOnEvents(app: Ref<App>, v: Ref<ScrollView>, onChange: (int) => void): void {
+    onEvent(app, v.id, (rec: EventRecord): void => {
+            if (rec.kind == EV_MOUSE_DOWN) {
+                if (hitScrollbar(v, rec.x, rec.y)) {
+                    v.dragging = true;
+                    v.last_y = rec.y;
+                }
+                return;
+            }
+            if (rec.kind == EV_MOUSE_MOVE) {
+                if (!v.dragging) {
+                    return;
+                }
+                v.scroll_y = v.scroll_y + (rec.y - v.last_y);
+                v.last_y = rec.y;
+                scrollClamp(v);
+                onChange(v.scroll_y);
+                return;
+            }
+            if (rec.kind == EV_MOUSE_UP) {
+                v.dragging = false;
+                return;
+            }
+        });
+}
+
+/// 提示框拍推进（每帧一次——帧钟计数非墙钟：重放/虚拟时钟确定性）。
+/// 连续 hover **绑定目标** 达阈值返回 true（调用方 drawTooltip 叠绘）。
+export function tooltipTick(app: Ref<App>, t: Ref<Tooltip>): bool {
+    // target 绑定语义（v0.1.4 反馈 #9）：未绑定（0）恒 false；hover 非绑定
+    // 目标恒重置计数——提示文本与控件一一对应。
+    if (t.target == 0 || app.hover_id != t.target) {
+        t.cur = 0;
+        t.count = 0;
+        return false;
+    }
+    if (t.cur == app.hover_id) {
+        t.count = t.count + 1;
+    } else {
+        t.cur = app.hover_id;
+        t.count = 0;
+    }
+    if (t.count >= t.threshold) {
+        t.x = app.mouse_x;
+        t.y = app.mouse_y;
+        return true;
+    }
+    return false;
+}
+
+/// 模态事件消费（pump 拦截后的单点：按钮点击/回车确认/ESC 取消；其余
+/// 事件吞掉——模态语义）。
+function modalConsume(app: Ref<App>, kind: int, raw_target: int, x: int, y: int): void {
+    const m = app.modal;
+    if (kind == EV_MOUSE_DOWN) {
+        const idx: int = modalHit(m, x, y);
+        if (idx >= 0) {
+            m.result = idx;
+            m.active = false;
+            app.dirty = true;
+        }
+        return;
+    }
+    if (kind == EV_KEY_DOWN) {
+        if (raw_target == KEY_RETURN) {
+            if (listLen(m.buttons) > 0) {
+                m.result = 0;
+            } else {
+                m.result = -1;
+            }
+            m.active = false;
+            app.dirty = true;
+            return;
+        }
+        if (raw_target == KEY_ESC) {
+            m.result = -1;
+            m.active = false;
+            app.dirty = true;
+            return;
+        }
+    }
+}
+
+/// 模态打开（App 域位换绑——pump 即刻拦截；渲染面由调用方 drawModal）。
+export function modalOpen(app: Ref<App>, m: Ref<MessageBox>): void {
+    app.modal = m;
+    app.dirty = true;
+}
+
+/// 弹出菜单打开（挂到 app——pump 拦截消费面随后）。
+export function popupOpen(app: Ref<App>, p: Ref<Popup>): void {
+    app.popup = p;
+    p.active = true;
+    p.result = -1;
+    app.dirty = true;
+}
+
+/// 弹出菜单激活态（调用方渲染面判断——drawPopupC 是否入帧）。
+export function popupActive(app: Ref<App>): bool {
+    return app.popup.active;
+}
+
+/// 弹出菜单结果（-1＝未决/取消；≥0＝条目下标——调用方 pump 循环轮询）。
+export function popupResult(app: Ref<App>): int {
+    return app.popup.result;
+}
+
+/// 弹出菜单拦截消费（浮层内点击＝选中关；浮层外/ESC＝取消关——模态语义）。
+function popupConsume(app: Ref<App>, kind: int, tt: int, tx: int, ty: int): void {
+    app.dirty = true;
+    if (kind == EV_MOUSE_DOWN) {
+        const idx: int = popupHit(app.popup, tx, ty);
+        app.popup.result = idx;
+        app.popup.active = false;
+        return;
+    }
+    if (kind == EV_KEY_DOWN && tt == 27) {
+        app.popup.result = -1;
+        app.popup.active = false;
+    }
+}
+
+/// resize 兜底空处理器（listGet 越界防御面——正常注册序恒命中）。
+function noopResize(w: int, h: int): void {
+    const dead: int = w + h;
+    if (dead == -2) {
+        return;
+    }
+}
+
+/// 真窗通道命中换算（hitZone 扫描；未命中 0）。
+function resolveHit(app: Ref<App>, px: int, py: int): int {
+    let hi: int = 0;
+    while (hi < listLen(app.hits)) {
+        const hz = listTryGet(app.hits, hi) catch new HitZone { id: 0, x: 0, y: 0, w: 0, h: 0 };
+        if (px >= hz.x && px < hz.x + hz.w && py >= hz.y && py < hz.y + hz.h) {
+            return hz.id;
+        }
+        hi = hi + 1;
+    }
+    return 0;
+}
+
+/// 主循环一拍（取事件→分发→调用方 render 责任由 dirty 语义表达）：
+/// 返回 true＝继续运行。resize 事件在此更新布局根尺寸（默认零手写自适应）。
+/// **三通道分诊单点（先例，扩 {1..7}）**：真窗 raw 记录
+/// （target=MOUSE_LEFT/VK 码）经命中测试/焦点栈换算组件 id；脚本/重放
+/// 通道 target 已是组件 id——两通道同一取数面；模态激活期
+/// 一切事件先经 modalConsume（app-drawn 模态语义）。**命中扫描哨兵行
+/// （守护——feedback #6 缺口收容）**：重放/脚本行 target=-1 时
+/// 坐标 (x,y) 经 resolveHit 与真窗同路径换算组件 id——无头用例自此覆盖
+/// 命中注册面（组件 id 直达行语义不变；hitZone 先注册先命中序即被守护）。
+export function pump(app: Ref<App>, timeout_ms: int): bool {
+    if (!app.running) {
+        return false;
+    }
+    const kind: int = windowWaitEvent(app.hwnd, timeout_ms);
+    if (kind == EV_CLOSE) {
+        app.running = false;
+        return false;
+    }
+    if (kind == EV_RESIZE) {
+        // 增补①：布局根尺寸更新（默认零手写自适应）＋onResize 订阅分发
+        //（resize 即失效——调用方下一帧重排重绘）。帧级 DPI：
+        // scale 随 resize 重查（真窗 WM_DPICHANGED 迁移显示器即随动；
+        // 回放态恒脚本声明值——确定性锚）。
+        app.w = eventWindowX(app.hwnd);
+        app.h = eventWindowY(app.hwnd);
+        app.k = windowScale(app.hwnd);
+        app.resize_count = app.resize_count + 1;
+        app.dirty = true;
+        let ri: int = 0;
+        while (ri < listLen(app.resize_listeners)) {
+            const rl = listTryGet(app.resize_listeners, ri) catch new ResizeListener { handler: noopResize };
+            rl.handler(app.w, app.h);
+            ri = ri + 1;
+        }
+        return true;
+    }
+    if (kind == 0) {
+        // 动画节拍（v0.1.4 反馈 #7 追加——帧钟置脏单点）：**仅真窗通道**——
+        // 16ms 超时真实流逝，焦点存在时每 8 拍（≈128ms）置脏一次驱动相位
+        // 前进（光标闪烁 ≈512ms 半周期）；无头/重放通道 waitEvent 立即返回
+        // 且 scripted 恒不置脏——帧号保持事件锁定，动画相位＝帧号的纯函数
+        //（golden 可锚，确定性纪律不破）。
+        if (!app.scripted && focusTopId(app) != 0) {
+            app.anim_ticks = app.anim_ticks + 1;
+            if (app.anim_ticks >= 8) {
+                app.anim_ticks = 0;
+                app.dirty = true;
+            }
+        }
+        return app.running;
+    }
+    const tx: int = eventWindowX(app.hwnd);
+    const ty: int = eventWindowY(app.hwnd);
+    const tt: int = eventWindowTarget(app.hwnd);
+    const tm: int = eventWindowMods(app.hwnd);
+    if (app.modal.active) {
+        modalConsume(app, kind, tt, tx, ty);
+        return app.running;
+    }
+    if (app.popup.active) {
+        popupConsume(app, kind, tt, tx, ty);
+        return app.running;
+    }
+    if (kind == EV_SCROLL) {
+        let id = tt;
+        let delta = tx;
+        if (!app.scripted) {
+            id = resolveHit(app, tx, ty);
+            delta = tt;
+        }
+        if (id != 0 && delta != 0) {
+            dispatch(app.listeners, EventRecord { kind: kind, target: id, x: delta, y: 0, mods: tm });
+            app.dirty = true;
+        }
+        return app.running;
+    }
+    // frameless 自绘标题栏拦截：按钮/拖拽区命中
+    // 先于组件命中——close 双通道确定性（running=false）；min/max 真窗
+    // 引擎面（脚本通道绑定 no-op）；拖拽区锚定 title_drag 会话。
+    if (kind == EV_MOUSE_DOWN && app.spec.frameless) {
+        const hit: int = hitTitleBar(app.titlebar, tx, ty);
+        if (hit == TITLE_HIT_CLOSE) {
+            app.running = false;
+            return app.running;
+        }
+        if (hit == TITLE_HIT_MAX) {
+            windowMaximizeToggle(app.hwnd);
+            return app.running;
+        }
+        if (hit == TITLE_HIT_MIN) {
+            windowMinimize(app.hwnd);
+            return app.running;
+        }
+        if (hit == TITLE_HIT_DRAG) {
+            app.title_drag = true;
+            // 锚点必须在 down 时置位（反馈 #3——缺此则 move 用上一次
+            // 点击的陈旧锚点算增量，真窗拖拽瞬移"捉迷藏"）。
+            app.mouse_x = tx;
+            app.mouse_y = ty;
+            return app.running;
+        }
+    }
+    if (kind == EV_MOUSE_DOWN) {
+        let id: int = tt;
+        if (!app.scripted || tt == -1) {
+            if (tt >= MENU_ID_BASE) {
+                // 菜单事件（真窗 WM_COMMAND 事件化——kind 3＋target=菜单 id；
+                // 直达分发，不经 hitZone）。
+                const rec: EventRecord = { kind: kind, target: tt, x: tx, y: ty, mods: tm };
+                dispatch(app.listeners, rec);
+                app.dirty = true;
+                return app.running;
+            }
+            id = resolveHit(app, tx, ty);
+        }
+        focusPushId(app, id);
+        app.drag_target = id;
+        app.hover_id = id;
+        app.mouse_x = tx;
+        app.mouse_y = ty;
+        const rec: EventRecord = { kind: kind, target: id, x: tx, y: ty, mods: tm };
+        dispatch(app.listeners, rec);
+        app.dirty = true;
+        return app.running;
+    }
+    if (kind == EV_MOUSE_UP) {
+        let id: int = tt;
+        if (!app.scripted || tt == -1) {
+            id = resolveHit(app, tx, ty);
+        }
+        if (app.drag_target != 0) {
+            id = app.drag_target; // 拖拽会话：up 提交给 down 锚定的组件
+        }
+        app.drag_target = 0;
+        // 标题拖拽会话同 up 终止：独立清除块必须在本分支内——曾置于其后
+        // （f26398a9）被上方 return 短路成死代码，title_drag 永不清除，
+        // 真窗标题栏点过一次后窗口永久粘住光标（v0.1.4 feedback #11）。
+        app.title_drag = false;
+        const rec: EventRecord = { kind: kind, target: id, x: tx, y: ty, mods: tm };
+        dispatch(app.listeners, rec);
+        app.dirty = true;
+        return app.running;
+    }
+    if (kind == EV_MOUSE_MOVE) {
+        if (app.title_drag) {
+            // 标题拖拽移动（真窗引擎面——窗口增量移动；脚本通道 no-op）。
+            const dx: int = tx - app.mouse_x;
+            const dy: int = ty - app.mouse_y;
+            windowMove(app.hwnd, dx, dy);
+            // 锚点换基（v0.1.4 反馈 #11）：windowMove 后同一屏幕点的客户区
+            // 坐标＝旧坐标减增量——窗口已随动而锚点不随动，则下一事件增量
+            // 被窗口自身位移吞掉，拖拽第一步后冻结。
+            app.mouse_x = tx - dx;
+            app.mouse_y = ty - dy;
+            return app.running;
+        }
+        app.mouse_x = tx;
+        app.mouse_y = ty;
+        if (!app.scripted || tt == -1) {
+            app.hover_id = resolveHit(app, tx, ty);
+        } else {
+            app.hover_id = tt;
+        }
+        let id: int = app.hover_id;
+        if (app.drag_target != 0) {
+            id = app.drag_target; // 拖拽会话：move 跟踪锚定组件
+        }
+        // 客户区光标（v0.1.4 反馈 #10）：hover 命中文本区→I-beam，否则箭头
+        //（脚本通道 windowSetCursor no-op——golden 零涉）。
+        let ck: int = CURSOR_ARROW;
+        let ti: int = 0;
+        while (ti < listLen(app.text_ids)) {
+            if ((listTryGet(app.text_ids, ti) catch 0) == id) {
+                ck = CURSOR_TEXT;
+            }
+            ti = ti + 1;
+        }
+        windowSetCursor(app.hwnd, ck);
+        const rec: EventRecord = { kind: kind, target: id, x: tx, y: ty, mods: tm };
+        dispatch(app.listeners, rec);
+        app.dirty = true;
+        return app.running;
+    }
+    if (kind == EV_TEXT) {
+        // 文本字符路由（v0.1.4 反馈 #7；kind 值域内新增零格式变更——v1.2）：
+        // 与键事件同焦点路由，x＝Unicode 码位（消费臂在 inputOnKeys）。
+        const top: int = focusTopId(app);
+        if (top == 0) {
+            return app.running;
+        }
+        const rec: EventRecord = { kind: kind, target: top, x: tt, y: 0, mods: tm };
+        dispatch(app.listeners, rec);
+        app.dirty = true;
+        return app.running;
+    }
+    if (kind == EV_KEY_DOWN || kind == EV_KEY_UP) {
+        // **两级分发**：第一级＝onHotkey 全局表
+        //（mods+VK 全等匹配，命中即消费——KEY_DOWN 才触发，UP 不拦）；
+        // 第二级＝焦点栈路由（raw 记录 target＝VK 码——x 携键码给 handler）。
+        if (kind == EV_KEY_DOWN && hotkeyHit(app, tt, tm)) {
+            app.dirty = true;
+            return app.running;
+        }
+        const top: int = focusTopId(app);
+        if (top == 0) {
+            return app.running;
+        }
+        const rec: EventRecord = { kind: kind, target: top, x: tt, y: 0, mods: tm };
+        dispatch(app.listeners, rec);
+        app.dirty = true;
+        return app.running;
+    }
+    // 其余 kind（含未来值域内新增）：原样分发——向前兼容零格式变更。
+    const rec: EventRecord = { kind: kind, target: tt, x: tx, y: ty, mods: tm };
+    dispatch(app.listeners, rec);
+    app.dirty = true;
+    return app.running;
+}
+
+/// 全局快捷键匹配（第一级分发；注册序＝匹配序，首个命中即调用并消费）。
+function hotkeyHit(app: Ref<App>, vk: int, mods: int): bool {
+    let i: int = 0;
+    while (i < listLen(app.hotkeys)) {
+        const hk = listTryGet(app.hotkeys, i) catch new Hotkey { mods: 0, key: 0, handler: noopHotkey };
+        if (hk.key == vk && hk.mods == mods) {
+            hk.handler();
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// 文本光标区声明（v0.1.4 反馈 #10）：id 命中区域鼠标显示 I-beam（输入框
+/// 装配时与 hitZone 同调一次）；pump 鼠标移动按此驱动 windowSetCursor；
+/// 脚本通道 no-op（golden 零涉）。
+export function textCursor(app: Ref<App>, id: int): void {
+    if (id <= 0) {
+        return;
+    }
+    listPush(app.text_ids, id);
+}
+
+/// 快捷键兜底空处理器（listGet 越界防御面——正常注册序恒命中）。
+function noopHotkey(): void {
+}
+
+/// 窗口关闭（销毁句柄；脚本/真窗同 ABI）。
+export function appClose(app: Ref<App>): void {
+    windowClose(app.hwnd);
+    app.running = false;
+}
+
+// ============================================================================
+// TextArea 路由（taOnKeys/taOnMouse——inputOnKeys/onMouse 同构，
+// 事件模型/焦点栈/drag 会话全部复用；差异面＝(行,列) 光标模型与滚动跟随）。
+// ============================================================================
+
+/// 键盘装配：EV_TEXT＝IME 文本通道（taInsert 原样入——多字节/词组连打
+/// 单点）；BACK＝退格；RETURN＝换行（行模型分裂）；方向键/HOME/END＝
+/// taMove（shift 延伸选区）；ESC＝焦点出栈；ctrl 组合键不入（ctrl+A 全选
+/// 在册——其余交 onHotkey 面独占，与 input 同款）。滚动跟随随编辑驱动。
+export function taOnKeys(app: Ref<App>, ta: Ref<TextArea>, vis: int): void {
+    onEvent(app, ta.id, (rec: EventRecord): void => {
+            if (rec.kind == EV_TEXT) {
+                const ch: string = utf8Encode(rec.x) catch "";
+                if (len(ch) > 0) {
+                    taInsert(ta, ch);
+                }
+                taScrollFollow(ta);
+                return;
+            }
+            if (rec.kind != EV_KEY_DOWN) {
+                return;
+            }
+            if (rec.x == KEY_BACK) {
+                taBackspace(ta);
+                taScrollFollow(ta);
+                return;
+            }
+            if (rec.x == KEY_RETURN) {
+                taInsert(ta, "\n");
+                taScrollFollow(ta);
+                return;
+            }
+            if (rec.x == KEY_ESC) {
+                focusPopId(app);
+                return;
+            }
+            if (rec.x == KEY_LEFT || rec.x == KEY_RIGHT || rec.x == 36 || rec.x == 35 || rec.x == KEY_UP || rec.x == KEY_DOWN) {
+                taMove(ta, rec.x, modHas(rec.mods, EV_MOD_SHIFT));
+                taScrollFollow(ta);
+                return;
+            }
+            if (modHas(rec.mods, EV_MOD_CTRL) || modHas(rec.mods, EV_MOD_ALT)) {
+                // ctrl+A 全选（锚＝(0,0)、光标＝末行尾——多行选区带全行覆盖）。
+                if (modHas(rec.mods, EV_MOD_CTRL) && rec.x == 'A') {
+                    ta.al = 0;
+                    ta.ac = 0;
+                    ta.cl = listLen(ta.lines) - 1;
+                    ta.cc = taLineLen(ta, ta.cl);
+                }
+                return;
+            }
+            const ch: string = keyCharMods(rec.x, rec.mods);
+            if (len(ch) > 0) {
+                taInsert(ta, ch);
+                taScrollFollow(ta);
+            }
+        });
+}
+
+/// 鼠标装配：DOWN＝聚焦＋点位光标＋选区锚定；MOVE＝拖拽延伸（drag_target
+/// 会话路由——input 同款）；点位换算＝行(ly/line_h)×列(前缀宽单调扫)。
+export function taOnMouse(app: Ref<App>, ta: Ref<TextArea>, cv: Ref<Canvas>, ta_x: int, ta_y: int): void {
+    onEvent(app, ta.id, (rec: EventRecord): void => {
+            if (rec.kind == EV_MOUSE_DOWN) {
+                const lp = taPosAt(cv, ta, rec.x - ta_x, rec.y - ta_y);
+                ta.cl = lp.ll;
+                ta.cc = lp.lc;
+                ta.al = lp.ll;
+                ta.ac = lp.lc;
+                return;
+            }
+            if (rec.kind == EV_MOUSE_MOVE) {
+                if (app.drag_target != ta.id) {
+                    return;
+                }
+                const lp2 = taPosAt(cv, ta, rec.x - ta_x, rec.y - ta_y);
+                ta.cl = lp2.ll;
+                ta.cc = lp2.lc;
+                return;
+            }
+        });
+}
+
+/// 点位→(行,列)（行＝(y-4)/line_h＋scroll 钳制；列＝前缀宽单调扫——
+/// inputCharAtX 同款；返回结构体复用 TaSel 槽位名）。
+function taPosAt(cv: Ref<Canvas>, ta: Ref<TextArea>, px: int, py: int): TaSel {
+    let li: int = ta.scroll + (py - 4) / ta.line_h;
+    if (li < 0) {
+        li = 0;
+    }
+    if (li > listLen(ta.lines) - 1) {
+        li = listLen(ta.lines) - 1;
+    }
+    const line = listTryGet(ta.lines, li) catch "";
+    const n: int = len(line);
+    let i: int = 0;
+    while (i < n) {
+        const j: int = cpNext(line, i);
+        if (paintTextWidth(cv, taSlice(line, 0, j)) > px) {
+            return TaSel { active: false, ll: li, lc: i, hl: li, hc: i };
+        }
+        i = j;
+    }
+    return TaSel { active: false, ll: li, lc: n, hl: li, hc: n };
+}

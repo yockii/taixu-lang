@@ -1,0 +1,1343 @@
+// 对象与函数元数据的结构化 fuzz（gate.tx 的 object-fuzz 步，安全审查攻关第 3 项）。
+//
+// 以独立构造的 ELF64／COFF 夹具（scripts/check_obj.tx）和编译器写出的带 .txfn 的对象（runtime_function_probe）为种子，按固定种子做
+// 结构感知变异，每例一个新的受限进程（工具链内建 procSpawnLimited：Windows 作业对象限提交内存与 CPU、关闭即杀；Linux RLIMIT_AS、
+// RLIMIT_CPU、不留 core；macOS RLIMIT_CPU、不留 core、物理足迹看守），只解析与链接、不执行产物：
+//
+//   F1 单字段（0／1／±1／上限／随机，随机字节，截断）   F2 偏移与长度成对（和溢出、越过文件末尾 1 字节、表长非项长整数倍）
+//   F3 重定位（加数极值、类型互换改宽度、位置贴节尾）   F4 节重叠（节、符号表与字符串表、重定位表与目标节）
+//   F5 对齐（0、非 2 的幂、极大；COFF 保留的对齐值）    F6 结构边界截断（头、每个节头、每张表的末尾及 ±1）
+//   F7 .txfn 函数元数据（经 taixu build … --map；版本、节号、长度、计数、串长与偏移，及字段边界截断）
+//
+// F1–F6 经链接探针 native_link_map_probe（生产链接器的同一份代码）跑两遍：标准内核（--leak-check）与页堆内核，结局须相同。每例只
+// 允许干净拒绝（退出 1、stderr 空、无部分映射，原因是解析期的拒绝）或成功（映射与写出的映像一致）；崩溃、信号、超时、限额触发、
+// 泄漏或页堆报告、链接器内部不变式类的原因（*-OOB、AssemblerFailed、BadProgram*、Program*Overflow）都算失败。批前批后各以新进程跑
+// 未变异的夹具，映像须逐字节相同。失败样本连同按字节回退的最小化样本存进 --work。变异序列由种子决定、逐例可复现（scripts/test_random.tx
+// 与 random.Random 的 random、choice、randrange、sample 逐值相同）。
+//
+//   taixu run --toolchain scripts/test_object_fuzz.tx --compiler <taixu> --work <目录> [--cases N] [--root <仓库>]
+//
+// 受限进程由 procSpawnLimited 起（Windows 另限 CPU 20 秒、进程数上限 32）；报告里通过项的 detail 与 FAIL 行的细节写成本文件的文字。
+import { absolute, exeName, join, kindOf, mkdirs, nat, readBytes, removeTree } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { hexOf, hx, hxu, lossyText, sha256Of } from "./check_lib";
+import { Field, coffObject, elfObject, getLE, objectFields, setLE } from "./check_obj";
+import { FRow, OSec, objSections, txfnMetadata } from "./check_txfn";
+import { captureLimited, captureRaw } from "./test_lib";
+import { Rng, rngBelow, rngNew, rngRandom, rngU32 } from "./test_random";
+import { J_BOOL, J_NUM, J_STR, Jv, jArray, jNull, jNumber, jObject, jParse, jPretty, jPush, jSet, jString } from "./test_json";
+import { at, isNull, textOf } from "./test_jv";
+import { headChars, reprStr, sorted, strLess } from "./test_text";
+
+const SEC: int = 1000000000;
+const MAX_OUTPUT: int = 67108864;
+const SEED: int = 20261025;
+const LIMIT_BYTES: int = 1073741824;
+const KERNEL_FLAGS: []string = ["--with-move", "--with-alloc", "--with-rc", "--with-str", "--with-strb", "--with-zero", "--with-list", "--with-file",
+    "--with-argv", "--with-store-slots", "--with-nrt"];
+
+struct Ctx {
+    compiler: string,
+    root: string,
+    work: string,
+    runs: string,
+    rows: Ref<Jv>,
+    total: int,
+    bad: int,
+    counter: int,
+    reasons: List<string>,
+}
+
+function check(c: Ref<Ctx>, label: string, ok: bool, detail: string): bool {
+    const row = jObject();
+    jSet(row, "check", jString(label));
+    jSet(row, "ok", boolJv(ok));
+    jSet(row, "detail", jString(headChars(detail, 3000)));
+    jPush(c.rows, row);
+    c.total = c.total + 1;
+    if (ok) {
+        print("PASS " + label);
+    } else {
+        c.bad = c.bad + 1;
+        print("FAIL " + label + ": " + headChars(detail, 600));
+    }
+    return ok;
+}
+
+function boolJv(b: bool): Ref<Jv> {
+    return new Jv { kind: J_BOOL, text: "", truth: b, items: listNew(), keys: listNew() };
+}
+
+function strs(a: []string): List<string> {
+    const xs: List<string> = listNew();
+    for (x in a) {
+        listPush(xs, x);
+    }
+    return xs;
+}
+
+function plusL(xs: List<string>, ys: List<string>): List<string> {
+    const out: List<string> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+    }
+    for (y in ys) {
+        listPush(out, y);
+    }
+    return out;
+}
+
+function readOr(path: string): Bytes {
+    return readBytes(path) catch bytesNew(0);
+}
+
+// 不限额地跑一次（编译器、生成器），合并两个流的文本。
+struct Sh {
+    code: int,
+    text: string,
+}
+
+function sh(c: Ref<Ctx>, exe: string, args: List<string>): Sh {
+    const r = captureRaw(exe, args, c.root, 600 * SEC, 10 * SEC, MAX_OUTPUT) catch (e) {
+        return Sh { code: -2, text: e.message };
+    };
+    const both = bytesNew(0);
+    bytesAppend(both, r.out);
+    bytesAppend(both, r.err);
+    return Sh { code: r.code, text: lossyText(both) };
+}
+
+// 一次受限运行的结局：退出码（超时或起不了时 hasCode 为假）、stdout、stderr、说明（timeout 或起不了的原因）。
+struct Lim {
+    code: int,
+    hasCode: bool,
+    out: string,
+    err: string,
+    note: string,
+}
+
+// 一个新的受限进程（Windows 提交内存 1 GiB，类 Unix 地址空间 2 GiB；CPU 20 秒）。
+function limited(c: Ref<Ctx>, argv: List<string>, cwd: string, timeout: int): Lim {
+    const exe = listGet(argv, 0) ?? "";
+    const args: List<string> = listNew();
+    let i = 1;
+    while (i < listLen(argv)) {
+        listPush(args, listGet(argv, i) ?? "");
+        i = i + 1;
+    }
+    let memory = LIMIT_BYTES;
+    if (hostTarget() != "windows") {
+        memory = LIMIT_BYTES * 2;
+    }
+    const r = captureLimited(exe, args, cwd, timeout * SEC, 10 * SEC, MAX_OUTPUT, memory, 20) catch (e) {
+        return Lim { code: 0, hasCode: false, out: "", err: "", note: e.message };
+    };
+    if (r.timedOut) {
+        return Lim { code: 0, hasCode: false, out: "", err: "", note: "timeout" };
+    }
+    return Lim { code: r.code, hasCode: true, out: lossyText(r.out), err: lossyText(r.err), note: "" };
+}
+
+// ---- 判据 ----
+
+function isWord(ch: int): bool {
+    return (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 95 || ch >= 128;
+}
+
+function startsWith(s: string, p: string): bool {
+    if (len(s) < len(p)) {
+        return false;
+    }
+    let i = 0;
+    while (i < len(p)) {
+        if ((byteAt(s, i) ?? 0) != (byteAt(p, i) ?? 1)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function endsWith(s: string, p: string): bool {
+    if (len(s) < len(p)) {
+        return false;
+    }
+    let i = 0;
+    while (i < len(p)) {
+        if ((byteAt(s, len(s) - len(p) + i) ?? 0) != (byteAt(p, i) ?? 1)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function has(s: string, needle: string): bool {
+    const n = len(needle);
+    let i = 0;
+    while (i + n <= len(s)) {
+        let k = 0;
+        while (k < n && (byteAt(s, i + k) ?? 0) == (byteAt(needle, k) ?? 0)) {
+            k = k + 1;
+        }
+        if (k == n) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 链接器内部不变式类的原因（即正则 -OOB|^AssemblerFailed|^BadProgram|^Program\w*Overflow|^__tx_entry）。
+function internal(r: string): bool {
+    if (has(r, "-OOB") || startsWith(r, "AssemblerFailed") || startsWith(r, "BadProgram") || startsWith(r, "__tx_entry")) {
+        return true;
+    }
+    if (!startsWith(r, "Program")) {
+        return false;
+    }
+    let i = 7;
+    while (i <= len(r)) {
+        if (startsWith(bytesToStr(bytesSlice(bytesFromStr(r), i, len(r) - i)) catch "", "Overflow")) {
+            return true;
+        }
+        if (i >= len(r) || !isWord(byteAt(r, i) ?? 0)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 链接器源码里解析期的拒绝原因（字面量与带后缀的前缀），由源码提取，判据跟着源码走：同 Python 的
+// re.findall(r'(?:lkoReject|lkFail|reject)\("([^"]+)"')，自左向右、不重叠。
+function reasons(c: Ref<Ctx>): List<string> {
+    const found: List<string> = listNew();
+    const needles: []string = ["lkoReject(\"", "lkFail(\"", "reject(\""];
+    for (name in ["link_objects.tx", "link_elf_objects.tx", "link_macho.tx", "link_pe.tx"]) {
+        const b = readOr(nat(join(join(c.root, "bootstrap/selfhost"), name)));
+        let p = 0;
+        while (p < bytesLen(b)) {
+            let matched = false;
+            for (nd in needles) {
+                if (!matched && atBytes(b, p, nd)) {
+                    let q = p + len(nd);
+                    let e = q;
+                    while (e < bytesLen(b) && (bytesGet(b, e) ?? 34) != 34) {
+                        e = e + 1;
+                    }
+                    if (e > q && e < bytesLen(b)) {
+                        const r = bytesToStr(bytesSlice(b, q, e - q)) catch "";
+                        if (!internal(r) && !hasStr(found, r)) {
+                            listPush(found, r);
+                        }
+                        p = e + 1;
+                        matched = true;
+                    }
+                }
+            }
+            if (!matched) {
+                p = p + 1;
+            }
+        }
+    }
+    return sorted(found);
+}
+
+function atBytes(b: Bytes, p: int, s: string): bool {
+    const n = len(s);
+    if (p + n > bytesLen(b)) {
+        return false;
+    }
+    let k = 0;
+    while (k < n) {
+        if ((bytesGet(b, p + k) ?? -1) != (byteAt(s, k) ?? -2)) {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+function hasStr(xs: List<string>, s: string): bool {
+    for (x in xs) {
+        if (x == s) {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct Verdict {
+    kind: string,
+    why: string,
+}
+
+function isWsByte(ch: int): bool {
+    return ch == 32 || ch == 9 || ch == 10 || ch == 13 || ch == 11 || ch == 12;
+}
+
+function stripped(s: string): string {
+    let i = 0;
+    let n = len(s);
+    while (i < n && isWsByte(byteAt(s, i) ?? 0)) {
+        i = i + 1;
+    }
+    while (n > i && isWsByte(byteAt(s, n - 1) ?? 0)) {
+        n = n - 1;
+    }
+    return bytesToStr(bytesSlice(bytesFromStr(s), i, n - i)) catch s;
+}
+
+// 一例的结局：得（reject｜accept｜fail，原因）。image 为映像路径，空串即没有映像。
+function outcome(c: Ref<Ctx>, l: Lim, image: string, mode: string): Verdict {
+    if (len(l.note) > 0) {
+        return Verdict { kind: "fail", why: l.note };
+    }
+    if (!l.hasCode || (l.code != 0 && l.code != 1)) {
+        let code = "None";
+        if (l.hasCode) {
+            code = toStr(l.code);
+        }
+        return Verdict { kind: "fail", why: "exit " + code };
+    }
+    if (len(stripped(l.err)) > 0) {
+        return Verdict { kind: "fail", why: "stderr " + headChars(stripped(l.err), 200) };
+    }
+    const doc = jParse(l.out) catch (e) {
+        return Verdict { kind: "fail", why: "stdout is not JSON" };
+    };
+    if (l.code == 1) {
+        const reason = at(doc, "error");
+        const okv = at(doc, "ok");
+        const mapv = at(doc, "map");
+        const okFalse = okv != None && (okv ?? jNull()).kind == J_BOOL && !(okv ?? jNull()).truth;
+        const isStr = reason != None && (reason ?? jNull()).kind == J_STR;
+        const r = textOf(doc, "error");
+        if (!okFalse || mapv == None || !isNull(mapv) || !isStr || len(r) == 0) {
+            return Verdict { kind: "fail", why: "unclean reject " + reprStr(headChars(l.out, 200)) };
+        }
+        if (internal(r)) {
+            return Verdict { kind: "fail", why: "internal invariant " + r };
+        }
+        for (k in c.reasons) {
+            if (r == k || ((endsWith(k, ":") || endsWith(k, ": ")) && startsWith(r, k))) {
+                return Verdict { kind: "reject", why: r };
+            }
+        }
+        if (mode != "pe") {
+            return Verdict { kind: "fail", why: "unknown reason " + headChars(r, 120) };
+        }
+        // PE 的未解析符号以名字本身为原因（lkFail(名字)）。
+        return Verdict { kind: "reject", why: "name:" + headChars(r, 60) };
+    }
+    const okv = at(doc, "ok");
+    if (okv == None || (okv ?? jNull()).kind != J_BOOL || !(okv ?? jNull()).truth || len(image) == 0 || kindOf(image) != 1) {
+        return Verdict { kind: "fail", why: "accepted without image" };
+    }
+    const body = readOr(image);
+    const img = at(at(doc, "map"), "image");
+    if (textOf(img, "bytes") != toStr(bytesLen(body)) || textOf(img, "sha256") != hexOf(sha256Of(body, 0, bytesLen(body)))) {
+        return Verdict { kind: "fail", why: "map disagrees with image" };
+    }
+    return Verdict { kind: "accept", why: "" };
+}
+
+function oracleChecks(c: Ref<Ctx>): void {
+    const reject = "{\"ok\": false, \"map\": null, \"error\": \"BadImage\"}";
+    let av = -11;
+    if (hostTarget() == "windows") {
+        av = 3221225477;
+    }
+    oracle(c, "clean reject passes", Lim { code: 1, hasCode: true, out: reject, err: "", note: "" }, "pe", "reject");
+    oracle(c, "trap fails", Lim { code: 3, hasCode: true, out: "", err: "x.tx:1:1: [runtime:out_of_bounds]", note: "" }, "pe", "fail");
+    oracle(c, "access violation fails", Lim { code: av, hasCode: true, out: "", err: "", note: "" }, "pe", "fail");
+    oracle(c, "timeout fails", Lim { code: 0, hasCode: false, out: "", err: "", note: "timeout" }, "pe", "fail");
+    oracle(c, "leak report fails", Lim { code: 1, hasCode: true, out: reject, err: "[runtime:leak] 1 object", note: "" }, "pe", "fail");
+    oracle(c, "page heap report fails", Lim { code: 3, hasCode: true, out: "", err: "[runtime:corrupt_code] heapcheck: 重复释放", note: "" }, "pe", "fail");
+    oracle(c, "internal invariant fails", Lim { code: 1, hasCode: true, out: "{\"ok\": false, \"map\": null, \"error\": \"reloc-OOB sec=.text\"}", err: "",
+            note: "" }, "pe", "fail");
+    oracle(c, "partial map fails", Lim { code: 1, hasCode: true, out: "{\"ok\": false, \"map\": {}, \"error\": \"BadImage\"}", err: "", note: "" }, "pe", "fail");
+    oracle(c, "unknown ELF reason fails", Lim { code: 1, hasCode: true, out: "{\"ok\": false, \"map\": null, \"error\": \"whatever\"}", err: "", note: "" },
+        "elf", "fail");
+}
+
+function oracle(c: Ref<Ctx>, label: string, l: Lim, mode: string, want: string): void {
+    const v = outcome(c, l, "", mode);
+    check(c, "oracle: " + label, v.kind == want, "('" + v.kind + "', " + reprStr(v.why) + ")");
+}
+
+// ---- 链接 ----
+
+struct Link {
+    v: Verdict,
+    sha: string,
+}
+
+function link(c: Ref<Ctx>, probe: string, mode: string, first: Bytes, second: Bytes): Link {
+    c.counter = c.counter + 1;
+    const tag = toStr(c.counter);
+    const image = nat(join(c.runs, tag + ".image"));
+    const p0 = nat(join(c.runs, tag + "-0.o"));
+    const p1 = nat(join(c.runs, tag + "-1.o"));
+    writeFileBytes(p0, first) catch (e) {};
+    writeFileBytes(p1, second) catch (e) {};
+    const l = limited(c, strs([probe, mode, image, p0, p1]), c.runs, 30);
+    const v = outcome(c, l, image, mode);
+    let sha = "";
+    if (v.kind == "accept") {
+        const body = readOr(image);
+        sha = hexOf(sha256Of(body, 0, bytesLen(body)));
+    }
+    removeFile(image) catch (e) {};
+    removeFile(p0) catch (e) {};
+    removeFile(p1) catch (e) {};
+    return Link { v: v, sha: sha };
+}
+
+// ---- 变异 ----
+
+// 一个变异：族、描述，以及至多两处改写（at, w, v）或一处截断（cut ≥ 0）。
+struct Mut {
+    fam: string,
+    how: string,
+    puts: int,
+    at1: int,
+    w1: int,
+    v1: int,
+    at2: int,
+    w2: int,
+    v2: int,
+    cut: int,
+}
+
+function put1(fam: string, how: string, at: int, w: int, v: int): Mut {
+    return Mut { fam: fam, how: how, puts: 1, at1: at, w1: w, v1: v, at2: 0, w2: 0, v2: 0, cut: -1 };
+}
+
+function put2(fam: string, how: string, at: int, w: int, v: int, at2: int, w2: int, v2: int): Mut {
+    return Mut { fam: fam, how: how, puts: 2, at1: at, w1: w, v1: v, at2: at2, w2: w2, v2: v2, cut: -1 };
+}
+
+function apply(m: Mut, source: Bytes): Bytes {
+    if (m.cut >= 0) {
+        return bytesSlice(source, 0, m.cut);
+    }
+    const d = bytesSlice(source, 0, bytesLen(source));
+    setLE(d, m.at1, m.w1, m.v1);
+    if (m.puts == 2) {
+        setLE(d, m.at2, m.w2, m.v2);
+    }
+    return d;
+}
+
+struct ESec {
+    index: int,
+    header: int,
+    kind: int,
+    off: int,
+    size: int,
+    info: int,
+    entsize: int,
+}
+
+struct CSec {
+    index: int,
+    header: int,
+    size: int,
+    ptr: int,
+    relptr: int,
+    nrel: int,
+}
+
+function addBound(bounds: List<int>, v: int): void {
+    for (b in bounds) {
+        if (b == v) {
+            return;
+        }
+    }
+    listPush(bounds, v);
+}
+
+function sortInts(xs: List<int>): List<int> {
+    const out: List<int> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+        let k = listLen(out) - 1;
+        while (k > 0 && x < (listGet(out, k - 1) ?? 0)) {
+            listSet(out, k, listGet(out, k - 1) ?? 0);
+            k = k - 1;
+        }
+        listSet(out, k, x);
+    }
+    return out;
+}
+
+// F2–F6：按夹具结构枚举的变异。
+function families(mode: string, source: Bytes): List<Mut> {
+    const out: List<Mut> = listNew();
+    const n = bytesLen(source);
+    const bounds: List<int> = listNew();
+    if (mode == "elf") {
+        const shoff = getLE(source, 40, 8);
+        const shnum = getLE(source, 60, 2);
+        const secs: List<ESec> = listNew();
+        let i = 0;
+        while (i < shnum) {
+            const h = shoff + 64 * i;
+            listPush(secs, ESec { index: i, header: h, kind: getLE(source, h + 4, 4), off: getLE(source, h + 24, 8), size: getLE(source, h + 32, 8),
+                    info: getLE(source, h + 44, 4), entsize: getLE(source, h + 56, 8) });
+            i = i + 1;
+        }
+        for (s in secs) {
+            const h = s.header;
+            const id = "sec" + toStr(s.index);
+            listPush(out, put1("F2", id + " off+size overflows", h + 24, 8, wrapSub(0, s.size)));
+            listPush(out, put1("F2", id + " one past end", h + 24, 8, n - s.size + 1));
+            listPush(out, put1("F2", id + " size to end+1", h + 32, 8, n - s.off + 1));
+            listPush(out, put1("F2", id + " size max", h + 32, 8, -1));
+            if (s.entsize != 0) {
+                listPush(out, put1("F2", id + " size not entry multiple", h + 32, 8, s.size + 1));
+                listPush(out, put1("F2", id + " entsize 0", h + 56, 8, 0));
+            }
+            const aligns: []int = [0, 3, -9223372036854775807 - 1, 4294967296];
+            for (v in aligns) {
+                listPush(out, put1("F5", id + " align " + hxu(v), h + 48, 8, v));
+            }
+            for (t in secs) {
+                if (t.index != s.index && s.kind != 0 && t.kind != 0) {
+                    listPush(out, put2("F4", id + " overlaps sec" + toStr(t.index), h + 24, 8, t.off, h + 32, 8, t.size));
+                }
+            }
+            if (s.kind == 4 && s.entsize == 24) {
+                let target = -1;
+                if (s.info < listLen(secs)) {
+                    target = s.info;
+                }
+                let r = s.off;
+                while (r < s.off + s.size) {
+                    const info = getLE(source, r + 8, 8);
+                    const addends: []int = [9223372036854775807, -9223372036854775807 - 1, 2147483647, -2147483648, 2147483648, -2147483649];
+                    for (a in addends) {
+                        listPush(out, put1("F3", "rela@" + toStr(r) + " addend " + toStr(a), r + 16, 8, a));
+                    }
+                    const types: []int = [1, 2, 4, 9, 10, 11, 24, 42];
+                    for (k in types) {
+                        listPush(out, put1("F3", "rela@" + toStr(r) + " type " + toStr(k), r + 8, 8, (info & -4294967296) | k));
+                    }
+                    if (target >= 0) {
+                        const ts = (listGet(secs, target) ?? s).size;
+                        for (w in [1, 4, 8]) {
+                            listPush(out, put1("F3", "rela@" + toStr(r) + " site end-" + toStr(w) + "+1", r, 8, ts - w + 1));
+                        }
+                    }
+                    r = r + 24;
+                }
+            }
+        }
+        addBound(bounds, 64);
+        addBound(bounds, shoff);
+        i = 0;
+        while (i <= listLen(secs)) {
+            addBound(bounds, shoff + 64 * i);
+            i = i + 1;
+        }
+        for (s in secs) {
+            // SHT_NOBITS 不占文件。
+            if (s.kind != 8) {
+                addBound(bounds, s.off);
+                addBound(bounds, s.off + s.size);
+            }
+        }
+    } else {
+        const count = getLE(source, 2, 2);
+        const symptr = getLE(source, 8, 4);
+        const nsyms = getLE(source, 12, 4);
+        const strings = symptr + 18 * nsyms;
+        const secs: List<CSec> = listNew();
+        let i = 0;
+        while (i < count) {
+            const h = 20 + 40 * i;
+            listPush(secs, CSec { index: i, header: h, size: getLE(source, h + 16, 4), ptr: getLE(source, h + 20, 4), relptr: getLE(source, h + 24, 4),
+                    nrel: getLE(source, h + 32, 2) });
+            i = i + 1;
+        }
+        for (s in secs) {
+            const h = s.header;
+            const id = "sec" + toStr(s.index);
+            let atLeast = s.nrel;
+            if (atLeast < 1) {
+                atLeast = 1;
+            }
+            listPush(out, put1("F2", id + " ptr+size overflows u32", h + 20, 4, 4294967295 - s.size + 1));
+            listPush(out, put1("F2", id + " one past end", h + 20, 4, n - s.size + 1));
+            listPush(out, put1("F2", id + " size to end+1", h + 16, 4, n - s.ptr + 1));
+            listPush(out, put1("F2", id + " relocs past end", h + 24, 4, n - 10 * atLeast + 1));
+            listPush(out, put1("F2", id + " reloc count max", h + 32, 2, 65535));
+            const flags = getLE(source, h + 36, 4);
+            for (nib in [15, 14, 0]) {
+                listPush(out, put1("F5", id + " align nibble " + hx(nib), h + 36, 4, (flags & 0xFF0FFFFF) | (nib << 20)));
+            }
+            for (t in secs) {
+                if (t.index != s.index && t.size != 0 && s.size != 0) {
+                    listPush(out, put2("F4", id + " overlaps sec" + toStr(t.index), h + 20, 4, t.ptr, h + 16, 4, t.size));
+                }
+            }
+            let k = 0;
+            while (k < s.nrel) {
+                const r = s.relptr + 10 * k;
+                const site = getLE(source, r, 4);
+                const kind = getLE(source, r + 8, 2);
+                for (v in [1, 2, 3, 4, 5, 9, 10, 11, 16]) {
+                    listPush(out, put1("F3", "reloc@" + toStr(r) + " type " + toStr(v), r + 8, 2, v));
+                }
+                for (w in [1, 4, 8]) {
+                    listPush(out, put1("F3", "reloc@" + toStr(r) + " site end-" + toStr(w) + "+1", r, 4, s.size - w + 1));
+                }
+                let width = 4;
+                if (kind == 1) {
+                    width = 8;
+                }
+                const addends: []int = [9223372036854775807, -9223372036854775807 - 1, 2147483647, -2147483648];
+                for (a in addends) {
+                    listPush(out, put1("F3", "reloc@" + toStr(r) + " implicit addend " + toStr(a), s.ptr + site, width, a));
+                }
+                k = k + 1;
+            }
+            listPush(out, put1("F4", id + " relocs overlap symbols", h + 24, 4, symptr));
+        }
+        let first = 0;
+        if (listLen(secs) > 0) {
+            first = (listGet(secs, 0) ?? CSec { index: 0, header: 0, size: 0, ptr: 0, relptr: 0, nrel: 0 }).ptr;
+        }
+        listPush(out, put1("F2", "symbols past end", 8, 4, n - 18 * nsyms + 1));
+        listPush(out, put1("F2", "symbol count max", 12, 4, 4294967295));
+        listPush(out, put1("F2", "symbol count to end+1", 12, 4, (n - symptr) / 18 + 1));
+        listPush(out, put1("F4", "symbols overlap section 0", 8, 4, first));
+        listPush(out, put1("F2", "string table size max", strings, 4, 4294967295));
+        listPush(out, put1("F2", "string table size end+1", strings, 4, n - strings + 1));
+        addBound(bounds, 20);
+        addBound(bounds, symptr);
+        addBound(bounds, strings);
+        addBound(bounds, n);
+        i = 0;
+        while (i <= listLen(secs)) {
+            addBound(bounds, 20 + 40 * i);
+            i = i + 1;
+        }
+        for (s in secs) {
+            addBound(bounds, s.ptr);
+            addBound(bounds, s.ptr + s.size);
+            addBound(bounds, s.relptr + 10 * s.nrel);
+        }
+    }
+    for (b in sortInts(bounds)) {
+        for (d in [-1, 0, 1]) {
+            const cut = b + d;
+            if (0 < cut && cut < n) {
+                listPush(out, Mut { fam: "F6", how: "truncate@" + toStr(cut), puts: 0, at1: 0, w1: 0, v1: 0, at2: 0, w2: 0, v2: 0, cut: cut });
+            }
+        }
+    }
+    return out;
+}
+
+// random.Random 的 randrange(2^bits)：_randbelow 取 getrandbits(bits+1) 直到小于 2^bits（bits 为 8、16、32、64；64 位按位模式）。
+function belowPow2(r: Ref<Rng>, bits: int): int {
+    while (true) {
+        const k = bits + 1;
+        if (k <= 32) {
+            const v = rngU32(r) >> (32 - k);
+            if (v < (1 << bits)) {
+                return v;
+            }
+        } else if (k == 33) {
+            const w0 = rngU32(r);
+            const w1 = rngU32(r) >> 31;
+            if (w1 == 0) {
+                return w0;
+            }
+        } else {
+            const w0 = rngU32(r);
+            const w1 = rngU32(r);
+            const w2 = rngU32(r) >> 31;
+            if (w2 == 0) {
+                return w0 | (w1 << 32);
+            }
+        }
+    }
+    return 0;
+}
+
+function topOf(w: int): int {
+    if (w >= 8) {
+        return -1;
+    }
+    return (1 << (8 * w)) - 1;
+}
+
+function hexW(v: int, w: int): string {
+    if (w >= 8) {
+        return hxu(v);
+    }
+    return hx(v);
+}
+
+struct Case {
+    fam: string,
+    how: string,
+    data: Bytes,
+}
+
+// F1：一处变异。
+function mutate(r: Ref<Rng>, source: Bytes, fields: List<Field>): Case {
+    const d = bytesSlice(source, 0, bytesLen(source));
+    const pick = rngRandom(r);
+    if (pick < 0.7) {
+        const f = listGet(fields, rngBelow(r, listLen(fields))) ?? Field { at: 0, w: 1 };
+        const top = topOf(f.w);
+        const old = getLE(d, f.at, f.w);
+        const rand = belowPow2(r, 8 * f.w);
+        const choices: List<int> = listNew();
+        listPush(choices, 0);
+        listPush(choices, 1);
+        listPush(choices, top);
+        listPush(choices, wrapSub(top, 1) & top);
+        listPush(choices, wrapAdd(old, 1) & top);
+        listPush(choices, wrapSub(old, 1) & top);
+        listPush(choices, top >>> 1);
+        listPush(choices, wrapAdd(top >>> 1, 1));
+        listPush(choices, rand);
+        const value = listGet(choices, rngBelow(r, 9)) ?? 0;
+        setLE(d, f.at, f.w, value);
+        return Case { fam: "F1", how: "field@" + toStr(f.at) + "/" + toStr(f.w) + "=" + hexW(value, f.w), data: d };
+    }
+    if (pick < 0.9) {
+        const offset = rngBelow(r, bytesLen(d));
+        const value = rngBelow(r, 256);
+        bytesSet(d, offset, value);
+        return Case { fam: "F1", how: "byte@" + toStr(offset) + "=" + hx(value), data: d };
+    }
+    const size = rngBelow(r, bytesLen(d));
+    return Case { fam: "F1", how: "truncate@" + toStr(size), data: bytesSlice(d, 0, size) };
+}
+
+// random.Random(seed).sample(range(n), k) 的下标（同 Python 3：n 不大于集合阈值时用池，否则用已选集合）。
+function sampleIdx(seed: int, n: int, k: int): List<int> {
+    const r = rngNew(seed);
+    let setsize = 21;
+    if (k > 5) {
+        // 4 ** ceil(log(3k, 4))：取不小于 3k 的最小 4 的幂。
+        let p = 1;
+        while (p < 3 * k) {
+            p = p * 4;
+        }
+        setsize = setsize + p;
+    }
+    const out: List<int> = listNew();
+    if (n <= setsize) {
+        const pool: List<int> = listNew();
+        let i = 0;
+        while (i < n) {
+            listPush(pool, i);
+            i = i + 1;
+        }
+        i = 0;
+        while (i < k) {
+            const j = rngBelow(r, n - i);
+            listPush(out, listGet(pool, j) ?? 0);
+            listSet(pool, j, listGet(pool, n - i - 1) ?? 0);
+            i = i + 1;
+        }
+        return out;
+    }
+    const selected: List<bool> = listNew();
+    let i = 0;
+    while (i < n) {
+        listPush(selected, false);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < k) {
+        let j = rngBelow(r, n);
+        while (listGet(selected, j) ?? false) {
+            j = rngBelow(r, n);
+        }
+        listSet(selected, j, true);
+        listPush(out, j);
+        i = i + 1;
+    }
+    return out;
+}
+
+// 按字节回退：把与原样本不同的字节逐个改回，仍失败就保留回退。截断的样本不缩。
+function minimize(c: Ref<Ctx>, probes: List<string>, mode: string, source: Bytes, data: Bytes, second: Bytes): Bytes {
+    if (bytesLen(data) != bytesLen(source)) {
+        return data;
+    }
+    const cur = bytesSlice(data, 0, bytesLen(data));
+    let i = 0;
+    while (i < bytesLen(cur)) {
+        const was = bytesGet(cur, i) ?? 0;
+        const orig = bytesGet(source, i) ?? 0;
+        if (was != orig) {
+            bytesSet(cur, i, orig);
+            if (!stillFails(c, probes, mode, cur, second)) {
+                bytesSet(cur, i, was);
+            }
+        }
+        i = i + 1;
+    }
+    return cur;
+}
+
+function stillFails(c: Ref<Ctx>, probes: List<string>, mode: string, d: Bytes, second: Bytes): bool {
+    const a = link(c, listGet(probes, 0) ?? "", mode, d, second);
+    const b = link(c, listGet(probes, 1) ?? "", mode, d, second);
+    return a.v.kind == "fail" || b.v.kind == "fail" || a.v.kind != b.v.kind;
+}
+
+struct Count {
+    key: string,
+    n: int,
+}
+
+function bump(counts: List<Count>, key: string): void {
+    let i = 0;
+    while (i < listLen(counts)) {
+        const x = listGet(counts, i) ?? Count { key: "", n: 0 };
+        if (x.key == key) {
+            listSet(counts, i, Count { key: key, n: x.n + 1 });
+            return;
+        }
+        i = i + 1;
+    }
+    listPush(counts, Count { key: key, n: 1 });
+}
+
+function sortCounts(xs: List<Count>): List<Count> {
+    const out: List<Count> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+        let k = listLen(out) - 1;
+        while (k > 0 && strLess(x.key, (listGet(out, k - 1) ?? x).key)) {
+            listSet(out, k, listGet(out, k - 1) ?? x);
+            k = k - 1;
+        }
+        listSet(out, k, x);
+    }
+    return out;
+}
+
+function failureText(fs: List<string>): string {
+    let s = "[";
+    let i = 0;
+    for (f in fs) {
+        if (i >= 8) {
+            break;
+        }
+        if (i > 0) {
+            s = s + ", ";
+        }
+        s = s + f;
+        i = i + 1;
+    }
+    return s + "]";
+}
+
+function structuredFuzz(c: Ref<Ctx>, probes: List<string>, cases: int): void {
+    const work = c.work;
+    const modes: []string = ["elf", "pe"];
+    const firsts: List<Bytes> = listNew();
+    const seconds: List<Bytes> = listNew();
+    listPush(firsts, elfObject(false).data);
+    listPush(seconds, elfObject(true).data);
+    listPush(firsts, coffObject(false).data);
+    listPush(seconds, coffObject(true).data);
+    const names: []string = ["standard", "heapcheck"];
+    // 新进程同结果：批前的基线。
+    const baseline: List<string> = listNew();
+    let m = 0;
+    while (m < 2) {
+        const first = listGet(firsts, m) ?? bytesNew(0);
+        const second = listGet(seconds, m) ?? bytesNew(0);
+        let k = 0;
+        while (k < 2) {
+            const l = link(c, listGet(probes, k) ?? "", modes[m], first, second);
+            check(c, "baseline " + modes[m] + " " + names[k] + " links", l.v.kind == "accept", l.v.why);
+            listPush(baseline, l.sha);
+            k = k + 1;
+        }
+        check(c, "baseline " + modes[m] + ": page-heap probe writes the same image", (listGet(baseline, 2 * m) ?? "a") == (listGet(baseline, 2 * m + 1) ?? "b"), "");
+        m = m + 1;
+    }
+    const failures: List<string> = listNew();
+    const counts: List<Count> = listNew();
+    m = 0;
+    while (m < 2) {
+        const mode = modes[m];
+        const first = listGet(firsts, m) ?? bytesNew(0);
+        const second = listGet(seconds, m) ?? bytesNew(0);
+        const rng = rngNew(SEED + m);
+        const list: List<Case> = listNew();
+        const fields = objectFields(mode, first);
+        let k = 0;
+        while (k < cases) {
+            listPush(list, mutate(rng, first, fields));
+            k = k + 1;
+        }
+        const enumerated = families(mode, first);
+        for (fam in ["F2", "F3", "F4", "F5", "F6"]) {
+            const group: List<Mut> = listNew();
+            for (mu in enumerated) {
+                if (mu.fam == fam) {
+                    listPush(group, mu);
+                }
+            }
+            let picked = group;
+            if (listLen(group) > cases) {
+                const seed = SEED + ((byteAt(fam, 1) ?? 48) - 48);
+                picked = listNew();
+                for (j in sampleIdx(seed, listLen(group), cases)) {
+                    listPush(picked, listGet(group, j) ?? put1("", "", 0, 0, 0));
+                }
+            }
+            for (mu in picked) {
+                const d = apply(mu, first);
+                if (!bytesEqual(d, first)) {
+                    listPush(list, Case { fam: fam, how: mu.how, data: d });
+                }
+            }
+        }
+        for (cs in list) {
+            const a = link(c, listGet(probes, 0) ?? "", mode, cs.data, second);
+            const b = link(c, listGet(probes, 1) ?? "", mode, cs.data, second);
+            bump(counts, mode + " " + cs.fam + " " + a.v.kind);
+            const same = a.v.kind == b.v.kind && a.sha == b.sha;
+            if (a.v.kind == "fail" || b.v.kind == "fail" || !same) {
+                const index = listLen(failures);
+                writeFileBytes(nat(join(work, "failure-" + toStr(index) + ".o")), cs.data) catch (e) {};
+                writeFileBytes(nat(join(work, "failure-" + toStr(index) + "-min.o")), minimize(c, probes, mode, first, cs.data, second)) catch (e) {};
+                listPush(failures, "{'mode': '" + mode + "', 'family': '" + cs.fam + "', 'mutation': " + reprStr(cs.how) + ", 'sample': 'failure-"
+                    + toStr(index) + ".o', 'standard': ('" + a.v.kind + "', " + reprStr(a.v.why) + "), 'heapcheck': ('" + b.v.kind + "', " + reprStr(b.v.why) + ")}");
+            }
+        }
+        m = m + 1;
+    }
+    for (x in sortCounts(counts)) {
+        print("  " + x.key + "=" + toStr(x.n));
+    }
+    check(c, "structured object fuzz (seed " + toStr(SEED) + "): every case cleanly rejected or consistently linked, page heap agrees",
+        listLen(failures) == 0, failureText(failures));
+    // 新进程同结果：批后再跑基线。
+    m = 0;
+    while (m < 2) {
+        let k = 0;
+        while (k < 2) {
+            const l = link(c, listGet(probes, k) ?? "", modes[m], listGet(firsts, m) ?? bytesNew(0), listGet(seconds, m) ?? bytesNew(0));
+            check(c, "after the batch, " + modes[m] + " " + names[k] + " gives the baseline image", l.v.kind == "accept" && l.sha == (listGet(baseline, 2 * m + k) ?? ""),
+                l.v.why);
+            k = k + 1;
+        }
+        m = m + 1;
+    }
+}
+
+struct Spot {
+    at: int,
+    w: int,
+}
+
+function txfnSection(d: Bytes, target: string): OSec {
+    for (s in objSections(d, target)) {
+        if (s.name == ".txfn") {
+            return s;
+        }
+    }
+    return OSec { index: -1, header: 0, name: "", at: 0, size: 0, flags: 0, nameAt: 0 };
+}
+
+// stderr 里“失败”之后的第一个词（同 Python 的 re.sub(r'[\s:].*', '', se.split('失败', 1)[-1].strip())[:40]）。
+function rejectWord(se: string): string {
+    let tail = se;
+    const parts = strSplit(se, "失败");
+    if (listLen(parts) > 1) {
+        const b = bytesFromStr(se);
+        const head = listGet(parts, 0) ?? "";
+        const from = len(head) + len("失败");
+        tail = bytesToStr(bytesSlice(b, from, bytesLen(b) - from)) catch "";
+    }
+    tail = stripped(tail);
+    const b = bytesFromStr(tail);
+    let end = 0;
+    while (end < bytesLen(b)) {
+        const ch = bytesGet(b, end) ?? 0;
+        if (isWsByte(ch) || ch == 58) {
+            break;
+        }
+        end = end + 1;
+    }
+    return headChars(bytesToStr(bytesSlice(b, 0, end)) catch "", 40);
+}
+
+// 映射文件在、是 JSON 且 ok 为 true。
+function mapAccepted(mapping: string): bool {
+    if (kindOf(mapping) != 1) {
+        return false;
+    }
+    const doc = jParse(lossyText(readOr(mapping))) catch (e) {
+        return false;
+    };
+    const okv = at(doc, "ok");
+    return okv != None && (okv ?? jNull()).kind == J_BOOL && (okv ?? jNull()).truth;
+}
+
+function countNl(s: string): int {
+    let n = 0;
+    let i = 0;
+    while (i < len(s)) {
+        if ((byteAt(s, i) ?? 0) == 10) {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// F7：.txfn 函数元数据，经 taixu build … --map。夹具由 runtime_function_probe 写出（编译器自己的对象写出端）。
+function txfnFuzz(c: Ref<Ctx>, kernelWindows: string, kernelLinux: string, cases: int): void | Error {
+    const work = c.work;
+    const built = sh(c, c.compiler, strs(["build", "bootstrap/runtime_function_probe.tx", "--toolchain", "--out", nat(join(work, "rf-probe"))]));
+    const fixture = nat(join(work, "rf-fixture"));
+    mkdirs(fixture);
+    if (check(c, "runtime function probe build", built.code == 0, built.text)) {
+        const p = sh(c, nat(join(join(work, "rf-probe"), exeName("runtime_function_probe"))), strs([fixture]));
+        check(c, "runtime function fixture objects", p.code == 0, tailText(p.text, 500));
+    }
+    const basic = nat(join(work, "basic.tx"));
+    writeFileBytes(basic, bytesFromStr("export function main(args: []string): int { print(\"fuzz\"); return 0; }\n"))?;
+    const failures: List<string> = listNew();
+    const counts: List<Count> = listNew();
+    for (target in ["windows", "linux"]) {
+        let suffix = ".o";
+        let kernel = kernelLinux;
+        let triple = "x86_64-linux";
+        let product = "basic";
+        if (target == "windows") {
+            suffix = ".obj";
+            kernel = kernelWindows;
+            triple = "x86_64-windows";
+            product = "basic.exe";
+        }
+        const path = nat(join(fixture, "fixture" + suffix));
+        if (kindOf(path) != 1) {
+            continue;
+        }
+        const source = readOr(path);
+        const md = txfnMetadata(source, target) catch (e) {
+            check(c, "function metadata decodes: " + target, false, e.message);
+            continue;
+        };
+        const base = md.meta.at;
+        const size = md.meta.size;
+        const spots: List<Spot> = listNew();
+        listPush(spots, Spot { at: base + 4, w: 4 });
+        listPush(spots, Spot { at: base + 8, w: 4 });
+        listPush(spots, Spot { at: base + 12, w: 8 });
+        listPush(spots, Spot { at: base + 84, w: 4 });
+        for (r in md.rows) {
+            listPush(spots, Spot { at: r.modelPosition - 4, w: 4 });
+            listPush(spots, Spot { at: r.beginPosition, w: 8 });
+            listPush(spots, Spot { at: r.beginPosition + 8, w: 8 });
+            listPush(spots, Spot { at: r.beginPosition + 16, w: 8 });
+            listPush(spots, Spot { at: r.beginPosition + 24, w: 4 });
+            for (e in r.events) {
+                listPush(spots, Spot { at: e.position, w: 8 });
+                listPush(spots, Spot { at: e.position + 16, w: 1 });
+                listPush(spots, Spot { at: e.position + 17, w: 1 });
+                listPush(spots, Spot { at: e.position + 18, w: 8 });
+            }
+        }
+        let seedAdd = 7;
+        if (target == "linux") {
+            seedAdd = 8;
+        }
+        const rng = rngNew(SEED + seedAdd);
+        const list: List<Case> = listNew();
+        listPush(list, Case { fam: "F7", how: "baseline", data: source });
+        let k = 0;
+        while (k < cases) {
+            const d = bytesSlice(source, 0, bytesLen(source));
+            const sp = listGet(spots, rngBelow(rng, listLen(spots))) ?? Spot { at: 0, w: 1 };
+            const top = topOf(sp.w);
+            const rand = belowPow2(rng, 8 * sp.w);
+            const choices: List<int> = listNew();
+            listPush(choices, 0);
+            listPush(choices, 1);
+            listPush(choices, top);
+            listPush(choices, wrapSub(top, 1) & top);
+            listPush(choices, top >>> 1);
+            listPush(choices, wrapAdd(top >>> 1, 1));
+            listPush(choices, rand);
+            const value = listGet(choices, rngBelow(rng, 7)) ?? 0;
+            setLE(d, sp.at, sp.w, value);
+            listPush(list, Case { fam: "F7", how: "txfn@" + toStr(sp.at - base) + "/" + toStr(sp.w) + "=" + hexW(value, sp.w), data: d });
+            k = k + 1;
+        }
+        // 节内截断：把 .txfn 的长度字段改小（节头里的大小），解码器须报截断而不是越界读。
+        const cuts: List<int> = listNew();
+        for (v in [base + 4, base + 8, base + 20, base + 84, base + 88, base + size - 1]) {
+            addBound(cuts, v);
+        }
+        for (r in md.rows) {
+            addBound(cuts, r.beginPosition);
+        }
+        const hdr = txfnSection(source, target).header;
+        for (cutAt in sortInts(cuts)) {
+            const d = bytesSlice(source, 0, bytesLen(source));
+            if (target == "windows") {
+                setLE(d, hdr + 16, 4, cutAt - base);
+            } else {
+                setLE(d, hdr + 32, 8, cutAt - base);
+            }
+            listPush(list, Case { fam: "F7", how: "txfn size cut@" + toStr(cutAt - base), data: d });
+        }
+        for (cs in list) {
+            c.counter = c.counter + 1;
+            const tag = "txfn" + toStr(c.counter);
+            const obj = nat(join(c.runs, tag + suffix));
+            writeFileBytes(obj, cs.data) catch (e) {};
+            const out = nat(join(c.runs, tag));
+            const mapping = nat(join(c.runs, tag + ".json"));
+            // 夹具对象是 x86_64 的（runtime_function_probe 写出）：写明三元组，arm64 宿主上不带架构的 linux、windows 取 aarch64-linux、
+            // aarch64-windows。
+            const l = limited(c, strs([c.compiler, "build", basic, "--target=" + triple, "--out", out, "--link-object", kernel, "--link-object", obj,
+                        "--map", mapping, "--map-format=json"]), c.runs, 120);
+            const prod = nat(join(out, product));
+            let kind = "fail";
+            if (len(l.note) > 0 || !l.hasCode || (l.code != 0 && l.code != 1)) {
+                kind = "fail";
+            } else if (l.code == 1) {
+                if (startsWith(l.err, "driver:") && countNl(l.err) <= 1 && kindOf(mapping) == 0 && kindOf(prod) == 0) {
+                    kind = "reject";
+                }
+            } else if (mapAccepted(mapping) && kindOf(prod) == 1) {
+                kind = "accept";
+            }
+            if (cs.how == "baseline") {
+                let code = "None";
+                if (l.hasCode) {
+                    code = toStr(l.code);
+                }
+                check(c, "function metadata baseline links with a map: " + target, kind == "accept", "(" + code + ", " + reprStr(tailText(l.err, 300)) + ", "
+                    + reprStr(l.note) + ")");
+            } else {
+                let label = kind;
+                if (kind == "reject") {
+                    label = "reject " + rejectWord(l.err);
+                }
+                bump(counts, target + " " + label);
+                if (kind == "fail") {
+                    const keep = "txfn-failure-" + toStr(listLen(failures)) + suffix;
+                    writeFileBytes(nat(join(work, keep)), cs.data) catch (e) {};
+                    let code = "None";
+                    if (l.hasCode) {
+                        code = toStr(l.code);
+                    }
+                    listPush(failures, "{'target': '" + target + "', 'mutation': " + reprStr(cs.how) + ", 'sample': '" + keep + "', 'exit': " + code
+                        + ", 'note': " + reprStr(l.note) + ", 'stderr': " + reprStr(tailText(l.err, 300)) + "}");
+                }
+            }
+            removeTree(out);
+            removeFile(obj) catch (e) {};
+            removeFile(mapping) catch (e) {};
+        }
+    }
+    let total = 0;
+    for (x in sortCounts(counts)) {
+        print("  txfn " + x.key + "=" + toStr(x.n));
+        total = total + x.n;
+    }
+    check(c, "function metadata fuzz (seed " + toStr(SEED + 7) + "): every case cleanly rejected or linked with a map", total > 0 && listLen(failures) == 0,
+        failureText(failures));
+}
+
+function tailText(s: string, n: int): string {
+    let count = 0;
+    let i = len(s) - 1;
+    while (i >= 0) {
+        const ch = byteAt(s, i) ?? 0;
+        if ((ch & 0xC0) != 0x80) {
+            count = count + 1;
+            if (count == n) {
+                return bytesToStr(bytesSlice(bytesFromStr(s), i, len(s) - i)) catch s;
+            }
+        }
+        i = i - 1;
+    }
+    return s;
+}
+
+function body(c: Ref<Ctx>, cases: int): void | Error {
+    const work = c.work;
+    c.reasons = reasons(c);
+    let shown = "[";
+    let i = 0;
+    for (r in c.reasons) {
+        if (i > 0) {
+            shown = shown + ", ";
+        }
+        shown = shown + reprStr(r);
+        i = i + 1;
+    }
+    check(c, "rejection reasons extracted from the linker source", listLen(c.reasons) > 30, shown + "]");
+    // 判据的自检（正控制）：每种该判失败的结局都须判失败，干净拒绝与成功须判通过。
+    oracleChecks(c);
+    // 探针：标准内核（--leak-check）与页堆内核。页堆内核由本树的内核生成器生成。生成器在本宿主上跑：Linux 显式给宿主架构的目标，
+    // Windows 与 macOS 取宿主缺省（同 test_heap_check.tx；macOS 上给 linux 得 ELF，执行即 ENOEXEC）。
+    let linuxHost = "x86_64-linux";
+    if (hostArch() == "aarch64") {
+        linuxHost = "aarch64-linux";
+    }
+    const tflag: List<string> = listNew();
+    if (hostTarget() == "linux") {
+        listPush(tflag, "--target=" + linuxHost);
+    }
+    const gen = sh(c, c.compiler, plusL(plusL(strs(["build", "bootstrap/runtime_memory_gen.tx", "--toolchain", "--runtime=native"]), tflag),
+            strs(["--out", nat(join(work, "gen"))])));
+    if (!check(c, "kernel generator build", gen.code == 0, gen.text)) {
+        return;
+    }
+    const genExe = nat(join(join(work, "gen"), exeName("runtime_memory_gen")));
+    // 页堆探针按本宿主构建：Apple silicon 的 macOS 上内核与探针都取 aarch64-macos，aarch64 Linux 上取 aarch64-linux（同 test_heap_check.tx）。
+    let host = linuxHost;
+    let hostFlag = tflag;
+    if (hostTarget() == "windows") {
+        host = "x86_64-windows";
+    } else if (hostTarget() == "macos") {
+        host = "aarch64-macos";
+        hostFlag = strs(["--target=aarch64-macos"]);
+    }
+    const knames: []string = ["heapcheck", "windows", "linux"];
+    const ktargets: List<string> = listNew();
+    listPush(ktargets, host);
+    listPush(ktargets, "x86_64-windows");
+    listPush(ktargets, "x86_64-linux");
+    const kernels: List<string> = listNew();
+    let k = 0;
+    while (k < 3) {
+        const kp = nat(join(work, "kernel-" + knames[k] + ".o"));
+        let args = strs(["--target", listGet(ktargets, k) ?? "", kp]);
+        for (f in KERNEL_FLAGS) {
+            listPush(args, f);
+        }
+        if (k == 0) {
+            listPush(args, "--generic=heapcheck");
+        }
+        const g = sh(c, genExe, args);
+        if (!check(c, "kernel " + knames[k], g.code == 0 && kindOf(kp) == 1, g.text)) {
+            return;
+        }
+        listPush(kernels, kp);
+        k = k + 1;
+    }
+    const probes: List<string> = listNew();
+    const pnames: []string = ["standard", "heapcheck"];
+    k = 0;
+    while (k < 2) {
+        let extra = strs(["--leak-check"]);
+        if (k == 1) {
+            extra = strs(["--link-object", listGet(kernels, 0) ?? ""]);
+        }
+        const out = nat(join(work, "probe-" + pnames[k]));
+        const b = sh(c, c.compiler, plusL(plusL(plusL(strs(["build", "bootstrap/native_link_map_probe.tx", "--toolchain"]), hostFlag), extra), strs(["--out", out])));
+        if (!check(c, "link probe build " + pnames[k], b.code == 0, b.text)) {
+            return;
+        }
+        listPush(probes, nat(join(out, exeName("native_link_map_probe"))));
+        k = k + 1;
+    }
+    mkdirs(c.runs);
+    structuredFuzz(c, probes, cases);
+    txfnFuzz(c, listGet(kernels, 1) ?? "", listGet(kernels, 2) ?? "", cases)?;
+}
+
+function finish(c: Ref<Ctx>): int {
+    const report = jObject();
+    jSet(report, "seed", jNumber(SEED));
+    jSet(report, "rows", c.rows);
+    jSet(report, "failed", jNumber(c.bad));
+    writeFileBytes(nat(join(c.work, "object-fuzz.json")), bytesFromStr(jPretty(report, 1))) catch (e) {};
+    if (c.bad == 0) {
+        print("SUMMARY PASS object-fuzz: " + toStr(c.total) + " checks, 0 failed");
+        return 0;
+    }
+    print("SUMMARY FAIL object-fuzz: " + toStr(c.total) + " checks, " + toStr(c.bad) + " failed");
+    return 1;
+}
+
+function digitsOf(s: string): int {
+    let n = 0;
+    let i = 0;
+    if (len(s) == 0) {
+        return -1;
+    }
+    while (i < len(s)) {
+        const ch = byteAt(s, i) ?? 0;
+        if (ch < 48 || ch > 57) {
+            return -1;
+        }
+        n = n * 10 + ch - 48;
+        i = i + 1;
+    }
+    return n;
+}
+
+function run(argv: []string): int | Error {
+    let compiler = "";
+    let work = "";
+    let root = "";
+    let cases = 60;
+    let i = 0;
+    while (i + 1 < len(argv)) {
+        if (argv[i] == "--compiler") {
+            compiler = argv[i + 1];
+        } else if (argv[i] == "--work") {
+            work = argv[i + 1];
+        } else if (argv[i] == "--root") {
+            root = argv[i + 1];
+        } else if (argv[i] == "--cases") {
+            cases = digitsOf(argv[i + 1]);
+        } else {
+            return err("未知参数：" + argv[i]);
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0 || len(work) == 0 || i != len(argv) || cases < 0) {
+        return err("用法：taixu run --toolchain scripts/test_object_fuzz.tx --compiler <taixu> --work <目录> [--cases N] [--root <仓库>]");
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = osRealPath(absolute(nat(root)));
+    compiler = osRealPath(absolute(nat(compiler)));
+    const w = absolute(nat(work));
+    if (kindOf(w) != 0) {
+        removeTree(w);
+    }
+    if (!mkdirs(w)) {
+        return err("建不了工作目录：" + work);
+    }
+    work = osRealPath(w);
+    const c = new Ctx { compiler: compiler, root: root, work: work, runs: nat(join(work, "runs")), rows: jArray(), total: 0, bad: 0, counter: 0,
+        reasons: listNew() };
+    body(c, cases)?;
+    return finish(c);
+}
+
+function main(argv: []string): int {
+    return run(argv) catch (e) {
+        eprint("test_object_fuzz: " + e.message);
+        return 1;
+    };
+}

@@ -1,0 +1,163 @@
+// 测试机上的批量执行器（scripts/remote_batch.tx 把它交叉编成测试机的目标，同产物、清单与用例目录一起送去；
+// 测试机上不需要解释器）。
+//
+// 用法：remote_exec <批目录>
+// 读 <批目录>/manifest.txt（UTF-8，每行一项，字段以制表符分隔，字段内的 \ 制表符 换行写成 \\ \t \n）：
+//   E <名字> <值>                          设环境变量（此后起的产物都带上）
+//   I <键> <产物> <目录> <时限秒> <实参>...  运行 <批目录>/<产物>（正斜杠），工作目录为 <批目录>/trees/<目录>（空即批目录）
+// 逐项写一行结果到标准输出：R <键的十六进制> <退出码> <stdout 的十六进制> <stderr 的十六进制>（全是 ASCII，经测试机的控制台代码页也
+// 不走样）；超时退出码 −1、stderr 为 TIMEOUT，起不了为 −2。
+import { join, nat } from "./build_lib";
+import { Raw, captureRaw } from "./test_lib";
+
+const DRAIN_NS: int = 10000000000;
+const MAX_OUTPUT: int = 268435456;
+const DIGITS: string = "0123456789abcdef";
+
+export function escField(s: string): string {
+    const b = bytesFromStr(s);
+    const out = bytesNew(0);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) ?? 0;
+        if (c == 92) {
+            bytesPush(out, 92);
+            bytesPush(out, 92);
+        } else if (c == 9) {
+            bytesPush(out, 92);
+            bytesPush(out, 116);
+        } else if (c == 10) {
+            bytesPush(out, 92);
+            bytesPush(out, 110);
+        } else {
+            bytesPush(out, c);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(out) catch "";
+}
+
+export function unescField(s: string): string {
+    const b = bytesFromStr(s);
+    const out = bytesNew(0);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) ?? 0;
+        if (c == 92 && i + 1 < bytesLen(b)) {
+            const d = bytesGet(b, i + 1) ?? 0;
+            if (d == 116) {
+                bytesPush(out, 9);
+            } else if (d == 110) {
+                bytesPush(out, 10);
+            } else {
+                bytesPush(out, d);
+            }
+            i = i + 2;
+        } else {
+            bytesPush(out, c);
+            i = i + 1;
+        }
+    }
+    return bytesToStr(out) catch "";
+}
+
+export function hexBytes(b: Bytes): string {
+    const out = bytesNew(0);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) ?? 0;
+        bytesPush(out, byteAt(DIGITS, c >> 4) ?? 48);
+        bytesPush(out, byteAt(DIGITS, c & 15) ?? 48);
+        i = i + 1;
+    }
+    return bytesToStr(out) catch "";
+}
+
+function nibble(c: int): int {
+    if (c >= 48 && c <= 57) {
+        return c - 48;
+    }
+    if (c >= 97 && c <= 102) {
+        return c - 87;
+    }
+    return 0;
+}
+
+export function unhex(s: string): Bytes {
+    const out = bytesNew(0);
+    let i = 0;
+    while (i + 1 < len(s)) {
+        bytesPush(out, nibble(byteAt(s, i) ?? 0) * 16 + nibble(byteAt(s, i + 1) ?? 0));
+        i = i + 2;
+    }
+    return out;
+}
+
+function field(xs: List<string>, i: int): string {
+    return unescField(listGet(xs, i) catch "");
+}
+
+function seconds(s: string): int {
+    let v = 0;
+    let i = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) ?? 0;
+        if (c < 48 || c > 57) {
+            return 120;
+        }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+function runItem(dir: string, xs: List<string>): void {
+    const key = field(xs, 1);
+    const exe = join(dir, field(xs, 2));
+    const tree = field(xs, 3);
+    let cwd = dir;
+    if (len(tree) > 0) {
+        cwd = join(join(dir, "trees"), tree);
+    }
+    const argv: List<string> = listNew();
+    let k = 5;
+    while (k < listLen(xs)) {
+        listPush(argv, field(xs, k));
+        k = k + 1;
+    }
+    const limit = seconds(field(xs, 4)) * 1000000000;
+    const r = captureRaw(nat(exe), argv, nat(cwd), limit, DRAIN_NS, MAX_OUTPUT) catch (e) {
+        print("R\t" + hexBytes(bytesFromStr(key)) + "\t-2\t\t" + hexBytes(bytesFromStr(e.message)));
+        return;
+    };
+    if (r.timedOut) {
+        print("R\t" + hexBytes(bytesFromStr(key)) + "\t-1\t\t" + hexBytes(bytesFromStr("TIMEOUT")));
+        return;
+    }
+    print("R\t" + hexBytes(bytesFromStr(key)) + "\t" + toStr(r.code) + "\t" + hexBytes(r.out) + "\t" + hexBytes(r.err));
+}
+
+function main(args: []string): int {
+    if (len(args) != 1) {
+        eprint("用法：remote_exec <批目录>");
+        return 64;
+    }
+    const dir = args[0];
+    const text = readFile(join(dir, "manifest.txt")) catch (e) {
+        eprint("读不了清单：" + e.message);
+        return 1;
+    };
+    for (line in strSplit(text, "\n")) {
+        const xs = strSplit(line, "\t");
+        const kind = listGet(xs, 0) catch "";
+        if (kind == "E") {
+            setEnv(field(xs, 1), field(xs, 2)) catch (e) {
+                eprint("设不了环境变量 " + field(xs, 1) + "：" + e.message);
+                return 1;
+            };
+        } else if (kind == "I") {
+            runItem(dir, xs);
+        }
+    }
+    return 0;
+}

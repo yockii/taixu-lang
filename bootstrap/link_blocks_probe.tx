@@ -1,0 +1,199 @@
+// 函数块取舍（运行时按需链入，docs/design/v052-runtime-on-demand-link-v0.2-20261108.md）的探针，门步 on-demand-link 运行：
+// 一、link_blocks.tx 的计划与查找（空洞并块与钉住、重叠、空函数、越出节尾、节尾标号、跨块区间）；
+// 二、端到端：用汇编器与 COFF 写出器造一个带函数目录的小内核（入口 → 用到的函数 → 叶函数；另有没人用的函数调 DeleteFileW），
+//     与一个只有 ret 的程序映像经 linkExeObjects 链成 PE，产物写到 args[0]，供门步独立核对：没用到的函数与它的导入不在产物里。
+// 三、整节退路（目标分层 X5e）：rip 相对引用带位移被汇编层拒绝；入口取只读数据里的表，表项是另一个函数的地址加 8（目标不恰是
+//     符号本身），PE 链接器与 ELF 一族共用的链接器都退回整节放入，链接映射各记一处引用。
+// 每项通过打一行 ok <名>，任何一项不合即 assert 失败。
+import { StructuredBuffer, asBufferNew, asBufferInstruction, asBufferFunctionEnd, asBufferSubmit, asManualBegin, asManualLeaf,
+    asStructuredBegin, asStructuredLabel, asStructuredInstruction, asStructuredMissing, asStructuredTarget, asStructuredMem, asStructuredReg,
+    asStructuredSection, asStructuredAddressAddend,
+    asResolveLocalFixups, asFunctionBlocks, asFailedAs, asLastErrAs } from "./selfhost/assemble";
+import { nativeFunctionsEnable, nativeFunctionsSnapshot, NativeFunctionImage } from "./selfhost/native_function_data";
+import { coffCaptureAssembler, coffWriteFunctions, coffResultOk, coffResultBytes, coffResultError } from "./selfhost/emit_coff_storage";
+import { elfWriteObjectFunctions, elfObjectOk, elfObjectBytes, elfObjectError } from "./selfhost/emit_elf_object";
+import { linkExeObjects, exeBytesList, lkGetMissing } from "./selfhost/link_pe";
+import { linkElfObjects, elfDynReset, elfObjectsError } from "./selfhost/link_elf_objects";
+import { linkMapEnable, linkMapData } from "./selfhost/link_map_data";
+import { rawNameText } from "./selfhost/binary_name";
+import { T_X64_LINUX } from "./selfhost/target";
+import { BlockPlan, blockPlan, blockCount, blockBegin, blockEnd, blockPinned, blockAt, blockOfRange } from "./selfhost/link_blocks";
+
+function ints(a: int, b: int, c: int): List<int> {
+    const out: List<int> = listNew(); listPush(out, a); listPush(out, b); if (c >= 0) { listPush(out, c); } return out;
+}
+
+// 计划的形状：各块 起-止，钉住的块带 *。
+function shape(plan: Ref<BlockPlan>): string {
+    if (!plan.ok) { return plan.reason; }
+    let out = ""; let b = 0;
+    while (b < blockCount(plan)) {
+        if (b > 0) { out = out + " "; }
+        out = out + toStr(blockBegin(plan, b)) + "-" + toStr(blockEnd(plan, b));
+        if (blockPinned(plan, b)) { out = out + "*"; }
+        b = b + 1;
+    }
+    return out;
+}
+
+function planCases(): void {
+    const ok = blockPlan(30, ints(0, 10, 20), ints(10, 20, 30));
+    assert(ok.ok && blockCount(ok) == 3, "plan: contiguous directory");
+    assert(blockAt(ok, 0) == 0 && blockAt(ok, 9) == 0 && blockAt(ok, 10) == 1 && blockAt(ok, 29) == 2, "plan: offsets");
+    assert(blockAt(ok, 30) == 2, "plan: label at section end belongs to the last block");
+    assert(blockAt(ok, 31) == -1 && blockAt(ok, -1) == -1, "plan: offsets outside");
+    assert(blockOfRange(ok, 6, 4) == 0 && blockOfRange(ok, 7, 4) == -1 && blockOfRange(ok, 26, 4) == 2 && blockOfRange(ok, 27, 4) == -1, "plan: ranges");
+    assert(!blockPinned(ok, 0) && !blockPinned(ok, 1) && !blockPinned(ok, 2), "plan: contiguous blocks are not pinned");
+    print("ok plan:lookup");
+    // 空洞（目录没登记的字节）并进紧随其后的块并钉住；节尾的空洞并进最后一块。
+    assert(shape(blockPlan(30, ints(0, 12, 20), ints(10, 20, 30))) == "0-10 10-20* 20-30", "plan: gap glued into the next block");
+    assert(shape(blockPlan(30, ints(4, 10, 20), ints(10, 20, 30))) == "0-10* 10-20 20-30", "plan: head gap");
+    assert(shape(blockPlan(30, ints(0, 10, -1), ints(10, 20, -1))) == "0-10 10-30*", "plan: tail gap");
+    assert(blockAt(blockPlan(30, ints(0, 12, 20), ints(10, 20, 30)), 11) == 1, "plan: gap bytes belong to the next block");
+    print("ok plan:glue");
+    assert(blockPlan(30, ints(0, 8, 20), ints(10, 20, 30)).reason == "FunctionDirectoryOverlap", "plan: overlap");
+    assert(blockPlan(30, ints(0, 10, 10), ints(10, 10, 30)).reason == "EmptyFunction", "plan: empty function");
+    assert(blockPlan(30, ints(0, 10, 20), ints(10, 20, 31)).reason == "FunctionOutsideSection", "plan: outside");
+    assert(blockPlan(0, listNew(), listNew()).reason == "EmptySection", "plan: empty section");
+    assert(blockPlan(30, listNew(), listNew()).reason == "NoFunctions", "plan: no functions");
+    print("ok plan:reject");
+}
+
+function op(b: Ref<StructuredBuffer>, mn: string, target: string): void {
+    const none = asStructuredMissing();
+    asBufferInstruction(b, mn, 1, asStructuredTarget(target), none, none, 1);
+}
+
+function ret(b: Ref<StructuredBuffer>): void {
+    const none = asStructuredMissing();
+    asBufferInstruction(b, "ret", 0, none, none, none, 1);
+}
+
+// 小内核：__tx_entry 调 used_a；used_a 调 used_b 再尾跳 used_tail；used_b、used_tail 是叶；unused_c 经导入槽调 DeleteFileW。
+// 目录次序有意让没人用的函数夹在中间。
+function kernel(): Bytes {
+    asStructuredBegin(); asFunctionBlocks(true);
+    nativeFunctionsEnable(true);
+    const b = asBufferNew();
+    const module = "bootstrap/link_blocks_probe.tx";
+    asManualBegin(b, module, "__tx_entry"); asManualLeaf(b); op(b, "call", "used_a"); ret(b); asBufferFunctionEnd(b);
+    asManualBegin(b, module, "unused_c"); asManualLeaf(b);
+    const none = asStructuredMissing();
+    asBufferInstruction(b, "mov", 2, asStructuredReg(0, 0), asStructuredMem(2, -1, -1, 0, 0, 1, "__imp_DeleteFileW"), none, 1);
+    asBufferInstruction(b, "call", 1, asStructuredReg(0, 0), none, none, 1);
+    ret(b); asBufferFunctionEnd(b);
+    asManualBegin(b, module, "used_a"); asManualLeaf(b); op(b, "call", "used_b"); op(b, "jmp", "used_tail"); asBufferFunctionEnd(b);
+    asManualBegin(b, module, "unused_d"); asManualLeaf(b); op(b, "jmp", "unused_c"); asBufferFunctionEnd(b);
+    asManualBegin(b, module, "used_b"); asManualLeaf(b); ret(b); asBufferFunctionEnd(b);
+    asManualBegin(b, module, "used_tail"); asManualLeaf(b); ret(b); asBufferFunctionEnd(b);
+    asBufferSubmit(b);
+    assert(asFailedAs() == 0, "kernel assembly: " + asLastErrAs());
+    const functions = nativeFunctionsSnapshot();
+    assert(functions.ok, "kernel directory: " + functions.error);
+    nativeFunctionsEnable(false);
+    const exports: List<string> = listNew();
+    listPush(exports, "__tx_entry"); listPush(exports, "unused_c"); listPush(exports, "unused_d");
+    const result = coffWriteFunctions(coffCaptureAssembler(), exports, functions);
+    assert(coffResultOk(result) == 1, "kernel object: " + coffResultError(result));
+    return coffResultBytes(result);
+}
+
+// 落空的函数在内核生成时就被拒绝（列出全部落空的函数）。
+function fallThroughRejected(): void {
+    asStructuredBegin(); asFunctionBlocks(true);
+    const b = asBufferNew();
+    const none = asStructuredMissing();
+    asManualBegin(b, "bootstrap/link_blocks_probe.tx", "falls"); asManualLeaf(b);
+    asBufferInstruction(b, "cld", 0, none, none, none, 1); asBufferFunctionEnd(b);
+    asManualBegin(b, "bootstrap/link_blocks_probe.tx", "ends"); asManualLeaf(b); ret(b); asBufferFunctionEnd(b);
+    asBufferSubmit(b);
+    assert(asFailedAs() != 0 && asLastErrAs() == "FunctionFallsThrough: falls", "fall-through rejected: " + asLastErrAs());
+    print("ok generator:fall-through");
+}
+
+// 带偏移的引用的小内核：__tx_entry 取只读数据 offset_table 的地址后返回，表里一项是 far_d＋8 的绝对地址（引用带偏移）；far_c 没人
+// 用。x86 的 rip 相对引用只编符号本身（带位移的被拒绝，先核对这一点），带偏移的引用只能出自数据里的地址项。elf 为真时写 ELF 可
+// 重定位对象，否则写 COFF。
+function offsetKernel(elf: bool): Bytes {
+    asStructuredBegin(); asFunctionBlocks(true);
+    const none = asStructuredMissing();
+    asStructuredMem(2, -1, -1, 0, 8, 1, "far_d");
+    assert(asFailedAs() != 0 && asLastErrAs() == "BadOperand", "rip-relative displacement rejected: " + asLastErrAs());
+    asStructuredBegin(); asFunctionBlocks(true);
+    nativeFunctionsEnable(true);
+    const b = asBufferNew();
+    const module = "bootstrap/link_blocks_probe.tx";
+    asManualBegin(b, module, "__tx_entry"); asManualLeaf(b);
+    asBufferInstruction(b, "lea", 2, asStructuredReg(0, 0), asStructuredMem(2, -1, -1, 0, 0, 1, "offset_table"), none, 1);
+    ret(b); asBufferFunctionEnd(b);
+    asManualBegin(b, module, "far_c"); asManualLeaf(b); ret(b); asBufferFunctionEnd(b);
+    asManualBegin(b, module, "far_d"); asManualLeaf(b); ret(b); asBufferFunctionEnd(b);
+    asBufferSubmit(b);
+    asStructuredSection(1); asStructuredLabel("offset_table"); asStructuredAddressAddend("far_d", 8);
+    assert(asFailedAs() == 0, "offset kernel assembly: " + asLastErrAs());
+    const functions = nativeFunctionsSnapshot();
+    assert(functions.ok, "offset kernel directory: " + functions.error);
+    nativeFunctionsEnable(false);
+    const exports: List<string> = listNew();
+    listPush(exports, "__tx_entry"); listPush(exports, "far_c"); listPush(exports, "far_d");
+    if (elf) {
+        const object = elfWriteObjectFunctions(exports, functions);
+        assert(elfObjectOk(object) == 1, "offset kernel ELF object: " + elfObjectError(object));
+        return elfObjectBytes(object);
+    }
+    const result = coffWriteFunctions(coffCaptureAssembler(), exports, functions);
+    assert(coffResultOk(result) == 1, "offset kernel COFF object: " + coffResultError(result));
+    return coffResultBytes(result);
+}
+
+// 链接映射恰记一处整节退路：引用处是内核只读数据节里表项的偏移 0，所指符号 far_d，被整节放入的是内核的代码节；三个函数块都放入
+// （far_c 是退路带进来的）。
+function fallbackRecorded(name: string): void {
+    const d = linkMapData();
+    let blocks = 0;
+    for (p in d.placements) { if (p.objectIndex == 0 && p.functionIndex >= 0) { blocks = blocks + 1; } }
+    assert(listLen(d.fallbacks) == 1, name + ": fallbacks " + toStr(listLen(d.fallbacks)) + ", placed blocks " + toStr(blocks) + ", placements " + toStr(listLen(d.placements)));
+    for (f in d.fallbacks) {
+        assert(rawNameText(f.name) == "far_d" && f.objectIndex == 0 && f.offset == 0 && f.addend == 8 && f.targetObject == 0 && f.targetSection != f.inputSection,
+            name + ": fallback " + rawNameText(f.name) + " " + toStr(f.objectIndex) + ":" + toStr(f.inputSection) + "+" + toStr(f.offset) + " → " + toStr(f.targetObject) + ":" + toStr(f.targetSection));
+    }
+    assert(blocks == 3, name + ": placed blocks " + toStr(blocks));
+    print("ok fallback:" + name);
+}
+
+function offsetCases(): void {
+    const coff = offsetKernel(false);
+    asStructuredBegin();
+    asStructuredLabel("main");
+    asStructuredInstruction("ret", 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1);
+    asResolveLocalFixups();
+    linkMapEnable(true);
+    const status = linkExeObjects(coff, 0, listNew(), new NativeFunctionImage { ok: false, error: "", isa: "", functions: listNew() });
+    assert(status == 0, "offset link (PE): " + lkGetMissing());
+    fallbackRecorded("pe");
+    linkMapEnable(false);
+    const objects: List<Bytes> = listNew();
+    listPush(objects, offsetKernel(true));
+    elfDynReset();
+    linkMapEnable(true);
+    assert(linkElfObjects(objects, "__tx_entry", T_X64_LINUX) == 0, "offset link (ELF): " + elfObjectsError());
+    fallbackRecorded("elf");
+    linkMapEnable(false);
+}
+
+export function main(args: []string): int {
+    if (len(args) != 1) { eprint("用法：link_blocks_probe <产物路径>"); return 64; }
+    planCases();
+    fallThroughRejected();
+    const object = kernel();
+    asStructuredBegin();
+    asStructuredLabel("main");
+    asStructuredInstruction("ret", 0, asStructuredMissing(), asStructuredMissing(), asStructuredMissing(), 1);
+    asResolveLocalFixups();
+    const status = linkExeObjects(object, 0, listNew(), new NativeFunctionImage { ok: false, error: "", isa: "", functions: listNew() });
+    assert(status == 0, "link: " + lkGetMissing());
+    writeFileBytes(args[0], exeBytesList()) catch (e) { eprint(e.message); return 1; };
+    print("ok link:written");
+    offsetCases();
+    return 0;
+}

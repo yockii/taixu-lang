@@ -1,0 +1,809 @@
+// 测试侧的 JSON 解析（判定器与协议客户端不与被测编译器共用 bootstrap/selfhost/json_parse.tx；本文件不导入
+// bootstrap/ 的任何模块）。按 RFC 8259：对象、数组、字符串（含 \uXXXX 与代理对）、数字（保留原文，整数可取值）、true／false／null；
+// 嵌套至多 512 层，尾随内容、控制字符、单独的代理、前导零与多余逗号都报错。对象的重名键以后一个为准（同 Python 的 json）。
+//
+// 用法：const v = jParse(text)?; jGet(v, "rows") → Ref<Jv>?；jAt(v, i)；jLen(v)；jText(v)（字符串值）；jInt(v)；jIsTrue(v)。
+// 协议客户端读服务的回复用 jParseUnique：对象里的重名键报错（同 Python 以 object_pairs_hook 拒绝重名）；jEq 比较两个值（同 Python
+// 的 ==：对象不论键序，数字按值）。
+
+export const J_NULL: int = 0;
+export const J_BOOL: int = 1;
+export const J_NUM: int = 2;
+export const J_STR: int = 3;
+export const J_ARR: int = 4;
+export const J_OBJ: int = 5;
+
+const MAX_DEPTH: int = 512;
+
+export struct Jv {
+    kind: int,
+    // 字符串值，或数字的原文。
+    text: string,
+    truth: bool,
+    items: List<Ref<Jv>>,
+    keys: List<string>,
+}
+
+struct Rd {
+    b: Bytes,
+    at: int,
+    depth: int,
+    unique: bool,
+}
+
+function node(kind: int): Ref<Jv> {
+    return new Jv { kind: kind, text: "", truth: false, items: listNew(), keys: listNew() };
+}
+
+function peek(r: Ref<Rd>): int {
+    return bytesGet(r.b, r.at) ?? -1;
+}
+
+function skipWs(r: Ref<Rd>): void {
+    while (true) {
+        const c = peek(r);
+        if (c == 32 || c == 9 || c == 10 || c == 13) {
+            r.at = r.at + 1;
+        } else {
+            return;
+        }
+    }
+}
+
+function fail(r: Ref<Rd>, what: string): Error {
+    return err("JSON：" + what + "（字节 " + toStr(r.at) + "）");
+}
+
+export function jParse(text: string): Ref<Jv> | Error {
+    return jParseBytes(bytesFromStr(text));
+}
+
+export function jParseBytes(b: Bytes): Ref<Jv> | Error {
+    return parseWith(b, false);
+}
+
+// 同 jParseBytes，对象里出现重名键即报错。
+export function jParseUnique(b: Bytes): Ref<Jv> | Error {
+    return parseWith(b, true);
+}
+
+function parseWith(b: Bytes, unique: bool): Ref<Jv> | Error {
+    const r = new Rd { b: b, at: 0, depth: 0, unique: unique };
+    skipWs(r);
+    const v = value(r)?;
+    skipWs(r);
+    if (r.at != bytesLen(b)) {
+        return fail(r, "值之后还有内容");
+    }
+    return v;
+}
+
+function literal(r: Ref<Rd>, word: string): bool {
+    const n = len(word);
+    let k = 0;
+    while (k < n) {
+        if ((bytesGet(r.b, r.at + k) ?? -1) != (byteAt(word, k) ?? -2)) {
+            return false;
+        }
+        k = k + 1;
+    }
+    r.at = r.at + n;
+    return true;
+}
+
+function value(r: Ref<Rd>): Ref<Jv> | Error {
+    const c = peek(r);
+    if (c == 123) {
+        return object(r);
+    }
+    if (c == 91) {
+        return array(r);
+    }
+    if (c == 34) {
+        const v = node(J_STR);
+        v.text = str(r)?;
+        return v;
+    }
+    if (c == 116 && literal(r, "true")) {
+        const v = node(J_BOOL);
+        v.truth = true;
+        return v;
+    }
+    if (c == 102 && literal(r, "false")) {
+        return node(J_BOOL);
+    }
+    if (c == 110 && literal(r, "null")) {
+        return node(J_NULL);
+    }
+    if (c == 45 || (c >= 48 && c <= 57)) {
+        return number(r);
+    }
+    return fail(r, "不是 JSON 值");
+}
+
+function unit(): void {}
+
+function enter(r: Ref<Rd>): void | Error {
+    r.depth = r.depth + 1;
+    if (r.depth > MAX_DEPTH) {
+        return fail(r, "嵌套超过 " + toStr(MAX_DEPTH) + " 层");
+    }
+    return unit();
+}
+
+function object(r: Ref<Rd>): Ref<Jv> | Error {
+    enter(r)?;
+    r.at = r.at + 1;
+    const v = node(J_OBJ);
+    skipWs(r);
+    if (peek(r) == 125) {
+        r.at = r.at + 1;
+        r.depth = r.depth - 1;
+        return v;
+    }
+    while (true) {
+        skipWs(r);
+        if (peek(r) != 34) {
+            return fail(r, "对象的键须是字符串");
+        }
+        const key = str(r)?;
+        skipWs(r);
+        if (peek(r) != 58) {
+            return fail(r, "缺冒号");
+        }
+        r.at = r.at + 1;
+        skipWs(r);
+        const item = value(r)?;
+        // 重名键以后一个为准。
+        let k = 0;
+        let found = -1;
+        while (k < listLen(v.keys)) {
+            if ((listGet(v.keys, k) catch "") == key) {
+                found = k;
+            }
+            k = k + 1;
+        }
+        if (found >= 0 && r.unique) {
+            return fail(r, "对象里有重名键 " + jQuote(key));
+        }
+        if (found >= 0) {
+            listSet(v.items, found, item);
+        } else {
+            listPush(v.keys, key);
+            listPush(v.items, item);
+        }
+        skipWs(r);
+        const c = peek(r);
+        r.at = r.at + 1;
+        if (c == 125) {
+            r.depth = r.depth - 1;
+            return v;
+        }
+        if (c != 44) {
+            r.at = r.at - 1;
+            return fail(r, "对象成员之间缺逗号或右花括号");
+        }
+    }
+    return v;
+}
+
+function array(r: Ref<Rd>): Ref<Jv> | Error {
+    enter(r)?;
+    r.at = r.at + 1;
+    const v = node(J_ARR);
+    skipWs(r);
+    if (peek(r) == 93) {
+        r.at = r.at + 1;
+        r.depth = r.depth - 1;
+        return v;
+    }
+    while (true) {
+        skipWs(r);
+        listPush(v.items, value(r)?);
+        skipWs(r);
+        const c = peek(r);
+        r.at = r.at + 1;
+        if (c == 93) {
+            r.depth = r.depth - 1;
+            return v;
+        }
+        if (c != 44) {
+            r.at = r.at - 1;
+            return fail(r, "数组元素之间缺逗号或右方括号");
+        }
+    }
+    return v;
+}
+
+function hex4(r: Ref<Rd>): int | Error {
+    let v = 0;
+    let k = 0;
+    while (k < 4) {
+        const c = peek(r);
+        let d = -1;
+        if (c >= 48 && c <= 57) {
+            d = c - 48;
+        } else if (c >= 97 && c <= 102) {
+            d = c - 87;
+        } else if (c >= 65 && c <= 70) {
+            d = c - 55;
+        }
+        if (d < 0) {
+            return fail(r, "\\u 之后须是 4 位十六进制");
+        }
+        v = v * 16 + d;
+        r.at = r.at + 1;
+        k = k + 1;
+    }
+    return v;
+}
+
+function putUtf8(out: Bytes, cp: int): void {
+    if (cp < 0x80) {
+        bytesPush(out, cp);
+    } else if (cp < 0x800) {
+        bytesPush(out, 0xC0 | (cp >> 6));
+        bytesPush(out, 0x80 | (cp & 63));
+    } else if (cp < 0x10000) {
+        bytesPush(out, 0xE0 | (cp >> 12));
+        bytesPush(out, 0x80 | ((cp >> 6) & 63));
+        bytesPush(out, 0x80 | (cp & 63));
+    } else {
+        bytesPush(out, 0xF0 | (cp >> 18));
+        bytesPush(out, 0x80 | ((cp >> 12) & 63));
+        bytesPush(out, 0x80 | ((cp >> 6) & 63));
+        bytesPush(out, 0x80 | (cp & 63));
+    }
+}
+
+// 字符串（r.at 在左引号上）。原文须是合法 UTF-8（整份文本来自 string 时已保证）。
+function str(r: Ref<Rd>): string | Error {
+    r.at = r.at + 1;
+    const out = bytesNew(0);
+    while (true) {
+        const c = peek(r);
+        if (c < 0) {
+            return fail(r, "字符串没有结束");
+        }
+        if (c < 32) {
+            return fail(r, "字符串里有未转义的控制字符");
+        }
+        r.at = r.at + 1;
+        if (c == 34) {
+            break;
+        }
+        if (c != 92) {
+            bytesPush(out, c);
+            continue;
+        }
+        const e = peek(r);
+        r.at = r.at + 1;
+        if (e == 34 || e == 92 || e == 47) {
+            bytesPush(out, e);
+        } else if (e == 98) {
+            bytesPush(out, 8);
+        } else if (e == 102) {
+            bytesPush(out, 12);
+        } else if (e == 110) {
+            bytesPush(out, 10);
+        } else if (e == 114) {
+            bytesPush(out, 13);
+        } else if (e == 116) {
+            bytesPush(out, 9);
+        } else if (e == 117) {
+            let cp = hex4(r)?;
+            if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                return fail(r, "单独的低代理");
+            }
+            if (cp >= 0xD800 && cp <= 0xDBFF) {
+                if (peek(r) != 92 || (bytesGet(r.b, r.at + 1) ?? -1) != 117) {
+                    return fail(r, "高代理之后缺低代理");
+                }
+                r.at = r.at + 2;
+                const lo = hex4(r)?;
+                if (lo < 0xDC00 || lo > 0xDFFF) {
+                    return fail(r, "高代理之后不是低代理");
+                }
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+            }
+            putUtf8(out, cp);
+        } else {
+            r.at = r.at - 1;
+            return fail(r, "不认识的转义");
+        }
+    }
+    const s = bytesToStr(out) catch (e) {
+        return fail(r, "字符串不是合法的 UTF-8");
+    };
+    return s;
+}
+
+function isDigit(c: int): bool {
+    return c >= 48 && c <= 57;
+}
+
+function number(r: Ref<Rd>): Ref<Jv> | Error {
+    const start = r.at;
+    if (peek(r) == 45) {
+        r.at = r.at + 1;
+    }
+    if (peek(r) == 48) {
+        r.at = r.at + 1;
+        if (isDigit(peek(r))) {
+            return fail(r, "数字有前导零");
+        }
+    } else if (isDigit(peek(r))) {
+        while (isDigit(peek(r))) {
+            r.at = r.at + 1;
+        }
+    } else {
+        return fail(r, "负号之后缺数字");
+    }
+    if (peek(r) == 46) {
+        r.at = r.at + 1;
+        if (!isDigit(peek(r))) {
+            return fail(r, "小数点之后缺数字");
+        }
+        while (isDigit(peek(r))) {
+            r.at = r.at + 1;
+        }
+    }
+    if (peek(r) == 101 || peek(r) == 69) {
+        r.at = r.at + 1;
+        if (peek(r) == 43 || peek(r) == 45) {
+            r.at = r.at + 1;
+        }
+        if (!isDigit(peek(r))) {
+            return fail(r, "指数缺数字");
+        }
+        while (isDigit(peek(r))) {
+            r.at = r.at + 1;
+        }
+    }
+    const v = node(J_NUM);
+    v.text = bytesToStr(bytesSlice(r.b, start, r.at - start)) catch "0";
+    return v;
+}
+
+// ---- 取值 ----
+
+export function jGet(v: Ref<Jv>, key: string): Ref<Jv>? {
+    if (v.kind != J_OBJ) {
+        return None;
+    }
+    let k = 0;
+    while (k < listLen(v.keys)) {
+        if ((listGet(v.keys, k) catch "") == key) {
+            const item = listGet(v.items, k) catch v;
+            return item;
+        }
+        k = k + 1;
+    }
+    return None;
+}
+
+export function jAt(v: Ref<Jv>, i: int): Ref<Jv>? {
+    if (v.kind != J_ARR || i < 0 || i >= listLen(v.items)) {
+        return None;
+    }
+    const item = listGet(v.items, i) catch v;
+    return item;
+}
+
+// 数组的元素数、对象的成员数；其余为 0。
+export function jLen(v: Ref<Jv>): int {
+    if (v.kind == J_ARR || v.kind == J_OBJ) {
+        return listLen(v.items);
+    }
+    return 0;
+}
+
+// 字符串值；不是字符串得 None。
+export function jText(v: Ref<Jv>?): string? {
+    if (v == None) {
+        return None;
+    }
+    const x = v ?? node(J_NULL);
+    if (x.kind != J_STR) {
+        return None;
+    }
+    return x.text;
+}
+
+// 整数值（原文须是不带小数与指数的整数且在 int 范围内）；否则得 None。
+export function jInt(v: Ref<Jv>?): int? {
+    if (v == None) {
+        return None;
+    }
+    const x = v ?? node(J_NULL);
+    if (x.kind != J_NUM) {
+        return None;
+    }
+    const t = x.text;
+    let i = 0;
+    let neg = false;
+    if (len(t) > 0 && (byteAt(t, 0) ?? 0) == 45) {
+        neg = true;
+        i = 1;
+    }
+    if (i >= len(t) || len(t) - i > 18) {
+        return None;
+    }
+    let n = 0;
+    while (i < len(t)) {
+        const c = byteAt(t, i) ?? 0;
+        if (!isDigit(c)) {
+            return None;
+        }
+        n = n * 10 + (c - 48);
+        i = i + 1;
+    }
+    if (neg) {
+        return 0 - n;
+    }
+    return n;
+}
+
+export function jIsTrue(v: Ref<Jv>?): bool {
+    if (v == None) {
+        return false;
+    }
+    const x = v ?? node(J_NULL);
+    return x.kind == J_BOOL && x.truth;
+}
+
+export function jIsBool(v: Ref<Jv>?): bool {
+    if (v == None) {
+        return false;
+    }
+    const x = v ?? node(J_NULL);
+    return x.kind == J_BOOL;
+}
+
+// ---- 写出 ----
+
+const HEXD: string = "0123456789abcdef";
+
+// 同 Python 的 json.dumps(v, ensure_ascii=False, separators=(',', ':'))：对象按原有的键序、紧凑、非 ASCII 原样；字符串转义引号、反斜杠、
+// \b \f \n \r \t，其余控制字符写 \u00xx（小写）；数字照原文。
+export function jDump(v: Ref<Jv>): string {
+    const out = bytesNew(0);
+    dumpInto(v, out);
+    return bytesToStr(out) catch "";
+}
+
+export function jQuote(s: string): string {
+    const out = bytesNew(0);
+    quoteInto(s, out);
+    return bytesToStr(out) catch "";
+}
+
+function quoteInto(s: string, out: Bytes): void {
+    const b = bytesFromStr(s);
+    bytesPush(out, 34);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) ?? 0;
+        if (c == 34 || c == 92) {
+            bytesPush(out, 92);
+            bytesPush(out, c);
+        } else if (c == 8) {
+            bytesPush(out, 92);
+            bytesPush(out, 98);
+        } else if (c == 12) {
+            bytesPush(out, 92);
+            bytesPush(out, 102);
+        } else if (c == 10) {
+            bytesPush(out, 92);
+            bytesPush(out, 110);
+        } else if (c == 13) {
+            bytesPush(out, 92);
+            bytesPush(out, 114);
+        } else if (c == 9) {
+            bytesPush(out, 92);
+            bytesPush(out, 116);
+        } else if (c < 32) {
+            bytesPush(out, 92);
+            bytesPush(out, 117);
+            bytesPush(out, 48);
+            bytesPush(out, 48);
+            bytesPush(out, byteAt(HEXD, c >> 4) ?? 48);
+            bytesPush(out, byteAt(HEXD, c & 15) ?? 48);
+        } else {
+            bytesPush(out, c);
+        }
+        i = i + 1;
+    }
+    bytesPush(out, 34);
+}
+
+function dumpInto(v: Ref<Jv>, out: Bytes): void {
+    if (v.kind == J_NULL) {
+        bytesAppend(out, bytesFromStr("null"));
+    } else if (v.kind == J_BOOL) {
+        if (v.truth) {
+            bytesAppend(out, bytesFromStr("true"));
+        } else {
+            bytesAppend(out, bytesFromStr("false"));
+        }
+    } else if (v.kind == J_NUM) {
+        bytesAppend(out, bytesFromStr(v.text));
+    } else if (v.kind == J_STR) {
+        quoteInto(v.text, out);
+    } else if (v.kind == J_ARR) {
+        bytesPush(out, 91);
+        let i = 0;
+        while (i < listLen(v.items)) {
+            if (i > 0) {
+                bytesPush(out, 44);
+            }
+            dumpInto(listGet(v.items, i) catch v, out);
+            i = i + 1;
+        }
+        bytesPush(out, 93);
+    } else {
+        bytesPush(out, 123);
+        let i = 0;
+        while (i < listLen(v.items)) {
+            if (i > 0) {
+                bytesPush(out, 44);
+            }
+            quoteInto(listGet(v.keys, i) catch "", out);
+            bytesPush(out, 58);
+            dumpInto(listGet(v.items, i) catch v, out);
+            i = i + 1;
+        }
+        bytesPush(out, 125);
+    }
+}
+
+// 新的字符串值。
+export function jString(s: string): Ref<Jv> {
+    const v = node(J_STR);
+    v.text = s;
+    return v;
+}
+
+// 把对象里已有的键改成新值（键序不变，同 Python 的 dict 赋值）；没有该键时加在末尾。
+export function jSet(v: Ref<Jv>, key: string, item: Ref<Jv>): void {
+    let k = 0;
+    while (k < listLen(v.keys)) {
+        if ((listGet(v.keys, k) catch "") == key) {
+            listSet(v.items, k, item);
+            return;
+        }
+        k = k + 1;
+    }
+    listPush(v.keys, key);
+    listPush(v.items, item);
+}
+
+// 对象是否有该键。
+export function jHas(v: Ref<Jv>, key: string): bool {
+    return jGet(v, key) != None;
+}
+
+// ---- 构造与另两种写出 ----
+
+export function jObject(): Ref<Jv> {
+    return node(J_OBJ);
+}
+
+export function jArray(): Ref<Jv> {
+    return node(J_ARR);
+}
+
+export function jNull(): Ref<Jv> {
+    return node(J_NULL);
+}
+
+export function jNumber(n: int): Ref<Jv> {
+    const v = node(J_NUM);
+    v.text = toStr(n);
+    return v;
+}
+
+export function jPush(a: Ref<Jv>, item: Ref<Jv>): void {
+    listPush(a.items, item);
+}
+
+// 对象（递归地）按键的码点序排（同 Python 的 sort_keys=True）。得新值，原值不变。
+export function jSorted(v: Ref<Jv>): Ref<Jv> {
+    if (v.kind == J_ARR) {
+        const a = node(J_ARR);
+        for (x in v.items) {
+            listPush(a.items, jSorted(x));
+        }
+        return a;
+    }
+    if (v.kind != J_OBJ) {
+        return v;
+    }
+    const o = node(J_OBJ);
+    const order: List<int> = listNew();
+    let k = 0;
+    while (k < listLen(v.keys)) {
+        // 插入排序（键数不多）：按 UTF-8 字节序，即码点序。
+        const key = listGet(v.keys, k) catch "";
+        let at = listLen(order);
+        listPush(order, k);
+        while (at > 0 && byteLess(key, listGet(v.keys, listGet(order, at - 1) catch 0) catch "")) {
+            listSet(order, at, listGet(order, at - 1) catch 0);
+            at = at - 1;
+        }
+        listSet(order, at, k);
+        k = k + 1;
+    }
+    for (i in order) {
+        listPush(o.keys, listGet(v.keys, i) catch "");
+        listPush(o.items, jSorted(listGet(v.items, i) catch v));
+    }
+    return o;
+}
+
+function byteLess(a: string, b: string): bool {
+    let i = 0;
+    while (i < len(a) && i < len(b)) {
+        const x = byteAt(a, i) ?? 0;
+        const y = byteAt(b, i) ?? 0;
+        if (x != y) {
+            return x < y;
+        }
+        i = i + 1;
+    }
+    return len(a) < len(b);
+}
+
+// 同 Python 的 json.dumps(v, ensure_ascii=False)（缺省分隔符 ', ' 与 ': '，单行）。
+export function jDumpSpaced(v: Ref<Jv>): string {
+    const out = bytesNew(0);
+    spacedInto(v, out);
+    return bytesToStr(out) catch "";
+}
+
+function spacedInto(v: Ref<Jv>, out: Bytes): void {
+    if (v.kind == J_ARR) {
+        bytesPush(out, 91);
+        let i = 0;
+        while (i < listLen(v.items)) {
+            if (i > 0) {
+                bytesAppend(out, bytesFromStr(", "));
+            }
+            spacedInto(listGet(v.items, i) catch v, out);
+            i = i + 1;
+        }
+        bytesPush(out, 93);
+    } else if (v.kind == J_OBJ) {
+        bytesPush(out, 123);
+        let i = 0;
+        while (i < listLen(v.items)) {
+            if (i > 0) {
+                bytesAppend(out, bytesFromStr(", "));
+            }
+            quoteInto(listGet(v.keys, i) catch "", out);
+            bytesAppend(out, bytesFromStr(": "));
+            spacedInto(listGet(v.items, i) catch v, out);
+            i = i + 1;
+        }
+        bytesPush(out, 125);
+    } else {
+        dumpInto(v, out);
+    }
+}
+
+// 同 Python 的 json.dumps(v, ensure_ascii=False, indent=n)：每层缩进 n 个空格，元素与成员各占一行（分隔符 ',' 与 ': '），空对象、
+// 空数组写 {}、[]；不另排键（要排先 jSorted）。
+export function jPretty(v: Ref<Jv>, n: int): string {
+    const out = bytesNew(0);
+    prettyInto(v, n, 0, out);
+    return bytesToStr(out) catch "";
+}
+
+function newline(out: Bytes, n: int, level: int): void {
+    bytesPush(out, 10);
+    let k = 0;
+    while (k < n * level) {
+        bytesPush(out, 32);
+        k = k + 1;
+    }
+}
+
+function prettyInto(v: Ref<Jv>, n: int, level: int, out: Bytes): void {
+    if (v.kind == J_ARR || v.kind == J_OBJ) {
+        if (listLen(v.items) == 0) {
+            if (v.kind == J_ARR) {
+                bytesAppend(out, bytesFromStr("[]"));
+            } else {
+                bytesAppend(out, bytesFromStr("{}"));
+            }
+            return;
+        }
+        if (v.kind == J_ARR) {
+            bytesPush(out, 91);
+        } else {
+            bytesPush(out, 123);
+        }
+        let i = 0;
+        while (i < listLen(v.items)) {
+            if (i > 0) {
+                bytesPush(out, 44);
+            }
+            newline(out, n, level + 1);
+            if (v.kind == J_OBJ) {
+                quoteInto(listGet(v.keys, i) catch "", out);
+                bytesAppend(out, bytesFromStr(": "));
+            }
+            prettyInto(listGet(v.items, i) catch v, n, level + 1, out);
+            i = i + 1;
+        }
+        newline(out, n, level);
+        if (v.kind == J_ARR) {
+            bytesPush(out, 93);
+        } else {
+            bytesPush(out, 125);
+        }
+        return;
+    }
+    dumpInto(v, out);
+}
+
+// ---- 比较 ----
+
+// 两个值相等（同 Python 解析后的 ==）：对象的成员一一相等、不论键序；数组逐项相等；数字按值（整数比整数，其余比规范化的原文）。
+export function jEq(a: Ref<Jv>, b: Ref<Jv>): bool {
+    if (a.kind != b.kind) {
+        return false;
+    }
+    if (a.kind == J_NULL) {
+        return true;
+    }
+    if (a.kind == J_BOOL) {
+        return a.truth == b.truth;
+    }
+    if (a.kind == J_STR) {
+        return a.text == b.text;
+    }
+    if (a.kind == J_NUM) {
+        const x = jInt(a);
+        const y = jInt(b);
+        if (x != None && y != None) {
+            return (x ?? 0) == (y ?? 1);
+        }
+        return numText(a.text) == numText(b.text);
+    }
+    if (listLen(a.items) != listLen(b.items)) {
+        return false;
+    }
+    let i = 0;
+    while (i < listLen(a.items)) {
+        const x = listGet(a.items, i) catch a;
+        if (a.kind == J_ARR) {
+            const y = listGet(b.items, i) catch a;
+            if (!jEq(x, y)) {
+                return false;
+            }
+        } else {
+            const y = jGet(b, listGet(a.keys, i) catch "");
+            if (y == None || !jEq(x, y ?? a)) {
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 非整数数字的比较用原文：去掉小数部分末尾的 0 与随之空出的小数点（7.250 与 7.25 同；指数形态照原文比）。
+function numText(t: string): string {
+    if (strIndexOf(t, ".") < 0 || strIndexOf(t, "e") >= 0 || strIndexOf(t, "E") >= 0) {
+        return t;
+    }
+    let n = len(t);
+    while (n > 0 && (byteAt(t, n - 1) ?? 0) == 48) {
+        n = n - 1;
+    }
+    if (n > 0 && (byteAt(t, n - 1) ?? 0) == 46) {
+        n = n - 1;
+    }
+    return strSub(t, 0, n);
+}

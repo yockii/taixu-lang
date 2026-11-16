@@ -1,0 +1,201 @@
+// 调试构建的变量表门。§六。
+//
+// 以 --toolchain 构建 bootstrap/selfhost/dbg-vars-probe.tx，再对几个程序运行它。探针把程序按调试构建编到 ProgramContext（不出产物），
+// 对每个有变量的函数列出每个语句检查点（callbi 3073）可见的变量（name@slot:type），另加一行 all 列出记下的全部变量（只由表达式构成的
+// switch 臂没有语句检查点）。输出须与金文件逐字节相同，每个目标的前端各一次（windows 与 linux 给出同一张表）。
+//
+// 探针的环境照传本进程的 TAIXU_*（setEnv 只能设不能删）——探针不读环境变量，前端只在导入标准库或 GUI 库时读 TAIXU_STDLIB、
+// TAIXU_GUI_ROOT，三个用例都不导入。未给 --work 时自建的临时目录用后删除。
+//
+// 运行（仓根）：taixu run --toolchain scripts/test_native_debug_vars.tx --compiler <taixu> [--work <目录>]
+// 任何 FAIL 时退出码 1。
+import { absolute, deleteTree, exeName, join, kindOf, mkdirs, nat, readBytes } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { captureRaw } from "./test_lib";
+import { crlf, reprStr, tailChars } from "./test_text";
+import { lossyText } from "./check_lib";
+
+const SEC: int = 1000000000;
+const MAX_OUTPUT: int = 1073741824;
+const SOURCES: []string = ["tests/debug/native/vars.tx", "tests/debug/native/gen.tx", "tests/debug/async.tx"];
+const GOLDENS: []string = ["tests/debug/native/vars.dbgvars", "tests/debug/native/gen.dbgvars", "tests/debug/native/async.dbgvars"];
+
+function args(xs: []string): List<string> {
+    const out: List<string> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+    }
+    return out;
+}
+
+// 文件名去掉目录与扩展名（同 Path.stem）。
+function stem(p: string): string {
+    let s = p;
+    let i = len(s) - 1;
+    while (i >= 0) {
+        if ((byteAt(s, i) ?? 0) == 47) {
+            s = bytesToStr(bytesSlice(bytesFromStr(s), i + 1, len(s) - i - 1)) catch s;
+            break;
+        }
+        i = i - 1;
+    }
+    i = len(s) - 1;
+    while (i > 0) {
+        if ((byteAt(s, i) ?? 0) == 46) {
+            return bytesToStr(bytesSlice(bytesFromStr(s), 0, i)) catch s;
+        }
+        i = i - 1;
+    }
+    return s;
+}
+
+function sameBytes(a: Bytes, b: Bytes): bool {
+    if (bytesLen(a) != bytesLen(b)) {
+        return false;
+    }
+    let i = 0;
+    while (i < bytesLen(a)) {
+        if ((bytesGet(a, i) ?? 0) != (bytesGet(b, i) ?? 1)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Python 的 '%r'：在范围内的行写 repr，越界写 None。
+function lineRepr(lines: List<string>, i: int): string {
+    if (i < listLen(lines)) {
+        return reprStr(listGet(lines, i) catch "");
+    }
+    return "None";
+}
+
+function pad(s: string, w: int): string {
+    let t = s;
+    while (len(t) < w) {
+        t = t + " ";
+    }
+    return t;
+}
+
+// 对一个前端运行探针、与金文件比较并输出该项；通过为真。
+function runFront(probe: string, root: string, src: string, front: string, want: Bytes): bool {
+    const label = stem(src) + ":" + front;
+    const r = captureRaw(probe, args([src, front]), root, 600 * SEC, 10 * SEC, MAX_OUTPUT) catch (e) {
+        print("FAIL  " + pad(label, 20) + " " + e.message);
+        return false;
+    };
+    const got = crlf(r.out);
+    if (r.code == 0 && sameBytes(got, want)) {
+        print("PASS  " + label);
+        return true;
+    }
+    const gl = strSplit(lossyText(got), "\n");
+    const wl = strSplit(lossyText(want), "\n");
+    let n = 0;
+    while (n < listLen(gl) && n < listLen(wl) && (listGet(gl, n) catch "") == (listGet(wl, n) catch "")) {
+        n = n + 1;
+    }
+    print("FAIL  " + pad(label, 20) + " exit=" + toStr(r.code) + " line " + toStr(n + 1) + ": got " + lineRepr(gl, n) + " want " + lineRepr(wl, n)
+        + " stderr=" + reprStr(tailChars(lossyText(r.err), 300)));
+    return false;
+}
+
+function freshDir(prefix: string): string | Error {
+    const base = osRealPath(tempDir());
+    let k = 0;
+    while (k < 1000) {
+        const p = nat(join(base, prefix + toStr(monoNs() % 1000000000) + "-" + toStr(k)));
+        if (kindOf(p) == 0) {
+            makeDir(p)?;
+            return p;
+        }
+        k = k + 1;
+    }
+    return err("建不了临时目录 " + prefix);
+}
+
+function main(argv: []string): int {
+    let compiler = "";
+    let work = "";
+    let root = "";
+    let i = 0;
+    while (i + 1 < len(argv)) {
+        if (argv[i] == "--compiler") {
+            compiler = argv[i + 1];
+        } else if (argv[i] == "--work") {
+            work = argv[i + 1];
+        } else if (argv[i] == "--root") {
+            root = argv[i + 1];
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0) {
+        eprint("用法：taixu run --toolchain scripts/test_native_debug_vars.tx --compiler <taixu> [--work <目录>]");
+        return 2;
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = absolute(nat(root));
+    compiler = absolute(nat(compiler));
+    let ownWork = false;
+    if (len(work) == 0) {
+        work = freshDir("tx-dbgvars-") catch (e) {
+            eprint(e.message);
+            return 2;
+        };
+        ownWork = true;
+    } else {
+        work = absolute(nat(work));
+        mkdirs(work);
+    }
+    const out = nat(join(work, "probe"));
+    if (kindOf(out) == 2) {
+        deleteTree(out);
+    }
+    const b = captureRaw(compiler, args(["build", "bootstrap/selfhost/dbg-vars-probe.tx", "--toolchain", "--out", out]), root, 1200 * SEC, 10 * SEC,
+        MAX_OUTPUT) catch (e) {
+        print("FAIL  probe-build          " + e.message);
+        print("SUMMARY FAIL=1 (1 checks)");
+        return 1;
+    };
+    const probe = nat(join(out, exeName("dbg-vars-probe")));
+    if (b.code != 0 || kindOf(probe) != 1) {
+        const both = bytesNew(0);
+        bytesAppend(both, b.out);
+        bytesAppend(both, b.err);
+        print("FAIL  probe-build          " + tailChars(lossyText(both), 600));
+        print("SUMMARY FAIL=1 (1 checks)");
+        return 1;
+    }
+    print("PASS  probe-build");
+    let fails = 0;
+    let total = 1;
+    let k = 0;
+    while (k < 3) {
+        const src = SOURCES[k];
+        const want = readBytes(nat(join(root, GOLDENS[k]))) catch bytesNew(0);
+        const fronts: []string = ["windows", "linux"];
+        for (front in fronts) {
+            total = total + 1;
+            if (!runFront(probe, root, src, front, want)) {
+                fails = fails + 1;
+            }
+        }
+        k = k + 1;
+    }
+    if (ownWork) {
+        deleteTree(work);
+    }
+    let verdict = "PASS";
+    if (fails > 0) {
+        verdict = "FAIL=" + toStr(fails);
+    }
+    print("SUMMARY " + verdict + " (" + toStr(total) + " checks)");
+    if (fails > 0) {
+        return 1;
+    }
+    return 0;
+}

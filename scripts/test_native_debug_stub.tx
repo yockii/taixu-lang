@@ -1,0 +1,1066 @@
+// 调试构建的薄桩门。§四-4。
+//
+// 以 `taixu build --debug` 构建 tests/debug 下的程序，带私有控制通道起产物（procSpawn 的控制通道，经 TAIXU_DEBUG_CHANNEL 交给子进程），
+// 按二进制协议驱动薄桩：
+//   产物 → 客户端：HELLO 1、STOP 2、TIMEOUT 3、FRAMES 回复 4、READ 回复 5
+//   客户端 → 产物：ARM 10（fn、pc、值）、RUN 11（模式 0 continue／1 into／2 over／3 out，期限毫秒）、FRAMES 12、READ 13（地址、长度）、
+//                  PAUSE 14（运行中）
+// 每帧为 u32 小端长度、u8 操作码与若干 u64 小端字段。客户端不知道名字：经 READ 读程序映像（`__tx_nrt_image`，地址在 HELLO 里），据此
+// 把模块与源码行映射到 (函数, pc)、把 pc 映射回行。各场景核对确切的停点序列（原因、行、深度）、程序的 stdout 与退出码；另核对 FRAMES、
+// 经 READ 读到的槽值、读无效地址（0 字节，产物照常运行）、continue 的期限（TIMEOUT，退出码 3）、通道关闭（退出码 3）、main 之外的
+// 线程从不停下；运行中 ARM 立即生效、PAUSE 停下（原因 3）、停着时的 PAUSE 被忽略；工具链程序（tests/debug/native/ctl-driver.tx，
+// --toolchain 构建）经 procSpawn 的控制通道驱动调试产物；TAIXU_DEBUG_CHANNEL 指向的不是管道时产物照无通道运行。
+//
+// 结束时 procCloseStream(h, 3) 关掉控制通道的两端（产物此后不再写通道）。产物的环境照传本进程的 TAIXU_*（setEnv 不能删变量）：
+// bogus 场景把 TAIXU_DEBUG_CHANNEL 设为 99,98，之后改回原值（原先没有则设为空串，薄桩不认空串）。FAIL 行里的停点序列、帧、退出码与
+// 输出照 Python 的 repr 写。未给 --work 时自建的临时目录用后删除。
+//
+// 运行（仓根）：taixu run --toolchain scripts/test_native_debug_stub.tx --compiler <taixu> [--work <目录>] [场景 ...]
+// 任何 FAIL 时退出码 1。
+import { absolute, deleteTree, exeName, join, kindOf, mkdirs, nat } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { captureRaw } from "./test_lib";
+import { reprBytes, reprStr, tailChars } from "./test_text";
+import { hexOf, lossyText } from "./check_lib";
+
+const SEC: int = 1000000000;
+const MS: int = 1000000;
+const TIMEOUT_MS: int = 30000;
+const MAX_OUTPUT: int = 1073741824;
+const CHANNEL: string = "TAIXU_DEBUG_CHANNEL";
+
+const OP_HELLO: int = 1;
+const OP_STOP: int = 2;
+const OP_TIMEOUT: int = 3;
+const OP_FRAMES_R: int = 4;
+const OP_READ_R: int = 5;
+const OP_ARM: int = 10;
+const OP_RUN: int = 11;
+const OP_FRAMES: int = 12;
+const OP_READ: int = 13;
+const OP_PAUSE: int = 14;
+const CONTINUE: int = 0;
+const INTO: int = 1;
+const OVER: int = 2;
+const OUT: int = 3;
+const BREAKPOINT: int = 1;
+const STEP: int = 2;
+const PAUSE: int = 3;
+
+struct Ctx {
+    compiler: string,
+    root: string,
+    work: string,
+    built: Map<string, string>,
+}
+
+struct Row {
+    label: string,
+    ok: bool,
+    detail: string,
+}
+
+function row(label: string, ok: bool, detail: string): Row {
+    return Row { label: label, ok: ok, detail: detail };
+}
+
+function one(label: string, ok: bool, detail: string): List<Row> {
+    const xs: List<Row> = listNew();
+    listPush(xs, row(label, ok, detail));
+    return xs;
+}
+
+// ---------------------------------------------------------------- 字节
+
+function u64(b: Bytes, off: int): int {
+    return bytesGetLE<int>(b, off) ?? 0;
+}
+
+// 无符号的 u64 在太虚的 int 里为负时照原样（比较与打印只用于同一来源的值）。
+function packFields(op: int, fields: List<int>): Bytes {
+    const body = bytesNew(1 + 8 * listLen(fields));
+    bytesSet(body, 0, op);
+    let i = 0;
+    for (v in fields) {
+        bytesSetLE<int>(body, 1 + 8 * i, v);
+        i = i + 1;
+    }
+    const out = bytesNew(4);
+    bytesSetLE<u32>(out, 0, bytesLen(body) as u32);
+    bytesAppend(out, body);
+    return out;
+}
+
+function noInts(): List<int> {
+    const out: List<int> = listNew();
+    return out;
+}
+
+function ints(xs: []int): List<int> {
+    const out: List<int> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------- 一次产物运行
+
+struct Session {
+    h: int,
+    channel: bool,
+    out: Bytes,
+    err: Bytes,
+    ctl: Bytes,
+    outOpen: bool,
+    errOpen: bool,
+    ctlOpen: bool,
+    frames: List<Bytes>,
+    buf: Bytes,
+}
+
+// 一帧：操作码与载荷；流尾时 op 为 −1。
+struct Frame {
+    op: int,
+    payload: Bytes,
+}
+
+function session(exe: string, channel: bool): Ref<Session> | Error {
+    let flags = 0;
+    if (channel) {
+        flags = 2;
+    }
+    const noArgs: List<string> = listNew();
+    const h = procSpawn(exe, noArgs, dirOfExe(exe), flags)?;
+    const frames: List<Bytes> = listNew();
+    return new Session { h: h, channel: channel, out: bytesNew(0), err: bytesNew(0), ctl: bytesNew(0), outOpen: true, errOpen: true,
+        ctlOpen: channel, frames: frames, buf: bytesNew(65536) };
+}
+
+function dirOfExe(exe: string): string {
+    let i = len(exe) - 1;
+    while (i >= 0) {
+        const c = byteAt(exe, i) ?? 0;
+        if (c == 47 || c == 92) {
+            return bytesToStr(bytesSlice(bytesFromStr(exe), 0, i)) catch ".";
+        }
+        i = i - 1;
+    }
+    return ".";
+}
+
+// 至多等 ms 毫秒，读进可读的流（stdout、stderr 原样收，控制通道切帧）。
+function pump(s: Ref<Session>, ms: int): void {
+    let mask = 0;
+    if (s.outOpen) {
+        mask = mask | 2;
+    }
+    if (s.errOpen) {
+        mask = mask | 4;
+    }
+    if (s.ctlOpen) {
+        mask = mask | 8;
+    }
+    if (mask == 0) {
+        const w = procWait(s.h, ms);
+        return;
+    }
+    const ready = ioWait(s.h, mask, ms);
+    if ((ready & 2) != 0) {
+        const n = procRead(s.h, 1, s.buf);
+        if (n < 0) {
+            s.outOpen = false;
+        } else if (n > 0) {
+            bytesAppend(s.out, bytesSlice(s.buf, 0, n));
+        }
+    }
+    if ((ready & 4) != 0) {
+        const n = procRead(s.h, 2, s.buf);
+        if (n < 0) {
+            s.errOpen = false;
+        } else if (n > 0) {
+            bytesAppend(s.err, bytesSlice(s.buf, 0, n));
+        }
+    }
+    if ((ready & 8) != 0) {
+        const n = procRead(s.h, 3, s.buf);
+        if (n < 0) {
+            s.ctlOpen = false;
+        } else if (n > 0) {
+            bytesAppend(s.ctl, bytesSlice(s.buf, 0, n));
+            splitFrames(s);
+        }
+    }
+}
+
+function splitFrames(s: Ref<Session>): void {
+    while (bytesLen(s.ctl) >= 4) {
+        const n = (bytesGetLE<u32>(s.ctl, 0) ?? 0) as int;
+        if (bytesLen(s.ctl) < 4 + n) {
+            return;
+        }
+        listPush(s.frames, bytesSlice(s.ctl, 4, n));
+        s.ctl = bytesSlice(s.ctl, 4 + n, bytesLen(s.ctl) - 4 - n);
+    }
+}
+
+function send(s: Ref<Session>, op: int, fields: List<int>): void {
+    const w = procWrite(s.h, 3, packFields(op, fields));
+}
+
+// 下一帧；通道已到流尾为 op −1；超时为错误。
+function recv(s: Ref<Session>, timeoutMs: int): Frame | Error {
+    const end = monoNs() + timeoutMs * MS;
+    while (true) {
+        if (listLen(s.frames) > 0) {
+            const body = listGet(s.frames, 0) catch bytesNew(1);
+            listRemoveAt(s.frames, 0);
+            return Frame { op: bytesGet(body, 0) ?? 0, payload: bytesSlice(body, 1, bytesLen(body) - 1) };
+        }
+        if (!s.ctlOpen) {
+            return Frame { op: -1, payload: bytesNew(0) };
+        }
+        const left = (end - monoNs()) / MS;
+        if (left <= 0) {
+            return err("no frame within " + toStr(timeoutMs / 1000) + "s");
+        }
+        let step = left;
+        if (step > 100) {
+            step = 100;
+        }
+        pump(s, step);
+    }
+    return err("unreachable");
+}
+
+function opRepr(op: int): string {
+    if (op < 0) {
+        return "None";
+    }
+    return toStr(op);
+}
+
+function expect(s: Ref<Session>, op: int): Bytes | Error {
+    const f = recv(s, TIMEOUT_MS)?;
+    if (f.op != op) {
+        return err("expected op " + toStr(op) + ", got " + opRepr(f.op));
+    }
+    return f.payload;
+}
+
+function read(s: Ref<Session>, addr: int, n: int): Bytes | Error {
+    send(s, OP_READ, ints([addr, n]));
+    const p = expect(s, OP_READ_R)?;
+    const got = u64(p, 0);
+    let take = got;
+    if (take > bytesLen(p) - 8) {
+        take = bytesLen(p) - 8;
+    }
+    if (take < 0) {
+        take = 0;
+    }
+    return bytesSlice(p, 8, take);
+}
+
+struct Stack {
+    total: int,
+    frames: List<List<int>>,
+}
+
+function stack(s: Ref<Session>): Stack | Error {
+    send(s, OP_FRAMES, noInts());
+    const p = expect(s, OP_FRAMES_R)?;
+    const total = u64(p, 0);
+    const n = u64(p, 8);
+    const frames: List<List<int>> = listNew();
+    let i = 0;
+    while (i < n) {
+        listPush(frames, ints([u64(p, 16 + 24 * i), u64(p, 24 + 24 * i), u64(p, 32 + 24 * i)]));
+        i = i + 1;
+    }
+    return Stack { total: total, frames: frames };
+}
+
+struct Done {
+    code: int,
+    killed: bool,
+    out: string,
+    err: string,
+}
+
+// 关掉控制通道（产物读到流尾），至多等 30 s 让它退出（否则结束它、记 killed），再读完 stdout 与 stderr（\r\n 换成 \n）。
+function finish(s: Ref<Session>): Done {
+    if (s.channel) {
+        procCloseStream(s.h, 3);
+        s.ctlOpen = false;
+    }
+    const end = monoNs() + TIMEOUT_MS * MS;
+    let code = 0;
+    let killed = false;
+    while (true) {
+        const w = procWait(s.h, 0);
+        if (w != None) {
+            code = w ?? 0;
+            break;
+        }
+        if (monoNs() >= end) {
+            procKill(s.h);
+            const k = procWait(s.h, 10000);
+            killed = true;
+            break;
+        }
+        pump(s, 50);
+    }
+    if (code > 2147483647) {
+        code = code - 4294967296;
+    }
+    const drain = monoNs() + TIMEOUT_MS * MS;
+    while ((s.outOpen || s.errOpen) && monoNs() < drain) {
+        pump(s, 50);
+    }
+    procClose(s.h);
+    return Done { code: code, killed: killed, out: crlfText(s.out), err: crlfText(s.err) };
+}
+
+function crlfText(b: Bytes): string {
+    const out = bytesNew(0);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) ?? 0;
+        if (c == 13 && (bytesGet(b, i + 1) ?? 0) == 10) {
+            i = i + 1;
+        } else {
+            bytesPush(out, c);
+            i = i + 1;
+        }
+    }
+    return lossyText(out);
+}
+
+function codeRepr(d: Done): string {
+    if (d.killed) {
+        return "'killed'";
+    }
+    return toStr(d.code);
+}
+
+function exitIs(d: Done, want: int): bool {
+    return !d.killed && d.code == want;
+}
+
+// ---------------------------------------------------------------- 程序映像
+
+struct Image {
+    nf: int,
+    fnModule: List<int>,
+    lines: List<List<int>>,
+    modNames: List<string>,
+}
+
+function image(s: Ref<Session>, img: int, nfuncs: int): Ref<Image> | Error {
+    const hdr = read(s, img, 104)?;
+    if (bytesLen(hdr) != 104) {
+        return err("image header unreadable");
+    }
+    const nf = u64(hdr, 16);
+    const nmod = u64(hdr, 24);
+    const funcs = u64(hdr, 48);
+    const mods = u64(hdr, 56);
+    const strs = u64(hdr, 64);
+    if (nf != nfuncs) {
+        return err("HELLO nfuncs " + toStr(nfuncs) + " != image " + toStr(nf));
+    }
+    const rows = read(s, funcs, 64 * nf)?;
+    const fnModule: List<int> = listNew();
+    const lines: List<List<int>> = listNew();
+    let i = 0;
+    while (i < nf) {
+        listPush(fnModule, u64(rows, 64 * i + 8));
+        const nlines = u64(rows, 64 * i + 24);
+        const lp = u64(rows, 64 * i + 32);
+        const ls: List<int> = listNew();
+        if (nlines > 0) {
+            const raw = read(s, lp, 8 * nlines)?;
+            let k = 0;
+            while (k < nlines) {
+                listPush(ls, u64(raw, 8 * k) & 4294967295);
+                k = k + 1;
+            }
+        }
+        listPush(lines, ls);
+        i = i + 1;
+    }
+    const mrows = read(s, mods, 32 * nmod)?;
+    const names: List<string> = listNew();
+    let m = 0;
+    while (m < nmod) {
+        const si = u64(mrows, 32 * m + 24);
+        const lnPtr = read(s, strs + 16 * si, 16)?;
+        listPush(names, lossyText(read(s, u64(lnPtr, 8), u64(lnPtr, 0))?));
+        m = m + 1;
+    }
+    return new Image { nf: nf, fnModule: fnModule, lines: lines, modNames: names };
+}
+
+function baseName(n: string): string {
+    let i = len(n) - 1;
+    while (i >= 0) {
+        const c = byteAt(n, i) ?? 0;
+        if (c == 47 || c == 92) {
+            return bytesToStr(bytesSlice(bytesFromStr(n), i + 1, len(n) - i - 1)) catch n;
+        }
+        i = i - 1;
+    }
+    return n;
+}
+
+function strListRepr(xs: List<string>): string {
+    let s = "[";
+    let k = 0;
+    for (x in xs) {
+        if (k > 0) {
+            s = s + ", ";
+        }
+        s = s + reprStr(x);
+        k = k + 1;
+    }
+    return s + "]";
+}
+
+function moduleOf(im: Ref<Image>, name: string): int | Error {
+    let hit = -1;
+    let hits = 0;
+    let m = 0;
+    for (n in im.modNames) {
+        if (n == name || baseName(n) == name) {
+            hit = m;
+            hits = hits + 1;
+        }
+        m = m + 1;
+    }
+    if (hits != 1) {
+        return err("module " + reprStr(name) + " not found in " + strListRepr(im.modNames));
+    }
+    return hit;
+}
+
+function lineOf(im: Ref<Image>, fn: int, pc: int): int {
+    if (fn < 0 || fn >= im.nf) {
+        return -1;
+    }
+    const ls = listGet(im.lines, fn) catch noInts();
+    if (pc < 0 || pc >= listLen(ls)) {
+        return -1;
+    }
+    return listGet(ls, pc) catch -1;
+}
+
+struct Started {
+    s: Ref<Session>,
+    im: Ref<Image>,
+    tb: int,
+}
+
+function start(exe: string): Started | Error {
+    const s = session(exe, true)?;
+    const p = expect(s, OP_HELLO)?;
+    const version = u64(p, 0);
+    if (version != 2) {
+        return err("HELLO version " + toStr(version));
+    }
+    const im = image(s, u64(p, 16), u64(p, 24))?;
+    return Started { s: s, im: im, tb: u64(p, 8) };
+}
+
+function arm(st: Started, module: string, line: int, value: int): void | Error {
+    const m = moduleOf(st.im, module)?;
+    let any = false;
+    let f = 0;
+    while (f < st.im.nf) {
+        if ((listGet(st.im.fnModule, f) catch -1) == m) {
+            const ls = listGet(st.im.lines, f) catch noInts();
+            let pc = 0;
+            while (pc < listLen(ls)) {
+                if ((listGet(ls, pc) catch -1) == line) {
+                    send(st.s, OP_ARM, ints([f, pc, value]));
+                    any = true;
+                }
+                pc = pc + 1;
+            }
+        }
+        f = f + 1;
+    }
+    if (!any) {
+        return err("no pc at " + module + ":" + toStr(line));
+    }
+}
+
+// RUN 之后的下一个 STOP：kind 0 产物已不在、1 TIMEOUT、2 STOP（原因、行、深度、函数、窗口）。
+struct Stop {
+    kind: int,
+    reason: int,
+    line: int,
+    depth: int,
+    fn: int,
+    win: int,
+}
+
+function run(st: Started, mode: int, deadlineMs: int): Stop | Error {
+    send(st.s, OP_RUN, ints([mode, deadlineMs]));
+    const f = recv(st.s, TIMEOUT_MS)?;
+    return stopOf(st, f);
+}
+
+function stopOf(st: Started, f: Frame): Stop | Error {
+    if (f.op < 0) {
+        return Stop { kind: 0, reason: 0, line: 0, depth: 0, fn: 0, win: 0 };
+    }
+    if (f.op == OP_TIMEOUT) {
+        return Stop { kind: 1, reason: 0, line: 0, depth: 0, fn: 0, win: 0 };
+    }
+    if (f.op != OP_STOP) {
+        return err("expected STOP, got op " + opRepr(f.op));
+    }
+    const fn = u64(f.payload, 8);
+    return Stop { kind: 2, reason: u64(f.payload, 0), line: lineOf(st.im, fn, u64(f.payload, 16)), depth: u64(f.payload, 24), fn: fn,
+        win: u64(f.payload, 32) };
+}
+
+// Python 的 repr：r[:3] 写 (原因, 行, 深度)，TIMEOUT 写 'timeout'，产物不在写 None（stops 里写 'exit'）。
+function stop3(r: Stop): string {
+    if (r.kind == 0) {
+        return "None";
+    }
+    if (r.kind == 1) {
+        return "'timeout'";
+    }
+    return "(" + toStr(r.reason) + ", " + toStr(r.line) + ", " + toStr(r.depth) + ")";
+}
+
+function stop5(r: Stop): string {
+    if (r.kind == 0) {
+        return "None";
+    }
+    if (r.kind == 1) {
+        return "'timeout'";
+    }
+    return "(" + toStr(r.reason) + ", " + toStr(r.line) + ", " + toStr(r.depth) + ", " + toStr(r.fn) + ", " + toStr(r.win) + ")";
+}
+
+function stops(st: Started, modes: []int): List<string> | Error {
+    const out: List<string> = listNew();
+    for (mode in modes) {
+        const r = run(st, mode, 0)?;
+        if (r.kind == 0) {
+            listPush(out, "'exit'");
+            break;
+        }
+        listPush(out, stop3(r));
+    }
+    return out;
+}
+
+function listRepr(xs: List<string>): string {
+    let s = "[";
+    let k = 0;
+    for (x in xs) {
+        if (k > 0) {
+            s = s + ", ";
+        }
+        s = s + x;
+        k = k + 1;
+    }
+    return s + "]";
+}
+
+function t3(a: int, b: int, c: int): string {
+    return "(" + toStr(a) + ", " + toStr(b) + ", " + toStr(c) + ")";
+}
+
+function rep(x: string, n: int): List<string> {
+    const out: List<string> = listNew();
+    let i = 0;
+    while (i < n) {
+        listPush(out, x);
+        i = i + 1;
+    }
+    return out;
+}
+
+function want(xs: []string): string {
+    const out: List<string> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+    }
+    return listRepr(out);
+}
+
+function framesRepr(fs: List<List<int>>): string {
+    const xs: List<string> = listNew();
+    for (f in fs) {
+        listPush(xs, t3(listGet(f, 0) catch 0, listGet(f, 1) catch 0, listGet(f, 2) catch 0));
+    }
+    return listRepr(xs);
+}
+
+// ---------------------------------------------------------------- 场景
+
+function build(c: Ref<Ctx>, rel: string, flag: string): string | Error {
+    const key = rel + " " + flag;
+    const had = mapGet(c.built, key);
+    if (had != None) {
+        return had ?? "";
+    }
+    const name = replaceAll(replaceAll(rel, "/", "_"), ".tx", "");
+    const out = nat(join(c.work, name + replaceAll(flag, "-", "_")));
+    if (kindOf(out) != 0) {
+        deleteTree(out);
+    }
+    const args: List<string> = listNew();
+    listPush(args, "build");
+    listPush(args, nat(join(c.root, "tests/debug/" + rel)));
+    listPush(args, flag);
+    listPush(args, "--out");
+    listPush(args, out);
+    const r = captureRaw(c.compiler, args, c.root, 600 * SEC, 10 * SEC, MAX_OUTPUT) catch (e) {
+        return err("build " + rel + " failed: " + e.message);
+    };
+    const exe = nat(join(out, exeName(baseName(stripTx(rel)))));
+    if (r.code != 0 || kindOf(exe) != 1) {
+        const both = bytesNew(0);
+        bytesAppend(both, r.out);
+        bytesAppend(both, r.err);
+        return err("build " + rel + " failed: " + tailChars(lossyText(both), 400));
+    }
+    mapSet(c.built, key, exe);
+    return exe;
+}
+
+// 去掉扩展名（同 Path(rel).stem 的取法，目录部分由 baseName 去）。
+function stripTx(rel: string): string {
+    return replaceAll(rel, ".tx", "");
+}
+
+function replaceAll(s: string, a: string, b: string): string {
+    const parts = strSplit(s, a);
+    let out = listGet(parts, 0) catch "";
+    let i = 1;
+    while (i < listLen(parts)) {
+        out = out + b + (listGet(parts, i) catch "");
+        i = i + 1;
+    }
+    return out;
+}
+
+function scStepInto(c: Ref<Ctx>): List<Row> | Error {
+    const st = start(build(c, "basic.tx", "--debug")?)?;
+    const got = listRepr(stops(st, [INTO, INTO, INTO, INTO, INTO, INTO, INTO, INTO, INTO])?);
+    const d = finish(st.s);
+    const w = want([t3(STEP, 2, 1), t3(STEP, 10, 1), t3(STEP, 11, 1), t3(STEP, 5, 2), t3(STEP, 6, 2), t3(STEP, 12, 1), t3(STEP, 13, 1), t3(STEP, 14, 1),
+            "'exit'"]);
+    return one("step-into", got == w && exitIs(d, 10) && d.out == "b=2\n", "got=" + got + " exit=" + codeRepr(d) + " out=" + reprStr(d.out));
+}
+
+function scBreakpoint(c: Ref<Ctx>): List<Row> | Error {
+    const st = start(build(c, "basic.tx", "--debug")?)?;
+    arm(st, "basic.tx", 5, 1)?;
+    const rows: List<Row> = listNew();
+    const r = run(st, CONTINUE, 0)?;
+    listPush(rows, row("bp-hit", r.kind == 2 && stop3(r) == t3(BREAKPOINT, 5, 2), "got=" + stop5(r)));
+    const sk = stack(st.s)?;
+    const f0 = listGet(sk.frames, 0) catch ints([0, 0, 0]);
+    const f1 = listGet(sk.frames, 1) catch ints([0, 0, 0]);
+    const a0 = listGet(f0, 0) catch 0;
+    const a1 = listGet(f1, 0) catch 0;
+    const ok = sk.total == 2 && listLen(sk.frames) == 2 && a0 < a1 && a1 == r.win && lineOf(st.im, listGet(f0, 1) catch 0, listGet(f0, 2) catch 0) == 11
+    && (a0 & -268435456) == st.tb;
+    listPush(rows, row("frames", ok, "total=" + toStr(sk.total) + " frames=" + framesRepr(sk.frames)));
+    // twice(x) 以 x = 1 调用：它的窗口里槽 1 存 int（标签 1）1。
+    const slot = read(st.s, r.win + 16, 16)?;
+    listPush(rows, row("read-slot", bytesLen(slot) == 16 && (bytesGet(slot, 0) ?? 0) == 1 && u64(slot, 8) == 1, "slot=" + reprStr(hexOf(slot))));
+    const bad = read(st.s, 8, 16)?;
+    listPush(rows, row("read-invalid", bytesLen(bad) == 0, "got " + toStr(bytesLen(bad)) + " bytes"));
+    const r2 = run(st, CONTINUE, 0)?;
+    const d = finish(st.s);
+    listPush(rows, row("bp-continue-exit", r2.kind == 0 && exitIs(d, 10) && d.out == "b=2\n", "got=" + stop5(r2) + " exit=" + codeRepr(d) + " out="
+            + reprStr(d.out)));
+    return rows;
+}
+
+function scOverOut(c: Ref<Ctx>): List<Row> | Error {
+    let st = start(build(c, "basic.tx", "--debug")?)?;
+    arm(st, "basic.tx", 11, 1)?;
+    let got = listRepr(stops(st, [CONTINUE, OVER, INTO, CONTINUE])?);
+    let d = finish(st.s);
+    const rows: List<Row> = listNew();
+    listPush(rows, row("step-over", got == want([t3(BREAKPOINT, 11, 1), t3(STEP, 12, 1), t3(STEP, 13, 1), "'exit'"]) && exitIs(d, 10), "got=" + got
+            + " exit=" + codeRepr(d)));
+    st = start(build(c, "basic.tx", "--debug")?)?;
+    arm(st, "basic.tx", 5, 1)?;
+    got = listRepr(stops(st, [CONTINUE, OUT, CONTINUE])?);
+    d = finish(st.s);
+    listPush(rows, row("step-out", got == want([t3(BREAKPOINT, 5, 2), t3(STEP, 12, 1), "'exit'"]) && exitIs(d, 10), "got=" + got + " exit="
+            + codeRepr(d)));
+    return rows;
+}
+
+function scRecurse(c: Ref<Ctx>): List<Row> | Error {
+    const st = start(build(c, "recurse.tx", "--debug")?)?;
+    arm(st, "recurse.tx", 4, 1)?;
+    const r = run(st, CONTINUE, 0)?;
+    const sk = stack(st.s)?;
+    arm(st, "recurse.tx", 4, 0)?;
+    const seq: List<string> = listNew();
+    if (r.kind == 0) {
+        listPush(seq, "None");
+    } else {
+        listPush(seq, stop3(r));
+    }
+    for (x in stops(st, [OUT, OUT, OUT, OUT, CONTINUE])?) {
+        listPush(seq, x);
+    }
+    const got = listRepr(seq);
+    const d = finish(st.s);
+    let ordered = true;
+    let i = 0;
+    while (i + 1 < listLen(sk.frames)) {
+        const a = listGet(listGet(sk.frames, i) catch ints([0]), 0) catch 0;
+        const b = listGet(listGet(sk.frames, i + 1) catch ints([0]), 0) catch 0;
+        if (!(a < b)) {
+            ordered = false;
+        }
+        i = i + 1;
+    }
+    const w = want([t3(BREAKPOINT, 4, 5), t3(STEP, 7, 4), t3(STEP, 7, 3), t3(STEP, 7, 2), t3(STEP, 12, 1), "'exit'"]);
+    return one("recurse-out", got == w && sk.total == 5 && exitIs(d, 0) && d.out == "24\n" && ordered, "got=" + got + " total=" + toStr(sk.total)
+        + " exit=" + codeRepr(d) + " out=" + reprStr(d.out));
+}
+
+function scAsync(c: Ref<Ctx>): List<Row> | Error {
+    const st = start(build(c, "async.tx", "--debug")?)?;
+    arm(st, "async.tx", 3, 1)?;
+    arm(st, "async.tx", 11, 1)?;
+    const got = listRepr(stops(st, [CONTINUE, CONTINUE, CONTINUE])?);
+    const d = finish(st.s);
+    // D3 v0.53：任务在 main 的 await 里运行，栈底多一层 main。
+    const w = want([t3(BREAKPOINT, 3, 2), t3(BREAKPOINT, 11, 2), "'exit'"]);
+    return one("async", got == w && exitIs(d, 0) && d.out == "spawned\njob 15\ngot 15\n", "got=" + got + " exit=" + codeRepr(d) + " out="
+        + reprStr(d.out));
+}
+
+function scGenerator(c: Ref<Ctx>): List<Row> | Error {
+    let st = start(build(c, "native/gen.tx", "--debug")?)?;
+    arm(st, "gen.tx", 5, 1)?;
+    let got = listRepr(stops(st, [CONTINUE, CONTINUE, CONTINUE, CONTINUE])?);
+    let d = finish(st.s);
+    const rows: List<Row> = listNew();
+    const w1 = want([t3(BREAKPOINT, 5, 2), t3(BREAKPOINT, 5, 2), t3(BREAKPOINT, 5, 2), "'exit'"]);
+    listPush(rows, row("gen-breakpoint", got == w1 && exitIs(d, 0) && d.out == "30\n", "got=" + got + " exit=" + codeRepr(d) + " out=" + reprStr(d.out)));
+    st = start(build(c, "native/gen.tx", "--debug")?)?;
+    arm(st, "gen.tx", 13, 1)?;
+    const first = run(st, CONTINUE, 0)?;
+    arm(st, "gen.tx", 13, 0)?;
+    const seq: List<string> = listNew();
+    if (first.kind == 0) {
+        listPush(seq, "None");
+    } else {
+        listPush(seq, stop3(first));
+    }
+    for (x in stops(st, [INTO, INTO, OVER, OVER, OVER, CONTINUE])?) {
+        listPush(seq, x);
+    }
+    got = listRepr(seq);
+    d = finish(st.s);
+    // 体结束后消费方回到 for 行，genNext 再恢复体；跨过 yield 回到循环体（第 12 行余下的部分是同一行，不算新行事件）。
+    const w2 = want([t3(BREAKPOINT, 13, 1), t3(STEP, 12, 1), t3(STEP, 6, 2), t3(STEP, 4, 2), t3(STEP, 5, 2), t3(STEP, 13, 1), "'exit'"]);
+    listPush(rows, row("gen-step", got == w2 && exitIs(d, 0), "got=" + got + " exit=" + codeRepr(d)));
+    return rows;
+}
+
+function scThread(c: Ref<Ctx>): List<Row> | Error {
+    const st = start(build(c, "native/thread.tx", "--debug")?)?;
+    arm(st, "thread.tx", 9, 1)?;
+    const got = listRepr(stops(st, [CONTINUE, CONTINUE])?);
+    const d = finish(st.s);
+    return one("thread-main-only", got == want([t3(BREAKPOINT, 9, 2), "'exit'"]) && exitIs(d, 0) && d.out == "499500 499500\n", "got=" + got + " exit="
+        + codeRepr(d) + " out=" + reprStr(d.out));
+}
+
+function scTimeout(c: Ref<Ctx>): List<Row> | Error {
+    const st = start(build(c, "loop.tx", "--debug")?)?;
+    const r = run(st, CONTINUE, 1000)?;
+    const d = finish(st.s);
+    return one("deadline", r.kind == 1 && exitIs(d, 3), "got=" + stop5(r) + " exit=" + codeRepr(d));
+}
+
+function scEof(c: Ref<Ctx>): List<Row> | Error {
+    const st = start(build(c, "basic.tx", "--debug")?)?;
+    arm(st, "basic.tx", 12, 1)?;
+    const r = run(st, CONTINUE, 0)?;
+    const d = finish(st.s);
+    return one("channel-closed", r.kind == 2 && stop3(r) == t3(BREAKPOINT, 12, 1) && exitIs(d, 3) && d.out == "", "got=" + stop5(r) + " exit="
+        + codeRepr(d) + " out=" + reprStr(d.out));
+}
+
+// 收一帧当作 STOP：不是 STOP 时 kind 为 −1（reason 为该帧的操作码）。
+function stopFrame(st: Started): Stop | Error {
+    const f = recv(st.s, TIMEOUT_MS)?;
+    if (f.op != OP_STOP) {
+        return Stop { kind: -1, reason: f.op, line: 0, depth: 0, fn: 0, win: 0 };
+    }
+    return stopOf(st, f);
+}
+
+function rawStop(r: Stop): string {
+    if (r.kind != 2) {
+        return "None";
+    }
+    return "(" + toStr(r.reason) + ", " + toStr(r.fn) + ", ...)";
+}
+
+function idle(s: Ref<Session>, ms: int): void {
+    const end = monoNs() + ms * MS;
+    while (monoNs() < end) {
+        let left = (end - monoNs()) / MS;
+        if (left < 1) {
+            left = 1;
+        }
+        pump(s, left);
+    }
+}
+
+function scLive(c: Ref<Ctx>): List<Row> | Error {
+    const st = start(build(c, "loop.tx", "--debug")?)?;
+    const rows: List<Row> = listNew();
+    // 运行中 ARM：死循环在 stub 看到这一帧后停在第 5 行。
+    send(st.s, OP_RUN, ints([CONTINUE, 0]));
+    idle(st.s, 300);
+    arm(st, "loop.tx", 5, 1)?;
+    let r = stopFrame(st)?;
+    listPush(rows, row("live-arm", r.kind == 2 && r.reason == BREAKPOINT && r.line == 5 && r.depth == 1, "op=" + liveOp(r) + " stop=" + stop5(r)));
+    // 运行中 PAUSE：停在循环的某一行，原因 3。
+    arm(st, "loop.tx", 5, 0)?;
+    send(st.s, OP_RUN, ints([CONTINUE, 0]));
+    idle(st.s, 300);
+    send(st.s, OP_PAUSE, noInts());
+    r = stopFrame(st)?;
+    listPush(rows, row("pause", r.kind == 2 && r.reason == PAUSE && (r.line == 4 || r.line == 5) && r.depth == 1, "op=" + liveOp(r) + " stop=" + stop5(r)));
+    // 停着时到达的 PAUSE 被忽略；产物照常回答并继续运行。
+    send(st.s, OP_PAUSE, noInts());
+    const sk = stack(st.s)?;
+    const r2 = run(st, CONTINUE, 500)?;
+    const d = finish(st.s);
+    listPush(rows, row("stale-pause", sk.total == 1 && r2.kind == 1 && exitIs(d, 3), "total=" + toStr(sk.total) + " got=" + stop5(r2) + " exit="
+            + codeRepr(d)));
+    return rows;
+}
+
+function liveOp(r: Stop): string {
+    if (r.kind == 2) {
+        return toStr(OP_STOP);
+    }
+    if (r.kind == 0) {
+        return "None";
+    }
+    if (r.kind == 1) {
+        return toStr(OP_TIMEOUT);
+    }
+    return toStr(r.reason);
+}
+
+function scInert(c: Ref<Ctx>): List<Row> | Error {
+    const s = session(build(c, "basic.tx", "--debug")?, false)?;
+    const d = finish(s);
+    return one("no-channel", exitIs(d, 10) && d.out == "b=2\n" && d.err == "", "exit=" + codeRepr(d) + " out=" + reprStr(d.out) + " err="
+        + reprStr(d.err));
+}
+
+function scBogus(c: Ref<Ctx>): List<Row> | Error {
+    const exe = build(c, "basic.tx", "--debug")?;
+    const before = getEnv(CHANNEL) ?? "";
+    setEnv(CHANNEL, "99,98")?;
+    const started = session(exe, false);
+    setEnv(CHANNEL, before)?;
+    const s = started?;
+    const d = finish(s);
+    return one("bogus-channel", exitIs(d, 10) && d.out == "b=2\n" && d.err == "", "exit=" + codeRepr(d) + " out=" + reprStr(d.out) + " err="
+        + reprStr(d.err));
+}
+
+function scDriver(c: Ref<Ctx>): List<Row> | Error {
+    const product = build(c, "basic.tx", "--debug")?;
+    const driver = build(c, "native/ctl-driver.tx", "--toolchain")?;
+    const args: List<string> = listNew();
+    listPush(args, product);
+    const r = captureRaw(driver, args, dirOfExe(product), 2 * TIMEOUT_MS * MS, 10 * SEC, MAX_OUTPUT) catch (e) {
+        return err(e.message);
+    };
+    const out = crlfText(r.out);
+    const w = "hello: op=1 version=2\nrun into sent: 21\nstop: op=2 reason=2 depth=1\ncontinue sent: 21\nproduct stdout: b=2\n\nproduct exit: 10\nctl after exit: -1\n";
+    let tail = r.err;
+    if (bytesLen(tail) > 300) {
+        tail = bytesSlice(tail, bytesLen(tail) - 300, 300);
+    }
+    return one("toolchain-driver", r.code == 0 && out == w, "exit=" + toStr(r.code) + " out=" + reprStr(out) + " err=" + reprBytes(tail, 300));
+}
+
+const NAMES: []string = ["step-into", "breakpoint", "over-out", "recurse", "async", "generator", "thread", "timeout", "eof", "live", "inert", "bogus",
+    "driver"];
+
+function scenario(c: Ref<Ctx>, name: string): List<Row> | Error {
+    if (name == "step-into") {
+        return scStepInto(c);
+    }
+    if (name == "breakpoint") {
+        return scBreakpoint(c);
+    }
+    if (name == "over-out") {
+        return scOverOut(c);
+    }
+    if (name == "recurse") {
+        return scRecurse(c);
+    }
+    if (name == "async") {
+        return scAsync(c);
+    }
+    if (name == "generator") {
+        return scGenerator(c);
+    }
+    if (name == "thread") {
+        return scThread(c);
+    }
+    if (name == "timeout") {
+        return scTimeout(c);
+    }
+    if (name == "eof") {
+        return scEof(c);
+    }
+    if (name == "live") {
+        return scLive(c);
+    }
+    if (name == "inert") {
+        return scInert(c);
+    }
+    if (name == "bogus") {
+        return scBogus(c);
+    }
+    if (name == "driver") {
+        return scDriver(c);
+    }
+    return err("unknown scenario " + name);
+}
+
+// 场景的各项；场景出错（StubError 等）时为一项 error。
+function rowsOf(c: Ref<Ctx>, name: string): List<Row> {
+    return scenario(c, name) catch (e) {
+        return one(name, false, "error: " + e.message);
+    };
+}
+
+function pad(s: string, w: int): string {
+    let t = s;
+    let n = 0;
+    let i = 0;
+    while (i < len(t)) {
+        if (((byteAt(t, i) ?? 0) & 0xC0) != 0x80) {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    while (n < w) {
+        t = t + " ";
+        n = n + 1;
+    }
+    return t;
+}
+
+function freshDir(prefix: string): string | Error {
+    const base = osRealPath(tempDir());
+    let k = 0;
+    while (k < 1000) {
+        const p = nat(join(base, prefix + toStr(monoNs() % 1000000000) + "-" + toStr(k)));
+        if (kindOf(p) == 0) {
+            makeDir(p)?;
+            return p;
+        }
+        k = k + 1;
+    }
+    return err("建不了临时目录 " + prefix);
+}
+
+function main(argv: []string): int {
+    let compiler = "";
+    let work = "";
+    let root = "";
+    const names: List<string> = listNew();
+    let i = 0;
+    while (i < len(argv)) {
+        if ((argv[i] == "--compiler" || argv[i] == "--work" || argv[i] == "--root") && i + 1 < len(argv)) {
+            if (argv[i] == "--compiler") {
+                compiler = argv[i + 1];
+            } else if (argv[i] == "--work") {
+                work = argv[i + 1];
+            } else {
+                root = argv[i + 1];
+            }
+            i = i + 2;
+        } else {
+            listPush(names, argv[i]);
+            i = i + 1;
+        }
+    }
+    if (len(compiler) == 0) {
+        eprint("用法：taixu run --toolchain scripts/test_native_debug_stub.tx --compiler <taixu> [--work <目录>] [场景 ...]");
+        return 2;
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = absolute(nat(root));
+    compiler = absolute(nat(compiler));
+    let ownWork = false;
+    if (len(work) == 0) {
+        work = freshDir("tx-dbgstub-") catch (e) {
+            eprint(e.message);
+            return 2;
+        };
+        ownWork = true;
+    } else {
+        work = absolute(nat(work));
+        mkdirs(work);
+    }
+    if (listLen(names) == 0) {
+        for (n in NAMES) {
+            listPush(names, n);
+        }
+    }
+    const c = new Ctx { compiler: compiler, root: root, work: work, built: mapNew<string, string>() };
+    let fails = 0;
+    let total = 0;
+    for (name in names) {
+        for (r in rowsOf(c, name)) {
+            total = total + 1;
+            if (!r.ok) {
+                fails = fails + 1;
+            }
+            let detail = "";
+            if (!r.ok) {
+                detail = r.detail;
+            }
+            let tag = "PASS ";
+            if (!r.ok) {
+                tag = "FAIL ";
+            }
+            print(tag + " " + pad(r.label, 20) + " " + detail);
+        }
+    }
+    if (fails == 0) {
+        print("SUMMARY PASS (" + toStr(total) + " checks)");
+        if (ownWork) {
+            deleteTree(work);
+        }
+        return 0;
+    }
+    print("SUMMARY FAIL=" + toStr(fails) + " (" + toStr(total) + " checks)");
+    return 1;
+}

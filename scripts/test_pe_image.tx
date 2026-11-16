@@ -9,8 +9,10 @@
 //   块末补齐；每处落在某节有文件内容的字节上、不重复，所存的 8 字节值指向映像内；TLS 目录（数据目录 9）的四个 VA 都有重定位；
 //   反查完整性：非代码、非可丢弃节的文件内容里，任一偏移上的 8 字节值若落在映像内，该处须有重定位（代码节不查——指令字节常凑成
 //   这种值，而代码只用 RIP 相对寻址）；
-// - TimeDateStamp＝内容哈希：时间戳、校验和两字段置零后，整个文件按 8 字节小端字推进 FNV-1a（64 位初值与乘数、环绕乘），每步把
-//   高 32 位异或进低位，末尾不足 8 字节的补零成一字，最后并入文件长度，取低 32 位；
+// - TimeDateStamp＝内容哈希：时间戳、校验和与调试目录各项的时间戳置零后，整个文件按 8 字节小端字推进 FNV-1a（64 位初值与乘数、
+//   环绕乘），每步把高 32 位异或进低位，末尾不足 8 字节的补零成一字，最后并入文件长度，取低 32 位；
+// - 调试目录（数据目录 6，运行时按需链入）：恰一项 28 字节、落在只读数据节的文件内容里、4 字节对齐，类型 IMAGE_DEBUG_TYPE_REPRO（16），
+//   数据长度、地址与文件位置都为 0，时间戳等于 COFF 头的（同 lld-link /Brepro）；
 // - CheckSum：逐个 16 位小端字反码累加（校验和字段按零计），折成 16 位再加文件长度（imagehlp 的 CheckSumMappedFile；写法有意与
 //   pe_image.tx 的 8 字节累加不同，两边互证）。
 // - x86_64 的展开信息（数据目录 3，P3）：.pdata 每项 12 字节，按起点升序、互不重叠、都在 .text 里；UNWIND_INFO 4 字节对齐、版本 1、
@@ -53,10 +55,25 @@ function zero4(b: Bytes, at: int): void {
     while (k < 4) { bytesSet(b, at + k, 0); k = k + 1; }
 }
 
+// 调试目录各项时间戳的文件偏移（数据目录 6 不在文件内容里时为空）。
+function debugStamps(img: Bytes, pe: int): List<int> {
+    const out: List<int> = listNew();
+    const opt = pe + 24;
+    if (u(img, opt + 108, 4) <= 6) { return out; }
+    const rva = u(img, opt + 112 + 8 * 6, 4);
+    const size = u(img, opt + 112 + 8 * 6 + 4, 4);
+    const at = fileAt(img, pe, rva, size);
+    if (rva == 0 || size == 0 || at < 0) { return out; }
+    let e = 0;
+    while (e + 28 <= size) { listPush(out, at + e + 4); e = e + 28; }
+    return out;
+}
+
 function contentHash(img: Bytes, pe: int): int {
     const b = bytesSlice(img, 0, bytesLen(img));
     zero4(b, pe + 8);
     zero4(b, pe + 24 + 64);
+    for (at in debugStamps(img, pe)) { zero4(b, at); }
     const n = bytesLen(b);
     let h = FNV_OFFSET;
     let i = 0;
@@ -151,6 +168,7 @@ function headerChecks(t: Ref<Tally>, name: string, img: Bytes, machine: int, maj
     const stamp = u(img, pe + 8, 4);
     const wantStamp = contentHash(img, pe);
     check(t, name + ":timestamp", stamp == wantStamp, "TimeDateStamp " + toStr(stamp) + "，内容哈希 " + toStr(wantStamp));
+    debugChecks(t, name, img, pe, stamp);
     const sum = u(img, opt + 64, 4);
     const wantSum = checksum(img, pe);
     check(t, name + ":checksum", sum == wantSum, "CheckSum " + toStr(sum) + "，复算 " + toStr(wantSum));
@@ -221,7 +239,8 @@ function relocChecks(t: Ref<Tally>, name: string, img: Bytes, pe: int): void {
         check(t, name + ":reloc-tls", mapHas(sites, tlsRva) && mapHas(sites, tlsRva + 8) && mapHas(sites, tlsRva + 16) && mapHas(sites, tlsRva + 24),
             "TLS 目录 " + toStr(tlsRva) + " 的四个 VA 不都有重定位");
     }
-    // 反查：非代码、非可丢弃节里看着像映像内地址的 8 字节值都须有重定位。
+    // 反查：非代码、非可丢弃节里看着像映像内地址的 8 字节值都须有重定位（盖到调试目录时间戳字段的不算——那是内容哈希，不是地址）。
+    const stamps = debugStamps(img, pe);
     const nsec = u(img, pe + 6, 2);
     const sh = opt + u(img, pe + 20, 2);
     let missing = 0;
@@ -238,7 +257,9 @@ function relocChecks(t: Ref<Tally>, name: string, img: Bytes, pe: int): void {
             let i = 0;
             while (i + 8 <= filled) {
                 const value = bytesGetLE<int>(img, raw + i) ?? 0;
-                if (value >= base && value < base + imageSize && !mapHas(sites, va + i)) {
+                let stampWindow = false;
+                for (st in stamps) { if (raw + i < st + 4 && st < raw + i + 8) { stampWindow = true; } }
+                if (value >= base && value < base + imageSize && !mapHas(sites, va + i) && !stampWindow) {
                     missing = missing + 1;
                     if (len(first) == 0) { first = "RVA " + toStr(va + i) + " 存 " + toStr(value); }
                 }
@@ -248,6 +269,23 @@ function relocChecks(t: Ref<Tally>, name: string, img: Bytes, pe: int): void {
         k = k + 1;
     }
     check(t, name + ":reloc-complete", missing == 0, toStr(missing) + " 处像映像内地址却没有重定位，首处 " + first);
+}
+
+// 调试目录：恰一条 REPRO 项，在只读数据节的文件内容里，时间戳同 COFF 头。
+function debugChecks(t: Ref<Tally>, name: string, img: Bytes, pe: int, stamp: int): void {
+    const opt = pe + 24;
+    const rva = u(img, opt + 112 + 8 * 6, 4);
+    const size = u(img, opt + 112 + 8 * 6 + 4, 4);
+    const at = fileAt(img, pe, rva, size);
+    if (!check(t, name + ":debug-dir", u(img, opt + 108, 4) > 6 && size == 28 && rva % 4 == 0 && at >= 0,
+            "数据目录 6：RVA " + toStr(rva) + "，长度 " + toStr(size))) { return; }
+    const sec = pe + 24 + u(img, pe + 20, 2) + 40 * sectionOf(img, pe, rva, size, true);
+    const chars = u(img, sec + 36, 4);
+    check(t, name + ":debug-repro", (chars & 0x40) != 0 && (chars & 0x80000000) == 0 && (chars & 0x20000000) == 0
+        && u(img, at, 4) == 0 && u(img, at + 4, 4) == stamp && u(img, at + 8, 4) == 0 && u(img, at + 12, 4) == 16
+        && u(img, at + 16, 4) == 0 && u(img, at + 20, 4) == 0 && u(img, at + 24, 4) == 0,
+        "类型 " + toStr(u(img, at + 12, 4)) + "，时间戳 " + toStr(u(img, at + 4, 4)) + "（COFF 头 " + toStr(stamp) + "），数据 "
+        + toStr(u(img, at + 16, 4)) + "／" + toStr(u(img, at + 20, 4)) + "／" + toStr(u(img, at + 24, 4)) + "，所在节特征 " + toStr(chars));
 }
 
 function noInts(): List<int> { return listNew(); }

@@ -1,0 +1,76 @@
+// DNSService 的结果只在当前网络线程的 ProcessResult 调用里进入太虚回调。
+import { BrowserAddress, dnsCheckpoint, dnsLiteral, dnsAdd } from "./dns_common";
+import { deadlineRemainingMs } from "std/deadline";
+
+declare type Service;
+declare struct ServiceOut { value: Service }
+declare function DNSServiceGetAddrInfo(output: Ref<ServiceOut>, flags: u32, interfaceIndex: u32, protocol: u32, host: string, callback: (Service, u32, u32, i32, usize, usize, u32, usize) => void, context: usize): i32 from "libSystem";
+declare function DNSServiceRefSockFD(service: Service): i32 from "libSystem";
+declare function DNSServiceProcessResult(service: Service): i32 from "libSystem";
+declare function DNSServiceRefDeallocate(service: Service): void from "libSystem";
+declare function poll(fds: Bytes, count: u32, timeout: i32): i32 from "libSystem";
+
+struct Query { protocol: int, service: Service, fd: i32, addresses: List<BrowserAddress>, done: bool, error: string }
+let queries: List<Ref<Query>?> = listNew();
+
+function received(service: Service, flags: u32, interfaceIndex: u32, code: i32, host: usize, address: usize, ttl: u32, context: usize): void {
+    const index = context as int; if (index < 0 || index >= listLen(queries)) { return; }
+    const query = listGet(queries, index); if (query == None || query.done || handleBits(query.service) != handleBits(service)) { return; }
+    if (code != 0 as i32) { if (code != -65554 as i32) { query.error = "browser dns: DNSService callback " + toStr(code); } query.done = true; return; }
+    if ((flags & (2 as u32)) != 0 as u32 && address != 0 as usize) {
+        let size = 16; let family = 2; let offset = 4; let length = 4;
+        if (query.protocol == 2) { size = 28; family = 30; offset = 8; length = 16; }
+        const view = ffiMem(address as int, size, false) catch (e) { query.error = e.message; query.done = true; return; };
+        const raw = ffiMemRead(view, 0, size); ffiMemEnd(view);
+        if ((bytesGet(raw, 0) catch 0) != size || (bytesGet(raw, 1) catch 0) != family) { query.error = "browser dns: inconsistent system address"; query.done = true; return; }
+        let scope = 0; if (length == 16) { scope = (bytesGetLE<u32>(raw, 24) catch (0 as u32)) as int; }
+        dnsAdd(query.addresses, bytesSlice(raw, offset, length), scope) catch (e) { query.error = e.message; query.done = true; return; };
+    }
+    if ((flags & (1 as u32)) == 0 as u32) { query.done = true; }
+}
+function start(host: string, protocol: int): int | Error {
+    const query = new Query { protocol: protocol, service: handleFromBits<Service>(0), fd: -1 as i32, addresses: listNew(), done: false, error: "" };
+    let index = 0; while (index < listLen(queries) && listGet(queries, index) != None) { index = index + 1; }
+    if (index == listLen(queries)) { listPush(queries, query); } else { listSet(queries, index, query); }
+    let owned = false; defer { if (!owned) { listSet(queries, index, None); } }
+    const output = new ServiceOut { value: handleFromBits<Service>(0) };
+    // ReturnIntermediates 让 NXDOMAIN／NODATA 通知可见；GetAddrInfo 仍在系统内跟随 CNAME。
+    const code = DNSServiceGetAddrInfo(output, 4096 as u32, 0 as u32, protocol as u32, host, received, index as usize);
+    if (code != 0 as i32) { return err("browser dns: DNSServiceGetAddrInfo " + toStr(code)); }
+    query.service = output.value; query.fd = DNSServiceRefSockFD(query.service);
+    if (query.fd < 0 as i32) { DNSServiceRefDeallocate(query.service); return err("browser dns: invalid DNSService fd"); }
+    owned = true; return index;
+}
+function close(index: int): void {
+    const query = listGet(queries, index); if (query != None) { DNSServiceRefDeallocate(query.service); listSet(queries, index, None); }
+}
+function process(index: int, timeout: int): void | Error {
+    const query = listGet(queries, index); if (query == None || query.done) { return done(); }
+    const descriptor = bytesNew(8); bytesSetLE<i32>(descriptor, 0, query.fd); bytesSetLE<i16>(descriptor, 4, 1 as i16);
+    const ready = poll(descriptor, 1 as u32, timeout as i32);
+    if (ready < 0 as i32) { if (ffiLastError() == 4) { return done(); } return err("browser dns: DNSService poll failed"); }
+    if (ready > 0 as i32) {
+        if (((bytesGetLE<i16>(descriptor, 6) catch (0 as i16)) & (1 as i16)) == 0 as i16) { return err("browser dns: DNSService fd closed"); }
+        const code = DNSServiceProcessResult(query.service); if (code != 0 as i32) { query.error = "browser dns: DNSServiceProcessResult " + toStr(code); query.done = true; }
+    } return done();
+}
+export function browserResolve(host: string, deadline: int, cancelled: () => bool): List<BrowserAddress> | Error {
+    dnsCheckpoint(deadline, cancelled)?; const literal = dnsLiteral(host)?; if (listLen(literal) > 0) { return literal; }
+    // 分开两个协议的首批结果，不能把 A 的 MoreComing=0 当作 AAAA 也已完成。
+    const ipv4 = start(host, 1)?; defer { close(ipv4); } const ipv6 = start(host, 2)?; defer { close(ipv6); }
+    while (true) {
+        dnsCheckpoint(deadline, cancelled)?;
+        const a = listGet(queries, ipv4); const b = listGet(queries, ipv6); if (a == None || b == None) { return err("browser dns: missing query state"); }
+        if (a.done && b.done) { break; }
+        process(ipv4, 0)?; process(ipv6, 0)?;
+        let left = deadlineRemainingMs(deadline)?; if (left > 25) { left = 25; }
+        if (!a.done) { process(ipv4, left)?; } else if (!b.done) { process(ipv6, left)?; }
+    }
+    dnsCheckpoint(deadline, cancelled)?; const out: List<BrowserAddress> = listNew(); let error = "browser dns: name has no usable addresses";
+    for (index in [ipv4, ipv6]) {
+        const query = listGet(queries, index); if (query == None) { return err("browser dns: missing final query state"); }
+        for (address in query.addresses) { dnsAdd(out, address.ip, address.scope)?; } if (len(query.error) > 0) { error = query.error; }
+    }
+    if (listLen(out) == 0) { return err(error); } return out;
+}
+function done(): void {}

@@ -1,0 +1,432 @@
+// 编译器工作区的连续结构编辑门：同步 hover 正确、关闭入口后零泄漏，记录实际响应耗时。设计
+// 第五、六节。
+//
+// 以 --toolchain --leak-check 构建编译器，对它起 `lsp --stdio --toolchain`（工作区为源码根与工作目录），打开 bootstrap/taixu.tx 并
+// 连续改 --changes 次（每次在末尾追加的常量在 int 与 string 之间交替，单数次另加一个常量），每次随即 hover 那个常量：须无错、说明里
+// 有名字与 `: int`／`: string`，期间的 publishDiagnostics 须为空表；每 20 次与最后一次打印耗时与服务的常驻内存。关闭文档、shutdown、
+// exit 后须退出 0 且 stderr 为空（泄漏检查构建在有泄漏时写 stderr）。逐次耗时、内存与结论写进工作目录的 report.json。
+//
+// 客户端是 test_lsp_session.tx。服务的常驻内存按 procPid（D3 v0.54）经 proc_info_os_*.tx 取（Windows 工作集、Linux VmRSS；macOS 经 ps）。
+// initialize 无回复时记为失败、照常收尾并写报告；构建超时报构建失败；失败说明里的回复是 JSON 原文；未给 --work 时自建的临时目录
+// 全部通过即删除（内有约 60 MB 的泄漏检查构建）、有失败则保留。
+//
+// 运行（仓根）：taixu run --toolchain scripts/test_lsp_cache.tx --compiler <taixu> [--source 源码根] [--work 目录] [--changes N]
+//   [--skip-build]（--skip-build 直接用 --compiler，须已是泄漏检查构建，仅供开发）
+// 任何失败时退出码 1。
+import { absolute, deleteTree, exeName, join, kindOf, mkdirs, nat, pad3, parseDigits } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { captureRaw } from "./test_lib";
+import { lossyText } from "./check_lib";
+import { Jv, jArray, jDumpSpaced, jNull, jNumber, jObject, jParse, jPretty, jPush, jQuote, jSet, jString } from "./test_json";
+import { at, dump, textIs, truthy } from "./test_jv";
+import { close, finish, KILLED, Lsp, lspOpen, init, open, change, send, units, uriOf, waitId } from "./test_lsp_session";
+import { procRss } from "./proc_info_os";
+
+const SEC: int = 1000000000;
+const MAX_OUTPUT: int = 1073741824;
+const HOVER_WAIT_MS: int = 180000;
+const NAME: string = "lspCacheSoakValue";
+
+struct Sample {
+    revision: int,
+    ns: int,
+}
+
+struct Mem {
+    revision: int,
+    bytes: int,
+}
+
+// 读文本并统一换行（同 Python 的 read_text：\r\n 与单独的 \r 都成 \n）。
+function readText(p: string): string | Error {
+    const s = readFile(p)?;
+    return replaceAll(replaceAll(s, "\r\n", "\n"), "\r", "\n");
+}
+
+function replaceAll(s: string, a: string, b: string): string {
+    const parts = strSplit(s, a);
+    let out = listGet(parts, 0) catch "";
+    let i = 1;
+    while (i < listLen(parts)) {
+        out = out + b + (listGet(parts, i) catch "");
+        i = i + 1;
+    }
+    return out;
+}
+
+// needle 在 s 里最后一次出现的字节位置，没有得 −1（同 str.rindex，这里总能找到）。
+function lastIndex(s: string, needle: string): int {
+    let i = len(s) - len(needle);
+    while (i >= 0) {
+        let k = 0;
+        while (k < len(needle) && (byteAt(s, i + k) ?? 0) == (byteAt(needle, k) ?? 1)) {
+            k = k + 1;
+        }
+        if (k == len(needle)) {
+            return i;
+        }
+        i = i - 1;
+    }
+    return -1;
+}
+
+// 秒，三位小数（同 Python 的 '%.3f' % (ns / 1e9)；在第四位上四舍五入）。
+function seconds(ns: int): string {
+    const ms = (ns + 500000) / 1000000;
+    return toStr(ms / 1000) + "." + pad3(ms % 1000);
+}
+
+function sortInts(xs: List<int>): List<int> {
+    const out: List<int> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+        let k = listLen(out) - 1;
+        while (k > 0 && x < (listGet(out, k - 1) catch 0)) {
+            listSet(out, k, listGet(out, k - 1) catch 0);
+            k = k - 1;
+        }
+        listSet(out, k, x);
+    }
+    return out;
+}
+
+// statistics.median 的 JSON 写法：个数为奇数取中间的整数，偶数取中间两个的平均（Python 为浮点，写成 x.0 或 x.5）；空表为 null。
+function medianJson(hot: List<int>): Ref<Jv> {
+    const n = listLen(hot);
+    if (n == 0) {
+        return jNull();
+    }
+    if (n % 2 == 1) {
+        return jNumber(listGet(hot, n / 2) catch 0);
+    }
+    const sum = (listGet(hot, n / 2 - 1) catch 0) + (listGet(hot, n / 2) catch 0);
+    let text = toStr(sum / 2) + ".0";
+    if (sum % 2 != 0) {
+        text = toStr(sum / 2) + ".5";
+    }
+    return jParse(text) catch jNumber(sum / 2);
+}
+
+// 中位数的纳秒（取整，供 SUMMARY 行的秒数）；空表为 0。
+function medianNs(hot: List<int>): int {
+    const n = listLen(hot);
+    if (n == 0) {
+        return 0;
+    }
+    if (n % 2 == 1) {
+        return listGet(hot, n / 2) catch 0;
+    }
+    return ((listGet(hot, n / 2 - 1) catch 0) + (listGet(hot, n / 2) catch 0)) / 2;
+}
+
+function freshDir(prefix: string): string | Error {
+    const base = osRealPath(tempDir());
+    let k = 0;
+    while (k < 1000) {
+        const p = nat(join(base, prefix + toStr(monoNs() % 1000000000) + "-" + toStr(k)));
+        if (kindOf(p) == 0) {
+            makeDir(p)?;
+            return p;
+        }
+        k = k + 1;
+    }
+    return err("建不了临时目录 " + prefix);
+}
+
+function strs(xs: []string): List<string> {
+    const out: List<string> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+    }
+    return out;
+}
+
+function usage(): int {
+    eprint("用法：taixu run --toolchain scripts/test_lsp_cache.tx --compiler <taixu> [--source 源码根] [--work 目录] [--changes N] [--skip-build]");
+    return 2;
+}
+
+// 一次编辑并 hover；失败时把说明记进 failures、得假。
+function revise(s: Ref<Lsp>, uri: string, original: string, i: int, failures: List<string>, samples: List<Sample>): bool {
+    let value = toStr(i);
+    if (i % 2 == 1) {
+        value = "\"x\"";
+    }
+    let text = original + "\nconst " + NAME + " = " + value + ";\n";
+    if (i % 2 == 1) {
+        text = text + "const lspCacheSoakExtra: int = " + toStr(i) + ";\n";
+    }
+    const offset = lastIndex(text, NAME);
+    let line = 0;
+    let lineStart = 0;
+    let k = 0;
+    while (k < offset) {
+        if ((byteAt(text, k) ?? 0) == 10) {
+            line = line + 1;
+            lineStart = k + 1;
+        }
+        k = k + 1;
+    }
+    const prefix = bytesToStr(bytesSlice(bytesFromStr(text), lineStart, offset - lineStart)) catch "";
+    const position = "{\"line\": " + toStr(line) + ", \"character\": " + toStr(units(prefix, "utf-16")) + "}";
+    const started = monoNs();
+    if (i == 0) {
+        open(s, uri, text);
+    } else {
+        change(s, uri, i + 1, "[{\"text\": " + jQuote(text) + "}]");
+    }
+    const rid = 1000 + i;
+    send(s, "{\"jsonrpc\": \"2.0\", \"id\": " + toStr(rid) + ", \"method\": \"textDocument/hover\", \"params\": {\"textDocument\": {\"uri\": "
+        + jQuote(uri) + "}, \"position\": " + position + "}}");
+    const response = waitId(s, toStr(rid), HOVER_WAIT_MS);
+    const elapsed = monoNs() - started;
+    let expected = "int";
+    if (i % 2 == 1) {
+        expected = "string";
+    }
+    let body = "null";
+    const result = at(response, "result");
+    if (result != None) {
+        body = jDumpSpaced(result ?? jNull());
+    }
+    if (!truthy(response) || at(response, "error") != None || !contains(body, NAME) || !contains(body, ": " + expected)) {
+        listPush(failures, "revision " + toStr(i) + " hover " + dump(response));
+        return false;
+    }
+    for (note in s.notes) {
+        if (textIs(note, "method", "textDocument/publishDiagnostics") && truthy(at(at(note, "params"), "diagnostics"))) {
+            listPush(failures, "revision " + toStr(i) + " diagnostics " + dump(at(note, "params")));
+        }
+    }
+    const fresh: List<Ref<Jv>> = listNew();
+    s.notes = fresh;
+    listPush(samples, Sample { revision: i, ns: elapsed });
+    return true;
+}
+
+function contains(s: string, needle: string): bool {
+    if (len(needle) > len(s)) {
+        return false;
+    }
+    let i = 0;
+    while (i + len(needle) <= len(s)) {
+        let k = 0;
+        while (k < len(needle) && (byteAt(s, i + k) ?? 0) == (byteAt(needle, k) ?? 1)) {
+            k = k + 1;
+        }
+        if (k == len(needle)) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+function main(argv: []string): int {
+    let compiler = "";
+    let source = "";
+    let work = "";
+    let root = "";
+    let changes = 200;
+    let skipBuild = false;
+    let i = 0;
+    while (i < len(argv)) {
+        const a = argv[i];
+        if (a == "--skip-build") {
+            skipBuild = true;
+            i = i + 1;
+        } else if (i + 1 < len(argv) && (a == "--compiler" || a == "--source" || a == "--work" || a == "--root" || a == "--changes")) {
+            const v = argv[i + 1];
+            if (a == "--compiler") {
+                compiler = v;
+            } else if (a == "--source") {
+                source = v;
+            } else if (a == "--work") {
+                work = v;
+            } else if (a == "--root") {
+                root = v;
+            } else {
+                changes = parseDigits(v);
+                if (changes < 1) {
+                    eprint("--changes must be positive");
+                    return usage();
+                }
+            }
+            i = i + 2;
+        } else {
+            return usage();
+        }
+    }
+    if (len(compiler) == 0) {
+        return usage();
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = absolute(nat(root));
+    if (len(source) == 0) {
+        source = root;
+    }
+    source = osRealPath(absolute(nat(source)));
+    compiler = absolute(nat(compiler));
+    let ownWork = false;
+    if (len(work) == 0) {
+        work = freshDir("taixu-lsp-cache-") catch (e) {
+            eprint(e.message);
+            return 2;
+        };
+        ownWork = true;
+    } else {
+        work = absolute(nat(work));
+        mkdirs(work);
+    }
+    work = osRealPath(work);
+    const entry = nat(join(source, "bootstrap/taixu.tx"));
+    const original = readText(entry) catch (e) {
+        eprint("读不了 " + entry + "：" + e.message);
+        return 2;
+    };
+    const uri = uriOf(entry);
+    if (!skipBuild) {
+        const log = nat(join(work, "build.log"));
+        const out = nat(join(work, "compiler"));
+        const args = strs(["build", "bootstrap/taixu.tx", "--toolchain", "--leak-check", "--out", out]);
+        const b = captureRaw(compiler, args, root, 900 * SEC, 10 * SEC, MAX_OUTPUT) catch (e) {
+            writeFile(log, e.message + "\n") catch (e2) {
+                eprint("写不了 build.log：" + e2.message);
+            };
+            print("FAIL build leak-instrumented compiler, see " + log);
+            return 1;
+        };
+        const both = bytesNew(0);
+        bytesAppend(both, b.out);
+        bytesAppend(both, b.err);
+        writeFileBytes(log, both) catch (e) {
+            eprint("写不了 build.log：" + e.message);
+        };
+        if (b.code != 0) {
+            print("FAIL build leak-instrumented compiler, see " + log);
+            return 1;
+        }
+        compiler = nat(join(out, exeName("taixu")));
+    }
+    const lspArgs = strs(["lsp", "--stdio", "--toolchain", "--workspace", source, "--workspace", work]);
+    const s = lspOpen(compiler, lspArgs, source) catch (e) {
+        print("FAIL start " + e.message);
+        return 1;
+    };
+    const failures: List<string> = listNew();
+    const samples: List<Sample> = listNew();
+    const mems: List<Mem> = listNew();
+    if (init(s, "") == None) {
+        listPush(failures, "initialize failed");
+    } else {
+        let k = 0;
+        while (k <= changes) {
+            if (!revise(s, uri, original, k, failures, samples)) {
+                break;
+            }
+            if (k % 20 == 0 || k == changes) {
+                const rss = procRss(procPid(s.p.h));
+                listPush(mems, Mem { revision: k, bytes: rss });
+                let shown = "None";
+                if (rss >= 0) {
+                    shown = toStr(rss);
+                }
+                const last = listGet(samples, listLen(samples) - 1) catch Sample { revision: k, ns: 0 };
+                print("revision=" + toStr(k) + " seconds=" + seconds(last.ns) + " rss=" + shown);
+            }
+            if (listLen(failures) > 0) {
+                break;
+            }
+            k = k + 1;
+        }
+        close(s, uri);
+    }
+    const code = finish(s, true);
+    const stderr = lossyText(s.p.err);
+    if (code != 0 || len(stderr) > 0) {
+        let shown = toStr(code);
+        if (code == KILLED) {
+            shown = "'killed'";
+        }
+        listPush(failures, "exit=" + shown + " stderr=" + stderr);
+    }
+    const hotRaw: List<int> = listNew();
+    for (r in samples) {
+        if (r.revision > 0) {
+            listPush(hotRaw, r.ns);
+        }
+    }
+    const hot = sortInts(hotRaw);
+    let status = "PASS";
+    if (listLen(failures) > 0) {
+        status = "FAIL";
+    }
+    const report = jObject();
+    jSet(report, "requested_changes", jNumber(changes));
+    const sv = jArray();
+    for (r in samples) {
+        const o = jObject();
+        jSet(o, "revision", jNumber(r.revision));
+        jSet(o, "ns", jNumber(r.ns));
+        jPush(sv, o);
+    }
+    jSet(report, "samples", sv);
+    const mv = jArray();
+    for (m in mems) {
+        const o = jObject();
+        jSet(o, "revision", jNumber(m.revision));
+        if (m.bytes >= 0) {
+            jSet(o, "bytes", jNumber(m.bytes));
+        } else {
+            jSet(o, "bytes", jNull());
+        }
+        jPush(mv, o);
+    }
+    jSet(report, "rss", mv);
+    if (code == KILLED) {
+        jSet(report, "exit", jString("killed"));
+    } else {
+        jSet(report, "exit", jNumber(code));
+    }
+    jSet(report, "stderr", jString(stderr));
+    const fv = jArray();
+    for (f in failures) {
+        jPush(fv, jString(f));
+    }
+    jSet(report, "failures", fv);
+    jSet(report, "status", jString(status));
+    jSet(report, "median_hot_ns", medianJson(hot));
+    if (listLen(hot) > 0) {
+        let p = (listLen(hot) * 95 + 99) / 100 - 1;
+        if (p < 0) {
+            p = 0;
+        }
+        jSet(report, "p95_hot_ns", jNumber(listGet(hot, p) catch 0));
+    } else {
+        jSet(report, "p95_hot_ns", jNull());
+    }
+    jSet(report, "note", jString("LSP response measurements; compiler regression timing uses separate formal windows."));
+    writeFile(nat(join(work, "report.json")), jPretty(report, 2)) catch (e) {
+        eprint("写不了 report.json：" + e.message);
+    };
+    for (f in failures) {
+        print("FAIL " + f);
+    }
+    let done = listLen(samples) - 1;
+    if (done < 0) {
+        done = 0;
+    }
+    print("SUMMARY " + status + " changes=" + toStr(done) + " median-hot=" + seconds(medianNs(hot)) + "s");
+    if (listLen(failures) > 0) {
+        if (ownWork) {
+            eprint("工作目录保留在 " + work);
+        }
+        return 1;
+    }
+    if (ownWork) {
+        deleteTree(work);
+    }
+    return 0;
+}

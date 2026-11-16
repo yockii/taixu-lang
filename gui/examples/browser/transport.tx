@@ -1,0 +1,100 @@
+// 浏览器专用网络线程适配器；非阻塞 try 操作＋有界等待，共用一个绝对截止。
+import { ByteSocket, socketOpen, socketConnect, socketFinishConnect, socketRead, socketWrite, socketPoll, socketClose } from "std/net_socket";
+import { deadlineRemainingMs } from "std/deadline";
+import { Tls13Client } from "std/tls13_state";
+import { tls13Client, tls13Start, tls13Receive, tls13Write, tls13Close, tls13Dispose } from "std/tls13_client";
+
+export struct BrowserTransport {
+    socket: Ref<ByteSocket>, tls: Ref<Tls13Client>?, deadline: int, cancelled: () => bool,
+    pending: Bytes, pendingAt: int, peerClosed: bool,
+}
+
+function checkpoint(transport: Ref<BrowserTransport>): void | Error {
+    if (transport.cancelled()) { return err("browser network: cancelled"); }
+    if (deadlineRemainingMs(transport.deadline)? == 0) { return err("browser network: deadline exceeded"); } return done();
+}
+function wait(transport: Ref<BrowserTransport>, writable: bool): void | Error {
+    checkpoint(transport)?; let remaining = deadlineRemainingMs(transport.deadline)?; if (remaining > 25) { remaining = 25; }
+    socketPoll(transport.socket, writable, remaining)?; checkpoint(transport)?; return done();
+}
+function writeWire(transport: Ref<BrowserTransport>, data: Bytes): void | Error {
+    let offset = 0;
+    while (offset < bytesLen(data)) {
+        checkpoint(transport)?; let count = bytesLen(data) - offset; if (count > 65536) { count = 65536; }
+        const result = socketWrite(transport.socket, bytesSlice(data, offset, count))?;
+        if (result.wouldBlock) { wait(transport, true)?; continue; } offset = offset + result.written;
+    } return done();
+}
+function readWire(transport: Ref<BrowserTransport>): Bytes | Error {
+    while (true) {
+        checkpoint(transport)?; const result = socketRead(transport.socket, 65536)?;
+        if (result.wouldBlock) { wait(transport, false)?; continue; } return result.data;
+    } return err("browser network: unreachable read state");
+}
+function pump(transport: Ref<BrowserTransport>): void | Error {
+    const tls = transport.tls; if (tls == None) { return err("browser network: missing TLS state"); }
+    const data = readWire(transport)?; const progress = tls13Receive(tls, data, bytesLen(data) == 0)?;
+    for (record in progress.outbound) { writeWire(transport, record)?; }
+    for (application in progress.application) { bytesAppend(transport.pending, application); }
+    transport.peerClosed = progress.peerClosed; checkpoint(transport)?; return done();
+}
+
+export function transportOpenAddress(host: string, ip: Bytes, port: int, secure: bool, deadline: int, roots: List<Bytes>, cancelled: () => bool): Ref<BrowserTransport> | Error {
+    let version = 4; if (bytesLen(ip) == 16) { version = 6; }
+    const socket = socketOpen(version, false)?; let owned = false; defer { if (!owned) { socketClose(socket); } }
+    const transport = new BrowserTransport { socket: socket, tls: None, deadline: deadline, cancelled: cancelled, pending: bytesNew(0), pendingAt: 0, peerClosed: false };
+    checkpoint(transport)?;
+    if (!socketConnect(socket, ip, port)?) {
+        while (!socketFinishConnect(socket)?) { wait(transport, true)?; }
+    }
+    checkpoint(transport)?; owned = true; return transportOpenSocket(host, socket, secure, deadline, roots, cancelled);
+}
+
+// 入口接管 socket，任何错误也会将其关闭。
+export function transportOpenSocket(host: string, socket: Ref<ByteSocket>, secure: bool, deadline: int, roots: List<Bytes>, cancelled: () => bool): Ref<BrowserTransport> | Error {
+    const transport = new BrowserTransport { socket: socket, tls: None, deadline: deadline, cancelled: cancelled, pending: bytesNew(0), pendingAt: 0, peerClosed: false };
+    let owned = false; defer { if (!owned) { transportClose(transport); } }
+    if (socket.state != 2 || socket.datagram) { return err("browser network: expected connected TCP socket"); }
+    checkpoint(transport)?; if (secure) {
+        const tls = tls13Client(host, nowMs() / 1000, roots)?; transport.tls = tls;
+        writeWire(transport, tls13Start(tls)?)?;
+        while (tls.phase != 6) { pump(transport)?; }
+    }
+    checkpoint(transport)?; owned = true; return transport;
+}
+
+export function transportWrite(transport: Ref<BrowserTransport>, data: Bytes): void | Error {
+    checkpoint(transport)?; const tls = transport.tls;
+    if (tls == None) { return writeWire(transport, data); }
+    for (record in tls13Write(tls, data)?) { writeWire(transport, record)?; } return done();
+}
+export function transportRead(transport: Ref<BrowserTransport>, maximum: int): Bytes | Error {
+    if (maximum < 1 || maximum > 65536) { return err("browser network: invalid read limit"); }
+    while (true) {
+        checkpoint(transport)?;
+        const available = bytesLen(transport.pending) - transport.pendingAt;
+        if (available > 0) {
+            let count = available; if (count > maximum) { count = maximum; }
+            const data = bytesSlice(transport.pending, transport.pendingAt, count); transport.pendingAt = transport.pendingAt + count;
+            if (transport.pendingAt == bytesLen(transport.pending)) { transport.pending = bytesNew(0); transport.pendingAt = 0; } return data;
+        }
+        if (transport.peerClosed) { return bytesNew(0); }
+        if (transport.tls == None) {
+            const data = readWire(transport)?;
+            if (bytesLen(data) == 0) { transport.peerClosed = true; return data; } transport.pending = data;
+        } else { pump(transport)?; }
+    } return err("browser network: unreachable application read state");
+}
+export function transportShutdown(transport: Ref<BrowserTransport>): void | Error {
+    defer { transportClose(transport); }
+    const tls = transport.tls;
+    if (tls != None && !tls.failed && tls.phase == 6 && !tls.localClosed) {
+        for (record in tls13Close(tls)?) { writeWire(transport, record)?; }
+    }
+    return done();
+}
+export function transportClose(transport: Ref<BrowserTransport>): void {
+    socketClose(transport.socket); const tls = transport.tls; if (tls != None) { tls13Dispose(tls); transport.tls = None; }
+    bytesFill(transport.pending, 0, bytesLen(transport.pending), 0); transport.pending = bytesNew(0); transport.pendingAt = 0; transport.peerClosed = true;
+}
+function done(): void {}

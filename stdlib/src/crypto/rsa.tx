@@ -1,0 +1,85 @@
+// RSA 公钥验签，RFC 8017；PSS 固定 SHA-256 / MGF1-SHA256 / 32 字节 salt（TLS 1.3）。
+import { rsaDecode, rsaEncode, rsaNprime, rsaR2, rsaModPow } from "./rsa_math";
+import { sha256Sum } from "../hash";
+import { constantTimeEqual } from "./subtle";
+
+export struct RsaPublicKey { modulus: Bytes, bits: int, exponent: int, limbs: List<int>, nprime: int, r2: List<int> }
+
+function at(data: Bytes, i: int): int { return bytesGet(data, i) catch panic("rsa: internal byte bounds"); }
+
+export function rsaPublicKey(modulus: Bytes, exponent: int): Ref<RsaPublicKey> | Error { return rsaPublicKeyLimit(modulus, exponent, 8192); }
+
+export function rsaPublicKeyLimit(modulus: Bytes, exponent: int, maxBits: int): Ref<RsaPublicKey> | Error {
+    if (maxBits < 1024 || maxBits > 1048576 || bytesLen(modulus) < 128 || bytesLen(modulus) > (maxBits + 7) / 8
+        || exponent < 3 || exponent > 2147483647 || (exponent & 1) == 0) { return err("rsa: invalid public key parameters"); }
+    let top = at(modulus, 0);
+    if (top == 0 || (at(modulus, bytesLen(modulus) - 1) & 1) == 0) { return err("rsa: non-canonical or even modulus"); }
+    let bits = (bytesLen(modulus) - 1) * 8;
+    while (top > 0) { bits = bits + 1; top = top >> 1; }
+    if (bits < 1024 || bits > maxBits) { return err("rsa: modulus bit length out of bounds"); }
+    const copy = bytesSlice(modulus, 0, bytesLen(modulus));
+    const limbs = rsaDecode(copy, (bits + 14) / 15);
+    return new RsaPublicKey { modulus: copy, bits: bits, exponent: exponent, limbs: limbs, nprime: rsaNprime(limbs), r2: rsaR2(limbs) };
+}
+
+function signatureInRange(key: Ref<RsaPublicKey>, signature: Bytes): bool {
+    if (bytesLen(signature) != bytesLen(key.modulus)) { return false; }
+    let i = 0;
+    while (i < bytesLen(signature)) {
+        if (at(signature, i) < at(key.modulus, i)) { return true; }
+        if (at(signature, i) > at(key.modulus, i)) { return false; }
+        i = i + 1;
+    }
+    return false;
+}
+
+function recover(key: Ref<RsaPublicKey>, signature: Bytes): Bytes {
+    return rsaEncode(rsaModPow(rsaDecode(signature, listLen(key.limbs)), key.exponent, key.limbs, key.nprime, key.r2), bytesLen(key.modulus));
+}
+
+function mgf1(seed: Bytes, length: int): Bytes {
+    const out = bytesNew(length); const input = bytesNew(bytesLen(seed) + 4); bytesCopy(input, 0, seed, 0, bytesLen(seed));
+    let offset = 0; let counter = 0;
+    while (offset < length) {
+        let i = 0;
+        while (i < 4) { bytesSet(input, bytesLen(seed) + i, (counter >> ((3 - i) * 8)) & 255); i = i + 1; }
+        const digest = sha256Sum(input); let n = length - offset;
+        if (n > 32) { n = 32; }
+        bytesCopy(out, offset, digest, 0, n); offset = offset + n; counter = counter + 1;
+    }
+    return out;
+}
+
+export function rsaPssSha256Verify(key: Ref<RsaPublicKey>, message: Bytes, signature: Bytes): bool {
+    if (!signatureInRange(key, signature)) { return false; }
+    const encoded = recover(key, signature); const emBits = key.bits - 1; const emLen = (emBits + 7) / 8;
+    if (emLen < 66) { return false; }
+    const offset = bytesLen(encoded) - emLen; let i = 0;
+    while (i < offset) { if (at(encoded, i) != 0) { return false; } i = i + 1; }
+    const em = bytesSlice(encoded, offset, emLen);
+    if (at(em, emLen - 1) != 188) { return false; }
+    const dbLen = emLen - 33; const mask = 255 >> (emLen * 8 - emBits);
+    if ((at(em, 0) & (255 ^ mask)) != 0) { return false; }
+    const hash = bytesSlice(em, dbLen, 32); const db = mgf1(hash, dbLen); i = 0;
+    while (i < dbLen) { bytesSet(db, i, at(db, i) ^ at(em, i)); i = i + 1; }
+    bytesSet(db, 0, at(db, 0) & mask); i = 0;
+    while (i < dbLen - 33) { if (at(db, i) != 0) { return false; } i = i + 1; }
+    if (at(db, dbLen - 33) != 1) { return false; }
+    const input = bytesNew(8); bytesAppend(input, sha256Sum(message)); bytesAppend(input, bytesSlice(db, dbLen - 32, 32));
+    return constantTimeEqual(hash, sha256Sum(input));
+}
+
+export function rsaPkcs1Sha256Verify(key: Ref<RsaPublicKey>, message: Bytes, signature: Bytes): bool {
+    if (!signatureInRange(key, signature)) { return false; }
+    const encoded = recover(key, signature); const n = bytesLen(encoded);
+    if (n < 62 || at(encoded, 0) != 0 || at(encoded, 1) != 1) { return false; }
+    let i = 2;
+    while (i < n - 52) { if (at(encoded, i) != 255) { return false; } i = i + 1; }
+    if (at(encoded, i) != 0) { return false; }
+    const expected = bytesNew(0);
+    for (value in [48, 49, 48, 13, 6, 9, 96, 134, 72, 1, 101, 3, 4, 2, 1, 5, 0, 4, 32]) {
+        const b = bytesNew(1); bytesSet(b, 0, value); bytesAppend(expected, b);
+    }
+    bytesAppend(expected, sha256Sum(message));
+    return constantTimeEqual(bytesSlice(encoded, i + 1, 51), expected);
+}

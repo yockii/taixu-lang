@@ -1,0 +1,136 @@
+import { tls13Client, tls13Start, tls13Receive, tls13Write, tls13Close, tls13Dispose } from "std/tls13_client";
+import { Tls13Client } from "std/tls13_state";
+import { tls13Cursor, tls13Take, tls13Vector, tls13ParseServerHello, tls13Extensions, tls13ClientHello, tls13Integer, tls13PlainRecord, tls13Message, tls13Wrap, tls13Extension } from "std/tls13_wire";
+import { tls13ServerCertificateVerify } from "std/tls13_auth";
+import { tls13TrafficKeys, tls13Seal } from "std/tls13_record";
+import { x509ParseCertificate } from "std/x509";
+import { x509RsaPublicKey } from "std/x509_keys";
+import { rsaPssSha256Verify } from "std/crypto/rsa";
+import { sha256Sum } from "std/hash";
+import { p256Hex } from "std/crypto/p256_field";
+import { constantTimeEqual } from "std/crypto/subtle";
+import { tls13HandshakeSecrets } from "std/tls13_kdf";
+
+function vector(name: string): Bytes {
+    const text = readFile("tests/vectors/tls13-handshake.txt") catch panic("handshake fixture");
+    for (line in strSplit(text, "\n")) {
+        if (len(line) == 0 || byteAt(line, 0) == 35) { continue; } const p = strSplit(line, " ");
+        if (listGet(p, 0) == name) { return p256Hex(listGet(p, 1)); }
+    } panic("missing vector " + name);
+}
+function badHello(body: Bytes): bool { tls13ParseServerHello(body, bytesNew(0), 29) catch (e) { return true; }; return false; }
+// RFC 8446 §4.4.3 的服务器 CertificateVerify 签名内容。
+function signedContent(transcript: Bytes): Bytes {
+    const signed = bytesNew(64); bytesFill(signed, 0, 64, 32); bytesAppend(signed, bytesFromStr("TLS 1.3, server CertificateVerify"));
+    listPush(bytesAsList(signed), 0 as u8); bytesAppend(signed, sha256Sum(transcript)); return signed;
+}
+function cvError(state: Ref<Tls13Client>, body: Bytes): bool { tls13ServerCertificateVerify(state, body) catch (e) { return true; }; return false; }
+function receiveError(state: Ref<Tls13Client>, data: Bytes, eof: bool): bool { tls13Receive(state, data, eof) catch (e) { return true; }; return false; }
+function extensionError(data: Bytes): bool { tls13Extensions(data) catch (e) { return true; }; return false; }
+function helloError(host: string, cookie: Bytes): bool {
+    tls13ClientHello(host, bytesNew(32), bytesNew(32), 29, bytesNew(32), cookie) catch (e) { return true; }; return false;
+}
+function startError(state: Ref<Tls13Client>): bool { tls13Start(state) catch (e) { return true; }; return false; }
+function sharedError(data: Bytes): bool { tls13HandshakeSecrets(data, bytesNew(32)) catch (e) { return true; }; return false; }
+function appState(): Ref<Tls13Client> {
+    // 仅检验已握手后的记录状态；完整认证另由独立 TLS 引擎互操作验证。
+    const state = tls13Client("example.test", 1794456000, listNew()) catch panic("client"); state.phase = 6;
+    state.serverTraffic = vector("s"); state.clientTraffic = vector("c");
+    state.readKeys = tls13TrafficKeys(state.serverTraffic) catch panic("read keys"); state.writeKeys = tls13TrafficKeys(state.clientTraffic) catch panic("write keys"); return state;
+}
+
+test "TLS 握手：RFC 8448 ServerHello 与真实 CertificateVerify 转录" {
+    const sh = vector("sh"); const body = bytesSlice(sh, 4, bytesLen(sh) - 4);
+    const parsed = tls13ParseServerHello(body, bytesNew(0), 29) catch panic("RFC ServerHello");
+    assert(!parsed.retry && parsed.group == 29 && bytesLen(parsed.key) == 32, "RFC key share"); let cut = 0;
+    while (cut < bytesLen(body)) { assert(badHello(bytesSlice(body, 0, cut)), "every truncated hello prefix"); cut = cut + 1; }
+    const cursor = tls13Cursor(vector("cert")); tls13Take(cursor, 4) catch panic("message header"); tls13Vector(cursor, 1) catch panic("context");
+    const list = tls13Cursor(tls13Vector(cursor, 3) catch panic("cert list"));
+    const cert = x509ParseCertificate(tls13Vector(list, 3) catch panic("certificate")) catch panic("RFC certificate schema");
+    const state = tls13Client("server", 1794456000, listNew()) catch panic("state"); state.certificate = cert; state.transcript = vector("cv-transcript");
+    const cv = vector("cv"); const signature = bytesSlice(cv, 4, bytesLen(cv) - 4);
+    // RFC 8448 的服务器密钥是 1024 位 RSA：TLS 入口按 2048 位下限拒绝；签名本身用同一份转录在 PSS 层核对。
+    assert(cvError(state, signature), "1024-bit RSA server key rejected by TLS policy");
+    const key = x509RsaPublicKey(cert) catch panic("RFC RSA key"); assert(key.bits == 1024, "RFC 8448 key size");
+    // 消息体是算法号 0x0804、两字节长度与签名；PSS 层只要签名本身。
+    assert((bytesGet(signature, 0) catch 0) == 8 && (bytesGet(signature, 1) catch 0) == 4, "RFC CertificateVerify uses rsa_pss_rsae_sha256");
+    const raw = bytesSlice(signature, 4, bytesLen(signature) - 4);
+    assert(rsaPssSha256Verify(key, signedContent(vector("cv-transcript")), raw), "real RFC CertificateVerify signature over transcript");
+    const wrong = vector("cv-transcript"); bytesSet(wrong, 0, 2);
+    assert(!rsaPssSha256Verify(key, signedContent(wrong), raw), "wrong transcript cannot authenticate");
+    bytesSet(raw, bytesLen(raw) - 1, (bytesGet(raw, bytesLen(raw) - 1) catch 0) ^ 1);
+    assert(!rsaPssSha256Verify(key, signedContent(vector("cv-transcript")), raw), "altered RFC signature");
+}
+
+test "TLS 报文：重复扩展、组重试、SNI 与向量边界" {
+    const duplicate = p256Hex("002b00020304002b00020304"); assert(extensionError(duplicate), "duplicate extension");
+    const sh = vector("sh"); const body = bytesSlice(sh, 4, bytesLen(sh) - 4); bytesSet(body, 1, 1); assert(badHello(body), "legacy version");
+    const random = bytesNew(32); const session = bytesNew(32); const key = bytesNew(32);
+    const hello = tls13ClientHello("example.test", random, session, 29, key, bytesNew(0)) catch panic("hello");
+    assert((bytesGet(hello, 0) catch 0) == 1 && bytesLen(hello) < 16384, "bounded ClientHello");
+    for (host in ["", "例子.test", "127.1", "a..test", "a.test\r\nX: y"]) {
+        assert(helloError(host, bytesNew(0)), "invalid reference hostname");
+    }
+    assert(helloError("example.test", bytesNew(65500)), "aggregate extension vector overflow");
+}
+
+test "TLS 应用状态：独立密钥更新、逐字节重组与序号归零" {
+    const state = appState(); const incoming = vector("peer-update"); bytesAppend(incoming, vector("peer-app"));
+    const outbound = bytesNew(0); const application = bytesNew(0); let i = 0;
+    while (i < bytesLen(incoming)) {
+        const progress = tls13Receive(state, bytesSlice(incoming, i, 1), false) catch (e) { panic(e.message); };
+        for (packet in progress.outbound) { bytesAppend(outbound, packet); } for (data in progress.application) { bytesAppend(application, data); } i = i + 1;
+    }
+    assert(bytesEqual(outbound, vector("client-update")) && bytesEqual(application, p256Hex("7065657200ff")), "old-key reply and new-key data");
+    const sent = tls13Write(state, p256Hex("636c69656e740080")) catch panic("updated write");
+    assert(listLen(sent) == 1 && bytesEqual(listGet(sent, 0), vector("client-app")), "new client key sequence zero");
+    const close = tls13Close(state) catch panic("close"); assert(bytesEqual(listGet(close, 0), vector("client-close")), "close uses updated key");
+    assert(listLen(tls13Close(state) catch panic("repeat close")) == 0, "idempotent local close");
+    const end = tls13Receive(state, vector("peer-close"), true) catch panic("peer close"); assert(end.peerClosed && end.ready, "authenticated close before EOF");
+    const ignored = tls13Receive(state, p256Hex("ff0303ffff00"), true) catch panic("ignore after close");
+    assert(ignored.peerClosed && listLen(ignored.application) == 0 && !state.failed, "no input is interpreted after authenticated closure");
+    const capped = appState(); const keys = capped.writeKeys catch panic("keys"); keys.sequence = 16777215;
+    const updated = tls13Write(capped, p256Hex("636c69656e740080")) catch panic("automatic key update");
+    assert(listLen(updated) == 2 && bytesEqual(listGet(updated, 0), vector("cap-update")) && bytesEqual(listGet(updated, 1), vector("cap-app")), "key update before per-key record limit");
+}
+
+test "TLS 重试：cookie-only 保留密钥份额，第二次重试拒绝" {
+    const state = tls13Client("example.test", 1794456000, listNew()) catch panic("client"); tls13Start(state) catch panic("first hello");
+    const public = bytesSlice(state.publicKey, 0, bytesLen(state.publicKey));
+    const body = p256Hex("0303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c");
+    bytesAppend(body, tls13Wrap(state.session, 1)); bytesAppend(body, p256Hex("130100"));
+    const extensions = tls13Extension(43, p256Hex("0304")); bytesAppend(extensions, tls13Extension(44, tls13Wrap(bytesFromStr("demo"), 2))); bytesAppend(body, tls13Wrap(extensions, 2));
+    const record = tls13PlainRecord(22, tls13Message(2, body), 771);
+    const progress = tls13Receive(state, record, false) catch (e) { panic(e.message); };
+    assert(state.retried && state.phase == 1 && !progress.ready && listLen(progress.outbound) == 2, "retry sends CCS and new hello");
+    assert(bytesEqual(public, state.publicKey) && state.group == 29, "cookie-only keeps original share");
+    assert(receiveError(state, record, false) && state.failed, "second HRR is fatal");
+}
+
+test "TLS 状态：截断、提前应用数据与失败后不可复用" {
+    assert(sharedError(bytesNew(32)) && sharedError(bytesNew(31)), "zero and short ECDH material rejected");
+    const state = appState(); assert(receiveError(state, bytesNew(0), true), "EOF without close_notify");
+    assert(state.failed && receiveError(state, vector("peer-update"), false), "failed state stays failed");
+    const before = appState(); before.phase = 5;
+    const early = tls13Seal(tls13TrafficKeys(vector("s")) catch panic("peer keys"), 23, bytesFromStr("premature"), 0) catch panic("early record");
+    assert(receiveError(before, early, false), "no application bytes before Finished");
+    const plain = tls13Client("example.test", 1794456000, listNew()) catch panic("client"); tls13Start(plain) catch panic("start");
+    const ccs = tls13PlainRecord(20, tls13Integer(1, 1), 771); tls13Receive(plain, ccs, false) catch panic("compat CCS");
+    const huge = tls13PlainRecord(22, p256Hex("02100001"), 771);
+    assert(receiveError(plain, huge, false), "handshake size header limit");
+    const duplicate = tls13Client("example.test", 1794456000, listNew()) catch panic("client"); tls13Start(duplicate) catch panic("start");
+    assert(startError(duplicate) && duplicate.failed, "cannot start a second handshake");
+}
+
+test "TLS 释放：外层取消也能清零持有的密钥别名" {
+    const state = appState(); const read = state.readKeys; const write = state.writeKeys;
+    if (read == None || write == None) { panic("application keys"); }
+    const readKey = read.key; const writeKey = write.key; const readIv = read.iv; const writeIv = write.iv;
+    state.privateKey = bytesFromStr("private"); const private = state.privateKey;
+    state.handshakeSecret = bytesFromStr("handshake"); const secret = state.handshakeSecret;
+    tls13Dispose(state); tls13Dispose(state);
+    for (buffer in [readKey, writeKey, readIv, writeIv, private, secret]) {
+        for (b in bytesAsList(buffer)) { assert(b == 0 as u8, "original aliases see zeroed bytes"); }
+    }
+    assert(state.failed && state.localClosed && state.peerClosed && receiveError(state, bytesNew(0), false), "disposed state cannot resume");
+}

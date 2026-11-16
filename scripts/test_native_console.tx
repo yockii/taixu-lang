@@ -1,0 +1,549 @@
+// 实际控制台／PTY 与 UTF-8 重定向门，不改调用者的代码页：同一个打印 PRINT／ERROR／WRITE／COUNT／ARG 的程序经产物与 `taixu run`
+// 两条路，先在重定向的管道里逐行比对 UTF-8，再接到真终端上（Windows 为 ConPTY，代码页 437、936、65001 各一遍；类 Unix 为 PTY）
+// 看去掉 VT 序列后的文本含全部期望行。Windows 另有反例（CP936 控制台上原样写 UTF-8 字节不得显示成原文，证明前面确是真控制台而不是
+// 同样能过正例的管道）与 Windows PowerShell 5.1 的 UTF-8 管道（会话内显式设 UTF-8，不改原生管道字节的约定，也不动用户的配置）。
+// 首个失败即停，报告写 --report（缺省为工作目录下本次的 console-… 目录里的 report.json）。
+//
+// 内层助手是本程序自己（--inside <计划>）：外层把它接到终端上，它确认标准句柄是真终端（Windows 重开新控制台的 CONIN$／CONOUT$ 并设
+// 代码页）后经 runProcess 起计划里的命令，命令继承这些句柄。反例里“原样写字节”的也是本程序（--raw-write）。终端的接法在
+// console_os_windows.tx 与 console_os_unix.tx。
+//
+// 内层起命令不另设上限（runProcess 不限时），由外层的 90 秒上限兜住；逐项输出 PASS／FAIL，末行 SUMMARY。
+//
+// 运行（仓根）：taixu run --toolchain scripts/test_native_console.tx --compiler <原生 taixu> [--work <目录>] [--report 文件]
+import { absolute, dirOf, exeName, findInPath, freshRunDir, join, mkdirs, nat, readBytes } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { Tally, captureRaw, check, linesOf, summary, tallyNew } from "./test_lib";
+import { J_BOOL, Jv, jArray, jGet, jInt, jLen, jAt, jNull, jNumber, jObject, jPretty, jPush, jSet, jString, jText } from "./test_json";
+import { cut, readJ, shaHex } from "./contract_lib";
+import { attach, isTty, terminal, writeRaw } from "./console_os";
+
+const TEXT: string = "太虚 🦊 é e\u{301}";
+const ARG: string = "参数 中文 & 🦊";
+const SEC: int = 1000000000;
+const DRAIN_NS: int = 10000000000;
+const MAX_OUTPUT: int = 67108864;
+
+function sourceText(): string {
+    return "export function main(args: []string): int {\n" +
+    "    print(\"PRINT " + TEXT + "\");\n" +
+    "    eprint(\"ERROR " + TEXT + "\");\n" +
+    "    const data = bytesFromStr(\"WRITE " + TEXT + "\\n\");\n" +
+    "    print(\"COUNT \" + toStr(stdoutWrite(data)));\n" +
+    "    if (len(args) > 0) { print(\"ARG \" + args[0]); }\n" +
+    "    return 0;\n" +
+    "}\n";
+}
+
+function onWindows(): bool {
+    return hostTarget() == "windows";
+}
+
+function jBool(v: bool): Ref<Jv> {
+    const b = jNull();
+    b.kind = J_BOOL;
+    b.truth = v;
+    return b;
+}
+
+function jStrings(xs: List<string>): Ref<Jv> {
+    const a = jArray();
+    for (x in xs) {
+        jPush(a, jString(x));
+    }
+    return a;
+}
+
+function writeJson(path: string, v: Ref<Jv>): void | Error {
+    writeFile(path, jPretty(v, 2) + "\n")?;
+    return nothing();
+}
+
+function nothing(): void {
+}
+
+// 字节转文本：不是合法 UTF-8 得 None。
+function utf8(b: Bytes): string? {
+    const s = bytesToStr(b) catch (e) {
+        return None;
+    };
+    return s;
+}
+
+function sameLines(a: List<string>, b: List<string>): bool {
+    if (listLen(a) != listLen(b)) {
+        return false;
+    }
+    let i = 0;
+    while (i < listLen(a)) {
+        if ((listGet(a, i) catch "") != (listGet(b, i) catch "?")) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- 去掉 VT 序列
+
+// 同 Python 的 re.sub(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[=>]', '', text)：OSC（BEL 或 ESC \ 结尾）、
+// CSI、ESC = 与 ESC >；哪一种都对不上的 ESC 原样留下。涉及的字节都是 ASCII，UTF-8 的多字节字符里不会出现，按字节扫即可。
+function stripVt(s: string): string {
+    const b = bytesFromStr(s);
+    const out = bytesNew(0);
+    const n = bytesLen(b);
+    let i = 0;
+    while (i < n) {
+        const c = bytesGet(b, i) ?? 0;
+        if (c == 27) {
+            const end = vtEnd(b, i);
+            if (end > i) {
+                i = end;
+                continue;
+            }
+        }
+        bytesPush(out, c);
+        i = i + 1;
+    }
+    return bytesToStr(out) catch s;
+}
+
+// b[i] 是 ESC：对得上某种序列得序列之后的位置，对不上得 i。
+function vtEnd(b: Bytes, i: int): int {
+    const n = bytesLen(b);
+    const next = bytesGet(b, i + 1) ?? -1;
+    if (next == 93) {
+        let j = i + 2;
+        while (j < n) {
+            const c = bytesGet(b, j) ?? 0;
+            if (c == 7) {
+                return j + 1;
+            }
+            if (c == 27) {
+                if ((bytesGet(b, j + 1) ?? -1) == 92) {
+                    return j + 2;
+                }
+                return i;
+            }
+            j = j + 1;
+        }
+        return i;
+    }
+    if (next == 91) {
+        let j = i + 2;
+        while (j < n && (bytesGet(b, j) ?? 0) >= 48 && (bytesGet(b, j) ?? 0) <= 63) {
+            j = j + 1;
+        }
+        while (j < n && (bytesGet(b, j) ?? 0) >= 32 && (bytesGet(b, j) ?? 0) <= 47) {
+            j = j + 1;
+        }
+        const f = bytesGet(b, j) ?? -1;
+        if (f >= 64 && f <= 126) {
+            return j + 1;
+        }
+        return i;
+    }
+    if (next == 61 || next == 62) {
+        return i + 2;
+    }
+    return i;
+}
+
+// ---------------------------------------------------------------- 内层助手
+
+// 接在终端上：记下标准三件是不是终端，接好并核对控制台（不成立即退出 1，不写 info），写 info，再起计划里的命令并照传退出码。
+function inside(planPath: string): int {
+    const plan = readJ(readBytes(planPath) catch bytesNew(0));
+    if (plan == None) {
+        eprint("读不了计划：" + planPath);
+        return 2;
+    }
+    const p = plan ?? jObject();
+    const info = jObject();
+    jSet(info, "stdin_tty", jBool(isTty(0)));
+    jSet(info, "stdout_tty", jBool(isTty(1)));
+    jSet(info, "stderr_tty", jBool(isTty(2)));
+    const page = jInt(jGet(p, "codepage")) ?? 0;
+    const problem = attach(page, info);
+    if (len(problem) > 0) {
+        eprint("inside: " + problem + " " + jPretty(info, 0));
+        return 1;
+    }
+    writeJson(jText(jGet(p, "info")) ?? "", info) catch (e) {
+        eprint("写不了 info：" + e.message);
+        return 1;
+    };
+    const argv = jGet(p, "argv") ?? jArray();
+    const rest: List<string> = listNew();
+    let i = 1;
+    while (i < jLen(argv)) {
+        listPush(rest, jText(jAt(argv, i)) ?? "");
+        i = i + 1;
+    }
+    return runProcess(jText(jAt(argv, 0)) ?? "", rest, "") catch (e) {
+        eprint(e.message);
+        return 1;
+    };
+}
+
+// ---------------------------------------------------------------- 外层
+
+struct Gate {
+    t: Ref<Tally>,
+    checks: Ref<Jv>,
+}
+
+// 一项检查：打印 PASS／FAIL，记进报告；失败时外层随即停下。
+function chk(g: Ref<Gate>, name: string, ok: bool, detail: Ref<Jv>): bool {
+    check(g.t, name, ok, cut(jPretty(detail, 0), 4000));
+    const row = jObject();
+    jSet(row, "name", jString(name));
+    jSet(row, "passed", jBool(ok));
+    jSet(row, "detail", detail);
+    jPush(g.checks, row);
+    return ok;
+}
+
+// 一次重定向运行的细节。
+function runDetail(code: int, out: string, errs: string): Ref<Jv> {
+    const d = jObject();
+    jSet(d, "exit", jNumber(code));
+    jSet(d, "stdout", jString(out));
+    jSet(d, "stderr", jString(errs));
+    return d;
+}
+
+// --compiler，缺省取 TAIXU_NATIVE 或 PATH 上的 taixu；须是原生太虚编译器。
+function nativeCompiler(value: string): string | Error {
+    let candidate = value;
+    if (len(candidate) == 0) {
+        candidate = getEnv("TAIXU_NATIVE") ?? "";
+    }
+    if (len(candidate) == 0) {
+        candidate = findInPath("taixu");
+    }
+    if (len(candidate) == 0) {
+        return err("请给出 --compiler <原生 taixu>");
+    }
+    const compiler = nat(osRealPath(absolute(candidate)));
+    const args: List<string> = listNew();
+    listPush(args, "capabilities");
+    listPush(args, "--format=json");
+    const r = captureRaw(compiler, args, "", 30 * SEC, DRAIN_NS, MAX_OUTPUT)?;
+    if (r.code != 0) {
+        return err(compiler + " capabilities 退出码 " + toStr(r.code));
+    }
+    const caps = readJ(r.out) ?? jObject();
+    if ((jText(jGet(jGet(caps, "capabilities") ?? jObject(), "compiler")) ?? "") != "native-tx") {
+        return err("所选编译器不是原生太虚：" + compiler);
+    }
+    return compiler;
+}
+
+function terminalRoute(g: Ref<Gate>, work: string, route: string, argv: List<string>, page: int, want: List<string>): bool | Error {
+    let label = "UTF-8";
+    let tag = "None";
+    if (page > 0) {
+        label = toStr(page);
+        tag = toStr(page);
+    }
+    const name = route + ": terminal " + label;
+    const stem = join(work, route + "-" + tag);
+    const plan = stem + ".json";
+    const infoPath = stem + ".inside.json";
+    const pj = jObject();
+    jSet(pj, "argv", jStrings(argv));
+    jSet(pj, "cwd", jString(work));
+    if (page > 0) {
+        jSet(pj, "codepage", jNumber(page));
+    } else {
+        jSet(pj, "codepage", jNull());
+    }
+    jSet(pj, "info", jString(infoPath));
+    writeJson(plan, pj)?;
+    const helper: List<string> = listNew();
+    listPush(helper, selfExePath());
+    listPush(helper, "--inside");
+    listPush(helper, plan);
+    const t = terminal(helper, work)?;
+    writeFileBytes(stem + ".vt.bin", t.raw)?;
+    const text = utf8(t.raw) ?? "";
+    if (utf8(t.raw) == None) {
+        return err(name + "：终端输出不是 UTF-8");
+    }
+    const plain = stripVt(text);
+    const info = readJ(readBytes(infoPath) catch bytesNew(0));
+    let found = true;
+    for (line in want) {
+        if (strFind(plain, line) < 0) {
+            found = false;
+        }
+    }
+    const d = jObject();
+    jSet(d, "exit", jNumber(t.code));
+    jSet(d, "inside", info ?? jNull());
+    jSet(d, "errors", jStrings(t.errors));
+    jSet(d, "text", jString(plain));
+    return chk(g, name, t.code == 0 && listLen(t.errors) == 0 && info != None && found, d);
+}
+
+// 各项检查；首个失败即返回 false。
+function checks(g: Ref<Gate>, compiler: string, work: string, source: string, product: string): bool | Error {
+    const expectedOut: List<string> = listNew();
+    listPush(expectedOut, "PRINT " + TEXT);
+    listPush(expectedOut, "WRITE " + TEXT);
+    listPush(expectedOut, "COUNT " + toStr(len("WRITE " + TEXT + "\n")));
+    listPush(expectedOut, "ARG " + ARG);
+    const expectedErr: List<string> = listNew();
+    listPush(expectedErr, "ERROR " + TEXT);
+    const both: List<string> = listNew();
+    for (x in expectedOut) {
+        listPush(both, x);
+    }
+    listPush(both, "ERROR " + TEXT);
+    const routes: []string = ["product", "cli-run"];
+    const productArgv: List<string> = listNew();
+    listPush(productArgv, product);
+    listPush(productArgv, ARG);
+    const cliArgv: List<string> = listNew();
+    listPush(cliArgv, compiler);
+    listPush(cliArgv, "run");
+    listPush(cliArgv, "--toolchain");
+    listPush(cliArgv, source);
+    listPush(cliArgv, ARG);
+    for (route in routes) {
+        let argv = productArgv;
+        if (route == "cli-run") {
+            argv = cliArgv;
+        }
+        const rest: List<string> = listNew();
+        let i = 1;
+        while (i < listLen(argv)) {
+            listPush(rest, listGet(argv, i) catch "");
+            i = i + 1;
+        }
+        const p = captureRaw(listGet(argv, 0) catch "", rest, work, 90 * SEC, DRAIN_NS, MAX_OUTPUT)?;
+        const out = utf8(p.out);
+        const errs = utf8(p.err);
+        if (out == None || errs == None) {
+            return err(route + "：重定向输出不是 UTF-8");
+        }
+        const so = out ?? "";
+        const se = errs ?? "";
+        if (!chk(g, route + ": redirected UTF-8 stdout", p.code == 0 && sameLines(linesOf(so), expectedOut), runDetail(p.code, so, se))) {
+            return false;
+        }
+        if (!chk(g, route + ": redirected UTF-8 stderr", sameLines(linesOf(se), expectedErr), jObject())) {
+            return false;
+        }
+        if (onWindows()) {
+            const pages: []int = [437, 936, 65001];
+            for (page in pages) {
+                if (!terminalRoute(g, work, route, argv, page, both)?) {
+                    return false;
+                }
+            }
+        } else if (!terminalRoute(g, work, route, argv, 0, both)?) {
+            return false;
+        }
+    }
+    if (onWindows()) {
+        if (!negative(g, work)?) {
+            return false;
+        }
+        if (!powershell(g, work, cliArgv, expectedOut, expectedErr)?) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 证明前面确是真控制台：CP936 的控制台上原样写 UTF-8 字节，终端送出的文本里不得出现原文（管道会原样传过去，同样能过正例）。
+function negative(g: Ref<Gate>, work: string): bool | Error {
+    const plan = join(work, "raw-negative.json");
+    const infoPath = join(work, "raw-negative.inside.json");
+    const argv: List<string> = listNew();
+    listPush(argv, selfExePath());
+    listPush(argv, "--raw-write");
+    const pj = jObject();
+    jSet(pj, "argv", jStrings(argv));
+    jSet(pj, "cwd", jString(work));
+    jSet(pj, "codepage", jNumber(936));
+    jSet(pj, "info", jString(infoPath));
+    writeJson(plan, pj)?;
+    const helper: List<string> = listNew();
+    listPush(helper, selfExePath());
+    listPush(helper, "--inside");
+    listPush(helper, plan);
+    const t = terminal(helper, work)?;
+    writeFileBytes(join(work, "raw-negative.vt.bin"), t.raw)?;
+    const text = utf8(t.raw) ?? "";
+    if (utf8(t.raw) == None) {
+        return err("negative control：终端输出不是 UTF-8");
+    }
+    const d = jObject();
+    jSet(d, "exit", jNumber(t.code));
+    jSet(d, "errors", jStrings(t.errors));
+    jSet(d, "text", jString(text));
+    return chk(g, "negative control: raw UTF-8 at CP936 is not valid Unicode output",
+        t.code == 0 && listLen(t.errors) == 0 && fileThere(infoPath) && strFind(text, TEXT) < 0, d);
+}
+
+function fileThere(path: string): bool {
+    const b = readBytes(path) catch (e) {
+        return false;
+    };
+    return true;
+}
+
+// 第二个消费者：Windows PowerShell 5.1 在管道里按控制台编码解原生程序的 stdout；会话内显式设 UTF-8。
+function powershell(g: Ref<Gate>, work: string, cliArgv: List<string>, expectedOut: List<string>, expectedErr: List<string>): bool | Error {
+    const root = getEnv("SystemRoot") ?? "C:\\Windows";
+    const exe = join(root, "System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    let invoke = "";
+    for (a in cliArgv) {
+        if (len(invoke) > 0) {
+            invoke = invoke + " ";
+        }
+        invoke = invoke + "'" + doubleQuotes(a) + "'";
+    }
+    const script = "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); " +
+    "$lines = & " + invoke + " | ForEach-Object { $_ }; " +
+    "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; " +
+    "[Console]::Out.WriteLine(($lines -join \"`n\"))";
+    const args: List<string> = listNew();
+    listPush(args, "-NoProfile");
+    listPush(args, "-NonInteractive");
+    listPush(args, "-Command");
+    listPush(args, script);
+    const p = captureRaw(exe, args, work, 90 * SEC, DRAIN_NS, MAX_OUTPUT)?;
+    const out = utf8(p.out);
+    const errs = utf8(p.err);
+    if (out == None || errs == None) {
+        return err("Windows PowerShell 的输出不是 UTF-8");
+    }
+    const so = out ?? "";
+    const se = errs ?? "";
+    return chk(g, "Windows PowerShell UTF-8 pipeline", p.code == 0 && sameLines(linesOf(so), expectedOut) &&
+        strFind(se, listGet(expectedErr, 0) catch "") >= 0, runDetail(p.code, so, se));
+}
+
+// PowerShell 单引号串里的单引号写两遍。
+function doubleQuotes(s: string): string {
+    let out = "";
+    let start = 0;
+    let i = 0;
+    while (i < len(s)) {
+        if ((byteAt(s, i) ?? 0) == 39) {
+            out = out + strSlice(s, start, i + 1) + "'";
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return out + strSlice(s, start, len(s));
+}
+
+function platformName(): string {
+    if (onWindows()) {
+        return "win32";
+    }
+    if (hostTarget() == "macos") {
+        return "darwin";
+    }
+    return hostTarget();
+}
+
+function run(args: []string): int | Error {
+    let compilerArg = "";
+    let workArg = "";
+    let report = "";
+    let i = 0;
+    while (i < len(args)) {
+        const a = args[i];
+        if (i + 1 >= len(args)) {
+            return err("缺少取值或未知参数：" + a);
+        }
+        if (a == "--compiler") {
+            compilerArg = args[i + 1];
+        } else if (a == "--work") {
+            workArg = args[i + 1];
+        } else if (a == "--report") {
+            report = args[i + 1];
+        } else {
+            return err("未知参数：" + a);
+        }
+        i = i + 2;
+    }
+    const root = osRealPath(absolute(currentDir() catch "."));
+    const compiler = nativeCompiler(compilerArg)?;
+    if (len(workArg) == 0) {
+        workArg = join(root, "work/native-console");
+    }
+    if (!mkdirs(absolute(workArg))) {
+        return err("建不了工作目录：" + workArg);
+    }
+    const work = nat(osRealPath(freshRunDir(osRealPath(absolute(workArg)), "console-", 0)?));
+    const source = join(work, "控制台 & unicode.tx");
+    writeFile(source, sourceText())?;
+    const build: List<string> = listNew();
+    listPush(build, "build");
+    listPush(build, source);
+    listPush(build, "--toolchain");
+    listPush(build, "--out");
+    listPush(build, join(work, "product"));
+    const b = captureRaw(compiler, build, root, 120 * SEC, DRAIN_NS, MAX_OUTPUT)?;
+    if (b.code != 0) {
+        return err("构建失败（退出码 " + toStr(b.code) + "）：" + (bytesToStr(b.err) catch ""));
+    }
+    const product = join(join(work, "product"), exeName("控制台 & unicode"));
+    const t = tallyNew();
+    const g = new Gate { t: t, checks: jArray() };
+    const result = jObject();
+    jSet(result, "compiler_sha256", jString(shaHex(readBytes(compiler) catch bytesNew(0))));
+    jSet(result, "platform", jString(platformName()));
+    jSet(result, "work", jString(work));
+    jSet(result, "checks", g.checks);
+    const failure = runChecks(g, compiler, work, source, product);
+    let status = "FAIL";
+    if (len(failure) == 0) {
+        status = "PASS";
+    }
+    jSet(result, "status", jString(status));
+    if (len(report) == 0) {
+        report = join(work, "report.json");
+    }
+    const made = mkdirs(dirOf(absolute(report)));
+    writeJson(report, result)?;
+    print("Report: " + report);
+    if (len(failure) > 0 && failure != "-") {
+        return err(failure);
+    }
+    return summary(t, "console");
+}
+
+// 跑各项检查：全过得空串，有检查失败得 "-"，中途出错（起不来、超时、输出不是 UTF-8 等）得原因。
+function runChecks(g: Ref<Gate>, compiler: string, work: string, source: string, product: string): string {
+    const ok = checks(g, compiler, work, source, product) catch (e) {
+        return e.message;
+    };
+    if (ok) {
+        return "";
+    }
+    return "-";
+}
+
+function main(args: []string): int {
+    if (len(args) == 2 && args[0] == "--inside") {
+        return inside(args[1]);
+    }
+    if (len(args) == 1 && args[0] == "--raw-write") {
+        if (writeRaw(bytesFromStr(TEXT))) {
+            return 0;
+        }
+        return 1;
+    }
+    return run(args) catch (e) {
+        eprint("test_native_console: " + e.message);
+        return 2;
+    };
+}

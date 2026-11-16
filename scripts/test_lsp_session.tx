@@ -1,0 +1,302 @@
+// LSP 端到端客户端的会话层（从 test_lsp_e2e.tx 抽出；lsp-e2e、lsp-cache 等门共用）：分帧模式的 test_proto.tx（回复以独立的
+// test_json.tx 解析）、按 id 等响应（其间的别的消息记进 notes）、请求与通知、等服务退出，以及位置的码元数与 file URI。
+import { byteSub, slashes } from "./test_text";
+import { J_OBJ, Jv, jNull, jParse, jQuote } from "./test_json";
+import { at, has, sameJv, textIs } from "./test_jv";
+import { MODE_FRAMES, Peer, peerClose, peerExited, peerPump, peerSend, peerStart } from "./test_proto";
+
+// 宿主是 Windows（不借 build_lib，本模块列在 repo_hygiene 的独立判定器名单里）。
+function onWindows(): bool {
+    return hostTarget() == "windows";
+}
+
+// 等响应、等消息与等退出的缺省上限（30 s）。
+export const WAIT_MS: int = 30000;
+// 等退出超时、被结束时 waitExit 得的值。
+export const KILLED: int = -100001;
+
+// 起服务：exe args，工作目录 cwd。
+export function lspOpen(exe: string, args: List<string>, cwd: string): Ref<Lsp> | Error {
+    const p = peerStart(exe, args, cwd, MODE_FRAMES, false)?;
+    const notes: List<Ref<Jv>> = listNew();
+    return new Lsp { p: p, notes: notes, nextId: 0, eof: false };
+}
+
+export struct Lsp {
+    p: Ref<Peer>,
+    notes: List<Ref<Jv>>,
+    nextId: int,
+    eof: bool,
+}
+
+// 取下一条消息的结果：kind 0 消息、1 流尾（只报一次）、2 超时。
+export struct Got {
+    kind: int,
+    msg: Ref<Jv>?,
+}
+
+export function frameOf(body: string): Bytes {
+    const b = bytesFromStr(body);
+    const out = bytesFromStr("Content-Length: " + toStr(bytesLen(b)) + "\r\n\r\n");
+    bytesAppend(out, b);
+    return out;
+}
+
+export function raw(s: Ref<Lsp>, data: Bytes): void {
+    const ok = peerSend(s.p, data);
+}
+
+export function send(s: Ref<Lsp>, body: string): void {
+    raw(s, frameOf(body));
+}
+
+export function get(s: Ref<Lsp>, limitMs: int): Ref<Got> {
+    const end = monoNs() + limitMs * 1000000;
+    while (true) {
+        if (listLen(s.p.msgs) > 0) {
+            const m = listGet(s.p.msgs, 0) catch jNull();
+            listRemoveAt(s.p.msgs, 0);
+            return new Got { kind: 0, msg: m };
+        }
+        if (!s.p.outOpen) {
+            if (!s.eof) {
+                s.eof = true;
+                return new Got { kind: 1, msg: None };
+            }
+            return new Got { kind: 2, msg: None };
+        }
+        let left = (end - monoNs()) / 1000000;
+        if (left <= 0) {
+            return new Got { kind: 2, msg: None };
+        }
+        if (left > 100) {
+            left = 100;
+        }
+        peerPump(s.p, left);
+    }
+    return new Got { kind: 2, msg: None };
+}
+
+// 等 id 等于 rid（JSON 原文，按值比较，同 Python 的 ==）的响应；其间的别的消息记进 notes。
+export function waitId(s: Ref<Lsp>, rid: string, limitMs: int): Ref<Jv>? {
+    const want = jParse(rid) catch jNull();
+    const end = monoNs() + limitMs * 1000000;
+    while (monoNs() < end) {
+        const g = get(s, (end - monoNs()) / 1000000);
+        if (g.kind != 0) {
+            return None;
+        }
+        const m = g.msg ?? jNull();
+        if (m.kind == J_OBJ && !has(m, "method") && sameJv(at(m, "id"), want)) {
+            return m;
+        }
+        listPush(s.notes, m);
+    }
+    return None;
+}
+
+export function requestRid(s: Ref<Lsp>, method: string, params: string, rid: string): Ref<Jv>? {
+    let msg = "{\"jsonrpc\": \"2.0\", \"id\": " + rid + ", \"method\": " + jQuote(method);
+    if (len(params) > 0) {
+        msg = msg + ", \"params\": " + params;
+    }
+    send(s, msg + "}");
+    return waitId(s, rid, WAIT_MS);
+}
+
+export function request(s: Ref<Lsp>, method: string, params: string): Ref<Jv>? {
+    s.nextId = s.nextId + 1;
+    return requestRid(s, method, params, toStr(s.nextId));
+}
+
+export function notify(s: Ref<Lsp>, method: string, params: string): void {
+    let msg = "{\"jsonrpc\": \"2.0\", \"method\": " + jQuote(method);
+    if (len(params) > 0) {
+        msg = msg + ", \"params\": " + params;
+    }
+    send(s, msg + "}");
+}
+
+// 收消息直到静默 ms 毫秒。
+export function quiet(s: Ref<Lsp>, ms: int): void {
+    while (true) {
+        const g = get(s, ms);
+        if (g.kind != 0) {
+            return;
+        }
+        listPush(s.notes, g.msg ?? jNull());
+    }
+}
+
+export function isPub(m: Ref<Jv>, uri: string): bool {
+    return textIs(m, "method", "textDocument/publishDiagnostics") && textIs(at(m, "params"), "uri", uri);
+}
+
+// 该 uri 的下一条 publishDiagnostics 的 diagnostics（先查已收下的）；等不到得 None。
+export function diags(s: Ref<Lsp>, uri: string): Ref<Jv>? {
+    const end = monoNs() + WAIT_MS * 1000000;
+    while (true) {
+        let i = 0;
+        while (i < listLen(s.notes)) {
+            const m = listGet(s.notes, i) catch jNull();
+            if (isPub(m, uri)) {
+                listRemoveAt(s.notes, i);
+                return at(at(m, "params"), "diagnostics");
+            }
+            i = i + 1;
+        }
+        const left = (end - monoNs()) / 1000000;
+        if (left <= 0) {
+            return None;
+        }
+        const g = get(s, left);
+        if (g.kind != 0) {
+            return None;
+        }
+        listPush(s.notes, g.msg ?? jNull());
+    }
+    return None;
+}
+
+// 已收下的该 uri 的全部 publishDiagnostics（取走），各自的 diagnostics。
+export function pubsFor(s: Ref<Lsp>, uri: string): List<Ref<Jv>> {
+    const out: List<Ref<Jv>> = listNew();
+    const keep: List<Ref<Jv>> = listNew();
+    for (m in s.notes) {
+        if (isPub(m, uri)) {
+            listPush(out, at(at(m, "params"), "diagnostics") ?? jNull());
+        } else {
+            listPush(keep, m);
+        }
+    }
+    s.notes = keep;
+    return out;
+}
+
+export function init(s: Ref<Lsp>, encs: string): Ref<Jv>? {
+    let caps = "{}";
+    if (len(encs) > 0) {
+        caps = "{\"general\": {\"positionEncodings\": " + encs + "}}";
+    }
+    const r = request(s, "initialize", "{\"processId\": null, \"rootUri\": null, \"capabilities\": " + caps + "}");
+    notify(s, "initialized", "{}");
+    return r;
+}
+
+export function open(s: Ref<Lsp>, uri: string, text: string): void {
+    notify(s, "textDocument/didOpen", "{\"textDocument\": {\"uri\": " + jQuote(uri) + ", \"languageId\": \"taixu\", \"version\": 1, \"text\": "
+        + jQuote(text) + "}}");
+}
+
+export function change(s: Ref<Lsp>, uri: string, version: int, changes: string): void {
+    notify(s, "textDocument/didChange", "{\"textDocument\": {\"uri\": " + jQuote(uri) + ", \"version\": " + toStr(version) + "}, \"contentChanges\": "
+        + changes + "}");
+}
+
+export function changeText(s: Ref<Lsp>, uri: string, version: int, text: string): void {
+    change(s, uri, version, "[{\"text\": " + jQuote(text) + "}]");
+}
+
+export function close(s: Ref<Lsp>, uri: string): void {
+    notify(s, "textDocument/didClose", "{\"textDocument\": {\"uri\": " + jQuote(uri) + "}}");
+}
+
+// 等服务退出（不关输入），至多 WAIT_MS；超时则结束它、得 KILLED。随后读完两个流。
+export function waitExit(s: Ref<Lsp>): int {
+    const end = monoNs() + WAIT_MS * 1000000;
+    let code = 0;
+    while (!peerExited(s.p)) {
+        if (monoNs() >= end) {
+            procKill(s.p.h);
+            const w = procWait(s.p.h, 10000);
+            code = KILLED;
+            break;
+        }
+        peerPump(s.p, 50);
+    }
+    if (code != KILLED) {
+        code = s.p.code;
+    }
+    const drain = monoNs() + WAIT_MS * 1000000;
+    while ((s.p.outOpen || s.p.errOpen) && monoNs() < drain) {
+        peerPump(s.p, 50);
+    }
+    return code;
+}
+
+// shutdown（可选）、exit 通知，等退出。
+export function finish(s: Ref<Lsp>, shutdown: bool): int {
+    if (shutdown) {
+        const r = request(s, "shutdown", "");
+    }
+    notify(s, "exit", "");
+    return waitExit(s);
+}
+
+export function kill(s: Ref<Lsp>): void {
+    peerClose(s.p);
+}
+
+// s 的长度：utf-8 为字节数，utf-16 为码元数（四字节字符计 2）。
+export function units(s: string, enc: string): int {
+    if (enc == "utf-8") {
+        return len(s);
+    }
+    let n = 0;
+    let i = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) ?? 0;
+        if ((c & 0xC0) != 0x80) {
+            n = n + 1;
+            if (c >= 0xF0) {
+                n = n + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// 百分号编码（同 urllib.parse.quote_from_bytes，safe 为 /）。
+export function quote(s: string): string {
+    const hex = "0123456789ABCDEF";
+    const out = bytesNew(0);
+    let i = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) ?? 0;
+        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95 || c == 46 || c == 45 || c == 126 || c == 47) {
+            bytesPush(out, c);
+        } else {
+            bytesPush(out, 37);
+            bytesPush(out, byteAt(hex, c >> 4) ?? 48);
+            bytesPush(out, byteAt(hex, c & 15) ?? 48);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(out) catch s;
+}
+
+// Path(path).resolve().as_uri()：path 已是真实的绝对路径。Windows 为 file:///E:/…（盘符原样、其余编码），POSIX 为 file:///…。
+export function uriOf(path: string): string {
+    const p = slashes(path);
+    if (onWindows()) {
+        return "file:///" + byteSub(p, 0, 2) + quote(byteSub(p, 2, len(p) - 2));
+    }
+    return "file://" + quote(p);
+}
+
+// VS Code 在 Windows 上的写法：小写盘符、冒号编码（file:///e%3A/…）。
+export function vscodeUri(path: string): string {
+    const u = uriOf(path);
+    if (onWindows() && len(u) > 10 && (byteAt(u, 9) ?? 0) == 58) {
+        let d = byteAt(u, 8) ?? 0;
+        if (d >= 65 && d <= 90) {
+            d = d + 32;
+        }
+        const b = bytesFromStr(byteSub(u, 0, 8));
+        bytesPush(b, d);
+        bytesAppend(b, bytesFromStr("%3A" + byteSub(u, 10, len(u) - 10)));
+        return bytesToStr(b) catch u;
+    }
+    return u;
+}

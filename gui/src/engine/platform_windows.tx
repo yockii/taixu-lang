@@ -1,0 +1,1153 @@
+// ============================================================================
+// engine/platform_windows —— Windows 真窗（GUI 原生引擎 G2；按目标文件选取，Linux 见 platform_linux、macOS 见 platform_macos）。
+//
+// - 窗口类 TaixuGui 的窗口过程 wndProc 是顶层函数，经外部结构体的回调字段交给 RegisterClassExW（核心 D3 v0.43）；
+//   系统只在本线程的外部调用期间（DispatchMessageW、CreateWindowExW、SetWindowPos、DestroyWindow 等）回调它。窗口过程
+//   只把消息翻成事件入队，不调用框架代码。
+// - 事件映射沿用旧宿主的冻结表（v1.1）：关窗 6（不销毁，由程序决定）；键 1／2（target＝VK 码低 8 位；可打印键在
+//   无 Ctrl／Alt 时不发，字符走 WM_CHAR）；字符 8（target＝码位，UTF-16 代理对合成一个码位，控制字符不发）；左键按下 3、
+//   抬起 4（target 1）、移动 5；尺寸 7（x、y＝新客户区宽高，0×0 不发）；菜单项 id≥100 记作按下 3、target＝id。坐标、尺寸
+//   一律按窗口 DPI 从物理像素换成 DIP（四舍五入，缩放 100 时恒等）。mods 由 GetKeyState 读 Shift 1、Ctrl 2、Alt 4。
+//   修正旧实现：方向键、Home／End、Delete 等不再被当成可打印键吞掉；Alt 组合键（WM_SYSKEYDOWN）照常发键事件；左键按下
+//   时捕获鼠标，拖出窗外抬手也能收到抬起。
+// - 每窗事件队列至多 64 条；队尾是同类的移动或尺寸事件时原位覆写（拖拽洪泛不挤掉按下与抬起）。
+// - 呈现：面的 BGRX 像素即 32 位自顶向下 DIB，SetDIBitsToDevice 直接交出（Bytes 调用期间借用）；面没盖住的右、下边带
+//   涂黑。保留最近一帧，WM_PAINT（窗口被遮挡后露出、从最小化还原）时重画，不必等程序下一帧。
+// - DPI：首次开窗前设 PER_MONITOR_AWARE_V2；客户区请求按 DIP×缩放，外框经 AdjustWindowRectExForDpi 反推；WM_DPICHANGED
+//   按系统建议的矩形落位并发尺寸事件（框架随之重查缩放）。
+// - WM_GETMINMAXINFO 与 WM_DPICHANGED 的 lParam 是系统给的结构指针，只在本条消息期间有效：经外部内存区（核心 D3 v0.48 §6.8，
+//   K4）按声明的布局读写——ffiMemOf 先核验地址（MINMAXINFO 还须可写），区随窗口过程返回结束。地址不合法（投递来的空地址、已释放
+//   的页）时不动窗口、不写内存。MINMAXINFO 读出、改最小与最大拖拽尺寸、整体写回，其余字段保持系统给的值。
+// - 剪贴板（G5）：CF_UNICODETEXT。写：GlobalAlloc 可移动块，字节数 2×（UTF-16 码元数＋1），经可写区写入文本与 NUL，交给系统后
+//   不再释放（SetClipboardData 失败时自己释放）；读：GlobalLock 所得地址以 GlobalSize 为上界建只读区，ffiMemUtf16 读到第一个
+//   NUL（文本里含 NUL 时读回到它为止；坏代理换成 U+FFFD）。持有剪贴板的是一个只收消息的 STATIC 窗口（OpenClipboard 不给窗口时
+//   EmptyClipboard 把主人置空，SetClipboardData 随之失败）；别的程序正开着剪贴板时重试，至多 20 次、每次隔 5 毫秒。
+// - 文件对话框（G5 第二部分）：comdlg32 GetOpenFileNameW／GetSaveFileNameW，不带钩子与模板（系统显示资源管理器式界面）。
+//   路径缓冲（32768 码元，覆盖长路径；保存时预填建议文件名）、过滤串（“名称\0模式\0…\0”，见 engine/filedialog）、缺省扩展名与
+//   标题放在同一块 GlobalAlloc 固定内存里，经可写区写入；选中后经只读区 ffiMemUtf16 读出路径，用完释放。没有过滤器、标题为空、
+//   打开或没有具体扩展名时对应字段给空指针（系统缺省标题、不补扩展名）。旗标：OFN_EXPLORER | OFN_HIDEREADONLY |
+//   OFN_NOCHANGEDIR，打开另加 OFN_FILEMUSTEXIST，保存另加 OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT。属主是引擎编号对应的真窗，
+//   不是真窗时无属主。没开过窗也先设 DPI 感知（对话框不模糊）。取消与失败都得空串。
+// ============================================================================
+
+import { FdFilter, fdWin32Parts, fdDefExt } from "./filedialog";
+
+declare type HWND;
+declare type HDC;
+declare type HMENU;
+
+declare struct WNDCLASSEXW { cbSize: u32, style: u32, lpfnWndProc: (HWND, u32, usize, isize) => isize, cbClsExtra: i32, cbWndExtra: i32, hInstance: usize, hIcon: usize, hCursor: usize, hbrBackground: usize, lpszMenuName: usize, lpszClassName: wstr, hIconSm: usize }
+declare struct MSG { hwnd: usize, message: u32, wParam: usize, lParam: isize, time: u32, ptX: i32, ptY: i32, lPrivate: u32 }
+declare struct RECT { left: i32, top: i32, right: i32, bottom: i32 }
+declare struct BITMAPINFO { biSize: u32, biWidth: i32, biHeight: i32, biPlanes: u16, biBitCount: u16, biCompression: u32, biSizeImage: u32, biXPelsPerMeter: i32, biYPelsPerMeter: i32, biClrUsed: u32, biClrImportant: u32, color0: u32 }
+declare struct PAINTSTRUCT { hdc: usize, fErase: i32, left: i32, top: i32, right: i32, bottom: i32, fRestore: i32, fIncUpdate: i32, reserved: [32]u8 }
+declare struct POINT { x: i32, y: i32 }
+declare struct MINMAXINFO { reserved: POINT, maxSize: POINT, maxPosition: POINT, minTrackSize: POINT, maxTrackSize: POINT }
+declare struct OPENFILENAMEW { lStructSize: u32, hwndOwner: usize, hInstance: usize, lpstrFilter: usize, lpstrCustomFilter: usize, nMaxCustFilter: u32, nFilterIndex: u32, lpstrFile: usize, nMaxFile: u32, lpstrFileTitle: usize, nMaxFileTitle: u32, lpstrInitialDir: usize, lpstrTitle: usize, flags: u32, nFileOffset: u16, nFileExtension: u16, lpstrDefExt: usize, lCustData: isize, lpfnHook: usize, lpTemplateName: usize, pvReserved: usize, dwReserved: u32, flagsEx: u32 }
+
+declare function GetModuleHandleW(name: usize): usize from "kernel32";
+declare function GetTickCount64(): u64 from "kernel32";
+declare function Sleep(ms: u32): void from "kernel32";
+declare function GlobalAlloc(flags: u32, bytes: usize): usize from "kernel32";
+declare function GlobalLock(mem: usize): usize from "kernel32";
+declare function GlobalUnlock(mem: usize): i32 from "kernel32";
+declare function GlobalSize(mem: usize): usize from "kernel32";
+declare function GlobalFree(mem: usize): usize from "kernel32";
+declare function OpenClipboard(owner: usize): i32 from "user32";
+declare function CloseClipboard(): i32 from "user32";
+declare function EmptyClipboard(): i32 from "user32";
+declare function GetClipboardData(format: u32): usize from "user32";
+declare function SetClipboardData(format: u32, mem: usize): usize from "user32";
+declare function RegisterClassExW(wc: Ref<WNDCLASSEXW>): u16 from "user32";
+declare function CreateWindowExW(ex: u32, cls: wstr, title: wstr, style: u32, x: i32, y: i32, w: i32, h: i32, parent: isize, menu: usize, inst: usize, param: usize): HWND? from "user32";
+declare function DestroyWindow(h: HWND): i32 from "user32";
+declare function DefWindowProcW(h: HWND, msg: u32, wp: usize, lp: isize): isize from "user32";
+declare function PeekMessageW(m: Ref<MSG>, h: usize, lo: u32, hi: u32, remove: u32): i32 from "user32";
+declare function TranslateMessage(m: Ref<MSG>): i32 from "user32";
+declare function DispatchMessageW(m: Ref<MSG>): isize from "user32";
+declare function MsgWaitForMultipleObjects(n: u32, handles: usize, all: i32, ms: u32, mask: u32): u32 from "user32";
+declare function PostMessageW(h: HWND, msg: u32, wp: usize, lp: isize): i32 from "user32";
+declare function SendMessageW(h: HWND, msg: u32, wp: usize, lp: isize): isize from "user32";
+declare function GetDC(h: HWND): HDC? from "user32";
+declare function ReleaseDC(h: HWND, dc: HDC): i32 from "user32";
+declare function BeginPaint(h: HWND, ps: Ref<PAINTSTRUCT>): HDC? from "user32";
+declare function EndPaint(h: HWND, ps: Ref<PAINTSTRUCT>): i32 from "user32";
+declare function GetClientRect(h: HWND, r: Ref<RECT>): i32 from "user32";
+declare function ScreenToClient(h: HWND, p: Ref<POINT>): i32 from "user32";
+declare function GetWindowRect(h: HWND, r: Ref<RECT>): i32 from "user32";
+declare function SetWindowPos(h: HWND, after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32): i32 from "user32";
+declare function ShowWindow(h: HWND, cmd: i32): i32 from "user32";
+declare function IsZoomed(h: HWND): i32 from "user32";
+declare function GetWindowLongPtrW(h: HWND, index: i32): isize from "user32";
+declare function SetWindowLongPtrW(h: HWND, index: i32, v: isize): isize from "user32";
+declare function AdjustWindowRectExForDpi(r: Ref<RECT>, style: u32, menu: i32, ex: u32, dpi: u32): i32 from "user32";
+declare function SetWindowTextW(h: HWND, title: wstr): i32 from "user32";
+declare function GetKeyState(vk: i32): i16 from "user32";
+declare function LoadCursorW(inst: usize, name: usize): usize from "user32";
+declare function SetCursor(c: usize): usize from "user32";
+declare function SetCapture(h: HWND): usize from "user32";
+declare function ReleaseCapture(): i32 from "user32";
+declare function CreateMenu(): HMENU? from "user32";
+declare function AppendMenuW(m: HMENU, flags: u32, id: usize, label: wstr): i32 from "user32";
+declare function SetMenu(h: HWND, m: HMENU): i32 from "user32";
+declare function DestroyMenu(m: HMENU): i32 from "user32";
+declare function SetLayeredWindowAttributes(h: HWND, key: u32, alpha: u8, flags: u32): i32 from "user32";
+declare function GetSystemMetrics(index: i32): i32 from "user32";
+declare function SetProcessDpiAwarenessContext(ctx: isize): i32 from "user32";
+declare function GetDpiForWindow(h: HWND): u32 from "user32";
+declare function GetDpiForSystem(): u32 from "user32";
+declare function SetDIBitsToDevice(dc: HDC, x: i32, y: i32, w: u32, h: u32, xs: i32, ys: i32, start: u32, lines: u32, bits: Bytes, bmi: Ref<BITMAPINFO>, usage: u32): i32 from "gdi32";
+declare function PatBlt(dc: HDC, x: i32, y: i32, w: i32, h: i32, rop: u32): i32 from "gdi32";
+declare function DwmSetWindowAttribute(h: HWND, attr: u32, value: Bytes, size: u32): i32 from "dwmapi";
+declare function GetOpenFileNameW(ofn: Ref<OPENFILENAMEW>): i32 from "comdlg32";
+declare function GetSaveFileNameW(ofn: Ref<OPENFILENAMEW>): i32 from "comdlg32";
+
+const WM_SIZE: u32 = 0x0005;
+const WM_PAINT: u32 = 0x000F;
+const WM_CLOSE: u32 = 0x0010;
+const WM_SETCURSOR: u32 = 0x0020;
+const WM_GETMINMAXINFO: u32 = 0x0024;
+const WM_KEYDOWN: u32 = 0x0100;
+const WM_KEYUP: u32 = 0x0101;
+const WM_CHAR: u32 = 0x0102;
+const WM_SYSKEYDOWN: u32 = 0x0104;
+const WM_SYSKEYUP: u32 = 0x0105;
+const WM_COMMAND: u32 = 0x0111;
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_LBUTTONUP: u32 = 0x0202;
+const WM_MOUSEWHEEL: u32 = 0x020A;
+const WM_DPICHANGED: u32 = 0x02E0;
+
+const WS_POPUP: u32 = 0x80000000;
+const WS_VISIBLE: u32 = 0x10000000;
+const WS_MAXIMIZE: u32 = 0x01000000;
+const WS_OVERLAPPEDWINDOW: u32 = 0x00CF0000;
+const WS_EX_LAYERED: int = 0x00080000;
+const CW_USEDEFAULT: i32 = -2147483648;
+const SWP_NOSIZE: u32 = 0x0001;
+const SWP_NOMOVE: u32 = 0x0002;
+const SWP_NOZORDER: u32 = 0x0004;
+const SWP_NOACTIVATE: u32 = 0x0010;
+const HWND_TOPMOST: isize = -1;
+const HWND_NOTOPMOST: isize = -2;
+const HWND_MESSAGE: isize = -3;
+const CF_UNICODETEXT: u32 = 13;
+const GMEM_MOVEABLE: u32 = 0x0002;
+const GPTR: u32 = 0x0040; // GMEM_FIXED | GMEM_ZEROINIT
+const OFN_OVERWRITEPROMPT: u32 = 0x00000002;
+const OFN_HIDEREADONLY: u32 = 0x00000004;
+const OFN_NOCHANGEDIR: u32 = 0x00000008;
+const OFN_PATHMUSTEXIST: u32 = 0x00000800;
+const OFN_FILEMUSTEXIST: u32 = 0x00001000;
+const OFN_EXPLORER: u32 = 0x00080000;
+const OFN_SIZE: u32 = 152; // x86_64 与 aarch64 的 sizeof(OPENFILENAMEW)
+const FILE_UNITS: int = 32768; // 路径缓冲的 UTF-16 码元数
+const GWL_STYLE: i32 = -16;
+const GWL_EXSTYLE: i32 = -20;
+const SW_MINIMIZE: i32 = 6;
+const SW_MAXIMIZE: i32 = 3;
+const SW_RESTORE: i32 = 9;
+const SM_CXSCREEN: i32 = 0;
+const SM_CYSCREEN: i32 = 1;
+const SM_CXMAXTRACK: i32 = 59;
+const SM_CYMAXTRACK: i32 = 60;
+const PM_REMOVE: u32 = 1;
+const QS_ALLINPUT: u32 = 0x04FF;
+const IDC_ARROW: usize = 32512;
+const IDC_IBEAM: usize = 32513;
+const BLACKNESS: u32 = 0x00000042;
+const LWA_ALPHA: u32 = 0x00000002;
+const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
+const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
+
+// 与 engine/window、gui/surface 的约定一致。
+const EV_KEY_DOWN: int = 1;
+const EV_KEY_UP: int = 2;
+const EV_MOUSE_DOWN: int = 3;
+const EV_MOUSE_UP: int = 4;
+const EV_MOUSE_MOVE: int = 5;
+const EV_CLOSE: int = 6;
+const EV_RESIZE: int = 7;
+const EV_TEXT: int = 8;
+const EV_SCROLL: int = 9;
+const MOD_SHIFT: int = 1;
+const MOD_CTRL: int = 2;
+const MOD_ALT: int = 4;
+const WFLAG_FRAMELESS: int = 1;
+const WFLAG_MAXIMIZED: int = 2;
+const WFLAG_TOPMOST: int = 4;
+const WFLAG_CENTERED: int = 8;
+const WFLAG_HIDDEN: int = 16;
+const QUEUE_MAX: int = 64;
+const CLASS_NAME: string = "TaixuGui";
+
+struct RWin {
+    id: int,
+    hwnd: HWND,
+    bits: int,
+    scale: int, // DPI×100
+    frameless: bool,
+    minW: int, // 客户区 DIP；0＝未约束
+    minH: int,
+    maxW: int,
+    maxH: int,
+    menu: HMENU?,
+    cursor: int,
+    q: List<int>, // 每条 5 项：kind、target、x、y、mods
+    head: int,
+    hi: int, // 待配对的高位代理
+    wheel: int, // 不足一 DIP 的滚轮余数，单位为 1/120 DIP
+    px: Bytes, // 最近一次呈现的像素（WM_PAINT 重画）
+    pw: int,
+    ph: int,
+}
+
+let wins: List<Ref<RWin>> = listNew();
+let classReady: bool = false;
+let dpiReady: bool = false;
+let clipOwner: int = 0; // 持有剪贴板的只收消息窗口（句柄位）；0＝还没建
+
+function dipToPx(v: int, k: int): int {
+    if (k == 100) {
+        return v;
+    }
+    return (v * k + 50) / 100;
+}
+
+function pxToDip(v: int, k: int): int {
+    if (k == 100) {
+        return v;
+    }
+    return (v * 100 + k / 2) / k;
+}
+
+function scaleOfDpi(dpi: int): int {
+    if (dpi <= 0) {
+        return 100;
+    }
+    return dpi * 100 / 96;
+}
+
+// 串里有 NUL 字节时只取其前（C 串在 NUL 处结束；不让标题、菜单项里的 NUL 变成 trap）。
+function cText(s: string): string {
+    const b = bytesFromStr(s);
+    let i: int = 0;
+    while (i < bytesLen(b)) {
+        if ((bytesGet(b, i) catch 1) == 0) {
+            return bytesToStr(bytesSlice(b, 0, i)) catch "";
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+function idxOfBits(bits: int): int {
+    let i: int = 0;
+    while (i < listLen(wins)) {
+        const w: Ref<RWin> = listGet(wins, i);
+        if (w.bits == bits) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+function idxOfId(id: int): int {
+    let i: int = 0;
+    while (i < listLen(wins)) {
+        const w: Ref<RWin> = listGet(wins, i);
+        if (w.id == id) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+function winAt(i: int): Ref<RWin> {
+    return listGet(wins, i);
+}
+
+function mods(): int {
+    let m: int = 0;
+    if ((GetKeyState(0x10) as int) < 0) {
+        m = m + MOD_SHIFT;
+    }
+    if ((GetKeyState(0x11) as int) < 0) {
+        m = m + MOD_CTRL;
+    }
+    if ((GetKeyState(0x12) as int) < 0) {
+        m = m + MOD_ALT;
+    }
+    return m;
+}
+
+function queued(w: Ref<RWin>): int {
+    return (listLen(w.q) - w.head) / 5;
+}
+
+function push(w: Ref<RWin>, kind: int, target: int, x: int, y: int, m: int): void {
+    if ((kind == EV_MOUSE_MOVE || kind == EV_RESIZE) && queued(w) > 0) {
+        const at: int = listLen(w.q) - 5;
+        if ((listTryGet(w.q, at) catch 0) == kind) {
+            listSet(w.q, at + 2, x);
+            listSet(w.q, at + 3, y);
+            listSet(w.q, at + 4, m);
+            return;
+        }
+    }
+    if (queued(w) >= QUEUE_MAX) {
+        return;
+    }
+    if (w.head > 0 && w.head == listLen(w.q)) {
+        w.q = listNew();
+        w.head = 0;
+    }
+    listPush(w.q, kind);
+    listPush(w.q, target);
+    listPush(w.q, x);
+    listPush(w.q, y);
+    listPush(w.q, m);
+}
+
+// lParam 的低、高 16 位按有符号取（客户区坐标，捕获时可为负）。
+function loSigned(lp: isize): int {
+    const v: int = (lp as int) & 0xFFFF;
+    if (v >= 0x8000) {
+        return v - 0x10000;
+    }
+    return v;
+}
+
+function hiSigned(lp: isize): int {
+    const v: int = ((lp as int) >> 16) & 0xFFFF;
+    if (v >= 0x8000) {
+        return v - 0x10000;
+    }
+    return v;
+}
+
+// 产生字符的键（空格、数字、字母、OEM 标点、小键盘数字与运算符）：无 Ctrl／Alt 时字符由 WM_CHAR 给出，键事件不发（防止
+// 重复输入）。旧实现按 0x20..0x7E 整段判定，把方向键、Home／End、Insert／Delete（0x21..0x2F）也吞了，这里改正。
+function printableVk(vk: int): bool {
+    return vk == 0x20 || (vk >= 0x30 && vk <= 0x39) || (vk >= 0x41 && vk <= 0x5A) || (vk >= 0xBA && vk <= 0xC0) || (vk >= 0xDB && vk <= 0xDF) || vk == 0xE2 || (vk >= 0x60 && vk <= 0x6F && vk != 0x6C);
+}
+
+function blit(dc: HDC, w: Ref<RWin>, cw: int, ch: int): void {
+    if (w.pw > 0 && w.ph > 0) {
+        const bmi = new BITMAPINFO { biSize: 40, biWidth: w.pw as i32, biHeight: (0 - w.ph) as i32, biPlanes: 1, biBitCount: 32, biCompression: 0, biSizeImage: 0, biXPelsPerMeter: 0, biYPelsPerMeter: 0, biClrUsed: 0, biClrImportant: 0, color0: 0 };
+        SetDIBitsToDevice(dc, 0, 0, w.pw as u32, w.ph as u32, 0, 0, 0, w.ph as u32, w.px, bmi, 0);
+    }
+    if (cw > w.pw) {
+        PatBlt(dc, w.pw as i32, 0, (cw - w.pw) as i32, ch as i32, BLACKNESS);
+    }
+    if (ch > w.ph) {
+        PatBlt(dc, 0, w.ph as i32, cw as i32, (ch - w.ph) as i32, BLACKNESS);
+    }
+}
+
+function clientSize(h: HWND): RECT {
+    const r = new RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    GetClientRect(h, r);
+    return { left: 0, top: 0, right: r.right - r.left, bottom: r.bottom - r.top };
+}
+
+// 客户区（物理像素）→ 外框尺寸 [宽, 高]。
+function outerSize(w: Ref<RWin>, cw: int, ch: int): List<int> {
+    const out: List<int> = listNew();
+    const r = new RECT { left: 0, top: 0, right: cw as i32, bottom: ch as i32 };
+    if (!w.frameless) {
+        const style = GetWindowLongPtrW(w.hwnd, GWL_STYLE) as int;
+        const ex = GetWindowLongPtrW(w.hwnd, GWL_EXSTYLE) as int;
+        let hasMenu: i32 = 0;
+        if (w.menu != None) {
+            hasMenu = 1;
+        }
+        AdjustWindowRectExForDpi(r, (style & 0xFFFFFFFF) as u32, hasMenu, (ex & 0xFFFFFFFF) as u32, (w.scale * 96 / 100) as u32);
+    }
+    listPush(out, (r.right - r.left) as int);
+    listPush(out, (r.bottom - r.top) as int);
+    return out;
+}
+
+function wndProc(h: HWND, msg: u32, wp: usize, lp: isize): isize {
+    const i: int = idxOfBits(handleBits(h));
+    if (i < 0) {
+        return DefWindowProcW(h, msg, wp, lp);
+    }
+    const w: Ref<RWin> = winAt(i);
+    const k: int = w.scale;
+    if (msg == WM_CLOSE) {
+        push(w, EV_CLOSE, 0, 0, 0, 0);
+        return 0;
+    }
+    if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYUP) {
+        const vk: int = (wp as int) & 0xFFFF;
+        const m: int = mods();
+        let kind: int = EV_KEY_UP;
+        if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) {
+            kind = EV_KEY_DOWN;
+        }
+        if (!(kind == EV_KEY_DOWN && printableVk(vk) && (m & (MOD_CTRL | MOD_ALT)) == 0)) {
+            push(w, kind, vk & 0xFF, 0, 0, m);
+        }
+        return DefWindowProcW(h, msg, wp, lp);
+    }
+    if (msg == WM_CHAR) {
+        const u: int = (wp as int) & 0xFFFF;
+        if (u >= 0xD800 && u <= 0xDBFF) {
+            w.hi = u;
+            return 0;
+        }
+        let cp: int = u;
+        if (u >= 0xDC00 && u <= 0xDFFF) {
+            if (w.hi == 0) {
+                return 0;
+            }
+            cp = 0x10000 + ((w.hi - 0xD800) << 10) + (u - 0xDC00);
+        }
+        w.hi = 0;
+        if (cp >= 0x20 && cp != 0x7F) {
+            push(w, EV_TEXT, cp, 0, 0, mods());
+        }
+        return 0;
+    }
+    if (msg == WM_MOUSEWHEEL) {
+        const p = new POINT { x: loSigned(lp) as i32, y: hiSigned(lp) as i32 };
+        if (ScreenToClient(h, p) != 0) {
+            const total = w.wheel - hiSigned(wp as isize) * 40;
+            const delta = total / 120;
+            w.wheel = total - delta * 120;
+            if (delta != 0) {
+                push(w, EV_SCROLL, delta, pxToDip(p.x as int, k), pxToDip(p.y as int, k), mods());
+            }
+        }
+        return 0;
+    }
+    if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_MOUSEMOVE) {
+        const x: int = pxToDip(loSigned(lp), k);
+        const y: int = pxToDip(hiSigned(lp), k);
+        if (msg == WM_LBUTTONDOWN) {
+            SetCapture(h);
+            push(w, EV_MOUSE_DOWN, 1, x, y, mods());
+        } else if (msg == WM_LBUTTONUP) {
+            ReleaseCapture();
+            push(w, EV_MOUSE_UP, 1, x, y, mods());
+        } else {
+            push(w, EV_MOUSE_MOVE, 0, x, y, mods());
+        }
+        return 0;
+    }
+    if (msg == WM_SIZE) {
+        const cw: int = (lp as int) & 0xFFFF;
+        const ch: int = ((lp as int) >> 16) & 0xFFFF;
+        if (cw > 0 && ch > 0) {
+            push(w, EV_RESIZE, 0, pxToDip(cw, k), pxToDip(ch, k), 0);
+        }
+        return 0;
+    }
+    if (msg == WM_PAINT) {
+        const ps = new PAINTSTRUCT { hdc: 0, fErase: 0, left: 0, top: 0, right: 0, bottom: 0, fRestore: 0, fIncUpdate: 0, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] };
+        const dc = BeginPaint(h, ps);
+        if (dc != None) {
+            const c = clientSize(h);
+            blit(dc catch handleFromBits<HDC>(0), w, c.right as int, c.bottom as int);
+        }
+        EndPaint(h, ps);
+        return 0;
+    }
+    if (msg == WM_SETCURSOR) {
+        if (((lp as int) & 0xFFFF) == 1) {
+            let id: usize = IDC_ARROW;
+            if (w.cursor == 1) {
+                id = IDC_IBEAM;
+            }
+            SetCursor(LoadCursorW(0, id));
+            return 1;
+        }
+        return DefWindowProcW(h, msg, wp, lp);
+    }
+    if (msg == WM_GETMINMAXINFO) {
+        const m = ffiMemOf<MINMAXINFO>(lp as int, true) catch (e) {
+            return 0;
+        };
+        let info = ffiMemGet<MINMAXINFO>(m, 0);
+        const lo: List<int> = outerSize(w, dipToPx(w.minW, k), dipToPx(w.minH, k));
+        info.minTrackSize = POINT { x: 1, y: 1 };
+        info.maxTrackSize = POINT { x: GetSystemMetrics(SM_CXMAXTRACK), y: GetSystemMetrics(SM_CYMAXTRACK) };
+        if (w.minW > 0) {
+            info.minTrackSize.x = (listTryGet(lo, 0) catch 1) as i32;
+        }
+        if (w.minH > 0) {
+            info.minTrackSize.y = (listTryGet(lo, 1) catch 1) as i32;
+        }
+        if (w.maxW > 0 || w.maxH > 0) {
+            // 最大拖拽尺寸也钳制最大化的目标；不小于主屏，最大化总能铺满（同旧引擎）。
+            const hi: List<int> = outerSize(w, dipToPx(w.maxW, k), dipToPx(w.maxH, k));
+            if (w.maxW > 0) {
+                info.maxTrackSize.x = maxInt((listTryGet(hi, 0) catch 0), GetSystemMetrics(SM_CXSCREEN) as int) as i32;
+            }
+            if (w.maxH > 0) {
+                info.maxTrackSize.y = maxInt((listTryGet(hi, 1) catch 0), GetSystemMetrics(SM_CYSCREEN) as int) as i32;
+            }
+        }
+        ffiMemSet<MINMAXINFO>(m, 0, info);
+        return 0;
+    }
+    if (msg == WM_DPICHANGED) {
+        const m = ffiMemOf<RECT>(lp as int, false) catch (e) {
+            return 0;
+        };
+        const r = ffiMemGet<RECT>(m, 0);
+        ffiMemEnd(m);
+        w.scale = scaleOfDpi((wp as int) & 0xFFFF);
+        SetWindowPos(h, 0, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        const c = clientSize(h);
+        if (c.right > 0 && c.bottom > 0) {
+            push(w, EV_RESIZE, 0, pxToDip(c.right as int, w.scale), pxToDip(c.bottom as int, w.scale), 0);
+        }
+        return 0;
+    }
+    if (msg == WM_COMMAND) {
+        const id: int = (wp as int) & 0xFFFF;
+        if (id >= 100) {
+            push(w, EV_MOUSE_DOWN, id, 0, 0, 0);
+            return 0;
+        }
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+function maxInt(a: int, b: int): int {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+function ensureDpi(): void {
+    if (!dpiReady) {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        dpiReady = true;
+    }
+}
+
+function ensureClass(): bool {
+    if (classReady) {
+        return true;
+    }
+    ensureDpi();
+    const wc = new WNDCLASSEXW { cbSize: 80, style: 0, lpfnWndProc: wndProc, cbClsExtra: 0, cbWndExtra: 0, hInstance: GetModuleHandleW(0), hIcon: 0, hCursor: LoadCursorW(0, IDC_ARROW), hbrBackground: 0, lpszMenuName: 0, lpszClassName: CLASS_NAME, hIconSm: 0 };
+    classReady = RegisterClassExW(wc) != 0;
+    return classReady;
+}
+
+/// 系统 DPI×100。
+export function platSystemScale(): int {
+    return scaleOfDpi(GetDpiForSystem() as int);
+}
+
+/// 有没有窗口系统（Windows 恒有）。
+export function platAvailable(): bool {
+    return true;
+}
+
+/// 开真窗，引擎编号 id；flags 为 WFLAG_* 位集（16＝不显示，测试用）。成功得 true。
+export function platCreate(id: int, title: string, w: int, h: int, flags: int): bool {
+    if (!ensureClass() || w < 1 || h < 1) {
+        return false;
+    }
+    const frameless: bool = (flags & WFLAG_FRAMELESS) != 0;
+    let style: u32 = WS_OVERLAPPEDWINDOW;
+    if (frameless) {
+        style = WS_POPUP;
+    }
+    if ((flags & WFLAG_MAXIMIZED) != 0) {
+        style = style | WS_MAXIMIZE;
+    }
+    if ((flags & WFLAG_HIDDEN) == 0) {
+        style = style | WS_VISIBLE;
+    }
+    const sys: int = platSystemScale();
+    const r = new RECT { left: 0, top: 0, right: dipToPx(w, sys) as i32, bottom: dipToPx(h, sys) as i32 };
+    if (!frameless) {
+        AdjustWindowRectExForDpi(r, style, 0, 0, GetDpiForSystem());
+    }
+    const ow: int = (r.right - r.left) as int;
+    const oh: int = (r.bottom - r.top) as int;
+    let x: i32 = CW_USEDEFAULT;
+    let y: i32 = CW_USEDEFAULT;
+    if ((flags & WFLAG_CENTERED) != 0) {
+        const sw: int = GetSystemMetrics(SM_CXSCREEN) as int;
+        const sh: int = GetSystemMetrics(SM_CYSCREEN) as int;
+        if (sw > 0 && sh > 0) {
+            x = maxInt(0, (sw - ow) / 2) as i32;
+            y = maxInt(0, (sh - oh) / 2) as i32;
+        }
+    }
+    const made = CreateWindowExW(0, CLASS_NAME, cText(title), style, x, y, ow as i32, oh as i32, 0, 0, GetModuleHandleW(0), 0);
+    if (made == None) {
+        return false;
+    }
+    const hw: HWND = made catch handleFromBits<HWND>(0);
+    const win = new RWin { id: id, hwnd: hw, bits: handleBits(hw), scale: scaleOfDpi(GetDpiForWindow(hw) as int), frameless: frameless, minW: 0, minH: 0, maxW: 0, maxH: 0, menu: None, cursor: 0, q: listNew(), head: 0, hi: 0, wheel: 0, px: bytesNew(0), pw: 0, ph: 0 };
+    listPush(wins, win);
+    if (win.scale != sys && (flags & WFLAG_MAXIMIZED) == 0) {
+        // 窗口所在显示器的 DPI 与系统 DPI 不同：按窗口 DPI 重设客户区。
+        platClientResize(id, w, h);
+    }
+    if ((flags & WFLAG_TOPMOST) != 0) {
+        SetWindowPos(hw, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
+    }
+    // 创建期间的尺寸消息在登记之前到达、没有入队：客户区与请求不同（最大化等）时补一条尺寸事件。
+    const c = clientSize(hw);
+    const cw: int = pxToDip(c.right as int, win.scale);
+    const ch: int = pxToDip(c.bottom as int, win.scale);
+    if (cw > 0 && ch > 0 && (cw != w || ch != h)) {
+        push(win, EV_RESIZE, 0, cw, ch, 0);
+    }
+    return true;
+}
+
+/// 是不是本模块开的真窗。
+export function platIsReal(id: int): bool {
+    return idxOfId(id) >= 0;
+}
+
+/// 关真窗（幂等）。
+export function platDestroy(id: int): void {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return;
+    }
+    const w: Ref<RWin> = winAt(i);
+    DestroyWindow(w.hwnd);
+    if (w.menu != None) {
+        DestroyMenu(w.menu catch handleFromBits<HMENU>(0));
+    }
+    listRemoveAt(wins, idxOfId(id));
+}
+
+function zeros5(): List<int> {
+    const r: List<int> = listNew();
+    let i: int = 0;
+    while (i < 5) {
+        listPush(r, 0);
+        i = i + 1;
+    }
+    return r;
+}
+
+function pumpAll(): void {
+    const m = new MSG { hwnd: 0, message: 0, wParam: 0, lParam: 0, time: 0, ptX: 0, ptY: 0, lPrivate: 0 };
+    while (PeekMessageW(m, 0, 0, 0, PM_REMOVE) != 0) {
+        TranslateMessage(m);
+        DispatchMessageW(m);
+    }
+}
+
+/// 取下一条事件 [kind、target、x、y、mods]（kind 0＝至多等 timeoutMs 毫秒仍无事件）。
+export function platWait(id: int, timeoutMs: int): List<int> {
+    const none: List<int> = zeros5();
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return none;
+    }
+    if (queued(winAt(i)) == 0) {
+        pumpAll();
+    }
+    if (idxOfId(id) >= 0 && queued(winAt(idxOfId(id))) == 0 && timeoutMs > 0) {
+        MsgWaitForMultipleObjects(0, 0, 0, timeoutMs as u32, QS_ALLINPUT);
+        pumpAll();
+    }
+    const j: int = idxOfId(id);
+    if (j < 0) {
+        return none;
+    }
+    const w: Ref<RWin> = winAt(j);
+    if (queued(w) == 0) {
+        return none;
+    }
+    const rec: List<int> = listNew();
+    let s: int = 0;
+    while (s < 5) {
+        listPush(rec, listTryGet(w.q, w.head + s) catch 0);
+        s = s + 1;
+    }
+    w.head = w.head + 5;
+    return rec;
+}
+
+/// 呈现：像素（BGRX，宽 pw、高 ph）交给窗口客户区，并留作重画用。失败得 -1。
+export function platPresent(id: int, px: Bytes, pw: int, ph: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0 || pw < 1 || ph < 1 || bytesLen(px) < pw * ph * 4) {
+        return -1;
+    }
+    const w: Ref<RWin> = winAt(i);
+    w.px = px;
+    w.pw = pw;
+    w.ph = ph;
+    const dc = GetDC(w.hwnd);
+    if (dc == None) {
+        return -1;
+    }
+    const d: HDC = dc catch handleFromBits<HDC>(0);
+    const c = clientSize(w.hwnd);
+    blit(d, w, c.right as int, c.bottom as int);
+    ReleaseDC(w.hwnd, d);
+    return 0;
+}
+
+/// 窗口 DPI×100。
+export function platScale(id: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return 100;
+    }
+    return winAt(i).scale;
+}
+
+export function platSetTitle(id: int, title: string): int {
+    const i: int = idxOfId(id);
+    if (i < 0 || SetWindowTextW(winAt(i).hwnd, cText(title)) == 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/// 相对移动（DIP 增量）。
+export function platMove(id: int, dx: int, dy: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return -1;
+    }
+    const w: Ref<RWin> = winAt(i);
+    const r = new RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    if (GetWindowRect(w.hwnd, r) == 0) {
+        return -1;
+    }
+    const nx: int = (r.left as int) + dipToPx(dx, w.scale);
+    const ny: int = (r.top as int) + dipToPx(dy, w.scale);
+    if (SetWindowPos(w.hwnd, 0, nx as i32, ny as i32, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) == 0) {
+        return -1;
+    }
+    return 0;
+}
+
+export function platMinimize(id: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return -1;
+    }
+    ShowWindow(winAt(i).hwnd, SW_MINIMIZE);
+    return 0;
+}
+
+export function platMaximizeToggle(id: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return -1;
+    }
+    const h: HWND = winAt(i).hwnd;
+    if (IsZoomed(h) != 0) {
+        ShowWindow(h, SW_RESTORE);
+    } else {
+        ShowWindow(h, SW_MAXIMIZE);
+    }
+    return 0;
+}
+
+/// 客户区尺寸（DIP）。
+export function platClientResize(id: int, cw: int, ch: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0 || cw < 1 || ch < 1) {
+        return -1;
+    }
+    const w: Ref<RWin> = winAt(i);
+    const o: List<int> = outerSize(w, dipToPx(cw, w.scale), dipToPx(ch, w.scale));
+    if (SetWindowPos(w.hwnd, 0, 0, 0, (listTryGet(o, 0) catch 1) as i32, (listTryGet(o, 1) catch 1) as i32, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) == 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/// 客户区的最小、最大尺寸（DIP；0＝不约束）。
+export function platSetMinMax(id: int, minW: int, minH: int, maxW: int, maxH: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return -1;
+    }
+    const w: Ref<RWin> = winAt(i);
+    w.minW = maxInt(minW, 0);
+    w.minH = maxInt(minH, 0);
+    w.maxW = maxInt(maxW, 0);
+    w.maxH = maxInt(maxH, 0);
+    return 0;
+}
+
+export function platSetTopmost(id: int, on: bool): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return -1;
+    }
+    let after: isize = HWND_NOTOPMOST;
+    if (on) {
+        after = HWND_TOPMOST;
+    }
+    if (SetWindowPos(winAt(i).hwnd, after, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE) == 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/// 菜单项（id 即事件 target，≥100）。
+export function platMenuAdd(id: int, item: int, label: string): int {
+    const i: int = idxOfId(id);
+    if (i < 0 || item < 100 || item > 0xFFFF) {
+        return -1;
+    }
+    const w: Ref<RWin> = winAt(i);
+    if (w.menu == None) {
+        const m = CreateMenu();
+        if (m == None) {
+            return -1;
+        }
+        w.menu = m;
+    }
+    const m: HMENU = w.menu catch handleFromBits<HMENU>(0);
+    if (AppendMenuW(m, 0, item as usize, cText(label)) == 0 || SetMenu(w.hwnd, m) == 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/// 客户区光标：0 箭头、1 I 形。
+export function platSetCursor(id: int, kind: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0 || kind < 0 || kind > 1) {
+        return -1;
+    }
+    const w: Ref<RWin> = winAt(i);
+    w.cursor = kind;
+    let c: usize = IDC_ARROW;
+    if (kind == 1) {
+        c = IDC_IBEAM;
+    }
+    SetCursor(LoadCursorW(0, c));
+    return 0;
+}
+
+/// 窗口整体不透明度 0..255。
+export function platSetOpacity(id: int, opacity: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0 || opacity < 0 || opacity > 255) {
+        return -1;
+    }
+    const h: HWND = winAt(i).hwnd;
+    const ex: int = GetWindowLongPtrW(h, GWL_EXSTYLE) as int;
+    SetWindowLongPtrW(h, GWL_EXSTYLE, (ex | WS_EX_LAYERED) as isize);
+    if (SetLayeredWindowAttributes(h, 0, opacity as u8, LWA_ALPHA) == 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/// 窗口效果（gui/app 的 EFFECT_*：1 透明＝分层窗，2 亚克力、3 云母由 DWM 提供，Windows 11 22H2 起）：得实际生效的档位，
+/// 不支持即 0（plain）。
+export function platSetEffect(id: int, effect: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return 0;
+    }
+    const h: HWND = winAt(i).hwnd;
+    if (effect == 1) {
+        const ex: int = GetWindowLongPtrW(h, GWL_EXSTYLE) as int;
+        SetWindowLongPtrW(h, GWL_EXSTYLE, (ex | WS_EX_LAYERED) as isize);
+        SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
+        return 1;
+    }
+    if (effect != 2 && effect != 3) {
+        return 0;
+    }
+    // DWMSBT_TRANSIENTWINDOW 3（亚克力）、DWMSBT_MAINWINDOW 2（云母）。
+    const v = bytesNew(4);
+    bytesSet(v, 0, 5 - effect);
+    if (DwmSetWindowAttribute(h, DWMWA_SYSTEMBACKDROP_TYPE, v, 4) != 0) {
+        return 0;
+    }
+    return effect;
+}
+
+/// 真窗会话的动画毫秒（单调真实时间）。
+export function platAnimMs(): int {
+    return GetTickCount64() as int;
+}
+
+/// 测试用：往真窗投递一条窗口消息（同用户输入经系统到达窗口过程）。
+export function platDebugPost(id: int, msg: int, wp: int, lp: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0 || PostMessageW(winAt(i).hwnd, msg as u32, wp as usize, lp as isize) == 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/// 测试用：同步发一条消息给真窗（SendMessageW，本线程直接进窗口过程），得窗口过程的返回值；没有这个窗得 -1。lParam 带指针的
+/// 系统消息（WM_GETMINMAXINFO、WM_DPICHANGED 等）不许异步投递（PostMessageW 失败），用它。
+export function platDebugSend(id: int, msg: int, wp: int, lp: int): int {
+    const i: int = idxOfId(id);
+    if (i < 0) {
+        return -1;
+    }
+    return SendMessageW(winAt(i).hwnd, msg as u32, wp as usize, lp as isize) as int;
+}
+
+/// 剪贴板可用（Windows 总有系统剪贴板）。
+export function platClipAvailable(): bool {
+    return true;
+}
+
+/// 写剪贴板（CF_UNICODETEXT）。成功得 0；分配、打开或交给系统失败得 -1。
+export function platClipSet(text: string): int {
+    const u: Bytes = utf16z(text);
+    const mem: usize = GlobalAlloc(GMEM_MOVEABLE, bytesLen(u) as usize);
+    if (mem == 0) {
+        return -1;
+    }
+    if (!fillGlobal(mem, u) || !openClip()) {
+        GlobalFree(mem);
+        return -1;
+    }
+    let rc: int = 0;
+    if (EmptyClipboard() == 0 || SetClipboardData(CF_UNICODETEXT, mem) == 0) {
+        GlobalFree(mem);
+        rc = -1;
+    }
+    CloseClipboard();
+    return rc;
+}
+
+/// 读剪贴板（CF_UNICODETEXT，别的格式由系统转换）。没有文本或打不开得空串。
+export function platClipGet(): string {
+    if (!openClip()) {
+        return "";
+    }
+    let s: string = "";
+    const mem: usize = GetClipboardData(CF_UNICODETEXT);
+    if (mem != 0) {
+        s = readGlobal(mem);
+    }
+    CloseClipboard();
+    return s;
+}
+
+// 打开剪贴板，主人是只收消息的 STATIC 窗口（首次用时建）；别的程序正开着时重试。
+function openClip(): bool {
+    if (clipOwner == 0) {
+        const made = CreateWindowExW(0, "STATIC", "", 0, 0, 0, 0, 0, HWND_MESSAGE, 0, GetModuleHandleW(0), 0);
+        if (made == None) {
+            return false;
+        }
+        clipOwner = handleBits(made catch handleFromBits<HWND>(0));
+    }
+    let n: int = 0;
+    while (n < 20) {
+        if (OpenClipboard(clipOwner as usize) != 0) {
+            return true;
+        }
+        Sleep(5);
+        n = n + 1;
+    }
+    return false;
+}
+
+// 把 u 写进全局内存块的开头（锁定期间经可写区；区在解锁前结束）。
+function fillGlobal(mem: usize, u: Bytes): bool {
+    const p: usize = GlobalLock(mem);
+    if (p == 0) {
+        return false;
+    }
+    const m = ffiMem(p as int, bytesLen(u), true) catch (e) {
+        GlobalUnlock(mem);
+        return false;
+    };
+    ffiMemWrite(m, 0, u);
+    ffiMemEnd(m);
+    GlobalUnlock(mem);
+    return true;
+}
+
+// 读全局内存块里的 UTF-16 文本（以 GlobalSize 为上界，读到第一个 NUL）。
+function readGlobal(mem: usize): string {
+    const p: usize = GlobalLock(mem);
+    if (p == 0) {
+        return "";
+    }
+    const m = ffiMem(p as int, GlobalSize(mem) as int, false) catch (e) {
+        GlobalUnlock(mem);
+        return "";
+    };
+    const s: string = ffiMemUtf16(m, 0);
+    ffiMemEnd(m);
+    GlobalUnlock(mem);
+    return s;
+}
+
+/// 文件对话框可用（Windows 恒有 comdlg32）。
+export function platDialogAvailable(): bool {
+    return true;
+}
+
+/// 打开文件对话框（GetOpenFileNameW）：选中得路径，取消或失败得空串。
+export function platDialogOpen(id: int, title: string, filters: List<FdFilter>): string {
+    return fileDialog(id, title, filters, "", false);
+}
+
+/// 保存文件对话框（GetSaveFileNameW）：defaultName 预填进路径缓冲；选中得路径，取消或失败得空串。
+export function platDialogSave(id: int, title: string, filters: List<FdFilter>, defaultName: string): string {
+    return fileDialog(id, title, filters, defaultName, true);
+}
+
+// 弹 comdlg32 对话框。一块固定内存依次放路径缓冲、过滤串、缺省扩展名、标题，后三段为空时对应字段给空指针。
+function fileDialog(id: int, title: string, filters: List<FdFilter>, defaultName: string, save: bool): string {
+    ensureDpi();
+    const fileBytes: int = FILE_UNITS * 2;
+    let name: Bytes = bytesNew(0);
+    if (save) {
+        name = utf16z(cText(defaultName));
+        if (bytesLen(name) > fileBytes) {
+            name = bytesNew(0);
+        }
+    }
+    const filt: Bytes = bytesNew(0);
+    const parts: List<string> = fdWin32Parts(filters);
+    if (listLen(parts) > 0) {
+        for (part in parts) {
+            utf16Into(filt, part);
+            unit16(filt, 0);
+        }
+        unit16(filt, 0);
+    }
+    let ext: Bytes = bytesNew(0);
+    if (save && fdDefExt(filters) != "") {
+        ext = utf16z(fdDefExt(filters));
+    }
+    let tt: Bytes = bytesNew(0);
+    if (cText(title) != "") {
+        tt = utf16z(cText(title));
+    }
+    const total: int = fileBytes + bytesLen(filt) + bytesLen(ext) + bytesLen(tt);
+    const mem: usize = GlobalAlloc(GPTR, total as usize);
+    if (mem == 0) {
+        return "";
+    }
+    const p: int = mem as int;
+    const w = ffiMem(p, total, true) catch (e) {
+        GlobalFree(mem);
+        return "";
+    };
+    ffiMemWrite(w, 0, name);
+    const filtAt: int = fileBytes;
+    const extAt: int = filtAt + bytesLen(filt);
+    const ttAt: int = extAt + bytesLen(ext);
+    ffiMemWrite(w, filtAt, filt);
+    ffiMemWrite(w, extAt, ext);
+    ffiMemWrite(w, ttAt, tt);
+    ffiMemEnd(w);
+    let owner: usize = 0;
+    const i: int = idxOfId(id);
+    if (i >= 0) {
+        owner = winAt(i).bits as usize;
+    }
+    let flags: u32 = OFN_EXPLORER | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+    if (save) {
+        flags = flags | OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+    } else {
+        flags = flags | OFN_FILEMUSTEXIST;
+    }
+    const ofn = new OPENFILENAMEW { lStructSize: OFN_SIZE, hwndOwner: owner, hInstance: 0, lpstrFilter: ptrOr(p, filtAt, filt), lpstrCustomFilter: 0, nMaxCustFilter: 0, nFilterIndex: filterIndex(parts), lpstrFile: mem, nMaxFile: FILE_UNITS as u32, lpstrFileTitle: 0, nMaxFileTitle: 0, lpstrInitialDir: 0, lpstrTitle: ptrOr(p, ttAt, tt), flags: flags, nFileOffset: 0, nFileExtension: 0, lpstrDefExt: ptrOr(p, extAt, ext), lCustData: 0, lpfnHook: 0, lpTemplateName: 0, pvReserved: 0, dwReserved: 0, flagsEx: 0 };
+    let ok: i32 = 0;
+    if (save) {
+        ok = GetSaveFileNameW(ofn);
+    } else {
+        ok = GetOpenFileNameW(ofn);
+    }
+    let path: string = "";
+    if (ok != 0) {
+        const r = ffiMem(p, fileBytes, false) catch (e) {
+            GlobalFree(mem);
+            return "";
+        };
+        path = ffiMemUtf16(r, 0);
+        ffiMemEnd(r);
+    }
+    GlobalFree(mem);
+    return path;
+}
+
+// 初选第一个过滤器；没有过滤器时为 0。
+function filterIndex(parts: List<string>): u32 {
+    if (listLen(parts) == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+// 块内某段的地址；该段为空时得空指针。
+function ptrOr(base: int, off: int, seg: Bytes): usize {
+    if (bytesLen(seg) == 0) {
+        return 0;
+    }
+    return (base + off) as usize;
+}
+
+// string（UTF-8）→ UTF-16LE 码元，末尾补一个 NUL 码元。
+function utf16z(s: string): Bytes {
+    const out = bytesNew(0);
+    utf16Into(out, s);
+    unit16(out, 0);
+    return out;
+}
+
+// 把 s（UTF-8）的 UTF-16LE 码元追加到 out（不补 NUL）。
+function utf16Into(out: Bytes, s: string): void {
+    const b = bytesFromStr(s);
+    const n: int = bytesLen(b);
+    let i: int = 0;
+    while (i < n) {
+        const c: int = bytesGet(b, i) catch 0;
+        let cp: int = c;
+        let len: int = 1;
+        if (c >= 0xF0) {
+            cp = c & 0x07;
+            len = 4;
+        } else if (c >= 0xE0) {
+            cp = c & 0x0F;
+            len = 3;
+        } else if (c >= 0xC0) {
+            cp = c & 0x1F;
+            len = 2;
+        }
+        let j: int = 1;
+        while (j < len) {
+            cp = (cp << 6) | ((bytesGet(b, i + j) catch 0x80) & 0x3F);
+            j = j + 1;
+        }
+        i = i + len;
+        if (cp >= 0x10000) {
+            cp = cp - 0x10000;
+            unit16(out, 0xD800 | (cp >> 10));
+            unit16(out, 0xDC00 | (cp & 0x3FF));
+        } else {
+            unit16(out, cp);
+        }
+    }
+}
+
+function unit16(out: Bytes, u: int): void {
+    bytesPush(out, u & 0xFF);
+    bytesPush(out, (u >> 8) & 0xFF);
+}

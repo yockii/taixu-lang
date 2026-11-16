@@ -1,0 +1,68 @@
+// 非阻塞 Bytes 套接字。poll 可同步等待，只在专用网络线程使用；异步调度器可复用 try 操作。
+import { slotAlloc, slotPeek, slotTake } from "./net_impl";
+import { sysByteOpen, sysByteClose, sysByteConnect, sysByteRead, sysByteWrite, sysBytePoll, sysByteError } from "./net_socket_sys";
+
+// 状态：0 新建、1 连接中、2 已连接、3 已关闭。句柄仅在所属线程操作和关闭。
+export struct ByteSocket { handle: int, version: int, datagram: bool, state: int }
+export struct SocketRead { data: Bytes, eof: bool, wouldBlock: bool }
+export struct SocketWrite { written: int, wouldBlock: bool }
+
+function systemError(operation: string, code: int): Error { return err("socket: " + operation + " failed " + toStr(code)); }
+function descriptor(socket: Ref<ByteSocket>): int | Error {
+    if (socket.state == 3) { return err("socket: closed"); }
+    const raw = slotPeek(socket.handle); if (raw < 0) { return err("socket: invalid or expired handle"); } return raw;
+}
+export function socketOpen(version: int, datagram: bool): Ref<ByteSocket> | Error {
+    if (version != 4 && version != 6) { return err("socket: address version must be 4 or 6"); }
+    const raw = sysByteOpen(version, datagram); if (raw < 0) { return systemError("open", raw); }
+    const handle = slotAlloc(raw); if (handle < 0) { sysByteClose(raw); return err("socket: handle table full"); }
+    return new ByteSocket { handle: handle, version: version, datagram: datagram, state: 0 };
+}
+export function socketClose(socket: Ref<ByteSocket>): void {
+    if (socket.state != 3) {
+        const raw = slotTake(socket.handle); socket.state = 3; socket.handle = 0;
+        if (raw >= 0) { sysByteClose(raw); }
+    }
+}
+export function socketConnect(socket: Ref<ByteSocket>, ip: Bytes, port: int): bool | Error {
+    return socketConnectScoped(socket, ip, port, 0);
+}
+export function socketConnectScoped(socket: Ref<ByteSocket>, ip: Bytes, port: int, scope: int): bool | Error {
+    const raw = descriptor(socket)?;
+    if (socket.state != 0 || port < 1 || port > 65535) { return err("socket: invalid connect state or port"); }
+    if ((socket.version == 4 && bytesLen(ip) != 4) || (socket.version == 6 && bytesLen(ip) != 16)) { return err("socket: address family mismatch"); }
+    if (scope < 0 || scope > 4294967295 || (socket.version == 4 && scope != 0)) { return err("socket: invalid address scope"); }
+    const result = sysByteConnect(raw, ip, port, scope); if (result < 0) { return systemError("connect", result); }
+    if (result == 0) { socket.state = 2; return true; } socket.state = 1; return false;
+}
+export function socketFinishConnect(socket: Ref<ByteSocket>): bool | Error {
+    const raw = descriptor(socket)?; if (socket.state == 2) { return true; }
+    if (socket.state != 1) { return err("socket: no pending connection"); }
+    const ready = sysBytePoll(raw, true, 0); if (ready < 0) { return systemError("connect readiness", ready); } if (ready == 0) { return false; }
+    const error = sysByteError(raw); if (error != 0) { return systemError("connect completion", error); }
+    socket.state = 2; return true;
+}
+export function socketPoll(socket: Ref<ByteSocket>, writable: bool, timeoutMs: int): bool | Error {
+    if (timeoutMs < 0 || timeoutMs > 2147483647) { return err("socket: invalid poll timeout"); }
+    const result = sysBytePoll(descriptor(socket)?, writable, timeoutMs);
+    if (result < 0) { return systemError("poll", result); } return result != 0;
+}
+export function socketRead(socket: Ref<ByteSocket>, maximum: int): SocketRead | Error {
+    const raw = descriptor(socket)?;
+    if (socket.state != 2 || maximum < 1 || maximum > 1048576) { return err("socket: invalid read state or limit"); }
+    const data = bytesNew(maximum); const n = sysByteRead(raw, data);
+    if (n == -2) { return SocketRead { data: bytesNew(0), eof: false, wouldBlock: true }; }
+    if (n < 0) { return systemError("read", n); }
+    if (n > maximum) { return err("socket: system read exceeded buffer"); }
+    return SocketRead { data: bytesSlice(data, 0, n), eof: n == 0 && !socket.datagram, wouldBlock: false };
+}
+export function socketWrite(socket: Ref<ByteSocket>, data: Bytes): SocketWrite | Error {
+    const raw = descriptor(socket)?;
+    if (socket.state != 2 || bytesLen(data) > 1048576) { return err("socket: invalid write state or limit"); }
+    if (bytesLen(data) == 0) { return SocketWrite { written: 0, wouldBlock: false }; }
+    const n = sysByteWrite(raw, data);
+    if (n == -2) { return SocketWrite { written: 0, wouldBlock: true }; }
+    if (n < 0) { return systemError("write", n); }
+    if (n == 0 || n > bytesLen(data)) { return err("socket: invalid system write progress"); }
+    return SocketWrite { written: n, wouldBlock: false };
+}

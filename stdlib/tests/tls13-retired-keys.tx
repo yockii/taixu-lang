@@ -1,0 +1,66 @@
+import { tls13Client, tls13Receive, tls13Write } from "std/tls13_client";
+import { Tls13Client } from "std/tls13_state";
+import { Tls13RecordKeys, tls13TrafficKeys, tls13Seal, tls13Open } from "std/tls13_record";
+import { tls13Finished, tls13UpdateSecret } from "std/tls13_kdf";
+import { tls13Message, tls13Integer } from "std/tls13_wire";
+import { sha256Sum } from "std/hash";
+
+function material(value: int): Bytes { const b = bytesNew(32); bytesFill(b, 0, 32, value); return b; }
+function app(): Ref<Tls13Client> {
+    const state = tls13Client("example.test", 1794456000, listNew()) catch panic("client");
+    state.phase = 6; state.serverTraffic = material(17); state.clientTraffic = material(29);
+    state.readKeys = tls13TrafficKeys(state.serverTraffic) catch panic("read");
+    state.writeKeys = tls13TrafficKeys(state.clientTraffic) catch panic("write"); return state;
+}
+function sealRejected(keys: Ref<Tls13RecordKeys>): bool {
+    tls13Seal(keys, 23, bytesFromStr("retired"), 0) catch (e) { return true; }; return false;
+}
+function retired(keys: Ref<Tls13RecordKeys>): void {
+    assert(keys.failed, "retired record keys cannot be reused");
+    for (buffer in [keys.key, keys.iv]) {
+        for (byte in bytesAsList(buffer)) { assert(byte == 0 as u8, "retired key and IV aliases are zeroed"); }
+    }
+    assert(sealRejected(keys), "retired keys reject encryption");
+}
+
+test "TLS key update retires both old directions after the old-key reply" {
+    const state = app(); const oldRead = state.readKeys catch panic("read"); const oldWrite = state.writeKeys catch panic("write");
+    const peerWrite = tls13TrafficKeys(material(17)) catch panic("peer write");
+    const peerRead = tls13TrafficKeys(material(29)) catch panic("peer read");
+    const nextPeer = tls13TrafficKeys(tls13UpdateSecret(material(17)) catch panic("update")) catch panic("next peer");
+    const wire = tls13Seal(peerWrite, 22, tls13Message(24, tls13Integer(1, 1)), 0) catch panic("request");
+    bytesAppend(wire, tls13Seal(nextPeer, 23, bytesFromStr("new traffic"), 0) catch panic("new record"));
+    const progress = tls13Receive(state, wire, false) catch panic("receive");
+    assert(progress.ready && listLen(progress.application) == 1 && bytesEqual(listGet(progress.application, 0), bytesFromStr("new traffic")), "next record uses new read key");
+    assert(listLen(progress.outbound) == 1, "one update reply");
+    const reply = tls13Open(peerRead, listGet(progress.outbound, 0)) catch panic("reply retains old write key");
+    assert(reply.contentType == 22 && bytesEqual(reply.content, tls13Message(24, tls13Integer(0, 1))), "reply encrypted before old key retirement");
+    retired(oldRead); retired(oldWrite);
+    const read = state.readKeys catch panic("new read"); const write = state.writeKeys catch panic("new write");
+    assert(!read.failed && !write.failed, "new keys stay usable");
+}
+
+test "TLS record limit retires the old sending key after KeyUpdate" {
+    const state = app(); const oldWrite = state.writeKeys catch panic("write"); oldWrite.sequence = 16777215;
+    const output = tls13Write(state, bytesFromStr("new data")) catch panic("automatic update");
+    assert(listLen(output) == 2, "update and application record"); retired(oldWrite);
+    const nextPeer = tls13TrafficKeys(tls13UpdateSecret(material(29)) catch panic("update")) catch panic("next peer");
+    const data = tls13Open(nextPeer, listGet(output, 1)) catch panic("new write key");
+    assert(bytesEqual(data.content, bytesFromStr("new data")), "new key remains usable");
+}
+
+test "TLS Finished retires handshake record keys before application traffic" {
+    const state = tls13Client("example.test", 1794456000, listNew()) catch panic("client"); state.phase = 5;
+    state.handshakeSecret = material(7); state.serverHandshake = material(11); state.clientHandshake = material(19);
+    state.transcript = bytesFromStr("authenticated transcript before Finished");
+    state.readKeys = tls13TrafficKeys(state.serverHandshake) catch panic("read"); state.writeKeys = tls13TrafficKeys(state.clientHandshake) catch panic("write");
+    const oldRead = state.readKeys catch panic("old read"); const oldWrite = state.writeKeys catch panic("old write");
+    const peerWrite = tls13TrafficKeys(material(11)) catch panic("peer write"); const peerRead = tls13TrafficKeys(material(19)) catch panic("peer read");
+    const finished = tls13Message(20, tls13Finished(state.serverHandshake, sha256Sum(state.transcript)) catch panic("finished"));
+    const progress = tls13Receive(state, tls13Seal(peerWrite, 22, finished, 0) catch panic("peer Finished"), false) catch panic("finish");
+    assert(progress.ready && state.phase == 6 && listLen(progress.outbound) == 2, "CCS and client Finished");
+    const reply = tls13Open(peerRead, listGet(progress.outbound, 1)) catch panic("client Finished uses old handshake key");
+    assert(reply.contentType == 22 && (bytesGet(reply.content, 0) catch 0) == 20, "client Finished precedes retirement");
+    retired(oldRead); retired(oldWrite);
+    assert(listLen(tls13Write(state, bytesFromStr("application")) catch panic("application write")) == 1, "application keys remain usable");
+}

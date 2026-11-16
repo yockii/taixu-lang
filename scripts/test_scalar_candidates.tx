@@ -1,0 +1,96 @@
+import { ScalarBlock, ScalarLoop, scalarLoops } from "../bootstrap/selfhost/scalar_loops";
+import { ScalarInstruction, ScalarEntry, ScalarCandidate, ScalarCandidates, scalarCandidates } from "../bootstrap/selfhost/scalar_candidates";
+
+struct Fixture {
+    blocks: List<Ref<ScalarBlock>>, regions: List<Ref<ScalarLoop>>,
+    nodes: List<Ref<ScalarInstruction>>, entries: List<Ref<ScalarEntry>>, slots: int,
+}
+function ints(values: []int): List<int> { const out: List<int> = listNew(); for (v in values) { listPush(out, v); } return out; }
+function repeated(n: int, value: int): List<int> { const out: List<int> = listNew(); let i = 0; while (i < n) { listPush(out, value); i = i + 1; } return out; }
+function at(xs: List<int>, i: int): int { return listGet(xs, i) catch panic("test scalar index"); }
+function node(f: Ref<Fixture>, pc: int): Ref<ScalarInstruction> { return listGet(f.nodes, pc) catch panic("test scalar instruction"); }
+function entry(f: Ref<Fixture>): Ref<ScalarEntry> { return listGet(f.entries, 0) catch panic("test scalar entry"); }
+function fixture(tags: []int): Ref<Fixture> {
+    const blocks: List<Ref<ScalarBlock>> = listNew();
+    listPush(blocks, new ScalarBlock { first: 0, last: len(tags) - 1, succs: ints([0]) });
+    const loops = scalarLoops(blocks, ints([0]), 10000) catch panic("test loop");
+    const nodes: List<Ref<ScalarInstruction>> = listNew(); let slot = 0;
+    for (tag in tags) {
+        listPush(nodes, new ScalarInstruction { uses: ints([slot]), useTags: ints([tag]), def: slot, defTag: tag, killFrom: -1, barrier: false }); slot = slot + 1;
+    }
+    const entries: List<Ref<ScalarEntry>> = listNew();
+    listPush(entries, new ScalarEntry { tags: ints(tags), live: repeated(len(tags), 1) });
+    return new Fixture { blocks: blocks, regions: loops.regions, nodes: nodes, entries: entries, slots: len(tags) };
+}
+function run(f: Ref<Fixture>, budget: int): ScalarCandidates {
+    return scalarCandidates(f.blocks, f.regions, f.nodes, f.entries, f.slots, budget) catch panic("valid candidate input");
+}
+function candidate(p: ScalarCandidates, i: int): Ref<ScalarCandidate> { assert(!p.limited, "complete plan"); return listGet(p.values, i) catch panic("missing candidate"); }
+function invalid(f: Ref<Fixture>): bool {
+    scalarCandidates(f.blocks, f.regions, f.nodes, f.entries, f.slots, 10000) catch (e) { return true; }; return false;
+}
+
+test "scalar candidates: exact scalar tags and live carried values" {
+    const f = fixture([1, 2, 3, 1, 6, 0]); listSet(entry(f).live, 3, 0);
+    const p = run(f, 10000); assert(listLen(p.values) == 3, "exclude dead, heap and unknown");
+    let i = 0;
+    while (i < 3) {
+        const value = candidate(p, i);
+        assert(value.region == 0 && value.slot == i && value.tag == i + 1, "stable slot order and runtime tags");
+        assert(value.reads == 1 && value.writes == 1 && value.barriers == 0, "read/write facts"); i = i + 1;
+    }
+    const n0 = node(f, 0); n0.def = -1;
+    assert(listLen(run(f, 10000).values) == 2, "read-only invariant is not loop-carried");
+    const n1 = node(f, 1); n1.uses = listNew(); n1.useTags = listNew();
+    assert(listLen(run(f, 10000).values) == 1, "write-only value is not loop-carried");
+}
+
+test "scalar candidates: all definitions, uses and call window kills" {
+    const f = fixture([1, 2, 3, 1, 2, 3]);
+    const n1 = node(f, 1); n1.defTag = 1; listSet(node(f, 2).useTags, 0, 0);
+    const n3 = node(f, 3); n3.barrier = true; n3.killFrom = 4;
+    const p = run(f, 10000); assert(listLen(p.values) == 2, "bad definition, unknown read and killed window rejected");
+    assert(candidate(p, 0).slot == 0 && candidate(p, 1).slot == 3, "slots below window remain eligible");
+    assert(candidate(p, 0).barriers == 1 && candidate(p, 1).barriers == 1, "call boundary retained for emitter");
+    n3.killFrom = 0;
+    assert(listLen(run(f, 10000).values) == 0, "whole window invalidation");
+}
+
+test "scalar candidates: nested regions have independent facts" {
+    const f = fixture([1]);
+    f.blocks = listNew(); f.nodes = listNew(); let i = 0;
+    while (i < 3) {
+        let next = ints([i + 1]); if (i == 1) { next = ints([1, 2]); } if (i == 2) { next = ints([0]); }
+        listPush(f.blocks, new ScalarBlock { first: i, last: i, succs: next });
+        listPush(f.nodes, new ScalarInstruction { uses: ints([0]), useTags: ints([1]), def: 0, defTag: 1, killFrom: -1, barrier: i != 1 }); i = i + 1;
+    }
+    const loops = scalarLoops(f.blocks, ints([0]), 10000) catch panic("nested loop"); f.regions = loops.regions;
+    listPush(f.entries, new ScalarEntry { tags: ints([1]), live: ints([1]) });
+    const p = run(f, 10000); assert(listLen(p.values) == 2, "outer and inner candidates");
+    assert(candidate(p, 0).reads == 3 && candidate(p, 0).barriers == 2, "outer body facts");
+    assert(candidate(p, 1).reads == 1 && candidate(p, 1).barriers == 0, "inner body facts");
+}
+
+test "scalar candidates: exhaustive budgets never retain partial plans" {
+    const f = fixture([1, 2, 3, 1, 2, 3]); const complete = run(f, 10000);
+    assert(listLen(complete.values) == 6 && complete.work > 0, "fixture has six candidates"); let maximum = 0;
+    while (maximum < complete.work) {
+        const p = run(f, maximum);
+        assert(p.limited && p.work == maximum && listLen(p.values) == 0, "budget must discard even late candidates"); maximum = maximum + 1;
+    }
+    const exact = run(f, complete.work); assert(!exact.limited && listLen(exact.values) == 6, "exact budget succeeds");
+}
+
+test "scalar candidates: malformed facts fail explicitly" {
+    const f = fixture([1]); const n0 = node(f, 0); const e0 = entry(f);
+    n0.def = 1; assert(invalid(f), "definition beyond slots"); n0.def = 0;
+    n0.killFrom = 2; assert(invalid(f), "kill beyond window"); n0.killFrom = -1;
+    listSet(node(f, 0).uses, 0, -1); assert(invalid(f), "negative use"); listSet(node(f, 0).uses, 0, 1); assert(invalid(f), "use beyond slots");
+    listSet(node(f, 0).uses, 0, 0); n0.useTags = listNew(); assert(invalid(f), "missing use facts"); n0.useTags = ints([1]);
+    e0.live = listNew(); assert(invalid(f), "missing entry liveness"); e0.live = ints([1]);
+    const block = listGet(f.blocks, 0) catch panic("test block"); block.first = 1; assert(invalid(f), "PC hole"); block.first = 0;
+    const loop = listGet(f.regions, 0) catch panic("test loop"); loop.last = 1; assert(invalid(f), "region beyond CFG"); loop.last = 0;
+    f.entries = listNew(); assert(invalid(f), "missing region entry");
+    const empty = scalarCandidates(listNew(), listNew(), listNew(), listNew(), 0, 0) catch panic("empty facts");
+    assert(!empty.limited && empty.work == 0 && listLen(empty.values) == 0, "empty function");
+}

@@ -1,0 +1,1474 @@
+// 函数范围与帧事件的独立核对（含四种指令集的帧指令解码）：映射声明的每个函数范围、序言与尾声、逐条帧事件，对照产物里的实际字节
+// 独立解码；进程与线程入口按手写的字节形态核对。
+// functions 与 runtime-functions 两步共用。判定器要与被测编译器相互独立：本文件不导入 bootstrap/ 的任何模块。
+// 不合时返回 Error，说明里写函数名与位置。
+import { hexOf, sha256Of } from "./check_lib";
+import { Seg, fileAt, getLE, hexVal, ult } from "./check_obj";
+import { J_NUM, J_STR, Jv, jEq, jNull, jQuote } from "./test_json";
+import { at, count, isNull, item, textIs, textOf, truthy } from "./test_jv";
+import { contains } from "./test_text";
+import { noTarget, targetNamed } from "./targets";
+
+// 一条帧事件：种类、寄存器（JSON null 记 −1）、字节数、sp 变化。
+export struct Ev {
+    kind: string,
+    reg: int,
+    bytes: int,
+    delta: int,
+}
+
+function ev(kind: string, reg: int, bytes: int, delta: int): Ev {
+    return Ev { kind: kind, reg: reg, bytes: bytes, delta: delta };
+}
+
+function need(ok: bool, what: string): void | Error {
+    if (!ok) {
+        return err(what);
+    }
+}
+
+function hx(v: int): string {
+    return "0x" + hexOf(bytes4(v));
+}
+
+function bytes4(v: int): Bytes {
+    const b = bytesNew(4);
+    bytesSet(b, 0, (v >>> 24) & 255);
+    bytesSet(b, 1, (v >>> 16) & 255);
+    bytesSet(b, 2, (v >>> 8) & 255);
+    bytesSet(b, 3, v & 255);
+    return b;
+}
+
+// 十进制串（可带负号）；不是十进制得 None。
+export function decVal(t: string): int? {
+    let i = 0;
+    let neg = false;
+    if (len(t) > 0 && (byteAt(t, 0) ?? 0) == 45) {
+        neg = true;
+        i = 1;
+    }
+    if (i >= len(t)) {
+        return None;
+    }
+    let n = 0;
+    while (i < len(t)) {
+        const c = byteAt(t, i) ?? 0;
+        if (c < 48 || c > 57) {
+            return None;
+        }
+        n = wrapAdd(wrapMul(n, 10), c - 48);
+        i = i + 1;
+    }
+    if (neg) {
+        return wrapSub(0, n);
+    }
+    return n;
+}
+
+function jvNum(v: Ref<Jv>?): int? {
+    if (v == None) {
+        return None;
+    }
+    const x = v ?? jNull();
+    if (x.kind != J_NUM && x.kind != J_STR) {
+        return None;
+    }
+    return decVal(x.text);
+}
+
+// 字段的十进制值（数字或十进制串）；缺席、null 或不是十进制得 Error。
+export function decAt(v: Ref<Jv>?, key: string): int | Error {
+    const n = jvNum(at(v, key));
+    if (n == None) {
+        return err("field " + key + " is not decimal");
+    }
+    return n ?? 0;
+}
+
+export function hexAt(v: Ref<Jv>?, key: string): int | Error {
+    const n = hexVal(textOf(v, key));
+    if (n == None) {
+        return err("field " + key + " is not hexadecimal");
+    }
+    return n ?? 0;
+}
+
+function regOf(v: Ref<Jv>?): int {
+    const r = at(v, "register");
+    if (r == None || isNull(r)) {
+        return -1;
+    }
+    return jvNum(r) ?? -2;
+}
+
+function codeAt(image: Bytes, from: int, n: int): Bytes {
+    if (from < 0 || n < 0 || from >= bytesLen(image)) {
+        return bytesNew(0);
+    }
+    let m = n;
+    if (from + m > bytesLen(image)) {
+        m = bytesLen(image) - from;
+    }
+    return bytesSlice(image, from, m);
+}
+
+function eqBytes(b: Bytes, want: []int): bool {
+    if (bytesLen(b) != len(want)) {
+        return false;
+    }
+    let i = 0;
+    while (i < len(want)) {
+        if ((bytesGet(b, i) ?? -1) != want[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function i8(b: Bytes, at: int): int {
+    const v = bytesGet(b, at) ?? 0;
+    if (v >= 128) {
+        return v - 256;
+    }
+    return v;
+}
+
+function i32At(b: Bytes, at: int): int {
+    const v = getLE(b, at, 4);
+    if (v >= 0x80000000) {
+        return v - 0x100000000;
+    }
+    return v;
+}
+
+// 有限几种 x86-64 帧指令的独立解码，得这条指令的 sp 变化。
+export function frameBytes(kind: string, reg: int, size: int, code: Bytes): int | Error {
+    if (kind == "push-nonvolatile" || kind == "pop-nonvolatile") {
+        need((reg == 3 || reg == 5 || reg == 6 || reg == 7 || reg == 12 || reg == 13 || reg == 14 || reg == 15) && size == 8, kind + " register")?;
+        let base = 88;
+        if (kind == "push-nonvolatile") {
+            base = 80;
+        }
+        if (reg >= 8) {
+            need(bytesLen(code) == 2 && (bytesGet(code, 0) ?? 0) == 65 && (bytesGet(code, 1) ?? 0) == base + (reg & 7), kind + " bytes " + hexOf(code))?;
+        } else {
+            need(bytesLen(code) == 1 && (bytesGet(code, 0) ?? 0) == base + (reg & 7), kind + " bytes " + hexOf(code))?;
+        }
+        if (kind == "push-nonvolatile") {
+            return -8;
+        }
+        return 8;
+    }
+    if (kind == "set-frame-pointer") {
+        need(reg == 5 && size == 0 && (eqBytes(code, [72, 137, 229]) || eqBytes(code, [72, 139, 236])), "set-frame-pointer bytes " + hexOf(code))?;
+        return 0;
+    }
+    if (kind == "allocate-stack" || kind == "release-stack") {
+        let modrm = 196;
+        if (kind == "allocate-stack") {
+            modrm = 236;
+        }
+        need(reg == 4 && size >= 0 && size % 8 == 0 && bytesLen(code) >= 1 && (bytesGet(code, 0) ?? 0) == 72, kind + " form " + hexOf(code))?;
+        let amount = 0;
+        if (bytesLen(code) == 4) {
+            need((bytesGet(code, 1) ?? 0) == 131 && (bytesGet(code, 2) ?? 0) == modrm, kind + " bytes " + hexOf(code))?;
+            amount = i8(code, 3);
+        } else {
+            need(bytesLen(code) == 7 && (bytesGet(code, 1) ?? 0) == 129 && (bytesGet(code, 2) ?? 0) == modrm, kind + " bytes " + hexOf(code))?;
+            amount = i32At(code, 3);
+        }
+        need(amount == size, kind + " amount " + hexOf(code))?;
+        if (kind == "allocate-stack") {
+            return -size;
+        }
+        return size;
+    }
+    if (kind == "align-stack" || kind == "restore-stack-pointer") {
+        // 重对齐帧：align-stack 为 and rsp, −size（48 83 E4 ib 或 48 81 E4 id），restore-stack-pointer 为 lea rsp, [rbp − size]
+        // （48 8D 65 db 或 48 8D A5 dd）。栈深的变化取决于进入时的对齐，记 0；复原后的栈深由调用方按帧指针算。
+        const align = kind == "align-stack";
+        need(reg == 4 && size >= 0 && size % 8 == 0 && (!align || (size >= 16 && (size & (size - 1)) == 0)), kind + " operand")?;
+        let short: []int = [72, 131, 228];
+        let long: []int = [72, 129, 228];
+        if (!align) {
+            short = [72, 141, 101];
+            long = [72, 141, 165];
+        }
+        let amount = 1;
+        if (bytesLen(code) == 4 && sliceIs(code, 0, short)) {
+            amount = i8(code, 3);
+        } else if (bytesLen(code) == 7 && sliceIs(code, 0, long)) {
+            amount = i32At(code, 3);
+        }
+        need(amount == 0 - size, kind + " bytes " + hexOf(code))?;
+        return 0;
+    }
+    need(kind == "return" && reg == -1 && size == 8 && eqBytes(code, [195]), "return " + hexOf(code))?;
+    return 8;
+}
+
+// 事件的 sp_delta：重对齐帧的两种事件写 null（变化取决于进入时的对齐），按 0 比对。
+function deltaOf(e: Ref<Jv>?): int | Error {
+    const kind = textOf(e, "kind");
+    if (kind == "align-stack" || kind == "restore-stack-pointer") {
+        need(isNull(at(e, "sp_delta")), kind + " sp_delta")?;
+        return 0;
+    }
+    return decAt(e, "sp_delta");
+}
+
+function sext(v: int, bits: int): int {
+    const top = 1 << (bits - 1);
+    return (v ^ top) - top;
+}
+
+function word(code: Bytes, k: int): int {
+    return getLE(code, 4 * k, 4);
+}
+
+// A64 固定帧形态的独立解码：一条指令按生效次序得 [(种类, 寄存器, 字节, sp 变化)]。sp 为其前的栈偏移，fp 为 x29 被设成的偏移
+// （hasFp 为假即 None；经 x29 的释放用它）。
+export function a64Frame(code: Bytes, sp: int, fp: int, hasFp: bool): List<Ev> | Error {
+    need(bytesLen(code) == 4, "A64 frame instruction " + hexOf(code))?;
+    const w = word(code, 0);
+    const rt = w & 31;
+    const rn = (w >> 5) & 31;
+    const rt2 = (w >> 10) & 31;
+    const imm7 = sext((w >> 15) & 127, 7);
+    const imm9 = sext((w >> 12) & 511, 9);
+    const out: List<Ev> = listNew();
+    if ((w & 0xFFC00000) == 0xA9800000 && rn == 31 && imm7 == -2) {
+        listPush(out, ev("push-nonvolatile", rt2, 8, -8));
+        listPush(out, ev("push-nonvolatile", rt, 8, -8));
+        return out;
+    }
+    if ((w & 0xFFE00C00) == 0xF8000C00 && rn == 31 && imm9 == -16) {
+        listPush(out, ev("push-nonvolatile", rt, 16, -16));
+        return out;
+    }
+    if ((w & 0xFFC00000) == 0xA8C00000 && rn == 31 && imm7 == 2) {
+        listPush(out, ev("pop-nonvolatile", rt, 8, 8));
+        listPush(out, ev("pop-nonvolatile", rt2, 8, 8));
+        return out;
+    }
+    if ((w & 0xFFE00C00) == 0xF8400400 && rn == 31 && imm9 == 16) {
+        listPush(out, ev("pop-nonvolatile", rt, 16, 16));
+        return out;
+    }
+    if (w == 0x910003FD) {
+        listPush(out, ev("set-frame-pointer", 29, 0, 0));
+        return out;
+    }
+    if ((w & 0xFF8003FF) == 0xD10003FF) {
+        const size = ((w >> 10) & 4095) << (12 * ((w >> 22) & 1));
+        listPush(out, ev("allocate-stack", 31, size, -size));
+        return out;
+    }
+    const masked = w & 0xFFC003FF;
+    if ((masked == 0x910003BF || masked == 0xD10003BF) && hasFp) {
+        const k = (w >> 10) & 4095;
+        let target = fp + k;
+        if ((w & 0x40000000) != 0) {
+            target = fp - k;
+        }
+        listPush(out, ev("release-stack", 31, target - sp, target - sp));
+        return out;
+    }
+    need(w == 0xD65F03C0, "A64 frame instruction " + hx(w))?;
+    listPush(out, ev("return", -1, 0, 0));
+    return out;
+}
+
+function words(code: Bytes): List<int> | Error {
+    need(bytesLen(code) > 0 && bytesLen(code) % 4 == 0, "frame code " + hexOf(code))?;
+    const out: List<int> = listNew();
+    let k = 0;
+    while (4 * k < bytesLen(code)) {
+        listPush(out, word(code, k));
+        k = k + 1;
+    }
+    return out;
+}
+
+function wAt(w: List<int>, k: int): int {
+    return listGet(w, k) catch -1;
+}
+
+function la64Si12(w: int): int {
+    return sext((w >> 10) & 4095, 12);
+}
+
+// lu12i.w／ori／lu32i.d／lu52i.d／addi.d 序列留在 rd 里的值（每条都写 rd）。
+function la64Movimm(w: List<int>, from: int, to: int, rd: int): int | Error {
+    let v = 0;
+    let k = from;
+    while (k < to) {
+        const x = wAt(w, k);
+        need((x & 31) == rd, "la64 movimm " + hx(x))?;
+        let src = v;
+        if (((x >> 5) & 31) == 0) {
+            src = 0;
+        }
+        if ((x & 0xFFC00000) == 0x2C00000) {
+            need(((x >> 5) & 31) == 0, "la64 addi.d " + hx(x))?;
+            v = la64Si12(x);
+        } else if ((x & 0xFFC00000) == 0x3800000) {
+            v = src | ((x >> 10) & 4095);
+        } else if ((x & 0xFE000000) == 0x14000000) {
+            v = sext((x >> 5) & 0xFFFFF, 20) << 12;
+        } else if ((x & 0xFE000000) == 0x16000000) {
+            v = (v & 0xFFFFFFFF) | (sext((x >> 5) & 0xFFFFF, 20) << 32);
+        } else {
+            need((x & 0xFFC00000) == 0x3000000, "la64 lu52i.d " + hx(x))?;
+            v = (src & 0xFFFFFFFFFFFFF) | (sext((x >> 10) & 4095, 12) << 52);
+        }
+        k = k + 1;
+    }
+    return v;
+}
+
+struct Slot {
+    off: int,
+    reg: int,
+}
+
+// 按偏移排序（降序为 desc）。
+function sortSlots(xs: List<Slot>, desc: bool): List<Slot> {
+    const out: List<Slot> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+        let k = listLen(out) - 1;
+        while (k > 0) {
+            const prev = listGet(out, k - 1) catch x;
+            let before = prev.off > x.off || (prev.off == x.off && prev.reg > x.reg);
+            if (desc) {
+                before = prev.off < x.off || (prev.off == x.off && prev.reg < x.reg);
+            }
+            if (!before) {
+                break;
+            }
+            listSet(out, k, prev);
+            k = k - 1;
+        }
+        listSet(out, k, x);
+    }
+    return out;
+}
+
+function distinctOffsets(xs: List<Slot>): bool {
+    let i = 1;
+    while (i < listLen(xs)) {
+        if ((listGet(xs, i) catch Slot { off: 0, reg: 0 }).off == (listGet(xs, i - 1) catch Slot { off: 1, reg: 0 }).off) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 压栈组：先 sp −= N，再把各寄存器存进这 N 字节；寄存器从最高的槽往下记，每个到上一个更高的槽为止（第一个到 N）。出栈组反之。
+function pushGroup(slots: List<Slot>, n: int): List<Ev> | Error {
+    const s = sortSlots(slots, true);
+    need((listGet(s, listLen(s) - 1) catch Slot { off: 1, reg: 0 }).off == 0 && distinctOffsets(s), "push group slots")?;
+    const out: List<Ev> = listNew();
+    let top = n;
+    for (x in s) {
+        const b = top - x.off;
+        need(b == 8 || b == 16, "push group slot size")?;
+        listPush(out, ev("push-nonvolatile", x.reg, b, x.off - top));
+        top = x.off;
+    }
+    return out;
+}
+
+function popGroup(slots: List<Slot>, n: int): List<Ev> | Error {
+    const s = sortSlots(slots, false);
+    need((listGet(s, 0) catch Slot { off: 1, reg: 0 }).off == 0 && distinctOffsets(s), "pop group slots")?;
+    const out: List<Ev> = listNew();
+    let i = 0;
+    while (i < listLen(s)) {
+        const x = listGet(s, i) catch Slot { off: 0, reg: 0 };
+        let top = n;
+        if (i + 1 < listLen(s)) {
+            top = (listGet(s, i + 1) catch x).off;
+        }
+        const b = top - x.off;
+        need(b == 8 || b == 16, "pop group slot size")?;
+        listPush(out, ev("pop-nonvolatile", x.reg, b, b));
+        i = i + 1;
+    }
+    return out;
+}
+
+// 龙芯固定帧形态的独立解码（一个事件区间的指令）。帧指针为 addi.d fp, sp, 16（帧记录之上的地址，同 psABI 与 perf）。
+export function la64Frame(code: Bytes, sp: int, fp: int, hasFp: bool): List<Ev> | Error {
+    const w = words(code)?;
+    const n = listLen(w);
+    const out: List<Ev> = listNew();
+    if (n > 1 && la64Addi(wAt(w, 0), 3, 3) && la64Si12(wAt(w, 0)) < 0 && allMatch(w, 1, n, 0xFFC003E0, 0x29C00060)) {
+        const slots: List<Slot> = listNew();
+        let k = 1;
+        while (k < n) {
+            listPush(slots, Slot { off: la64Si12(wAt(w, k)), reg: wAt(w, k) & 31 });
+            k = k + 1;
+        }
+        return pushGroup(slots, -la64Si12(wAt(w, 0)));
+    }
+    if (n > 1 && la64Addi(wAt(w, n - 1), 3, 3) && la64Si12(wAt(w, n - 1)) > 0 && allMatch(w, 0, n - 1, 0xFFC003E0, 0x28C00060)) {
+        const slots: List<Slot> = listNew();
+        let k = 0;
+        while (k < n - 1) {
+            listPush(slots, Slot { off: la64Si12(wAt(w, k)), reg: wAt(w, k) & 31 });
+            k = k + 1;
+        }
+        return popGroup(slots, la64Si12(wAt(w, n - 1)));
+    }
+    if (n > 1) {
+        // sp −= N 的长形：N 进 t8（r20），再 sub.d sp, sp, t8。
+        need(wAt(w, n - 1) == 0x11D063, "la64 long allocation " + hx(wAt(w, n - 1)))?;
+        const size = la64Movimm(w, 0, n - 1, 20)?;
+        need(size > 2048, "la64 long allocation size")?;
+        listPush(out, ev("allocate-stack", 3, size, -size));
+        return out;
+    }
+    const x = wAt(w, 0);
+    if (x == 0x2C04076) {
+        listPush(out, ev("set-frame-pointer", 22, 16, 0));
+        return out;
+    }
+    if (la64Addi(x, 3, 3) && la64Si12(x) < 0) {
+        listPush(out, ev("allocate-stack", 3, -la64Si12(x), la64Si12(x)));
+        return out;
+    }
+    if (la64Addi(x, 3, 22) && hasFp) {
+        const target = fp + la64Si12(x);
+        listPush(out, ev("release-stack", 3, target - sp, target - sp));
+        return out;
+    }
+    need(x == 0x4C000020, "la64 frame instruction " + hx(x))?;
+    listPush(out, ev("return", -1, 0, 0));
+    return out;
+}
+
+function la64Addi(x: int, rd: int, rj: int): bool {
+    return (x & 0xFFC00000) == 0x2C00000 && (x & 31) == rd && ((x >> 5) & 31) == rj;
+}
+
+function allMatch(w: List<int>, from: int, to: int, mask: int, want: int): bool {
+    let k = from;
+    while (k < to) {
+        if ((wAt(w, k) & mask) != want) {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+function rv64I12(w: int): int {
+    return sext((w >> 20) & 4095, 12);
+}
+
+function rv64S12(w: int): int {
+    return sext(((w >> 25) << 5) | ((w >> 7) & 31), 12);
+}
+
+function sext32(x: int): int {
+    return sext(x & 0xFFFFFFFF, 32);
+}
+
+// lui／addiw／addi／slli 序列留在 rd 里的值（每条都写 rd）。
+function rv64Movimm(w: List<int>, from: int, to: int, rd: int): int | Error {
+    let v = 0;
+    let k = from;
+    while (k < to) {
+        const x = wAt(w, k);
+        need(((x >> 7) & 31) == rd, "rv64 movimm " + hx(x))?;
+        let src = v;
+        if (((x >> 15) & 31) == 0) {
+            src = 0;
+        }
+        if ((x & 127) == 55) {
+            v = sext32(x & 0xFFFFF000);
+        } else if ((x & 0x707F) == 27) {
+            v = sext32(wrapAdd(src, rv64I12(x)));
+        } else if ((x & 0x707F) == 19) {
+            v = wrapAdd(src, rv64I12(x));
+        } else {
+            need((x & 0xFC00707F) == 0x1013, "rv64 slli " + hx(x))?;
+            v = src << ((x >> 20) & 63);
+        }
+        k = k + 1;
+    }
+    return v;
+}
+
+function rv64Addi(x: int, rd: int, rs: int): bool {
+    return (x & 0x707F) == 19 && ((x >> 7) & 31) == rd && ((x >> 15) & 31) == rs;
+}
+
+// RISC-V 固定帧形态的独立解码，形态同龙芯：帧指针为 addi s0, sp, 16（psABI 的 fp＝CFA）；长分配把 N 放进 t6（x31）再相减。
+export function rv64Frame(code: Bytes, sp: int, fp: int, hasFp: bool): List<Ev> | Error {
+    const w = words(code)?;
+    const n = listLen(w);
+    const out: List<Ev> = listNew();
+    if (n > 1 && rv64Addi(wAt(w, 0), 2, 2) && rv64I12(wAt(w, 0)) < 0 && allMatch(w, 1, n, 0xFF07F, 0x13023)) {
+        const slots: List<Slot> = listNew();
+        let k = 1;
+        while (k < n) {
+            listPush(slots, Slot { off: rv64S12(wAt(w, k)), reg: (wAt(w, k) >> 20) & 31 });
+            k = k + 1;
+        }
+        return pushGroup(slots, -rv64I12(wAt(w, 0)));
+    }
+    if (n > 1 && rv64Addi(wAt(w, n - 1), 2, 2) && rv64I12(wAt(w, n - 1)) > 0 && allMatch(w, 0, n - 1, 0xFF07F, 0x13003)) {
+        const slots: List<Slot> = listNew();
+        let k = 0;
+        while (k < n - 1) {
+            listPush(slots, Slot { off: rv64I12(wAt(w, k)), reg: (wAt(w, k) >> 7) & 31 });
+            k = k + 1;
+        }
+        return popGroup(slots, rv64I12(wAt(w, n - 1)));
+    }
+    if (n > 1) {
+        // sp −= N 的长形：N 进 t6（x31），再 sub sp, sp, t6。
+        need(wAt(w, n - 1) == 0x41F10133, "rv64 long allocation " + hx(wAt(w, n - 1)))?;
+        const size = rv64Movimm(w, 0, n - 1, 31)?;
+        need(size > 2048, "rv64 long allocation size")?;
+        listPush(out, ev("allocate-stack", 2, size, -size));
+        return out;
+    }
+    const x = wAt(w, 0);
+    if (x == 0x1010413) {
+        listPush(out, ev("set-frame-pointer", 8, 16, 0));
+        return out;
+    }
+    if (rv64Addi(x, 2, 2) && rv64I12(x) < 0) {
+        listPush(out, ev("allocate-stack", 2, -rv64I12(x), rv64I12(x)));
+        return out;
+    }
+    if (rv64Addi(x, 2, 8) && hasFp) {
+        const target = fp + rv64I12(x);
+        listPush(out, ev("release-stack", 2, target - sp, target - sp));
+        return out;
+    }
+    need(x == 0x8067, "rv64 frame instruction " + hx(x))?;
+    listPush(out, ev("return", -1, 0, 0));
+    return out;
+}
+
+function strArr(v: Ref<Jv>?): List<string> {
+    const out: List<string> = listNew();
+    let i = 0;
+    while (i < count(v)) {
+        const x = item(v, i);
+        if (x != None && (x ?? jNull()).kind == J_STR) {
+            listPush(out, (x ?? jNull()).text);
+        } else {
+            listPush(out, "\u{0}<not a string>");
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+function hasStr(xs: List<string>, s: string): bool {
+    for (x in xs) {
+        if (x == s) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 两组字符串作为集合相等（同 Python 的 set(a) == set(b)）。
+function sameSet(a: List<string>, b: List<string>): bool {
+    for (x in a) {
+        if (!hasStr(b, x)) {
+            return false;
+        }
+    }
+    for (y in b) {
+        if (!hasStr(a, y)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function isHex16(t: string): bool {
+    if (len(t) != 18 || (byteAt(t, 0) ?? 0) != 48 || (byteAt(t, 1) ?? 0) != 120) {
+        return false;
+    }
+    let i = 2;
+    while (i < 18) {
+        const d = byteAt(t, i) ?? 0;
+        if (!((d >= 48 && d <= 57) || (d >= 97 && d <= 102))) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function jvText(v: Ref<Jv>?): string {
+    if (v == None) {
+        return "None";
+    }
+    const x = v ?? jNull();
+    if (x.kind == J_STR) {
+        return x.text;
+    }
+    if (x.kind == J_NUM) {
+        return x.text;
+    }
+    if (x.kind == 0) {
+        return "None";
+    }
+    return "?";
+}
+
+struct Pair {
+    reg: int,
+    bytes: int,
+}
+
+function evText(e: Ev): string {
+    let r = toStr(e.reg);
+    if (e.reg == -1) {
+        r = "None";
+    }
+    return "(" + jQuote(e.kind) + ", " + r + ", " + toStr(e.bytes) + ", " + toStr(e.delta) + ")";
+}
+
+function evsText(xs: List<Ev>): string {
+    let s = "[";
+    let i = 0;
+    for (e in xs) {
+        if (i > 0) {
+            s = s + ", ";
+        }
+        s = s + evText(e);
+        i = i + 1;
+    }
+    return s + "]";
+}
+
+function sameEvs(a: List<Ev>, b: List<Ev>): bool {
+    if (listLen(a) != listLen(b)) {
+        return false;
+    }
+    let i = 0;
+    while (i < listLen(a)) {
+        const x = listGet(a, i) catch ev("", 0, 0, 0);
+        const y = listGet(b, i) catch ev("?", 0, 0, 0);
+        if (x.kind != y.kind || x.reg != y.reg || x.bytes != y.bytes || x.delta != y.delta) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 映射的函数表、覆盖声明与每个函数的帧事件对照产物字节。segs 为产物的实际布局。返回 tx 生成函数各自保存的寄存器序列（去重，
+// 写成逗号分隔的十进制）。
+export function verifyFunctions(doc: Ref<Jv>?, image: Bytes, segs: List<Seg>): List<string> | Error {
+    const x = at(doc, "map");
+    const functions = at(x, "functions");
+    const saves: List<string> = listNew();
+    need(textIs(doc, "schema", "link-map/7") && truthyBool(at(doc, "ok")), "schema/ok")?;
+    need(textIs(at(x, "image"), "sha256", hexOf(sha256Of(image, 0, bytesLen(image)))) && decAt(at(x, "image"), "bytes")? == bytesLen(image), "image identity")?;
+    const nf = count(functions);
+    need(decAt(x, "functions_total")? == nf && nf > 0, "functions_total")?;
+    let boundary = 0;
+    let i = 0;
+    while (i < nf) {
+        if (!textIs(item(functions, i), "stack_model", "fixed-call")) {
+            boundary = boundary + 1;
+        }
+        i = i + 1;
+    }
+    const cov = at(x, "coverage");
+    need(textIs(cov, "function_ranges", "producer-declared"), "coverage.function_ranges")?;
+    let frames = "producer-declared";
+    if (boundary > 0) {
+        frames = "partial-producer-declared";
+    }
+    need(textIs(cov, "frame_events", frames), "coverage.frame_events")?;
+    need(decAt(cov, "boundary_functions")? == boundary, "coverage.boundary_functions")?;
+    need(decAt(cov, "frame_functions")? == nf - boundary, "coverage.frame_functions")?;
+    need(isNull(at(cov, "unwind")) && isNull(at(cov, "cpu_profile")) && !truthy(at(cov, "truncated")), "coverage unknowns")?;
+    need(isNull(at(at(x, "image"), "runtime_load_bias")), "runtime_load_bias")?;
+    const target = textOf(x, "target");
+    // 内核的手写例程是否已全部登记，取门侧目标表（scripts/targets.tx 的 manualRegistered；不问编译器怎么判断）。
+    const excluded: List<string> = listNew();
+    listPush(excluded, "linker-thunks");
+    listPush(excluded, "external-objects-without-metadata");
+    if (!(targetNamed(target) ?? noTarget()).manualRegistered) {
+        listPush(excluded, "runtime-manual");
+    }
+    need(sameSet(strArr(at(cov, "excluded_function_origins")), excluded), "coverage.excluded_function_origins")?;
+    const origins: List<string> = listNew();
+    i = 0;
+    while (i < nf) {
+        listPush(origins, textOf(item(functions, i), "origin"));
+        i = i + 1;
+    }
+    need(sameSet(strArr(at(cov, "included_function_origins")), origins), "coverage.included_function_origins")?;
+    need(textIs(at(cov, "object_metadata"), "schema", "txfn/3"), "object_metadata.schema")?;
+    need(contains(textOf(x, "numeric_encoding"), "sp_delta=decimal-string/i64"), "numeric_encoding")?;
+    const a64 = startsWithText(target, "aarch64-");
+    const la64 = target == "loongarch64-linux";
+    const rv64 = target == "riscv64-linux";
+    const risc = a64 || la64 || rv64;
+    const endKeys: List<string> = listNew();
+    const endVals: List<int> = listNew();
+    const rVa: List<int> = listNew();
+    const rStop: List<int> = listNew();
+    i = 0;
+    while (i < nf) {
+        const f = item(functions, i);
+        const name = textOf(f, "name");
+        const va = hexAt(f, "link_va")?;
+        const stop = hexAt(f, "link_va_end")?;
+        const size = decAt(f, "bytes")?;
+        const offset = decAt(f, "file_offset")?;
+        need(isHex16(textOf(f, "link_va")) && isHex16(textOf(f, "link_va_end")), name + ": address form")?;
+        need(jvText(at(f, "id")) == toStr(i), name + ": id")?;
+        const tx = textIs(f, "origin", "tx-generated");
+        if (tx) {
+            need(!isNullOrMissing(at(f, "source_id")) && textIs(f, "link_name", "f_" + jvText(at(f, "source_id"))), name + ": tx link name")?;
+        } else {
+            need(isNull(at(f, "source_id")) && textOf(f, "link_name") == name && textIs(f, "link_name", name), name + ": link name")?;
+        }
+        const key = jvText(at(f, "object_index")) + "/" + jvText(at(f, "input_section_index"));
+        let k = 0;
+        let found = -1;
+        while (k < listLen(endKeys)) {
+            if ((listGet(endKeys, k) catch "") == key) {
+                found = k;
+            }
+            k = k + 1;
+        }
+        if (found >= 0) {
+            need(!ult(va, listGet(endVals, found) catch 0), name + ": overlaps the previous function of its input section")?;
+        }
+        need(stop == wrapAdd(va, size) && size > 0, name + ": range")?;
+        if (found >= 0) {
+            listSet(endVals, found, stop);
+        } else {
+            listPush(endKeys, key);
+            listPush(endVals, stop);
+        }
+        listPush(rVa, va);
+        listPush(rStop, stop);
+        need(decAt(f, "input_section_end")? - decAt(f, "input_section_begin")? == size, name + ": input section range")?;
+        need(offset == fileAt(segs, va) && offset + size <= bytesLen(image), name + ": file offset")?;
+        if (!textIs(f, "stack_model", "fixed-call")) {
+            const m = textOf(f, "stack_model");
+            need(textIs(f, "origin", "process-thread-entry") && (m == "process-entry" || m == "thread-entry" || m == "stack-transition"
+                    || m == "stack-disposal"), name + ": boundary model")?;
+            need(isNull(at(f, "frame")) && isNull(at(f, "prologue_end_offset")) && count(at(f, "epilogues")) == 0 && arrayAt(f, "epilogues"),
+                name + ": boundary frame")?;
+            i = i + 1;
+            continue;
+        }
+        verifyFrame(f, image, offset, size, tx, a64, la64, rv64, saves)?;
+        i = i + 1;
+    }
+    // 范围两两不重叠（按起点排序后相邻的不交）。
+    const order: List<int> = listNew();
+    i = 0;
+    while (i < listLen(rVa)) {
+        listPush(order, i);
+        let k = listLen(order) - 1;
+        while (k > 0) {
+            const p = listGet(order, k - 1) catch 0;
+            const pv = listGet(rVa, p) catch 0;
+            const cv = listGet(rVa, i) catch 0;
+            if (!(ult(cv, pv) || (cv == pv && ult(listGet(rStop, i) catch 0, listGet(rStop, p) catch 0)))) {
+                break;
+            }
+            listSet(order, k, p);
+            k = k - 1;
+        }
+        listSet(order, k, i);
+        i = i + 1;
+    }
+    i = 1;
+    while (i < listLen(order)) {
+        const left = listGet(order, i - 1) catch 0;
+        const right = listGet(order, i) catch 0;
+        need(!ult(listGet(rVa, right) catch 0, listGet(rStop, left) catch 0), "overlapping function ranges")?;
+        i = i + 1;
+    }
+    return saves;
+}
+
+function arrayAt(v: Ref<Jv>?, key: string): bool {
+    const x = at(v, key);
+    return x != None && (x ?? jNull()).kind == 4;
+}
+
+function isNullOrMissing(v: Ref<Jv>?): bool {
+    return v == None || isNull(v);
+}
+
+function truthyBool(v: Ref<Jv>?): bool {
+    if (v == None) {
+        return false;
+    }
+    const x = v ?? jNull();
+    return x.kind == 1 && x.truth;
+}
+
+function startsWithText(s: string, prefix: string): bool {
+    if (len(s) < len(prefix)) {
+        return false;
+    }
+    let i = 0;
+    while (i < len(prefix)) {
+        if ((byteAt(s, i) ?? 0) != (byteAt(prefix, i) ?? 1)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function pairsEq(a: List<Pair>, want: []int): bool {
+    if (listLen(a) * 2 != len(want)) {
+        return false;
+    }
+    let i = 0;
+    while (i < listLen(a)) {
+        const p = listGet(a, i) catch Pair { reg: -9, bytes: 0 };
+        if (p.reg != want[2 * i] || p.bytes != want[2 * i + 1]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function lastTwo(a: List<Pair>): List<Pair> {
+    const out: List<Pair> = listNew();
+    let i = listLen(a) - 2;
+    if (i < 0) {
+        i = 0;
+    }
+    while (i < listLen(a)) {
+        listPush(out, listGet(a, i) catch Pair { reg: 0, bytes: 0 });
+        i = i + 1;
+    }
+    return out;
+}
+
+function copyPairs(a: List<Pair>): List<Pair> {
+    const out: List<Pair> = listNew();
+    for (p in a) {
+        listPush(out, p);
+    }
+    return out;
+}
+
+function verifyFrame(f: Ref<Jv>?, image: Bytes, offset: int, size: int, tx: bool, a64: bool, la64: bool, rv64: bool, saves: List<string>): void | Error {
+    const name = textOf(f, "name");
+    const risc = a64 || la64 || rv64;
+    const prologue = decAt(f, "prologue_end_offset")?;
+    const epis = at(f, "epilogues");
+    const epStart: List<int> = listNew();
+    const epEnd: List<int> = listNew();
+    let i = 0;
+    while (i < count(epis)) {
+        listPush(epStart, decAt(item(epis, i), "start_offset")?);
+        listPush(epEnd, decAt(item(epis, i), "end_offset")?);
+        i = i + 1;
+    }
+    const neps = listLen(epStart);
+    need(0 <= prologue && prologue <= size, name + ": prologue end")?;
+    let previous = prologue;
+    i = 0;
+    while (i < neps) {
+        const s = listGet(epStart, i) catch 0;
+        const e = listGet(epEnd, i) catch 0;
+        need(previous <= s && s < e && e <= size, name + ": epilogue order")?;
+        previous = e;
+        i = i + 1;
+    }
+    if (tx) {
+        need(neps == 1 && (listGet(epEnd, 0) catch -1) == size, name + ": tx epilogue")?;
+    }
+    const frame = at(f, "frame");
+    need(textIs(frame, "effect_at", "instruction-end") && textIs(frame, "offset_basis", "function-start"), name + ": frame basis")?;
+    let entry = "return-address-slot";
+    if (risc) {
+        entry = "call-site-sp";
+    }
+    need(textIs(frame, "entry_sp", entry), name + ": entry_sp")?;
+    let numbering = "x86-64-gpr";
+    if (a64) {
+        numbering = "aarch64-gpr";
+    } else if (la64) {
+        numbering = "loongarch64-gpr";
+    } else if (rv64) {
+        numbering = "riscv64-gpr";
+    }
+    need(textIs(frame, "register_numbering", numbering), name + ": register_numbering")?;
+    let recovery = "not-provided";
+    if (tx || textIs(f, "origin", "ffi-callback-shell")) {
+        recovery = "saved-gpr-events";
+    }
+    // body_sp：带 align-stack 的重对齐帧为 realigned，其余为 fixed。
+    let realigned = false;
+    let k0 = 0;
+    while (k0 < count(at(frame, "events"))) {
+        if (textIs(item(at(frame, "events"), k0), "kind", "align-stack")) {
+            realigned = true;
+        }
+        k0 = k0 + 1;
+    }
+    let bodyWant = "fixed";
+    if (realigned) {
+        bodyWant = "realigned";
+    }
+    need(textIs(frame, "body_sp", bodyWant) && textIs(frame, "register_recovery", recovery), name + ": body_sp/register_recovery")?;
+    // sp 相对进入时；saved 为（寄存器，字节）。一条 A64 指令（stp／ldp）或一组龙芯／RISC-V 指令（addi.d sp 与 st.d／ld.d，addi sp 与
+    // sd／ld）可以带同一区间的几个事件。
+    let position = 0;
+    let sp = 0;
+    let saved: List<Pair> = listNew();
+    const original: List<Pair> = listNew();
+    let allocation = 0;
+    let hasAllocation = false;
+    let returned = false;
+    let epIndex = -1;
+    let proEnd = 0;
+    let bodySp = 0;
+    let hasBodySp = false;
+    let fp = 0;
+    let hasFp = false;
+    // 重对齐帧：alignedSp 为对齐之前的栈偏移，restored 为本尾声已经经帧指针复原。
+    let aligned = false;
+    let alignedSp = 0;
+    let restored = false;
+    const events = at(frame, "events");
+    const nev = count(events);
+    const origin = textOf(f, "origin");
+    i = 0;
+    while (i < nev) {
+        const first = item(events, i);
+        const before = decAt(first, "instruction_start_offset")?;
+        const after = decAt(first, "instruction_end_offset")?;
+        const group: List<Ev> = listNew();
+        listPush(group, ev(textOf(first, "kind"), regOf(first), decAt(first, "bytes")?, deltaOf(first)?));
+        i = i + 1;
+        while (risc && i < nev && decAt(item(events, i), "instruction_start_offset")? == before
+            && decAt(item(events, i), "instruction_end_offset")? == after) {
+            const e = item(events, i);
+            listPush(group, ev(textOf(e, "kind"), regOf(e), decAt(e, "bytes")?, deltaOf(e)?));
+            i = i + 1;
+        }
+        need(position <= before && before < after && after <= size, name + ": event " + toStr(before) + " order")?;
+        const pro = before < prologue;
+        if (pro) {
+            need(before == position && after <= prologue && epIndex == -1, name + ": prologue event " + toStr(before))?;
+            proEnd = after;
+        } else {
+            if (!hasBodySp) {
+                bodySp = sp;
+                hasBodySp = true;
+            }
+            if (epIndex == -1 || before >= (listGet(epEnd, epIndex) catch 0)) {
+                if (epIndex >= 0) {
+                    need(returned, name + ": epilogue without return")?;
+                }
+                epIndex = epIndex + 1;
+                need(epIndex < neps, name + ": event after the last epilogue")?;
+                position = listGet(epStart, epIndex) catch 0;
+                sp = bodySp;
+                saved = copyPairs(original);
+                returned = false;
+                restored = false;
+            }
+            need(!returned && before == position && after <= (listGet(epEnd, epIndex) catch 0), name + ": epilogue event " + toStr(before))?;
+        }
+        position = after;
+        const code = codeAt(image, offset + before, after - before);
+        let decoded: List<Ev> = listNew();
+        if (a64) {
+            decoded = a64Frame(code, sp, fp, hasFp)?;
+        } else if (la64) {
+            decoded = la64Frame(code, sp, fp, hasFp)?;
+        } else if (rv64) {
+            decoded = rv64Frame(code, sp, fp, hasFp)?;
+        } else {
+            const g = listGet(group, 0) catch ev("", 0, 0, 0);
+            listPush(decoded, ev(g.kind, g.reg, g.bytes, frameBytes(g.kind, g.reg, g.bytes, code)?));
+        }
+        need(sameEvs(group, decoded), name + ": event " + toStr(before) + " " + evsText(group) + " vs " + evsText(decoded) + " " + hexOf(code))?;
+        for (e in group) {
+            if (e.kind == "push-nonvolatile") {
+                // x86 上压栈只许 tx 生成函数、回调外壳与按平台约定调用的入口（x86_64-windows 的线程入口，PE 规范化 P3）。
+                need(pro && !aligned && (tx || risc || origin == "ffi-callback-shell" || origin == "process-thread-entry" || origin == "runtime-manual"),
+                    name + ": push outside the prologue")?;
+                listPush(saved, Pair { reg: e.reg, bytes: e.bytes });
+                listPush(original, Pair { reg: e.reg, bytes: e.bytes });
+            }
+            if (e.kind == "set-frame-pointer") {
+                let ok = pairsEq(saved, [5, 8]);
+                if (a64) {
+                    ok = pairsEq(lastTwo(saved), [30, 8, 29, 8]);
+                } else if (la64) {
+                    ok = pairsEq(saved, [1, 8, 22, 8]);
+                } else if (rv64) {
+                    ok = pairsEq(saved, [1, 8, 8, 8]);
+                }
+                need(ok, name + ": frame pointer set before its save")?;
+                fp = sp + e.bytes;
+                hasFp = true;
+            }
+            if (e.kind == "allocate-stack") {
+                need(pro && (!hasAllocation || a64), name + ": allocation")?;
+                allocation = allocation + e.bytes;
+                hasAllocation = true;
+            }
+            if (e.kind == "release-stack") {
+                need(!pro && !aligned && hasAllocation && e.bytes == allocation, name + ": release")?;
+            }
+            if (e.kind == "align-stack") {
+                // 只许 x86 的手写例程：设帧指针之后、分配之前。
+                need(pro && !risc && origin == "runtime-manual" && hasFp && !hasAllocation && !aligned, name + ": stack alignment")?;
+                aligned = true;
+                alignedSp = sp;
+            }
+            if (e.kind == "restore-stack-pointer") {
+                // rsp = fp − bytes，须恰是对齐之前的栈顶，且在本尾声弹出之前。
+                need(!pro && aligned && !restored && listLen(saved) == listLen(original) && fp - e.bytes == alignedSp, name + ": stack restore")?;
+                sp = fp - e.bytes;
+                restored = true;
+            }
+            if (e.kind == "pop-nonvolatile") {
+                need(!aligned || restored, name + ": pop before the stack restore")?;
+                need(listLen(saved) > 0, name + ": pop without a save")?;
+                const top = listPop(saved) ?? Pair { reg: -9, bytes: -9 };
+                need(top.reg == e.reg && top.bytes == e.bytes, name + ": pop order")?;
+            }
+            if (e.kind == "return") {
+                need(!pro && sp == 0 && listLen(saved) == 0 && after == (listGet(epEnd, epIndex) catch -1), name + ": return")?;
+                returned = true;
+            }
+            sp = sp + e.delta;
+        }
+        if (risc) {
+            need(sp % 16 == 0, name + ": sp alignment at " + toStr(before))?;
+        }
+    }
+    need(proEnd == prologue && epIndex + 1 == neps, name + ": prologue/epilogue coverage")?;
+    if (neps > 0) {
+        let rest = 8;
+        if (risc) {
+            rest = 0;
+        }
+        need(returned && sp == rest, name + ": final sp")?;
+    }
+    if (tx) {
+        let key = "";
+        let k = 0;
+        for (p in original) {
+            if (k > 0) {
+                key = key + ",";
+            }
+            key = key + toStr(p.reg);
+            k = k + 1;
+        }
+        if (!hasStr(saves, key)) {
+            listPush(saves, key);
+        }
+    }
+}
+
+// 链接名到函数（同名的以后一个为准）。
+function byLink(functions: Ref<Jv>?, name: string): Ref<Jv>? {
+    let found: Ref<Jv>? = None;
+    let i = 0;
+    while (i < count(functions)) {
+        const f = item(functions, i);
+        if (textIs(f, "link_name", name)) {
+            found = f;
+        }
+        i = i + 1;
+    }
+    return found;
+}
+
+function special(functions: Ref<Jv>?, name: string): Ref<Jv>? {
+    const f = byLink(functions, name);
+    if (f != None && textIs(f, "origin", "process-thread-entry")) {
+        return f;
+    }
+    return None;
+}
+
+function codeOf(image: Bytes, f: Ref<Jv>?): Bytes | Error {
+    return codeAt(image, decAt(f, "file_offset")?, decAt(f, "bytes")?);
+}
+
+function vaOf(f: Ref<Jv>?): int | Error {
+    return hexAt(f, "link_va");
+}
+
+function wordsOf(image: Bytes, f: Ref<Jv>?): List<int> | Error {
+    return words(codeOf(image, f)?);
+}
+
+function wordsAre(w: List<int>, from: int, want: []int): bool {
+    let k = 0;
+    while (k < len(want)) {
+        if (wAt(w, from + k) != want[k]) {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+function countWord(w: List<int>, v: int): int {
+    let n = 0;
+    for (x in w) {
+        if (x == v) {
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+function sliceIs(b: Bytes, from: int, want: []int): bool {
+    if (from < 0 || from + len(want) > bytesLen(b)) {
+        return false;
+    }
+    let k = 0;
+    while (k < len(want)) {
+        if ((bytesGet(b, from + k) ?? -1) != want[k]) {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+function tailIs(b: Bytes, from: int, want: []int): bool {
+    return bytesLen(b) - from == len(want) && sliceIs(b, from, want);
+}
+
+function a64CallTarget(f: Ref<Jv>?, w: List<int>, k: int): int | Error {
+    need((wAt(w, k) >> 26) == 0x25, "bl expected")?;
+    return vaOf(f)? + 4 * k + 4 * sext(wAt(w, k) & 0x3FFFFFF, 26);
+}
+
+// 进程入口与线程入口按约定调用、或有特别的栈模型：核对它们的实际字节。target：windows、linux
+// （同 x86_64-linux）、x86_64-linux、aarch64-linux、loongarch64-linux、riscv64-linux、x86_64-macos、aarch64-macos。threads：产物该不该有
+// 线程入口——运行时按需链入，只有用线程的程序才链入线程入口（Linux 连同 clone 与线程退出两个手写例程）；None 不限定，但这几个须全有
+// 或全无。
+export function verifyBoundaries(doc: Ref<Jv>?, image: Bytes, target: string, threads: bool?): void | Error {
+    const functions = at(at(doc, "map"), "functions");
+    const x86Linux = target == "linux" || target == "x86_64-linux";
+    const linux = x86Linux || target == "aarch64-linux" || target == "loongarch64-linux" || target == "riscv64-linux";
+    // 各个按名字取的特殊函数与它们的栈模型。
+    const names: List<string> = listNew();
+    let i = 0;
+    while (i < count(functions)) {
+        const f = item(functions, i);
+        if (textIs(f, "origin", "process-thread-entry")) {
+            const ln = textOf(f, "link_name");
+            if (!hasStr(names, ln)) {
+                listPush(names, ln);
+            }
+        }
+        i = i + 1;
+    }
+    // special 只含最后一个同名函数为 process-thread-entry 的名字（先按名字建表再筛）。
+    const live: List<string> = listNew();
+    for (n in names) {
+        if (special(functions, n) != None) {
+            listPush(live, n);
+        }
+    }
+    let present = 0;
+    let all = 1;
+    if (hasStr(live, "__tx_thread_entry")) {
+        present = present + 1;
+    }
+    if (linux) {
+        all = 3;
+        if (hasStr(live, "__tx_thread_clone")) {
+            present = present + 1;
+        }
+        if (hasStr(live, "__tx_thread_unmap_exit")) {
+            present = present + 1;
+        }
+    }
+    need(present == 0 || present == all, "thread entries all or none")?;
+    const hasThreads = present == all;
+    if (threads != None) {
+        need((threads ?? false) == hasThreads, "thread entries present: " + toStr(hasThreads))?;
+    }
+    const main = byLink(functions, "__tx_thread_main");
+    if (target == "windows") {
+        // x86_64-windows 的进程入口与线程入口在内核里，是按平台约定调用、带帧事件的普通函数（PE 规范化 P3，同 aarch64-windows）：
+        // __tx_entry：sub rsp, 40；call __tx_native_entry；add rsp, 40；ret。
+        // __tx_thread_entry：push rbx；sub rsp, 32；call __tx_thread_main；xor eax, eax；add rsp, 32；pop rbx；ret。
+        let want = 1;
+        if (hasThreads) {
+            want = 2;
+        }
+        need(listLen(live) == want && hasStr(live, "__tx_entry") && textIs(special(functions, "__tx_entry"), "stack_model", "fixed-call")
+            && (!hasThreads || textIs(special(functions, "__tx_thread_entry"), "stack_model", "fixed-call")), "windows special functions")?;
+        for (n in live) {
+            const f = special(functions, n);
+            need(jvText(at(f, "object_index")) == "0" && !isNullOrMissing(at(f, "frame")) && count(at(f, "epilogues")) == 1, n + ": entry facts")?;
+        }
+        let f = special(functions, "__tx_entry");
+        let body = codeOf(image, f)?;
+        need(sliceIs(body, 0, [0x48, 0x83, 0xec, 0x28]) && (bytesGet(body, 4) ?? 0) == 0xe8 && tailIs(body, 9, [0x48, 0x83, 0xc4, 0x28, 0xc3]),
+            "__tx_entry bytes")?;
+        const native = byLink(functions, "__tx_native_entry");
+        if (native != None) {
+            need(vaOf(f)? + 4 + 5 + i32At(body, 5) == vaOf(native)?, "__tx_entry call target")?;
+        }
+        if (hasThreads) {
+            f = special(functions, "__tx_thread_entry");
+            body = codeOf(image, f)?;
+            need(main != None, "__tx_thread_main missing")?;
+            need(sliceIs(body, 0, [0x53, 0x48, 0x83, 0xec, 0x20]) && (bytesGet(body, 5) ?? 0) == 0xe8
+                && vaOf(f)? + 5 + 5 + i32At(body, 6) == vaOf(main)?, "__tx_thread_entry call")?;
+            need(tailIs(body, 10, [0x31, 0xc0, 0x48, 0x83, 0xc4, 0x20, 0x5b, 0xc3]) || tailIs(body, 10, [0x33, 0xc0, 0x48, 0x83, 0xc4, 0x20, 0x5b, 0xc3]),
+                "__tx_thread_entry tail")?;
+        }
+        return;
+    }
+    const wantNames: List<string> = listNew();
+    const wantModels: List<string> = listNew();
+    if (hasThreads) {
+        listPush(wantNames, "__tx_thread_entry");
+        listPush(wantModels, "thread-entry");
+    }
+    if (linux) {
+        listPush(wantNames, "_start");
+        listPush(wantModels, "process-entry");
+        if (hasThreads) {
+            listPush(wantNames, "__tx_thread_clone");
+            listPush(wantModels, "stack-transition");
+            listPush(wantNames, "__tx_thread_unmap_exit");
+            listPush(wantModels, "stack-disposal");
+        }
+    }
+    need(listLen(live) == listLen(wantNames), "special function set")?;
+    i = 0;
+    while (i < listLen(wantNames)) {
+        const n = listGet(wantNames, i) catch "";
+        need(hasStr(live, n) && textIs(special(functions, n), "stack_model", listGet(wantModels, i) catch ""), n + ": stack model")?;
+        i = i + 1;
+    }
+    for (n in live) {
+        const f = special(functions, n);
+        need(jvText(at(f, "object_index")) == "0" && isNull(at(f, "frame")) && isNull(at(f, "prologue_end_offset")) && count(at(f, "epilogues")) == 0
+            && arrayAt(f, "epilogues"), n + ": boundary facts")?;
+    }
+    if (target == "aarch64-linux") {
+        // bootstrap/selfhost/linux_a64.tx 的手写入口（号按 aarch64：exit_group 94、clone 220、munmap 215、exit 93）。
+        let f = special(functions, "_start");
+        let w = wordsOf(image, f)?;
+        const n = listLen(w);
+        // movz x29/x30, #0；ldr x0, [sp]；add x1, sp, #8 …… 取 TPIDR_EL0、为 0 时设成静态 TLS 块 …… bl __tx_native_entry；
+        // movz x8, #94；svc #0；brk #1。
+        need(wordsAre(w, 0, [0xD280001D, 0xD280001E, 0xF94003E0, 0x910023E1]) && wordsAre(w, n - 3, [0xD2800BC8, 0xD4000001, 0xD4200020]),
+            "_start words")?;
+        need(countWord(w, 0xD53BD050) == 1 && countWord(w, 0xD51BD050) == 1 && countWord(w, 0xD4000001) == 1, "_start TPIDR")?;
+        const native = byLink(functions, "__tx_native_entry");
+        need(native != None && a64CallTarget(f, w, n - 4)? == vaOf(native)?, "_start call")?;
+        if (hasThreads) {
+            f = special(functions, "__tx_thread_clone");
+            w = wordsOf(image, f)?;
+            // 实参按 x86_64 的次序收、交换 ctid 与 tls（x3↔x4）后 svc clone；父线程 cbz 不跳、ret；子线程清帧链、ldr x0, [sp]、
+            // bl __tx_thread_main（不返回）、brk。
+            need(listLen(w) == 12 && wordsAre(w, 0, [0xAA0303F0, 0xAA0403E3, 0xAA1003E4, 0xD2801B88, 0xD4000001, 0xB4000040, 0xD65F03C0]),
+                "__tx_thread_clone words")?;
+            need(wordsAre(w, 7, [0xD280001D, 0xD280001E, 0xF94003E0]) && wAt(w, 11) == 0xD4200020, "__tx_thread_clone child")?;
+            need(main != None && a64CallTarget(f, w, 10)? == vaOf(main)?, "__tx_thread_clone call")?;
+            // munmap(base, size) 后只用寄存器：movz x0, #0；exit；brk。
+            w = wordsOf(image, special(functions, "__tx_thread_unmap_exit"))?;
+            need(listLen(w) == 6 && wordsAre(w, 0, [0xD2801AE8, 0xD4000001, 0xD2800000, 0xD2800BA8, 0xD4000001, 0xD4200020]),
+                "__tx_thread_unmap_exit")?;
+        }
+    }
+    if (target == "loongarch64-linux") {
+        return la64Boundaries(functions, image, main, hasThreads);
+    }
+    if (target == "riscv64-linux") {
+        return rv64Boundaries(functions, image, main, hasThreads);
+    }
+    if (startsWithText(target, "aarch64-")) {
+        if (!hasThreads) {
+            return;
+        }
+        // stp x29, x30, [sp, #-32]!; mov x29, sp; str x19, [sp, #16]; bl __tx_thread_main; ldr x19, [sp, #16];
+        // ldp x29, x30, [sp], #32; movz x0, #0; ret
+        const f = special(functions, "__tx_thread_entry");
+        const body = codeOf(image, f)?;
+        need(main != None, "__tx_thread_main missing")?;
+        const w = words(body)?;
+        const call = wAt(w, 3);
+        need(bytesLen(body) == 32 && wordsAre(w, 0, [0xA9BE7BFD, 0x910003FD, 0xF9000BF3]) && (call >> 26) == 0x25, "__tx_thread_entry words")?;
+        need(vaOf(f)? + 12 + 4 * sext(call & 0x3FFFFFF, 26) == vaOf(main)?, "__tx_thread_entry call")?;
+        need(wordsAre(w, 4, [0xF9400BF3, 0xA8C27BFD, 0xD2800000, 0xD65F03C0]), "__tx_thread_entry tail")?;
+        return;
+    }
+    if (hasThreads) {
+        const f = special(functions, "__tx_thread_entry");
+        const body = codeOf(image, f)?;
+        need(main != None, "__tx_thread_main missing")?;
+        need(sliceIs(body, 0, [0x53]), "__tx_thread_entry push")?;
+        let p = 1;
+        if (x86Linux || target == "x86_64-macos") {
+            need(sliceIs(body, p, [0x48, 0x89, 0xf9]) || sliceIs(body, p, [0x48, 0x8b, 0xcf]), "__tx_thread_entry argument move")?;
+            p = p + 3;
+        }
+        let size = 7;
+        if (sliceIs(body, p, [0x48, 0x83])) {
+            size = 4;
+        }
+        frameBytes("allocate-stack", 4, 32, codeAt(body, p, size))?;
+        p = p + size;
+        need((bytesGet(body, p) ?? 0) == 0xe8 && vaOf(f)? + p + 5 + i32At(body, p + 1) == vaOf(main)?, "__tx_thread_entry call")?;
+        p = p + 5;
+        size = 7;
+        if (sliceIs(body, p, [0x48, 0x83])) {
+            size = 4;
+        }
+        frameBytes("release-stack", 4, 32, codeAt(body, p, size))?;
+        p = p + size;
+        need(tailIs(body, p, [0x5b, 0x31, 0xc0, 0xc3]) || tailIs(body, p, [0x5b, 0x33, 0xc0, 0xc3]), "__tx_thread_entry tail")?;
+    }
+    if (x86Linux) {
+        const root = codeOf(image, special(functions, "_start"))?;
+        need((sliceIs(root, 0, [0x31, 0xed]) || sliceIs(root, 0, [0x33, 0xed])) && sliceIs(root, 2, [0x48, 0x8b, 0x3c, 0x24]), "_start head")?;
+        // 以 exit_group 系统调用结束，其后 ud2（函数不落入下一个函数，按函数块取舍的前提）。
+        const rn = bytesLen(root);
+        need(tailIs(root, rn - 11, [0x89, 0xc7, 0xb8, 0xe7, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b])
+            || tailIs(root, rn - 11, [0x8b, 0xf8, 0xb8, 0xe7, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b]), "_start tail")?;
+        if (!hasThreads) {
+            return;
+        }
+        const clone = special(functions, "__tx_thread_clone");
+        const cb = codeOf(image, clone)?;
+        const cn = bytesLen(cb);
+        // b'\x0f\x05' 不重叠出现的次数（同 Python 的 bytes.count）。
+        let syscalls = 0;
+        let k = 0;
+        while (k + 1 < cn) {
+            if ((bytesGet(cb, k) ?? 0) == 0x0f && (bytesGet(cb, k + 1) ?? 0) == 0x05) {
+                syscalls = syscalls + 1;
+                k = k + 2;
+            } else {
+                k = k + 1;
+            }
+        }
+        need(syscalls == 1 && (bytesGet(cb, cn - 7) ?? 0) == 0xe8 && tailIs(cb, cn - 2, [0x0f, 0x0b]), "__tx_thread_clone bytes")?;
+        need(vaOf(clone)? + cn - 2 + i32At(cb, cn - 6) == vaOf(main)?, "__tx_thread_clone call")?;
+        const disposal = codeOf(image, special(functions, "__tx_thread_unmap_exit"))?;
+        need(bytesLen(disposal) == 24 && sliceIs(disposal, 6, [0xb8, 0x0b, 0, 0, 0, 0x0f, 0x05]), "__tx_thread_unmap_exit munmap")?;
+        need((sliceIs(disposal, 13, [0x31, 0xff]) || sliceIs(disposal, 13, [0x33, 0xff])) && tailIs(disposal, 15, [0xb8, 0x3c, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b]),
+            "__tx_thread_unmap_exit exit")?;
+    }
+}
+
+function la64Call(f: Ref<Jv>?, w: List<int>, k: int): int | Error {
+    const x = wAt(w, k);
+    need((x & 0xFC000000) == 0x54000000, "la64 bl expected")?;
+    const off = ((x >> 10) & 0xFFFF) | ((x & 0x3FF) << 16);
+    return vaOf(f)? + 4 * k + 4 * sext(off, 26);
+}
+
+// bootstrap/selfhost/linux_la64.tx 与 nrt_spawn.tx 的手写入口（号按 loongarch64：exit_group 94、clone 220、munmap 215、exit 93）。
+// move 即 or rd, rj, zero；ret 即 jirl zero, ra, 0；syscall 0；break 1。
+function la64Boundaries(functions: Ref<Jv>?, image: Bytes, main: Ref<Jv>?, hasThreads: bool): void | Error {
+    const native = byLink(functions, "__tx_native_entry");
+    need(native != None, "__tx_native_entry missing")?;
+    let f = special(functions, "_start");
+    let w = wordsOf(image, f)?;
+    // fp＝0、ra＝0；ld.d a0, [sp]；addi.d a1, sp, 8；slli.d t0, a0, 3；add.d a2, a1, t0；addi.d a2, a2, 8；经 t7 存 envp；
+    // bnez tp 跳过下两条（静态产物设 tp）；bl __tx_native_entry；exit_group；break。
+    need(listLen(w) == 16 && wordsAre(w, 0, [0x00150016, 0x00150001, 0x28C00064, 0x02C02065, 0x00410C8C, 0x0010B0A6, 0x02C020C6]), "_start head")?;
+    need((wAt(w, 7) & 0xFE00001F) == 0x1A000013 && (wAt(w, 8) & 0xFFC003FF) == 0x29C00266, "_start envp")?;
+    need(wAt(w, 9) == 0x44000C40 && (wAt(w, 10) & 0xFE00001F) == 0x1A000002 && (wAt(w, 11) & 0xFFC003FF) == 0x02C00042, "_start tls")?;
+    need(wordsAre(w, 13, [0x02C1780B, 0x002B0000, 0x002A0001]) && la64Call(f, w, 12)? == vaOf(native)?, "_start tail")?;
+    if (!hasThreads) {
+        return;
+    }
+    need(main != None, "__tx_thread_main missing")?;
+    f = special(functions, "__tx_thread_clone");
+    w = wordsOf(image, f)?;
+    // 实参原样 syscall clone；父线程 beqz 不跳、ret；子线程清帧链、ld.d a0, [sp]、bl __tx_thread_main（不返回）、break。
+    need(listLen(w) == 9 && wordsAre(w, 0, [0x02C3700B, 0x002B0000, 0x40000880, 0x4C000020, 0x00150016, 0x00150001, 0x28C00064]),
+        "__tx_thread_clone words")?;
+    need(wAt(w, 8) == 0x002A0001 && la64Call(f, w, 7)? == vaOf(main)?, "__tx_thread_clone call")?;
+    // munmap(base, size) 后只用寄存器：a0＝0；exit；break。
+    w = wordsOf(image, special(functions, "__tx_thread_unmap_exit"))?;
+    need(listLen(w) == 6 && wordsAre(w, 0, [0x02C35C0B, 0x002B0000, 0x02C00004, 0x02C1740B, 0x002B0000, 0x002A0001]), "__tx_thread_unmap_exit")?;
+    // addi.d sp, sp, -32；st.d ra, [sp+24]；st.d fp, [sp+16]；addi.d fp, sp, 32（进入时的 sp）；st.d s0, [sp+8]；bl __tx_thread_main；
+    // ld.d s0、fp、ra；addi.d sp, sp, 32；a0＝0；ret。
+    f = special(functions, "__tx_thread_entry");
+    w = wordsOf(image, f)?;
+    need(listLen(w) == 12 && wordsAre(w, 0, [0x02FF8063, 0x29C06061, 0x29C04076, 0x02C08076, 0x29C02077]), "__tx_thread_entry head")?;
+    need(la64Call(f, w, 5)? == vaOf(main)?, "__tx_thread_entry call")?;
+    need(wordsAre(w, 6, [0x28C02077, 0x28C04076, 0x28C06061, 0x02C08063, 0x02C00004, 0x4C000020]), "__tx_thread_entry tail")?;
+}
+
+function rv64Call(f: Ref<Jv>?, w: List<int>, k: int): int | Error {
+    // auipc ra；jalr ra, lo(ra)。
+    need((wAt(w, k) & 0xFFF) == 0x097 && (wAt(w, k + 1) & 0xFFFFF) == 0x080E7, "rv64 call expected")?;
+    const hi = sext32(wAt(w, k) & 0xFFFFF000);
+    return vaOf(f)? + 4 * k + hi + rv64I12(wAt(w, k + 1));
+}
+
+// bootstrap/selfhost/linux_rv64.tx 与 nrt_spawn.tx 的手写入口（号按 riscv64：exit_group 94、clone 220、munmap 215、exit 93）。
+// mv 即 addi rd, rs, 0；ret 即 jalr zero, 0(ra)；调用为 auipc ra＋jalr ra（R_RISCV_CALL_PLT）；ecall；ebreak。期望的字由 GNU as 2.42
+// 汇编核对。
+function rv64Boundaries(functions: Ref<Jv>?, image: Bytes, main: Ref<Jv>?, hasThreads: bool): void | Error {
+    const native = byLink(functions, "__tx_native_entry");
+    need(native != None, "__tx_native_entry missing")?;
+    let f = special(functions, "_start");
+    let w = wordsOf(image, f)?;
+    // s0＝0、ra＝0；ld a0, 0(sp)；addi a1, sp, 8；slli t0, a0, 3；add a2, a1, t0；addi a2, a2, 8；经 t5 存 envp；读 __tx_dynamic_image 进
+    // t0，不为 0 跳过下两条（静态产物设 tp）；call __tx_native_entry；exit_group；ebreak。
+    need(listLen(w) == 19 && wordsAre(w, 0, [0x00000413, 0x00000093, 0x00013503, 0x00810593, 0x00351293, 0x00558633, 0x00860613]), "_start head")?;
+    need((wAt(w, 7) & 0xFFF) == 0xF17 && (wAt(w, 8) & 0x01FFF07F) == 0x00CF3023, "_start envp")?;
+    need((wAt(w, 9) & 0xFFF) == 0x297 && (wAt(w, 10) & 0xFFFFF) == 0x2B283 && wAt(w, 11) == 0x00029663, "_start dynamic")?;
+    need((wAt(w, 12) & 0xFFF) == 0x217 && (wAt(w, 13) & 0xFFFFF) == 0x20213, "_start tls")?;
+    need(wordsAre(w, 16, [0x05E00893, 0x00000073, 0x00100073]) && rv64Call(f, w, 14)? == vaOf(native)?, "_start tail")?;
+    if (!hasThreads) {
+        return;
+    }
+    need(main != None, "__tx_thread_main missing")?;
+    f = special(functions, "__tx_thread_clone");
+    w = wordsOf(image, f)?;
+    // 实参按 x86_64 的次序收、交换 ctid 与 tls（a3↔a4，经 t5）后 ecall clone；父线程 beqz 不跳、ret；子线程清帧链、ld a0, 0(sp)、
+    // call __tx_thread_main（不返回）、ebreak。
+    need(listLen(w) == 13 && wordsAre(w, 0, [0x00068F13, 0x00070693, 0x000F0713, 0x0DC00893, 0x00000073, 0x00050463, 0x00008067]),
+        "__tx_thread_clone words")?;
+    need(wordsAre(w, 7, [0x00000413, 0x00000093, 0x00013503]) && wAt(w, 12) == 0x00100073, "__tx_thread_clone child")?;
+    need(rv64Call(f, w, 10)? == vaOf(main)?, "__tx_thread_clone call")?;
+    // munmap(base, size) 后只用寄存器：a0＝0；exit；ebreak。
+    w = wordsOf(image, special(functions, "__tx_thread_unmap_exit"))?;
+    need(listLen(w) == 6 && wordsAre(w, 0, [0x0D700893, 0x00000073, 0x00000513, 0x05D00893, 0x00000073, 0x00100073]), "__tx_thread_unmap_exit")?;
+    // addi sp, sp, -32；sd ra, 24(sp)；sd s0, 16(sp)；addi s0, sp, 32（进入时的 sp）；sd s1, 8(sp)；call __tx_thread_main；
+    // ld s1、s0、ra；addi sp, sp, 32；a0＝0；ret。
+    f = special(functions, "__tx_thread_entry");
+    w = wordsOf(image, f)?;
+    need(listLen(w) == 13 && wordsAre(w, 0, [0xFE010113, 0x00113C23, 0x00813823, 0x02010413, 0x00913423]), "__tx_thread_entry head")?;
+    need(rv64Call(f, w, 5)? == vaOf(main)?, "__tx_thread_entry call")?;
+    need(wordsAre(w, 7, [0x00813483, 0x01013403, 0x01813083, 0x02010113, 0x00000513, 0x00008067]), "__tx_thread_entry tail")?;
+}

@@ -1,0 +1,180 @@
+// 去掉某些系统调用再运行一个程序（Linux x86_64、aarch64）：装一个 seccomp 过滤器，
+// 让指名的系统调用得 ENOSYS（gVisor 一类沙箱与某些容器的 seccomp 配置即如此），再起命令。过滤器由子进程继承，命令起的产物同样看不到
+// 这些调用。门里用它复现“waitid 不可用时 procWait 退回 wait4 并按组补杀”（toolchain-contract 的 wait-nopeek）；开发时可用来先验
+// 新用到的系统调用在沙箱里缺席时的退路。
+//
+// 太虚没有 execve 的封装，命令在子进程里跑——stdout 原样转发，stderr 按文本转发，退出码照传（被信号结束时为
+// 128＋信号号，同 shell）。过滤程序须以地址交给内核（struct sock_fprog 里的指针），而太虚取不到缓冲区的地址：先用 mmap 取一块地址
+// 已知的匿名内存，经管道把过滤程序写进去，再把这个地址填进 sock_fprog。
+//
+// 用法（工具链构建后运行）：run_without_syscall <名字|号>[,<名字|号>...] -- <程序> [实参...]
+import { captureRaw } from "./test_lib";
+
+declare function lxMmap(addr: int, size: int, prot: int, flags: int, fd: int, off: int): int from syscall "mmap";
+declare function lxPipe2(fds: Bytes, flags: int): int from syscall "pipe2";
+declare function lxWrite(fd: int, data: Bytes, n: int): int from syscall "write";
+declare function lxReadTo(fd: int, addr: int, n: int): int from syscall "read";
+declare function lxClose(fd: int): int from syscall "close";
+declare function lxPrctl(option: int, a2: int, a3: int, a4: int, a5: int): int from syscall "prctl";
+declare function lxPrctlFilter(option: int, mode: int, prog: Bytes, a4: int, a5: int): int from syscall "prctl";
+
+const PR_SET_NO_NEW_PRIVS: int = 38;
+const PR_SET_SECCOMP: int = 22;
+const SECCOMP_MODE_FILTER: int = 2;
+const SECCOMP_RET_ALLOW: int = 0x7FFF0000;
+const SECCOMP_RET_ERRNO: int = 0x00050000;
+const ENOSYS: int = 38;
+const BPF_LD_W_ABS: int = 0x20;
+const BPF_JEQ_K: int = 0x15;
+const BPF_RET_K: int = 0x06;
+const USAGE: string = "用法：run_without_syscall <名字|号>[,<名字|号>...] -- <程序> [实参...]（Linux x86_64、aarch64）";
+
+// 宿主架构的 seccomp AUDIT_ARCH；不支持为 −1。
+function auditArch(): int {
+    if (hostArch() == "x86_64") {
+        return 0xC000003E;
+    }
+    if (hostArch() == "aarch64") {
+        return 0xC00000B7;
+    }
+    return -1;
+}
+
+// 名字 → 宿主架构的号（取自 Linux 的 syscall_64.tbl 与通用表，同编译器的号表；只收用到的）；十进制数原样；认不得为 −1。
+function numberOf(name: string): int {
+    let n = 0;
+    let i = 0;
+    while (i < len(name)) {
+        const c = byteAt(name, i) ?? 0;
+        if (c < 48 || c > 57) {
+            n = -1;
+            break;
+        }
+        n = n * 10 + (c - 48);
+        i = i + 1;
+    }
+    if (len(name) > 0 && n >= 0) {
+        return n;
+    }
+    const x86 = hostArch() == "x86_64";
+    if (name == "waitid") {
+        if (x86) {
+            return 247;
+        }
+        return 95;
+    }
+    if (name == "process_vm_readv") {
+        if (x86) {
+            return 310;
+        }
+        return 270;
+    }
+    return -1;
+}
+
+function insn(out: Bytes, code: int, jt: int, jf: int, k: int): void {
+    bytesPush(out, code & 255);
+    bytesPush(out, (code >> 8) & 255);
+    bytesPush(out, jt);
+    bytesPush(out, jf);
+    bytesPush(out, k & 255);
+    bytesPush(out, (k >> 8) & 255);
+    bytesPush(out, (k >> 16) & 255);
+    bytesPush(out, (k >> 24) & 255);
+}
+
+// 架构不是宿主的 → 放行；号在 nrs 里 → ENOSYS；其余放行。
+function program(arch: int, nrs: List<int>): Bytes {
+    const out = bytesNew(0);
+    insn(out, BPF_LD_W_ABS, 0, 0, 4);
+    insn(out, BPF_JEQ_K, 1, 0, arch);
+    insn(out, BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW);
+    insn(out, BPF_LD_W_ABS, 0, 0, 0);
+    let i = 0;
+    while (i < listLen(nrs)) {
+        // 相等 → 越过余下的比较与放行，落到 ENOSYS。
+        insn(out, BPF_JEQ_K, listLen(nrs) - i, 0, listGet(nrs, i) catch 0);
+        i = i + 1;
+    }
+    insn(out, BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW);
+    insn(out, BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO | ENOSYS);
+    return out;
+}
+
+// 把过滤程序装进本进程；失败得原因。
+function install(code: Bytes): string {
+    const n = bytesLen(code);
+    const addr = lxMmap(0, 4096, 3, 0x22, -1, 0);
+    if (addr < 0 && addr > -4096) {
+        return "mmap failed: errno " + toStr(-addr);
+    }
+    const fds = bytesNew(8);
+    if (lxPipe2(fds, 0) != 0) {
+        return "pipe2 failed";
+    }
+    const r = (bytesGetLE<i32>(fds, 0) ?? 0) as int;
+    const w = (bytesGetLE<i32>(fds, 4) ?? 0) as int;
+    const wrote = lxWrite(w, code, n);
+    const got = lxReadTo(r, addr, n);
+    const c1 = lxClose(r);
+    const c2 = lxClose(w);
+    if (wrote != n || got != n) {
+        return "copying the filter failed";
+    }
+    const fprog = bytesNew(16);
+    bytesSetLE<u16>(fprog, 0, (n / 8) as u16);
+    bytesSetLE<u64>(fprog, 8, addr as u64);
+    const a = lxPrctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    if (a != 0) {
+        return "prctl(NO_NEW_PRIVS) failed: errno " + toStr(-a);
+    }
+    const b = lxPrctlFilter(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, fprog, 0, 0);
+    if (b != 0) {
+        return "prctl(SECCOMP) failed: errno " + toStr(-b);
+    }
+    return "";
+}
+
+function main(args: []string): int {
+    const arch = auditArch();
+    if (hostTarget() != "linux" || arch < 0 || len(args) < 3 || args[1] != "--") {
+        eprint(USAGE);
+        return 64;
+    }
+    const nrs: List<int> = listNew();
+    for (name in strSplit(args[0], ",")) {
+        const nr = numberOf(name);
+        if (nr < 0) {
+            eprint(USAGE);
+            return 64;
+        }
+        listPush(nrs, nr);
+    }
+    const problem = install(program(arch, nrs));
+    if (len(problem) > 0) {
+        eprint(problem);
+        return 3;
+    }
+    const rest: List<string> = listNew();
+    let i = 3;
+    while (i < len(args)) {
+        listPush(rest, args[i]);
+        i = i + 1;
+    }
+    const r = captureRaw(args[2], rest, "", 86400000000000, 10000000000, 1073741824) catch (e) {
+        eprint(e.message);
+        return 127;
+    };
+    const w = stdoutWrite(r.out);
+    if (bytesLen(r.err) > 0) {
+        let n = bytesLen(r.err);
+        if ((bytesGet(r.err, n - 1) ?? 0) == 10) {
+            n = n - 1;
+        }
+        eprint(bytesToStr(bytesSlice(r.err, 0, n)) catch "<stderr 不是 UTF-8>");
+    }
+    if (r.code < 0) {
+        return 128 - r.code;
+    }
+    return r.code;
+}

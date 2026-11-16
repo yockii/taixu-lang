@@ -1,0 +1,1238 @@
+// 原生 `taixu mcp` 的端到端检查。设计：§六。
+//
+// 以 stdio 起 `taixu mcp`（一行一个 JSON-RPC 消息），给它私有的临时目录（TMP、TEMP、TMPDIR，以便看住它写的调试产物），核对：
+// - 五个 debug_* 场景：tools/list 列出八个调试工具、JSON Schema 2020-12，server/discover 列出 debug_kill；完整会话（会话 "1"、ready、
+//   breakpoint_set、以 breakpoint 停在 main、模块状态槽按 ref 查看、stops、kill，之后为未知会话）；5000 行洪泛（exited 照样到达、
+//   events_truncated、JSON 有效）；idle_timeout_s 1（1.2 s 后会话未知）。缺省的 301 s 空闲与 1800 s 寿命上限不跑（要 30 分钟；
+//   两者与 1 s 空闲走同一个到期检查）；
+// - 每行回复都是有效 JSON（严格：没有 NaN、没有重名键），含带 $schema 的十二个 inputSchema 的 tools/list；
+// - JSON-RPC：解析错误与非对象请求回 −32600／−32700、id 为 null，未知方法 −32601，通知与空行不回，字符串／整数／小数／布尔／null
+//   的 id 原样回；initialize 带 serverInfo.version；
+// - tools/call 分派：请求形态不对与未知工具名是 JSON-RPC 错误；工具实参校验失败是只有文本的 isError 结果（没有 structuredContent）；
+//   未知工具名先于实参检查；
+// - compile：原生字节码的大小与 SHA-256 与参照探针一致；不要求 main；诊断、缺文件、导入失败与常驻服务上的成功／失败／成功；
+//   compile 从不写产物；
+// - run／test：与 CLI 一致、实参与非零退出、编译失败、含编译的超时、空 stdin、逐个测试隔离与超时的测试名、有界的 UTF-8 输出保留两端，
+//   以及常驻服务上混用的构建形态；
+// - 断点：debug_start 逐条回执（未知模块与形态不对的条目为 error 事件），未知模块上的 debug_breakpoint 回 error 事件、会话继续；
+// - 对死循环调用 debug_step（timeout_s 1）以 exited 码 3、reason timeout 结束，之后会话不在；
+// - events_truncated 只出现在洪泛的那次回复上；
+// - 失败带 isError，成功不带；
+// - 服务等输入时照样清扫空闲会话（不发请求，调试产物即被删除）；
+// - 带着活会话读到输入流尾时退出 0 并删产物；两个会话并行；
+// - 超过 16 MiB 的一行使服务以 3 结束，stderr 有 `taixu mcp: MessageTooLong`。
+//
+// 客户端是 test_proto.tx：回复用独立的 test_json.tx 解析（不与服务端共用 json_parse.tx），输入流尾经 procCloseStream（D3 v0.54）。
+// 取不到的字段记该项 FAIL、该场景余下各项照跑；FAIL 行的细节是 JSON 原文。
+//
+// 运行（仓根）：taixu run --toolchain scripts/test_mcp_e2e.tx --compiler <原生 taixu> [场景…]
+// 任何 FAIL 时退出码 1。
+import { absolute, deleteTree, exeName, join, kindOf, nat, onWindows, readBytes, startsWith, words } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { mtimeOf } from "./mtime_os";
+import { captureRaw } from "./test_lib";
+import { contains, endsWith, headChars, sorted, strip } from "./test_text";
+import { hexOf, lossyText, sha256Of } from "./check_lib";
+import { J_ARR, J_BOOL, J_NULL, J_OBJ, J_STR, Jv, jAt, jDump, jEq, jGet, jInt, jIsBool, jIsTrue, jLen, jNull, jObject, jParse, jParseUnique, jQuote,
+    jText } from "./test_json";
+import { at, dump, eqJson, falseAt, fieldsOf, has, intIs, isArr, isObj, item, listText, sameAt, sameJv, textIs, textOf, trueAt, truthy } from "./test_jv";
+import { MODE_LINES, Peer, nap, peerClose, peerExited, peerFinish, peerIdle, peerPump, peerSend, peerStart } from "./test_proto";
+import { Mcp, Res, TIMEOUT_MS, badHead, byteText, call, callRid, eText, errIs, errNone, finish, hardTimeout, idMatches, idsValid, isE, mcpOpen, notE,
+    parseStrict, raw, res, rpcErr, rpcErrIs, send, session, show, sid, takeId, tool, waitId } from "./test_mcp_client";
+
+const SEC: int = 1000000000;
+const MAX_OUTPUT: int = 1073741824;
+const TOOLS: string = "compile run test disasm debug_start debug_breakpoint debug_step debug_continue debug_frames debug_inspect debug_stops debug_kill";
+const UNKNOWN_SESSION: string = "未知会话（已退出、被 kill 或超时清扫）";
+const DIED: string = "调试子进程已退出";
+const TIMEOUT_PARAM: string = "timeout_ms 需要 1..60000 的整数（启动配置上限）";
+const SCENARIOS: string = "list session flood idle jsonrpc compile run run-output test modes disasm breaks step golden budget eof long";
+const BASIC_TX: string = "let g: int = 7;\n\nfunction twice(x: int): int {\n    const y = x * 2;\n    return y;\n}\n\nexport function main(args: []string): int {\n    let a: int = 1;\n    let b: int = twice(a);\n    print(\"b=\" + toStr(b));\n    a = a + b;\n    return a + g;\n}\n";
+const FLOOD_TX: string = "function mark(): int {\n    return 1;\n}\n\nexport function main(args: []string): int {\n    let i: int = 0;\n    while (i < 5000) {\n        print(\"line \" + toStr(i));\n        i = i + 1;\n    }\n    const m = mark();\n    print(\"after\");\n    return m;\n}\n";
+const SPIN_TX: string = "function spin(): int {\n    let i: int = 0;\n    while (true) {\n        i = i + 1;\n    }\n    return i;\n}\n\nexport function main(args: []string): int {\n    const x = spin();\n    return x;\n}\n";
+
+struct Ctx {
+    exe: string,
+    root: string,
+    tmp: string,
+    prod: string,
+    fails: int,
+    total: int,
+}
+
+// ---------------------------------------------------------------- 逐项输出
+
+// 逐项输出 'PASS  标签' 或 'FAIL  %-28s %s'（标签按字符补到 28，细节至多 400 字符）。
+function check(c: Ref<Ctx>, label: string, ok: bool, detail: string): bool {
+    c.total = c.total + 1;
+    if (ok) {
+        print("PASS  " + label);
+    } else {
+        c.fails = c.fails + 1;
+        print("FAIL  " + padChars(label, 28) + " " + headChars(detail, 400));
+    }
+    return ok;
+}
+
+function padChars(s: string, w: int): string {
+    let n = 0;
+    let i = 0;
+    while (i < len(s)) {
+        if (((byteAt(s, i) ?? 0) & 0xC0) != 0x80) {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    let t = s;
+    while (n < w) {
+        t = t + " ";
+        n = n + 1;
+    }
+    return t;
+}
+
+// ---------------------------------------------------------------- JSON 取值
+
+// 值是 JSON 整数且不小于 0（Python 的 type(x) is int and x >= 0）。
+function natAt(v: Ref<Jv>?, key: string): bool {
+    const n = jInt(at(v, key));
+    return n != None && (n ?? -1) >= 0;
+}
+
+function lenAt(v: Ref<Jv>?, key: string): int {
+    const x = at(v, key);
+    if (!isArr(x)) {
+        return -1;
+    }
+    return jLen(x ?? jNull());
+}
+
+function parseLoose(text: string): Ref<Jv>? {
+    const v = jParse(text) catch (e) {
+        return None;
+    };
+    return v;
+}
+
+// ---------------------------------------------------------------- MCP 客户端（test_mcp_client.tx）
+
+// 以 TMP、TEMP、TMPDIR 指向 prod 起服务（test_mcp_client.tx 的 mcpOpen）。
+function mcpStart(c: Ref<Ctx>, requestTimeoutMs: string): Ref<Mcp> | Error {
+    const args: List<string> = listNew();
+    listPush(args, "--trust-workspace");
+    listPush(args, "--request-timeout-ms");
+    listPush(args, requestTimeoutMs);
+    return mcpOpen(c.exe, c.tmp, c.prod, args);
+}
+
+function start(c: Ref<Ctx>): Ref<Mcp> | Error {
+    return mcpStart(c, "60000");
+}
+
+// ---------------------------------------------------------------- 文件与子进程
+
+function path(c: Ref<Ctx>, name: string): string {
+    return nat(join(c.tmp, name));
+}
+
+function write(c: Ref<Ctx>, name: string, text: string): void {
+    writeFile(path(c, name), text) catch (e) {
+        eprint("写不了 " + name + "：" + e.message);
+    };
+}
+
+function dirNames(p: string): List<string> {
+    const xs = listDir(p) catch (e) {
+        const none: List<string> = listNew();
+        return none;
+    };
+    return xs;
+}
+
+// prod 下 taixu-mcp-worker-*/p-* 的文件（服务的调试产物），排序。
+function products(prod: string): List<string> {
+    const out: List<string> = listNew();
+    for (w in dirNames(prod)) {
+        const wd = nat(join(prod, w));
+        if (startsWith(w, "taixu-mcp-worker-") && entryKind(wd) == 2) {
+            for (f in dirNames(wd)) {
+                if (startsWith(f, "p-") && entryKind(nat(join(wd, f))) == 1) {
+                    listPush(out, nat(join(w, f)));
+                }
+            }
+        }
+    }
+    return sorted(out);
+}
+
+// 至多 sec 秒内 f 成立：服务在时以它的输出为计时（同时照收消息），不在时忙等短间隔。
+function waitPeer(p: Ref<Peer>, f: () => bool, sec: int): bool {
+    const end = monoNs() + sec * SEC;
+    while (monoNs() < end) {
+        if (f()) {
+            return true;
+        }
+        peerIdle(p, 50);
+    }
+    return f();
+}
+
+function waitNap(f: () => bool, sec: int): bool {
+    const end = monoNs() + sec * SEC;
+    while (monoNs() < end) {
+        if (f()) {
+            return true;
+        }
+        nap(50);
+    }
+    return f();
+}
+
+struct Ran {
+    code: int,
+    out: Bytes,
+    err: Bytes,
+}
+
+function runCli(exe: string, args: List<string>, cwd: string, limitSec: int): Ref<Ran> {
+    const r = captureRaw(exe, args, cwd, limitSec * SEC, 10 * SEC, MAX_OUTPUT) catch (e) {
+        return new Ran { code: -1000, out: bytesNew(0), err: bytesFromStr(e.message) };
+    };
+    return new Ran { code: r.code, out: r.out, err: r.err };
+}
+
+function lst(xs: []string): List<string> {
+    const out: List<string> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+    }
+    return out;
+}
+
+function cat(a: List<string>, b: List<string>): List<string> {
+    const out: List<string> = listNew();
+    for (x in a) {
+        listPush(out, x);
+    }
+    for (x in b) {
+        listPush(out, x);
+    }
+    return out;
+}
+
+function sameBytes(a: Bytes, b: Bytes): bool {
+    if (bytesLen(a) != bytesLen(b)) {
+        return false;
+    }
+    let i = 0;
+    while (i < bytesLen(a)) {
+        if ((bytesGet(a, i) ?? 0) != (bytesGet(b, i) ?? 1)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function shaHex(b: Bytes): string {
+    return hexOf(sha256Of(b, 0, bytesLen(b)));
+}
+
+// tmp 下的全部文件（withDirs 时连同目录与修改时间）：每项 "相对路径 内容的 SHA-256（目录写 dir）[ 修改时间]"，排序。
+function snapshot(c: Ref<Ctx>, withDirs: bool): List<string> {
+    const out: List<string> = listNew();
+    walk(c.tmp, "", withDirs, out);
+    return sorted(out);
+}
+
+function walk(base: string, rel: string, withDirs: bool, out: List<string>): void {
+    for (n in dirNames(base)) {
+        const full = nat(join(base, n));
+        let r = n;
+        if (len(rel) > 0) {
+            r = rel + "/" + n;
+        }
+        const k = entryKind(full);
+        if (k == 2) {
+            if (withDirs) {
+                listPush(out, r + " dir " + toStr(mtimeOf(full)));
+            }
+            walk(full, r, withDirs, out);
+        } else if (k == 1) {
+            listPush(out, fileEntry(full, r, withDirs));
+        }
+    }
+}
+
+function fileEntry(full: string, r: string, withDirs: bool): string {
+    const b = readBytes(full) catch (e) {
+        return r + " unreadable";
+    };
+    let entry = r + " " + shaHex(b);
+    if (withDirs) {
+        entry = entry + " " + toStr(mtimeOf(full));
+    }
+    return entry;
+}
+
+function sameList(a: List<string>, b: List<string>): bool {
+    if (listLen(a) != listLen(b)) {
+        return false;
+    }
+    let i = 0;
+    while (i < listLen(a)) {
+        if ((listGet(a, i) catch "") != (listGet(b, i) catch "")) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- 场景
+
+function scList(c: Ref<Ctx>): void | Error {
+    const m = start(c)?;
+    const r = call(m, "tools/list", "");
+    const tools = at(at(r, "result"), "tools");
+    const got = fieldsOf(tools, "name");
+    check(c, "list:names", got == TOOLS, got);
+    let schemaOk = listLen(m.p.bad) == 0;
+    let i = 0;
+    while (i < lenAt(at(r, "result"), "tools")) {
+        const s = at(item(tools, i), "inputSchema");
+        if (!isObj(s) || !contains(textOf(s, "$schema"), "2020-12") || !textIs(s, "type", "object")) {
+            schemaOk = false;
+        }
+        i = i + 1;
+    }
+    let detail = badHead(m);
+    if (listLen(m.p.bad) == 0) {
+        detail = dump(item(tools, 0));
+    }
+    check(c, "list:schema", schemaOk, detail);
+    const d = call(m, "server/discover", "");
+    const listed = at(at(d, "result"), "tools");
+    let joined = "";
+    let k = 0;
+    let hasKill = false;
+    while (k < lenAt(at(d, "result"), "tools")) {
+        const name = jText(item(listed, k)) ?? "None";
+        if (k > 0) {
+            joined = joined + " ";
+        }
+        joined = joined + name;
+        if (name == "debug_kill") {
+            hasKill = true;
+        }
+        k = k + 1;
+    }
+    check(c, "list:discover", hasKill && joined == TOOLS, dump(d));
+    check(c, "list:exit0", finish(m) == 0, "");
+}
+
+function scSession(c: Ref<Ctx>): void | Error {
+    const m = start(c)?;
+    const reference = tool(m, "compile", "{\"path\": \"basic.tx\"}").sc;
+    let r = tool(m, "debug_start", "{\"path\": \"basic.tx\", \"breakpoints\": [{\"module\": \"basic.tx\", \"line\": 4}, {\"fn\": \"main\"}]}");
+    check(c, "session:start", r.sc != None && textIs(r.sc, "session", session(m, 1)) && idsValid(m) && textIs(at(r.sc, "start"), "event", "ready")
+        && fieldsOf(at(r.sc, "breakpoints"), "event") == "breakpoint_set breakpoint_fn" && notE(r), show(r));
+    r = tool(m, "debug_continue", sid(m, 1));
+    check(c, "session:stopped", r.sc != None && textIs(r.sc, "event", "stopped") && textIs(r.sc, "fn", "main") && textIs(r.sc, "reason", "breakpoint"),
+        show(r));
+    r = tool(m, "compile", "{\"path\": \"basic.tx\"}");
+    check(c, "session:compile-while-paused", r.sc != None && trueAt(r.sc, "ok") && notE(r) && errNone(r) && sameAt(r.sc, reference, "txc_sha256"),
+        show(r));
+    r = tool(m, "debug_frames", sid(m, 1));
+    check(c, "session:frames", r.sc != None && textIs(r.sc, "event", "frames") && textIs(item(at(r.sc, "frames"), 0), "fn", "main"), show(r));
+    r = tool(m, "debug_inspect", "{\"session\": " + jQuote(session(m, 1)) + ", \"frame\": 0, \"slot\": 0}");
+    check(c, "session:inspect", r.sc != None && textIs(r.sc, "event", "inspect") && textIs(at(r.sc, "value"), "tag", "ref"), show(r));
+    r = tool(m, "debug_continue", sid(m, 1));
+    check(c, "session:stopped-twice", r.sc != None && textIs(r.sc, "event", "stopped") && textIs(r.sc, "fn", "twice"), show(r));
+    r = tool(m, "debug_stops", sid(m, 1));
+    check(c, "session:stops", r.sc != None && lenAt(r.sc, "stops") == 2, show(r));
+    r = tool(m, "debug_nope", sid(m, 1));
+    check(c, "session:unknown-tool", rpcErrIs(r, -32602, "Unknown tool: debug_nope"), show(r));
+    r = tool(m, "debug_kill", sid(m, 1));
+    check(c, "session:kill", r.sc != None && trueAt(r.sc, "killed") && textIs(at(r.sc, "exited"), "reason", "kill") && notE(r), show(r));
+    r = tool(m, "debug_frames", sid(m, 1));
+    check(c, "session:gone", r.sc != None && textIs(r.sc, "error", UNKNOWN_SESSION) && isE(r), show(r));
+    const prod = c.prod;
+    check(c, "session:products-deleted", waitPeer(m.p, (): bool => listLen(products(prod)) == 0, 10), listText(products(prod)));
+    check(c, "session:valid-json", listLen(m.p.bad) == 0, badHead(m));
+    check(c, "session:exit0", finish(m) == 0, "");
+}
+
+function scFlood(c: Ref<Ctx>): void | Error {
+    const m = start(c)?;
+    let r = tool(m, "debug_start", "{\"path\": \"flood.tx\", \"breakpoints\": [{\"fn\": \"mark\"}]}");
+    check(c, "flood:start", r.sc != None && textIs(at(r.sc, "start"), "event", "ready"), show(r));
+    r = tool(m, "debug_continue", sid(m, 1));
+    const evs = at(r.sc, "events");
+    let n = lenAt(r.sc, "events");
+    if (n < 0) {
+        n = 0;
+    }
+    check(c, "flood:truncated", r.sc != None && textIs(r.sc, "event", "stopped") && textIs(r.sc, "fn", "mark") && trueAt(r.sc, "events_truncated")
+        && n == 4095 && textIs(item(evs, -1), "text", "line 4999"), "(" + toStr(n) + ", " + textOf(r.sc, "event") + ")");
+    r = tool(m, "debug_continue", sid(m, 1));
+    check(c, "flood:reset", r.sc != None && textIs(r.sc, "event", "exited") && intIs(r.sc, "code", 1) && !has(r.sc, "events_truncated")
+        && eqJson(at(r.sc, "events"), "[{\"event\": \"stdout\", \"text\": \"after\"}]"), show(r));
+    check(c, "flood:valid-json", listLen(m.p.bad) == 0, badHead(m));
+    check(c, "flood:exit0", finish(m) == 0, "");
+}
+
+function scIdle(c: Ref<Ctx>): void | Error {
+    const m = start(c)?;
+    let r = tool(m, "debug_start", "{\"path\": \"basic.tx\", \"idle_timeout_s\": 1}");
+    check(c, "idle:start", r.sc != None && textIs(r.sc, "session", session(m, 1)), show(r));
+    peerIdle(m.p, 1200);
+    r = tool(m, "debug_stops", sid(m, 1));
+    check(c, "idle:swept", r.sc != None && textIs(r.sc, "error", UNKNOWN_SESSION), show(r));
+    // 不发请求：等输入时到点清扫，产物随之删除。
+    r = tool(m, "debug_start", "{\"path\": \"idle.tx\", \"idle_timeout_s\": 1}");
+    const prod = c.prod;
+    check(c, "idle:start2", r.sc != None && textIs(r.sc, "session", session(m, 2)) && idsValid(m) && listLen(products(prod)) > 0,
+        show(r) + " " + listText(products(prod)));
+    check(c, "idle:sweep-while-waiting", waitPeer(m.p, (): bool => listLen(products(prod)) == 0, 5), listText(products(prod)));
+    r = tool(m, "debug_stops", sid(m, 2));
+    check(c, "idle:swept2", r.sc != None && textIs(r.sc, "error", UNKNOWN_SESSION), show(r));
+    r = tool(m, "debug_start", "{\"path\": \"basic.tx\", \"idle_timeout_s\": 0}");
+    check(c, "idle:bad-param", r.sc == None && isE(r) && errIs(r, "Invalid params: idle_timeout_s 需要正整数（秒）"), show(r));
+    check(c, "idle:exit0", finish(m) == 0, "");
+}
+
+function scJsonrpc(c: Ref<Ctx>): void | Error {
+    const m = start(c)?;
+    const r = call(m, "initialize", "{\"protocolVersion\": \"2025-11-25\"}");
+    const info = at(at(r, "result"), "serverInfo");
+    const ver = lossyText(runCli(c.exe, lst(["version"]), c.tmp, 60).out);
+    const version = textOf(info, "version");
+    check(c, "rpc:initialize", textIs(at(r, "result"), "protocolVersion", "2025-11-25") && textIs(info, "name", "taixu")
+        && jText(at(info, "version")) != None && len(version) > 0 && contains(ver, version), dump(r) + " " + jQuote(ver));
+    raw(m, "garbage\n");
+    raw(m, "[1]\n");
+    raw(m, "  \t\r\n");
+    send(m, "{\"jsonrpc\": \"2.0\", \"method\": \"tools/list\"}");
+    send(m, "{\"jsonrpc\": \"2.0\", \"id\": 99, \"method\": \"notifications/initialized\"}");
+    send(m, "{\"jsonrpc\": \"2.0\", \"method\": \"nope\"}");
+    const ping = callRid(m, "ping", "", "5");
+    const early: List<Ref<Jv>> = listNew();
+    for (x in m.p.msgs) {
+        listPush(early, x);
+    }
+    while (listLen(m.p.msgs) > 0) {
+        listRemoveAt(m.p.msgs, 0);
+    }
+    let codes = "";
+    let nullIds = true;
+    let earlyText = "[";
+    let i = 0;
+    while (i < listLen(early)) {
+        const x = listGet(early, i) catch jNull();
+        if (i > 0) {
+            codes = codes + " ";
+            earlyText = earlyText + ", ";
+        }
+        codes = codes + codeText(at(at(x, "error"), "code"));
+        earlyText = earlyText + jDump(x);
+        const id = at(x, "id");
+        if (id != None && (id ?? x).kind != J_NULL) {
+            nullIds = false;
+        }
+        i = i + 1;
+    }
+    earlyText = earlyText + "]";
+    check(c, "rpc:parse-and-invalid", codes == "-32700 -32600" && nullIds, earlyText);
+    check(c, "rpc:no-reply", ping != None && eqJson(at(ping, "result"), "{}") && listLen(early) == 2, dump(ping) + " " + earlyText);
+    const nope = call(m, "nope", "");
+    check(c, "rpc:method-not-found", eqJson(at(nope, "error"), rpcErr(-32601, "Method not found")), dump(nope));
+    const idLabels: []string = ["string", "int", "fraction", "null"];
+    const idTexts: []string = ["\"a\\\"b\\\\c\"", "123456789012", "7.25", "null"];
+    let k = 0;
+    while (k < 4) {
+        const rid = idTexts[k];
+        send(m, "{\"jsonrpc\": \"2.0\", \"id\": " + rid + ", \"method\": \"ping\"}");
+        const got = waitId(m, rid, TIMEOUT_MS);
+        check(c, "rpc:id-" + idLabels[k], got != None && idMatches(got ?? jNull(), rid) && eqJson(at(got, "result"), "{}"), dump(got));
+        k = k + 1;
+    }
+    send(m, "{\"jsonrpc\": \"2.0\", \"id\": true, \"method\": \"ping\"}");
+    const gotBool = waitId(m, "null", TIMEOUT_MS);
+    check(c, "rpc:id-bool", gotBool != None && idMatches(gotBool ?? jNull(), "null") && eqJson(at(gotBool, "result"), "{}"), dump(gotBool));
+    const badLabels: []string = ["missing-params", "params-not-object", "missing-name", "name-not-string", "arguments-not-object", "arguments-null"];
+    const badParams: []string = ["", "\"x\"", "{}", "{\"name\": 3}", "{\"name\": \"compile\", \"arguments\": []}",
+        "{\"name\": \"compile\", \"arguments\": null}"];
+    const badWants: []string = ["params 须为对象", "params 须为对象", "name 须为字符串", "name 须为字符串", "arguments 须为对象", "arguments 须为对象"];
+    k = 0;
+    while (k < 6) {
+        const got = call(m, "tools/call", badParams[k]);
+        check(c, "rpc:" + badLabels[k], eqJson(at(got, "error"), rpcErr(-32602, "Invalid params: " + badWants[k])), dump(got));
+        k = k + 1;
+    }
+    let t = tool(m, "compile", "{}");
+    check(c, "rpc:tool-compile-缺少-path", t.sc == None && isE(t) && errIs(t, "Invalid params: 缺少 path"), show(t));
+    t = tool(m, "compile", "{\"path\": 3}");
+    check(c, "rpc:tool-compile-path-须为字符串", t.sc == None && isE(t) && errIs(t, "Invalid params: path 须为字符串"), show(t));
+    t = tool(m, "compile", "{\"path\": \"\"}");
+    check(c, "rpc:tool-compile-path-为空", t.sc == None && isE(t) && errIs(t, "Invalid params: path 为空"), show(t));
+    const omitted = call(m, "tools/call", "{\"name\": \"compile\"}");
+    check(c, "rpc:arguments-omitted", eqJson(at(omitted, "result"),
+            "{\"content\": [{\"type\": \"text\", \"text\": \"Invalid params: 缺少 path\"}], \"isError\": true}"), dump(omitted));
+    const unknown: []string = ["nope", "debug_nope", "", "debug_", "compile\"", "debug_start,debug_kill"];
+    for (name in unknown) {
+        t = tool(m, name, "{}");
+        check(c, "rpc:unknown-" + name, rpcErrIs(t, -32602, "Unknown tool: " + name), show(t));
+    }
+    t = tool(m, "debug_frames", "{}");
+    check(c, "rpc:no-session", t.sc == None && isE(t) && errIs(t, "Invalid params: 缺少 session"), show(t));
+    t = tool(m, "debug_frames", "{\"session\": 1}");
+    check(c, "rpc:session-type", t.sc == None && isE(t) && errIs(t, "Invalid params: session 须为字符串"), show(t));
+    check(c, "rpc:valid-json", listLen(m.p.bad) == 0, badHead(m));
+    check(c, "rpc:exit0", finish(m) == 0, "");
+}
+
+function codeText(v: Ref<Jv>?): string {
+    if (v == None) {
+        return "None";
+    }
+    return jDump(v ?? jNull());
+}
+
+// 系统临时目录下新建的空目录（同 tempfile.mkdtemp；取真实路径，macOS 的 /var 是链接）。
+function freshDir(prefix: string): string | Error {
+    const base = osRealPath(tempDir());
+    let k = 0;
+    while (k < 1000) {
+        const p = nat(join(base, prefix + toStr(monoNs() % 1000000000) + "-" + toStr(k)));
+        if (kindOf(p) == 0) {
+            makeDir(p)?;
+            return p;
+        }
+        k = k + 1;
+    }
+    return err("建不了临时目录 " + prefix);
+}
+
+function scCompile(c: Ref<Ctx>): void | Error {
+    write(c, "library.tx", "export function answer(): int { return 42; }\n");
+    write(c, "中文.tx", "export function main(args: []string): int { print(\"太虚\"); return 0; }\n");
+    write(c, "bad.tx", "export function answer(): int { return true; }\n");
+    write(c, "missing-import.tx", "import { answer } from \"./missing\";\nexport function main(args: []string): int { return answer(); }\n");
+    write(c, "tool-only.tx", "export function answer(): int { const b = bytesNew(1); return stdinRead(b, 0); }\n");
+    const expectNames: List<string> = listNew();
+    const expectShas: List<string> = listNew();
+    const expectSizes: List<int> = listNew();
+    // 参照属于测试方，放在服务的产物区之外；在核对服务 compile／disasm 只读之前删掉。
+    const refDir = freshDir("taixu-mcp-compile-ref-")?;
+    const p = runCli(c.exe, lst(["build", "--toolchain", "bootstrap/selfhost/mcp-compile-probe.tx", "--out", refDir]), c.root, 1200);
+    const reference = nat(join(refDir, exeName("mcp-compile-probe")));
+    check(c, "compile:reference-probe", p.code == 0 && kindOf(reference) == 1, lossyText(p.err));
+    if (kindOf(reference) != 1) {
+        deleteTree(refDir);
+        return;
+    }
+    for (name in lst(["basic.tx", "library.tx", "中文.tx"])) {
+        const out = nat(join(refDir, name + ".ir"));
+        const q = runCli(reference, lst([name, out]), c.tmp, 60);
+        check(c, "compile:reference-" + name, q.code == 0 && kindOf(out) == 1, lossyText(q.err));
+        if (kindOf(out) == 1) {
+            const b = readBytes(out)?;
+            listPush(expectNames, name);
+            listPush(expectShas, shaHex(b));
+            listPush(expectSizes, bytesLen(b));
+        }
+    }
+    deleteTree(refDir);
+    const before = snapshot(c, false);
+    const m = start(c)?;
+    const cases: []string = ["basic.tx", "bad.tx", "library.tx", "missing.tx", "missing-import.tx", "中文.tx", "tool-only.tx", "basic.tx"];
+    for (name in cases) {
+        const wantOk = name == "basic.tx" || name == "library.tx" || name == "中文.tx";
+        const r = tool(m, "compile", "{\"path\": " + jQuote(name) + "}");
+        const okFlag = (wantOk && trueAt(r.sc, "ok")) || (!wantOk && falseAt(r.sc, "ok"));
+        const eFlag = (wantOk && r.e == 0) || (!wantOk && r.e == 1);
+        check(c, "compile:status-" + name, isObj(r.sc) && okFlag && eFlag && errNone(r), show(r));
+        if (!isObj(r.sc)) {
+            continue;
+        }
+        check(c, "compile:duration-" + name, natAt(r.sc, "duration_us"), dump(r.sc));
+        const diags = at(r.sc, "diags");
+        let diagOk = isArr(diags) && ((wantOk && jLen(diags ?? jNull()) == 0) || (!wantOk && jLen(diags ?? jNull()) > 0));
+        let i = 0;
+        while (isArr(diags) && i < jLen(diags ?? jNull())) {
+            const d = item(diags, i);
+            if (!isObj(d) || jLen(d ?? jNull()) != 6 || !has(d, "severity") || !has(d, "code") || !has(d, "msg") || !has(d, "module")
+                || !has(d, "line") || !has(d, "col") || jInt(at(d, "code")) == None || jText(at(d, "msg")) == None) {
+                diagOk = false;
+            }
+            i = i + 1;
+        }
+        check(c, "compile:diags-" + name, diagOk, dump(diags));
+        if (wantOk) {
+            let k = 0;
+            let found = false;
+            while (k < listLen(expectNames)) {
+                if ((listGet(expectNames, k) catch "") == name) {
+                    found = textIs(r.sc, "txc_sha256", listGet(expectShas, k) catch "") && intIs(r.sc, "txc_bytes", listGet(expectSizes, k) catch -1);
+                }
+                k = k + 1;
+            }
+            check(c, "compile:bytecode-" + name, found, dump(r.sc));
+        } else {
+            check(c, "compile:no-product-" + name, !has(r.sc, "txc_sha256") && !has(r.sc, "txc_bytes"), dump(r.sc));
+        }
+    }
+    check(c, "compile:valid-json", listLen(m.p.bad) == 0, badHead(m));
+    check(c, "compile:exit0", finish(m) == 0, "");
+    const after = snapshot(c, false);
+    const added: List<string> = listNew();
+    for (a in after) {
+        let seen = false;
+        for (b in before) {
+            if (a == b) {
+                seen = true;
+            }
+        }
+        if (!seen) {
+            listPush(added, a);
+        }
+    }
+    check(c, "compile:read-only", sameList(before, after), listText(added));
+}
+
+function libName(): string {
+    if (onWindows()) {
+        return "msvcrt.dll";
+    }
+    if (hostTarget() == "macos") {
+        return "libSystem";
+    }
+    return "libc.so.6";
+}
+
+function scRun(c: Ref<Ctx>): void | Error {
+    const lib = libName();
+    write(c, "run-args.tx", "function main(args: []string): int { for (a in args) { print(a); } eprint(\"错误✓\"); return 7; }\n");
+    write(c, "run-trap.tx", "function main(args: []string): int { eprint(\"before trap\"); assert(false, \"故意失败\"); return 0; }\n");
+    write(c, "run-library.tx", "export function answer(): int { return 42; }\n");
+    write(c, "run-stdin.tx", "declare function getchar(): i32 from \"" + lib + "\";\nfunction main(args: []string): int { print(toStr(getchar())); return 0; }\n");
+    const m = start(c)?;
+    const argv = lst(["hello world", "引号\"\\", "", "--flag"]);
+    const argvJson = "[\"hello world\", \"引号\\\"\\\\\", \"\", \"--flag\"]";
+    const runNames: []string = ["basic.tx", "run-args.tx", "run-trap.tx"];
+    for (name in runNames) {
+        let args: List<string> = listNew();
+        let argsJson = "[]";
+        if (name == "run-args.tx") {
+            args = argv;
+            argsJson = argvJson;
+        }
+        const p = runCli(c.exe, cat(lst(["run", "--format=json", name]), args), c.tmp, 60);
+        const r = tool(m, "run", "{\"path\": " + jQuote(name) + ", \"args\": " + argsJson + "}");
+        const out = bytesToStr(p.out) catch "\u{FFFD}<binary>";
+        const errText = bytesToStr(p.err) catch "\u{FFFD}<binary>";
+        const same = r.sc != None && intIs(r.sc, "exit_code", p.code) && textIs(r.sc, "stdout", out) && textIs(r.sc, "stderr", errText);
+        check(c, "run:cli-" + name, same && notE(r) && errNone(r), show(r) + " want " + toStr(p.code) + " " + jQuote(out) + " " + jQuote(errText));
+        check(c, "run:flags-" + name, r.sc != None && falseAt(r.sc, "timed_out") && falseAt(r.sc, "truncated") && natAt(r.sc, "duration_us"), show(r));
+    }
+    for (name in lst(["missing-run.tx", "run-library.tx"])) {
+        const r = tool(m, "run", "{\"path\": " + jQuote(name) + "}");
+        let errDoc = textOf(r.sc, "stderr");
+        if (!has(r.sc, "stderr")) {
+            errDoc = "{}";
+        }
+        check(c, "run:compile-error-" + name, r.sc != None && intIs(r.sc, "exit_code", 1) && isE(r) && textIs(r.sc, "stdout", "")
+            && truthy(at(parseLoose(errDoc), "diags")), show(r));
+    }
+    let r = tool(m, "run", "{\"path\": \"run-stdin.tx\", \"timeout_ms\": 3000}");
+    check(c, "run:empty-stdin", r.sc != None && intIs(r.sc, "exit_code", 0) && textIs(r.sc, "stdout", "-1\n") && notE(r), show(r));
+    let invalid = "declare function putchar(c: i32): i32 from \"" + lib + "\";\ndeclare function fflush(stream: usize): i32 from \"" + lib + "\";\n";
+    invalid = invalid + "function main(args: []string): int { ";
+    const bs: []int = [65, 240, 159, 146, 161, 255, 226, 130];
+    for (b in bs) {
+        invalid = invalid + "putchar(" + toStr(b) + "); ";
+    }
+    invalid = invalid + "fflush(0); return 0; }\n";
+    write(c, "run-invalid.tx", invalid);
+    r = tool(m, "run", "{\"path\": \"run-invalid.tx\"}");
+    check(c, "run:invalid-utf8", r.sc != None && intIs(r.sc, "exit_code", 0) && textIs(r.sc, "stdout", "A💡���") && notE(r)
+        && !truthy(at(r.sc, "truncated")), show(r));
+    r = tool(m, "run", "{\"path\": \"basic.tx\", \"args\": [\"\\u0000\"]}");
+    check(c, "run:spawn-error", r.sc != None && intIs(r.sc, "exit_code", 3) && isE(r) && contains(textOf(r.sc, "stderr"), "invalid argument"), show(r));
+    r = tool(m, "run", "{\"path\": \"basic.tx\", \"timeout_ms\": 1}");
+    check(c, "run:timeout-compile", r.sc != None && isE(r) && errNone(r) && hardTimeout(r.sc), show(r));
+    // 时限从收到请求起算，含编译与起进程：满核超订时编译可超过 500 ms，落成编译期超时。留足余量，只让 spin 本身超时。
+    r = tool(m, "run", "{\"path\": \"spin.tx\", \"timeout_ms\": 5000}");
+    check(c, "run:timeout-runtime", r.sc != None && isE(r) && errNone(r) && intIs(r.sc, "exit_code", -1) && trueAt(r.sc, "timed_out")
+        && textIs(r.sc, "stdout", ""), show(r));
+    const values: []string = ["0", "-1", "true", "1.5", "\"100\"", "null"];
+    const reprs: []string = ["0", "-1", "True", "1.5", "'100'", "None"];
+    let k = 0;
+    while (k < 6) {
+        for (t in lst(["run", "test"])) {
+            r = tool(m, t, "{\"path\": \"basic.tx\", \"timeout_ms\": " + values[k] + "}");
+            check(c, "run:timeout-param-" + t + "-" + reprs[k], r.sc == None && isE(r) && errIs(r, TIMEOUT_PARAM), show(r));
+        }
+        k = k + 1;
+    }
+    const argValues: []string = ["null", "\"x\"", "[1]", "[true]", "[\"ok\", null]"];
+    const argReprs: []string = ["None", "'x'", "[1]", "[True]", "['ok', None]"];
+    k = 0;
+    while (k < 5) {
+        r = tool(m, "run", "{\"path\": \"basic.tx\", \"args\": " + argValues[k] + "}");
+        check(c, "run:args-param-" + argReprs[k], r.sc == None && isE(r) && errIs(r, "Invalid params: args 须为字符串数组"), show(r));
+        k = k + 1;
+    }
+    r = tool(m, "run", "{\"path\": \"basic.tx\", \"timeout_ms\": 60001}");
+    check(c, "run:timeout-upper-bound", r.sc == None && isE(r) && errIs(r, TIMEOUT_PARAM), show(r));
+    if (!onWindows()) {
+        write(c, "run-signal.tx", "declare function raise(sig: i32): i32 from \"" + lib + "\";\nfunction main(args: []string): int { return raise(15) as int; }\n");
+        r = tool(m, "run", "{\"path\": \"run-signal.tx\"}");
+        check(c, "run:signal", r.sc != None && intIs(r.sc, "exit_code", -2) && intIs(r.sc, "signal", 15) && notE(r), show(r));
+    }
+    check(c, "run:valid-json", listLen(m.p.bad) == 0, badHead(m));
+    check(c, "run:exit0", finish(m) == 0, "");
+    check(c, "run:cleanup", !anyMcpDir(c.prod), listText(dirNames(c.prod)));
+}
+
+// prod 下有没有 taixu-mcp-* 条目（同 Python 的 Path(prod).glob('taixu-mcp-*')）。
+function anyMcpDir(prod: string): bool {
+    for (n in dirNames(prod)) {
+        if (startsWith(n, "taixu-mcp-")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 头尾标记、截去说明、没有 U+FFFD、不超过 1 MiB。
+function boundedOk(text: string, stream: string, endTail: bool): bool {
+    let tailOk = contains(text, stream + "-tail✓\n");
+    if (endTail) {
+        tailOk = endsWith(text, stream + "-tail✓\n");
+    }
+    return startsWith(text, stream + "-head✓\n") && tailOk && contains(text, "截去 ") && !contains(text, "\u{FFFD}") && len(text) <= 1048576;
+}
+
+function lastLine(text: string): string {
+    const lines = strSplit(text, "\n");
+    let i = listLen(lines) - 1;
+    while (i >= 0) {
+        const l = listGet(lines, i) catch "";
+        if (len(l) > 0 || i < listLen(lines) - 1) {
+            return l;
+        }
+        i = i - 1;
+    }
+    return "";
+}
+
+function scRunOutput(c: Ref<Ctx>): void | Error {
+    let line = "";
+    let n = 0;
+    while (n < 683) {
+        line = line + "界";
+        n = n + 1;
+    }
+    const source = "function main(args: []string): int {\n    print(\"stdout-head✓\"); eprint(\"stderr-head✓\");\n    let i = 0;\n"
+    + "    while (i < 650) { print(\"" + line + "\"); eprint(\"" + line + "\"); i = i + 1; }\n"
+    + "    print(\"stdout-tail✓\"); eprint(\"stderr-tail✓\");\n    return 0;\n}\n";
+    write(c, "run-output.tx", source);
+    const m = start(c)?;
+    let r = tool(m, "run", "{\"path\": \"run-output.tx\", \"timeout_ms\": 60000}");
+    check(c, "run-output:status", r.sc != None && intIs(r.sc, "exit_code", 0) && trueAt(r.sc, "truncated") && notE(r), show(r));
+    for (stream in lst(["stdout", "stderr"])) {
+        const text = textOf(r.sc, stream);
+        check(c, "run-output:" + stream, boundedOk(text, stream, true), toStr(len(text)) + " " + jQuote(headChars(text, 30)));
+    }
+    write(c, "test-output.tx", testsOf(source));
+    r = tool(m, "test", "{\"path\": \"test-output.tx\", \"timeout_ms\": 60000}");
+    check(c, "test-output:status", r.sc != None && intIs(r.sc, "exit_code", 0) && trueAt(r.sc, "truncated") && notE(r)
+        && eqJson(at(r.sc, "summary"), "{\"total\": 2, \"pass\": 2, \"fail\": 0}"), show(r));
+    for (stream in lst(["stdout", "stderr"])) {
+        const text = textOf(r.sc, stream);
+        check(c, "test-output:" + stream, boundedOk(text, stream, false), toStr(len(text)) + " " + jQuote(headChars(text, 30)));
+    }
+    const stdout = textOf(r.sc, "stdout");
+    check(c, "test-output:summary-tail", r.sc != None && contains(stdout, "last test✓\n") && sameJv(at(parseLoose(lastLine(stdout)), "summary"),
+            at(r.sc, "summary")), show(r));
+    check(c, "run-output:valid-json", listLen(m.p.bad) == 0, badHead(m));
+    check(c, "run-output:exit0", finish(m) == 0, "");
+}
+
+// Python：source.replace('function main(args: []string): int {', 'test "output" {').replace('    return 0;\n', '') ＋ 末尾一个测试。
+function testsOf(source: string): string {
+    let s = replaceAll(source, "function main(args: []string): int {", "test \"output\" {");
+    s = replaceAll(s, "    return 0;\n", "");
+    return s + "test \"last\" { print(\"last test✓\"); }\n";
+}
+
+function replaceAll(s: string, a: string, b: string): string {
+    const parts = strSplit(s, a);
+    let out = "";
+    let i = 0;
+    while (i < listLen(parts)) {
+        if (i > 0) {
+            out = out + b;
+        }
+        out = out + (listGet(parts, i) catch "");
+        i = i + 1;
+    }
+    return out;
+}
+
+// {'summary': doc.get('summary'), 'tests': [去掉 duration_us 的各项]}（缺席写 null）。
+function withoutDurations(doc: Ref<Jv>?): string {
+    let s = "{\"summary\": " + jsonOrNull(at(doc, "summary")) + ", \"tests\": [";
+    const tests = at(doc, "tests");
+    let i = 0;
+    while (isArr(tests) && i < jLen(tests ?? jNull())) {
+        const t = item(tests, i) ?? jNull();
+        if (i > 0) {
+            s = s + ", ";
+        }
+        s = s + "{";
+        let k = 0;
+        let first = true;
+        while (t.kind == J_OBJ && k < listLen(t.keys)) {
+            const key = listGet(t.keys, k) catch "";
+            if (key != "duration_us") {
+                if (!first) {
+                    s = s + ", ";
+                }
+                first = false;
+                s = s + jQuote(key) + ": " + jDump(listGet(t.items, k) catch t);
+            }
+            k = k + 1;
+        }
+        s = s + "}";
+        i = i + 1;
+    }
+    return s + "]}";
+}
+
+function jsonOrNull(v: Ref<Jv>?): string {
+    if (v == None) {
+        return "null";
+    }
+    return jDump(v ?? jNull());
+}
+
+function sameDoc(a: Ref<Jv>?, b: Ref<Jv>?): bool {
+    return eqJson(parseLoose(withoutDurations(a)), withoutDurations(b));
+}
+
+function scTest(c: Ref<Ctx>): void | Error {
+    write(c, "tests-pass.tx", "test \"first\" { print(\"测试输出✓\"); eprint(\"测试错误✓\"); assert(true, \"first\"); }\ntest \"second\" { assert(2 == 2, \"second\"); }\n");
+    write(c, "tests-fail.tx", "test \"bad\" { assert(false, \"故意失败\"); }\ntest \"after\" { print(\"after failure\"); assert(true, \"after\"); }\n");
+    write(c, "tests-none.tx", "export function answer(): int { return 42; }\n");
+    write(c, "tests-timeout.tx", "test \"first\" { print(\"first done\"); }\ntest \"loop\" { let i = 0; while (true) { i = i + 1; } }\ntest \"never\" { print(\"never reached\"); }\n");
+    const m = start(c)?;
+    const testNames: []string = ["tests-pass.tx", "tests-fail.tx", "tests-none.tx"];
+    const wantCodes: []int = [0, 2, 0];
+    let k = 0;
+    while (k < 3) {
+        const name = testNames[k];
+        const p = runCli(c.exe, lst(["test", "--format=json", name]), c.tmp, 60);
+        const cliOut = bytesToStr(p.out) catch "";
+        const text = linesOf(cliOut);
+        let expected: Ref<Jv>? = jObject();
+        if (listLen(text) > 0) {
+            expected = parseLoose(listGet(text, listLen(text) - 1) catch "");
+        }
+        const r = tool(m, "test", "{\"path\": " + jQuote(name) + "}");
+        check(c, "test:status-" + name, r.sc != None && intIs(r.sc, "exit_code", wantCodes[k]) && p.code == wantCodes[k] && notE(r) && errNone(r), show(r));
+        check(c, "test:structured-" + name, r.sc != None && sameDoc(r.sc, expected), show(r) + " " + dump(expected));
+        const out = linesOf(textOf(r.sc, "stdout"));
+        let outOk = listLen(out) > 0 && listLen(out) == listLen(text);
+        let i = 0;
+        while (outOk && i < listLen(out) - 1) {
+            if ((listGet(out, i) catch "") != (listGet(text, i) catch "")) {
+                outOk = false;
+            }
+            i = i + 1;
+        }
+        outOk = outOk && sameDoc(parseLoose(listGet(out, listLen(out) - 1) catch ""), expected);
+        check(c, "test:stdout-" + name, outOk, listText(out) + " " + listText(text));
+        check(c, "test:stderr-" + name, r.sc != None && textIs(r.sc, "stderr", bytesToStr(p.err) catch "\u{FFFD}"), show(r) + " " + jQuote(lossyText(p.err)));
+        k = k + 1;
+    }
+    // 时限同样含编译与起进程：满载时 first 曾被调度拖到 672 ms、时限在它身上用完（M1 完整门，2026-11-11）。留足余量，只让 loop 超时。
+    let r = tool(m, "test", "{\"path\": \"tests-timeout.tx\", \"timeout_ms\": 5000}");
+    check(c, "test:timeout", r.sc != None && intIs(r.sc, "exit_code", -1) && trueAt(r.sc, "timed_out") && isE(r) && textIs(r.sc, "timeout_test", "loop")
+        && eqJson(at(r.sc, "summary"), "{\"total\": 2, \"pass\": 1, \"fail\": 1}") && fieldsOf(at(r.sc, "tests"), "name") == "first loop"
+        && !contains(textOf(r.sc, "stdout"), "never reached"), show(r));
+    r = tool(m, "test", "{\"path\": \"missing-test.tx\"}");
+    let errDoc = textOf(r.sc, "stderr");
+    if (!has(r.sc, "stderr")) {
+        errDoc = "{}";
+    }
+    check(c, "test:compile-error", r.sc != None && intIs(r.sc, "exit_code", 1) && isE(r) && eqJson(at(r.sc, "tests"), "[]")
+        && truthy(at(parseLoose(errDoc), "diags")), show(r));
+    r = tool(m, "test", "{\"path\": \"tests-pass.tx\", \"timeout_ms\": 1}");
+    check(c, "test:compile-timeout", hardTimeout(r.sc) && isE(r) && errNone(r), show(r));
+    check(c, "test:valid-json", listLen(m.p.bad) == 0, badHead(m));
+    check(c, "test:exit0", finish(m) == 0, "");
+    check(c, "test:cleanup", !anyMcpDir(c.prod), listText(dirNames(c.prod)));
+}
+
+// 按行切开（同 Python 的 splitlines：去掉行尾的 \r\n 或 \n，末尾的换行不产生空行）。
+function linesOf(s: string): List<string> {
+    const out: List<string> = listNew();
+    if (len(s) == 0) {
+        return out;
+    }
+    const parts = strSplit(s, "\n");
+    let i = 0;
+    while (i < listLen(parts)) {
+        let l = listGet(parts, i) catch "";
+        if (i == listLen(parts) - 1 && len(l) == 0) {
+            break;
+        }
+        if (endsWith(l, "\r")) {
+            l = byteText(l, 0, len(l) - 1);
+        }
+        listPush(out, l);
+        i = i + 1;
+    }
+    return out;
+}
+
+function scDisasm(c: Ref<Ctx>): void | Error {
+    write(c, "disasm-bad.tx", "function invalid(): int { return true; }\n");
+    const m = start(c)?;
+    const reference = tool(m, "compile", "{\"path\": \"basic.tx\"}").sc;
+    // 常驻 worker 已有一个空的草稿目录；disasm 不许写任何东西。
+    const before = snapshot(c, true);
+    const cli = runCli(c.exe, lst(["disasm", "--format=json", "basic.tx"]), c.tmp, 60);
+    let cliDoc: Ref<Jv>? = jObject();
+    if (cli.code == 0) {
+        cliDoc = parseStrict(bytesToStr(cli.out) catch "");
+    }
+    check(c, "disasm:cli-json", cli.code == 0 && truthy(at(cliDoc, "functions")), toStr(cli.code) + " " + jQuote(lossyText(cli.err)));
+    const fmts: []string = ["", "text", "json"];
+    for (fmt in fmts) {
+        let args = "{\"path\": \"basic.tx\"";
+        let label = "default";
+        let want = "text";
+        if (len(fmt) > 0) {
+            args = args + ", \"format\": " + jQuote(fmt);
+            label = fmt;
+            want = fmt;
+        }
+        const r = tool(m, "disasm", args + "}");
+        check(c, "disasm:" + label, r.sc != None && intIs(r.sc, "exit_code", 0) && falseAt(r.sc, "timed_out") && falseAt(r.sc, "truncated") && notE(r)
+            && errNone(r) && natAt(r.sc, "duration_us") && textIs(r.sc, "format", want) && sameAt(r.sc, cliDoc, "functions"), show(r));
+        if (r.sc != None) {
+            const stdout = textOf(r.sc, "stdout");
+            if (fmt == "json") {
+                check(c, "disasm:json-parity", sameBytes(bytesFromStr(stdout), cli.out) && sameJv(parseStrict(stdout), cliDoc), show(r));
+            } else {
+                const plain = runCli(c.exe, lst(["disasm", "basic.tx"]), c.tmp, 60);
+                check(c, "disasm:" + label + "-parity", sameBytes(bytesFromStr(stdout), plain.out) && plain.code == 0, show(r));
+            }
+        }
+    }
+    const after = snapshot(c, true);
+    check(c, "disasm:no-writes", sameList(before, after), "{'before': " + listText(before) + ", 'after': " + listText(after) + "}");
+    for (p in lst(["no-such.tx", "disasm-bad.tx"])) {
+        const r = tool(m, "disasm", "{\"path\": " + jQuote(p) + "}");
+        let errDoc = textOf(r.sc, "stderr");
+        if (!has(r.sc, "stderr")) {
+            errDoc = "{}";
+        }
+        check(c, "disasm:failure-" + p, r.sc != None && intIs(r.sc, "exit_code", 1) && isE(r) && errNone(r) && eqJson(at(r.sc, "functions"), "[]")
+            && truthy(at(parseStrict(errDoc), "diags")), show(r));
+    }
+    const badFormats: []string = ["null", "4", "true", "[]", "\"yaml\"", "\"\""];
+    const badReprs: []string = ["None", "4", "True", "[]", "'yaml'", "''"];
+    let k = 0;
+    while (k < 6) {
+        const r = tool(m, "disasm", "{\"path\": \"basic.tx\", \"format\": " + badFormats[k] + "}");
+        check(c, "disasm:bad-format-" + badReprs[k], r.sc == None && isE(r) && errIs(r, "Invalid params: format 须为 text 或 json"), show(r));
+        k = k + 1;
+    }
+    let large = "";
+    let i = 0;
+    while (i < 1500) {
+        large = large + "function f" + toStr(i) + "(): int { return " + toStr(i) + "; }\n";
+        i = i + 1;
+    }
+    write(c, "large-listing.tx", large);
+    let r = tool(m, "disasm", "{\"path\": \"large-listing.tx\", \"format\": \"json\"}");
+    const listing = parseStrict(textOf(r.sc, "stdout"));
+    let fnLen = 0;
+    if (has(r.sc, "functions")) {
+        fnLen = len(jDump(at(r.sc, "functions") ?? jNull()));
+    }
+    check(c, "disasm:bounded", r.sc != None && intIs(r.sc, "exit_code", 0) && notE(r) && errNone(r) && trueAt(r.sc, "truncated")
+        && len(textOf(r.sc, "stdout")) <= 1048576 && fnLen <= 1048576 && sameAt(listing, r.sc, "functions") && trueAt(listing, "truncated"), show(r));
+    r = tool(m, "disasm", "{\"path\": \"large-listing.tx\", \"timeout_ms\": 1}");
+    check(c, "disasm:compile-budget", hardTimeout(r.sc) && isE(r) && errNone(r), show(r));
+    const timeouts: []string = ["null", "0", "-1", "1.5", "true", "\"1\""];
+    const timeoutReprs: []string = ["None", "0", "-1", "1.5", "True", "'1'"];
+    k = 0;
+    while (k < 6) {
+        r = tool(m, "disasm", "{\"path\": \"basic.tx\", \"timeout_ms\": " + timeouts[k] + "}");
+        check(c, "disasm:bad-timeout-" + timeoutReprs[k], r.sc == None && isE(r) && errIs(r, TIMEOUT_PARAM), show(r));
+        k = k + 1;
+    }
+    r = tool(m, "disasm", "{\"path\": \"basic.tx\", \"timeout_ms\": 60001}");
+    check(c, "disasm:timeout-upper-bound", r.sc == None && isE(r) && errIs(r, TIMEOUT_PARAM), show(r));
+    r = tool(m, "compile", "{\"path\": \"basic.tx\"}");
+    check(c, "disasm:compile-after", r.sc != None && sameAt(r.sc, reference, "txc_sha256") && notE(r), show(r));
+    check(c, "disasm:valid-json", listLen(m.p.bad) == 0, badHead(m));
+    check(c, "disasm:exit0", finish(m) == 0, "");
+}
+
+function scModes(c: Ref<Ctx>): void | Error {
+    write(c, "modes-test.tx", "test \"mode\" { assert(true, \"mode\"); }\n");
+    const m = start(c)?;
+    const reference = tool(m, "compile", "{\"path\": \"basic.tx\"}").sc;
+    modesRound(c, m, "modes:before-debug-", reference);
+    let r = tool(m, "debug_start", "{\"path\": \"basic.tx\", \"breakpoints\": [{\"fn\": \"main\"}]}");
+    check(c, "modes:debug-start", r.sc != None && textIs(at(r.sc, "start"), "event", "ready") && notE(r), show(r));
+    r = tool(m, "debug_continue", sid(m, 1));
+    modesRound(c, m, "modes:paused-", reference);
+    r = tool(m, "debug_frames", sid(m, 1));
+    check(c, "modes:frames", r.sc != None && textIs(item(at(r.sc, "frames"), 0), "fn", "main") && notE(r), show(r));
+    r = tool(m, "debug_continue", sid(m, 1));
+    check(c, "modes:continue", r.sc != None && textIs(r.sc, "event", "exited") && notE(r), show(r));
+    check(c, "modes:exit0", finish(m) == 0, "");
+}
+
+function modesRound(c: Ref<Ctx>, m: Ref<Mcp>, prefix: string, reference: Ref<Jv>?): void {
+    const kinds: []string = ["test", "disasm", "run", "compile"];
+    for (name in kinds) {
+        let p = "basic.tx";
+        if (name == "test") {
+            p = "modes-test.tx";
+        }
+        const r = tool(m, name, "{\"path\": " + jQuote(p) + "}");
+        check(c, prefix + name, r.sc != None && notE(r) && errNone(r) && (name != "compile" || sameAt(r.sc, reference, "txc_sha256")), show(r));
+    }
+}
+
+function scBreaks(c: Ref<Ctx>): void | Error {
+    const m = start(c)?;
+    let r = tool(m, "debug_start", "{\"path\": \"basic.tx\", \"breakpoints\": [{\"module\": \"nope.tx\", \"line\": 1}, {\"line\": 3}, 5, {\"fn\": 7}, {\"fn\": \"twice\"}]}");
+    const bps = at(r.sc, "breakpoints");
+    check(c, "break:receipts", fieldsOf(bps, "event") == "error error error error breakpoint_fn"
+        && textIs(item(bps, 0), "message", "未知模块（见 ready 事件的 modules 清单）")
+        && textIs(item(bps, 1), "message", "breakpoints[1] 需要 fn（字符串）或 module（字符串）+line（整数）")
+        && startsWith(textOf(item(bps, 2), "message"), "breakpoints[2] ") && startsWith(textOf(item(bps, 3), "message"), "breakpoints[3] "), dump(bps));
+    r = tool(m, "debug_breakpoint", "{\"session\": " + jQuote(session(m, 1)) + ", \"module\": \"nope.tx\", \"line\": 1}");
+    check(c, "break:unknown-module", r.sc != None && textIs(r.sc, "event", "error") && isE(r), show(r));
+    r = tool(m, "debug_breakpoint", "{\"session\": " + jQuote(session(m, 1)) + ", \"module\": \"basic.tx\", \"line\": -1}");
+    check(c, "break:negative-line", r.sc != None && textIs(r.sc, "event", "error") && contains(textOf(r.sc, "message"), "line"), show(r));
+    r = tool(m, "debug_breakpoint", sid(m, 1));
+    check(c, "break:no-target", r.sc == None && isE(r) && errIs(r, "Invalid params: 需要 fn 或 module+line"), show(r));
+    r = tool(m, "debug_continue", sid(m, 1));
+    check(c, "break:alive", r.sc != None && textIs(r.sc, "event", "stopped") && textIs(r.sc, "fn", "twice") && notE(r), show(r));
+    r = tool(m, "debug_inspect", "{\"session\": " + jQuote(session(m, 1)) + ", \"frame\": 9, \"slot\": 0}");
+    check(c, "break:inspect-error", r.sc != None && textIs(r.sc, "event", "error") && isE(r), show(r));
+    r = tool(m, "debug_continue", sid(m, 1));
+    check(c, "break:exited", r.sc != None && textIs(r.sc, "event", "exited") && intIs(r.sc, "code", 10), show(r));
+    r = tool(m, "debug_continue", sid(m, 1));
+    check(c, "break:died", r.sc != None && textIs(r.sc, "error", DIED) && textIs(r.sc, "stderr", "") && isE(r), show(r));
+    check(c, "break:exit0", finish(m) == 0, "");
+}
+
+function scStep(c: Ref<Ctx>): void | Error {
+    const m = start(c)?;
+    let r = tool(m, "debug_start", "{\"path\": \"spin.tx\", \"breakpoints\": [{\"fn\": \"main\"}]}");
+    r = tool(m, "debug_continue", sid(m, 1));
+    r = tool(m, "debug_step", "{\"session\": " + jQuote(session(m, 1)) + ", \"mode\": \"over\", \"timeout_s\": 0}");
+    check(c, "step:bad-timeout", r.sc == None && isE(r) && errIs(r, "Invalid params: timeout_s 需要正整数（秒）"), show(r));
+    const t0 = monoNs();
+    r = tool(m, "debug_step", "{\"session\": " + jQuote(session(m, 1)) + ", \"mode\": \"over\", \"timeout_s\": 1}");
+    const took = monoNs() - t0;
+    check(c, "step:timeout", r.sc != None && textIs(r.sc, "event", "exited") && intIs(r.sc, "code", 3) && textIs(r.sc, "reason", "timeout")
+        && took < 10 * SEC, show(r) + " " + toStr(took / 1000000) + " ms");
+    r = tool(m, "debug_step", sid(m, 1));
+    check(c, "step:died", r.sc != None && textIs(r.sc, "error", DIED) && isE(r), show(r));
+    const a = tool(m, "debug_start", "{\"path\": \"basic.tx\"}");
+    const b = tool(m, "debug_start", "{\"path\": \"basic.tx\", \"breakpoints\": [{\"fn\": \"twice\"}]}");
+    check(c, "step:two-sessions", textIs(a.sc, "session", session(m, 2)) && textIs(b.sc, "session", session(m, 3)) && idsValid(m),
+        show(a) + " " + show(b) + " " + listText(m.sessions));
+    const b2 = tool(m, "debug_continue", sid(m, 3));
+    const a2 = tool(m, "debug_continue", sid(m, 2));
+    check(c, "step:interleaved", textIs(b2.sc, "fn", "twice") && textIs(a2.sc, "event", "exited") && intIs(a2.sc, "code", 10), show(a2) + " " + show(b2));
+    const b3 = tool(m, "debug_step", "{\"session\": " + jQuote(session(m, 3)) + ", \"mode\": \"out\"}");
+    check(c, "step:out", textIs(b3.sc, "event", "stopped") && textIs(b3.sc, "fn", "main") && textIs(b3.sc, "reason", "step"), show(b3));
+    check(c, "step:exit0-live", finish(m) == 0, "");
+    const prod = c.prod;
+    check(c, "step:products-deleted", waitNap((): bool => listLen(products(prod)) == 0, 10), listText(dirNames(prod)));
+}
+
+function scEof(c: Ref<Ctx>): void | Error {
+    const m = start(c)?;
+    const r = tool(m, "debug_start", "{\"path\": \"eof.tx\"}");
+    check(c, "eof:start", r.sc != None && listLen(products(c.prod)) > 0, show(r) + " " + listText(products(c.prod)));
+    check(c, "eof:exit0", finish(m) == 0, "");
+    const prod = c.prod;
+    check(c, "eof:product-deleted", waitNap((): bool => listLen(products(prod)) == 0, 10), listText(products(prod)));
+}
+
+function scGolden(c: Ref<Ctx>): void | Error {
+    // tests/golden/hello.native.txc.sha256 锁定 examples/hello.tx 的内部 TXC 编码；MCP compile 回报它的 SHA-256。
+    const hello = readBytes(nat(join(c.root, "examples/hello.tx")))?;
+    writeFileBytes(path(c, "hello.tx"), hello)?;
+    const want = strip(lossyText(readBytes(nat(join(c.root, "tests/golden/hello.native.txc.sha256")))?));
+    const m = start(c)?;
+    const r = tool(m, "compile", "{\"path\": \"hello.tx\"}");
+    check(c, "golden:hello-txc", textIs(r.sc, "txc_sha256", want) && notE(r), show(r) + " " + want);
+    finish(m);
+}
+
+function scBudget(c: Ref<Ctx>): void | Error {
+    // 请求时限短于程序运行：到点暂停（reason pause）并照常回复；该会话与同一 worker 里的其他会话都保留，不会因撞上父进程的请求
+    // 墙钟而整个 worker 被杀。
+    const m = mcpStart(c, "3000")?;
+    let r = tool(m, "debug_start", "{\"path\": \"basic.tx\"}");
+    r = tool(m, "debug_start", "{\"path\": \"spin.tx\", \"breakpoints\": [{\"fn\": \"main\"}]}");
+    r = tool(m, "debug_continue", sid(m, 2));
+    check(c, "budget:at-main", r.sc != None && textIs(r.sc, "event", "stopped") && textIs(r.sc, "fn", "main"), show(r));
+    const t0 = monoNs();
+    r = tool(m, "debug_continue", "{\"session\": " + jQuote(session(m, 2)) + ", \"timeout_s\": 60}");
+    const took = monoNs() - t0;
+    check(c, "budget:pause", r.sc != None && textIs(r.sc, "event", "stopped") && textIs(r.sc, "reason", "pause") && notE(r) && took < 3500000000,
+        show(r) + " " + toStr(took / 1000000) + " ms");
+    r = tool(m, "debug_frames", sid(m, 2));
+    check(c, "budget:session-kept", r.sc != None && textIs(r.sc, "event", "frames") && notE(r), show(r));
+    r = tool(m, "debug_stops", sid(m, 1));
+    check(c, "budget:other-session-kept", r.sc != None && notE(r) && !has(r.sc, "error"), show(r));
+    r = tool(m, "debug_kill", sid(m, 2));
+    check(c, "budget:kill", r.sc != None && trueAt(r.sc, "killed"), show(r));
+    r = tool(m, "debug_kill", sid(m, 1));
+    check(c, "budget:valid-json", listLen(m.p.bad) == 0, badHead(m));
+    finish(m);
+}
+
+function scLong(c: Ref<Ctx>): void | Error {
+    const m = start(c)?;
+    const line = bytesNew(16 * 1024 * 1024 + 9);
+    bytesFill(line, 0, 16 * 1024 * 1024 + 8, 120);
+    bytesSet(line, 16 * 1024 * 1024 + 8, 10);
+    peerSend(m.p, line);
+    const code = finish(m);
+    const err = lossyText(m.p.err);
+    check(c, "long:exit3", code == 3 && contains(err, "taixu mcp: MessageTooLong"), "(" + toStr(code) + ", " + jQuote(headChars(err, 200)) + ")");
+}
+
+function runScenario(c: Ref<Ctx>, name: string): void | Error {
+    if (name == "list") {
+        return scList(c);
+    }
+    if (name == "session") {
+        return scSession(c);
+    }
+    if (name == "flood") {
+        return scFlood(c);
+    }
+    if (name == "idle") {
+        return scIdle(c);
+    }
+    if (name == "jsonrpc") {
+        return scJsonrpc(c);
+    }
+    if (name == "compile") {
+        return scCompile(c);
+    }
+    if (name == "run") {
+        return scRun(c);
+    }
+    if (name == "run-output") {
+        return scRunOutput(c);
+    }
+    if (name == "test") {
+        return scTest(c);
+    }
+    if (name == "modes") {
+        return scModes(c);
+    }
+    if (name == "disasm") {
+        return scDisasm(c);
+    }
+    if (name == "breaks") {
+        return scBreaks(c);
+    }
+    if (name == "step") {
+        return scStep(c);
+    }
+    if (name == "golden") {
+        return scGolden(c);
+    }
+    if (name == "budget") {
+        return scBudget(c);
+    }
+    if (name == "eof") {
+        return scEof(c);
+    }
+    if (name == "long") {
+        return scLong(c);
+    }
+    return err("KeyError(" + jQuote(name) + ")");
+}
+
+function main(args: []string): int {
+    let compiler = "";
+    let root = "";
+    const chosen: List<string> = listNew();
+    let i = 0;
+    while (i < len(args)) {
+        const a = args[i];
+        if (i + 1 < len(args) && (a == "--compiler" || a == "--root")) {
+            if (a == "--compiler") {
+                compiler = args[i + 1];
+            } else {
+                root = args[i + 1];
+            }
+            i = i + 2;
+        } else {
+            listPush(chosen, a);
+            i = i + 1;
+        }
+    }
+    if (len(compiler) == 0) {
+        eprint("用法：taixu run --toolchain scripts/test_mcp_e2e.tx --compiler <原生 taixu> [场景…]");
+        return 2;
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    const tmp = freshDir("taixu-mcp-e2e-") catch (e) {
+        eprint(e.message);
+        return 2;
+    };
+    const c = new Ctx { exe: absolute(nat(compiler)), root: absolute(nat(root)), tmp: tmp, prod: nat(join(tmp, "tmp")), fails: 0, total: 0 };
+    makeDir(c.prod) catch (e) {
+        eprint(e.message);
+        return 2;
+    };
+    write(c, "basic.tx", BASIC_TX);
+    write(c, "idle.tx", BASIC_TX);
+    write(c, "eof.tx", BASIC_TX);
+    write(c, "flood.tx", FLOOD_TX);
+    write(c, "spin.tx", SPIN_TX);
+    let todo = chosen;
+    if (listLen(todo) == 0) {
+        todo = words(SCENARIOS);
+    }
+    for (name in todo) {
+        runScenario(c, name) catch (e) {
+            check(c, name + ":crash", false, e.message);
+        };
+    }
+    deleteTree(tmp);
+    let verdict = "PASS";
+    if (c.fails > 0) {
+        verdict = "FAIL=" + toStr(c.fails);
+    }
+    print("SUMMARY " + verdict + " (" + toStr(c.total) + " checks)");
+    if (c.fails > 0) {
+        return 1;
+    }
+    return 0;
+}

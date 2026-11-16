@@ -1,0 +1,324 @@
+// 独立判定器（Mach-O、PE 等结构核对器）共用的部分：SHA-256、十六进制、按 UTF-8 宽松解码。
+// 判定器要与被测编译器相互独立（结构核对另写一份独立实现）：本文件与用到它的判定器都不导入 bootstrap/ 的
+// 任何模块——编译器写出代码签名用的是 bootstrap/selfhost/sha256.tx，这里的 SHA-256 照 FIPS 180-4 另写一份，自检对 NIST 的例子。
+
+const M32: int = 0xFFFFFFFF;
+const DIGITS: string = "0123456789abcdef";
+
+// FIPS 180-4 §4.2.2：前 64 个素数立方根小数部分的前 32 位。
+const ROUND: []int = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+function ror(x: int, n: int): int {
+    return ((x >>> n) | (x << (32 - n))) & M32;
+}
+
+// 压缩一块（src 从 at 起的 64 字节，大端字）进 st 的八个字。
+function compress(st: List<int>, src: Bytes, at: int, w: List<int>): void {
+    let i = 0;
+    while (i < 16) {
+        listSet(w, i, (bytesGetBE<u32>(src, at + 4 * i) ?? 0) as int);
+        i = i + 1;
+    }
+    while (i < 64) {
+        const a = listGet(w, i - 15) catch 0;
+        const b = listGet(w, i - 2) catch 0;
+        const lo = ror(a, 7) ^ ror(a, 18) ^ (a >>> 3);
+        const hi = ror(b, 17) ^ ror(b, 19) ^ (b >>> 10);
+        listSet(w, i, ((listGet(w, i - 16) catch 0) + lo + (listGet(w, i - 7) catch 0) + hi) & M32);
+        i = i + 1;
+    }
+    let a = listGet(st, 0) catch 0;
+    let b = listGet(st, 1) catch 0;
+    let c = listGet(st, 2) catch 0;
+    let d = listGet(st, 3) catch 0;
+    let e = listGet(st, 4) catch 0;
+    let f = listGet(st, 5) catch 0;
+    let g = listGet(st, 6) catch 0;
+    let h = listGet(st, 7) catch 0;
+    i = 0;
+    while (i < 64) {
+        const choose = (e & f) ^ ((e ^ M32) & g);
+        const t1 = (h + (ror(e, 6) ^ ror(e, 11) ^ ror(e, 25)) + choose + ROUND[i] + (listGet(w, i) catch 0)) & M32;
+        const major = (a & b) ^ (a & c) ^ (b & c);
+        const t2 = ((ror(a, 2) ^ ror(a, 13) ^ ror(a, 22)) + major) & M32;
+        h = g;
+        g = f;
+        f = e;
+        e = (d + t1) & M32;
+        d = c;
+        c = b;
+        b = a;
+        a = (t1 + t2) & M32;
+        i = i + 1;
+    }
+    listSet(st, 0, ((listGet(st, 0) catch 0) + a) & M32);
+    listSet(st, 1, ((listGet(st, 1) catch 0) + b) & M32);
+    listSet(st, 2, ((listGet(st, 2) catch 0) + c) & M32);
+    listSet(st, 3, ((listGet(st, 3) catch 0) + d) & M32);
+    listSet(st, 4, ((listGet(st, 4) catch 0) + e) & M32);
+    listSet(st, 5, ((listGet(st, 5) catch 0) + f) & M32);
+    listSet(st, 6, ((listGet(st, 6) catch 0) + g) & M32);
+    listSet(st, 7, ((listGet(st, 7) catch 0) + h) & M32);
+}
+
+// data 里 [from, from+n) 的 SHA-256 摘要（32 字节）；区间超出 data 的部分不算（同 Python 切片）。
+export function sha256Of(data: Bytes, from: int, n: int): Bytes {
+    let count = n;
+    if (from + count > bytesLen(data)) {
+        count = bytesLen(data) - from;
+    }
+    if (count < 0) {
+        count = 0;
+    }
+    // 初值：前 8 个素数平方根小数部分的前 32 位（FIPS 180-4 §5.3.3）。
+    const st: List<int> = listNew();
+    listPush(st, 0x6a09e667);
+    listPush(st, 0xbb67ae85);
+    listPush(st, 0x3c6ef372);
+    listPush(st, 0xa54ff53a);
+    listPush(st, 0x510e527f);
+    listPush(st, 0x9b05688c);
+    listPush(st, 0x1f83d9ab);
+    listPush(st, 0x5be0cd19);
+    const w: List<int> = listNew();
+    let k = 0;
+    while (k < 64) {
+        listPush(w, 0);
+        k = k + 1;
+    }
+    let done = 0;
+    while (done + 64 <= count) {
+        compress(st, data, from + done, w);
+        done = done + 64;
+    }
+    // 末块：余下的字节、0x80、补零，最后 8 字节是按位计的长度（大端）。
+    const rest = count - done;
+    let tailLen = 64;
+    if (rest >= 56) {
+        tailLen = 128;
+    }
+    const tail = bytesNew(tailLen);
+    k = 0;
+    while (k < rest) {
+        bytesSet(tail, k, bytesGet(data, from + done + k) catch 0);
+        k = k + 1;
+    }
+    bytesSet(tail, rest, 0x80);
+    const bits = count * 8;
+    k = 0;
+    while (k < 8) {
+        bytesSet(tail, tailLen - 1 - k, ((bits >>> (8 * k)) & 255) as u8);
+        k = k + 1;
+    }
+    compress(st, tail, 0, w);
+    if (tailLen == 128) {
+        compress(st, tail, 64, w);
+    }
+    const out = bytesNew(32);
+    k = 0;
+    while (k < 8) {
+        bytesSetBE<u32>(out, 4 * k, (listGet(st, k) catch 0) as u32);
+        k = k + 1;
+    }
+    return out;
+}
+
+// 字节串的小写十六进制。
+export function hexOf(b: Bytes): string {
+    let s = "";
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const v = bytesGet(b, i) catch 0;
+        s = s + byteText(DIGITS, v >>> 4) + byteText(DIGITS, v & 15);
+        i = i + 1;
+    }
+    return s;
+}
+
+function byteText(s: string, i: int): string {
+    const one = bytesNew(1);
+    bytesSet(one, 0, (byteAt(s, i) catch 0) as u8);
+    return bytesToStr(one) catch "?";
+}
+
+// 同 Python 的 '%#x'：0x 加不补零的小写十六进制；负数前置负号。
+export function hx(v: int): string {
+    if (v < 0) {
+        return "-0x" + digitsOf(wrapSub<int>(0, v), 1);
+    }
+    return "0x" + digitsOf(v, 1);
+}
+
+// 无符号 64 位字段（按 int 读进来、最高位可能为 1）的 '%#x'：同 Python 对无符号读出的值。
+export function hxu(v: int): string {
+    return "0x" + digitsOf(v, 1);
+}
+
+// 同 Python 的 '%#0Nx'（N＝width＋2）：0x 加至少 width 位的小写十六进制。
+export function hxw(v: int, width: int): string {
+    return "0x" + digitsOf(v, width);
+}
+
+function digitsOf(v: int, width: int): string {
+    let s = "";
+    let x = v;
+    while (x != 0 || len(s) < width) {
+        s = byteText(DIGITS, x & 15) + s;
+        x = x >>> 4;
+    }
+    return s;
+}
+
+// 按 UTF-8 解码，不合法的部分换成 U+FFFD（只用于报错与摘要文本）。同 Python 的 errors='replace'：每个不合法的最大子段
+// （合法的首字节连同其后合法的续字节，或单个不合法字节）换成一个 U+FFFD。
+export function lossyText(b: Bytes): string {
+    const whole = bytesToStr(b) catch (e) {
+        return lossySlow(b);
+    };
+    return whole;
+}
+
+function lossySlow(b: Bytes): string {
+    const out = bytesNew(0);
+    let i = 0;
+    const n = bytesLen(b);
+    while (i < n) {
+        const c = bytesGet(b, i) catch 0;
+        let need = 0;
+        // 第二字节的范围（排除超长编码、代理区与超出 U+10FFFF）。
+        let lo = 0x80;
+        let hi = 0xBF;
+        if (c >= 0xC2 && c <= 0xDF) {
+            need = 1;
+        } else if (c >= 0xE0 && c <= 0xEF) {
+            need = 2;
+            if (c == 0xE0) {
+                lo = 0xA0;
+            } else if (c == 0xED) {
+                hi = 0x9F;
+            }
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            need = 3;
+            if (c == 0xF0) {
+                lo = 0x90;
+            } else if (c == 0xF4) {
+                hi = 0x8F;
+            }
+        }
+        // 首字节之后连续合法的续字节数。
+        let got = 0;
+        while (got < need && i + 1 + got < n) {
+            const d = bytesGet(b, i + 1 + got) catch 0;
+            if (got == 0 && (d < lo || d > hi)) {
+                break;
+            }
+            if (got > 0 && (d < 0x80 || d > 0xBF)) {
+                break;
+            }
+            got = got + 1;
+        }
+        if (c < 0x80 || (need > 0 && got == need)) {
+            let k = 0;
+            while (k <= need) {
+                bytesPush(out, bytesGet(b, i + k) catch 0);
+                k = k + 1;
+            }
+            i = i + need + 1;
+        } else {
+            bytesPush(out, 0xEF);
+            bytesPush(out, 0xBF);
+            bytesPush(out, 0xBD);
+            i = i + 1 + got;
+        }
+    }
+    return bytesToStr(out) catch "";
+}
+
+// 读映像：越出文件的读得 0 并记下，核对结束前报错。
+export struct Img {
+    d: Bytes,
+    size: int,
+    oob: bool,
+    oobAt: int,
+}
+
+export function imgOf(d: Bytes): Ref<Img> {
+    return new Img { d: d, size: bytesLen(d), oob: false, oobAt: 0 };
+}
+
+export function miss(m: Ref<Img>, at: int): int {
+    if (!m.oob) {
+        m.oob = true;
+        m.oobAt = at;
+    }
+    return 0;
+}
+
+export function b8(m: Ref<Img>, at: int): int {
+    const v = bytesGetLE<u8>(m.d, at);
+    if (v == None) {
+        return miss(m, at);
+    }
+    return (v ?? 0) as int;
+}
+
+export function u16(m: Ref<Img>, at: int): int {
+    const v = bytesGetLE<u16>(m.d, at);
+    if (v == None) {
+        return miss(m, at);
+    }
+    return (v ?? 0) as int;
+}
+
+export function u32(m: Ref<Img>, at: int): int {
+    const v = bytesGetLE<u32>(m.d, at);
+    if (v == None) {
+        return miss(m, at);
+    }
+    return (v ?? 0) as int;
+}
+
+export function i32(m: Ref<Img>, at: int): int {
+    const v = bytesGetLE<i32>(m.d, at);
+    if (v == None) {
+        return miss(m, at);
+    }
+    return (v ?? 0) as int;
+}
+
+export function u64(m: Ref<Img>, at: int): int {
+    const v = bytesGetLE<int>(m.d, at);
+    if (v == None) {
+        return miss(m, at);
+    }
+    return v ?? 0;
+}
+
+export function be32(m: Ref<Img>, at: int): int {
+    const v = bytesGetBE<u32>(m.d, at);
+    if (v == None) {
+        return miss(m, at);
+    }
+    return (v ?? 0) as int;
+}
+
+export function be64(m: Ref<Img>, at: int): int {
+    const v = bytesGetBE<int>(m.d, at);
+    if (v == None) {
+        return miss(m, at);
+    }
+    return v ?? 0;
+}
+
+export function oobErr(m: Ref<Img>): Error {
+    return err("read past end of file at " + hx(m.oobAt));
+}

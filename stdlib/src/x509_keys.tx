@@ -1,0 +1,100 @@
+import { X509Algorithm, X509Certificate } from "./x509_types";
+import { x509Algorithm } from "./x509_der";
+import { derRead, derChildren, derPositiveInteger } from "./crypto/der";
+import { p256Hex, p256Prime } from "./crypto/p256_field";
+import { p256DecodePoint } from "./crypto/p256_point";
+import { RsaPublicKey, rsaPublicKey, rsaPkcs1Sha256Verify, rsaPssSha256Verify } from "./crypto/rsa";
+import { ecdsaP256VerifyDigest } from "./crypto/ecdsa_p256";
+import { ecdsaP384VerifyDigest } from "./crypto/ecdsa_p384";
+import { p384Prime } from "./crypto/p384_field";
+import { p384DecodePoint } from "./crypto/p384_point";
+import { sha256Sum } from "./hash";
+import { sha384Sum } from "./crypto/sha384";
+
+function nullOrAbsent(parameters: Bytes): bool { return bytesLen(parameters) == 0 || bytesEqual(parameters, p256Hex("0500")); }
+
+export function x509RsaPublicKey(cert: Ref<X509Certificate>): Ref<RsaPublicKey> | Error {
+    if (cert.publicKeyAlgorithm.oidHex != "2a864886f70d010101" || !nullOrAbsent(cert.publicKeyAlgorithm.parameters)) { return err("x509: requires rsaEncryption public key"); }
+    const data = cert.publicKey; const sequence = derRead(data, 0, bytesLen(data))?;
+    if (sequence.tag != 48 || sequence.end != bytesLen(data)) { return err("x509: invalid RSAPublicKey sequence"); }
+    const parts = derChildren(data, sequence, 2)?;
+    if (listLen(parts) != 2) { return err("x509: invalid RSA key fields"); }
+    const modulus = derPositiveInteger(data, listGet(parts, 0), 1024)?; const exponent = derPositiveInteger(data, listGet(parts, 1), 4)?;
+    let e = 0; let i = 0;
+    while (i < bytesLen(exponent)) { e = e * 256 + (bytesGet(exponent, i) catch 0); i = i + 1; }
+    return rsaPublicKey(modulus, e);
+}
+
+// TLS 服务器与证书链上的 RSA 密钥至少 2048 位（CA/B 论坛基线要求；客户端设计稿承诺）。只做解码的是 x509RsaPublicKey。
+export function x509TlsRsaPublicKey(cert: Ref<X509Certificate>): Ref<RsaPublicKey> | Error {
+    const key = x509RsaPublicKey(cert)?; if (key.bits < 2048) { return err("x509: RSA key shorter than 2048 bits"); } return key;
+}
+
+export function x509P256PublicKey(cert: Ref<X509Certificate>): Bytes | Error {
+    if (cert.publicKeyAlgorithm.oidHex != "2a8648ce3d0201" || !bytesEqual(cert.publicKeyAlgorithm.parameters, p256Hex("06082a8648ce3d030107"))) {
+        return err("x509: requires named P-256 public key");
+    }
+    p256DecodePoint(p256Prime(), cert.publicKey)?;
+    return bytesSlice(cert.publicKey, 0, bytesLen(cert.publicKey));
+}
+
+export function x509P384PublicKey(cert: Ref<X509Certificate>): Bytes | Error {
+    if (cert.publicKeyAlgorithm.oidHex != "2a8648ce3d0201" || !bytesEqual(cert.publicKeyAlgorithm.parameters, p256Hex("06052b81040022"))) {
+        return err("x509: requires named P-384 public key");
+    }
+    p384DecodePoint(p384Prime(), cert.publicKey)?;
+    return bytesSlice(cert.publicKey, 0, bytesLen(cert.publicKey));
+}
+
+function sha256Algorithm(algorithm: X509Algorithm): bool { return algorithm.oidHex == "608648016503040201" && nullOrAbsent(algorithm.parameters); }
+
+// TLS 1.3 SHA-256 PSS profile；DER 的默认 trailerField=1 应省略。
+function pssSha256(parameters: Bytes): void | Error {
+    const root = derRead(parameters, 0, bytesLen(parameters))?;
+    if (root.tag != 48 || root.end != bytesLen(parameters)) { return err("x509: invalid PSS parameters"); }
+    let hash = false; let mask = false; let salt = 20; let previous = -1;
+    for (entry in derChildren(parameters, root, 4)?) {
+        const index = entry.tag - 160;
+        if (index < 0 || index > 2 || index <= previous) { return err("x509: unsupported or non-canonical PSS parameter"); } previous = index;
+        const wrapped = derChildren(parameters, entry, 1)?;
+        if (listLen(wrapped) != 1) { return err("x509: invalid PSS wrapper"); }
+        const value = listGet(wrapped, 0);
+        if (index == 0) { hash = sha256Algorithm(x509Algorithm(parameters, value)?); }
+        else if (index == 1) {
+            const mgf = x509Algorithm(parameters, value)?;
+            if (mgf.oidHex != "2a864886f70d010108") { return err("x509: unsupported PSS mask function"); }
+            const nested = derRead(mgf.parameters, 0, bytesLen(mgf.parameters))?;
+            if (nested.end != bytesLen(mgf.parameters)) { return err("x509: trailing PSS hash parameters"); }
+            mask = sha256Algorithm(x509Algorithm(mgf.parameters, nested)?);
+        } else {
+            const raw = derPositiveInteger(parameters, value, 2)?; salt = 0; let i = 0;
+            while (i < bytesLen(raw)) { salt = salt * 256 + (bytesGet(raw, i) catch 0); i = i + 1; }
+        }
+    }
+    if (!hash || !mask || salt != 32) { return err("x509: unsupported PSS digest, mask or salt length"); }
+    return done();
+}
+
+export function x509VerifyCertificateSignature(cert: Ref<X509Certificate>, issuer: Ref<X509Certificate>): bool | Error {
+    const algorithm = cert.signatureAlgorithm;
+    if (algorithm.oidHex == "2a864886f70d01010b") {
+        if (!nullOrAbsent(algorithm.parameters)) { return err("x509: invalid RSA-SHA256 signature parameters"); }
+        if (issuer.publicKeyAlgorithm.oidHex != "2a864886f70d010101") { return false; }
+        return rsaPkcs1Sha256Verify(x509TlsRsaPublicKey(issuer)?, cert.tbs, cert.signature);
+    }
+    if (algorithm.oidHex == "2a864886f70d01010a") {
+        pssSha256(algorithm.parameters)?;
+        if (issuer.publicKeyAlgorithm.oidHex != "2a864886f70d010101") { return false; }
+        return rsaPssSha256Verify(x509TlsRsaPublicKey(issuer)?, cert.tbs, cert.signature);
+    }
+    if (algorithm.oidHex == "2a8648ce3d040302" || algorithm.oidHex == "2a8648ce3d040303") {
+        if (bytesLen(algorithm.parameters) != 0) { return err("x509: ECDSA signature parameters must be absent"); }
+        if (issuer.publicKeyAlgorithm.oidHex != "2a8648ce3d0201") { return false; }
+        let digest = sha256Sum(cert.tbs); if (algorithm.oidHex == "2a8648ce3d040303") { digest = sha384Sum(cert.tbs); }
+        if (bytesEqual(issuer.publicKeyAlgorithm.parameters, p256Hex("06082a8648ce3d030107"))) { return ecdsaP256VerifyDigest(x509P256PublicKey(issuer)?, digest, cert.signature); }
+        return ecdsaP384VerifyDigest(x509P384PublicKey(issuer)?, digest, cert.signature);
+    }
+    return err("x509: unsupported certificate signature algorithm " + algorithm.oidHex);
+}
+
+function done(): void {}

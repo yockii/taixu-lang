@@ -15,11 +15,11 @@ description: 太虚（Taixu）语言开发规范与上手指南。在创建、�
 
 **安装**：将本目录（`skill/taixu/`）复制到你的 Agent 技能目录（ZCode：`~/.zcode/skills/`；Claude Code：`.claude/skills/`；其它 Agent 按其技能机制注册）。
 
-> 工具链版本 0.3.0-beta.1（首次公测）。当前规范 D3 v0.53；命令以 `taixu capabilities` 为准。
+> 工具链版本 0.3.0-beta.2（第二个公测版）。当前规范 D3 v0.54；命令以 `taixu capabilities` 为准。
 
 > 开始生成代码前查询 taixu capabilities --format=json，核对 toolchain_version、diagnostic_version 与 schemas。遇到版本差异，用 taixu changes --format=json 查看迁移示例；applicability=unavailable 表示尚无自动修复。当前不提供 edition/API 版本门。
 
-**v0.31 现行边界（2026-10-21）**：编译器、运行时和 CLI 全部由太虚原生实现，直接生成原生可执行文件。模块级 `declare function` 必须有 `from "库"` 或 `from syscall 编号`；无 `from` 的宿主 extern 报 3033，即使未调用也报错。接口内的方法签名不是宿主 extern，不受影响。带 `from` 的既有 FFI、类型和 ABI 不变。GUI 由外部库 taixu-gui 提供（2026-10-26 起按原生引擎设计分期补齐），核心不内置 GUI 宿主；`taixu init gui` 生成用它的模板。原生 `build/run/test`、格式化、调试、DAP、LSP、MCP 与源码汇编清单保留；`build --bytecode` 报用法错误 64。
+**v0.31 现行边界（2026-10-21）**：编译器、运行时和 CLI 全部由太虚原生实现，直接生成原生可执行文件。模块级 `declare function` 必须有 `from "库"` 或 `from syscall 编号`；无 `from` 的宿主 extern 报 3033，即使未调用也报错。接口内的方法签名不是宿主 extern，不受影响。带 `from` 的既有 FFI、类型和 ABI 不变。GUI 由随附的可选库 gui/ 提供（纯太虚实现），核心不内置 GUI 宿主；`taixu init gui` 生成用它的模板。原生 `build/run/test`、格式化、调试、DAP、LSP、MCP 与源码汇编清单保留；`build --bytecode` 报用法错误 64。
 
 
 ## 1. 一句话定位
@@ -227,7 +227,7 @@ async function copyOut(path: string): int {
 - 同一 `Future` 可以多次 `await`（v0.38），每次得同一结果（与 future 共享：列表、结构体等引用类型得同一对象）；已取消的每次得 `err("task cancelled")`。`threadJoin` 不同：每个线程只能 join 一次，第二次得 `Error`。
 - `async` 函数的失败侧仍只能是 `Error`（错误 enum 失败侧 3028）。
 - 原生 `taixu run <file.tx> [程序参数...]`：文件之后的参数全部交给程序；`taixu test` 每个 test 块一个进程；`taixu fmt [--write|--check]` 由原生实现，以冻结兼容夹具和幂等性检查验证；规范形里泛型尖括号紧贴（`List<int>`、`Map<string, List<int>>`、`wrapTo<i32>(x)`，2026-10-25 起，此前排成 `List< int>`），`??` 两侧一空格（`a ?? -1`，此前排成 `a?? - 1`）。
-- `hostTarget` `getEnv` `setEnv`（v0.42） `runProcess` `tempDir` `removeFile` `selfExePath` `monoNs`，以及 v0.27 的进程与标准输入内建 `stdinRead` `stdoutWrite` `procSpawn` `procWrite` `procRead` `ioWait` `procKill` `procWait` `procClose`、v0.28 的 `currentDir`、v0.29 的 `fileSize`、v0.32 的 `procSpawnLimited` `readLocalFileBytes` `localEntryKind` `localFileSize`、v0.33 的 `procTryWrite` 与 v0.35 的 `hostArch` `localListDir`，是**工具链专用**内建（编译器自身使用，仅 `--toolchain` 构建可用，否则 3001）——生成应用代码时不要使用。
+- `hostTarget` `getEnv` `setEnv`（v0.42） `runProcess` `tempDir` `removeFile` `selfExePath` `monoNs`，以及 v0.27 的进程与标准输入内建 `stdinRead` `stdoutWrite` `procSpawn` `procWrite` `procRead` `ioWait` `procKill` `procWait` `procClose`（v0.54 增 `procCloseStream` `procPid`）、v0.28 的 `currentDir`、v0.29 的 `fileSize`、v0.32 的 `procSpawnLimited` `readLocalFileBytes` `localEntryKind` `localFileSize`、v0.33 的 `procTryWrite` 与 v0.35 的 `hostArch` `localListDir`，是**工具链专用**内建（编译器自身使用，仅 `--toolchain` 构建可用，否则 3001）——生成应用代码时不要使用。
 - 以 `__rt` 开头的名字是标准库的内部内建（D3 v0.24 §7），只有标准库模块能调用，用户代码调用报 3001——生成应用代码时不要使用。
 
 **v0.22：生成器 `function*`／`yield`／`Gen<T>`**：
@@ -482,7 +482,7 @@ const seen: Set<u32> = setNew();          // 定宽整数可作 Map/Set 的键
 | `makeDir` | `(string) void \| Error` | 创建单层目录，已存在的目录视为成功；递归用标准库 `makeDirAll`（v0.17） |
 | `writeExecutable` | `(string, List<int>) void \| Error` | 工具链专用（仅 `--toolchain` 构建可用，否则 3001）：写出带执行位的可执行文件；普通程序不要使用（v0.17） |
 | `hostTarget`/`hostArch`/`getEnv`/`setEnv`/`runProcess`/`tempDir`/`removeFile`/`selfExePath`/`monoNs` | 见右 | **工具链专用**（v0.21；`hostArch` 为 v0.35，`setEnv` 为 v0.42）：目标平台名、目标架构名、读环境变量（`string?`）、设环境变量（`setEnv(名, 值)`，`void \| Error`；写同一张表，此后起的子进程带上；名字为空、含 `=` 或 NUL，或值含 NUL 得 `Error`）、启动子进程并等待（`int \| Error`；子进程（`runProcess`、`procSpawn`）继承本进程当前的环境（v0.39，含 `std/os` 的 `setenv`），只得到标准三件（v0.40，本进程其余文件、套接字不进子进程））、临时目录、删文件（`void \| Error`）、自身路径、单调纳秒；未带 `--toolchain` 即编译错误 3001——生成应用代码时不要使用 |
-| `stdinRead`/`stdoutWrite`/`procSpawn`/`procWrite`/`procRead`/`ioWait`/`procKill`/`procWait`/`procClose` | 见右 | **工具链专用**（v0.27）：读本进程 stdin 进 `Bytes`、原样写 stdout；起子进程（参数数组、不经 shell、stdout/stderr 走管道，`int \| Error` 句柄），读写其管道（返回字节数，暂无数据 0、流尾 −1）、等就绪（位集合）、结束、等退出码（`int?`；Linux 被信号终止为负的信号号，子进程已被别处回收、状态不可知为 −256）、关闭；未带 `--toolchain` 即编译错误 3001，只能原生构建——生成应用代码时不要使用 |
+| `stdinRead`/`stdoutWrite`/`procSpawn`/`procWrite`/`procRead`/`ioWait`/`procKill`/`procWait`/`procClose` | 见右 | **工具链专用**（v0.27）：读本进程 stdin 进 `Bytes`、原样写 stdout；起子进程（参数数组、不经 shell、stdout/stderr 走管道，`int \| Error` 句柄），读写其管道（返回字节数，暂无数据 0、流尾 −1）、等就绪（位集合）、结束、等退出码（`int?`；Linux 被信号终止为负的信号号，子进程已被别处回收、状态不可知为 −256）、关闭；未带 `--toolchain` 即编译错误 3001，只能原生构建——生成应用代码时不要使用；`procCloseStream(h, stream)`（v0.54）关掉一个流在本进程这端（0 stdin 写端，子进程读到流尾；1 stdout、2 stderr 读端；3 控制通道），别的流照读写；`procPid(h)`（v0.54）得子进程的系统进程号 |
 | `currentDir` | `() string \| Error` | **工具链专用**（v0.28）：本进程当前工作目录的绝对路径；当前目录已被删除等失败得 `Error`（`no such file: .` 等）；未带 `--toolchain` 即编译错误 3001，只能原生构建——生成应用代码时不要使用 |
 | `fileSize` | `(string) int \| Error` | **工具链专用**（v0.29）：普通文件的字节数，只取元数据、不读内容，跟随符号链接；目录、设备等非普通文件得 `invalid argument: 路径`，不存在得 `no such file: 路径`；未带 `--toolchain` 即编译错误 3001，只能原生构建——生成应用代码时不要使用 |
 | `procSpawnLimited` | `(string, List<string>, string, int, int, int) int \| Error` | **工具链专用**（v0.32）：前四参同 `procSpawn`，另给内存字节数与 CPU 秒数（正整数）作系统硬限额，执行前设置、设置失败得 `Error` 且不执行；Windows 为 Job（总提交与逐进程提交、累计用户态 CPU、最多 32 个进程），Linux 为逐进程 RLIMIT_AS／RLIMIT_CPU 并自成进程组；macOS 为 RLIMIT_CPU 并自成进程组，内存由看守线程按组的物理足迹事后执行（超过即整组 SIGKILL，`procWait` 得 −9，不是分配失败）；限额不是沙箱；未带 `--toolchain` 即编译错误 3001——生成应用代码时不要使用 |
@@ -561,7 +561,7 @@ export function unixSeconds(): int {
 
 ## 本地工具服务的信任与预算
 
-LSP/MCP 以启动操作者的本地根为边界：不带 --workspace 时为当前目录；可重复 --workspace 和 --library-root，显式 TAIXU_STDLIB/TAIXU_GUI_ROOT 也属于库根。这些旗标不改变cwd或模块搜索规则；path相对启动目录，自动化宜传绝对路径。服务模式下，与编译器可执行文件同目录的 stdlib/src（发布包布局；也认 taixu-stdlib/src）、taixu-gui/src存在且可核验时自动授权；按目录上溯发现的同级仓只有位于已授权根内时才会被找到，否则须以 --library-root 或 TAIXU_STDLIB／TAIXU_GUI_ROOT 显式授权。TAIXU_STDLIB／TAIXU_GUI_ROOT 指向无法核验的目录时只在 stderr 告警、不授权；--workspace、--library-root 无法核验时拒绝启动（退出 64）。WSL 的 /mnt/<盘符>（9p／drvfs）以及虚拟机、Docker Desktop 的共享目录（virtiofs、fuse.grpcfuse、fakeowner）属主机共享挂载，缺省拒绝；启动操作者可用可重复的 --allow-mount-type <类型> 逐类开启（作用于全部根，MCP 转给 worker），discover 的 security 与 LSP initialize 的 taixuFileAccess 以 host_share_mount_types 报告已开启的类型；网络 9p（trans=tcp／rdma）与 nfs、cifs 等网络文件系统开启也拒绝。网络路径（Linux 按启动时读取的挂载表核验根及其祖先，Windows 只接受本地硬盘卷）、设备等非普通文件与根之下的符号链接／重解析点拒绝；启动操作者给的根本身经符号链接、目录联接或 SUBST 盘符时（如 macOS 的 /tmp、/var），启动时解析为真实路径一次，核验对真实路径做，roots 报真实根、root_aliases 报写法与真实根，请求里按写法给的路径改写到真实根；硬链接不检测；initialize/workspaceFolders 与 RPC 参数不能授权新根。库只读不表示代码可安全执行。
+LSP/MCP 以启动操作者的本地根为边界：不带 --workspace 时为当前目录；可重复 --workspace 和 --library-root，显式 TAIXU_STDLIB/TAIXU_GUI_ROOT 也属于库根。这些旗标不改变cwd或模块搜索规则；path相对启动目录，自动化宜传绝对路径。服务模式下，与编译器可执行文件同目录的 stdlib/src（发布包布局；也认 taixu-stdlib/src）、gui/src（也认 taixu-gui/src）存在且可核验时自动授权；按目录上溯发现的同级仓只有位于已授权根内时才会被找到，否则须以 --library-root 或 TAIXU_STDLIB／TAIXU_GUI_ROOT 显式授权。TAIXU_STDLIB／TAIXU_GUI_ROOT 指向无法核验的目录时只在 stderr 告警、不授权；--workspace、--library-root 无法核验时拒绝启动（退出 64）。WSL 的 /mnt/<盘符>（9p／drvfs）以及虚拟机、Docker Desktop 的共享目录（virtiofs、fuse.grpcfuse、fakeowner）属主机共享挂载，缺省拒绝；启动操作者可用可重复的 --allow-mount-type <类型> 逐类开启（作用于全部根，MCP 转给 worker），discover 的 security 与 LSP initialize 的 taixuFileAccess 以 host_share_mount_types 报告已开启的类型；网络 9p（trans=tcp／rdma）与 nfs、cifs 等网络文件系统开启也拒绝。网络路径（Linux 按启动时读取的挂载表核验根及其祖先，Windows 只接受本地硬盘卷）、设备等非普通文件与根之下的符号链接／重解析点拒绝；启动操作者给的根本身经符号链接、目录联接或 SUBST 盘符时（如 macOS 的 /tmp、/var），启动时解析为真实路径一次，核验对真实路径做，roots 报真实根、root_aliases 报写法与真实根，请求里按写法给的路径改写到真实根；硬链接不检测；initialize/workspaceFolders 与 RPC 参数不能授权新根。库只读不表示代码可安全执行。
 
 LSP 资源预算（initialize 结果的 experimental.taixuResources 宣告实际值；initializationOptions.taixuResources 只能收紧）：打开文档至多 1024 个、合计 256 MiB、单文档 32 MiB，一条 didChange 的 range 编辑按编辑前全文字节累计至多 64 MiB；超出的文档按未打开处理（分析取磁盘内容），发 code 为 document_budget／change_budget 的说明诊断（source 为 taixu-lsp），其上的请求回 -32803（data.reason 同码），全文变更回到预算内或重新打开即恢复。全部入口的程序源码至多 32 MiB（超出的入口发 analysis_budget，此时 rename 拒绝、references 附 logMessage），检查缓存只留最近使用、累计至多 4 MiB 的入口（其余下次冷查，结果相同）。单文件诊断至多 1000 条、1 MiB（末条 code 为 diagnostics_truncated），回复至多 32 MiB（否则 -32803 response_too_large）。去抖 300 ms、最长等待 2 s；$/cancelRequest 在同步分析的入口之间生效（回 -32800），单个入口的检查不中断。写 stdout 阻塞：客户端停读时服务停住、不再读入，读端关闭即退出（码 3）。
 

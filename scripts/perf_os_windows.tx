@@ -1,0 +1,156 @@
+// 性能测量取子进程读数的 Windows 部分（导出面同 perf_os_linux.tx、perf_os_macos.tx）：内建 procSpawn 起子进程（stdin 接 NUL），随即按
+// procPid 以 OpenProcess 另开一个进程句柄（内建的句柄到 procClose 才关，其间进程号不会被复用）。子进程结束后取 QueryProcessCycleTime
+// （各线程在 CPU 上时按 TSC 计的周期，含内核态）、GetProcessTimes 的内核与用户时间（按 15.625 ms 的时钟节拍量化，只记录）与
+// K32GetProcessMemoryInfo 的 PeakWorkingSetSize（PROCESS_MEMORY_COUNTERS 在 x64／ARM64 上 72 字节，第 1 个字）。
+import { lossyText } from "./check_lib";
+import { maskText, pipesNew, pipesOpen, pump, pumpRest } from "./perf_child";
+
+declare function OpenProcess(access: u32, inherit: i32, pid: u32): isize from "kernel32";
+declare function WaitForSingleObject(h: isize, ms: u32): u32 from "kernel32";
+declare function GetProcessTimes(h: isize, creation: Bytes, exit: Bytes, kernel: Bytes, user: Bytes): i32 from "kernel32";
+declare function QueryProcessCycleTime(h: isize, cycles: Bytes): i32 from "kernel32";
+declare function K32GetProcessMemoryInfo(h: isize, counters: Bytes, cb: u32): i32 from "kernel32";
+declare function CloseHandle(h: isize): i32 from "kernel32";
+declare function GetLastError(): u32 from "kernel32";
+declare function GetSystemTimeAsFileTime(ft: Bytes): void from "kernel32";
+declare function GetCurrentProcess(): isize from "kernel32";
+declare function GetProcessAffinityMask(h: isize, process: Bytes, system: Bytes): i32 from "kernel32";
+declare function SetProcessAffinityMask(h: isize, mask: usize): i32 from "kernel32";
+
+export struct PerfSample {
+    exit: int,
+    wallNs: int,
+    cpuNs: int,
+    peakKib: int,
+    // 用户态退休指令数与周期数（Linux、macOS）；Windows 为 −1。
+    instructions: int,
+    cycles: int,
+    // QueryProcessCycleTime 的周期（Windows）；别处为 −1。
+    cycleTime: int,
+    // 子进程刚起来时允许它运行的逻辑 CPU，逗号分隔；macOS 为空。
+    cpus: string,
+    // 非空时本样本作废（起不来、超时、计数器多路复用等）。
+    error: string,
+    // 子进程的 stderr（非法 UTF-8 按 U+FFFD 替换）。
+    stderr: string,
+}
+
+// SYNCHRONIZE｜PROCESS_QUERY_LIMITED_INFORMATION。
+const ACCESS: int = 1052672;
+const COUNTERS_SIZE: int = 72;
+const WAIT_OBJECT_0: int = 0;
+const DRAIN_MS: int = 10000;
+
+function fail(why: string): Ref<PerfSample> {
+    return new PerfSample { exit: -1, wallNs: 0, cpuNs: 0, peakKib: 0, instructions: -1, cycles: -1, cycleTime: -1, cpus: "", error: why,
+        stderr: "" };
+}
+
+// 进程 h 允许运行的逻辑 CPU（进程亲和掩码），逗号分隔；取不到得空串。
+function cpusOf(h: isize): string {
+    const mask = bytesNew(8);
+    const system = bytesNew(8);
+    if (GetProcessAffinityMask(h, mask, system) == 0) {
+        return "";
+    }
+    return maskText(mask, 8);
+}
+
+function ns100(b: Bytes): int {
+    return (bytesGetLE<int>(b, 0) ?? 0) * 100;
+}
+
+// 在 cwd 里运行 exe（stdin 接 NUL，stdout 丢弃，stderr 留在样本里），至多 limitMs 毫秒。
+export function perfRun(exe: string, args: List<string>, cwd: string, limitMs: int): Ref<PerfSample> {
+    const t0 = monoNs();
+    const h = procSpawn(exe, args, cwd, 0) catch (e) {
+        return fail("spawn " + e.message);
+    };
+    const proc = OpenProcess(ACCESS as u32, 0, procPid(h) as u32);
+    if ((proc as int) == 0) {
+        const e = GetLastError() as int;
+        procClose(h);
+        return fail("OpenProcess error " + toStr(e));
+    }
+    const cpus = cpusOf(proc);
+    const p = pipesNew(h);
+    const deadline = t0 + limitMs * 1000000;
+    let exited = false;
+    while (!exited) {
+        let waitMs = 0;
+        if (pipesOpen(p)) {
+            pump(p, 20);
+        } else {
+            waitMs = 20;
+        }
+        exited = (WaitForSingleObject(proc, waitMs as u32) as int) == WAIT_OBJECT_0;
+        if (!exited && monoNs() > deadline) {
+            procKill(h);
+            procClose(h);
+            CloseHandle(proc);
+            return fail("timeout");
+        }
+    }
+    const s = fail("");
+    s.cpus = cpus;
+    s.wallNs = monoNs() - t0;
+    pumpRest(p, DRAIN_MS);
+    s.exit = procWait(h, 5000) ?? -1;
+    procClose(h);
+    s.stderr = lossyText(p.err);
+    const created = bytesNew(8);
+    const ended = bytesNew(8);
+    const kernel = bytesNew(8);
+    const user = bytesNew(8);
+    if (GetProcessTimes(proc, created, ended, kernel, user) != 0) {
+        s.cpuNs = ns100(kernel) + ns100(user);
+    } else {
+        s.error = "GetProcessTimes error " + toStr(GetLastError() as int);
+    }
+    const cycles = bytesNew(8);
+    if (QueryProcessCycleTime(proc, cycles) != 0) {
+        s.cycleTime = bytesGetLE<int>(cycles, 0) ?? -1;
+    } else {
+        s.error = "QueryProcessCycleTime error " + toStr(GetLastError() as int);
+    }
+    const counters = bytesNew(COUNTERS_SIZE);
+    bytesSetLE<u32>(counters, 0, COUNTERS_SIZE as u32);
+    if (K32GetProcessMemoryInfo(proc, counters, COUNTERS_SIZE as u32) != 0) {
+        s.peakKib = (bytesGetLE<int>(counters, 8) ?? 0) / 1024;
+    } else {
+        s.error = "GetProcessMemoryInfo error " + toStr(GetLastError() as int);
+    }
+    CloseHandle(proc);
+    return s;
+}
+
+// 当前时间的 Unix 秒（FILETIME 以 1601 年起的 100 纳秒计）。
+export function unixSeconds(): int {
+    const ft = bytesNew(8);
+    GetSystemTimeAsFileTime(ft);
+    return (bytesGetLE<int>(ft, 0) ?? 0) / 10000000 - 11644473600;
+}
+
+// 本进程允许运行的逻辑 CPU，逗号分隔。
+export function ownCpus(): string {
+    return cpusOf(GetCurrentProcess());
+}
+
+// 把本进程（及此后起的子进程）固定在逻辑 CPU cpu 上（本处理器组内）；cpu 不在当前允许的集合里得 Error。
+export function pinCpu(cpu: int): void | Error {
+    const mask = bytesNew(8);
+    const system = bytesNew(8);
+    if (cpu < 0 || cpu >= 64 || GetProcessAffinityMask(GetCurrentProcess(), mask, system) == 0) {
+        return err("取不到 CPU 亲和掩码，或 CPU 号超出范围：" + toStr(cpu));
+    }
+    if ((((bytesGetLE<int>(mask, 0) ?? 0) >> cpu) & 1) == 0) {
+        return err("CPU " + toStr(cpu) + " 不在当前允许集合：" + ownCpus());
+    }
+    if (SetProcessAffinityMask(GetCurrentProcess(), (1 << cpu) as usize) == 0) {
+        return err("SetProcessAffinityMask: error " + toStr(GetLastError() as int));
+    }
+    return nothing();
+}
+
+function nothing(): void {
+}

@@ -1,0 +1,1406 @@
+// 原生 `taixu lsp` 的无头会话门。§四-1、§六。
+//
+// 各组：
+//   lifecycle  initialize 之前、再次 initialize、坏 JSON、非对象、缺 method、带 id 的 $/、未知方法、串 id、shutdown 之后、退出码 0/1/3、
+//              --stdio 重复与 --toolchain；
+//   framing    帧头回归（test_frames.tx）；
+//   encoding   缺省 utf-16、宣告 utf-8 时选 utf-8，中文行的列；
+//   uri        Windows 的 %3A 形与小写盘符、百分号编码的中文路径，POSIX 路径；回复与诊断用客户端给的 URI；
+//   diag       分文件发布、依赖改动后重查、修好后清空、覆盖层、未保存的新文件、导入失败、关闭后、防抖、范围终点；
+//   format     只替换首尾相同行之间的一段（无尾换行、只改中间一行，编辑应用后与格式化结果相同）、无变化、词法错误、未打开；
+//   symbols    各种声明的种类、名字位置与范围，utf-16 下的中文列；
+//   refs       definition（捕获、跨文件、字段、方法糖、内建、名字末尾的光标、中文列、for-in、泛型体）、references（struct 的导入名、
+//              类型标注补面、字面量、声明，includeDeclaration）、rename（局部、跨文件、方法糖的前缀改写与拒绝、struct 连类型标注、
+//              模板插值、标准库、遮蔽、坏新名与缺 newName），import { a as b }，变更后立即请求按新文本作答；
+//   tokens     legend、记号逐个对照（补面、中文串之后的 utf-16 列）、变更后立即请求、未打开的文档、refreshSupport 时的 refresh 与
+//              对其响应的静默收下；
+//   hover      各类声明的说明、泛型照写与随实例不同的注明、导入名、prelude、内建与遮蔽内建的用户函数、名字末尾、关键字与注释为
+//              null、变更后立即请求、plaintext 偏好；
+//   sig        宣告的触发字符、各个实参位置、嵌套与 ) 之后、函数名上为 null、方法糖不含接收者、变体构造、函数类型的绑定、串里的
+//              逗号、隔着型参的内建（utf-16 偏移）、导入的函数、未闭合的 (、分组括号；
+//   complete   局部按位置与块、形参、顶层声明与导入名、遮蔽内建、内建与 --toolchain、prelude 的导出、类型名、None 与关键字，注释、
+//              串与 . 之后为空表。
+//
+// 客户端是 test_proto.tx 的分帧模式（回复以独立的 test_json.tx 解析）。服务起在仓根，工作区为仓根与工作目录（信任根取真实
+// 路径：macOS 的临时目录在 /var 下，/var 是链接），库根优先取 TAIXU_STDLIB，否则为仓内 stdlib/src 或同级 taixu-stdlib/src。
+// 取不到字段时记该项 FAIL、余下照跑（组本身起不来时记 <组>: crash）；FAIL 行的细节是 JSON 原文；读到流尾之后再取消息
+// 不再等满超时。
+//
+// 运行（仓根）：taixu run --toolchain scripts/test_lsp_e2e.tx --compiler <原生 taixu> [--only 组,组] [--work 目录]
+// 任何 FAIL 时退出码 1。
+import { absolute, deleteTree, dirOf, join, kindOf, mkdirs, nat, onWindows } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { captureRaw } from "./test_lib";
+import { byteSub, contains, headChars, indexOf, slashes } from "./test_text";
+import { J_ARR, Jv, jDump, jInt, jNull, jParse, jQuote, jSorted, jText } from "./test_json";
+import { at, count, dump, eqJson, fieldsOf, has, intIs, isArr, isNull, isObj, item, lastBy, textIs, textOf, trueAt } from "./test_jv";
+import { peerIdle } from "./test_proto";
+import { framingCases } from "./test_frames";
+import { change, changeText, close, diags, finish, frameOf, get, init, kill, Lsp, lspOpen, notify, open, pubsFor, quiet, raw, request, requestRid, send, units, uriOf,
+    vscodeUri, WAIT_MS, waitExit } from "./test_lsp_session";
+
+const SEC: int = 1000000000;
+const GROUPS: []string = ["lifecycle", "framing", "encoding", "uri", "diag", "format", "symbols", "refs", "tokens", "hover", "sig", "complete"];
+
+const ZH: string = "// 中文注释：位置换算\nexport struct Point {\n    x: int,\n    y: int,\n}\n\nexport function dist(p: Ref< Point>): int {\n    return p.x + p.y;\n}\n\nexport function main(args: []string): int {\n    const p: Ref< Point> = new Point { x: 1, y: 2 };\n    print(\"距离：\" + toStr(dist(p)) + \"𝄞\" + toStr(nope));\n    return 0;\n}\n";
+const SYMS: string = "import { x } from \"./other\";\nexport const UNIT: int = 1;\nlet counter = 0;\nconst (left, right) = pair();\nexport struct Box<T> {\n    v: T,\n}\nenum Color {\n    Red,\n    Green,\n}\nexport interface Shape {\n    function area(): int;\n}\ndeclare type Handle;\ndeclare function lstrlenW(s: wstr): i32 from \"kernel32\";\nexport async function load(): int {\n    return 1;\n}\nfunction* gen(): Gen<int> {\n    yield 1;\n}\ntest \"加法：\\\"一\\\"\" {\n    assert(1 + 1 == 2, \"x\");\n}\nexport function 坏(\nexport function after(): int {\n    return 2;\n}\n";
+const REFS_A: string = "import { Point, Pair, LIMIT, makePoint, pick } from \"./b\";\nimport { newBuilder } from \"std/bytes\";\n\nfunction pointSum(p: Point): int {\n    return p.x + p.y;\n}\n\nfunction sumPair(q: Pair): int {\n    return q.a + q.b;\n}\n\nfunction apply(f: (int) => int, v: int): int {\n    return f(v);\n}\n\nfunction main(args: []string): int {\n    const base = 10;\n    const outer = (a: int): int => {\n        const inner = (b: int): int => a + b + base;\n        return inner(a);\n    };\n    const p: Point = makePoint(1, 2);\n    let total = p.sum() + apply(outer, base) + LIMIT + sumPair(Pair { a: 1, b: 2 });\n    const count = pick(1, 2) + pick(3, 4);\n    print(`n=${count}`);\n    const m = newBuilder();\n    for (k in args) {\n        total = total + len(k);\n    }\n    print(\"中文\" + toStr(base));\n    return total;\n}\n";
+const REFS_B: string = "export struct Point {\n    x: int,\n    y: int,\n}\n\nexport struct Pair {\n    a: int,\n    b: int,\n}\n\nexport const LIMIT: int = 3;\n\nexport function makePoint(x: int, y: int): Point {\n    return Point { x: x, y: y };\n}\n\nexport function pick<T>(a: T, b: T): T {\n    const c = a;\n    return c;\n}\n";
+const REFS_C: string = "import { LIMIT as CAP, makePoint as mk } from \"./b\";\n\nfunction main(args: []string): int {\n    const p = mk(1, 2);\n    return CAP + p.x;\n}\n";
+const TOKS: string = "struct Point {\n    x: int,\n}\n\nenum Color {\n    Red,\n}\n\nfunction area(p: Point, c: Color): int {\n    const s = \"中文\" + toStr(p.x);\n    return switch (c) {\n        case Red => p.x,\n    };\n}\n";
+// (行, utf-16 列, 长, 类)，以分号分隔；类为 legend 下标（function struct enum enumMember variable parameter property）。
+const TOKS_WANT: string = "0,7,5,1;1,4,1,6;4,5,5,2;5,4,3,3;8,9,4,0;8,14,1,5;8,17,5,1;8,24,1,5;8,27,5,2;9,10,1,4;9,27,1,5;9,29,1,6;10,19,1,5;11,13,3,3;11,20,1,5;11,22,1,6";
+const TOKS_WANT_SHIFTED: string = "1,7,5,1;2,4,1,6;5,5,5,2;6,4,3,3;9,9,4,0;9,14,1,5;9,17,5,1;9,24,1,5;9,27,5,2;10,10,1,4;10,27,1,5;10,29,1,6;11,19,1,5;12,13,3,3;12,20,1,5;12,22,1,6";
+const HOV_LIB: string = "export function scale(v: int, k: int): int {\n    return v * k;\n}\n";
+const HOV: string = "import { scale } from \"./hlib\";\n\nstruct Point {\n    x: int,\n}\n\nenum Shape {\n    Dot,\n    Circle(r: int),\n}\n\nfunction wrap<T>(v: T): List< T> {\n    const out: List< T> = listNew();\n    listPush(out, v);\n    return out;\n}\n\nfunction risky(n: int): int | Error {\n    if (n < 0) { return err(\"neg\"); }\n    return n;\n}\n\nfunction assert(ok: bool): void {\n    if (!ok) { print(\"bad\"); }\n}\n\nfunction main(args: []string): int {\n    const p = Point { x: scale(2, 3) };\n    const m = mapNew< string, int>();\n    let s = \"中文\" + toStr(p.x);\n    print(s);\n    assert(true);\n    const a = wrap(1);\n    const b = wrap(\"x\");\n    const v = risky(p.x) catch (e) {\n        return 1;\n    };\n    return switch (Shape.Circle(v)) {\n        case Circle(r) => r + listLen(a) + listLen(b),\n        case Dot => 0,\n    };\n}\n// print(s)\n";
+const SIG_LIB: string = "export function scale(v: int, k: int): int {\n    return v * k;\n}\n";
+const SIG: string = "import { scale } from \"./slib\";\n\nstruct P {\n    x: int,\n}\n\nenum Shape {\n    Dot,\n    Circle(r: int),\n}\n\nfunction pArea(p: P, k: int): int {\n    return p.x * k;\n}\n\nfunction add(a: int, b: int): int {\n    return a + b;\n}\n\nfunction wrap<T>(v: T, n: int): List< T> {\n    const out: List< T> = listNew();\n    listPush(out, v);\n    return out;\n}\n\nfunction main(args: []string): int {\n    const p = P { x: 1 };\n    const g = (q: int): int => q * 2;\n    const s = add(1, add(2, 3));\n    const t = p.area(4);\n    const u = Shape.Circle(5);\n    const w = g(6);\n    const z = wrap(\"a,b\", 7);\n    const c = wrapTo< u8>(300);\n    print(toStr(scale(s, t)));\n    return 0;\n}\n";
+const COMP: string = "import { scale } from \"./clib\";\n\nstruct Box {\n    v: int,\n}\n\nfunction helper(n: int): int {\n    return n;\n}\n\nfunction assert(ok: bool): void {\n    if (!ok) { print(\"bad\"); }\n}\n\nlet counter: int = 0;\n\nfunction main(args: []string): int {\n    const outer = 1;\n    if (outer > 0) {\n        const inner = 2;\n        print(toStr(inner + scale(1, 2)));\n    }\n    // here comment\n    const msg = \"text here\";\n    const b = Box { v: 1 };\n    const later = b.v;\n    return outer;\n}\n";
+const COMP2: string = "enum Kind {\n    A,\n    B(n: int),\n}\n\nfunction pick(k: Kind): int {\n    return switch (k) {\n        case B(n) => n + 0,\n        else => 0,\n    };\n}\n\nexport function main(args: []string): int {\n    const outer = 1;\n    if (outer > 0) {\n        const outer = \"s\";\n        print(outer);\n    }\n    const data = readFile(\"nope.txt\") catch (e) {\n        print(e.message);\n        return pick(Kind.A);\n    };\n    const tpl = `v=${outer} d=${data}`;\n    print(tpl);\n    return 0;\n}\n";
+const L_ADD: string = "function add(a: int, b: int): int";
+const L_SCALE: string = "function scale(v: int, k: int): int";
+
+struct Ctx {
+    exe: string,
+    root: string,
+    work: string,
+    lib: string,
+    passes: int,
+    fails: int,
+}
+
+// 逐项输出 'PASS  名字' 或 'FAIL  名字 细节'（细节至多 400 字符）。
+function check(c: Ref<Ctx>, name: string, ok: bool, detail: string): bool {
+    if (ok) {
+        c.passes = c.passes + 1;
+        print("PASS  " + name);
+    } else {
+        c.fails = c.fails + 1;
+        print("FAIL  " + name + " " + headChars(detail, 400));
+    }
+    return ok;
+}
+
+// ---------------------------------------------------------------- 会话
+
+function lspStart(c: Ref<Ctx>, args: List<string>): Ref<Lsp> | Error {
+    let has_ = false;
+    let hasLib = false;
+    for (a in args) {
+        if (a == "--workspace") {
+            has_ = true;
+        }
+        if (a == "--library-root") {
+            hasLib = true;
+        }
+    }
+    const all: List<string> = listNew();
+    for (a in args) {
+        listPush(all, a);
+    }
+    if (!has_) {
+        // 此语料需要读取仓库外的标准库；测试启动者显式授权，协议不扩权。
+        listPush(all, "--workspace");
+        listPush(all, c.root);
+        listPush(all, "--workspace");
+        listPush(all, c.work);
+        if (!hasLib) {
+            listPush(all, "--library-root");
+            listPush(all, c.lib);
+        }
+    }
+    return lspOpen(c.exe, all, c.root);
+}
+
+function session(c: Ref<Ctx>): Ref<Lsp> | Error {
+    return lspStart(c, words2("lsp", "--stdio"));
+}
+
+function words2(a: string, b: string): List<string> {
+    const xs: List<string> = listNew();
+    listPush(xs, a);
+    listPush(xs, b);
+    return xs;
+}
+
+// ---------------------------------------------------------------- 位置、URI 与编辑
+
+struct Pos {
+    line: int,
+    ch: int,
+}
+
+// 从字节位置 at 起前进 n 个字符后的字节位置。
+function charsAfter(s: string, at_: int, n: int): int {
+    let i = at_;
+    let k = 0;
+    while (k < n && i < len(s)) {
+        i = i + 1;
+        while (i < len(s) && ((byteAt(s, i) ?? 0) & 0xC0) == 0x80) {
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    return i;
+}
+
+// 第一处含 needle 的行，needle 之后再 delta 个字符的位置。没有得 (−1, −1)。
+function posOf(text: string, needle: string, enc: string, delta: int): Pos {
+    let ln = 0;
+    for (line in strSplit(text, "\n")) {
+        const i = indexOf(line, needle);
+        if (i >= 0) {
+            return Pos { line: ln, ch: units(byteSub(line, 0, charsAfter(line, i, delta)), enc) };
+        }
+        ln = ln + 1;
+    }
+    return Pos { line: -1, ch: -1 };
+}
+
+function posJson(p: Pos): string {
+    return "{\"line\": " + toStr(p.line) + ", \"character\": " + toStr(p.ch) + "}";
+}
+
+function rangeJson(sl: int, sc: int, el: int, ec: int): string {
+    return "{\"start\": {\"line\": " + toStr(sl) + ", \"character\": " + toStr(sc) + "}, \"end\": {\"line\": " + toStr(el) + ", \"character\": "
+    + toStr(ec) + "}}";
+}
+
+// 从 needle 之后 delta 个字符起、n 个字符的范围（第一处出现）。
+function rng(text: string, needle: string, n: int, delta: int): string {
+    const p = posOf(text, needle, "utf-16", delta);
+    const line = listGet(strSplit(text, "\n"), p.line) catch "";
+    const from = charsAfter(line, indexOf(line, needle), delta);
+    return rangeJson(p.line, p.ch, p.line, units(byteSub(line, 0, charsAfter(line, from, n)), "utf-16"));
+}
+
+// 第 lineNo 行里 needle 起、n 个字符的范围。
+function rngLine(text: string, lineNo: int, needle: string, n: int): string {
+    const line = listGet(strSplit(text, "\n"), lineNo) catch "";
+    const i = indexOf(line, needle);
+    return rangeJson(lineNo, units(byteSub(line, 0, i), "utf-16"), lineNo, units(byteSub(line, 0, charsAfter(line, i, n)), "utf-16"));
+}
+
+function loc(uri: string, range: string): string {
+    return "{\"uri\": " + jQuote(uri) + ", \"range\": " + range + "}";
+}
+
+// 位置换成字节偏移（utf-16 时取前 character 个码元能完整装下的字符）。
+function offsetOf(lines: List<string>, p: Ref<Jv>?, enc: string): int {
+    const ln = jInt(at(p, "line")) ?? 0;
+    const chr = jInt(at(p, "character")) ?? 0;
+    let before = 0;
+    let k = 0;
+    while (k < ln && k < listLen(lines)) {
+        before = before + len(listGet(lines, k) catch "") + 1;
+        k = k + 1;
+    }
+    let line = "";
+    if (ln < listLen(lines)) {
+        line = listGet(lines, ln) catch "";
+    }
+    if (enc != "utf-16") {
+        if (chr < len(line)) {
+            return before + chr;
+        }
+        return before + len(line);
+    }
+    let i = 0;
+    let used = 0;
+    while (i < len(line)) {
+        const c = byteAt(line, i) ?? 0;
+        let w = 1;
+        let size = 1;
+        if (c >= 0xF0) {
+            w = 2;
+            size = 4;
+        } else if (c >= 0xE0) {
+            size = 3;
+        } else if (c >= 0xC0) {
+            size = 2;
+        }
+        if (used + w > chr) {
+            break;
+        }
+        used = used + w;
+        i = i + size;
+    }
+    return before + i;
+}
+
+// 应用互不重叠的 TextEdit（按起点从后往前替换）。
+function applyEdits(text: string, edits: Ref<Jv>?, enc: string): string {
+    const lines = strSplit(text, "\n");
+    const n = count(edits);
+    const starts: List<int> = listNew();
+    const ends: List<int> = listNew();
+    const order: List<int> = listNew();
+    let i = 0;
+    while (i < n) {
+        const e = item(edits, i);
+        listPush(starts, offsetOf(lines, at(at(e, "range"), "start"), enc));
+        listPush(ends, offsetOf(lines, at(at(e, "range"), "end"), enc));
+        // 按 (起点行, 起点列) 降序：起点偏移与之同序。
+        let at_ = listLen(order);
+        listPush(order, i);
+        while (at_ > 0 && (listGet(starts, listGet(order, at_ - 1) catch 0) catch 0) < (listGet(starts, i) catch 0)) {
+            listSet(order, at_, listGet(order, at_ - 1) catch 0);
+            at_ = at_ - 1;
+        }
+        listSet(order, at_, i);
+        i = i + 1;
+    }
+    let raw_ = bytesFromStr(text);
+    for (k in order) {
+        const a = listGet(starts, k) catch 0;
+        const z = listGet(ends, k) catch 0;
+        const out = bytesSlice(raw_, 0, a);
+        bytesAppend(out, bytesFromStr(textOf(item(edits, k), "newText")));
+        bytesAppend(out, bytesSlice(raw_, z, bytesLen(raw_) - z));
+        raw_ = out;
+    }
+    return bytesToStr(raw_) catch "";
+}
+
+// str.replace（全部替换）。
+function replaceAll(s: string, a: string, b: string): string {
+    const parts = strSplit(s, a);
+    let out = "";
+    let i = 0;
+    while (i < listLen(parts)) {
+        if (i > 0) {
+            out = out + b;
+        }
+        out = out + (listGet(parts, i) catch "");
+        i = i + 1;
+    }
+    return out;
+}
+
+// re.sub(r'\bw\b', r, s)：两侧不是字母、数字、下划线（非 ASCII 字符按字母算，同 Python 的 Unicode \w）。
+function replaceWord(s: string, w: string, r: string): string {
+    let out = "";
+    let from = 0;
+    let i = indexOf(s, w);
+    while (i >= 0) {
+        const at_ = from + i;
+        let before = 32;
+        if (at_ > 0) {
+            before = byteAt(s, at_ - 1) ?? 32;
+        }
+        let after = 32;
+        if (at_ + len(w) < len(s)) {
+            after = byteAt(s, at_ + len(w)) ?? 32;
+        }
+        out = out + byteSub(s, from, at_ - from);
+        if (!wordByte(before) && !wordByte(after)) {
+            out = out + r;
+        } else {
+            out = out + w;
+        }
+        from = at_ + len(w);
+        i = indexOf(byteSub(s, from, len(s) - from), w);
+    }
+    return out + byteSub(s, from, len(s) - from);
+}
+
+function wordByte(c: int): bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95 || c >= 128;
+}
+
+// 诊断的码，排序后以空格连接（缺 code 记 0）。
+function codes(ds: Ref<Jv>?): string {
+    const xs: List<int> = listNew();
+    let i = 0;
+    while (i < count(ds)) {
+        const v = jInt(at(item(ds, i), "code")) ?? 0;
+        let k = listLen(xs);
+        listPush(xs, v);
+        while (k > 0 && (listGet(xs, k - 1) catch 0) > v) {
+            listSet(xs, k, listGet(xs, k - 1) catch 0);
+            k = k - 1;
+        }
+        listSet(xs, k, v);
+        i = i + 1;
+    }
+    let s = "";
+    for (x in xs) {
+        if (len(s) > 0) {
+            s = s + " ";
+        }
+        s = s + toStr(x);
+    }
+    return s;
+}
+
+function hasCode(ds: Ref<Jv>?, code: int): bool {
+    let i = 0;
+    while (i < count(ds)) {
+        if ((jInt(at(item(ds, i), "code")) ?? 0) == code) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 码为 code 的诊断（同 Python 的列表推导）。
+function withCode(ds: Ref<Jv>?, code: int): List<Ref<Jv>> {
+    const out: List<Ref<Jv>> = listNew();
+    let i = 0;
+    while (i < count(ds)) {
+        const d = item(ds, i) ?? jNull();
+        if ((jInt(at(d, "code")) ?? 0) == code) {
+            listPush(out, d);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+function dumps(xs: List<Ref<Jv>>): string {
+    let s = "[";
+    let i = 0;
+    while (i < listLen(xs)) {
+        if (i > 0) {
+            s = s + ", ";
+        }
+        s = s + jDump(listGet(xs, i) catch jNull());
+        i = i + 1;
+    }
+    return s + "]";
+}
+
+function result(r: Ref<Jv>?): Ref<Jv>? {
+    return at(r, "result");
+}
+
+// 'result' in r and r['result'] is None。
+function nullResult(r: Ref<Jv>?): bool {
+    return r != None && isNull(result(r));
+}
+
+function errCode(r: Ref<Jv>?, code: int): bool {
+    return r != None && intIs(at(r, "error"), "code", code);
+}
+
+function md(code: string, note: string): string {
+    let v = "```taixu\n" + code + "\n```";
+    if (len(note) > 0) {
+        v = v + "\n\n" + note;
+    }
+    return "{\"kind\": \"markdown\", \"value\": " + jQuote(v) + "}";
+}
+
+// 签名帮助的期望：spans 为 "起,止 起,止"。
+function sigJson(label: string, spans: string, active: int): string {
+    let ps = "";
+    for (sp in strSplit(spans, " ")) {
+        if (len(ps) > 0) {
+            ps = ps + ", ";
+        }
+        ps = ps + "{\"label\": [" + sp + "]}";
+    }
+    return "{\"signatures\": [{\"label\": " + jQuote(label) + ", \"parameters\": [" + ps + "], \"activeParameter\": " + toStr(active)
+    + "}], \"activeSignature\": 0, \"activeParameter\": " + toStr(active) + "}";
+}
+
+// 语义记号的 data 解成 "行,列,长,类[,修饰]"，以分号连接。
+function decode(data: Ref<Jv>?): string {
+    let s = "";
+    let line = 0;
+    let col = 0;
+    let i = 0;
+    while (i + 4 < count(data)) {
+        const dl = jInt(item(data, i)) ?? 0;
+        const dc = jInt(item(data, i + 1)) ?? 0;
+        const n = jInt(item(data, i + 2)) ?? 0;
+        const tt = jInt(item(data, i + 3)) ?? 0;
+        const mod = jInt(item(data, i + 4)) ?? 0;
+        if (dl != 0) {
+            line = line + dl;
+            col = dc;
+        } else {
+            col = col + dc;
+        }
+        if (len(s) > 0) {
+            s = s + ";";
+        }
+        s = s + toStr(line) + "," + toStr(col) + "," + toStr(n) + "," + toStr(tt);
+        if (mod != 0) {
+            s = s + "," + toStr(mod);
+        }
+        i = i + 5;
+    }
+    return s;
+}
+
+function tokensOf(r: Ref<Jv>?): string {
+    return decode(at(result(r), "data"));
+}
+
+function textDoc(uri: string): string {
+    return "{\"textDocument\": {\"uri\": " + jQuote(uri) + "}}";
+}
+
+// {"textDocument": {"uri": …}, "position": …[, 其余]}。
+function at3(uri: string, p: Pos, extra: string): string {
+    return "{\"textDocument\": {\"uri\": " + jQuote(uri) + "}, \"position\": " + posJson(p) + extra + "}";
+}
+
+function path(c: Ref<Ctx>, rel: string): string {
+    return nat(join(c.work, rel));
+}
+
+function writeText(p: string, text: string): void | Error {
+    mkdirs(dirOfPath(p));
+    writeFile(p, text)?;
+}
+
+function dirOfPath(p: string): string {
+    let i = len(p) - 1;
+    while (i > 0 && (byteAt(p, i) ?? 0) != 47 && (byteAt(p, i) ?? 0) != 92) {
+        i = i - 1;
+    }
+    return byteSub(p, 0, i);
+}
+
+// 清空重建目录（同 shutil.rmtree 后 mkdir）。
+function freshSub(c: Ref<Ctx>, rel: string): string {
+    const d = path(c, rel);
+    if (kindOf(d) == 2) {
+        deleteTree(d);
+    }
+    mkdirs(d);
+    return d;
+}
+
+// ---------------------------------------------------------------- 各组
+
+function gLifecycle(c: Ref<Ctx>): void | Error {
+    const three: List<string> = listNew();
+    listPush(three, "lsp");
+    listPush(three, "--stdio");
+    listPush(three, "--stdio");
+    let s = lspStart(c, three)?;
+    let r = requestRid(s, "textDocument/documentSymbol", "{\"textDocument\": {\"uri\": \"file:///x.tx\"}}", "1");
+    check(c, "lifecycle: initialize 之前的请求 -32002", errCode(r, -32002) && intIs(r, "id", 1), dump(r));
+    r = init(s, "");
+    const caps = at(result(r), "capabilities");
+    const info = at(result(r), "serverInfo");
+    check(c, "lifecycle: initialize 能力（缺省 utf-16、格式化、documentSymbol、全量同步）", textIs(caps, "positionEncoding", "utf-16")
+        && trueAt(caps, "documentFormattingProvider") && trueAt(caps, "documentSymbolProvider")
+        && eqJson(at(caps, "textDocumentSync"), "{\"openClose\": true, \"change\": 1}"), dump(caps));
+    check(c, "lifecycle: serverInfo 增 version", textIs(info, "name", "taixu") && len(textOf(info, "version")) > 0, dump(info));
+    r = request(s, "initialize", "{\"processId\": null, \"rootUri\": null, \"capabilities\": {}}");
+    check(c, "lifecycle: 再次 initialize 回 -32600（LSP 3.17：只能发一次）", errCode(r, -32600), dump(r));
+    raw(s, frameOf("not json"));
+    let g = get(s, WAIT_MS);
+    check(c, "lifecycle: 坏 JSON 回 -32700 且带 \"id\":null", g.kind == 0 && isObj(g.msg) && errCode(g.msg, -32700) && isNull(at(g.msg, "id")),
+        dump(g.msg));
+    raw(s, frameOf("[1,2]"));
+    g = get(s, WAIT_MS);
+    check(c, "lifecycle: 非对象回 -32600 且带 \"id\":null", g.kind == 0 && isObj(g.msg) && errCode(g.msg, -32600) && isNull(at(g.msg, "id")),
+        dump(g.msg));
+    raw(s, frameOf("{\"jsonrpc\":\"2.0\",\"id\":77}"));
+    g = get(s, WAIT_MS);
+    check(c, "lifecycle: 带 id 缺 method 回 -32600", g.kind == 0 && isObj(g.msg) && errCode(g.msg, -32600) && intIs(g.msg, "id", 77), dump(g.msg));
+    r = request(s, "$/frobnicate", "{}");
+    check(c, "lifecycle: 带 id 的 $/ 请求 -32601", errCode(r, -32601), dump(r));
+    r = requestRid(s, "workspace/symbol", "{\"query\": \"x\"}", "\"s-1\"");
+    check(c, "lifecycle: 未知请求 -32601，串 id 原样回显", errCode(r, -32601) && textIs(r, "id", "s-1"), dump(r));
+    notify(s, "$/cancelRequest", "{\"id\": 1}");
+    notify(s, "workspace/didChangeConfiguration", "{\"settings\": {}}");
+    r = request(s, "shutdown", "");
+    check(c, "lifecycle: shutdown 回 null", nullResult(r), dump(r));
+    r = request(s, "textDocument/documentSymbol", "{\"textDocument\": {\"uri\": \"file:///x.tx\"}}");
+    check(c, "lifecycle: shutdown 之后的请求 -32600", errCode(r, -32600), dump(r));
+    let code = finish(s, false);
+    check(c, "lifecycle: shutdown 后 exit 退出 0", code == 0, toStr(code));
+    kill(s);
+    const one: List<string> = listNew();
+    listPush(one, "lsp");
+    s = lspStart(c, one)?;
+    r = init(s, "");
+    code = finish(s, false);
+    check(c, "lifecycle: 未 shutdown 就 exit 退出 1", code == 1, toStr(code));
+    kill(s);
+    s = lspStart(c, one)?;
+    raw(s, bytesFromStr("Content-Length: abc\r\n\r\n{}"));
+    code = waitExit(s);
+    check(c, "lifecycle: 坏帧头退出 3", code == 3, toStr(code));
+    kill(s);
+    s = lspStart(c, one)?;
+    raw(s, bytesFromStr("Content-Length: 40000000\r\n\r\n"));
+    code = waitExit(s);
+    check(c, "lifecycle: 超过 32 MiB 的消息退出 3", code == 3, toStr(code));
+    kill(s);
+    const tool: List<string> = listNew();
+    listPush(tool, "lsp");
+    listPush(tool, "--toolchain");
+    listPush(tool, "--stdio");
+    s = lspStart(c, tool)?;
+    r = init(s, "");
+    check(c, "lifecycle: 接受 --toolchain", r != None && has(r, "result"), dump(r));
+    code = finish(s, true);
+    kill(s);
+    const bogus = words2("lsp", "--bogus");
+    const p = captureRaw(c.exe, bogus, c.root, 30 * SEC, 10 * SEC, 1048576)?;
+    check(c, "lifecycle: 不认识的选项退出 64", p.code == 64, toStr(p.code));
+}
+
+function gFraming(c: Ref<Ctx>): void | Error {
+    framingCases(c.exe, "lsp", c.root, (name: string, ok: bool, detail: string): bool => check(c, name, ok, detail));
+}
+
+function gEncoding(c: Ref<Ctx>): void | Error {
+    const p = path(c, "enc/zh.tx");
+    writeText(p, ZH)?;
+    const encsList: []string = ["[\"utf-8\", \"utf-16\"]", "[\"utf-16\"]", ""];
+    const reprs: []string = ["['utf-8', 'utf-16']", "['utf-16']", "None"];
+    const wants: []string = ["utf-8", "utf-16", "utf-16"];
+    let k = 0;
+    while (k < 3) {
+        const want = wants[k];
+        const s = session(c)?;
+        const r = init(s, encsList[k]);
+        const got = at(at(result(r), "capabilities"), "positionEncoding");
+        check(c, "encoding: 宣告 " + reprs[k] + " 时选 " + want, jText(got) != None && (jText(got) ?? "") == want, dump(got));
+        const u = uriOf(p);
+        open(s, u, ZH);
+        const ds = diags(s, u);
+        const d = withCode(ds, 3001);
+        const st = posOf(ZH, "nope));", want, 0);
+        check(c, "encoding: " + want + " 下中文串与四字节字符之后的诊断列与终点", listLen(d) == 1
+            && eqJson(at(listGet(d, 0) catch jNull(), "range"), rangeJson(st.line, st.ch, st.line, st.ch + 4)), dump(ds));
+        const code = finish(s, true);
+        kill(s);
+        k = k + 1;
+    }
+}
+
+function gUri(c: Ref<Ctx>): void | Error {
+    const f = path(c, "uri/目录 甲/m.tx");
+    const text = "export function main(args: []string): int {\n    return gone();\n}\n";
+    writeText(f, text)?;
+    const names: List<string> = listNew();
+    const uris: List<string> = listNew();
+    listPush(names, "百分号编码");
+    listPush(uris, uriOf(f));
+    if (onWindows()) {
+        listPush(names, "VS Code 形（小写盘符、%3A）");
+        listPush(uris, vscodeUri(f));
+        listPush(names, "未编码的中文");
+        listPush(uris, "file:///" + slashes(f));
+    }
+    let k = 0;
+    while (k < listLen(names)) {
+        const name = listGet(names, k) catch "";
+        const u = listGet(uris, k) catch "";
+        const s = session(c)?;
+        const r0 = init(s, "");
+        open(s, u, text);
+        const ds = diags(s, u);
+        check(c, "uri: " + name + " 的诊断以客户端的 URI 发布", ds != None && hasCode(ds, 3001), dump(ds));
+        const r = request(s, "textDocument/documentSymbol", textDoc(u));
+        check(c, "uri: " + name + " 的 documentSymbol", r != None && fieldsOf(result(r), "name") == "main" && count(result(r)) == 1, dump(r));
+        const code = finish(s, true);
+        kill(s);
+        k = k + 1;
+    }
+}
+
+function gDiag(c: Ref<Ctx>): void | Error {
+    const d = freshSub(c, "proj");
+    const fa = "import { twice } from \"./b\";\nimport { fresh } from \"./c\";\n\nexport function main(args: []string): int {\n    return twice(fresh());\n}\n";
+    const fb = "export function twice(n: int): int {\n    const s: string = n;\n    return n * 2;\n}\n";
+    writeFile(nat(join(d, "a.tx")), fa)?;
+    writeFile(nat(join(d, "b.tx")), fb)?;
+    const ua = uriOf(nat(join(d, "a.tx")));
+    const ub = uriOf(nat(join(d, "b.tx")));
+    const uc = uriOf(nat(join(d, "c.tx")));
+    const s = session(c)?;
+    const r0 = init(s, "");
+    open(s, ua, fa);
+    let da = diags(s, ua);
+    let db = diags(s, ub);
+    check(c, "diag: 入口的诊断发在入口（缺导入 3008、未定义 3001）", codes(da) == "3001 3008", dump(da));
+    check(c, "diag: 被导入模块的诊断发在它自己的文件（未打开也发）", codes(db) == "3002", dump(db));
+    const imp = withCode(da, 3008);
+    check(c, "diag: 缺导入落在 import 语句上", listLen(imp) > 0 && eqJson(at(at(listGet(imp, 0) catch jNull(), "range"), "start"),
+            "{\"line\": 1, \"character\": 0}"), dumps(imp));
+    const undef = withCode(da, 3001);
+    const st = posOf(fa, "fresh());", "utf-16", 0);
+    check(c, "diag: 范围终点为记号末尾", listLen(undef) > 0 && eqJson(at(listGet(undef, 0) catch jNull(), "range"),
+            rangeJson(st.line, st.ch, st.line, st.ch + 5)), dumps(undef));
+    // 未保存的新文件：打开 c.tx（磁盘上没有）后缺导入消失。
+    open(s, uc, "export function fresh(): int {\n    return 3;\n}\n");
+    da = diags(s, ua);
+    check(c, "diag: 打开未保存的新文件后缺导入消失", codes(da) == "", dump(da));
+    // 依赖改动后重查：b 打开并改掉 twice，a 的诊断随之出现。
+    open(s, ub, fb);
+    quiet(s, 1000);
+    let ignored = pubsFor(s, ub);
+    changeText(s, ub, 2, "export function thrice(n: int): int {\n    return n * 3;\n}\n");
+    da = diags(s, ua);
+    db = diags(s, ub);
+    check(c, "diag: 依赖改动后导入方重查（twice 不再导出）", da != None && (hasCode(da, 3001) || hasCode(da, 3008)), dump(da));
+    check(c, "diag: 修好的文件清空诊断", db != None && eqJson(db, "[]"), dump(db));
+    // 防抖：连续五次变更只分析一次（300 ms 内）。
+    quiet(s, 1000);
+    ignored = pubsFor(s, ua);
+    ignored = pubsFor(s, ub);
+    let v = 3;
+    while (v < 8) {
+        changeText(s, ub, v, "export function twice(n: int): int {\n    const s: string = " + toStr(v) + ";\n    return n * 2;\n}\n");
+        peerIdle(s.p, 30);
+        v = v + 1;
+    }
+    quiet(s, 1500);
+    ignored = pubsFor(s, ua);
+    let pb = pubsFor(s, ub);
+    check(c, "diag: 连续变更防抖后只发布一次", listLen(pb) == 1 && codes(listGet(pb, 0) catch jNull()) == "3002", dumps(pb));
+    // 带 range 的变更按协商编码应用（§五）。第 1 行为 `    const s: string = 7;`，把第 22 列的 7 换成 "x"。
+    change(s, ub, 9, "[{\"range\": {\"start\": {\"line\": 1, \"character\": 22}, \"end\": {\"line\": 1, \"character\": 23}}, \"text\": \"\\\"x\\\"\"}]");
+    quiet(s, 1500);
+    ignored = pubsFor(s, ua);
+    pb = pubsFor(s, ub);
+    check(c, "diag: 带 range 的变更生效（修好后清空）", listLen(pb) == 1 && eqJson(listGet(pb, 0) catch jNull(), "[]"), dumps(pb));
+    const r = request(s, "textDocument/documentSymbol", textDoc(ub));
+    check(c, "diag: 带 range 的变更后文本正确", r != None && count(result(r)) == 1 && fieldsOf(result(r), "name") == "twice", dump(r));
+    // 关闭未保存的新文件：缺导入回来。
+    close(s, uc);
+    da = diags(s, ua);
+    check(c, "diag: 关闭未保存的新文件后缺导入回来", da != None && hasCode(da, 3008), dump(da));
+    // 覆盖层：入口未保存的修改。
+    changeText(s, ua, 2, "export function main(args: []string): int {\n    return 0;\n}\n");
+    da = diags(s, ua);
+    check(c, "diag: 入口未保存的修改生效（覆盖层）", da != None && eqJson(da, "[]"), dump(da));
+    const code = finish(s, true);
+    check(c, "diag: 正常退出", code == 0, toStr(code));
+    kill(s);
+}
+
+function gFormat(c: Ref<Ctx>): void | Error {
+    const p = path(c, "fmt/f.tx");
+    const messy = "export function f(n: int): int {\n  return n;\n}";
+    const clean = "export function f(n: int): int {\n    return n;\n}\n";
+    writeText(p, messy)?;
+    const u = uriOf(p);
+    const s = session(c)?;
+    const r0 = init(s, "");
+    open(s, u, messy);
+    let r = request(s, "textDocument/formatting", "{\"textDocument\": {\"uri\": " + jQuote(u) + "}, \"options\": {\"tabSize\": 4, \"insertSpaces\": true}}");
+    let edits = result(r);
+    // 首行相同、最后一行无尾换行而不同：替换第 1 行起到文末（不重复最后一行）。
+    check(c, "format: 无尾换行时只替换变化的行段、终点为文末", isArr(edits) && count(edits) == 1 && eqJson(at(item(edits, 0), "range"),
+            rangeJson(1, 0, 2, 1)), dump(edits));
+    check(c, "format: 应用编辑后与格式化结果相同", isArr(edits) && applyEdits(messy, edits, "utf-16") == clean, dump(edits));
+    const mid = "export function f(n: int): int {\n  return n;\n}\n";
+    changeText(s, u, 2, mid);
+    r = request(s, "textDocument/formatting", "{\"textDocument\": {\"uri\": " + jQuote(u) + "}, \"options\": {}}");
+    edits = result(r);
+    check(c, "format: 只改中间一行时编辑只覆盖那一行", isArr(edits) && count(edits) == 1 && eqJson(at(item(edits, 0), "range"), rangeJson(1, 0, 2, 0))
+        && textIs(item(edits, 0), "newText", "    return n;\n"), dump(edits));
+    check(c, "format: 应用后与格式化结果相同（中间一行）", isArr(edits) && applyEdits(mid, edits, "utf-16") == clean, dump(edits));
+    changeText(s, u, 3, clean);
+    r = request(s, "textDocument/formatting", "{\"textDocument\": {\"uri\": " + jQuote(u) + "}, \"options\": {}}");
+    check(c, "format: 已规范时回 []", r != None && eqJson(result(r), "[]"), dump(r));
+    changeText(s, u, 4, "export function f(): int {\n    return \"unterminated;\n}\n");
+    r = request(s, "textDocument/formatting", "{\"textDocument\": {\"uri\": " + jQuote(u) + "}, \"options\": {}}");
+    check(c, "format: 词法错误时回 null", nullResult(r), dump(r));
+    r = request(s, "textDocument/formatting", "{\"textDocument\": {\"uri\": " + jQuote(uriOf(path(c, "fmt/none.tx"))) + "}, \"options\": {}}");
+    check(c, "format: 未打开的文档回 null", nullResult(r), dump(r));
+    const code = finish(s, true);
+    kill(s);
+}
+
+function gSymbols(c: Ref<Ctx>): void | Error {
+    const p = path(c, "sym/s.tx");
+    writeText(p, SYMS)?;
+    const u = uriOf(p);
+    const s = session(c)?;
+    const r0 = init(s, "");
+    open(s, u, SYMS);
+    let r = request(s, "textDocument/documentSymbol", textDoc(u));
+    const res = result(r);
+    let got = "";
+    let i = 0;
+    while (i < count(res)) {
+        if (i > 0) {
+            got = got + " ";
+        }
+        got = got + textOf(item(res, i), "name") + ":" + toStr(jInt(at(item(res, i), "kind")) ?? -1);
+        i = i + 1;
+    }
+    check(c, "symbols: 种类与名字（import 不列，test 为 12 且名字解码，解构逐个列）", got == "UNIT:14 counter:13 left:14 right:14 Box:23 Color:10 Shape:11 Handle:23 lstrlenW:12 load:12 gen:12 加法：\"一\":12 after:12",
+        got);
+    const unit = lastBy(res, "name", "UNIT");
+    check(c, "symbols: 绑定的名字位置在名字上（不在关键字上）", unit != None && eqJson(at(unit, "selectionRange"), rangeJson(1, 13, 1, 17)), dump(unit));
+    check(c, "symbols: 范围从 export 起到 ; 止", unit != None && eqJson(at(unit, "range"), rangeJson(1, 0, 1, 27)), dump(unit));
+    const box = lastBy(res, "name", "Box");
+    check(c, "symbols: 块形声明的范围到匹配的 }", box != None && eqJson(at(at(box, "range"), "end"), "{\"line\": 6, \"character\": 1}"), dump(box));
+    const t = lastBy(res, "name", "加法：\"一\"");
+    let ln = 0;
+    for (line in strSplit(SYMS, "\n")) {
+        if (line == "test \"加法：\\\"一\\\"\" {") {
+            break;
+        }
+        ln = ln + 1;
+    }
+    check(c, "symbols: test 的名字位置为串字面量（utf-16 列）", t != None && eqJson(at(t, "selectionRange"), rangeJson(ln, 5, ln, 5
+                + units("\"加法：\\\"一\\\"\"", "utf-16"))), dump(t));
+    check(c, "symbols: 写到一半的声明不吞掉后面的声明", lastBy(res, "name", "after") != None, got);
+    r = request(s, "textDocument/documentSymbol", textDoc(uriOf(path(c, "sym/none.tx"))));
+    check(c, "symbols: 未打开的文档回 []", r != None && eqJson(result(r), "[]"), dump(r));
+    const code = finish(s, true);
+    kill(s);
+}
+
+// 位置列表按 (uri, 起点行, 起点列) 排序后逐项相等（同 Python 的 sorted(…, key=…) ==）。
+function sameLocs(got: Ref<Jv>?, want: string): bool {
+    const w = jParse(want) catch jNull();
+    if (count(got) != count(w)) {
+        return false;
+    }
+    const a = sortedLocs(got);
+    const b = sortedLocs(w);
+    let i = 0;
+    while (i < listLen(a)) {
+        if ((listGet(a, i) catch "") != (listGet(b, i) catch "")) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function sortedLocs(v: Ref<Jv>?): List<string> {
+    const keys: List<string> = listNew();
+    const vals: List<string> = listNew();
+    let i = 0;
+    while (i < count(v)) {
+        const x = item(v, i) ?? jNull();
+        const start = at(at(x, "range"), "start");
+        const key = textOf(x, "uri") + "\u{1}" + pad9(intOfJv(at(start, "line"))) + "\u{1}" + pad9(intOfJv(at(start, "character")));
+        const val = jDump(jSorted(x));
+        let k = listLen(keys);
+        listPush(keys, key);
+        listPush(vals, val);
+        while (k > 0 && byteGreater(listGet(keys, k - 1) catch "", key)) {
+            listSet(keys, k, listGet(keys, k - 1) catch "");
+            listSet(vals, k, listGet(vals, k - 1) catch "");
+            k = k - 1;
+        }
+        listSet(keys, k, key);
+        listSet(vals, k, val);
+        i = i + 1;
+    }
+    return vals;
+}
+
+function intOfJv(v: Ref<Jv>?): int {
+    return jInt(v) ?? 0;
+}
+
+function pad9(n: int): string {
+    let s = toStr(n);
+    while (len(s) < 9) {
+        s = "0" + s;
+    }
+    return s;
+}
+
+function byteGreater(a: string, b: string): bool {
+    let i = 0;
+    while (i < len(a) && i < len(b)) {
+        const x = byteAt(a, i) ?? 0;
+        const y = byteAt(b, i) ?? 0;
+        if (x != y) {
+            return x > y;
+        }
+        i = i + 1;
+    }
+    return len(a) > len(b);
+}
+
+// changes 的键恰为给定的 uri 集合（以空格分隔）。
+function keysAre(ch: Ref<Jv>?, uris: List<string>): bool {
+    if (!isObj(ch)) {
+        return false;
+    }
+    const o = ch ?? jNull();
+    if (listLen(o.keys) != listLen(uris)) {
+        return false;
+    }
+    for (u in uris) {
+        if (!has(ch, u)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function one(a: string): List<string> {
+    const xs: List<string> = listNew();
+    listPush(xs, a);
+    return xs;
+}
+
+function gRefs(c: Ref<Ctx>): void | Error {
+    const d = freshSub(c, "refs");
+    writeFile(nat(join(d, "a.tx")), REFS_A)?;
+    writeFile(nat(join(d, "b.tx")), REFS_B)?;
+    const ua = uriOf(nat(join(d, "a.tx")));
+    const ub = uriOf(nat(join(d, "b.tx")));
+    const s = session(c)?;
+    let r = init(s, "");
+    const caps = at(result(r), "capabilities");
+    check(c, "refs: 宣告 definition、references、rename", trueAt(caps, "definitionProvider") && trueAt(caps, "referencesProvider")
+        && trueAt(caps, "renameProvider"), dump(caps));
+    open(s, ua, REFS_A);
+    // 未经防抖就请求：入口先同步分析。
+    r = request(s, "textDocument/definition", at3(ua, posOf(REFS_A, "+ base;", "utf-16", 2), ""));
+    const want = loc(ua, rng(REFS_A, "const base", 4, 6));
+    check(c, "refs: definition 嵌套闭包里的捕获解到源（打开后立即请求）", r != None && eqJson(result(r), want), dump(r));
+    r = request(s, "textDocument/definition", at3(ua, posOf(REFS_A, "+ base;", "utf-16", 6), ""));
+    check(c, "refs: definition 光标在名字末尾", r != None && eqJson(result(r), want), dump(r));
+    r = request(s, "textDocument/definition", at3(ua, posOf(REFS_A, "makePoint(1", "utf-16", 2), ""));
+    check(c, "refs: definition 跨文件到未打开的模块", r != None && eqJson(result(r), loc(ub, rng(REFS_B, "makePoint", 9, 0))), dump(r));
+    r = request(s, "textDocument/definition", at3(ua, posOf(REFS_A, "p.x", "utf-16", 2), ""));
+    check(c, "refs: definition 字段到被导入模块的字段声明", r != None && eqJson(result(r), loc(ub, rngLine(REFS_B, 1, "x", 1))), dump(r));
+    r = request(s, "textDocument/definition", at3(ua, posOf(REFS_A, "p.sum()", "utf-16", 2), ""));
+    check(c, "refs: definition 方法糖到函数", r != None && eqJson(result(r), loc(ua, rng(REFS_A, "pointSum", 8, 0))), dump(r));
+    r = request(s, "textDocument/definition", at3(ua, posOf(REFS_A, "len(k)", "utf-16", 0), ""));
+    check(c, "refs: definition 内建回 null", r != None && (result(r) == None || isNull(result(r))) && !has(r, "error"), dump(r));
+    r = request(s, "textDocument/definition", at3(ua, posOf(REFS_A, "toStr(base)", "utf-16", 6), ""));
+    check(c, "refs: definition utf-16 下中文串之后的列", r != None && eqJson(result(r), want), dump(r));
+    r = request(s, "textDocument/definition", at3(ua, posOf(REFS_A, "len(k)", "utf-16", 4), ""));
+    check(c, "refs: definition for-in 变量", r != None && eqJson(result(r), loc(ua, rng(REFS_A, "for (k", 1, 5))), dump(r));
+
+    r = request(s, "textDocument/references", at3(ua, posOf(REFS_A, "Pair {", "utf-16", 0), ", \"context\": {\"includeDeclaration\": true}"));
+    const wantPair3 = loc(ua, rngLine(REFS_A, 0, "Pair", 4)) + ", " + loc(ua, rng(REFS_A, "q: Pair", 4, 3)) + ", " + loc(ua, rng(REFS_A, "Pair {", 4, 0));
+    check(c, "refs: references struct（导入名、类型标注、字面量、声明）", sameLocs(result(r), "[" + wantPair3 + ", " + loc(ub, rng(REFS_B, "Pair", 4, 0)) + "]"),
+        dump(result(r)));
+    r = request(s, "textDocument/references", at3(ua, posOf(REFS_A, "Pair {", "utf-16", 0), ", \"context\": {\"includeDeclaration\": false}"));
+    check(c, "refs: references 不含声明", sameLocs(result(r), "[" + wantPair3 + "]"), dump(result(r)));
+
+    open(s, ub, REFS_B);
+    r = request(s, "textDocument/definition", at3(ub, posOf(REFS_B, "return c", "utf-16", 7), ""));
+    check(c, "refs: definition 泛型函数体里的局部（经实例）", r != None && eqJson(result(r), loc(ub, rng(REFS_B, "const c", 1, 6))), dump(r));
+
+    // —— rename ——
+    r = request(s, "textDocument/rename", at3(ua, posOf(REFS_A, "const base", "utf-16", 6), ", \"newName\": \"start\""));
+    let edits = at(at(result(r), "changes"), ua);
+    check(c, "refs: rename 局部（含捕获处）", count(edits) == 4 && applyEdits(REFS_A, edits, "utf-16") == replaceAll(REFS_A, "base", "start"), dump(r));
+    r = request(s, "textDocument/rename", at3(ua, posOf(REFS_A, "makePoint(1", "utf-16", 0), ", \"newName\": \"newPoint\""));
+    let ch = at(result(r), "changes");
+    const both: List<string> = listNew();
+    listPush(both, ua);
+    listPush(both, ub);
+    check(c, "refs: rename 跨文件（打开的与未打开的都改）", keysAre(ch, both)
+        && applyEdits(REFS_A, at(ch, ua), "utf-16") == replaceAll(REFS_A, "makePoint", "newPoint")
+        && applyEdits(REFS_B, at(ch, ub), "utf-16") == replaceAll(REFS_B, "makePoint", "newPoint"), dump(r));
+    r = request(s, "textDocument/rename", at3(ua, posOf(REFS_A, "function pointSum", "utf-16", 9), ", \"newName\": \"pointTotal\""));
+    ch = at(result(r), "changes");
+    check(c, "refs: rename 方法糖调用点按前缀改写", applyEdits(REFS_A, at(ch, ua), "utf-16")
+        == replaceAll(replaceAll(REFS_A, "pointSum", "pointTotal"), "p.sum()", "p.total()"), dump(r));
+    r = request(s, "textDocument/rename", at3(ua, posOf(REFS_A, "function pointSum", "utf-16", 9), ", \"newName\": \"totalOf\""));
+    check(c, "refs: rename 方法糖新名不带前缀即拒绝（-32803）", errCode(r, -32803), dump(r));
+    r = request(s, "textDocument/rename", at3(ua, posOf(REFS_A, "Pair {", "utf-16", 0), ", \"newName\": \"Couple\""));
+    ch = at(result(r), "changes");
+    check(c, "refs: rename struct 连类型标注一起改（补面）", applyEdits(REFS_A, at(ch, ua), "utf-16") == replaceWord(REFS_A, "Pair", "Couple")
+        && applyEdits(REFS_B, at(ch, ub), "utf-16") == replaceAll(REFS_B, "Pair", "Couple"), dump(r));
+    r = request(s, "textDocument/rename", at3(ua, posOf(REFS_A, "const count", "utf-16", 6), ", \"newName\": \"amount\""));
+    check(c, "refs: rename 遇同名模板插值即拒绝", errCode(r, -32803) && contains(textOf(at(r, "error"), "message"), "模板"), dump(r));
+    r = request(s, "textDocument/rename", at3(ua, posOf(REFS_A, "newBuilder()", "utf-16", 0), ", \"newName\": \"makeBuilder\""));
+    check(c, "refs: rename 标准库里的声明即拒绝", errCode(r, -32803) && contains(textOf(at(r, "error"), "message"), "标准库"), dump(r));
+    r = request(s, "textDocument/rename", at3(ua, posOf(REFS_A, "(a: int)", "utf-16", 1), ", \"newName\": \"b\""));
+    check(c, "refs: rename 造成遮蔽即拒绝（重查）", errCode(r, -32803) && contains(textOf(at(r, "error"), "message"), "遮蔽"), dump(r));
+    const bads: []string = ["let", "1x", "a b", ""];
+    for (bad in bads) {
+        r = request(s, "textDocument/rename", at3(ua, posOf(REFS_A, "const base", "utf-16", 6), ", \"newName\": " + jQuote(bad)));
+        check(c, "refs: rename 新名 '" + bad + "' 拒绝（-32803）", errCode(r, -32803), dump(r));
+    }
+    r = request(s, "textDocument/rename", at3(ua, posOf(REFS_A, "const base", "utf-16", 6), ""));
+    check(c, "refs: rename 缺 newName 回 -32602", errCode(r, -32602), dump(r));
+
+    // import { a as b }：改名只动本模块；改被导入的声明只动说明符里的原名，本地名与其用处不变。
+    writeFile(nat(join(d, "c.tx")), REFS_C)?;
+    const uc = uriOf(nat(join(d, "c.tx")));
+    open(s, uc, REFS_C);
+    r = request(s, "textDocument/definition", at3(uc, posOf(REFS_C, "CAP +", "utf-16", 0), ""));
+    check(c, "refs: definition 导入改名的本地名到说明符", r != None && eqJson(result(r), loc(uc, rng(REFS_C, "CAP", 3, 0))), dump(r));
+    r = request(s, "textDocument/rename", at3(uc, posOf(REFS_C, "CAP +", "utf-16", 0), ", \"newName\": \"CEIL\""));
+    ch = at(result(r), "changes");
+    check(c, "refs: rename 导入改名的本地名只改本模块", keysAre(ch, one(uc)) && applyEdits(REFS_C, at(ch, uc), "utf-16") == replaceAll(REFS_C, "CAP", "CEIL"),
+        dump(r));
+    r = request(s, "textDocument/rename", at3(uc, posOf(REFS_C, "mk(1", "utf-16", 0), ", \"newName\": \"build\""));
+    ch = at(result(r), "changes");
+    check(c, "refs: rename 改名导入的函数本地名（不当方法糖）", keysAre(ch, one(uc)) && applyEdits(REFS_C, at(ch, uc), "utf-16") == replaceAll(REFS_C, "mk", "build"),
+        dump(r));
+    r = request(s, "textDocument/rename", at3(ub, posOf(REFS_B, "const LIMIT", "utf-16", 6), ", \"newName\": \"BOUND\""));
+    ch = at(result(r), "changes");
+    check(c, "refs: rename 被改名导入的声明只改说明符里的原名", applyEdits(REFS_C, at(ch, uc), "utf-16") == replaceAll(REFS_C, "LIMIT as", "BOUND as")
+        && applyEdits(REFS_B, at(ch, ub), "utf-16") == replaceAll(REFS_B, "LIMIT", "BOUND"), dump(r));
+    close(s, uc);
+
+    // 改动后立即请求：位置随新文本。
+    const newA = "// 新加一行\n" + REFS_A;
+    changeText(s, ua, 2, newA);
+    r = request(s, "textDocument/definition", at3(ua, posOf(newA, "+ base;", "utf-16", 2), ""));
+    check(c, "refs: 变更后立即请求按新文本作答", r != None && eqJson(result(r), loc(ua, rng(newA, "const base", 4, 6))), dump(r));
+    r = request(s, "textDocument/definition", at3(uriOf(nat(join(d, "none.tx"))), Pos { line: 0, ch: 0 }, ""));
+    check(c, "refs: 未打开的文档回 null", r != None && (result(r) == None || isNull(result(r))), dump(r));
+    const code = finish(s, true);
+    kill(s);
+}
+
+function gTokens(c: Ref<Ctx>): void | Error {
+    const d = freshSub(c, "toks");
+    const f = nat(join(d, "t.tx"));
+    writeFile(f, TOKS)?;
+    const u = uriOf(f);
+    let s = session(c)?;
+    let r = init(s, "");
+    const caps = at(result(r), "capabilities");
+    check(c, "tokens: legend 冻结、只有 full", eqJson(at(caps, "semanticTokensProvider"), "{\"legend\": {\"tokenTypes\": [\"function\", \"struct\", \"enum\", \"enumMember\", \"variable\", \"parameter\", \"property\"], \"tokenModifiers\": []}, \"full\": true}"),
+        dump(at(caps, "semanticTokensProvider")));
+    open(s, u, TOKS);
+    r = request(s, "textDocument/semanticTokens/full", textDoc(u));
+    let got = tokensOf(r);
+    check(c, "tokens: 打开后立即请求，记号逐个相同（补面、中文串之后的 utf-16 列、模式、字段）", got == TOKS_WANT, got);
+    changeText(s, u, 2, "// 加一行\n" + TOKS);
+    r = request(s, "textDocument/semanticTokens/full", textDoc(u));
+    got = tokensOf(r);
+    check(c, "tokens: 变更后立即请求按新文本", got == TOKS_WANT_SHIFTED, got);
+    r = request(s, "textDocument/semanticTokens/full", textDoc(uriOf(nat(join(d, "none.tx")))));
+    check(c, "tokens: 未打开的文档回空 data", r != None && eqJson(result(r), "{\"data\": []}"), dump(r));
+    quiet(s, 1000);
+    const refreshes: List<Ref<Jv>> = listNew();
+    for (m in s.notes) {
+        if (textIs(m, "method", "workspace/semanticTokens/refresh")) {
+            listPush(refreshes, m);
+        }
+    }
+    check(c, "tokens: 客户端未宣告 refreshSupport 时不发 refresh", listLen(refreshes) == 0, dumps(refreshes));
+    let code = finish(s, true);
+    kill(s);
+    s = session(c)?;
+    r = request(s, "initialize", "{\"processId\": null, \"rootUri\": null, \"capabilities\": {\"workspace\": {\"semanticTokens\": {\"refreshSupport\": true}}}}");
+    notify(s, "initialized", "{}");
+    open(s, u, TOKS);
+    const end = monoNs() + WAIT_MS * 1000000;
+    let ref: Ref<Jv>? = None;
+    while (monoNs() < end && ref == None) {
+        const g = get(s, (end - monoNs()) / 1000000);
+        if (g.kind != 0) {
+            break;
+        }
+        if (textIs(g.msg, "method", "workspace/semanticTokens/refresh")) {
+            ref = g.msg;
+        } else {
+            listPush(s.notes, g.msg ?? jNull());
+        }
+    }
+    check(c, "tokens: 宣告 refreshSupport 时防抖分析后发 refresh（带 id 的请求）", ref != None && has(ref, "id"), dump(ref));
+    if (ref != None) {
+        send(s, "{\"jsonrpc\": \"2.0\", \"id\": " + dump(at(ref, "id")) + ", \"result\": null}");
+    }
+    quiet(s, 1000);
+    const errs: List<Ref<Jv>> = listNew();
+    for (m in s.notes) {
+        if (isObj(m) && has(m, "error")) {
+            listPush(errs, m);
+        }
+    }
+    check(c, "tokens: 对 refresh 的响应静默收下（不回错误）", listLen(errs) == 0, dumps(errs));
+    r = request(s, "textDocument/semanticTokens/full", textDoc(u));
+    check(c, "tokens: 之后的请求照常", tokensOf(r) == TOKS_WANT, dump(r));
+    code = finish(s, true);
+    kill(s);
+}
+
+function contentsIs(r: Ref<Jv>?, want: string): bool {
+    return eqJson(at(result(r), "contents"), want);
+}
+
+function gHover(c: Ref<Ctx>): void | Error {
+    const d = freshSub(c, "hover");
+    const f = nat(join(d, "h.tx"));
+    writeFile(f, HOV)?;
+    writeFile(nat(join(d, "hlib.tx")), HOV_LIB)?;
+    const u = uriOf(f);
+    let s = session(c)?;
+    let r = init(s, "");
+    const caps = at(result(r), "capabilities");
+    check(c, "hover: 宣告 hoverProvider", trueAt(caps, "hoverProvider"), dump(caps));
+    open(s, u, HOV);
+    // 未经防抖就请求：入口先同步分析。
+    r = hov(s, u, HOV, "struct Point", 7);
+    check(c, "hover: struct 声明（打开后立即请求），range 为名字", eqJson(result(r), "{\"contents\": " + md("struct Point { x: int }", "") + ", \"range\": "
+            + rng(HOV, "struct Point", 5, 7) + "}"), dump(r));
+    r = hov(s, u, HOV, "x: int,", 0);
+    check(c, "hover: 字段声明", contentsIs(r, md("Point.x: int", "")), dump(r));
+    r = hov(s, u, HOV, "p.x)", 2);
+    check(c, "hover: 字段访问", contentsIs(r, md("Point.x: int", "")), dump(r));
+    r = hov(s, u, HOV, "Circle(r: int)", 0);
+    check(c, "hover: 变体声明", contentsIs(r, md("Shape.Circle(r: int)", "")), dump(r));
+    r = hov(s, u, HOV, "function wrap", 9);
+    check(c, "hover: 泛型函数照写型参", contentsIs(r, md("function wrap<T>(v: T): List<T>", "")), dump(r));
+    r = hov(s, u, HOV, "const out", 6);
+    check(c, "hover: 泛型体里随实例不同的绑定只写名字并注明", contentsIs(r, md("const out", "类型随泛型实例而定")), dump(r));
+    r = hov(s, u, HOV, "scale(2", 1);
+    check(c, "hover: 导入名指到别的文件的声明", contentsIs(r, md("function scale(v: int, k: int): int", "")), dump(r));
+    r = hov(s, u, HOV, "const m", 6);
+    check(c, "hover: 推断的泛型实例类型", contentsIs(r, md("const m: Map<string, int>", "")), dump(r));
+    r = hov(s, u, HOV, "mapNew", 2);
+    check(c, "hover: prelude 的声明", contentsIs(r, md("function mapNew<K extends Hashable, V>(): Map<K, V>", "")), dump(r));
+    r = hov(s, u, HOV, "let s", 4);
+    check(c, "hover: let 绑定附推断的类型", contentsIs(r, md("let s: string", "")), dump(r));
+    r = hov(s, u, HOV, "toStr(p.x)", 2);
+    check(c, "hover: 中文串之后的内建（utf-16 的 range）", eqJson(result(r), "{\"contents\": "
+            + md("function toStr(int | float | bool | string | Error): string", "转字符串（Error 得 \"Error: \" 加消息）") + ", \"range\": "
+            + rng(HOV, "toStr(p.x)", 5, 0) + "}"), dump(r));
+    r = hov(s, u, HOV, "print(s)", 1);
+    check(c, "hover: 内建 print", contentsIs(r, md("function print(string): void", "标准输出一行")), dump(r));
+    r = hov(s, u, HOV, "assert(true)", 1);
+    check(c, "hover: 遮蔽内建的用户函数取用户的声明", contentsIs(r, md("function assert(ok: bool): void", "")), dump(r));
+    r = hov(s, u, HOV, "catch (e)", 7);
+    check(c, "hover: catch 绑定", contentsIs(r, md("e: Error", "")), dump(r));
+    r = hov(s, u, HOV, "Circle(r) =>", 7);
+    check(c, "hover: 模式绑定", contentsIs(r, md("r: int", "")), dump(r));
+    r = hov(s, u, HOV, "r + listLen", 1);
+    check(c, "hover: 光标在名字末尾", contentsIs(r, md("r: int", "")), dump(r));
+    r = hov(s, u, HOV, "return switch", 0);
+    check(c, "hover: 关键字为 null", nullResult(r), dump(r));
+    r = hov(s, u, HOV, "// print(s)", 4);
+    check(c, "hover: 注释里为 null", nullResult(r), dump(r));
+    r = request(s, "textDocument/hover", at3(uriOf(nat(join(d, "none.tx"))), Pos { line: 0, ch: 0 }, ""));
+    check(c, "hover: 未打开的文档为 null", nullResult(r), dump(r));
+    const newText = replaceAll(HOV, "mapNew< string, int>()", "mapNew< int, bool>()");
+    changeText(s, u, 2, newText);
+    r = hov(s, u, newText, "const m", 6);
+    check(c, "hover: 变更后立即请求按新文本", contentsIs(r, md("const m: Map<int, bool>", "")), dump(r));
+    let code = finish(s, true);
+    kill(s);
+    s = session(c)?;
+    r = request(s, "initialize", "{\"processId\": null, \"rootUri\": null, \"capabilities\": {\"textDocument\": {\"hover\": {\"contentFormat\": [\"plaintext\", \"markdown\"]}}}}");
+    notify(s, "initialized", "{}");
+    open(s, u, HOV);
+    r = request(s, "textDocument/hover", at3(u, posOf(HOV, "print(s)", "utf-16", 1), ""));
+    check(c, "hover: 客户端首选 plaintext 时给纯文本", eqJson(at(result(r), "contents"), "{\"kind\": \"plaintext\", \"value\": \"function print(string): void\\n\\n标准输出一行\"}"),
+        dump(r));
+    code = finish(s, true);
+    kill(s);
+}
+
+function hov(s: Ref<Lsp>, u: string, text: string, needle: string, delta: int): Ref<Jv>? {
+    return request(s, "textDocument/hover", at3(u, posOf(text, needle, "utf-16", delta), ""));
+}
+
+function sigAt(s: Ref<Lsp>, u: string, text: string, needle: string, delta: int): Ref<Jv>? {
+    return request(s, "textDocument/signatureHelp", at3(u, posOf(text, needle, "utf-16", delta), ""));
+}
+
+function sigIs(r: Ref<Jv>?, label: string, spans: string, active: int): bool {
+    return eqJson(result(r), sigJson(label, spans, active));
+}
+
+function gSig(c: Ref<Ctx>): void | Error {
+    const d = freshSub(c, "sig");
+    const f = nat(join(d, "s.tx"));
+    writeFile(f, SIG)?;
+    writeFile(nat(join(d, "slib.tx")), SIG_LIB)?;
+    const u = uriOf(f);
+    const s = session(c)?;
+    let r = init(s, "");
+    const caps = at(result(r), "capabilities");
+    check(c, "sig: 宣告 signatureHelpProvider（触发 ( 与 ,，重触发 )）", eqJson(at(caps, "signatureHelpProvider"), "{\"triggerCharacters\": [\"(\", \",\"], \"retriggerCharacters\": [\")\"]}"),
+        dump(at(caps, "signatureHelpProvider")));
+    open(s, u, SIG);
+    r = sigAt(s, u, SIG, "add(1", 4);
+    check(c, "sig: 第一个实参（打开后立即请求）", sigIs(r, L_ADD, "13,19 21,27", 0), dump(r));
+    r = sigAt(s, u, SIG, "add(1, add", 7);
+    check(c, "sig: 第二个实参", sigIs(r, L_ADD, "13,19 21,27", 1), dump(r));
+    r = sigAt(s, u, SIG, "add(2, 3)", 7);
+    check(c, "sig: 嵌套调用取最内层", sigIs(r, L_ADD, "13,19 21,27", 1), dump(r));
+    r = sigAt(s, u, SIG, "add(2, 3))", 9);
+    check(c, "sig: 内层 ) 之后回到外层", sigIs(r, L_ADD, "13,19 21,27", 1), dump(r));
+    r = sigAt(s, u, SIG, "add(2, 3));", 10);
+    check(c, "sig: 外层 ) 之后为 null", nullResult(r), dump(r));
+    r = sigAt(s, u, SIG, "add(1", 1);
+    check(c, "sig: 光标在函数名上为 null", nullResult(r), dump(r));
+    r = sigAt(s, u, SIG, "area(4", 5);
+    check(c, "sig: 方法糖不含接收者", sigIs(r, "function pArea(p: P, k: int): int", "21,27", 0), dump(r));
+    r = sigAt(s, u, SIG, "Circle(5", 7);
+    check(c, "sig: 变体构造", sigIs(r, "Shape.Circle(r: int)", "13,19", 0), dump(r));
+    r = sigAt(s, u, SIG, "g(6", 2);
+    check(c, "sig: 函数类型的绑定", sigIs(r, "const g: (int) => int", "10,13", 0), dump(r));
+    r = sigAt(s, u, SIG, "wrap(\"a,b\", 7", 11);
+    check(c, "sig: 串里的逗号不计，泛型照写", sigIs(r, "function wrap<T>(v: T, n: int): List<T>", "17,21 23,29", 1), dump(r));
+    r = sigAt(s, u, SIG, "wrapTo< u8>(", 12);
+    check(c, "sig: 隔着型参的内建，偏移按 utf-16（D3 的中文占位）", sigIs(r, "function wrapTo<T>(整数): T", "19,21", 0), dump(r));
+    r = sigAt(s, u, SIG, "toStr(scale", 6);
+    check(c, "sig: 内建", sigIs(r, "function toStr(int | float | bool | string | Error): string", "15,50", 0), dump(r));
+    r = sigAt(s, u, SIG, "scale(s, t", 9);
+    check(c, "sig: 导入的函数", sigIs(r, L_SCALE, "15,21 23,29", 1), dump(r));
+    const newText = replaceAll(SIG, "    return 0;\n}", "    const y = add(9, 8, 7\n    return 0;\n}");
+    changeText(s, u, 2, newText);
+    r = sigAt(s, u, newText, "add(9, 8, 7", 11);
+    check(c, "sig: 未闭合的 ( 按名字找到被调者，越界不高亮", sigIs(r, L_ADD, "13,19 21,27", 2), dump(r));
+    const new2 = replaceAll(newText, "    const y = add(9, 8, 7\n", "    const y = (1 + \n");
+    changeText(s, u, 3, new2);
+    r = sigAt(s, u, new2, "(1 + ", 5);
+    check(c, "sig: 分组括号不是调用", nullResult(r), dump(r));
+    const code = finish(s, true);
+    kill(s);
+}
+
+// 补全：r 与按 label 取项（同 Python 的 {x['label']: x}，同名以后一个为准）；结果不是数组时 items 为 None。
+function compAt(s: Ref<Lsp>, u: string, text: string, needle: string, delta: int): Ref<Jv>? {
+    return request(s, "textDocument/completion", at3(u, posOf(text, needle, "utf-16", delta), ""));
+}
+
+function itemOf(r: Ref<Jv>?, label: string): Ref<Jv>? {
+    return lastBy(result(r), "label", label);
+}
+
+function hasItem(r: Ref<Jv>?, label: string): bool {
+    return itemOf(r, label) != None;
+}
+
+function listResult(r: Ref<Jv>?): bool {
+    return isArr(result(r));
+}
+
+function gComplete(c: Ref<Ctx>): void | Error {
+    const d = freshSub(c, "comp");
+    const f = nat(join(d, "c.tx"));
+    writeFile(f, COMP)?;
+    writeFile(nat(join(d, "clib.tx")), SIG_LIB)?;
+    const u = uriOf(f);
+    let round = 0;
+    while (round < 2) {
+        const tool = round == 1;
+        const args = words2("lsp", "--stdio");
+        if (tool) {
+            listPush(args, "--toolchain");
+        }
+        const s = lspStart(c, args)?;
+        let r = init(s, "");
+        const caps = at(result(r), "capabilities");
+        if (!tool) {
+            check(c, "completion: 宣告 completionProvider（不宣告触发字符）", eqJson(at(caps, "completionProvider"), "{}"), dump(at(caps, "completionProvider")));
+        }
+        open(s, u, COMP);
+        if (tool) {
+            r = compAt(s, u, COMP, "if (outer", 0);
+            check(c, "completion: 带 --toolchain 时给工具链内建", listResult(r) && intIs(itemOf(r, "fileSize"), "kind", 3), dump(r));
+            const code = finish(s, true);
+            kill(s);
+        } else {
+            completeRound(c, s, u, d) catch (e) {
+                kill(s);
+                return e;
+            };
+            kill(s);
+        }
+        round = round + 1;
+    }
+}
+
+function completeRound(c: Ref<Ctx>, s: Ref<Lsp>, u: string, d: string): void | Error {
+    let r = compAt(s, u, COMP, "if (outer", 0);
+    const ok = listResult(r);
+    check(c, "completion: 局部按位置（之前声明的有、之后的与块里的没有；打开后立即请求）", ok && eqJson(itemOf(r, "outer"),
+            "{\"label\": \"outer\", \"kind\": 21, \"detail\": \"const outer: int\", \"sortText\": \"0outer\"}") && !hasItem(r, "inner") && !hasItem(r, "later")
+        && !hasItem(r, "msg"), dump(r));
+    check(c, "completion: 形参", ok && eqJson(itemOf(r, "args"), "{\"label\": \"args\", \"kind\": 6, \"detail\": \"args: []string\", \"sortText\": \"0args\"}"), dump(r));
+    check(c, "completion: 顶层声明与种类", ok && intIs(itemOf(r, "helper"), "kind", 3) && textIs(itemOf(r, "helper"), "detail", "function helper(n: int): int")
+        && intIs(itemOf(r, "Box"), "kind", 22) && eqJson(itemOf(r, "counter"),
+            "{\"label\": \"counter\", \"kind\": 6, \"detail\": \"let counter: int\", \"sortText\": \"1counter\"}"), dump(r));
+    check(c, "completion: 导入名", ok && eqJson(itemOf(r, "scale"),
+            "{\"label\": \"scale\", \"kind\": 3, \"detail\": \"function scale(v: int, k: int): int\", \"sortText\": \"1scale\"}"), dump(r));
+    check(c, "completion: 遮蔽内建的用户函数取用户的声明", ok && eqJson(itemOf(r, "assert"),
+            "{\"label\": \"assert\", \"kind\": 3, \"detail\": \"function assert(ok: bool): void\", \"sortText\": \"1assert\"}"), dump(r));
+    check(c, "completion: 内建", ok && eqJson(itemOf(r, "print"), "{\"label\": \"print\", \"kind\": 3, \"detail\": \"function print(string): void\", \"sortText\": \"2print\"}"),
+        dump(r));
+    check(c, "completion: 未带 --toolchain 时不给工具链内建", ok && !hasItem(r, "fileSize") && !hasItem(r, "procSpawn"), dump(r));
+    check(c, "completion: prelude 的导出（程序未用到 prelude 时也给）", ok && textIs(itemOf(r, "mapNew"), "detail", "function mapNew<K extends Hashable, V>(): Map<K, V>")
+        && intIs(itemOf(r, "Map"), "kind", 22) && !hasItem(r, "mixHash"), dump(r));
+    check(c, "completion: 预声明类型名、None 与关键字", ok && intIs(itemOf(r, "List"), "kind", 7) && intIs(itemOf(r, "int"), "kind", 7)
+        && intIs(itemOf(r, "None"), "kind", 21) && eqJson(itemOf(r, "return"), "{\"label\": \"return\", \"kind\": 14, \"sortText\": \"3return\"}"), dump(r));
+    r = compAt(s, u, COMP, "print(toStr(inner", 0);
+    check(c, "completion: 块里的局部", listResult(r) && hasItem(r, "inner") && hasItem(r, "outer"), dump(r));
+    r = compAt(s, u, COMP, "// here comment", 0);
+    check(c, "completion: 块结束后块里的局部不在", listResult(r) && !hasItem(r, "inner") && hasItem(r, "outer"), dump(r));
+    r = compAt(s, u, COMP, "here comment", 0);
+    check(c, "completion: 注释里为空表", eqJson(result(r), "[]"), dump(r));
+    r = compAt(s, u, COMP, "text here", 0);
+    check(c, "completion: 串里为空表", eqJson(result(r), "[]"), dump(r));
+    r = compAt(s, u, COMP, "b.v", 2);
+    check(c, "completion: . 之后为空表", eqJson(result(r), "[]"), dump(r));
+    r = compAt(s, u, COMP, "b.v", 3);
+    check(c, "completion: . 之后正在输入的名字为空表", eqJson(result(r), "[]"), dump(r));
+    r = compAt(s, u, COMP, "return outer", 7);
+    check(c, "completion: 其后才声明的不在、之前的在", listResult(r) && hasItem(r, "later") && hasItem(r, "b") && hasItem(r, "msg"), dump(r));
+    const f2 = nat(join(d, "c2.tx"));
+    writeFile(f2, COMP2)?;
+    const u2 = uriOf(f2);
+    open(s, u2, COMP2);
+    r = compAt(s, u2, COMP2, "print(outer", 0);
+    check(c, "completion: 遮蔽取内层", listResult(r) && textIs(itemOf(r, "outer"), "detail", "const outer: string"), dump(r));
+    r = compAt(s, u2, COMP2, "const data", 0);
+    check(c, "completion: 块结束后回到外层的声明", listResult(r) && textIs(itemOf(r, "outer"), "detail", "const outer: int"), dump(r));
+    r = compAt(s, u2, COMP2, "print(e.message", 0);
+    check(c, "completion: catch 绑定在其块里", listResult(r) && eqJson(itemOf(r, "e"), "{\"label\": \"e\", \"kind\": 6, \"detail\": \"e: Error\", \"sortText\": \"0e\"}"),
+        dump(r));
+    r = compAt(s, u2, COMP2, "const tpl", 0);
+    check(c, "completion: catch 绑定在块外不在", listResult(r) && !hasItem(r, "e") && hasItem(r, "data") && !hasItem(r, "tpl"), dump(r));
+    r = compAt(s, u2, COMP2, "n + 0", 0);
+    check(c, "completion: 模式绑定在其臂里，enum 的种类", listResult(r) && eqJson(itemOf(r, "n"), "{\"label\": \"n\", \"kind\": 6, \"detail\": \"n: int\", \"sortText\": \"0n\"}")
+        && intIs(itemOf(r, "Kind"), "kind", 13), dump(r));
+    r = compAt(s, u2, COMP2, "else => 0", 8);
+    check(c, "completion: 模式绑定在别的臂里不在", listResult(r) && !hasItem(r, "n") && hasItem(r, "k"), dump(r));
+    r = compAt(s, u2, COMP2, "${outer", 2);
+    check(c, "completion: 模板串的插值段里按代码补全", listResult(r) && hasItem(r, "outer") && hasItem(r, "data"), dump(r));
+    r = compAt(s, u2, COMP2, "v=$", 1);
+    check(c, "completion: 模板串的字面部分为空表", eqJson(result(r), "[]"), dump(r));
+    const code = finish(s, true);
+}
+
+function runGroup(c: Ref<Ctx>, name: string): void | Error {
+    if (name == "lifecycle") {
+        return gLifecycle(c);
+    }
+    if (name == "framing") {
+        return gFraming(c);
+    }
+    if (name == "encoding") {
+        return gEncoding(c);
+    }
+    if (name == "uri") {
+        return gUri(c);
+    }
+    if (name == "diag") {
+        return gDiag(c);
+    }
+    if (name == "format") {
+        return gFormat(c);
+    }
+    if (name == "symbols") {
+        return gSymbols(c);
+    }
+    if (name == "refs") {
+        return gRefs(c);
+    }
+    if (name == "tokens") {
+        return gTokens(c);
+    }
+    if (name == "hover") {
+        return gHover(c);
+    }
+    if (name == "sig") {
+        return gSig(c);
+    }
+    if (name == "complete") {
+        return gComplete(c);
+    }
+    return;
+}
+
+function freshDir(prefix: string): string | Error {
+    const base = osRealPath(tempDir());
+    let k = 0;
+    while (k < 1000) {
+        const p = nat(join(base, prefix + toStr(monoNs() % 1000000000) + "-" + toStr(k)));
+        if (kindOf(p) == 0) {
+            makeDir(p)?;
+            return p;
+        }
+        k = k + 1;
+    }
+    return err("建不了临时目录 " + prefix);
+}
+
+function main(args: []string): int {
+    let compiler = "";
+    let only = "";
+    let work = "";
+    let root = "";
+    let i = 0;
+    while (i + 1 < len(args)) {
+        const a = args[i];
+        if (a == "--compiler") {
+            compiler = args[i + 1];
+        } else if (a == "--only") {
+            only = args[i + 1];
+        } else if (a == "--work") {
+            work = args[i + 1];
+        } else if (a == "--root") {
+            root = args[i + 1];
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0) {
+        eprint("用法：taixu run --toolchain scripts/test_lsp_e2e.tx --compiler <原生 taixu> [--only 组,组] [--work 目录]");
+        return 2;
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = absolute(nat(root));
+    // 工作目录也作授权根：信任根的路径里不许有符号链接（macOS 的临时目录在 /var 下，/var 是链接），取真实路径。
+    const ownWork = len(work) == 0;
+    if (ownWork) {
+        work = freshDir("taixu-lsp-") catch (e) {
+            eprint(e.message);
+            return 2;
+        };
+    } else {
+        mkdirs(absolute(nat(work)));
+        work = osRealPath(absolute(nat(work)));
+    }
+    // 显式库根支持独立 worktree；未指定时再探测公开仓与开发仓的默认布局。
+    let lib = getEnv("TAIXU_STDLIB") catch "";
+    if (len(lib) == 0) {
+        lib = nat(join(root, "stdlib/src"));
+        if (kindOf(lib) != 2) { lib = nat(join(dirOf(root), "taixu-stdlib/src")); }
+    }
+    lib = absolute(nat(lib));
+    if (kindOf(lib) != 2) { eprint("LSP 用例标准库根不存在：" + lib); return 2; }
+    lib = osRealPath(lib);
+    const c = new Ctx { exe: absolute(nat(compiler)), root: root, work: work, lib: lib, passes: 0, fails: 0 };
+    const chosen = strSplit(only, ",");
+    for (g in GROUPS) {
+        let run = len(only) == 0;
+        for (x in chosen) {
+            if (x == g) {
+                run = true;
+            }
+        }
+        if (run) {
+            runGroup(c, g) catch (e) {
+                check(c, g + ": crash", false, e.message);
+            };
+        }
+    }
+    let verdict = "PASS";
+    if (c.fails > 0) {
+        verdict = "FAIL=" + toStr(c.fails);
+    }
+    print("SUMMARY " + verdict + " (" + toStr(c.passes + c.fails) + " checks)");
+    // 自建的临时根：通过即删，失败留给排查（同 pytest 的 failed 保留策略）。
+    if (ownWork) {
+        if (c.fails > 0) {
+            print("NOTE 工作目录保留以便排查： " + work);
+        } else {
+            deleteTree(work);
+        }
+    }
+    if (c.fails > 0) {
+        return 1;
+    }
+    return 0;
+}

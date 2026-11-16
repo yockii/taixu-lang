@@ -1,0 +1,323 @@
+// A64 写出链路（gate.tx 的 a64-image 步）：编出 bootstrap/a64_image_probe.tx，由它手写两个 aarch64 目标文件并链接成
+// Mach-O arm64；再编出 rtfn 底层、指令宏 gen_ops 与 libSystem 蹦床三个探针，各写出映像。任何宿主上都核对文件头与 load command、两次
+// 生成逐字节相同；在 Apple Silicon 宿主上另外运行它们，核对输出（经 __got 调 libSystem、跨度定长后的长跳转、跨对象 bl、.data 里的
+// 绝对地址；rtfn 原语与除零被 brk 终止；gen_ops 各族；经蹦床建文件、查权限位、设取描述符标志与 −errno）。
+// 运行（仓根）：taixu run --toolchain scripts/test_a64_image.tx --compiler <taixu> --work <目录> [--root <仓库>]
+// 不合时打一行 FAIL 与细节、退出码 1。
+import { absolute, exeName, join, kindOf, mkdirs, nat, readBytes } from "./build_lib";
+import { osRealPath, osWriteFile } from "./build_os";
+import { imgOf, lossyText, u32 } from "./check_lib";
+import { captureRaw } from "./test_lib";
+import { strip, tailChars } from "./test_text";
+
+const SEC: int = 1000000000;
+const MAX_OUTPUT: int = 16777216;
+const LC_SEGMENT_64: int = 0x19;
+const LC_CODE_SIGNATURE: int = 0x1d;
+const LC_BUILD_VERSION: int = 0x32;
+const LC_MAIN: int = 0x80000028;
+const EXPECTED: string = "a64 image: write ok\na64 image: relax ok\na64 image: call/data ok\n";
+// SIGTRAP：procWait 把被信号终止记为负的信号号。
+const SIGTRAP_EXIT: int = -5;
+
+struct Out {
+    ok: bool,
+    code: int,
+    text: string,
+}
+
+// 运行，退出码须为 0（want0）；不然打 FAIL 行。
+function exec(exe: string, args: List<string>, cwd: string, limit: int, what: string): Out | Error {
+    const r = captureRaw(exe, args, cwd, limit * SEC, 10 * SEC, MAX_OUTPUT)?;
+    const text = lossyText(r.out);
+    if (r.code != 0 || r.timedOut) {
+        print("FAIL  " + what + " exit=" + toStr(r.code) + " " + tailChars(text + lossyText(r.err), 4000));
+        return Out { ok: false, code: r.code, text: text };
+    }
+    return Out { ok: true, code: 0, text: text };
+}
+
+function fail(what: string, detail: string): int {
+    print("FAIL  " + what + " " + detail);
+    return 1;
+}
+
+function build(compiler: string, src: string, out: string, root: string): bool | Error {
+    const args: List<string> = listNew();
+    listPush(args, "build");
+    listPush(args, src);
+    listPush(args, "--toolchain");
+    listPush(args, "--out");
+    listPush(args, out);
+    const r = exec(compiler, args, root, 600, "build " + src)?;
+    return r.ok;
+}
+
+// 文件头：64 位 Mach-O、arm64、子类型 0。
+function machoArm64(b: Bytes): bool {
+    const m = imgOf(b);
+    return u32(m, 0) == 0xfeedfacf && u32(m, 4) == 0x0100000c && !m.oob;
+}
+
+// 探针 exe 依次以 work/<runs 的每一项> 为参数写出映像（asFile 时那是映像文件，否则是目录，先建好），输出须为 marker（asFile 时取首个词）。
+function runTwice(exe: string, work: string, runs: List<string>, asFile: bool, marker: string, root: string): bool | Error {
+    for (r in runs) {
+        const target = nat(join(work, r));
+        if (!asFile && !mkdirs(target)) {
+            print("FAIL  mkdir " + target);
+            return false;
+        }
+        const args: List<string> = listNew();
+        listPush(args, target);
+        const o = exec(exe, args, root, 600, exe + " " + r)?;
+        if (!o.ok) {
+            return false;
+        }
+        if (asFile) {
+            const first = strip(o.text);
+            const sp = strIndexOfSpace(first);
+            if (sp != marker) {
+                print("FAIL  " + r + " 探针输出：" + strip(o.text));
+                return false;
+            }
+        } else if (strip(o.text) != marker) {
+            print("FAIL  " + r + " 探针输出：" + strip(o.text));
+            return false;
+        }
+    }
+    return true;
+}
+
+// 首个空白之前的部分（同 Python 的 split()[0]）。
+function strIndexOfSpace(s: string): string {
+    let i = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) ?? 0;
+        if (c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12) {
+            return bytesToStr(bytesSlice(bytesFromStr(s), 0, i)) catch "";
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+function sameBytes(a: Bytes, b: Bytes): bool {
+    if (bytesLen(a) != bytesLen(b)) {
+        return false;
+    }
+    let i = 0;
+    while (i < bytesLen(a)) {
+        if ((bytesGet(a, i) ?? 0) != (bytesGet(b, i) ?? 0)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 映像改成可执行（探针以普通文件写出）后在 cwd 里运行。权限只在新建时生效，先删掉原文件再以 0755 写回。
+function runImage(path: string, cwd: string): Out | Error {
+    const image = readBytes(path)?;
+    removeFile(path)?;
+    if (!osWriteFile(path, image, true)) {
+        return err("改不了可执行位：" + path);
+    }
+    const r = captureRaw(path, listNew(), cwd, 60 * SEC, 10 * SEC, MAX_OUTPUT)?;
+    return Out { ok: r.code == 0 && !r.timedOut, code: r.code, text: lossyText(r.out) };
+}
+
+function run(argv: []string): int | Error {
+    let compiler = "";
+    let work = "";
+    let root = "";
+    let i = 0;
+    while (i + 1 < len(argv)) {
+        if (argv[i] == "--compiler") {
+            compiler = argv[i + 1];
+        } else if (argv[i] == "--work") {
+            work = argv[i + 1];
+        } else if (argv[i] == "--root") {
+            root = argv[i + 1];
+        } else {
+            return err("未知参数：" + argv[i]);
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0 || len(work) == 0 || i != len(argv)) {
+        return err("用法：taixu run --toolchain scripts/test_a64_image.tx --compiler <taixu> --work <目录> [--root <仓库>]");
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = osRealPath(absolute(nat(root)));
+    compiler = osRealPath(absolute(nat(compiler)));
+    if (!mkdirs(absolute(nat(work)))) {
+        return err("建不了工作目录：" + work);
+    }
+    work = osRealPath(absolute(nat(work)));
+
+    // 1. 链接映像：文件头、load command、确定性。
+    if (!build(compiler, "bootstrap/a64_image_probe.tx", nat(join(work, "probe")), root)?) {
+        return 1;
+    }
+    const images: List<string> = listNew();
+    listPush(images, "a64_image");
+    listPush(images, "a64_image_again");
+    if (!runTwice(nat(join(join(work, "probe"), exeName("a64_image_probe"))), work, images, true, "PASS_A64_IMAGE", root)?) {
+        return 1;
+    }
+    const b = readBytes(nat(join(work, "a64_image")))?;
+    if (!sameBytes(b, readBytes(nat(join(work, "a64_image_again")))?)) {
+        return fail("a64_image", "nondeterministic image");
+    }
+    const m = imgOf(b);
+    if (u32(m, 0) != 0xfeedfacf || u32(m, 4) != 0x0100000c || u32(m, 8) != 0 || u32(m, 12) != 2) {
+        return fail("a64_image", "文件头 magic、cputype、subtype、filetype 不对");
+    }
+    if ((u32(m, 24) & 0x200000) == 0) {
+        return fail("a64_image", "MH_PIE");
+    }
+    const ncmds = u32(m, 16);
+    let at = 32;
+    let hasMain = false;
+    let hasSig = false;
+    let hasBuild = false;
+    const segs: List<string> = listNew();
+    let k = 0;
+    while (k < ncmds) {
+        const cmd = u32(m, at);
+        if (cmd == LC_MAIN) {
+            hasMain = true;
+        } else if (cmd == LC_CODE_SIGNATURE) {
+            hasSig = true;
+        } else if (cmd == LC_BUILD_VERSION) {
+            hasBuild = true;
+        } else if (cmd == LC_SEGMENT_64) {
+            let n = 0;
+            while (n < 16 && (bytesGet(b, at + 8 + n) ?? 0) != 0) {
+                n = n + 1;
+            }
+            listPush(segs, bytesToStr(bytesSlice(b, at + 8, n)) catch "");
+        }
+        const size = u32(m, at + 4);
+        if (size == 0 || m.oob) {
+            return fail("a64_image", "load command 越界或长度为 0（" + toStr(at) + "）");
+        }
+        at = at + size;
+        k = k + 1;
+    }
+    if (!hasMain || !hasSig || !hasBuild) {
+        return fail("a64_image", "缺 LC_MAIN、LC_CODE_SIGNATURE 或 LC_BUILD_VERSION");
+    }
+    if (listLen(segs) < 2 || (listGet(segs, 0) catch "") != "__PAGEZERO" || (listGet(segs, 1) catch "") != "__TEXT") {
+        return fail("a64_image", "前两个段不是 __PAGEZERO、__TEXT");
+    }
+    print("PASS A64 Mach-O header, load commands, deterministic (" + toStr(bytesLen(b)) + " bytes)");
+
+    // 2. rtfn 的 A64 底层：一个映像逐项核对 rtfn 原语，一个除零须被 brk 终止。
+    if (!build(compiler, "bootstrap/a64_rtfn_probe.tx", nat(join(work, "rtfn-probe")), root)?) {
+        return 1;
+    }
+    const rruns: List<string> = listNew();
+    listPush(rruns, "rtfn");
+    listPush(rruns, "rtfn-again");
+    if (!runTwice(nat(join(join(work, "rtfn-probe"), exeName("a64_rtfn_probe"))), work, rruns, false, "PASS_A64_RTFN", root)?) {
+        return 1;
+    }
+    for (f in ["rtfn_ok", "rtfn_divzero"]) {
+        const x = readBytes(nat(join(join(work, "rtfn"), f)))?;
+        if (!sameBytes(x, readBytes(nat(join(join(work, "rtfn-again"), f)))?)) {
+            return fail("rtfn", "nondeterministic rtfn images");
+        }
+        if (!machoArm64(x)) {
+            return fail("rtfn", f + " 不是 arm64 的 Mach-O");
+        }
+    }
+    print("PASS A64 rtfn images built, deterministic");
+
+    // 3. 生成代码的指令宏 gen_ops 的 A64 落地：探针逐项核对宏的各个族。
+    if (!oneImage(compiler, work, root, "bootstrap/a64_gen_probe.tx", "gen-probe", "a64_gen_probe", "gen", "PASS_A64_GEN", "gen_ok")?) {
+        return 1;
+    }
+    print("PASS A64 gen image built, deterministic");
+
+    // 4. libSystem 蹦床的 A64 版：探针经蹦床建文件、查权限位、设取描述符标志（变参经栈）、核对 −errno。
+    if (!oneImage(compiler, work, root, "bootstrap/a64_sys_probe.tx", "sys-probe", "a64_sys_probe", "sys", "PASS_A64_SYS", "sys_ok")?) {
+        return 1;
+    }
+    print("PASS A64 sys image built, deterministic");
+
+    if (hostTarget() != "macos" || hostArch() != "aarch64") {
+        print("NOT-RUN A64 image execution (needs an Apple Silicon host)");
+        return 0;
+    }
+    const img = runImage(nat(join(work, "a64_image")), work)?;
+    if (!img.ok || img.text != EXPECTED) {
+        return fail("run a64_image", "exit=" + toStr(img.code) + " stdout=" + img.text);
+    }
+    print("PASS A64 image runs natively");
+    const rok = runImage(nat(join(join(work, "rtfn"), "rtfn_ok")), work)?;
+    if (!rok.ok || rok.text != "a64 rtfn ok\n") {
+        return fail("run rtfn_ok", "rtfn check failed (exit = index of the failing check) exit=" + toStr(rok.code) + " stdout=" + rok.text);
+    }
+    const rdz = runImage(nat(join(join(work, "rtfn"), "rtfn_divzero")), work)?;
+    if (rdz.code != SIGTRAP_EXIT) {
+        return fail("run rtfn_divzero", "division by zero must stop with SIGTRAP, exit=" + toStr(rdz.code));
+    }
+    print("PASS A64 rtfn primitives and division trap run natively");
+    const gok = runImage(nat(join(join(work, "gen"), "gen_ok")), work)?;
+    if (!gok.ok || gok.text != "a64 gen ok\n") {
+        return fail("run gen_ok", "gen check failed (exit = index of the failing check) exit=" + toStr(gok.code) + " stdout=" + gok.text);
+    }
+    print("PASS A64 gen_ops checks run natively");
+    // 探针在当前目录建删两个文件：在新的空目录里跑。
+    let cwd = "";
+    let n = 0;
+    while (len(cwd) == 0) {
+        const c = nat(join(work, "sys-run-" + toStr(monoNs() % 1000000000) + "-" + toStr(n)));
+        if (kindOf(c) == 0) {
+            cwd = c;
+        }
+        n = n + 1;
+    }
+    if (!mkdirs(cwd)) {
+        return err("建不了 " + cwd);
+    }
+    const sok = runImage(nat(join(join(work, "sys"), "sys_ok")), cwd)?;
+    if (!sok.ok || sok.text != "a64 sys ok\n") {
+        return fail("run sys_ok", "sys check failed (exit = index of the failing check) exit=" + toStr(sok.code) + " stdout=" + sok.text);
+    }
+    print("PASS A64 libSystem trampolines run natively");
+    return 0;
+}
+
+// 编出探针、在 work/<run> 与 work/<run>-again 各写一遍映像 file，须逐字节相同且为 arm64 的 Mach-O。
+function oneImage(compiler: string, work: string, root: string, src: string, dir: string, name: string, tag: string, marker: string,
+    file: string): bool | Error {
+    if (!build(compiler, src, nat(join(work, dir)), root)?) {
+        return false;
+    }
+    const runs: List<string> = listNew();
+    listPush(runs, tag);
+    listPush(runs, tag + "-again");
+    if (!runTwice(nat(join(join(work, dir), exeName(name))), work, runs, false, marker, root)?) {
+        return false;
+    }
+    const x = readBytes(nat(join(join(work, tag), file)))?;
+    if (!sameBytes(x, readBytes(nat(join(join(work, tag + "-again"), file)))?)) {
+        print("FAIL  " + tag + " nondeterministic " + tag + " image");
+        return false;
+    }
+    if (!machoArm64(x)) {
+        print("FAIL  " + tag + " " + file + " 不是 arm64 的 Mach-O");
+        return false;
+    }
+    return true;
+}
+
+function main(argv: []string): int {
+    return run(argv) catch (e) {
+        eprint("test_a64_image: " + e.message);
+        return 1;
+    };
+}

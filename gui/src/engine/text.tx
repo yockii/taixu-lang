@@ -1,0 +1,303 @@
+// ============================================================================
+// engine/text —— 字体句柄、单行排版、度量与绘制（GUI 原生引擎 G1）。
+//
+// - 字体句柄 1..8（同旧宿主；释放后槽位复用，投影里的 font= 即句柄号）。载入时拷贝字节，之后
+//   与调用方无关。嵌入字体为思源黑体 CFF 子集（ASCII＋GB2312 一级＋常用标点，OFL，见 fonts/）；
+//   系统字体按族名经 engine/fontdir 找到文件与 TTC 面号（重放、定格态不查）。
+// - 排版：码位经 cmap 得字形号（缺字为 .notdef），施加 GSUB 标准连字（ccmp、liga 等），前进量取
+//   hmtx，GPOS kern 的成对调整按查找号升序逐个施加；数值按 HarfBuzz 的定点算法缩放——1/64 像素
+//   单位 v·m 再四舍五入（m 为 size·64·65536/upem 取整，右移 16 位），每个字形的前进量与偏移再向零
+//   截到整像素。连字与字距同旧的 HarfBuzz 缺省；只排单行，不做上下文替换与复杂文字整形。度量＝
+//   各字形整像素前进量之和，与绘制所用完全一致（旧实现度量不截断、绘制截到 64 字节，已改正）。
+// - 绘制：(x, y) 为行顶；基线 = y + round(上升 × size ÷ (上升 − 下降))（em 盒归一化上升，上升与下降
+//   取 hhea）。字形按 glyph 模块光栅（不做 hinting），按覆盖度 src-over 混合；每次绘制记一条 text
+//   投影（全文，不再截断）。字号 1..1024 像素才光栅，度量不限。字形位图按（字体、字号、字形号）缓存，
+//   超过 8192 个或释放字体时清空。
+// ============================================================================
+
+import { Font, fontParseFace, glyphOf, advanceOf, outlineOf, pairAdjust, singleSubst, ligatureSubst } from "./sfnt";
+import { SysFace, sysFontFind } from "./fontdir";
+import { GlyphBm, rasterize } from "./glyph";
+import { surfOk, surfAt, rRecordText, rBlendMask } from "./raster";
+import { replayLoad, replayActive, freezeFrame } from "./replay";
+
+const MAX_FONTS: int = 8;
+const MAX_RENDER_SIZE: int = 1024;
+const MAX_MEASURE_SIZE: int = 1000000;
+const CACHE_MAX: int = 8192;
+
+let fonts: List<Font> = listNew();
+let live: List<bool> = listNew();
+let cache: Map<int, GlyphBm> = mapNew();
+
+function fontOk(h: int): bool {
+    return h >= 1 && (listTryGet(live, h - 1) catch false);
+}
+
+function fontAt(h: int): Font {
+    return listGet(fonts, h - 1);
+}
+
+/// 载入字体（拷贝字节；字体集合取第 0 个）；格式不支持或句柄用尽得 -1。
+export function textFontLoad(data: Bytes): int {
+    return textFontLoadFace(data, 0);
+}
+
+/// 载入字体集合（TTC）里第 index 个字体；单字体文件只收 0。
+export function textFontLoadFace(data: Bytes, index: int): int {
+    const f: Font = fontParseFace(bytesSlice(data, 0, bytesLen(data)), index) catch (e) {
+        return -1;
+    };
+    let i: int = 0;
+    while (i < listLen(live)) {
+        if (!(listTryGet(live, i) catch true)) {
+            listSet(fonts, i, f);
+            listSet(live, i, true);
+            return i + 1;
+        }
+        i = i + 1;
+    }
+    if (listLen(fonts) >= MAX_FONTS) {
+        return -1;
+    }
+    listPush(fonts, f);
+    listPush(live, true);
+    return listLen(fonts);
+}
+
+/// 释放字体（幂等；同时清空字形缓存）。
+export function textFontFree(h: int): void {
+    if (fontOk(h)) {
+        listSet(live, h - 1, false);
+        mapClear(cache);
+    }
+}
+
+/// 嵌入字体的字节（每次一份新拷贝）。
+export function textEmbedded(): Bytes {
+    return embedBytes("fonts/taixu-embed-cjk-sc.otf");
+}
+
+/// 按族名找系统字体（engine/fontdir：扫系统字体目录的 name 表，中英文族名都认）；没找到 path 为空串。
+/// 重放或定格态恒为空串——回放与 golden 恒用嵌入字体，结果不随机器装了什么字体而变。
+export function textSystemFace(family: string): SysFace {
+    replayLoad();
+    if (replayActive() || freezeFrame() != 0) {
+        return { path: "", index: 0 };
+    }
+    return sysFontFind(family);
+}
+
+// UTF-8 → 码位（输入恒为合法 UTF-8）。
+function codepoints(t: string): List<int> {
+    const out: List<int> = listNew();
+    let i: int = 0;
+    const n: int = len(t);
+    while (i < n) {
+        const c: int = byteTryAt(t, i) catch 0;
+        if (c < 128) {
+            listPush(out, c);
+            i = i + 1;
+        } else if (c < 224) {
+            listPush(out, ((c & 31) << 6) | ((byteTryAt(t, i + 1) catch 0) & 63));
+            i = i + 2;
+        } else if (c < 240) {
+            listPush(out, ((c & 15) << 12) | (((byteTryAt(t, i + 1) catch 0) & 63) << 6) | ((byteTryAt(t, i + 2) catch 0) & 63));
+            i = i + 3;
+        } else {
+            listPush(out, ((c & 7) << 18) | (((byteTryAt(t, i + 1) catch 0) & 63) << 12) | (((byteTryAt(t, i + 2) catch 0) & 63) << 6) | ((byteTryAt(t, i + 3) catch 0) & 63));
+            i = i + 4;
+        }
+    }
+    return out;
+}
+
+function emScale(v: int, mult: int): int {
+    return (v * mult + 32768) >> 16;
+}
+
+// GSUB 标准连字：按查找号升序，每个查找从头扫一遍；同一位置取第一个命中的子表。
+function substitute(f: Font, input: List<int>): List<int> {
+    let gids: List<int> = input;
+    let k: int = 0;
+    while (k < listLen(f.gsub)) {
+        const nsub: int = listTryGet(f.gsub, k) catch 0;
+        const out: List<int> = listNew();
+        let i: int = 0;
+        while (i < listLen(gids)) {
+            let used: int = 1;
+            let g: int = listTryGet(gids, i) catch 0;
+            let j: int = 0;
+            while (j < nsub) {
+                const st: int = listTryGet(f.gsub, k + 1 + j * 2) catch 0;
+                const so: int = listTryGet(f.gsub, k + 2 + j * 2) catch 0;
+                if (st == 1) {
+                    const r: int = singleSubst(f, so, g);
+                    if (r >= 0) {
+                        g = r;
+                        j = nsub;
+                    }
+                } else {
+                    const r: List<int> = ligatureSubst(f, so, gids, i);
+                    if (listLen(r) == 2) {
+                        g = listTryGet(r, 0) catch 0;
+                        used = listTryGet(r, 1) catch 1;
+                        j = nsub;
+                    }
+                }
+                j = j + 1;
+            }
+            listPush(out, g);
+            i = i + used;
+        }
+        gids = out;
+        k = k + 1 + nsub * 2;
+    }
+    return gids;
+}
+
+// 单行排版：得 [字形数 n, 总宽, 字形号₀, 笔位₀, …]（笔位为整像素，含 x 偏移）。
+function layout(f: Font, size: int, t: string): List<int> {
+    const cps: List<int> = codepoints(t);
+    const mult: int = (size * 64 * 65536) / f.upem;
+    let gids: List<int> = listNew();
+    for (cp in cps) {
+        listPush(gids, glyphOf(f, cp));
+    }
+    gids = substitute(f, gids);
+    const n: int = listLen(gids);
+    const adv: List<int> = listNew();
+    const off: List<int> = listNew();
+    for (g in gids) {
+        listPush(adv, emScale(advanceOf(f, g), mult));
+        listPush(off, 0);
+    }
+    let k: int = 0;
+    while (k < listLen(f.kern)) {
+        const nsub: int = listTryGet(f.kern, k) catch 0;
+        let i: int = 0;
+        while (i + 1 < n) {
+            let step: int = 1;
+            let j: int = 0;
+            while (j < nsub) {
+                const r: List<int> = pairAdjust(f, listTryGet(f.kern, k + 1 + j) catch 0, listTryGet(gids, i) catch 0, listTryGet(gids, i + 1) catch 0);
+                if (listLen(r) == 5) {
+                    listSet(off, i, (listTryGet(off, i) catch 0) + emScale(listTryGet(r, 0) catch 0, mult));
+                    listSet(adv, i, (listTryGet(adv, i) catch 0) + emScale(listTryGet(r, 1) catch 0, mult));
+                    listSet(off, i + 1, (listTryGet(off, i + 1) catch 0) + emScale(listTryGet(r, 2) catch 0, mult));
+                    listSet(adv, i + 1, (listTryGet(adv, i + 1) catch 0) + emScale(listTryGet(r, 3) catch 0, mult));
+                    if ((listTryGet(r, 4) catch 0) == 1) {
+                        step = 2;
+                    }
+                    j = nsub;
+                }
+                j = j + 1;
+            }
+            i = i + step;
+        }
+        k = k + 1 + nsub;
+    }
+    const out: List<int> = listNew();
+    listPush(out, n);
+    listPush(out, 0);
+    let pen: int = 0;
+    let i: int = 0;
+    while (i < n) {
+        listPush(out, listTryGet(gids, i) catch 0);
+        listPush(out, pen + (listTryGet(off, i) catch 0) / 64);
+        pen = pen + (listTryGet(adv, i) catch 0) / 64;
+        i = i + 1;
+    }
+    listSet(out, 1, pen);
+    return out;
+}
+
+/// 单行宽度（像素）；字体无效或字号不在 1..1000000 得 -1。
+export function textMeasure(font: int, size: int, t: string): int {
+    if (!fontOk(font) || size < 1 || size > MAX_MEASURE_SIZE) {
+        return -1;
+    }
+    return listTryGet(layout(fontAt(font), size, t), 1) catch 0;
+}
+
+/// em 盒归一化上升（像素，四舍五入）。
+export function textAscent(font: int, size: int): int {
+    if (!fontOk(font) || size < 1) {
+        return 0;
+    }
+    const f: Font = fontAt(font);
+    const total: int = f.asc - f.desc;
+    if (total <= 0) {
+        return (f.asc * size + f.upem / 2) / f.upem;
+    }
+    return (f.asc * size * 2 + total) / (2 * total);
+}
+
+function glyphBm(font: int, f: Font, size: int, gid: int): GlyphBm {
+    const key: int = (font * 4096 + size) * 65536 + gid;
+    if (mapHas(cache, key)) {
+        return mapGet(cache, key) catch panic("不可达");
+    }
+    const path: List<float> = listNew();
+    let bm: GlyphBm = { w: 0, h: 0, left: 0, top: 0, cov: bytesNew(0) };
+    if (outlineOf(f, gid, path)) {
+        bm = rasterize(path, (size as float) / (f.upem as float));
+    }
+    if (mapLen(cache) >= CACHE_MAX) {
+        mapClear(cache);
+    }
+    mapSet(cache, key, bm);
+    return bm;
+}
+
+/// 画单行文字，(x, y) 为行顶；记一条 text 投影。面或字体无效得 -1。
+export function textDraw(surface: int, font: int, size: int, t: string, x: int, y: int, color: int): int {
+    return textDrawStyled(surface, font, size, t, x, y, color, false, false);
+}
+
+// Synthetic emphasis for the browser's minimum CSS subset. Original cached masks
+// and advances remain unchanged; ordinary textDraw follows the original path.
+export function textDrawStyled(surface: int, font: int, size: int, t: string, x: int, y: int, color: int, bold: bool, italic: bool): int {
+    if (!surfOk(surface) || !fontOk(font)) {
+        return -1;
+    }
+    const s = surfAt(surface);
+    rRecordText(s, x, y, size, font, color, t);
+    if (size < 1 || size > MAX_RENDER_SIZE) {
+        return 0;
+    }
+    const f: Font = fontAt(font);
+    const lay: List<int> = layout(f, size, t);
+    const n: int = listTryGet(lay, 0) catch 0;
+    const base: int = y + textAscent(font, size);
+    let i: int = 0;
+    while (i < n) {
+        const gid: int = listTryGet(lay, 2 + i * 2) catch 0;
+        const gx: int = listTryGet(lay, 3 + i * 2) catch 0;
+        const bm: GlyphBm = glyphBm(font, f, size, gid);
+        if (bm.w > 0) {
+            if (!bold && !italic) { rBlendMask(s, x + gx + bm.left, base + bm.top, bm.w, bm.h, bm.cov, color); }
+            else {
+                let spread = 0; let slant = 0;
+                if (bold) { spread = size / 24; if (spread < 1) { spread = 1; } }
+                if (italic) { slant = (bm.h - 1) / 5; }
+                const width = bm.w + spread + slant;
+                if (width < 1 || width > 32768 || bm.h < 1 || bm.h > 32768 || width > 16777216 / bm.h) { return -1; }
+                const mask = bytesNew(width * bm.h); let row = 0;
+                while (row < bm.h) {
+                    let shift = 0; if (italic) { shift = (bm.h - 1 - row) / 5; } let col = 0;
+                    while (col < bm.w) {
+                        const coverage = bytesGet(bm.cov, row * bm.w + col) catch 0; let extra = 0;
+                        while (extra <= spread) {
+                            const at = row * width + col + shift + extra;
+                            if (coverage > (bytesGet(mask, at) catch 0)) { bytesSet(mask, at, coverage); } extra = extra + 1;
+                        } col = col + 1;
+                    } row = row + 1;
+                }
+                rBlendMask(s, x + gx + bm.left, base + bm.top, width, bm.h, mask, color);
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}

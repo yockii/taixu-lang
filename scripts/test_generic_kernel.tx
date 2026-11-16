@@ -1,0 +1,234 @@
+// 可移植版内核的对照：内核生成器的 --generic=模块,… 让所列模块用 rtfn 写的可移植版代替手写的 x86 版。
+// 由给定编译器编出生成器（宿主目标），生成所选 x86_64 目标的两个内核（标准、可移植），各跑一遍语料（语料运行器
+// scripts/test_nrt_products.tx 经 --kernel），可选再跑 --leak-check 与 --debug 两种；可移植内核的每个用例结果须与标准内核相同
+// （通过、失败、跳过一一对应）。另外列出标准内核自己没过的用例（只报告，不计入成败）。
+// 别的指令集的内核本来就全用可移植版（生成器只给 x86_64 手写版），所以目标只有 x86_64 的三个系统。
+//
+// 运行（仓根）：taixu run --toolchain scripts/test_generic_kernel.tx --compiler <taixu> --generic <模块,…|all> --work <目录>
+//   [--target windows|linux|macos] [--leak-check] [--debug] [用例…]
+// --target 缺省为宿主系统；linux 在 Windows 宿主上经 wsl.exe 运行产物，macos 经 ssh 在测试机上运行（x86_64，Rosetta），都由语料
+// 运行器负责。有不同即退出码 1；生成器或内核生成失败、报告读不了时 2。
+import { byteSub, exeName, isAbs, join, kindOf, mkdirs, nat } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { captureRaw } from "./test_lib";
+import { Rows, loadRows, runCorpus } from "./test_corpus";
+import { slashes, sorted } from "./test_text";
+import { noTarget, targetNamed } from "./targets";
+
+const SEC: int = 1000000000;
+// 内核生成器 runtime_memory_gen 编出完整内核的开关（同语料运行器 scripts/test_nrt_products.tx）。
+const KERNEL_FLAGS: []string = ["--with-move", "--with-alloc", "--with-rc", "--with-str", "--with-strb", "--with-zero", "--with-list",
+    "--with-file", "--with-argv", "--with-store-slots", "--with-nrt"];
+const USAGE: string = "用法：taixu run --toolchain scripts/test_generic_kernel.tx --compiler <taixu> --generic <模块,…|all> --work <目录> [--target windows|linux|macos] [--leak-check] [--debug] [用例…]";
+
+struct Opts {
+    root: string,
+    compiler: string,
+    generic: string,
+    work: string,
+    os: string,
+    leak: bool,
+    debug: bool,
+    cases: List<string>,
+}
+
+function full(root: string, p: string): string {
+    if (isAbs(p)) {
+        return slashes(osRealPath(nat(p)));
+    }
+    return slashes(osRealPath(nat(join(root, p))));
+}
+
+function parse(argv: []string): Ref<Opts> | Error {
+    const o = new Opts { root: "", compiler: "", generic: "", work: "", os: hostTarget(), leak: false, debug: false, cases: listNew() };
+    o.root = slashes(osRealPath(nat(currentDir() catch ".")));
+    let i = 0;
+    while (i < len(argv)) {
+        const a = argv[i];
+        if (a == "--leak-check") {
+            o.leak = true;
+        } else if (a == "--debug") {
+            o.debug = true;
+        } else if (a == "--compiler" || a == "--generic" || a == "--work" || a == "--target") {
+            if (i + 1 >= len(argv)) {
+                return err(a + " 缺值\n" + USAGE);
+            }
+            const v = argv[i + 1];
+            i = i + 1;
+            if (a == "--compiler") {
+                o.compiler = full(o.root, v);
+            } else if (a == "--generic") {
+                o.generic = v;
+            } else if (a == "--work") {
+                o.work = v;
+            } else {
+                o.os = v;
+            }
+        } else if (len(a) > 0 && (byteAt(a, 0) ?? 0) == 45) {
+            return err("未知参数：" + a + "\n" + USAGE);
+        } else {
+            listPush(o.cases, a);
+        }
+        i = i + 1;
+    }
+    if (len(o.compiler) == 0 || len(o.generic) == 0 || len(o.work) == 0) {
+        return err(USAGE);
+    }
+    if (!(o.os == "windows" || o.os == "linux" || o.os == "macos")) {
+        return err("--target 只能是 windows、linux 或 macos\n" + USAGE);
+    }
+    if (!mkdirs(nat(o.work))) {
+        return err("建不了 " + o.work);
+    }
+    o.work = full(o.root, o.work);
+    return o;
+}
+
+function kernelName(os: string): string {
+    return (targetNamed("x86_64-" + os) ?? noTarget()).kernel;
+}
+
+function text(r: Bytes): string {
+    return bytesToStr(r) catch "<非 UTF-8 输出>";
+}
+
+// 宿主上的内核生成器；失败得 Error。
+function generator(o: Ref<Opts>): string | Error {
+    const out = join(o.work, "gen");
+    const args: List<string> = listNew();
+    listPush(args, "build");
+    listPush(args, "bootstrap/runtime_memory_gen.tx");
+    listPush(args, "--toolchain");
+    listPush(args, "--runtime=native");
+    listPush(args, "--out");
+    listPush(args, nat(out));
+    const r = captureRaw(o.compiler, args, nat(o.root), 1800 * SEC, 30 * SEC, 16777216)?;
+    if (r.code != 0) {
+        return err("generator build failed:\n" + text(r.out) + text(r.err));
+    }
+    return nat(join(out, exeName("runtime_memory_gen")));
+}
+
+// kind（standard／generic）的内核；失败得 Error。
+function kernel(o: Ref<Opts>, gen: string, kind: string, generic: string): string | Error {
+    const dir = join(o.work, kind);
+    if (!mkdirs(nat(dir))) {
+        return err("建不了 " + dir);
+    }
+    const k = join(dir, kernelName(o.os));
+    const args: List<string> = listNew();
+    listPush(args, "--target");
+    listPush(args, "x86_64-" + o.os);
+    listPush(args, nat(k));
+    for (f in KERNEL_FLAGS) {
+        listPush(args, f);
+    }
+    if (len(generic) > 0) {
+        listPush(args, "--generic=" + generic);
+    }
+    const r = captureRaw(gen, args, nat(o.root), 600 * SEC, 30 * SEC, 16777216)?;
+    if (r.code != 0 || kindOf(nat(k)) != 1) {
+        return err(kind + " kernel failed: " + text(r.out) + text(r.err));
+    }
+    return nat(k);
+}
+
+// 一遍语料（mode 为空、--leak-check 或 --debug）；结果取语料运行器的报告。
+function corpus(o: Ref<Opts>, kind: string, k: string, mode: string): Ref<Rows> | Error {
+    let tag = "normal";
+    if (len(mode) > 0) {
+        tag = byteSub(mode, 2, len(mode) - 2);
+    }
+    const report = nat(join(o.work, kind + "-" + tag + ".json"));
+    const extra: List<string> = listNew();
+    listPush(extra, "--kernel");
+    listPush(extra, k);
+    listPush(extra, "--target");
+    listPush(extra, o.os);
+    if (len(mode) > 0) {
+        listPush(extra, mode);
+    }
+    for (c in o.cases) {
+        listPush(extra, c);
+    }
+    const runDir = nat(join(o.work, "run-" + kind + "-" + tag));
+    runCorpus(o.compiler, nat(o.root), runDir, report, extra)?;
+    if (kindOf(report) != 1) {
+        return err("语料运行器没写出报告 " + report + "（运行目录 " + runDir + "）");
+    }
+    return loadRows(report);
+}
+
+function compare(o: Ref<Opts>, std: string, gen: string, mode: string): int | Error {
+    const a = corpus(o, "standard", std, mode)?;
+    const b = corpus(o, "generic", gen, mode)?;
+    let label = "normal";
+    if (len(mode) > 0) {
+        label = mode;
+    }
+    const counts: Map<string, int> = mapNew();
+    for (c in mapKeys(b.status)) {
+        const s = mapGet(b.status, c) ?? "";
+        mapSet(counts, s, (mapGet(counts, s) ?? 0) + 1);
+    }
+    let line = label + ": ";
+    let first = true;
+    for (s in sorted(mapKeys(counts))) {
+        if (!first) {
+            line = line + " ";
+        }
+        line = line + s + "=" + toStr(mapGet(counts, s) ?? 0);
+        first = false;
+    }
+    print(line);
+    const all: Map<string, int> = mapNew();
+    for (c in mapKeys(a.status)) {
+        mapSet(all, c, 1);
+    }
+    for (c in mapKeys(b.status)) {
+        mapSet(all, c, 1);
+    }
+    let diff = 0;
+    for (c in sorted(mapKeys(all))) {
+        const x = mapGet(a.status, c);
+        const y = mapGet(b.status, c);
+        if ((x == None) != (y == None) || (x ?? "") != (y ?? "")) {
+            print("  DIFF " + c + " standard=" + (x ?? "None") + " generic=" + (y ?? "None"));
+            diff = diff + 1;
+        }
+    }
+    for (c in sorted(mapKeys(a.status))) {
+        const s = mapGet(a.status, c) ?? "";
+        if (s != "PASS" && s != "COMPILE_REJECT" && s != "SKIP") {
+            print("  standard kernel itself: " + c + " " + s);
+        }
+    }
+    return diff;
+}
+
+function run(argv: []string): int | Error {
+    const o = parse(argv)?;
+    const gen = generator(o)?;
+    const std = kernel(o, gen, "standard", "")?;
+    const generic = kernel(o, gen, "generic", o.generic)?;
+    let bad = compare(o, std, generic, "")?;
+    if (o.leak) {
+        bad = bad + compare(o, std, generic, "--leak-check")?;
+    }
+    if (o.debug) {
+        bad = bad + compare(o, std, generic, "--debug")?;
+    }
+    if (bad == 0) {
+        print("SUMMARY PASS generic=" + o.generic);
+        return 0;
+    }
+    print("SUMMARY FAIL generic=" + o.generic);
+    return 1;
+}
+
+function main(argv: []string): int {
+    return run(argv) catch (e) {
+        eprint(e.message);
+        return 2;
+    };
+}

@@ -1,0 +1,466 @@
+// 编译器优化画像／消融：一到三个编译器臂编同一批负载，按臂的全排列轮换次序，记墙钟、CPU 时间、周期（Windows 为子进程 CPU 周期，
+// Linux、macOS 为用户态周期，另记退休指令数）、峰值常驻内存与 --time 的各阶段耗时；各臂产物须逐字节相同。只作诊断，不作判定
+// （判退化见 perf_compare.tx）。
+//
+// 每个样本由 perf_lib.tx 的帮手进程起编译器；子进程的环境去掉 TAIXU_* 变量（置空）、PATH 指向空目录；stderr 存进样本目录的
+// stderr.log（stdout 不留）。bootstrap/ 下的负载按工具链程序编（带 --toolchain）。--kernel 让各臂以 --link-object 链同一个内核对象
+// （缺省用各自内嵌的内核）。--cpu 固定逻辑 CPU 并核对每个编译器进程实际的集合（macOS 不支持）。过程中报告随时写到 <work>/report.json；
+// 跑完再核对一遍源码、编译器与内核没被改过。
+//
+//   taixu run --toolchain scripts/compiler_profile.tx --arm <名> <编译器> [--arm <名> <编译器>…] --work <新目录> [--kernel <内核对象>]
+//       [--runs 6] [--cpu N] [--load <源>…] [--root <仓库根>]
+import { cleanEnv, cpuList, cpuPolicy, fixed, isPerfHelper, jFloat, median, perfHelperMain, perfMeasure, privateExe, timePhases,
+    txHashes } from "./perf_lib";
+import { absolute, baseOf, exeName, join, kindOf, mkdirs, parseDigits, shaOf, startsWith } from "./build_lib";
+import { J_NUM, Jv, jArray, jDump, jEq, jGet, jNull, jNumber, jObject, jPretty, jPush, jSet, jString } from "./test_json";
+
+const USAGE: string = "用法：compiler_profile --arm <名> <编译器> [--arm <名> <编译器>…] --work <新目录> [--kernel <内核对象>] [--runs 6]"
++ " [--cpu N] [--load <源>…] [--root <仓库根>]";
+const LIMIT_MS: int = 1200000;
+
+struct Opts {
+    names: List<string>,
+    exes: List<string>,
+    work: string,
+    kernel: string,
+    runs: int,
+    cpu: int,
+    loads: List<string>,
+    root: string,
+}
+
+// 一个样本里汇总要用的数。
+struct Row {
+    load: string,
+    round: int,
+    arm: string,
+    wallNs: int,
+    cpuNs: int,
+    cycles: int,
+    peak: int,
+    phases: List<string>,
+}
+
+function simpleName(n: string): bool {
+    if (len(n) == 0) {
+        return false;
+    }
+    let i = 0;
+    while (i < len(n)) {
+        const c = byteAt(n, i) ?? 0;
+        if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 45)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function parse(argv: []string): Ref<Opts> | Error {
+    const o = new Opts { names: listNew(), exes: listNew(), work: "", kernel: "", runs: 6, cpu: -1, loads: listNew(), root: "" };
+    let i = 0;
+    while (i + 1 < len(argv)) {
+        const a = argv[i];
+        const v = argv[i + 1];
+        if (a == "--arm") {
+            if (i + 2 >= len(argv)) {
+                return err(USAGE);
+            }
+            if (!simpleName(v)) {
+                return err("臂名只用字母、数字、_ 与 -：" + v);
+            }
+            for (n in o.names) {
+                if (n == v) {
+                    return err("臂名重复：" + v);
+                }
+            }
+            listPush(o.names, v);
+            listPush(o.exes, absolute(argv[i + 2]));
+            i = i + 3;
+            continue;
+        }
+        if (a == "--work") {
+            o.work = absolute(v);
+        } else if (a == "--kernel") {
+            o.kernel = absolute(v);
+        } else if (a == "--runs") {
+            o.runs = parseDigits(v);
+        } else if (a == "--cpu") {
+            o.cpu = parseDigits(v);
+            if (o.cpu < 0) {
+                return err("--cpu 须为非负整数");
+            }
+        } else if (a == "--load") {
+            listPush(o.loads, v);
+        } else if (a == "--root") {
+            o.root = absolute(v);
+        } else {
+            return err(USAGE);
+        }
+        i = i + 2;
+    }
+    if (i != len(argv) || len(o.work) == 0 || listLen(o.names) == 0) {
+        return err(USAGE);
+    }
+    if (listLen(o.names) > 3) {
+        return err("至多三个臂");
+    }
+    if (o.runs < 2) {
+        return err("--runs 至少 2");
+    }
+    if (listLen(o.loads) == 0) {
+        for (l in strSplit("bootstrap/lexer.tx bootstrap/parser.tx bootstrap/semamirror.tx", " ")) {
+            listPush(o.loads, l);
+        }
+    }
+    if (len(o.root) == 0) {
+        o.root = absolute(currentDir() catch ".");
+    }
+    return o;
+}
+
+// 0..n−1 的全排列，按字典序（同 itertools.permutations）。
+function permutations(n: int): List<List<int>> {
+    const out: List<List<int>> = listNew();
+    const cur: List<int> = listNew();
+    permute(n, cur, out);
+    return out;
+}
+
+function permute(n: int, cur: List<int>, out: List<List<int>>): void {
+    if (listLen(cur) == n) {
+        const copy: List<int> = listNew();
+        for (x in cur) {
+            listPush(copy, x);
+        }
+        listPush(out, copy);
+        return;
+    }
+    let k = 0;
+    while (k < n) {
+        let used = false;
+        for (x in cur) {
+            if (x == k) {
+                used = true;
+            }
+        }
+        if (!used) {
+            listPush(cur, k);
+            permute(n, cur, out);
+            const popped = listTryPop(cur);
+        }
+        k = k + 1;
+    }
+}
+
+function stemOf(load: string): string {
+    const b = baseOf(load);
+    if (len(b) > 3 && strSlice(b, len(b) - 3, len(b)) == ".tx") {
+        return strSlice(b, 0, len(b) - 3);
+    }
+    return b;
+}
+
+function save(o: Ref<Opts>, doc: Ref<Jv>): void {
+    writeFile(join(o.work, "report.json"), jPretty(doc, 2) + "\n") catch (e) {
+        eprint("写不了 report.json：" + e.message);
+    };
+}
+
+function sourceHashes(root: string): Ref<Jv> {
+    const h = jObject();
+    txHashes(root, "bootstrap", h);
+    txHashes(root, "prelude", h);
+    return h;
+}
+
+function compilersJson(o: Ref<Opts>): Ref<Jv> {
+    const c = jObject();
+    let k = 0;
+    while (k < listLen(o.names)) {
+        jSet(c, listGet(o.names, k) catch "", jString(shaOf(listGet(o.exes, k) catch "")));
+        k = k + 1;
+    }
+    return c;
+}
+
+function kernelSha(o: Ref<Opts>): Ref<Jv> {
+    if (len(o.kernel) == 0) {
+        return jNull();
+    }
+    return jString(shaOf(o.kernel));
+}
+
+// 一个负载：先按臂名的次序各跑一次不计，再跑 runs 轮。
+function profileLoad(o: Ref<Opts>, doc: Ref<Jv>, orders: List<List<int>>, load: string, rows: List<Ref<Row>>): void | Error {
+    const samples = jGet(doc, "samples") ?? doc;
+    const stem = stemOf(load);
+    let expected = "";
+    let iteration = -1;
+    while (iteration < o.runs) {
+        let order: List<int> = listNew();
+        if (iteration < 0) {
+            let k = 0;
+            while (k < listLen(o.names)) {
+                listPush(order, k);
+                k = k + 1;
+            }
+        } else {
+            order = listGet(orders, iteration % listLen(orders)) catch order;
+        }
+        let slot = 0;
+        for (idx in order) {
+            const name = listGet(o.names, idx) catch "";
+            const dest = join(join(o.work, stem), toStr(iteration) + "-" + toStr(slot) + "-" + name);
+            if (kindOf(dest) != 0 || !mkdirs(dest)) {
+                return err("建不了新目录 " + dest);
+            }
+            const args: List<string> = listNew();
+            listPush(args, "build");
+            listPush(args, load);
+            listPush(args, "--time");
+            if (len(o.kernel) > 0) {
+                listPush(args, "--link-object");
+                listPush(args, o.kernel);
+            }
+            listPush(args, "--out");
+            listPush(args, dest);
+            if (startsWith(load, "bootstrap/")) {
+                listPush(args, "--toolchain");
+            }
+            const s = perfMeasure(listGet(o.exes, idx) catch "", args, o.root, LIMIT_MS);
+            if (len(s.error) > 0) {
+                return err(name + " 臂编 " + load + " 测不了：" + s.error);
+            }
+            writeFile(join(dest, "stderr.log"), s.stderr) catch (e) {};
+            if (o.cpu >= 0 && s.cpus != toStr(o.cpu)) {
+                return err("子进程的 CPU 集合不符：" + s.cpus);
+            }
+            const product = join(dest, exeName(stem));
+            let digest = "";
+            if (kindOf(product) == 1) {
+                digest = shaOf(product);
+            }
+            let cycles = s.cycles;
+            if (hostTarget() == "windows") {
+                cycles = s.cycleTime;
+            }
+            const phases = timePhases(s.stderr);
+            const row = jObject();
+            jSet(row, "wall_ns", jNumber(s.wallNs));
+            jSet(row, "cpu_ns", jNumber(s.cpuNs));
+            jSet(row, "cycles", jNumber(cycles));
+            if (hostTarget() != "windows") {
+                jSet(row, "instructions", jNumber(s.instructions));
+            }
+            jSet(row, "peak_rss", jNumber(s.peakKib * 1024));
+            jSet(row, "actual_affinity", cpuList(s.cpus));
+            jSet(row, "exit", jNumber(s.exit));
+            const pm = jObject();
+            let p = 0;
+            while (p + 1 < listLen(phases)) {
+                jSet(pm, listGet(phases, p) catch "", jRaw(listGet(phases, p + 1) catch "0"));
+                p = p + 2;
+            }
+            jSet(row, "phases_ms", pm);
+            jSet(row, "load", jString(load));
+            jSet(row, "round", jNumber(iteration));
+            jSet(row, "arm", jString(name));
+            jSet(row, "slot", jNumber(slot));
+            if (len(digest) > 0) {
+                jSet(row, "product_sha256", jString(digest));
+            } else {
+                jSet(row, "product_sha256", jNull());
+            }
+            jPush(samples, row);
+            save(o, doc);
+            if (s.exit != 0) {
+                return err("native build failed; see " + join(dest, "stderr.log"));
+            }
+            if (len(digest) == 0) {
+                return err("native build produced no output: " + product);
+            }
+            if (len(expected) == 0) {
+                expected = digest;
+            }
+            if (digest != expected) {
+                return err("different compiled products: " + dest);
+            }
+            listPush(rows, new Row { load: load, round: iteration, arm: name, wallNs: s.wallNs, cpuNs: s.cpuNs, cycles: cycles,
+                    peak: s.peakKib * 1024, phases: phases });
+            print(load + " " + toStr(iteration) + " " + name + " " + fixed((s.wallNs as float) / 1000000000.0, 3, false) + " s "
+                + fixed((s.cpuNs as float) / 1000000000.0, 3, false) + " CPU s " + fixed((s.peakKib as float) / 1024.0, 1, false) + " MiB");
+            slot = slot + 1;
+        }
+        iteration = iteration + 1;
+    }
+    return nothing();
+}
+
+function nothing(): void {
+}
+
+// 数字原文（已核对过是十进制整数）。
+function jRaw(text: string): Ref<Jv> {
+    return new Jv { kind: J_NUM, text: text, truth: false, items: listNew(), keys: listNew() };
+}
+
+function phaseMs(r: Ref<Row>, phase: string): float {
+    let p = 0;
+    while (p + 1 < listLen(r.phases)) {
+        if ((listGet(r.phases, p) catch "") == phase) {
+            return parseDigits(listGet(r.phases, p + 1) catch "0") as float;
+        }
+        p = p + 2;
+    }
+    return 0.0;
+}
+
+// 一个负载各臂的中位数（不含预热轮）。
+function summarize(o: Ref<Opts>, load: string, rows: List<Ref<Row>>): Ref<Jv> {
+    const summary = jObject();
+    for (name in o.names) {
+        const mine: List<Ref<Row>> = listNew();
+        for (r in rows) {
+            if (r.load == load && r.arm == name && r.round >= 0) {
+                listPush(mine, r);
+            }
+        }
+        const wall: List<float> = listNew();
+        const cpu: List<float> = listNew();
+        const cyc: List<float> = listNew();
+        const peak: List<float> = listNew();
+        for (r in mine) {
+            listPush(wall, r.wallNs as float);
+            listPush(cpu, r.cpuNs as float);
+            listPush(cyc, r.cycles as float);
+            listPush(peak, r.peak as float);
+        }
+        const mw = median(wall);
+        const m = jObject();
+        jSet(m, "wall_ns", jFloat(mw));
+        jSet(m, "cpu_ns", jFloat(median(cpu)));
+        jSet(m, "cycles", jFloat(median(cyc)));
+        jSet(m, "peak_rss", jFloat(median(peak)));
+        const dev: List<float> = listNew();
+        for (x in wall) {
+            if (x >= mw) {
+                listPush(dev, x - mw);
+            } else {
+                listPush(dev, mw - x);
+            }
+        }
+        let mad = 0.0;
+        if (mw != 0.0) {
+            mad = median(dev) / mw;
+        }
+        jSet(m, "wall_mad_ratio", jFloat(mad));
+        const pm = jObject();
+        const first = listGet(mine, 0) catch new Row { load: "", round: 0, arm: "", wallNs: 0, cpuNs: 0, cycles: 0, peak: 0, phases: listNew() };
+        let p = 0;
+        while (p + 1 < listLen(first.phases)) {
+            const phase = listGet(first.phases, p) catch "";
+            const xs: List<float> = listNew();
+            for (r in mine) {
+                listPush(xs, phaseMs(r, phase));
+            }
+            jSet(pm, phase, jFloat(median(xs)));
+            p = p + 2;
+        }
+        jSet(m, "phase_medians_ms", pm);
+        jSet(summary, name, m);
+    }
+    return summary;
+}
+
+function profile(o: Ref<Opts>, doc: Ref<Jv>, sources: Ref<Jv>): void | Error {
+    const orders = permutations(listLen(o.names));
+    const rows: List<Ref<Row>> = listNew();
+    const loads = jGet(doc, "loads") ?? doc;
+    for (load in o.loads) {
+        profileLoad(o, doc, orders, load, rows)?;
+        const summary = summarize(o, load, rows);
+        jSet(loads, load, summary);
+        save(o, doc);
+        print("SUMMARY " + load + " " + jDump(summary));
+    }
+    if (!jEq(sourceHashes(o.root), sources)) {
+        return err("source changed during profile");
+    }
+    if (!jEq(compilersJson(o), jGet(doc, "compilers") ?? doc) || !jEq(kernelSha(o), jGet(doc, "kernel_sha256") ?? doc)) {
+        return err("compiler or kernel changed during profile");
+    }
+    return nothing();
+}
+
+function main(argv: []string): int {
+    if (isPerfHelper(argv)) {
+        return perfHelperMain(argv);
+    }
+    const o = parse(argv) catch (e) {
+        eprint(e.message);
+        return 2;
+    };
+    if (kindOf(o.work) != 0) {
+        eprint("--work 须是新目录：" + o.work);
+        return 2;
+    }
+    const empty = join(o.work, "empty-path");
+    if (!mkdirs(empty)) {
+        eprint("建不了 " + empty);
+        return 2;
+    }
+    const policy = cpuPolicy(o.cpu) catch (e) {
+        eprint(e.message);
+        return 2;
+    };
+    cleanEnv(empty) catch (e) {
+        eprint("改不了环境：" + e.message);
+        return 2;
+    };
+    // Windows 上各臂的编译器先复制进工作目录再测（perf_lib 的 privateExe）。
+    const exes: List<string> = listNew();
+    let k = 0;
+    while (k < listLen(o.exes)) {
+        const exe = privateExe(listGet(o.exes, k) catch "", join(join(o.work, "arms"), listGet(o.names, k) catch "")) catch (e) {
+            eprint(e.message);
+            return 2;
+        };
+        listPush(exes, exe);
+        k = k + 1;
+    }
+    o.exes = exes;
+    const sources = sourceHashes(o.root);
+    const doc = jObject();
+    jSet(doc, "scope", jString("optimization profile/ablation; no acceptance verdict; no exclusive-CPU claim"));
+    jSet(doc, "host", jString(hostTarget()));
+    jSet(doc, "N", jNumber(o.runs));
+    jSet(doc, "cpu_policy", policy);
+    jSet(doc, "compilers", compilersJson(o));
+    jSet(doc, "kernel_sha256", kernelSha(o));
+    jSet(doc, "source_sha256", sources);
+    const orders = jArray();
+    for (perm in permutations(listLen(o.names))) {
+        const a = jArray();
+        for (idx in perm) {
+            jPush(a, jString(listGet(o.names, idx) catch ""));
+        }
+        jPush(orders, a);
+    }
+    jSet(doc, "orders", orders);
+    jSet(doc, "samples", jArray());
+    jSet(doc, "loads", jObject());
+    jSet(doc, "status", jString("RUNNING"));
+    save(o, doc);
+    profile(o, doc, sources) catch (e) {
+        jSet(doc, "status", jString("FAIL"));
+        jSet(doc, "error", jString(e.message));
+        save(o, doc);
+        eprint(e.message);
+        return 1;
+    };
+    jSet(doc, "status", jString("COMPLETED DIAGNOSTIC"));
+    save(o, doc);
+    print("COMPLETED DIAGNOSTIC " + join(o.work, "report.json"));
+    return 0;
+}

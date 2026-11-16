@@ -1,0 +1,220 @@
+// 门按进程号取另一个进程的资源用量（procPid，D3 v0.54）的 Linux 部分（导出面同 proc_info_os_windows.tx、proc_info_os_macos.tx）：
+// 读 /proc/<pid>/status 的 VmRSS（KiB）与 /proc/<pid>/stat 的 utime、stime（时钟滴答）。滴答按 USER_HZ＝100 换算：
+// 它是 Linux 用户态 ABI 的常量（x86_64、aarch64、riscv64、loongarch64 都是 100），即 sysconf(_SC_CLK_TCK) 的值。
+// 后代进程经 /proc/<pid>/task/<pid>/children 逐层找，取不到启动标记（stat 第 22 项）的视为已不在，至多 64 个；
+// 存活为 kill(pid, 0) 成功（同 os.kill）。
+import { startsWith } from "./build_lib";
+import { osRealPath } from "./build_os";
+
+declare function kill(pid: i32, sig: i32): i32 from syscall "kill";
+
+const USER_HZ: int = 100;
+
+// 空白分隔的各段（同 Python 的 str.split()）。
+function fields(s: string): List<string> {
+    const out: List<string> = listNew();
+    let cur = bytesNew(0);
+    let i = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) ?? 0;
+        if (c == 32 || c == 9 || c == 10 || c == 13) {
+            if (bytesLen(cur) > 0) {
+                listPush(out, bytesToStr(cur) catch "");
+                cur = bytesNew(0);
+            }
+        } else {
+            bytesPush(cur, c);
+        }
+        i = i + 1;
+    }
+    if (bytesLen(cur) > 0) {
+        listPush(out, bytesToStr(cur) catch "");
+    }
+    return out;
+}
+
+// 十进制非负整数；不是得 −1。
+function number(s: string): int {
+    if (len(s) == 0) {
+        return -1;
+    }
+    let n = 0;
+    let i = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) ?? 0;
+        if (c < 48 || c > 57) {
+            return -1;
+        }
+        n = n * 10 + (c - 48);
+        i = i + 1;
+    }
+    return n;
+}
+
+// pid 的常驻内存（字节）；进程已不在或取不到得 −1。
+export function procRss(pid: int): int {
+    const s = readFile("/proc/" + toStr(pid) + "/status") catch (e) {
+        return -1;
+    };
+    for (line in strSplit(s, "\n")) {
+        if (startsWith(line, "VmRSS:")) {
+            const kb = number(listGet(fields(line), 1) catch "");
+            if (kb < 0) {
+                return -1;
+            }
+            return kb * 1024;
+        }
+    }
+    return -1;
+}
+
+// pid 用掉的 CPU 时间（用户加内核，微秒）；进程已不在或取不到得 −1。stat 的第二段（命令名）可含空白与括号，从最后一个 ')' 之后数。
+export function procCpuUs(pid: int): int {
+    const s = readFile("/proc/" + toStr(pid) + "/stat") catch (e) {
+        return -1;
+    };
+    let close = -1;
+    let i = 0;
+    while (i < len(s)) {
+        if ((byteAt(s, i) ?? 0) == 41) {
+            close = i;
+        }
+        i = i + 1;
+    }
+    if (close < 0) {
+        return -1;
+    }
+    const rest = fields(bytesToStr(bytesSlice(bytesFromStr(s), close + 1, len(s) - close - 1)) catch "");
+    const utime = number(listGet(rest, 11) catch "");
+    const stime = number(listGet(rest, 12) catch "");
+    if (utime < 0 || stime < 0) {
+        return -1;
+    }
+    return (utime + stime) * (1000000 / USER_HZ);
+}
+
+// 直接子进程。
+function children(pid: int): List<int> {
+    const out: List<int> = listNew();
+    const s = readFile("/proc/" + toStr(pid) + "/task/" + toStr(pid) + "/children") catch (e) {
+        return out;
+    };
+    for (f in fields(s)) {
+        const n = number(f);
+        if (n >= 0) {
+            listPush(out, n);
+        }
+    }
+    return out;
+}
+
+// 启动标记（stat 的 starttime）；进程已不在为空串。
+function startMark(pid: int): string {
+    const s = readFile("/proc/" + toStr(pid) + "/stat") catch (e) {
+        return "";
+    };
+    let close = -1;
+    let i = 0;
+    while (i + 1 < len(s)) {
+        if ((byteAt(s, i) ?? 0) == 41 && (byteAt(s, i + 1) ?? 0) == 32) {
+            close = i;
+        }
+        i = i + 1;
+    }
+    if (close < 0) {
+        return "";
+    }
+    const rest = fields(bytesToStr(bytesSlice(bytesFromStr(s), close + 2, len(s) - close - 2)) catch "");
+    return listGet(rest, 19) catch "";
+}
+
+// pid 的后代进程号（不含 pid 自己，至多 64 个）；hosts 只在 Windows 上有意义。
+export function procDescendants(pid: int, hosts: bool): List<int> {
+    const out: List<int> = listNew();
+    const pending: List<int> = listNew();
+    listPush(pending, pid);
+    while (listLen(pending) > 0 && listLen(out) < 64) {
+        const p = listGet(pending, listLen(pending) - 1) catch 0;
+        listRemoveAt(pending, listLen(pending) - 1);
+        for (c in children(p)) {
+            if (len(startMark(c)) > 0) {
+                listPush(out, c);
+                listPush(pending, c);
+            }
+        }
+    }
+    return out;
+}
+
+// 进程仍在（含未回收的僵尸，同 os.kill(pid, 0)）。
+export function procAlive(pid: int): bool {
+    return kill(pid as i32, 0) == 0;
+}
+
+declare function lxPidfdOpen(pid: int, flags: int): int from syscall "pidfd_open";
+declare function lxPidfdSendSignal(fd: int, sig: int, info: int, flags: int): int from syscall "pidfd_send_signal";
+declare function lxClose(fd: int): int from syscall "close";
+
+// 启动标记（同原 proc_probe.start）；进程已不在为空串。
+export function procStartMark(pid: int): string {
+    return startMark(pid);
+}
+
+// 命令行各段（/proc/<pid>/cmdline 以 NUL 分隔）。
+function argvOf(pid: int): List<string> {
+    const out: List<string> = listNew();
+    const s = readFile("/proc/" + toStr(pid) + "/cmdline") catch (e) {
+        return out;
+    };
+    let start = 0;
+    let i = 0;
+    while (i <= len(s)) {
+        if (i == len(s) || (byteAt(s, i) ?? 0) == 0) {
+            if (i > start) {
+                listPush(out, bytesToStr(bytesSlice(bytesFromStr(s), start, i - start)) catch "");
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+function hasArg(xs: List<string>, want: string): bool {
+    for (x in xs) {
+        if (x == want) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 只终止私有 MCP 实例 parent 的那个 worker：直接子进程里命令行含 mcp 与
+// --worker-generation、可执行文件即 compiler 的恰有一个才动手，经 pidfd 发 SIGKILL（持有进程句柄，不盲发 PID）。
+export function killOwnedWorker(parent: int, compiler: string): bool {
+    const want = osRealPath(compiler);
+    const matches: List<int> = listNew();
+    for (c in children(parent)) {
+        const a = argvOf(c);
+        if (listLen(a) > 0 && hasArg(a, "mcp") && hasArg(a, "--worker-generation") && osRealPath(listGet(a, 0) catch "") == want) {
+            listPush(matches, c);
+        }
+    }
+    if (listLen(matches) != 1) {
+        return false;
+    }
+    const fd = lxPidfdOpen(listGet(matches, 0) catch 0, 0);
+    if (fd < 0) {
+        return false;
+    }
+    const sent = lxPidfdSendSignal(fd, 9, 0, 0);
+    const closed = lxClose(fd);
+    return true;
+}
+
+// 启动标记仍是 mark 时发 SIGKILL（失败收尾用，不误杀复用了 PID 的进程）。
+export function killIfSame(pid: int, mark: string): void {
+    if (len(mark) > 0 && startMark(pid) == mark) {
+        const r = kill(pid as i32, 9);
+    }
+}

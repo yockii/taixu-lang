@@ -1,0 +1,211 @@
+// dbus-codec —— D-Bus 编组与门户请求的纯函数（G5 第二部分；三端都跑，不连总线）：解别家编的真实消息（libdbus 的 dbus-send 与
+// dbus-daemon、GLib 的 GDBus，2026-11-02 在 Ubuntu 24.04 的会话总线上用 dbus-monitor --binary 抓的，头部字段顺序各不相同）、手工
+// 构造的大端消息；本库编出的消息解回来字段不变（Hello 的字节另作金样）；不合格式的输入（截断、端序标记、超长、缺 NUL、坏签名、
+// 嵌套过深、数组越界、布尔不是 0／1）一律判坏而不 trap；签名完整性、总线地址、认证行、请求路径、file:// URI、门户通配。
+import { DbusMsg, DbusR, dbusMsg, dbusEncode, dbusDecode, dbusFrameLen, dbusReader, dbusAuthLine, dbusUnixAddr, sigNext, drStr, drSig, drU32, drBool, drArrayOpen, drStruct, drSkip, dwStr, dwSig, dwU32, dwBool, dwArrayOpen, dwArrayClose, dwStruct, DBUS_CALL } from "gui/engine/dbus";
+import { portalRequestPath, portalChooserBody, fileUriPath } from "gui/engine/portal";
+import { FdFilter, fdAdd, fdPortalGlob } from "gui/engine/filedialog";
+
+// libdbus（dbus-send）发的 Properties.Get("org.freedesktop.DBus", "Features")，经 dbus-daemon 补了 SENDER。
+const LIBDBUS_CALL: string = "6c01000129000000020000008d00000001016f00150000002f6f72672f667265656465736b746f702f44427573000000020173001f0000006f72672e667265656465736b746f702e444275732e50726f70657274696573000301730003000000476574000000000006017300140000006f72672e667265656465736b746f702e4442757300000000080167000273730007017300040000003a312e3200000000140000006f72672e667265656465736b746f702e444275730000000008000000466561747572657300";
+// dbus-daemon 的回复：变体里是 as。
+const DAEMON_REPLY: string = "6c02010152000000030000003d00000006017300040000003a312e32000000000501750002000000080167000176000007017300140000006f72672e667265656465736b746f702e4442757300000000026173004a0000001a0000004163746976617461626c6553657276696365734368616e67656400000f00000048656164657246696c746572696e67001100000053797374656d6441637469766174696f6e00";
+// GDBus（gdbus call）发的 Properties.Get("org.freedesktop.DBus", "Interfaces")：字段顺序与 libdbus 不同。
+const GDBUS_CALL: string = "6c0100012b000000030000008d00000001016f00150000002f6f72672f667265656465736b746f702f44427573000000020173001f0000006f72672e667265656465736b746f702e444275732e50726f706572746965730006017300140000006f72672e667265656465736b746f702e444275730000000008016700027373000301730003000000476574000000000007017300040000003a312e3300000000140000006f72672e667265656465736b746f702e44427573000000000a000000496e746572666163657300";
+// 手工构造的大端回复：REPLY_SERIAL 5、签名 u、正文 0x01020304。
+const BIG_REPLY: string = "4202000100000004000000070000000f0501750000000005080167000175000001020304";
+
+function hexBytes(s: string): Bytes {
+    const b = bytesFromStr(s);
+    const out = bytesNew(0);
+    let i: int = 0;
+    while (i + 1 < bytesLen(b)) {
+        bytesPush(out, nib(bytesGet(b, i) catch 0) * 16 + nib(bytesGet(b, i + 1) catch 0));
+        i = i + 2;
+    }
+    return out;
+}
+
+function nib(c: int): int {
+    if (c >= 0x61) {
+        return c - 0x61 + 10;
+    }
+    return c - 0x30;
+}
+
+function toHex(b: Bytes): string {
+    const digits: string = "0123456789abcdef";
+    let s: string = "";
+    let i: int = 0;
+    while (i < bytesLen(b)) {
+        const v: int = bytesGet(b, i) catch 0;
+        const hi: int = v >> 4;
+        const lo: int = v & 15;
+        s = s + strSlice(digits, hi, hi + 1) + strSlice(digits, lo, lo + 1);
+        i = i + 1;
+    }
+    return s;
+}
+
+function head(label: string, m: DbusMsg): void {
+    print(label + " kind=" + toStr(m.kind) + " flags=" + toStr(m.flags) + " serial=" + toStr(m.serial) + " reply=" + toStr(m.replyTo) + " path=" + m.path + " iface=" + m.iface + " member=" + m.member + " dest=" + m.dest + " sender=" + m.sender + " sig=" + m.sig + " body=" + toStr(bytesLen(m.body)));
+}
+
+function strings(r: Ref<DbusR>): string {
+    let s: string = "";
+    const end: int = drArrayOpen(r, 4);
+    while (!r.bad && r.pos < end) {
+        s = s + "[" + drStr(r) + "]";
+    }
+    return s;
+}
+
+function decodeHex(label: string, hex: string): DbusMsg {
+    const m: DbusMsg = dbusDecode(hexBytes(hex)) catch dbusMsg(0, "", "", "", "");
+    head(label, m);
+    return m;
+}
+
+function bad(label: string, b: Bytes): void {
+    const m: DbusMsg = dbusDecode(b) catch dbusMsg(0, "", "", "", "");
+    print("reject " + label + " frame=" + toStr(dbusFrameLen(b, 0)) + " kind=" + toStr(m.kind));
+}
+
+function skipBad(label: string, sig: string, body: Bytes): void {
+    const r = new DbusR { b: body, pos: 0, big: false, bad: false };
+    drSkip(r, sig);
+    print("skip " + label + " bad=" + toStr(r.bad) + " pos=" + toStr(r.pos));
+}
+
+export function main(args: []string): int {
+    args;
+    // 别家编的真实消息。
+    const a: DbusMsg = decodeHex("libdbus", LIBDBUS_CALL);
+    const ra = dbusReader(a);
+    print("  body " + drStr(ra) + " " + drStr(ra) + " bad=" + toStr(ra.bad));
+    const b: DbusMsg = decodeHex("daemon", DAEMON_REPLY);
+    const rb = dbusReader(b);
+    print("  variant " + drSig(rb) + " " + strings(rb) + " bad=" + toStr(rb.bad));
+    const g: DbusMsg = decodeHex("gdbus", GDBUS_CALL);
+    const rg = dbusReader(g);
+    print("  body " + drStr(rg) + " " + drStr(rg) + " bad=" + toStr(rg.bad));
+    const be: DbusMsg = decodeHex("big", BIG_REPLY);
+    print("  u " + toStr(drU32(dbusReader(be))));
+
+    // 本库编的消息：Hello 的字节作金样，解回来字段不变；带正文与 REPLY_SERIAL 的往返。
+    const hello: Bytes = dbusEncode(dbusMsg(DBUS_CALL, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "Hello"), 1);
+    print("hello " + toHex(hello));
+    head("hello-back", dbusDecode(hello) catch dbusMsg(0, "", "", "", ""));
+    let m: DbusMsg = dbusMsg(DBUS_CALL, "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop", "org.freedesktop.portal.FileChooser", "OpenFile");
+    m.sig = "ssa{sv}";
+    m.replyTo = 9;
+    m.flags = 1;
+    m.sender = ":1.7";
+    const fs: List<FdFilter> = listNew();
+    fdAdd(fs, "图片", ["png", "JPG"]);
+    fdAdd(fs, "所有文件", ["*"]);
+    m.body = portalChooserBody("x11:4a00007", "打开", "taixu1", fs, "未命名.tx");
+    const back: DbusMsg = dbusDecode(dbusEncode(m, 77)) catch dbusMsg(0, "", "", "", "");
+    head("chooser-back", back);
+    const rc = dbusReader(back);
+    let opts: string = drStr(rc) + " " + drStr(rc);
+    const end: int = drArrayOpen(rc, 8);
+    while (!rc.bad && rc.pos < end) {
+        drStruct(rc);
+        const key: string = drStr(rc);
+        const vs: string = drSig(rc);
+        opts = opts + " " + key + ":" + vs;
+        if (vs == "s") {
+            opts = opts + "=" + drStr(rc);
+        } else if (vs == "b") {
+            opts = opts + "=" + toStr(drBool(rc));
+        } else {
+            drSkip(rc, vs);
+        }
+    }
+    print("  options " + opts + " bad=" + toStr(rc.bad || rc.pos != end) + " end=" + toStr(rc.pos == bytesLen(back.body)));
+    print("  chooser-body " + toHex(m.body));
+
+    // 不合格式的输入。
+    const good: Bytes = hexBytes(DAEMON_REPLY);
+    bad("truncated", bytesSlice(good, 0, bytesLen(good) - 1));
+    bad("short-head", bytesSlice(good, 0, 10));
+    const endian = hexBytes(DAEMON_REPLY);
+    bytesSet(endian, 0, 0x78);
+    bad("endian", endian);
+    const huge = hexBytes(DAEMON_REPLY);
+    bytesSetLE<u32>(huge, 4, 0x7FFFFFFF as u32);
+    bad("huge-body", huge);
+    const kind0 = hexBytes(DAEMON_REPLY);
+    bytesSet(kind0, 1, 0);
+    bad("kind-0", kind0);
+    const ver = hexBytes(DAEMON_REPLY);
+    bytesSet(ver, 3, 2);
+    bad("version-2", ver);
+    const nonul = hexBytes(DAEMON_REPLY);
+    bytesSet(nonul, 28, 0x41); // SENDER 字段 ":1.2" 之后的 NUL
+    bad("no-nul", nonul);
+    const zero = hexBytes(DAEMON_REPLY);
+    bytesSetLE<u32>(zero, 8, 0 as u32);
+    bad("serial-0", zero);
+
+    const deep = bytesNew(0);
+    let d: int = 0;
+    while (d < 40) {
+        dwSig(deep, "v");
+        d = d + 1;
+    }
+    skipBad("deep-variant", "v", deep);
+    const arr = bytesNew(0);
+    dwU32(arr, 1000);
+    skipBad("array-past-end", "as", arr);
+    const vbad = bytesNew(0);
+    dwSig(vbad, "ss");
+    skipBad("variant-two-types", "v", vbad);
+    const boolBad = bytesNew(0);
+    dwU32(boolBad, 2);
+    const rbool = new DbusR { b: boolBad, pos: 0, big: false, bad: false };
+    drBool(rbool);
+    print("bool-2 bad=" + toStr(rbool.bad));
+    const nested = bytesNew(0);
+    const o: int = dwArrayOpen(nested, 8);
+    dwStruct(nested);
+    dwStr(nested, "k");
+    dwSig(nested, "a(us)");
+    const inner: int = dwArrayOpen(nested, 8);
+    dwStruct(nested);
+    dwU32(nested, 3);
+    dwStr(nested, "x");
+    dwArrayClose(nested, inner, 8);
+    dwArrayClose(nested, o, 8);
+    skipBad("a{sv}-ok", "a{sv}", nested);
+
+    // 签名完整性。
+    let sigs: string = "";
+    for (s in ["s", "a{sv}", "a(sa(us))", "(ii)", "v", "aai", "a{oa{sv}}", "a", "()", "(i", "{sv}", "a{s}", "a{vs}", "a{(i)s}", "a{sss}", "z"]) {
+        const sb = bytesFromStr(s);
+        sigs = sigs + " " + s + "=" + toStr(sigNext(sb, 0, 0) == bytesLen(sb));
+    }
+    print("sigs" + sigs);
+
+    // 总线地址、认证行、请求路径、URI、门户通配。
+    for (addr in ["unix:path=/run/user/1000/bus", "unix:abstract=/tmp/dbus-AbC,guid=1234", "tcp:host=x,port=1;unix:path=/tmp/a%20b", "unix:tmpdir=/tmp", ""]) {
+        let parts: string = "";
+        for (p in dbusUnixAddr(addr)) {
+            parts = parts + "[" + p + "]";
+        }
+        print("addr " + addr + " -> " + parts);
+    }
+    const auth: string = dbusAuthLine(1000);
+    print("auth " + strSlice(auth, 0, len(auth) - 2) + " crlf=" + toStr(strFind(auth, "\r\n") == bytesLen(bytesFromStr(auth)) - 2));
+    print("request " + portalRequestPath(":1.42", "taixu1") + " " + portalRequestPath("org.example.App", "t"));
+    for (u in ["file:///tmp/a%20b.txt", "file://localhost/x/%E5%A4%AA%E8%99%9A", "file://host/x", "https://a/b", "file:///bad%00nul", "file:///plain"]) {
+        print("uri " + u + " -> [" + fileUriPath(u) + "]");
+    }
+    let globs: string = "";
+    for (e in ["tx", "Tar.GZ", "图", "*", "a1"]) {
+        globs = globs + " " + fdPortalGlob(e);
+    }
+    print("globs" + globs);
+    return 0;
+}

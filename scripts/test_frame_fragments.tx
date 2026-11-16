@@ -1,0 +1,564 @@
+// 帧读取层（bootstrap/selfhost/frame_io.tx）的固定种子帧头变异与分片差分：90 项输入（10 项固定，80 项由种子 20261023 生成，序列同
+// Python 的 random.Random），各按整块、每 257 字节、每 1 字节（256 字节及以上的改为 65535／1／余下三段）三种分片写给探针，探针的输出与
+// 退出码须与本文件的参照模型相同。参照与 frame_io 的规则一一对应：头块（连同换行）至多 65536 字节；行尾的 CR 去掉后，行内的 CR、
+// ≥0x80 与水平制表符以外的控制字节（含 DEL）都是坏帧；Content-Length 头不分大小写、前后的空格与制表符不计、恰好一个、1～18 位十进制
+// 数字；正文超过 128 字节为 MessageTooLong；零长正文记作一个空格。
+// 探针只在已核验的无网络、无宿主挂载的 Docker 容器里运行：先由候选编译器构建
+// `taixu build tests/tool-security/frame-probe.tx --toolchain --target=linux`，复制进专用容器可执行的 tmpfs（/work/ 下）；本文件不复制
+// 任何宿主环境、源码或真实数据，运行前核对容器：网络 none、只读根文件系统、没有挂载、用户 65534:65534、有内存与进程数上限、
+// 去掉全部能力、no-new-privileges。
+// 运行（仓根）：taixu run --toolchain scripts/test_frame_fragments.tx --container <容器> [--probe /work/frame-probe] --report <文件>
+// 全部相同退出码 0 并写报告；容器核对不过或有不同 1（不写报告），参数不对 2。
+import { findInPath, nat, startsWith } from "./build_lib";
+import { MODE_RAW, Peer, peerClose, peerFinish, peerPump, peerSend, peerStart } from "./test_proto";
+import { Jv, J_ARR, jArray, jAt, jGet, jInt, jIsTrue, jLen } from "./test_json";
+import { jNumber, jObject, jParseBytes, jPretty, jPush, jSet, jString, jText } from "./test_json";
+import { rngBelow, rngNew } from "./test_random";
+import { captureRaw } from "./test_lib";
+
+const HEAD_MAX: int = 65536;
+const BODY_MAX: int = 128;
+const SEED: int = 20261023;
+const SEC: int = 1000000000;
+const LINE_MS: int = 10000;
+const EXIT_MS: int = 5000;
+const HEX: string = "0123456789abcdef";
+const USAGE: string = "用法：taixu run --toolchain scripts/test_frame_fragments.tx --container <容器> [--probe /work/frame-probe] --report <文件>";
+
+// ---- 用例 ----
+
+function str(s: string): Bytes {
+    return bytesFromStr(s);
+}
+
+function cat(a: Bytes, b: Bytes): Bytes {
+    const out = bytesNew(0);
+    bytesAppend(out, a);
+    bytesAppend(out, b);
+    return out;
+}
+
+function times(a: Bytes, n: int): Bytes {
+    const out = bytesNew(0);
+    let i = 0;
+    while (i < n) {
+        bytesAppend(out, a);
+        i = i + 1;
+    }
+    return out;
+}
+
+// 90 项输入：先 10 项固定的（空、一帧、三帧、零长正文、缺一字节、11000 行短头、70000 字节的长头行、头块恰为 65535／65536／65537
+// 字节），再 80 项随机的（正文 0～139 个随机字节；四分之一另加一个大写的重复 Content-Length；前面 0～9 行 `X: a`；一半在随机位置
+// 换进 NUL、LF、CR、+、-、: 或 0xFF 之一）。
+export function frameCases(): List<Bytes> {
+    const base = str("Content-Length: 2\r\n\r\n{}");
+    const cases: List<Bytes> = listNew();
+    listPush(cases, bytesNew(0));
+    listPush(cases, base);
+    listPush(cases, times(base, 3));
+    listPush(cases, str("Content-Length: 0\r\n\r\n"));
+    listPush(cases, bytesSlice(base, 0, bytesLen(base) - 1));
+    listPush(cases, cat(times(str("X: a\r\n"), 11000), base));
+    listPush(cases, cat(cat(cat(str("X: "), times(str("x"), 70000)), str("\r\n")), base));
+    for (size in [65535, 65536, 65537]) {
+        listPush(cases, cat(cat(cat(str("X: "), times(str("x"), size - (bytesLen(base) - 2) - 5)), str("\r\n")), base));
+    }
+    const rng = rngNew(SEED);
+    const swaps: []int = [0, 10, 13, 43, 45, 58, 255];
+    let k = 0;
+    while (k < 80) {
+        const n = rngBelow(rng, 140);
+        const body = bytesNew(0);
+        let i = 0;
+        while (i < n) {
+            bytesPush(body, rngBelow(rng, 256));
+            i = i + 1;
+        }
+        let head = "Content-Length: " + toStr(n) + "\r\n";
+        if (rngBelow(rng, 4) == 0) {
+            head = head + "CONTENT-LENGTH: " + toStr(n) + "\r\n";
+        }
+        const data = cat(cat(times(str("X: a\n"), rngBelow(rng, 10)), str(head + "\r\n")), body);
+        if (rngBelow(rng, 2) == 0) {
+            const at = rngBelow(rng, bytesLen(data));
+            bytesSet(data, at, swaps[rngBelow(rng, 7)]);
+        }
+        listPush(cases, data);
+        k = k + 1;
+    }
+    return cases;
+}
+
+// ---- 参照模型 ----
+
+export struct Outcome {
+    code: int,
+    lines: List<string>,
+}
+
+function hex(b: Bytes): string {
+    const out = bytesNew(0);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) catch 0;
+        bytesPush(out, byteAt(HEX, c / 16) ?? 48);
+        bytesPush(out, byteAt(HEX, c % 16) ?? 48);
+        i = i + 1;
+    }
+    return bytesToStr(out) catch "";
+}
+
+function isBlank(c: int): bool {
+    return c == 32 || c == 9;
+}
+
+function lower(c: int): int {
+    if (c >= 65 && c <= 90) {
+        return c + 32;
+    }
+    return c;
+}
+
+// b[from, to) 去掉两端的空格与制表符后，等于 ASCII 小写的 word（不分大小写）。
+function keyIs(b: Bytes, from: int, to: int, word: string): bool {
+    let a = from;
+    let z = to;
+    while (a < z && isBlank(bytesGet(b, a) catch 0)) {
+        a = a + 1;
+    }
+    while (z > a && isBlank(bytesGet(b, z - 1) catch 0)) {
+        z = z - 1;
+    }
+    if (z - a != len(word)) {
+        return false;
+    }
+    let i = 0;
+    while (i < z - a) {
+        if (lower(bytesGet(b, a + i) catch 0) != (byteAt(word, i) ?? 0)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// b[from, to) 去掉两端的空格与制表符后的 1～18 位十进制数；不是得 −1。
+function lengthOf(b: Bytes, from: int, to: int): int {
+    let a = from;
+    let z = to;
+    while (a < z && isBlank(bytesGet(b, a) catch 0)) {
+        a = a + 1;
+    }
+    while (z > a && isBlank(bytesGet(b, z - 1) catch 0)) {
+        z = z - 1;
+    }
+    if (z == a || z - a > 18) {
+        return -1;
+    }
+    let v = 0;
+    let i = a;
+    while (i < z) {
+        const c = bytesGet(b, i) catch 0;
+        if (c < 48 || c > 57) {
+            return -1;
+        }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+function fail(out: List<string>, why: string): Ref<Outcome> {
+    listPush(out, "ERROR " + why);
+    return new Outcome { code: 3, lines: out };
+}
+
+// 一整块输入在 frame_io 下应得的输出行与退出码。
+export function frameReference(input: Bytes): Ref<Outcome> {
+    const out: List<string> = listNew();
+    let data = input;
+    while (bytesLen(data) > 0) {
+        let pos = 0;
+        let length = -1;
+        while (true) {
+            let lf = pos;
+            while (lf < bytesLen(data) && (bytesGet(data, lf) catch 0) != 10) {
+                lf = lf + 1;
+            }
+            if (lf >= bytesLen(data) || lf + 1 > HEAD_MAX) {
+                return fail(out, "BadFrame");
+            }
+            let end = lf;
+            if (end > pos && (bytesGet(data, end - 1) catch 0) == 13) {
+                end = end - 1;
+            }
+            let colon = -1;
+            let i = pos;
+            while (i < end) {
+                const c = bytesGet(data, i) catch 0;
+                if (c == 13 || c >= 128 || (c < 32 && c != 9) || c == 127) {
+                    return fail(out, "BadFrame");
+                }
+                if (c == 58 && colon < 0) {
+                    colon = i;
+                }
+                i = i + 1;
+            }
+            const start = pos;
+            pos = lf + 1;
+            if (end == start) {
+                if (length < 0) {
+                    return fail(out, "BadFrame");
+                }
+                break;
+            }
+            if (colon >= 0 && keyIs(data, start, colon, "content-length")) {
+                if (length >= 0) {
+                    return fail(out, "BadFrame");
+                }
+                length = lengthOf(data, colon + 1, end);
+                if (length < 0) {
+                    return fail(out, "BadFrame");
+                }
+                if (length > BODY_MAX) {
+                    return fail(out, "MessageTooLong");
+                }
+            }
+        }
+        if (bytesLen(data) - pos < length) {
+            return fail(out, "BadFrame");
+        }
+        if (length == 0) {
+            listPush(out, "BODY 20");
+        } else {
+            listPush(out, "BODY " + hex(bytesSlice(data, pos, length)));
+        }
+        data = bytesSlice(data, pos + length, bytesLen(data) - pos - length);
+    }
+    return new Outcome { code: 0, lines: out };
+}
+
+// 三种分片：整块、每 257 字节、每 1 字节（256 字节及以上改为 65535／1／余下），空片不写。
+function splits(data: Bytes): List<List<Bytes>> {
+    const out: List<List<Bytes>> = listNew();
+    const whole: List<Bytes> = listNew();
+    listPush(whole, data);
+    listPush(out, whole);
+    const chunks: List<Bytes> = listNew();
+    let i = 0;
+    while (i < bytesLen(data)) {
+        let n = bytesLen(data) - i;
+        if (n > 257) {
+            n = 257;
+        }
+        listPush(chunks, bytesSlice(data, i, n));
+        i = i + n;
+    }
+    listPush(out, chunks);
+    const fine: List<Bytes> = listNew();
+    if (bytesLen(data) < 256) {
+        i = 0;
+        while (i < bytesLen(data)) {
+            listPush(fine, bytesSlice(data, i, 1));
+            i = i + 1;
+        }
+    } else {
+        let head = bytesLen(data);
+        if (head > 65535) {
+            head = 65535;
+        }
+        listPush(fine, bytesSlice(data, 0, head));
+        if (bytesLen(data) > 65535) {
+            listPush(fine, bytesSlice(data, 65535, 1));
+        }
+        if (bytesLen(data) > 65536) {
+            listPush(fine, bytesSlice(data, 65536, bytesLen(data) - 65536));
+        }
+    }
+    listPush(out, fine);
+    return out;
+}
+
+// ---- 探针 ----
+
+// 探针 stdout 里的下一行（去掉两端空白）；到流尾时置 eof、得空串，10 秒内没有完整的一行得 Error。
+struct Reader {
+    p: Ref<Peer>,
+    at: int,
+    eof: bool,
+}
+
+function nextLine(r: Ref<Reader>): string | Error {
+    const deadline = monoNs() + LINE_MS * 1000000;
+    while (true) {
+        let i = r.at;
+        while (i < bytesLen(r.p.pending) && (bytesGet(r.p.pending, i) catch 0) != 10) {
+            i = i + 1;
+        }
+        if (i < bytesLen(r.p.pending)) {
+            const raw = bytesSlice(r.p.pending, r.at, i - r.at);
+            r.at = i + 1;
+            let a = 0;
+            let z = bytesLen(raw);
+            while (a < z && (bytesGet(raw, a) catch 0) <= 32) {
+                a = a + 1;
+            }
+            while (z > a && (bytesGet(raw, z - 1) catch 0) <= 32) {
+                z = z - 1;
+            }
+            return bytesToStr(bytesSlice(raw, a, z - a)) catch "";
+        }
+        if (!r.p.outOpen) {
+            if (r.at < bytesLen(r.p.pending)) {
+                const tail = bytesSlice(r.p.pending, r.at, bytesLen(r.p.pending) - r.at);
+                r.at = bytesLen(r.p.pending);
+                return bytesToStr(tail) catch "";
+            }
+            r.eof = true;
+            return "";
+        }
+        const left = (deadline - monoNs()) / 1000000;
+        if (left <= 0) {
+            return err("探针 10 秒内没有输出完整的一行");
+        }
+        peerPump(r.p, left);
+    }
+    return "";
+}
+
+// 逐片写给探针，每写一片等它报一次 READ（或结束），收齐 BODY／ERROR 行；stderr 须为空。
+function exercise(docker: string, container: string, probe: string, pieces: List<Bytes>): Ref<Outcome> | Error {
+    const args: List<string> = listNew();
+    listPush(args, "exec");
+    listPush(args, "-i");
+    listPush(args, container);
+    listPush(args, probe);
+    listPush(args, "ack");
+    const p = peerStart(docker, args, nat(currentDir() catch "."), MODE_RAW, false)?;
+    const r = new Reader { p: p, at: 0, eof: false };
+    const out: List<string> = listNew();
+    let ended = false;
+    for (part in pieces) {
+        if (bytesLen(part) == 0) {
+            continue;
+        }
+        if (!peerSend(p, part)) {
+            break;
+        }
+        while (true) {
+            const line = nextLine(r) catch (e) {
+                peerClose(p);
+                return e;
+            };
+            if (r.eof) {
+                ended = true;
+                break;
+            }
+            if (line == "READ") {
+                break;
+            }
+            listPush(out, line);
+        }
+        if (ended) {
+            break;
+        }
+    }
+    procCloseStream(p.h, 0);
+    while (!ended) {
+        const line = nextLine(r) catch (e) {
+            peerClose(p);
+            return e;
+        };
+        if (r.eof) {
+            break;
+        }
+        if (line != "READ") {
+            listPush(out, line);
+        }
+    }
+    const code = peerFinish(p, EXIT_MS);
+    peerClose(p);
+    if (code == None) {
+        return err("探针 5 秒内没有退出");
+    }
+    if (bytesLen(p.err) > 0) {
+        return err("探针写了 stderr：" + (bytesToStr(bytesSlice(p.err, 0, 4096)) catch "<非 UTF-8>"));
+    }
+    return new Outcome { code: code ?? -1, lines: out };
+}
+
+// ---- 容器核对 ----
+
+function textAt(v: Ref<Jv>?, key: string): string {
+    return jText(jGet(v ?? jObject(), key)) ?? "";
+}
+
+function positive(v: Ref<Jv>?, key: string): bool {
+    return (jInt(jGet(v ?? jObject(), key)) ?? 0) > 0;
+}
+
+function hasText(v: Ref<Jv>?, want: string, prefix: bool): bool {
+    const a = v ?? jArray();
+    if (a.kind != J_ARR) {
+        return false;
+    }
+    let i = 0;
+    while (i < jLen(a)) {
+        const s = jText(jAt(a, i)) ?? "";
+        if (s == want || (prefix && startsWith(s, want))) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 容器的隔离：网络 none、只读根、没有挂载、用户 65534:65534、有内存与进程数上限、去掉全部能力、no-new-privileges。
+function containerOk(docker: string, container: string): string | Error {
+    const args: List<string> = listNew();
+    listPush(args, "inspect");
+    listPush(args, container);
+    const r = captureRaw(docker, args, nat(currentDir() catch "."), 60 * SEC, 10 * SEC, 16777216)?;
+    if (r.code != 0) {
+        return err("docker inspect " + container + " 失败：" + (bytesToStr(r.err) catch ""));
+    }
+    const all = jParseBytes(r.out)?;
+    const info = jAt(all, 0);
+    const host = jGet(info ?? jObject(), "HostConfig");
+    const config = jGet(info ?? jObject(), "Config");
+    const mounts = jGet(info ?? jObject(), "Mounts");
+    if (textAt(host, "NetworkMode") != "none") {
+        return "网络不是 none";
+    }
+    if (!jIsTrue(jGet(host ?? jObject(), "ReadonlyRootfs"))) {
+        return "根文件系统不是只读";
+    }
+    if (mounts == None || (mounts ?? jArray()).kind != J_ARR || jLen(mounts ?? jArray()) != 0) {
+        return "有挂载";
+    }
+    if (textAt(config, "User") != "65534:65534") {
+        return "用户不是 65534:65534";
+    }
+    if (!positive(host, "Memory") || !positive(host, "PidsLimit")) {
+        return "没有内存或进程数上限";
+    }
+    if (!hasText(jGet(host ?? jObject(), "CapDrop"), "ALL", false)) {
+        return "没有去掉全部能力";
+    }
+    if (!hasText(jGet(host ?? jObject(), "SecurityOpt"), "no-new-privileges", true)) {
+        return "没有 no-new-privileges";
+    }
+    return "";
+}
+
+// ---- 入口 ----
+
+function same(a: Ref<Outcome>, b: Ref<Outcome>): bool {
+    if (a.code != b.code || listLen(a.lines) != listLen(b.lines)) {
+        return false;
+    }
+    let i = 0;
+    while (i < listLen(a.lines)) {
+        if ((listGet(a.lines, i) catch "") != (listGet(b.lines, i) catch "")) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function show(o: Ref<Outcome>): string {
+    let s = "(" + toStr(o.code) + ", [";
+    let i = 0;
+    while (i < listLen(o.lines)) {
+        if (i > 0) {
+            s = s + ", ";
+        }
+        s = s + (listGet(o.lines, i) catch "");
+        i = i + 1;
+    }
+    return s + "])";
+}
+
+function run(argv: []string): int | Error {
+    let container = "";
+    let probe = "/work/frame-probe";
+    let report = "";
+    let i = 0;
+    while (i < len(argv)) {
+        if (i + 1 >= len(argv) || !(argv[i] == "--container" || argv[i] == "--probe" || argv[i] == "--report")) {
+            eprint(USAGE);
+            return 2;
+        }
+        if (argv[i] == "--container") {
+            container = argv[i + 1];
+        } else if (argv[i] == "--probe") {
+            probe = argv[i + 1];
+        } else {
+            report = argv[i + 1];
+        }
+        i = i + 2;
+    }
+    if (len(container) == 0 || len(report) == 0) {
+        eprint(USAGE);
+        return 2;
+    }
+    const docker = findInPath("docker");
+    if (len(docker) == 0) {
+        return err("PATH 里没有 docker");
+    }
+    if (!startsWith(probe, "/work/")) {
+        return err("探针须在容器的 /work/ 下：" + probe);
+    }
+    for (seg in strSplit(probe, "/")) {
+        if (seg == "..") {
+            return err("探针路径里有 ..：" + probe);
+        }
+    }
+    const why = containerOk(docker, container)?;
+    if (len(why) > 0) {
+        print("FAIL container " + container + ": " + why);
+        return 1;
+    }
+    const rows = jArray();
+    const cases = frameCases();
+    let k = 0;
+    while (k < listLen(cases)) {
+        const data = listGet(cases, k) catch bytesNew(0);
+        const want = frameReference(data);
+        let variant = 0;
+        for (pieces in splits(data)) {
+            const got = exercise(docker, container, probe, pieces)?;
+            if (!same(got, want)) {
+                print("FAIL case " + toStr(k) + " fragmentation " + toStr(variant) + " bytes " + toStr(bytesLen(data)) + ": want " + show(want)
+                    + " got " + show(got));
+                return 1;
+            }
+            const row = jObject();
+            jSet(row, "case", jNumber(k));
+            jSet(row, "fragmentation", jNumber(variant));
+            jSet(row, "bytes", jNumber(bytesLen(data)));
+            jSet(row, "status", jString("PASS"));
+            jPush(rows, row);
+            variant = variant + 1;
+        }
+        k = k + 1;
+    }
+    const doc = jObject();
+    jSet(doc, "seed", jNumber(SEED));
+    jSet(doc, "status", jString("PASS"));
+    jSet(doc, "cases", jNumber(listLen(cases)));
+    jSet(doc, "runs", jNumber(jLen(rows)));
+    jSet(doc, "rows", rows);
+    writeFileBytes(nat(report), bytesFromStr(jPretty(doc, 2) + "\n"))?;
+    print("PASS frame fragments seed=" + toStr(SEED) + " cases=" + toStr(listLen(cases)) + " runs=" + toStr(jLen(rows)));
+    return 0;
+}
+
+function main(argv: []string): int {
+    return run(argv) catch (e) {
+        eprint("test_frame_fragments: " + e.message);
+        return 2;
+    };
+}

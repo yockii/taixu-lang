@@ -1,0 +1,1241 @@
+// 独立的 Mach-O 可执行文件核对器。
+//
+// 不依赖编译器的任何代码（不导入 bootstrap/），按 Mach-O 格式逐项核对太虚产出的 x86_64 与 arm64 可执行文件：头与 load commands
+// 的尺寸与对齐，段的范围、对齐与保护（W^X、__TEXT 不可写），节落在段内，LC_MAIN 落在 __text 内，rebase／bind 指令逐条解码后
+// 每个目标都落在可写段里，符号表、间接符号表与 __got 的绑定一一对应，function starts 单调且在 __text 内，代码签名逐页重算
+// SHA-256（scripts/check_lib.tx 里另写的一份）。arm64另逐字解码 __text：B／BL／B.cond／CBZ／TBZ 的目标
+// 在 __text 内，每条 ADRP 紧跟用同一寄存器的 ADD 或无符号偏移的取存，合成的地址落在某个节里；经 __got 的只有 64 位 LDR，取存不
+// 写只读段（__DATA_CONST 带 SG_READ_ONLY，dyld 修补后改为只读）。这一条依赖写出端不在 __text 里放数据。
+//
+// 用法：taixu run --toolchain scripts/macho_check.tx <可执行文件>...      逐个核对，全部通过退出 0
+//       taixu run --toolchain scripts/macho_check.tx --self-test <文件>    另对篡改过的副本确认能查出（负例）
+// 库用法：machoCheck(映像字节) 得摘要串（arch=… size=…），不合格得 Error（文本即核对项）。
+import { Img, b8, be32, be64, hx, hxw, i32, imgOf, lossyText, miss, oobErr, sha256Of, u16, u32, u64 } from "./check_lib";
+
+const MH_MAGIC_64: int = 0xFEEDFACF;
+const CPU_X86_64: int = 0x01000007;
+const CPU_ARM64: int = 0x0100000C;
+const SG_READ_ONLY: int = 0x10;
+const MH_EXECUTE: int = 2;
+// NOUNDEFS DYLDLINK TWOLEVEL PIE
+const REQUIRED_FLAGS: int = 0x200085;
+const SEG_ALIGN: int = 0x4000;
+const LC_SEGMENT_64: int = 0x19;
+const LC_SYMTAB: int = 0x2;
+const LC_DYSYMTAB: int = 0xB;
+const LC_LOAD_DYLINKER: int = 0xE;
+const LC_LOAD_DYLIB: int = 0xC;
+const LC_UUID: int = 0x1B;
+const LC_BUILD_VERSION: int = 0x32;
+const LC_MAIN: int = 0x80000028;
+const LC_DYLD_INFO_ONLY: int = 0x80000022;
+const LC_FUNCTION_STARTS: int = 0x26;
+const LC_CODE_SIGNATURE: int = 0x1D;
+const LC_SOURCE_VERSION: int = 0x2A;
+const S_ZEROFILL: int = 0x1;
+const S_NON_LAZY_SYMBOL_POINTERS: int = 0x6;
+const S_THREAD_LOCAL_ZEROFILL: int = 0x12;
+const S_THREAD_LOCAL_VARIABLES: int = 0x13;
+const S_ATTR_PURE_INSTRUCTIONS: int = 0x80000000;
+
+struct Cur {
+    p: int,
+}
+
+struct Seg {
+    name: string,
+    vm: int,
+    vmsize: int,
+    off: int,
+    filesize: int,
+    maxprot: int,
+    initprot: int,
+    flags: int,
+}
+
+struct Sec {
+    name: string,
+    seg: string,
+    addr: int,
+    size: int,
+    off: int,
+    align: int,
+    flags: int,
+    reserved1: int,
+    segment: int,
+}
+
+// 定长名字段（16 字节）去掉末尾的 NUL。
+function name16(m: Ref<Img>, at: int): string {
+    let n = 16;
+    while (n > 0 && b8(m, at + n - 1) == 0) {
+        n = n - 1;
+    }
+    if (at < 0 || at + 16 > m.size) {
+        miss(m, at);
+        return "";
+    }
+    return lossyText(bytesSlice(m.d, at, n));
+}
+
+// [at, limit) 里以 NUL 结尾的串；limit 越出文件时按文件末尾截（同 Python 的 bytes.find）。
+function cstrEnd(m: Ref<Img>, at: int, limit: int): int | Error {
+    let end = limit;
+    if (end > m.size) {
+        end = m.size;
+    }
+    let p = at;
+    while (p >= 0 && p < end) {
+        if (b8(m, p) == 0) {
+            return p;
+        }
+        p = p + 1;
+    }
+    return err("unterminated string at " + hx(at));
+}
+
+function cstr(m: Ref<Img>, at: int, limit: int): string | Error {
+    const end = cstrEnd(m, at, limit)?;
+    return lossyText(bytesSlice(m.d, at, end - at));
+}
+
+function uleb(m: Ref<Img>, c: Ref<Cur>, limit: int): int | Error {
+    let value = 0;
+    let shift = 0;
+    while (true) {
+        if (c.p >= limit) {
+            return err("ULEB past end");
+        }
+        const b = b8(m, c.p);
+        c.p = c.p + 1;
+        value = value | ((b & 0x7F) << shift);
+        shift = shift + 7;
+        if (shift >= 70) {
+            return err("ULEB too long");
+        }
+        if ((b & 0x80) == 0) {
+            return value;
+        }
+    }
+    return value;
+}
+
+// 只用于跳过 bind 的加数（写出端不用加数，见到即报错），不求值。
+function skipSleb(m: Ref<Img>, c: Ref<Cur>, limit: int): void | Error {
+    while (true) {
+        if (c.p >= limit) {
+            return err("SLEB past end");
+        }
+        const b = b8(m, c.p);
+        c.p = c.p + 1;
+        if ((b & 0x80) == 0) {
+            return;
+        }
+    }
+}
+
+function one(kinds: List<int>, kind: int): int | Error {
+    let found = 0;
+    let idx = -1;
+    let i = 0;
+    while (i < listLen(kinds)) {
+        if ((listGet(kinds, i) catch 0) == kind) {
+            found = found + 1;
+            idx = i;
+        }
+        i = i + 1;
+    }
+    if (found != 1) {
+        return err("expected exactly one load command " + hx(kind) + ", found " + toStr(found));
+    }
+    return idx;
+}
+
+function known(cmd: int): bool {
+    return cmd == LC_SEGMENT_64 || cmd == LC_SYMTAB || cmd == LC_DYSYMTAB || cmd == LC_LOAD_DYLINKER || cmd == LC_LOAD_DYLIB
+    || cmd == LC_UUID || cmd == LC_BUILD_VERSION || cmd == LC_MAIN || cmd == LC_DYLD_INFO_ONLY || cmd == LC_FUNCTION_STARTS
+    || cmd == LC_CODE_SIGNATURE || cmd == LC_SOURCE_VERSION;
+}
+
+function segAt(segs: List<Seg>, i: int): Seg {
+    return listGet(segs, i) catch Seg { name: "", vm: 0, vmsize: 0, off: 0, filesize: 0, maxprot: 0, initprot: 0, flags: 0 };
+}
+
+function secAt(secs: List<Sec>, i: int): Sec {
+    return listGet(secs, i) catch Sec { name: "", seg: "", addr: 0, size: 0, off: 0, align: 0, flags: 0, reserved1: 0, segment: 0 };
+}
+
+function intAt(xs: List<int>, i: int): int {
+    return listGet(xs, i) catch 0;
+}
+
+function strAt(xs: List<string>, i: int): string {
+    return listGet(xs, i) catch "";
+}
+
+// 修补目标：段号与段内偏移；须落在可写段里。
+function writableTarget(segs: List<Seg>, segIndex: int, offset: int, what: string): int | Error {
+    if (!(segIndex > 0 && segIndex < listLen(segs))) {
+        return err(what + " names segment " + toStr(segIndex));
+    }
+    const seg = segAt(segs, segIndex);
+    if ((seg.initprot & 2) == 0) {
+        return err(what + " into non-writable segment " + seg.name);
+    }
+    if (!(offset >= 0 && offset <= seg.vmsize - 8)) {
+        return err(what + " past segment " + seg.name);
+    }
+    return seg.vm + offset;
+}
+
+// 核对一个映像；得摘要（arch、size、各项计数与 identifier，写成空格分隔的 键=值），问题即 Error。
+export function machoCheck(data: Bytes): string | Error {
+    const m = imgOf(data);
+    const size = m.size;
+    if (size < 32) {
+        return err("file too small");
+    }
+    const magic = u32(m, 0);
+    const cpu = i32(m, 4);
+    const sub = i32(m, 8);
+    const ftype = u32(m, 12);
+    const ncmds = u32(m, 16);
+    const sizeofcmds = u32(m, 20);
+    const flags = u32(m, 24);
+    if (magic != MH_MAGIC_64) {
+        return err("not MH_MAGIC_64");
+    }
+    if (cpu != CPU_X86_64 && cpu != CPU_ARM64) {
+        return err("cputype " + hx(cpu) + " is neither x86_64 nor arm64");
+    }
+    let wantSub = 3;
+    if (cpu == CPU_ARM64) {
+        wantSub = 0;
+    }
+    if ((sub & 0xFFFFFF) != wantSub) {
+        return err("cpusubtype " + hx(sub) + " for cputype " + hx(cpu));
+    }
+    if (ftype != MH_EXECUTE) {
+        return err("not MH_EXECUTE");
+    }
+    if ((flags & REQUIRED_FLAGS) != REQUIRED_FLAGS) {
+        return err("header flags " + hx(flags) + " lack NOUNDEFS|DYLDLINK|TWOLEVEL|PIE");
+    }
+    if (32 + sizeofcmds > size) {
+        return err("load commands past end of file");
+    }
+    const cmdKind: List<int> = listNew();
+    const cmdAt: List<int> = listNew();
+    const cmdSize: List<int> = listNew();
+    let at = 32;
+    let k = 0;
+    while (k < ncmds) {
+        if (at + 8 > 32 + sizeofcmds) {
+            return err("load command header past sizeofcmds");
+        }
+        const cmd = u32(m, at);
+        const cmdsize = u32(m, at + 4);
+        if (!(cmdsize >= 8 && cmdsize % 8 == 0)) {
+            return err("cmdsize " + toStr(cmdsize) + " of cmd " + hx(cmd) + " not a multiple of 8");
+        }
+        if (at + cmdsize > 32 + sizeofcmds) {
+            return err("load command " + hx(cmd) + " past sizeofcmds");
+        }
+        if (!known(cmd)) {
+            return err("unexpected load command " + hx(cmd));
+        }
+        listPush(cmdKind, cmd);
+        listPush(cmdAt, at);
+        listPush(cmdSize, cmdsize);
+        at = at + cmdsize;
+        k = k + 1;
+    }
+    if (at != 32 + sizeofcmds) {
+        return err("sizeofcmds " + toStr(sizeofcmds) + " != sum of cmdsize " + toStr(at - 32));
+    }
+
+    // 段与节。
+    const segs: List<Seg> = listNew();
+    const sections: List<Sec> = listNew();
+    let c = 0;
+    while (c < listLen(cmdKind)) {
+        if (intAt(cmdKind, c) != LC_SEGMENT_64) {
+            c = c + 1;
+            continue;
+        }
+        const sat = intAt(cmdAt, c);
+        const name = name16(m, sat + 8);
+        const nsects = u32(m, sat + 64);
+        const seg = new Seg { name: name, vm: u64(m, sat + 24), vmsize: u64(m, sat + 32), off: u64(m, sat + 40),
+            filesize: u64(m, sat + 48), maxprot: i32(m, sat + 56), initprot: i32(m, sat + 60), flags: u32(m, sat + 68) };
+        if (intAt(cmdSize, c) != 72 + 80 * nsects) {
+            return err("segment " + name + " cmdsize does not match nsects");
+        }
+        listPush(segs, unref(seg));
+        let s = 0;
+        while (s < nsects) {
+            const sa = sat + 72 + 80 * s;
+            const sec = new Sec { name: name16(m, sa), seg: name16(m, sa + 16), addr: u64(m, sa + 32), size: u64(m, sa + 40),
+                off: u32(m, sa + 48), align: u32(m, sa + 52), flags: u32(m, sa + 64), reserved1: u32(m, sa + 68),
+                segment: listLen(segs) - 1 };
+            if (sec.seg != name) {
+                return err("section " + sec.name + " names segment " + sec.seg + " inside " + name);
+            }
+            if (!(u32(m, sa + 60) == 0 && u32(m, sa + 56) == 0)) {
+                return err("section " + sec.name + " has relocations");
+            }
+            listPush(sections, unref(sec));
+            s = s + 1;
+        }
+        c = c + 1;
+    }
+    if (m.oob) {
+        return oobErr(m);
+    }
+    if (listLen(segs) < 3) {
+        return err("too few segments");
+    }
+    const zero = segAt(segs, 0);
+    if (!(zero.name == "__PAGEZERO" && zero.vm == 0 && zero.vmsize >= 4294967296)) {
+        return err("__PAGEZERO must come first and cover 4 GiB");
+    }
+    if (!(zero.filesize == 0 && zero.initprot == 0 && zero.maxprot == 0)) {
+        return err("__PAGEZERO must be unmapped and inaccessible");
+    }
+    let textIdx = -1;
+    let textCount = 0;
+    let i = 0;
+    while (i < listLen(segs)) {
+        if (segAt(segs, i).name == "__TEXT") {
+            textIdx = i;
+            textCount = textCount + 1;
+        }
+        i = i + 1;
+    }
+    if (textCount != 1) {
+        return err("exactly one __TEXT");
+    }
+    const text = segAt(segs, textIdx);
+    if (!(text.off == 0 && text.filesize > 32 + sizeofcmds)) {
+        return err("__TEXT must start at file offset 0 and hold the header");
+    }
+    if (!((text.maxprot & 2) == 0 && text.initprot == 5)) {
+        return err("__TEXT must be r-x and never writable");
+    }
+    const linkedit = segAt(segs, listLen(segs) - 1);
+    if (linkedit.name != "__LINKEDIT") {
+        return err("__LINKEDIT must be the last segment");
+    }
+    if (linkedit.off + linkedit.filesize != size) {
+        return err("__LINKEDIT must end at end of file");
+    }
+    i = 1;
+    while (i < listLen(segs)) {
+        const seg = segAt(segs, i);
+        if (!(seg.vm % SEG_ALIGN == 0 && seg.off % SEG_ALIGN == 0)) {
+            return err("segment " + seg.name + " not 16 KiB aligned");
+        }
+        if (!(seg.vmsize % SEG_ALIGN == 0 && seg.vmsize >= seg.filesize)) {
+            return err("segment " + seg.name + " vmsize");
+        }
+        if (seg.off + seg.filesize > size) {
+            return err("segment " + seg.name + " past end of file");
+        }
+        if (((seg.maxprot & 2) != 0 && (seg.maxprot & 4) != 0) || ((seg.initprot & 2) != 0 && (seg.initprot & 4) != 0)) {
+            return err("segment " + seg.name + " is writable and executable (W^X)");
+        }
+        if ((seg.initprot & ~seg.maxprot) != 0) {
+            return err("segment " + seg.name + " initprot exceeds maxprot");
+        }
+        i = i + 1;
+    }
+    i = 1;
+    while (i + 1 < listLen(segs)) {
+        const a = segAt(segs, i);
+        const b = segAt(segs, i + 1);
+        if (a.vm + a.vmsize > b.vm) {
+            return err("segments " + a.name + " and " + b.name + " overlap in memory");
+        }
+        if (a.off + a.filesize > b.off) {
+            return err("segments " + a.name + " and " + b.name + " overlap in the file");
+        }
+        i = i + 1;
+    }
+    let textSec = -1;
+    let textSecCount = 0;
+    i = 0;
+    while (i < listLen(sections)) {
+        const sec = secAt(sections, i);
+        const seg = segAt(segs, sec.segment);
+        if (!(seg.vm <= sec.addr && sec.addr + sec.size <= seg.vm + seg.vmsize)) {
+            return err("section " + sec.name + " outside its segment");
+        }
+        if (!(sec.align <= 14 && sec.addr % (1 << sec.align) == 0)) {
+            return err("section " + sec.name + " misaligned");
+        }
+        const kind = sec.flags & 0xFF;
+        if (kind == S_ZEROFILL || kind == S_THREAD_LOCAL_ZEROFILL) {
+            if (sec.off != 0) {
+                return err("zerofill section " + sec.name + " has a file offset");
+            }
+        } else if (sec.size != 0) {
+            if (sec.off != seg.off + (sec.addr - seg.vm)) {
+                return err("section " + sec.name + " file offset does not match its address");
+            }
+            if (sec.off + sec.size > seg.off + seg.filesize) {
+                return err("section " + sec.name + " past its segment file range");
+            }
+        }
+        if (sec.name == "__text" && sec.seg == "__TEXT") {
+            textSec = i;
+            textSecCount = textSecCount + 1;
+        }
+        i = i + 1;
+    }
+    const ts = secAt(sections, textSec);
+    if (!(textSecCount == 1 && (ts.flags & S_ATTR_PURE_INSTRUCTIONS) != 0)) {
+        return err("__TEXT,__text with S_ATTR_PURE_INSTRUCTIONS");
+    }
+
+    // 入口、dyld、库、版本、UUID。
+    const mainAt = intAt(cmdAt, one(cmdKind, LC_MAIN)?);
+    const entryoff = u64(m, mainAt + 8);
+    if (!(ts.off <= entryoff && entryoff < ts.off + ts.size)) {
+        return err("LC_MAIN entry outside __text");
+    }
+    const dyIdx = one(cmdKind, LC_LOAD_DYLINKER)?;
+    const dyAt = intAt(cmdAt, dyIdx);
+    if (cstr(m, dyAt + u32(m, dyAt + 8), dyAt + intAt(cmdSize, dyIdx))? != "/usr/lib/dyld") {
+        return err("dylinker must be /usr/lib/dyld");
+    }
+    const dylibs: List<string> = listNew();
+    c = 0;
+    while (c < listLen(cmdKind)) {
+        if (intAt(cmdKind, c) == LC_LOAD_DYLIB) {
+            const la = intAt(cmdAt, c);
+            listPush(dylibs, cstr(m, la + u32(m, la + 8), la + intAt(cmdSize, c))?);
+        }
+        c = c + 1;
+    }
+    if (!(listLen(dylibs) > 0 && strAt(dylibs, 0) == "/usr/lib/libSystem.B.dylib")) {
+        return err("first dylib must be libSystem");
+    }
+    const bvAt = intAt(cmdAt, one(cmdKind, LC_BUILD_VERSION)?);
+    if (u32(m, bvAt + 8) != 1) {
+        return err("LC_BUILD_VERSION platform is not macOS");
+    }
+    if (u32(m, bvAt + 12) < 0x0D0000) {
+        return err("minos below 13.0");
+    }
+    const uuidAt = intAt(cmdAt, one(cmdKind, LC_UUID)?);
+    let anyUuid = false;
+    i = 0;
+    while (i < 16) {
+        if (b8(m, uuidAt + 8 + i) != 0) {
+            anyUuid = true;
+        }
+        i = i + 1;
+    }
+    if (!anyUuid) {
+        return err("UUID is zero");
+    }
+
+    // 修补：rebase 与 bind 逐条解码。
+    const diAt = intAt(cmdAt, one(cmdKind, LC_DYLD_INFO_ONLY)?);
+    const rbOff = u32(m, diAt + 8);
+    const rbSize = u32(m, diAt + 12);
+    const bdOff = u32(m, diAt + 16);
+    const bdSize = u32(m, diAt + 20);
+    const wbSize = u32(m, diAt + 28);
+    const lbSize = u32(m, diAt + 36);
+    const exOff = u32(m, diAt + 40);
+    const exSize = u32(m, diAt + 44);
+    const leLo = linkedit.off;
+    const leHi = linkedit.off + linkedit.filesize;
+    if (!(rbSize == 0 || (leLo <= rbOff && rbOff + rbSize <= leHi))) {
+        return err("rebase info outside __LINKEDIT");
+    }
+    if (!(bdSize == 0 || (leLo <= bdOff && bdOff + bdSize <= leHi))) {
+        return err("bind info outside __LINKEDIT");
+    }
+    if (!(exSize == 0 || (leLo <= exOff && exOff + exSize <= leHi))) {
+        return err("export info outside __LINKEDIT");
+    }
+    if (!(wbSize == 0 && lbSize == 0)) {
+        return err("weak or lazy binds present (only non-lazy binds are emitted)");
+    }
+    const rebases: List<int> = listNew();
+    const cur = new Cur { p: rbOff };
+    let end = rbOff + rbSize;
+    let segIndex = -1;
+    let offset = 0;
+    while (cur.p < end) {
+        const b = b8(m, cur.p);
+        cur.p = cur.p + 1;
+        const op = b & 0xF0;
+        const imm = b & 0x0F;
+        if (op == 0x00) {
+            break;
+        } else if (op == 0x10) {
+            if (imm != 1) {
+                return err("rebase type " + toStr(imm) + " is not POINTER");
+            }
+        } else if (op == 0x20) {
+            segIndex = imm;
+            offset = uleb(m, cur, end)?;
+        } else if (op == 0x30) {
+            offset = wrapAdd<int>(offset, uleb(m, cur, end)?);
+        } else if (op == 0x40) {
+            offset = wrapAdd<int>(offset, imm * 8);
+        } else if (op == 0x50) {
+            let r = 0;
+            while (r < imm) {
+                listPush(rebases, writableTarget(segs, segIndex, offset, "rebase")?);
+                offset = offset + 8;
+                r = r + 1;
+            }
+        } else if (op == 0x60) {
+            const n = uleb(m, cur, end)?;
+            let r = 0;
+            while (r < n) {
+                listPush(rebases, writableTarget(segs, segIndex, offset, "rebase")?);
+                offset = offset + 8;
+                r = r + 1;
+            }
+        } else if (op == 0x70) {
+            listPush(rebases, writableTarget(segs, segIndex, offset, "rebase")?);
+            offset = wrapAdd<int>(offset, wrapAdd<int>(8, uleb(m, cur, end)?));
+        } else if (op == 0x80) {
+            const n = uleb(m, cur, end)?;
+            const skip = uleb(m, cur, end)?;
+            let r = 0;
+            while (r < n) {
+                listPush(rebases, writableTarget(segs, segIndex, offset, "rebase")?);
+                offset = wrapAdd<int>(offset, wrapAdd<int>(8, skip));
+                r = r + 1;
+            }
+        } else {
+            return err("unknown rebase opcode " + hx(b));
+        }
+    }
+    const bindAddr: List<int> = listNew();
+    const bindSym: List<string> = listNew();
+    const bindOrd: List<int> = listNew();
+    cur.p = bdOff;
+    end = bdOff + bdSize;
+    segIndex = -1;
+    offset = 0;
+    let ordinal = 0;
+    let symbol = "";
+    while (cur.p < end) {
+        const b = b8(m, cur.p);
+        cur.p = cur.p + 1;
+        const op = b & 0xF0;
+        const imm = b & 0x0F;
+        if (op == 0x00) {
+            break;
+        } else if (op == 0x10) {
+            ordinal = imm;
+        } else if (op == 0x20) {
+            ordinal = uleb(m, cur, end)?;
+        } else if (op == 0x40) {
+            const se = cstrEnd(m, cur.p, end)?;
+            symbol = lossyText(bytesSlice(m.d, cur.p, se - cur.p));
+            cur.p = se + 1;
+        } else if (op == 0x50) {
+            if (imm != 1) {
+                return err("bind type " + toStr(imm) + " is not POINTER");
+            }
+        } else if (op == 0x60) {
+            skipSleb(m, cur, end)?;
+            return err("bind addend is not used by the writer");
+        } else if (op == 0x70) {
+            segIndex = imm;
+            offset = uleb(m, cur, end)?;
+        } else if (op == 0x80) {
+            offset = wrapAdd<int>(offset, uleb(m, cur, end)?);
+        } else if (op == 0x90) {
+            if (len(symbol) == 0) {
+                return err("bind without a symbol");
+            }
+            if (!(ordinal >= 1 && ordinal <= listLen(dylibs))) {
+                return err("bind ordinal " + toStr(ordinal) + " out of range");
+            }
+            listPush(bindAddr, writableTarget(segs, segIndex, offset, "bind")?);
+            listPush(bindSym, symbol);
+            listPush(bindOrd, ordinal);
+            offset = offset + 8;
+        } else {
+            return err("unexpected bind opcode " + hx(b));
+        }
+    }
+    const bound: Map<int, int> = mapNew();
+    i = 0;
+    while (i < listLen(bindAddr)) {
+        const a = intAt(bindAddr, i);
+        if (mapHas(bound, a)) {
+            return err("two binds to one address");
+        }
+        mapSet(bound, a, i);
+        i = i + 1;
+    }
+    const rebased: Map<int, int> = mapNew();
+    let dupRebase = false;
+    i = 0;
+    while (i < listLen(rebases)) {
+        const a = intAt(rebases, i);
+        if (mapHas(bound, a)) {
+            return err("an address is both rebased and bound");
+        }
+        if (mapHas(rebased, a)) {
+            dupRebase = true;
+        }
+        mapSet(rebased, a, i);
+        i = i + 1;
+    }
+    if (dupRebase) {
+        return err("duplicate rebase");
+    }
+
+    // 符号表与间接符号表。
+    const stAt = intAt(cmdAt, one(cmdKind, LC_SYMTAB)?);
+    const symoff = u32(m, stAt + 8);
+    const nsyms = u32(m, stAt + 12);
+    const stroff = u32(m, stAt + 16);
+    const strsize = u32(m, stAt + 20);
+    if (!(leLo <= symoff && symoff + 16 * nsyms <= leHi)) {
+        return err("symbol table outside __LINKEDIT");
+    }
+    if (!(leLo <= stroff && stroff + strsize <= leHi)) {
+        return err("string table outside __LINKEDIT");
+    }
+    const symName: List<string> = listNew();
+    const symType: List<int> = listNew();
+    const symSect: List<int> = listNew();
+    const symDesc: List<int> = listNew();
+    const symValue: List<int> = listNew();
+    k = 0;
+    while (k < nsyms) {
+        const sa = symoff + 16 * k;
+        const strx = u32(m, sa);
+        const ntype = b8(m, sa + 4);
+        const nsect = b8(m, sa + 5);
+        const ndesc = u16(m, sa + 6);
+        const nvalue = u64(m, sa + 8);
+        if (strx >= strsize) {
+            return err("symbol " + toStr(k) + " name outside string table");
+        }
+        const name = cstr(m, stroff + strx, stroff + strsize)?;
+        if ((ntype & 0x0E) == 0x0E) {
+            if (!(nsect >= 1 && nsect <= listLen(sections))) {
+                return err("symbol " + name + " section " + toStr(nsect));
+            }
+            const sec = secAt(sections, nsect - 1);
+            if (name == "__mh_execute_header") {
+                // ld64 的惯例：记在第一个节，值为 Mach-O 头（__TEXT 起点），在 __text 之前。
+                if (nvalue != text.vm) {
+                    return err("__mh_execute_header is not the __TEXT start");
+                }
+            } else if (!(sec.addr <= nvalue && nvalue <= sec.addr + sec.size)) {
+                return err("symbol " + name + " outside its section " + sec.name);
+            }
+        }
+        listPush(symName, name);
+        listPush(symType, ntype);
+        listPush(symSect, nsect);
+        listPush(symDesc, ndesc);
+        listPush(symValue, nvalue);
+        k = k + 1;
+    }
+    const dyAt2 = intAt(cmdAt, one(cmdKind, LC_DYSYMTAB)?);
+    const ilocal = u32(m, dyAt2 + 8);
+    const nlocal = u32(m, dyAt2 + 12);
+    const iext = u32(m, dyAt2 + 16);
+    const nextdef = u32(m, dyAt2 + 20);
+    const iundef = u32(m, dyAt2 + 24);
+    const nundef = u32(m, dyAt2 + 28);
+    const indoff = u32(m, dyAt2 + 8 + 4 * 12);
+    const nind = u32(m, dyAt2 + 8 + 4 * 13);
+    if (!(ilocal == 0 && iext == nlocal && iundef == iext + nextdef && iundef + nundef == nsyms)) {
+        return err("dysymtab ranges do not partition the symbol table");
+    }
+    k = 0;
+    while (k < nlocal) {
+        if ((intAt(symType, k) & 1) != 0) {
+            return err("local symbol " + strAt(symName, k) + " is external");
+        }
+        k = k + 1;
+    }
+    k = iext;
+    while (k < iext + nextdef) {
+        const t = intAt(symType, k);
+        if (!((t & 1) != 0 && (t & 0x0E) == 0x0E)) {
+            return err("extdef " + strAt(symName, k) + " is not an external definition");
+        }
+        k = k + 1;
+    }
+    const undefNames: Map<string, int> = mapNew();
+    k = iundef;
+    while (k < nsyms) {
+        const t = intAt(symType, k);
+        if (t != 1) {
+            return err("undefined symbol " + strAt(symName, k) + " type " + hx(t));
+        }
+        const lib = intAt(symDesc, k) >> 8;
+        if (!(lib >= 1 && lib <= listLen(dylibs))) {
+            return err("undefined symbol " + strAt(symName, k) + " library ordinal " + toStr(lib));
+        }
+        mapSet(undefNames, strAt(symName, k), k);
+        k = k + 1;
+    }
+    if (!(nind == 0 || (leLo <= indoff && indoff + 4 * nind <= leHi))) {
+        return err("indirect table outside __LINKEDIT");
+    }
+    let hasTlv = false;
+    i = 0;
+    while (i < listLen(sections)) {
+        const sec = secAt(sections, i);
+        if ((sec.flags & 0xFF) == S_NON_LAZY_SYMBOL_POINTERS) {
+            if (!(sec.size % 8 == 0 && sec.reserved1 + sec.size / 8 <= nind)) {
+                return err(sec.name + " indirect range");
+            }
+            k = 0;
+            while (k < sec.size / 8) {
+                const si = u32(m, indoff + 4 * (sec.reserved1 + k));
+                if (si >= nsyms) {
+                    return err("indirect entry out of range");
+                }
+                const name = strAt(symName, si);
+                const slot = sec.addr + 8 * k;
+                const bi = mapGet(bound, slot) ?? -1;
+                if (bi < 0 || strAt(bindSym, bi) != name || intAt(bindOrd, bi) != (intAt(symDesc, si) >> 8)) {
+                    return err("GOT slot " + hx(slot) + " is not bound to " + name);
+                }
+                k = k + 1;
+            }
+        }
+        if ((sec.flags & 0xFF) == S_THREAD_LOCAL_VARIABLES) {
+            hasTlv = true;
+            if (sec.size % 24 != 0) {
+                return err("TLV descriptors must be 24 bytes each");
+            }
+            k = 0;
+            while (k < sec.size / 24) {
+                const bi = mapGet(bound, sec.addr + 24 * k) ?? -1;
+                if (bi < 0 || strAt(bindSym, bi) != "__tlv_bootstrap") {
+                    return err("TLV descriptor " + toStr(k) + " thunk is not bound to __tlv_bootstrap");
+                }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if ((flags & 0x800000) == 0 && hasTlv) {
+        return err("TLV sections without MH_HAS_TLV_DESCRIPTORS");
+    }
+    i = 0;
+    while (i < listLen(bindSym)) {
+        if (!mapHas(undefNames, strAt(bindSym, i))) {
+            return err("bound symbol " + strAt(bindSym, i) + " is not an undefined symbol");
+        }
+        i = i + 1;
+    }
+
+    // function starts。
+    const fsAt = intAt(cmdAt, one(cmdKind, LC_FUNCTION_STARTS)?);
+    const fsOff = u32(m, fsAt + 8);
+    const fsSize = u32(m, fsAt + 12);
+    if (!(leLo <= fsOff && fsOff + fsSize <= leHi)) {
+        return err("function starts outside __LINKEDIT");
+    }
+    // 带函数符号的产物（v052-image-symbols，未 --strip）：每个 function start 恰是某个 __text 本地符号的地址。
+    const named: Map<int, int> = mapNew();
+    k = 0;
+    while (k < nlocal) {
+        if ((intAt(symType, k) & 0x0E) == 0x0E && intAt(symSect, k) - 1 == textSec) {
+            mapSet(named, intAt(symValue, k), k);
+        }
+        k = k + 1;
+    }
+    cur.p = fsOff;
+    end = fsOff + fsSize;
+    let addr = 0;
+    let starts = 0;
+    while (cur.p < end) {
+        const delta = uleb(m, cur, end)?;
+        if (delta == 0) {
+            break;
+        }
+        addr = wrapAdd<int>(addr, delta);
+        if (!(ts.off <= addr && addr < ts.off + ts.size)) {
+            return err("function start " + hx(addr) + " outside __text");
+        }
+        if (cpu == CPU_ARM64 && addr % 4 != 0) {
+            return err("function start " + hx(addr) + " not 4-byte aligned");
+        }
+        if (mapLen(named) > 0 && !mapHas(named, text.vm + addr)) {
+            return err("function start " + hx(addr) + " has no local symbol");
+        }
+        starts = starts + 1;
+    }
+    let a64 = "";
+    if (cpu == CPU_ARM64) {
+        a64 = checkA64(m, ts, sections, segs, entryoff)?;
+    }
+
+    // 代码签名。
+    const csAt = intAt(cmdAt, one(cmdKind, LC_CODE_SIGNATURE)?);
+    const sigOff = u32(m, csAt + 8);
+    const sigSize = u32(m, csAt + 12);
+    if (!(sigOff + sigSize == size && leLo <= sigOff)) {
+        return err("code signature must be the last thing in __LINKEDIT");
+    }
+    const smagic = be32(m, sigOff);
+    const slength = be32(m, sigOff + 4);
+    const scount = be32(m, sigOff + 8);
+    if (!(smagic == 0xFADE0CC0 && slength <= sigSize && scount >= 1)) {
+        return err("bad SuperBlob");
+    }
+    let cdAt = -1;
+    k = 0;
+    while (k < scount) {
+        if (sigOff + 12 + 8 * k + 8 > size) {
+            return err("SuperBlob index past end of file");
+        }
+        if (be32(m, sigOff + 12 + 8 * k) == 0) {
+            cdAt = sigOff + be32(m, sigOff + 12 + 8 * k + 4);
+        }
+        k = k + 1;
+    }
+    if (cdAt < 0) {
+        return err("no CodeDirectory");
+    }
+    const cmagic = be32(m, cdAt);
+    const clen = be32(m, cdAt + 4);
+    const version = be32(m, cdAt + 8);
+    const cflags = be32(m, cdAt + 12);
+    const hashoff = be32(m, cdAt + 16);
+    const identoff = be32(m, cdAt + 20);
+    const ncode = be32(m, cdAt + 28);
+    const codelimit = be32(m, cdAt + 32);
+    const hsize = b8(m, cdAt + 36);
+    const htype = b8(m, cdAt + 37);
+    const pshift = b8(m, cdAt + 39);
+    const esegBase = be64(m, cdAt + 64);
+    const esegLimit = be64(m, cdAt + 72);
+    const esegFlags = be64(m, cdAt + 80);
+    if (m.oob) {
+        return oobErr(m);
+    }
+    if (!(cmagic == 0xFADE0C02 && version >= 0x20400)) {
+        return err("bad CodeDirectory header");
+    }
+    if ((cflags & 0x20002) != 0x20002) {
+        return err("CodeDirectory is not adhoc and linker-signed");
+    }
+    if (!(htype == 2 && hsize == 32 && pshift == 12)) {
+        return err("CodeDirectory must use SHA-256 over 4 KiB pages");
+    }
+    if (!(codelimit == sigOff && ncode == (codelimit + 4095) / 4096)) {
+        return err("codeLimit / nCodeSlots");
+    }
+    if (!(esegBase == text.off && esegLimit == text.filesize && (esegFlags & 1) != 0)) {
+        return err("execSeg does not describe __TEXT");
+    }
+    const ident = cstr(m, cdAt + identoff, cdAt + clen)?;
+    k = 0;
+    while (k < ncode) {
+        let pageEnd = 4096 * (k + 1);
+        if (pageEnd > codelimit) {
+            pageEnd = codelimit;
+        }
+        const got = sha256Of(data, 4096 * k, pageEnd - 4096 * k);
+        const wantAt = cdAt + hashoff + 32 * k;
+        if (wantAt + 32 > size || !bytesEqual(got, bytesSlice(data, wantAt, 32))) {
+            return err("page " + toStr(k) + " hash mismatch");
+        }
+        k = k + 1;
+    }
+    if (m.oob) {
+        return oobErr(m);
+    }
+    let arch = "x86_64";
+    if (cpu == CPU_ARM64) {
+        arch = "arm64";
+    }
+    return "arch=" + arch + " size=" + toStr(size) + " segments=" + toStr(listLen(segs) - 1) + " sections=" + toStr(listLen(sections))
+    + " rebases=" + toStr(listLen(rebases)) + " binds=" + toStr(listLen(bindAddr)) + " symbols=" + toStr(nsyms) + " locals="
+    + toStr(nlocal) + " starts=" + toStr(starts) + " pages=" + toStr(ncode) + " identifier=" + ident + a64;
+}
+
+function sx(value: int, bits: int): int {
+    if ((value & (1 << (bits - 1))) != 0) {
+        return value - (1 << bits);
+    }
+    return value;
+}
+
+// ADRP 对合成的地址所在的节（宽 width 字节须整个落在节里）。
+function sectionOf(sections: List<Sec>, pc: int, addr: int, width: int): int | Error {
+    let i = 0;
+    while (i < listLen(sections)) {
+        const sec = secAt(sections, i);
+        if (sec.addr <= addr && addr + width <= sec.addr + sec.size) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return err("ADRP pair at " + hx(pc) + " addresses " + hx(addr) + " outside every section");
+}
+
+// arm64 的 __text 逐字解码：分支目标、ADRP 配对与合成地址、经 __got 的取数、写只读段。得摘要的计数部分。
+function checkA64(m: Ref<Img>, ts: Sec, sections: List<Sec>, segs: List<Seg>, entryoff: int): string | Error {
+    if (!(ts.addr % 4 == 0 && ts.size % 4 == 0 && entryoff % 4 == 0)) {
+        return err("__text or LC_MAIN not 4-byte aligned");
+    }
+    const lo = ts.addr;
+    const hi = ts.addr + ts.size;
+    const n = ts.size / 4;
+    let branches = 0;
+    let pairs = 0;
+    let i = 0;
+    while (i < n) {
+        const w = u32(m, ts.off + 4 * i);
+        const pc = lo + 4 * i;
+        let isBranch = false;
+        let target = 0;
+        if ((w & 0x7C000000) == 0x14000000) {
+            // B、BL
+            isBranch = true;
+            target = pc + 4 * sx(w & 0x3FFFFFF, 26);
+        } else if ((w & 0xFF000010) == 0x54000000 || (w & 0x7E000000) == 0x34000000) {
+            // B.cond、CBZ／CBNZ
+            isBranch = true;
+            target = pc + 4 * sx((w >> 5) & 0x7FFFF, 19);
+        } else if ((w & 0x7E000000) == 0x36000000) {
+            // TBZ／TBNZ
+            isBranch = true;
+            target = pc + 4 * sx((w >> 5) & 0x3FFF, 14);
+        }
+        if (isBranch) {
+            if (!(lo <= target && target < hi)) {
+                return err("branch at " + hx(pc) + " targets " + hx(target) + " outside __text");
+            }
+            branches = branches + 1;
+            i = i + 1;
+            continue;
+        }
+        if ((w & 0x9F000000) != 0x90000000) {
+            // 只看 ADRP
+            i = i + 1;
+            continue;
+        }
+        const rd = w & 31;
+        const page = (pc & ~0xFFF) + (sx((((w >> 5) & 0x7FFFF) << 2) | ((w >> 29) & 3), 21) << 12);
+        if (i + 1 >= n) {
+            return err("ADRP at " + hx(pc) + " is the last word");
+        }
+        const nxt = u32(m, ts.off + 4 * (i + 1));
+        if (((nxt >> 5) & 31) != rd) {
+            return err("ADRP at " + hx(pc) + " is not followed by a use of x" + toStr(rd));
+        }
+        if ((nxt & 0xFFC00000) == 0x91000000) {
+            // ADD Xd, Xn, #imm12（不移位）
+            sectionOf(sections, pc, page + ((nxt >> 10) & 0xFFF), 1)?;
+        } else if ((nxt & 0x3B000000) == 0x39000000) {
+            // 取存，无符号偏移
+            const sz = nxt >> 30;
+            const vector = (nxt >> 26) & 1;
+            const opc = (nxt >> 22) & 3;
+            let scale = sz;
+            if (vector != 0 && (opc & 2) != 0 && sz == 0) {
+                scale = 4;
+            }
+            const a = page + (((nxt >> 10) & 0xFFF) << scale);
+            const sec = secAt(sections, sectionOf(sections, pc, a, 1 << scale)?);
+            let store = opc == 0;
+            if (vector != 0) {
+                store = (opc & 1) == 0;
+            }
+            const seg = segAt(segs, sec.segment);
+            if (store && ((seg.flags & SG_READ_ONLY) != 0 || (seg.initprot & 2) == 0)) {
+                return err("store at " + hx(pc + 4) + " into read-only " + sec.name);
+            }
+            if ((sec.flags & 0xFF) == S_NON_LAZY_SYMBOL_POINTERS && (nxt & 0xFFC00000) != 0xF9400000) {
+                return err("access at " + hx(pc + 4) + " to " + sec.name + " is not a 64-bit LDR");
+            }
+        } else {
+            return err("ADRP at " + hx(pc) + " is followed by " + hxw(nxt, 8) + ", neither ADD nor a load/store");
+        }
+        pairs = pairs + 1;
+        i = i + 1;
+    }
+    if (m.oob) {
+        return oobErr(m);
+    }
+    return " branches=" + toStr(branches) + " adrp_pairs=" + toStr(pairs);
+}
+
+// ---- 负例（--self-test）----
+
+function lcAt(d: Bytes, kind: int): int {
+    const ncmds = (bytesGetLE<u32>(d, 16) ?? 0) as int;
+    let at = 32;
+    let k = 0;
+    while (k < ncmds) {
+        if (((bytesGetLE<u32>(d, at) ?? 0) as int) == kind) {
+            return at;
+        }
+        at = at + ((bytesGetLE<u32>(d, at + 4) ?? 0) as int);
+        k = k + 1;
+    }
+    return -1;
+}
+
+function put32(d: Bytes, at: int, v: int): void {
+    bytesSetLE<u32>(d, at, (v & 0xFFFFFFFF) as u32);
+}
+
+// 篡改代码页后重算 CodeDirectory 的页哈希，让负例只撞上要测的那一条核对。
+function resign(d: Bytes): Bytes {
+    const sigOff = (bytesGetLE<u32>(d, lcAt(d, LC_CODE_SIGNATURE) + 8) ?? 0) as int;
+    const scount = (bytesGetBE<u32>(d, sigOff + 8) ?? 0) as int;
+    let k = 0;
+    while (k < scount) {
+        if (((bytesGetBE<u32>(d, sigOff + 12 + 8 * k) ?? 0) as int) == 0) {
+            const cd = sigOff + ((bytesGetBE<u32>(d, sigOff + 12 + 8 * k + 4) ?? 0) as int);
+            const hashoff = (bytesGetBE<u32>(d, cd + 16) ?? 0) as int;
+            const ncode = (bytesGetBE<u32>(d, cd + 28) ?? 0) as int;
+            const codelimit = (bytesGetBE<u32>(d, cd + 32) ?? 0) as int;
+            let page = 0;
+            while (page < ncode) {
+                let pageEnd = 4096 * (page + 1);
+                if (pageEnd > codelimit) {
+                    pageEnd = codelimit;
+                }
+                const h = sha256Of(d, 4096 * page, pageEnd - 4096 * page);
+                let j = 0;
+                while (j < 32) {
+                    bytesSet(d, cd + hashoff + 32 * page + j, bytesGet(h, j) catch 0);
+                    j = j + 1;
+                }
+                page = page + 1;
+            }
+        }
+        k = k + 1;
+    }
+    return d;
+}
+
+function copyOf(data: Bytes): Bytes {
+    return bytesSlice(data, 0, bytesLen(data));
+}
+
+struct Mutant {
+    name: string,
+    data: Bytes,
+    needle: string,
+}
+
+// arm64 的负例：分支出 __text、ADRP 指到节外、经 __got 的取数改成存数；都重新签名。
+function a64Cases(data: Bytes, cases: List<Mutant>): void | Error {
+    let tAddr = -1;
+    let tSize = 0;
+    let tOff = 0;
+    let gAddr = -1;
+    let gSize = 0;
+    const ncmds = (bytesGetLE<u32>(data, 16) ?? 0) as int;
+    let at = 32;
+    let c = 0;
+    while (c < ncmds) {
+        if (((bytesGetLE<u32>(data, at) ?? 0) as int) == LC_SEGMENT_64) {
+            const nsects = (bytesGetLE<u32>(data, at + 64) ?? 0) as int;
+            let k = 0;
+            while (k < nsects) {
+                const sa = at + 72 + 80 * k;
+                if (name16(imgOf(data), sa) == "__text") {
+                    tAddr = bytesGetLE<int>(data, sa + 32) ?? 0;
+                    tSize = bytesGetLE<int>(data, sa + 40) ?? 0;
+                    tOff = (bytesGetLE<u32>(data, sa + 48) ?? 0) as int;
+                }
+                if (name16(imgOf(data), sa) == "__got") {
+                    gAddr = bytesGetLE<int>(data, sa + 32) ?? 0;
+                    gSize = bytesGetLE<int>(data, sa + 40) ?? 0;
+                }
+                k = k + 1;
+            }
+        }
+        at = at + ((bytesGetLE<u32>(data, at + 4) ?? 0) as int);
+        c = c + 1;
+    }
+    if (tAddr < 0) {
+        return err("no __text section");
+    }
+    const n = tSize / 4;
+    let bl = -1;
+    let adrp = -1;
+    let gotLdr = -1;
+    let i = 0;
+    while (i < n) {
+        const w = (bytesGetLE<u32>(data, tOff + 4 * i) ?? 0) as int;
+        if (bl < 0 && (w & 0xFC000000) == 0x94000000) {
+            bl = i;
+        }
+        if ((w & 0x9F000000) == 0x90000000) {
+            if (adrp < 0) {
+                adrp = i;
+            }
+            const nx = (bytesGetLE<u32>(data, tOff + 4 * (i + 1)) ?? 0) as int;
+            // 只取目标落在 __got 里的那一对：内核也经 ADRP＋LDR 读 __bss 里的全局量，改成存数是合法的，查不出。
+            if (gotLdr < 0 && i + 1 < n && (nx & 0xFFC00000) == 0xF9400000) {
+                let imm = (((w >> 5) & 0x7FFFF) << 2) | ((w >> 29) & 3);
+                if (imm >= (1 << 20)) {
+                    imm = imm - (1 << 21);
+                }
+                const slot = ((tAddr + 4 * i) & ~0xFFF) + (imm << 12) + ((nx >> 10) & 0xFFF) * 8;
+                if (gAddr >= 0 && slot >= gAddr && slot < gAddr + gSize) {
+                    gotLdr = i + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if (bl < 0 || adrp < 0 || gotLdr < 0) {
+        return err("no BL, ADRP or GOT load to mutate");
+    }
+    let d = copyOf(data);
+    // 目标恰在 __text 之后
+    put32(d, tOff + 4 * bl, 0x94000000 | ((n - bl) & 0x3FFFFFF));
+    listPush(cases, Mutant { name: "branch retargeted past __text", data: resign(d), needle: "outside __text" });
+    d = copyOf(data);
+    // ADRP 的页偏移约 +4 GiB
+    const imm = (1 << 20) - 1;
+    const aw = (bytesGetLE<u32>(data, tOff + 4 * adrp) ?? 0) as int;
+    put32(d, tOff + 4 * adrp, (aw & 0x9F00001F) | ((imm & 3) << 29) | ((imm >> 2) << 5));
+    listPush(cases, Mutant { name: "ADRP moved outside the image", data: resign(d), needle: "outside every section" });
+    d = copyOf(data);
+    // LDR → STR
+    const lw = (bytesGetLE<u32>(data, tOff + 4 * gotLdr) ?? 0) as int;
+    put32(d, tOff + 4 * gotLdr, lw & ~0x00400000);
+    listPush(cases, Mutant { name: "GOT load turned into a store", data: resign(d), needle: "into read-only" });
+}
+
+// 负例：篡改副本后必须被查出，且由要测的那一条核对查出（核对错误文本）。得失败数。
+function selfTest(data: Bytes): int | Error {
+    const good = machoCheck(data)?;
+    const cases: List<Mutant> = listNew();
+    // 1. 代码页改一个字节：签名哈希不符。
+    const entry = bytesGetLE<int>(data, lcAt(data, LC_MAIN) + 8) ?? 0;
+    let d = copyOf(data);
+    bytesSet(d, entry, (bytesGet(data, entry) catch 0) ^ 0xFF);
+    listPush(cases, Mutant { name: "code byte flipped", data: d, needle: "hash mismatch" });
+    // 2. __TEXT 改成可写可执行。
+    d = copyOf(data);
+    const ncmds = (bytesGetLE<u32>(data, 16) ?? 0) as int;
+    let at = 32;
+    let c = 0;
+    while (c < ncmds) {
+        if (((bytesGetLE<u32>(data, at) ?? 0) as int) == LC_SEGMENT_64 && bytesEqual(bytesSlice(data, at + 8, 6), bytesFromStr("__TEXT"))) {
+            put32(d, at + 56, 7);
+            put32(d, at + 60, 7);
+        }
+        at = at + ((bytesGetLE<u32>(data, at + 4) ?? 0) as int);
+        c = c + 1;
+    }
+    listPush(cases, Mutant { name: "__TEXT made writable", data: d, needle: "never writable" });
+    // 3. 去掉 bind 信息（大小置零）：__got 的槽不再绑定。
+    d = copyOf(data);
+    put32(d, lcAt(data, LC_DYLD_INFO_ONLY) + 20, 0);
+    listPush(cases, Mutant { name: "bind info removed", data: d, needle: "is not bound" });
+    if (strFindText(good, "arch=arm64") == 0) {
+        a64Cases(data, cases)?;
+    }
+    let failures = 0;
+    for (cs in cases) {
+        const why = problemOf(cs.data);
+        if (len(why) == 0) {
+            print("FAIL negative case not detected: " + cs.name);
+            failures = failures + 1;
+        } else if (strFindText(why, cs.needle) >= 0) {
+            print("PASS negative case detected: " + cs.name + " - " + why);
+        } else {
+            print("FAIL negative case caught by another check: " + cs.name + " - " + why);
+            failures = failures + 1;
+        }
+    }
+    return failures;
+}
+
+// 核对不过时的问题文本；通过得空串。
+function problemOf(data: Bytes): string {
+    const info = machoCheck(data) catch (e) {
+        return e.message;
+    };
+    return "";
+}
+
+// s 里 needle 首次出现的字节位置，缺席 −1（不用 strFind：种子编译器没有它）。
+function strFindText(s: string, needle: string): int {
+    const n = len(needle);
+    let i = 0;
+    while (i + n <= len(s)) {
+        let k = 0;
+        while (k < n && (byteAt(s, i + k) catch 0) == (byteAt(needle, k) catch 0)) {
+            k = k + 1;
+        }
+        if (k == n) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+function main(args: []string): int {
+    if (len(args) == 0) {
+        print("用法：taixu run --toolchain scripts/macho_check.tx <可执行文件>...    逐个核对，全部通过退出 0");
+        print("      taixu run --toolchain scripts/macho_check.tx --self-test <文件>  另对篡改过的副本确认能查出（负例）");
+        return 64;
+    }
+    let bad = 0;
+    if (args[0] == "--self-test") {
+        let i = 1;
+        while (i < len(args)) {
+            bad = bad + selfTestFile(args[i]);
+            i = i + 1;
+        }
+    } else {
+        for (path in args) {
+            bad = bad + checkFile(path);
+        }
+    }
+    if (bad > 0) {
+        return 1;
+    }
+    return 0;
+}
+
+function checkFile(path: string): int {
+    const data = readFileBytes(path) catch (e) {
+        print("FAIL " + path + " " + e.message);
+        return 1;
+    };
+    const info = machoCheck(data) catch (e) {
+        print("FAIL " + path + " " + e.message);
+        return 1;
+    };
+    print("PASS " + path + " " + info);
+    return 0;
+}
+
+function selfTestFile(path: string): int {
+    const data = readFileBytes(path) catch (e) {
+        print("FAIL " + path + " " + e.message);
+        return 1;
+    };
+    const failures = selfTest(data) catch (e) {
+        print("FAIL " + path + " " + e.message);
+        return 1;
+    };
+    return failures;
+}

@@ -1,0 +1,73 @@
+import { dnsName, dnsQuery, dnsParseReply, dnsReadName } from "std/dns_wire";
+import { dnsParseConfig, dnsSearchNames, dnsHosts } from "std/dns_config";
+import { p256Hex } from "std/crypto/p256_field";
+import { parseIp } from "std/ip";
+
+function vector(name: string): Bytes {
+    const text = readFile("tests/vectors/dns.txt") catch panic("DNS fixture");
+    for (line in strSplit(text, "\n")) {
+        if (len(line) == 0 || byteAt(line, 0) == 35) { continue; } const parts = strSplit(line, " ");
+        if (listGet(parts, 0) == name) { return p256Hex(listGet(parts, 1)); }
+    } panic("missing DNS vector " + name);
+}
+function bad(data: Bytes): bool { dnsParseReply(data, "www.example.test", 1, 4660) catch (e) { return true; }; return false; }
+function badName(name: string): bool { dnsName(name) catch (e) { return true; }; return false; }
+function badRead(data: Bytes, start: int): bool { dnsReadName(data, start, bytesLen(data)) catch (e) { return true; }; return false; }
+function badConfig(text: string): bool { dnsParseConfig(text) catch (e) { return true; }; return false; }
+
+test "DNS：独立 wire、压缩 CNAME 与关联 answer" {
+    assert(bytesEqual(dnsQuery("WWW.Example.Test.", 1, 4660) catch panic("query"), vector("query")), "independent query wire");
+    const a = dnsParseReply(vector("a"), "WWW.EXAMPLE.TEST.", 1, 4660) catch panic("A");
+    assert(listLen(a.addresses) == 2 && a.code == 0 && !a.truncated, "two A answers");
+    assert(bytesEqual(listGet(a.addresses, 0), parseIp("192.0.2.1") catch panic("v4")), "IPv4 bytes");
+    const aaaa = dnsParseReply(vector("aaaa"), "www.example.test", 28, 4660) catch panic("AAAA");
+    assert(listLen(aaaa.addresses) == 1 && bytesEqual(listGet(aaaa.addresses, 0), parseIp("2001:db8::1") catch panic("v6")), "IPv6 bytes");
+    const cname = dnsParseReply(vector("cname"), "www.example.test", 1, 4660) catch panic("CNAME");
+    assert(cname.canonical == "edge.example.test" && listLen(cname.addresses) == 1, "out of order compressed CNAME chain");
+    const external = dnsParseReply(vector("external"), "www.example.test", 1, 4660) catch panic("external");
+    assert(external.canonical == "other.example.test" && listLen(external.addresses) == 0, "new query needed");
+    const poison = dnsParseReply(vector("poison"), "www.example.test", 1, 4660) catch panic("poison");
+    assert(listLen(poison.addresses) == 0, "unrelated answers and additional addresses excluded");
+    const nx = dnsParseReply(vector("nxdomain"), "www.example.test", 1, 4660) catch panic("NXDOMAIN");
+    assert(nx.code == 3 && listLen(nx.addresses) == 0, "negative response");
+    const tc = dnsParseReply(vector("tc"), "www.example.test", 1, 4660) catch panic("TC"); assert(tc.truncated, "TCP fallback signal");
+}
+
+test "DNS：错误关联、截断、CNAME 冲突与压缩环" {
+    const original = vector("a"); let n = 0;
+    while (n < bytesLen(original)) { assert(bad(bytesSlice(original, 0, n)), "every truncated prefix"); n = n + 1; }
+    const wrongId = bytesSlice(original, 0, bytesLen(original)); bytesSet(wrongId, 0, 255); assert(bad(wrongId), "transaction id");
+    const wrongName = bytesSlice(original, 0, bytesLen(original)); bytesSet(wrongName, 13, 120); assert(bad(wrongName), "question name");
+    const noQr = bytesSlice(original, 0, bytesLen(original)); bytesSet(noQr, 2, 1); assert(bad(noQr), "QR bit");
+    const trailing = bytesSlice(original, 0, bytesLen(original)); listPush(bytesAsList(trailing), 0 as u8); assert(bad(trailing), "trailing bytes");
+    assert(bad(vector("loop")), "CNAME loop"); assert(bad(vector("conflict")), "CNAME and address conflict"); assert(bad(vector("two-cnames")), "two CNAME targets");
+    assert(badRead(p256Hex("c000"), 0) && badRead(p256Hex("c00200"), 0), "self and forward pointers");
+    assert(badRead(p256Hex("000161c001"), 3), "backward pointer label loop");
+    assert(badRead(p256Hex("016100c0"), 3) && badRead(p256Hex("4061"), 0), "short pointer and reserved label");
+    assert(badRead(p256Hex("03612e6200"), 0) && badRead(p256Hex("016000c001"), 3), "ambiguous labels and pointer to body");
+    assert(badName("") && badName("a..b") && badName("a\\b") && badName("中文.test"), "unsupported host syntax");
+}
+
+test "DNS：resolv.conf 搜索规则与 hosts 别名" {
+    const config = dnsParseConfig("# comment\nnameserver 127.0.0.1\nnameserver ::1 ; v6\nsearch old.test\ndomain replaced.test\nsearch corp.test example.test corp.test\noptions ndots:2 timeout:1 attempts:3 rotate use-vc\n") catch panic("config");
+    assert(listLen(config.servers) == 2 && config.timeoutMs == 1000 && config.attempts == 3 && config.rotate && config.tcp, "resolver options");
+    const short = dnsSearchNames("api", config) catch panic("short");
+    assert(listLen(short) == 3 && listGet(short, 0) == "api.corp.test" && listGet(short, 2) == "api", "search first and dedup");
+    const dotted = dnsSearchNames("a.b.c", config) catch panic("dotted"); assert(listGet(dotted, 0) == "a.b.c", "ndots absolute first");
+    const absolute = dnsSearchNames("api.", config) catch panic("absolute"); assert(listLen(absolute) == 1 && listGet(absolute, 0) == "api", "trailing dot bypasses search");
+    const clamped = dnsParseConfig("nameserver 127.0.0.1\noptions ndots:99 timeout:99 attempts:99\n") catch panic("clamp");
+    assert(clamped.ndots == 15 && clamped.timeoutMs == 30000 && clamped.attempts == 5, "bounded options");
+    const hosts = dnsHosts("127.0.0.1 localhost Alias\n::1 alias # IPv6\n127.0.0.1 ALIAS\n192.0.2.99 other\n", "alias.") catch panic("hosts");
+    assert(listLen(hosts) == 2 && bytesLen(listGet(hosts, 0)) == 4 && bytesLen(listGet(hosts, 1)) == 16, "hosts aliases, case and dedup");
+    // 宽容解析（同 glibc 与 Go）：认不出的项逐项忽略，没有 nameserver 时用本机。
+    const stub = dnsParseConfig("nameserver 127.0.0.53\noptions edns0 trust-ad\nsearch .\n") catch panic("systemd-resolved stub");
+    assert(listLen(stub.servers) == 1 && listLen(stub.search) == 0 && stub.ndots == 1, "systemd-resolved stub: search . means no suffix");
+    const fallback = dnsParseConfig("search example.test\nnameserver bad.ip\nnameserver fe80::1%eth0\n") catch panic("fallback");
+    assert(listLen(fallback.servers) == 2 && bytesEqual(listGet(fallback.servers, 0).ip, parseIp("127.0.0.1") catch panic("ip"))
+        && bytesEqual(listGet(fallback.servers, 1).ip, parseIp("::1") catch panic("ip")) && listLen(fallback.search) == 1, "unusable servers skipped, loopback default");
+    const many = dnsParseConfig("nameserver 192.0.2.1\nnameserver 192.0.2.2\nnameserver 192.0.2.3\nnameserver 192.0.2.4\noptions timeout:1.5 attempts:x ndots:-1\n") catch panic("many");
+    assert(listLen(many.servers) == 3 && many.timeoutMs == 1000 && many.attempts == 2 && many.ndots == 1, "MAXNS 3 and leading-digit options");
+    const odd = dnsHosts("fe80::1%lo0 alias\n192.0.2.7 alias\n", "alias") catch panic("odd hosts");
+    assert(listLen(odd) == 1 && bytesLen(listGet(odd, 0)) == 4, "unparsable hosts address skipped");
+    const huge = bytesNew(1048577); bytesFill(huge, 0, 1048577, 35); assert(badConfig(bytesToStr(huge) catch panic("utf8")), "oversized resolver file still rejected");
+}

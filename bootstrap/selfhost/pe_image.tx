@@ -57,44 +57,24 @@ function put32(b: Bytes, at: int, value: int): void {
     while (i < 4) { bytesSet(b, at + i, (value >>> (i * 8)) & 255); i = i + 1; }
 }
 
-export function peContentHash(b: Bytes): int {
-    const n = bytesLen(b);
-    let h = FNV_OFFSET;
-    let i = 0;
-    while (i + 8 <= n) {
-        h = imul(h ^ (bytesGetLE<int>(b, i) catch 0), FNV_PRIME);
-        h = h ^ (h >>> 32);
-        i = i + 8;
-    }
-    if (i < n) {
-        let w = 0;
-        let k = 0;
-        while (i + k < n) { w = w | ((bytesGet(b, i + k) catch 0) << (8 * k)); k = k + 1; }
-        h = imul(h ^ w, FNV_PRIME);
-        h = h ^ (h >>> 32);
-    }
-    h = imul(h ^ n, FNV_PRIME);
-    h = h ^ (h >>> 32);
-    return h & LOW32;
+// 校验和对 [at, at + 8) 这一整字的贡献：两个 32 位半字之和。
+function wordSum(b: Bytes, at: int): int {
+    const v = bytesGetLE<int>(b, at) catch 0;
+    return (v & LOW32) + (v >>> 32);
 }
 
-export function peChecksum(b: Bytes): int {
-    const n = bytesLen(b);
-    let s = 0;
-    let i = 0;
-    while (i + 8 <= n) {
-        const v = bytesGetLE<int>(b, i) catch 0;
-        s = s + (v & LOW32) + (v >>> 32);
-        i = i + 8;
+// 时间戳字段 [at, at + 4) 落在整字部分（[0, wordEnd)）里的各整字起点记进 ws，不重复。
+function touchWords(ws: List<int>, at: int, wordEnd: int): void {
+    let p = at;
+    while (p < at + 4) {
+        if (p >= 0 && p < wordEnd) {
+            const w = p & -8;
+            let seen = false;
+            for (x in ws) { if (x == w) { seen = true; } }
+            if (!seen) { listPush(ws, w); }
+        }
+        p = p + 1;
     }
-    while (i < n) {
-        let w = bytesGet(b, i) catch 0;
-        if ((i & 1) == 1) { w = w << 8; }
-        s = s + w;
-        i = i + 1;
-    }
-    while ((s >>> 16) != 0) { s = (s & 65535) + (s >>> 16); }
-    return s + n;
 }
 
 // 自底向上归并排序（基址重定位的 RVA）。
@@ -149,13 +129,78 @@ export function peBaseRelocations(rvas: List<int>, reloc: Bytes): int {
     return 0;
 }
 
-// 映像写完后调用：两字段先清零，填时间戳，再按填好时间戳的文件算校验和。
+// 调试目录（数据目录 6）各项时间戳字段的文件偏移；没有调试目录、或它不在某节的文件内容里时为空。
+function debugStamps(b: Bytes, pe: int): List<int> {
+    const out: List<int> = listNew();
+    const opt = pe + 24;
+    if (u32At(b, opt + 108) <= 6) { return out; }
+    const rva = u32At(b, opt + 112 + 6 * 8); const size = u32At(b, opt + 112 + 6 * 8 + 4);
+    if (rva == 0 || size == 0 || size % 28 != 0) { return out; }
+    const count = (bytesGet(b, pe + 6) catch 0) | ((bytesGet(b, pe + 7) catch 0) << 8);
+    const headers = opt + ((bytesGet(b, pe + 20) catch 0) | ((bytesGet(b, pe + 21) catch 0) << 8));
+    let i = 0;
+    while (i < count) {
+        const at = headers + 40 * i; const va = u32At(b, at + 12); const raw = u32At(b, at + 16); const ptr = u32At(b, at + 20);
+        if (rva >= va && rva + size <= va + raw && ptr + (rva - va) + size <= bytesLen(b)) {
+            let e = 0;
+            while (e < size) { listPush(out, ptr + (rva - va) + e + 4); e = e + 28; }
+            return out;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// 映像写完后调用：时间戳、校验和与调试目录各项的时间戳先清零，按内容算出时间戳填入 COFF 头与调试目录（同 lld-link /Brepro：
+// 调试目录的 REPRO 项声明这个时间戳是内容哈希），再按填好的文件算校验和。
+// 内容哈希：FNV-1a 逐 8 字节小端字，末尾不足 8 字节的按小端拼成一字，最后混入长度，取低 32 位。
+// 校验和：整字部分逐 8 字节加两个 32 位半字，尾部逐字节（奇偏移左移 8 位），折叠到 16 位后加文件长度。
+// 两者一遍读完：取哈希的同时累加校验和的整字部分；填入时间戳后，含时间戳字节的整字按新旧之差改正，尾部填好后再加。
+// 结果与“先整份取哈希、填好后再整份求校验和”逐位相同（scripts/test_pe_image.tx 另有独立实现核对）。
 export function peFinish(b: Bytes): void {
     const pe = u32At(b, 60);
     const stampAt = pe + 8;
     const sumAt = pe + 24 + 64;
+    const stamps = debugStamps(b, pe);
     put32(b, stampAt, 0);
     put32(b, sumAt, 0);
-    put32(b, stampAt, peContentHash(b));
-    put32(b, sumAt, peChecksum(b));
+    for (at in stamps) { put32(b, at, 0); }
+    const n = bytesLen(b);
+    let h = FNV_OFFSET;
+    let s = 0;
+    let i = 0;
+    while (i + 8 <= n) {
+        const v = bytesGetLE<int>(b, i) catch 0;
+        h = imul(h ^ v, FNV_PRIME);
+        h = h ^ (h >>> 32);
+        s = s + (v & LOW32) + (v >>> 32);
+        i = i + 8;
+    }
+    const wordEnd = i;
+    if (i < n) {
+        let w = 0;
+        let k = 0;
+        while (i + k < n) { w = w | ((bytesGet(b, i + k) catch 0) << (8 * k)); k = k + 1; }
+        h = imul(h ^ w, FNV_PRIME);
+        h = h ^ (h >>> 32);
+    }
+    h = imul(h ^ n, FNV_PRIME);
+    h = h ^ (h >>> 32);
+    const stamp = h & LOW32;
+    const touched: List<int> = listNew();
+    touchWords(touched, stampAt, wordEnd);
+    for (at in stamps) { touchWords(touched, at, wordEnd); }
+    for (wa in touched) { s = s - wordSum(b, wa); }
+    put32(b, stampAt, stamp);
+    for (at in stamps) { put32(b, at, stamp); }
+    for (wa in touched) { s = s + wordSum(b, wa); }
+    i = wordEnd;
+    while (i < n) {
+        let t = bytesGet(b, i) catch 0;
+        if ((i & 1) == 1) { t = t << 8; }
+        s = s + t;
+        i = i + 1;
+    }
+    while ((s >>> 16) != 0) { s = (s & 65535) + (s >>> 16); }
+    put32(b, sumAt, s + n);
 }

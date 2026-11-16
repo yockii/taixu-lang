@@ -1,0 +1,72 @@
+// 系统异步解析；参数保存在固定外部内存，事件完成以后释放。
+import { BrowserAddress, dnsCheckpoint, dnsLiteral, dnsAdd } from "./dns_common";
+import { deadlineRemainingMs } from "std/deadline";
+
+declare type Event;
+declare struct PointerSlot { value: usize }
+declare struct Overlapped { internal: usize, internalHigh: usize, offset: u32, offsetHigh: u32, event: Event }
+declare struct AddrInfo { flags: i32, family: i32, kind: i32, protocol: i32, length: usize, canonical: usize, address: usize, blob: usize, blobLength: usize, provider: usize, next: usize }
+declare function WSAStartup(version: u16, data: Bytes): i32 from "ws2_32";
+declare function WSACleanup(): i32 from "ws2_32";
+declare function GetAddrInfoExW(name: usize, service: usize, namespace: u32, provider: usize, hints: usize, result: usize, timeout: usize, overlapped: usize, completion: usize, cancel: usize): i32 from "ws2_32";
+declare function GetAddrInfoExCancel(cancel: usize): i32 from "ws2_32";
+declare function GetAddrInfoExOverlappedResult(overlapped: usize): i32 from "ws2_32";
+declare function FreeAddrInfoExW(result: usize): void from "ws2_32";
+declare function LocalAlloc(flags: u32, size: usize): usize from "kernel32";
+declare function LocalFree(memory: usize): usize from "kernel32";
+declare function CreateEventW(attributes: usize, manual: i32, initial: i32, name: usize): Event? from "kernel32";
+declare function WaitForSingleObject(event: Event, milliseconds: u32): u32 from "kernel32";
+declare function CloseHandle(event: Event): i32 from "kernel32";
+
+function results(memory: usize): usize | Error {
+    const view = ffiMem(memory as int, 40, false)?; defer { ffiMemEnd(view); }
+    return ffiMemGet<PointerSlot>(view, 32).value;
+}
+function addresses(first: usize): List<BrowserAddress> | Error {
+    const out: List<BrowserAddress> = listNew(); const seen: List<usize> = listNew(); let pointer = first;
+    while (pointer != 0 as usize) {
+        if (listLen(seen) >= 256) { return err("browser dns: system result count limit"); }
+        for (previous in seen) { if (previous == pointer) { return err("browser dns: cyclic system result"); } } listPush(seen, pointer);
+        const view = ffiMem(pointer as int, 72, false)?; const item = ffiMemGet<AddrInfo>(view, 0); ffiMemEnd(view);
+        if (item.family == 2 as i32 || item.family == 23 as i32) {
+            let size = 16; let offset = 4; let length = 4;
+            if (item.family == 23 as i32) { size = 28; offset = 8; length = 16; }
+            if (item.address == 0 as usize || item.length < size as usize || item.length > 128 as usize) { return err("browser dns: invalid system sockaddr"); }
+            const address = ffiMem(item.address as int, size, false)?; const raw = ffiMemRead(address, 0, size); ffiMemEnd(address);
+            if ((bytesGetLE<u16>(raw, 0) catch (0 as u16)) as int != item.family as int) { return err("browser dns: inconsistent address family"); }
+            let scope = 0; if (length == 16) { scope = (bytesGetLE<u32>(raw, 24) catch (0 as u32)) as int; }
+            dnsAdd(out, bytesSlice(raw, offset, length), scope)?;
+        } pointer = item.next;
+    }
+    if (listLen(out) == 0) { return err("browser dns: name has no usable addresses"); } return out;
+}
+export function browserResolve(host: string, deadline: int, cancelled: () => bool): List<BrowserAddress> | Error {
+    dnsCheckpoint(deadline, cancelled)?; const literal = dnsLiteral(host)?; if (listLen(literal) > 0) { return literal; }
+    const startup = WSAStartup(514 as u16, bytesNew(512)); if (startup != 0 as i32) { return err("browser dns: WSAStartup " + toStr(startup)); } defer { WSACleanup(); }
+    const event = CreateEventW(0 as usize, 1 as i32, 0 as i32, 0 as usize); if (event == None) { return err("browser dns: CreateEventW failed"); } defer { CloseHandle(event); }
+    const size = 120 + (len(host) + 1) * 2; const memory = LocalAlloc(64 as u32, size as usize);
+    if (memory == 0 as usize) { return err("browser dns: LocalAlloc failed"); } defer { LocalFree(memory); }
+    let pending = false;
+    defer {
+        // 即使取消，系统也仍持有 OVERLAPPED，必须等到完成通知。
+        if (pending) { GetAddrInfoExCancel(memory + (40 as usize)); WaitForSingleObject(event, 4294967295 as u32); }
+        const output = results(memory) catch (0 as usize); if (output != 0 as usize) { FreeAddrInfoExW(output); }
+    }
+    const view = ffiMem(memory as int, size, true)?;
+    ffiMemSet<Overlapped>(view, 0, Overlapped { internal: 0 as usize, internalHigh: 0 as usize, offset: 0 as u32, offsetHigh: 0 as u32, event: event });
+    ffiMemSet<AddrInfo>(view, 48, AddrInfo { flags: 0 as i32, family: 0 as i32, kind: 1 as i32, protocol: 6 as i32, length: 0 as usize, canonical: 0 as usize, address: 0 as usize, blob: 0 as usize, blobLength: 0 as usize, provider: 0 as usize, next: 0 as usize });
+    const wide = bytesNew((len(host) + 1) * 2); let i = 0; while (i < len(host)) { bytesSet(wide, i * 2, byteAt(host, i)); i = i + 1; }
+    ffiMemWrite(view, 120, wide); ffiMemEnd(view); dnsCheckpoint(deadline, cancelled)?;
+    const status = GetAddrInfoExW(memory + (120 as usize), 0 as usize, 0 as u32, 0 as usize, memory + (48 as usize), memory + (32 as usize), 0 as usize, memory, 0 as usize, memory + (40 as usize));
+    if (status == 997 as i32) {
+        pending = true;
+        while (true) {
+            dnsCheckpoint(deadline, cancelled)?; let left = deadlineRemainingMs(deadline)?; if (left > 25) { left = 25; }
+            const waited = WaitForSingleObject(event, left as u32);
+            if (waited == 0 as u32) { pending = false; break; }
+            if (waited != 258 as u32) { return err("browser dns: completion wait failed"); }
+        }
+        const completed = GetAddrInfoExOverlappedResult(memory); if (completed != 0 as i32) { return err("browser dns: system resolver " + toStr(completed)); }
+    } else if (status != 0 as i32) { return err("browser dns: system resolver " + toStr(status)); }
+    dnsCheckpoint(deadline, cancelled)?; return addresses(results(memory)?);
+}

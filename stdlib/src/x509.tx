@@ -1,0 +1,83 @@
+// RFC 5280 的结构与原始字段读取；有效路径、用途和身份必须另行验证。
+import { derRead, derChildren, derPositiveInteger, derBitString, derContents } from "./crypto/der";
+import { X509Certificate, X509Extension } from "./x509_types";
+import { x509Full, x509Oid, x509Algorithm, x509Time, x509Name } from "./x509_der";
+
+export function x509ParseCertificate(input: Bytes): Ref<X509Certificate> | Error { return x509ParseCertificateLimit(input, 1048576, 1024); }
+
+export function x509ParseCertificateLimit(input: Bytes, maxBytes: int, maxExtensions: int): Ref<X509Certificate> | Error {
+    if (maxBytes < 1 || maxExtensions < 0 || bytesLen(input) > maxBytes) { return err("x509: invalid limits or certificate too large"); }
+    const data = bytesSlice(input, 0, bytesLen(input)); const outer = derRead(data, 0, bytesLen(data))?;
+    if (outer.tag != 48 || outer.end != bytesLen(data)) { return err("x509: invalid Certificate sequence"); }
+    const top = derChildren(data, outer, 3)?;
+    if (listLen(top) != 3) { return err("x509: Certificate requires three fields"); }
+    const tbs = listGet(top, 0);
+    if (tbs.tag != 48) { return err("x509: invalid TBSCertificate"); }
+    const fields = derChildren(data, tbs, 10)?;
+    if (listLen(fields) < 6) { return err("x509: missing TBS fields"); }
+    let at = 0; let version = 0;
+    if (listGet(fields, 0).tag == 160) {
+        const versions = derChildren(data, listGet(fields, 0), 1)?;
+        if (listLen(versions) != 1) { return err("x509: invalid version wrapper"); }
+        const v = derPositiveInteger(data, listGet(versions, 0), 1)?;
+        version = bytesGet(v, 0) catch 0;
+        if (version < 1 || version > 2) { return err("x509: invalid or explicit default version"); } at = 1;
+    }
+    if (listLen(fields) < at + 6) { return err("x509: missing versioned TBS fields"); }
+    const serial = derPositiveInteger(data, listGet(fields, at), 128)?;
+    const algorithm = x509Algorithm(data, listGet(fields, at + 1))?;
+    const signatureAlgorithm = x509Algorithm(data, listGet(top, 1))?;
+    if (!bytesEqual(algorithm.encoding, signatureAlgorithm.encoding)) { return err("x509: inner and outer signature algorithms differ"); }
+    const issuer = x509Name(data, listGet(fields, at + 2))?;
+    const validity = listGet(fields, at + 3);
+    if (validity.tag != 48) { return err("x509: invalid Validity"); }
+    const times = derChildren(data, validity, 2)?;
+    if (listLen(times) != 2) { return err("x509: invalid validity field count"); }
+    const before = x509Time(data, listGet(times, 0))?; const after = x509Time(data, listGet(times, 1))?;
+    if (after < before) { return err("x509: reversed validity"); }
+    const subject = x509Name(data, listGet(fields, at + 4))?;
+    const spki = listGet(fields, at + 5);
+    if (spki.tag != 48) { return err("x509: invalid SubjectPublicKeyInfo"); }
+    const keyFields = derChildren(data, spki, 2)?;
+    if (listLen(keyFields) != 2) { return err("x509: invalid SPKI field count"); }
+    const keyAlgorithm = x509Algorithm(data, listGet(keyFields, 0))?; const key = derBitString(data, listGet(keyFields, 1))?;
+    const signature = derBitString(data, listGet(top, 2))?;
+    if (key.unused != 0 || bytesLen(key.data) == 0 || signature.unused != 0 || bytesLen(signature.data) == 0) { return err("x509: invalid key or signature bits"); }
+    const extensions: List<X509Extension> = listNew(); const seen: Map<string, bool> = mapNew();
+    let previous = 0; at = at + 6;
+    while (at < listLen(fields)) {
+        const value = listGet(fields, at); let order = 0;
+        if (value.tag == 129) { order = 1; } else if (value.tag == 130) { order = 2; } else if (value.tag == 163) { order = 3; }
+        if (order == 0 || order <= previous || version == 0 || (order == 3 && version != 2)) { return err("x509: invalid optional field order or version"); }
+        previous = order;
+        if (order < 3) {
+            // IMPLICIT BIT STRING：保留内容和未用位约束，仅替换节点 tag 以复用判定。
+            let bits = value; bits.tag = 3; derBitString(data, bits)?;
+        } else {
+            const wrapped = derChildren(data, value, 1)?;
+            if (listLen(wrapped) != 1 || listGet(wrapped, 0).tag != 48) { return err("x509: invalid extensions wrapper"); }
+            const items = derChildren(data, listGet(wrapped, 0), maxExtensions)?;
+            if (listLen(items) == 0) { return err("x509: empty extensions sequence"); }
+            for (entry in items) {
+                if (entry.tag != 48) { return err("x509: invalid extension sequence"); }
+                const parts = derChildren(data, entry, 3)?;
+                if (listLen(parts) < 2) { return err("x509: incomplete extension"); }
+                const oid = x509Oid(data, listGet(parts, 0))?;
+                if (mapHas(seen, oid)) { return err("x509: duplicate extension OID"); } mapSet(seen, oid, true);
+                let critical = false; let index = 1;
+                if (listLen(parts) == 3) {
+                    const flag = listGet(parts, 1); const raw = derContents(data, flag)?;
+                    if (flag.tag != 1 || bytesLen(raw) != 1 || (bytesGet(raw, 0) catch 0) != 255) { return err("x509: invalid or explicit default critical flag"); }
+                    critical = true; index = 2;
+                }
+                const octets = listGet(parts, index);
+                if (octets.tag != 4) { return err("x509: extension value must be OCTET STRING"); }
+                listPush(extensions, X509Extension { oidHex: oid, critical: critical, value: derContents(data, octets)? });
+            }
+        }
+        at = at + 1;
+    }
+    return new X509Certificate { der: data, tbs: x509Full(data, tbs), version: version, serial: serial, issuer: issuer, subject: subject,
+        notBeforeSecs: before, notAfterSecs: after, publicKeyAlgorithm: keyAlgorithm, publicKey: key.data, spki: x509Full(data, spki),
+        signatureAlgorithm: signatureAlgorithm, signature: signature.data, extensions: extensions };
+}

@@ -1,0 +1,458 @@
+// ============================================================================
+// engine/window —— 窗口、事件、呈现、动画时钟、剪贴板与对话框（GUI 原生引擎 G0；真窗自 G2）。
+//
+// 窗口与事件行为：
+// - 窗口句柄是引擎分配的正整数（不再是 HWND 一类指针值）；0 表示开窗失败。真窗由按目标文件选取的
+//   platform 模块提供（Windows、Linux X11、macOS；无窗口系统时退回脚本窗）。重放或
+//   定格态一律不开真窗（结果只取决于脚本）。真窗的标题、几何、菜单、光标、透明度与效果交给平台层，
+//   脚本窗上这些操作为无操作、得 0。
+// - 脚本窗：每窗一条事件队列（未取出的至多 64 条，满则注入方得 -1）；取事件时先跑重放注入泵，
+//   把帧号 ≤ 已呈现次数+1 的本窗数据行按文件序注入；队列空立即得 0，不睡眠、不看 timeout。
+// - 重放的窗下标是脚本窗在存活列表里的位置；销毁时末尾的窗补到空位（同旧宿主 swapRemove）。
+// - 帧号＝全局成功呈现次数（多窗共用）；第 N 次呈现后写定格三伴 <目录>/<主名>-f<N>.{bmp,sha256,txt}。
+//   旧 CLI 在 main 返回后打印的 FRAME 摘要行退场（没有退出钩子），比对改看三伴。
+// - 动画毫秒：脚本窗每次呈现 +32，全局一个计数；能力查询 cap 6 读它。
+// - 重放态：DPI 与 cap 4 取脚本 scale；打开与保存对话框都取脚本 dialog 队列；给了重放脚本时剪贴板走进程内
+//   模拟板（无脚本又无真窗时剪贴板不可用）。
+// ============================================================================
+
+import { Surf, surfOk, surfAt, rWriteTrio } from "./raster";
+import { replayLoad, replayActive, replayScriptGiven, replayLines, replayScale, replayDialogPop, freezeFrame, freezeOutDir, freezeStem } from "./replay";
+import { fsMkdirs } from "std/fs";
+import { platAvailable, platCreate, platIsReal, platDestroy, platWait, platPresent, platScale, platSystemScale, platSetTitle, platMove, platMinimize, platMaximizeToggle, platClientResize, platSetMinMax, platSetTopmost, platMenuAdd, platSetCursor, platSetOpacity, platSetEffect, platAnimMs, platClipAvailable, platClipSet, platClipGet, platDialogAvailable, platDialogOpen, platDialogSave } from "./platform";
+import { FdFilter } from "./filedialog";
+
+export const CAP_WINDOW_SYSTEM: int = 0;
+export const CAP_DPI_SCALE_X100: int = 4;
+export const CAP_CLIPBOARD: int = 5;
+export const CAP_ANIM_MS: int = 6;
+export const CAP_FILE_DIALOG: int = 7;
+
+const QUEUE_MAX: int = 64;
+const EV_SLOTS: int = 5;
+const MAX_WIN_INDEX: int = 8;
+
+struct SWin {
+    id: int,
+    q: List<int>, // 每条 5 项：kind、target、x、y、mods
+    head: int,
+    cur: List<int>, // 当前记录（5 项）
+}
+
+let swins: List<Ref<SWin>> = listNew();
+let cursors: List<int> = listNew(); // 各窗下标的重放游标
+let nextId: int = 1;
+let presents: int = 0;
+let animMs: int = 0;
+let clip: string = "";
+let realCur: Map<int, List<int>> = mapNew(); // 真窗的当前记录（5 项）
+let realSession: bool = false;
+
+// 能不能开真窗：有窗口系统，且不在重放或定格态。
+function realAllowed(): bool {
+    return platAvailable() && !replayActive() && freezeFrame() == 0;
+}
+
+function zeros5(): List<int> {
+    const r: List<int> = listNew();
+    let i: int = 0;
+    while (i < EV_SLOTS) {
+        listPush(r, 0);
+        i = i + 1;
+    }
+    return r;
+}
+
+// 脚本窗在存活列表里的下标；不是脚本窗得 -1。
+function swIndex(hwnd: int): int {
+    let i: int = 0;
+    while (i < listLen(swins)) {
+        const w: Ref<SWin> = listGet(swins, i);
+        if (w.id == hwnd) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+function swAt(i: int): Ref<SWin> {
+    return listGet(swins, i);
+}
+
+/// 是不是脚本窗。
+export function isScripted(hwnd: int): bool {
+    return swIndex(hwnd) >= 0;
+}
+
+/// 开真窗（flags 为 WFLAG_* 位集）；没有窗口系统、重放或定格态、或系统拒绝时得 0，框架退回脚本窗。
+export function winCreate(title: string, w: int, h: int, flags: int): int {
+    replayLoad();
+    if (!realAllowed()) {
+        return 0;
+    }
+    const id: int = nextId;
+    if (!platCreate(id, title, w, h, flags)) {
+        return 0;
+    }
+    nextId = nextId + 1;
+    realSession = true;
+    mapSet(realCur, id, zeros5());
+    return id;
+}
+
+/// 开脚本窗（标题与尺寸不用）。
+export function winCreateScripted(): int {
+    replayLoad();
+    if (listLen(cursors) == 0) {
+        let i: int = 0;
+        while (i < MAX_WIN_INDEX) {
+            listPush(cursors, 0);
+            i = i + 1;
+        }
+    }
+    const id: int = nextId;
+    nextId = nextId + 1;
+    listPush(swins, new SWin { id: id, q: listNew(), head: 0, cur: zeros5() });
+    return id;
+}
+
+/// 关窗（脚本窗：末尾的窗补到空位）。
+export function winDestroy(hwnd: int): void {
+    if (platIsReal(hwnd)) {
+        platDestroy(hwnd);
+        mapRemove(realCur, hwnd);
+        return;
+    }
+    const i: int = swIndex(hwnd);
+    if (i < 0) {
+        return;
+    }
+    const last: int = listLen(swins) - 1;
+    if (i != last) {
+        listSet(swins, i, swAt(last));
+    }
+    listRemoveAt(swins, last);
+}
+
+function queued(w: Ref<SWin>): int {
+    return (listLen(w.q) - w.head) / EV_SLOTS;
+}
+
+/// 注入一条事件（只对脚本窗）；队列满或不是脚本窗得 -1。
+export function winPush(hwnd: int, kind: int, target: int, x: int, y: int, mods: int): int {
+    const i: int = swIndex(hwnd);
+    if (i < 0) {
+        return -1;
+    }
+    const w: Ref<SWin> = swAt(i);
+    if (queued(w) >= QUEUE_MAX) {
+        return -1;
+    }
+    listPush(w.q, kind);
+    listPush(w.q, target);
+    listPush(w.q, x);
+    listPush(w.q, y);
+    listPush(w.q, mods);
+    return 0;
+}
+
+// 重放注入泵：把帧号 ≤ 已呈现次数+1 的本窗数据行按文件序注入；队列满即停，游标不前进。
+function pumpReplay(idx: int, hwnd: int): void {
+    if (!replayActive() || idx >= MAX_WIN_INDEX) {
+        return;
+    }
+    const lines: List<int> = replayLines();
+    const n: int = listLen(lines) / 7;
+    while (true) {
+        const c: int = listTryGet(cursors, idx) catch n;
+        if (c >= n || (listTryGet(lines, c * 7) catch 0) > presents + 1) {
+            return;
+        }
+        if ((listTryGet(lines, c * 7 + 6) catch 0) != idx) {
+            listSet(cursors, idx, c + 1);
+            continue;
+        }
+        const k: int = listTryGet(lines, c * 7 + 1) catch 0;
+        const t: int = listTryGet(lines, c * 7 + 2) catch 0;
+        const x: int = listTryGet(lines, c * 7 + 3) catch 0;
+        const y: int = listTryGet(lines, c * 7 + 4) catch 0;
+        const m: int = listTryGet(lines, c * 7 + 5) catch 0;
+        if (winPush(hwnd, k, t, x, y, m) != 0) {
+            return;
+        }
+        listSet(cursors, idx, c + 1);
+    }
+}
+
+/// 取下一条事件，得 kind（0 为无）；记录字段经 winEvent* 读。脚本窗队列空立即得 0；真窗至多等 timeoutMs 毫秒。
+export function winWaitEvent(hwnd: int, timeoutMs: int): int {
+    replayLoad();
+    if (platIsReal(hwnd)) {
+        const rec: List<int> = platWait(hwnd, timeoutMs);
+        mapSet(realCur, hwnd, rec);
+        return listTryGet(rec, 0) catch 0;
+    }
+    const i: int = swIndex(hwnd);
+    if (i < 0) {
+        return 0;
+    }
+    pumpReplay(i, hwnd);
+    const w: Ref<SWin> = swAt(i);
+    if (w.head >= listLen(w.q)) {
+        w.cur = zeros5();
+        if (listLen(w.q) > 0) {
+            w.q = listNew();
+            w.head = 0;
+        }
+        return 0;
+    }
+    const rec: List<int> = listNew();
+    let j: int = 0;
+    while (j < EV_SLOTS) {
+        listPush(rec, listTryGet(w.q, w.head + j) catch 0);
+        j = j + 1;
+    }
+    w.head = w.head + EV_SLOTS;
+    w.cur = rec;
+    return listTryGet(rec, 0) catch 0;
+}
+
+function curField(hwnd: int, slot: int): int {
+    if (mapHas(realCur, hwnd)) {
+        const none: List<int> = listNew();
+        return listTryGet(mapGet(realCur, hwnd) catch none, slot) catch 0;
+    }
+    const i: int = swIndex(hwnd);
+    if (i < 0) {
+        return 0;
+    }
+    return listTryGet(swAt(i).cur, slot) catch 0;
+}
+
+export function winEventTarget(hwnd: int): int {
+    return curField(hwnd, 1);
+}
+
+export function winEventX(hwnd: int): int {
+    return curField(hwnd, 2);
+}
+
+export function winEventY(hwnd: int): int {
+    return curField(hwnd, 3);
+}
+
+export function winEventMods(hwnd: int): int {
+    return curField(hwnd, 4);
+}
+
+/// 呈现整帧；成功得 0 并推进帧号，命中定格帧时写三伴。面或窗无效得 -1，帧号不动。真窗把像素交给客户区
+/// （帧号与定格只属脚本窗）。
+export function winPresent(hwnd: int, surface: int): int {
+    replayLoad();
+    if (surfOk(surface) && platIsReal(hwnd)) {
+        const rs: Surf = surfAt(surface);
+        return platPresent(hwnd, rs.px, rs.w, rs.h);
+    }
+    if (!surfOk(surface) || !isScripted(hwnd)) {
+        return -1;
+    }
+    animMs = animMs + 32;
+    presents = presents + 1;
+    const n: int = freezeFrame();
+    if (n != 0 && n == presents) {
+        const dir: string = freezeOutDir();
+        fsMkdirs(dir) catch (e) {
+            e;
+        };
+        const s: Surf = surfAt(surface);
+        rWriteTrio(s, dir + "/" + freezeStem() + "-f" + toStr(n));
+    }
+    return 0;
+}
+
+/// 能力查询：cap 6 动画毫秒（真窗会话取单调真实毫秒，否则每次脚本窗呈现 +32）；cap 4 DPI×100（重放态取
+/// 脚本 scale，否则系统 DPI）；cap 0..3（窗口系统、效果、菜单、无框窗）能开真窗时为 1；cap 5 剪贴板在真窗会话里平台有剪贴板时为 1；
+/// cap 7 文件对话框在真窗会话里平台能弹原生对话框时为 1。
+export function guiCap(cap: int): int {
+    replayLoad();
+    if (cap == CAP_ANIM_MS) {
+        if (realSession) {
+            return platAnimMs();
+        }
+        return animMs;
+    }
+    if (cap == CAP_DPI_SCALE_X100) {
+        if (replayActive()) {
+            return replayScale();
+        }
+        if (realAllowed()) {
+            return platSystemScale();
+        }
+        return 100;
+    }
+    if (cap >= CAP_WINDOW_SYSTEM && cap <= 3 && realAllowed()) {
+        return 1;
+    }
+    if (cap == CAP_CLIPBOARD && realAllowed() && platClipAvailable()) {
+        return 1;
+    }
+    if (cap == CAP_FILE_DIALOG && realAllowed() && platDialogAvailable()) {
+        return 1;
+    }
+    return 0;
+}
+
+/// 窗口 DPI×100：重放态取脚本 scale，真窗取所在显示器的缩放，否则 100。
+export function winScale(hwnd: int): int {
+    replayLoad();
+    if (replayActive()) {
+        return replayScale();
+    }
+    if (platIsReal(hwnd)) {
+        return platScale(hwnd);
+    }
+    return 100;
+}
+
+// 真窗操作的分派：真窗交平台层；脚本窗为无操作、得 0；其余句柄得 -1。
+function scriptedOr(hwnd: int, rc: int): int {
+    if (isScripted(hwnd)) {
+        return 0;
+    }
+    return rc;
+}
+
+export function winSetTitle(hwnd: int, title: string): int {
+    if (platIsReal(hwnd)) {
+        return platSetTitle(hwnd, title);
+    }
+    return scriptedOr(hwnd, -1);
+}
+
+/// 相对移动（DIP 增量）。
+export function winMove(hwnd: int, dx: int, dy: int): int {
+    if (platIsReal(hwnd)) {
+        return platMove(hwnd, dx, dy);
+    }
+    return scriptedOr(hwnd, -1);
+}
+
+export function winMinimize(hwnd: int): int {
+    if (platIsReal(hwnd)) {
+        return platMinimize(hwnd);
+    }
+    return scriptedOr(hwnd, -1);
+}
+
+export function winMaximizeToggle(hwnd: int): int {
+    if (platIsReal(hwnd)) {
+        return platMaximizeToggle(hwnd);
+    }
+    return scriptedOr(hwnd, -1);
+}
+
+/// 客户区尺寸（DIP）。
+export function winClientResize(hwnd: int, w: int, h: int): int {
+    if (platIsReal(hwnd)) {
+        return platClientResize(hwnd, w, h);
+    }
+    return scriptedOr(hwnd, -1);
+}
+
+/// 客户区最小、最大尺寸（DIP；0＝不约束）。
+export function winSetMinMax(hwnd: int, minW: int, minH: int, maxW: int, maxH: int): int {
+    if (platIsReal(hwnd)) {
+        return platSetMinMax(hwnd, minW, minH, maxW, maxH);
+    }
+    return scriptedOr(hwnd, -1);
+}
+
+export function winSetTopmost(hwnd: int, on: bool): int {
+    if (platIsReal(hwnd)) {
+        return platSetTopmost(hwnd, on);
+    }
+    return scriptedOr(hwnd, -1);
+}
+
+/// 菜单项（id≥100，即事件 target）。
+export function winMenuAdd(hwnd: int, id: int, label: string): int {
+    if (platIsReal(hwnd)) {
+        return platMenuAdd(hwnd, id, label);
+    }
+    return scriptedOr(hwnd, -1);
+}
+
+/// 客户区光标（0 箭头、1 I 形）。
+export function winSetCursor(hwnd: int, kind: int): int {
+    if (platIsReal(hwnd)) {
+        return platSetCursor(hwnd, kind);
+    }
+    return scriptedOr(hwnd, -1);
+}
+
+/// 窗口整体不透明度 0..255。
+export function winSetOpacity(hwnd: int, opacity: int): int {
+    if (platIsReal(hwnd)) {
+        return platSetOpacity(hwnd, opacity);
+    }
+    return scriptedOr(hwnd, -1);
+}
+
+/// 窗口效果：返回实际生效的档位，脚本窗与无窗口系统恒为 0（plain）。
+export function winSetEffect(hwnd: int, effect: int): int {
+    if (platIsReal(hwnd)) {
+        return platSetEffect(hwnd, effect);
+    }
+    return 0;
+}
+
+/// 剪贴板写：给了重放脚本时写进程内模拟板得 0；真窗会话里平台有剪贴板时写系统剪贴板（Windows、Linux X11、macOS），否则得 -1。
+export function clipSet(text: string): int {
+    replayLoad();
+    if (replayScriptGiven()) {
+        clip = text;
+        return 0;
+    }
+    if (realAllowed() && platClipAvailable()) {
+        return platClipSet(text);
+    }
+    return -1;
+}
+
+/// 剪贴板读：模拟板内容，或真窗会话里的系统剪贴板；不可用时为空串。
+export function clipGet(): string {
+    replayLoad();
+    if (replayScriptGiven()) {
+        return clip;
+    }
+    if (realAllowed() && platClipAvailable()) {
+        return platClipGet();
+    }
+    return "";
+}
+
+/// 打开文件对话框：重放态取脚本 dialog 队列（空则为空串，即取消）；真窗会话里平台有原生对话框时弹它（owner 是真窗时作属主），
+/// 选中得路径，取消或失败得空串；否则得空串。
+export function dialogOpen(owner: int, title: string, filters: List<FdFilter>): string {
+    replayLoad();
+    if (replayActive()) {
+        return replayDialogPop();
+    }
+    if (realAllowed() && platDialogAvailable()) {
+        return platDialogOpen(owner, title, filters);
+    }
+    return "";
+}
+
+/// 保存文件对话框：同 dialogOpen（与打开共用重放的 dialog 队列）；defaultName 是预填的建议文件名，覆盖确认交给系统。
+export function dialogSave(owner: int, title: string, filters: List<FdFilter>, defaultName: string): string {
+    replayLoad();
+    if (replayActive()) {
+        return replayDialogPop();
+    }
+    if (realAllowed() && platDialogAvailable()) {
+        return platDialogSave(owner, title, filters, defaultName);
+    }
+    return "";
+}

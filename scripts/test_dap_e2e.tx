@@ -1,0 +1,544 @@
+// 原生 `taixu dap` 的端到端检查。设计：§六。
+//
+// 以 stdio 起 `taixu dap`（Content-Length 分帧），照 VS Code 的做法驱动它：
+// - main：launch 之前的 configurationDone（记下）、launch 之前设的断点（待定，其中一个在没有语句的行上）、launch（changed 事件）、
+//   停在断点、栈顶在先、“局部变量”与“槽位”两个作用域、struct 局部展开一层（u8 字段）、模块状态槽展开到全局、对变量名与表达式
+//   （拒绝）求值、next、setBreakpoints 替换该文件的断点、程序输出为 stdout 的 output 事件、exited 带退出码与 terminated、结束后
+//   continue（拒绝）、disconnect（适配器退出 0）；
+// - live：死循环；运行中设的断点使它停下，清掉断点后 pause 使它再停（reason pause），terminate，同一适配器里再 launch、pause、
+//   disconnect；
+// - trap：stderr 的 output 带 trap 行，exited 3 与 terminated；
+// - compile-fail：launch 失败，诊断在 stderr 的 output 里，terminated；stdin 流尾结束适配器（0）；
+// - framing：帧头回归（test_frames.tx）；坏的 Content-Length 使适配器以 3 结束，stderr 有 `taixu dap: BadFrame`；
+// - misc：attach 与未知命令拒绝，串形的 seq 回 request_seq 0 且 JSON 有效；
+// - link：断点路径与模块路径只隔着一个符号链接（Windows 上为目录联接）时指同一个文件——适配器比较真实路径，两个方向都命中。
+//
+// 客户端是 test_proto.tx（回复以独立的 test_json.tx 解析），输入流尾经 procCloseStream（D3 v0.54）。取不到的字段记该项
+// FAIL、该场景余下各项照跑；FAIL 行的细节是 JSON 原文。Windows 的目录联接经 cmd 的 mklink /J 建，类 Unix 的符号链接经系统的 ln -s。
+//
+// 运行（仓根）：taixu run --toolchain scripts/test_dap_e2e.tx --compiler <原生 taixu> [场景…]
+// 任何 FAIL 时退出码 1。
+import { absolute, deleteTree, findInPath, join, kindOf, nat, onWindows, startsWith, words } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { captureRaw } from "./test_lib";
+import { contains, endsWith, headChars } from "./test_text";
+import { lossyText } from "./check_lib";
+import { J_ARR, J_BOOL, J_NULL, J_OBJ, J_STR, Jv, jAt, jDump, jEq, jGet, jInt, jIsBool, jIsTrue, jLen, jNull, jQuote, jText } from "./test_json";
+import { at, count, dump, falseAt, fieldsOf, firstBy, has, intIs, intOf, isArr, item, lastBy, sameJv, textIs, textOf, trueAt, truthy }
+from "./test_jv";
+import { MODE_FRAMES, Peer, peerClose, peerExited, peerFinish, peerIdle, peerPump, peerSend, peerStart } from "./test_proto";
+import { bytesHas, framingCases } from "./test_frames";
+
+const TIMEOUT_MS: int = 60000;
+const SEC: int = 1000000000;
+const SCENARIOS: string = "main live trap compile-fail framing misc link";
+const MAIN_TX: string = "struct P {\n    x: u8,\n    y: int,\n}\n\nlet g: int = 7;\n\nexport function main(args: []string): int {\n    let a: int = 1;\n    const p = P { x: 200, y: 5 };\n    let b: int = 2;\n    print(\"sum \" + toStr(a + b + g + p.y));\n    return a + b + g;\n}\n";
+const LOOP_TX: string = "export function main(args: []string): int {\n    let i: int = 0;\n    while (true) {\n        i = i + 1;\n    }\n    return i;\n}\n";
+const TRAP_TX: string = "export function main(args: []string): int {\n    let z: int = 0;\n    print(\"before\");\n    return 10 / z;\n}\n";
+const BAD_TX: string = "export function main(args: []string): int {\n    return nope;\n}\n";
+
+struct Ctx {
+    exe: string,
+    tmp: string,
+    fails: int,
+    total: int,
+}
+
+// 逐项输出 'PASS  标签' 或 'FAIL  %-28s %s'（标签按字符补到 28，细节至多 400 字符）。
+function check(c: Ref<Ctx>, label: string, ok: bool, detail: string): bool {
+    c.total = c.total + 1;
+    if (ok) {
+        print("PASS  " + label);
+    } else {
+        c.fails = c.fails + 1;
+        print("FAIL  " + padChars(label, 28) + " " + headChars(detail, 400));
+    }
+    return ok;
+}
+
+function padChars(s: string, w: int): string {
+    let n = 0;
+    let i = 0;
+    while (i < len(s)) {
+        if (((byteAt(s, i) ?? 0) & 0xC0) != 0x80) {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    let t = s;
+    while (n < w) {
+        t = t + " ";
+        n = n + 1;
+    }
+    return t;
+}
+
+// ---------------------------------------------------------------- JSON 取值
+
+function body(r: Ref<Jv>?, key: string): Ref<Jv>? {
+    return at(at(r, "body"), key);
+}
+
+function lowerAscii(s: string): string {
+    const b = bytesFromStr(s);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) ?? 0;
+        if (c >= 65 && c <= 90) {
+            bytesSet(b, i, c + 32);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(b) catch s;
+}
+
+// ---------------------------------------------------------------- DAP 客户端
+
+struct Dap {
+    p: Ref<Peer>,
+    seq: int,
+}
+
+function dapNew(c: Ref<Ctx>): Ref<Dap> | Error {
+    const args: List<string> = listNew();
+    listPush(args, "dap");
+    const p = peerStart(c.exe, args, c.tmp, MODE_FRAMES, false)?;
+    return new Dap { p: p, seq: 0 };
+}
+
+function raw(d: Ref<Dap>, data: Bytes): void {
+    const ok = peerSend(d.p, data);
+}
+
+// 发一个请求；args 为 JSON 原文（空串表示不带），seq 为 JSON 原文（空串取递增的序号，计数照样加一）。得递增的序号。
+function sendSeq(d: Ref<Dap>, command: string, args: string, seq: string): int {
+    d.seq = d.seq + 1;
+    let s = seq;
+    if (len(s) == 0) {
+        s = toStr(d.seq);
+    }
+    let msg = "{\"seq\": " + s + ", \"type\": \"request\", \"command\": " + jQuote(command);
+    if (len(args) > 0) {
+        msg = msg + ", \"arguments\": " + args;
+    }
+    const b = bytesFromStr(msg + "}");
+    const frame = bytesFromStr("Content-Length: " + toStr(bytesLen(b)) + "\r\n\r\n");
+    bytesAppend(frame, b);
+    raw(d, frame);
+    return d.seq;
+}
+
+// 第一个满足 f 的消息，取走。服务已退出且没有未取的消息时不再等。
+function waitFor(d: Ref<Dap>, f: (Ref<Jv>) => bool, limitMs: int): Ref<Jv>? {
+    const end = monoNs() + limitMs * 1000000;
+    while (monoNs() < end) {
+        const hit = take(d, f);
+        if (hit != None) {
+            return hit;
+        }
+        if (peerExited(d.p) && listLen(d.p.msgs) == 0) {
+            const drain = monoNs() + SEC;
+            while (d.p.outOpen && monoNs() < drain) {
+                peerPump(d.p, 50);
+            }
+            return take(d, f);
+        }
+        let left = (end - monoNs()) / 1000000;
+        if (left > 100) {
+            left = 100;
+        }
+        if (left > 0) {
+            peerPump(d.p, left);
+        }
+    }
+    return None;
+}
+
+function take(d: Ref<Dap>, f: (Ref<Jv>) => bool): Ref<Jv>? {
+    let i = 0;
+    while (i < listLen(d.p.msgs)) {
+        const m = listGet(d.p.msgs, i) catch jNull();
+        if (m.kind == J_OBJ && f(m)) {
+            listRemoveAt(d.p.msgs, i);
+            return m;
+        }
+        i = i + 1;
+    }
+    return None;
+}
+
+function response(d: Ref<Dap>, seq: int): Ref<Jv>? {
+    return waitFor(d, (m: Ref<Jv>): bool => textIs(m, "type", "response") && intIs(m, "request_seq", seq), TIMEOUT_MS);
+}
+
+function event(d: Ref<Dap>, name: string): Ref<Jv>? {
+    return waitFor(d, (m: Ref<Jv>): bool => textIs(m, "type", "event") && textIs(m, "event", name), TIMEOUT_MS);
+}
+
+function request(d: Ref<Dap>, command: string, args: string): Ref<Jv>? {
+    return response(d, sendSeq(d, command, args, ""));
+}
+
+// 已收到、尚未取走的 output 事件里该类别的输出，按到达序连接（不取走）。
+function outputs(d: Ref<Dap>, category: string): string {
+    let s = "";
+    for (m in d.p.msgs) {
+        if (textIs(m, "event", "output") && textIs(at(m, "body"), "category", category)) {
+            s = s + textOf(at(m, "body"), "output");
+        }
+    }
+    return s;
+}
+
+function finish(d: Ref<Dap>): int {
+    const code = peerFinish(d.p, 30000);
+    peerClose(d.p);
+    return code ?? -100000;
+}
+
+function badHead(d: Ref<Dap>): string {
+    return listGet(d.p.bad, 0) catch "";
+}
+
+function startDap(c: Ref<Ctx>, label: string): Ref<Dap> | Error {
+    const d = dapNew(c)?;
+    const r = request(d, "initialize", "{\"adapterID\": \"taixu\"}");
+    const caps = at(r, "body");
+    check(c, label + ":initialize", !has(caps, "capabilities") && trueAt(caps, "supportsConfigurationDoneRequest") && trueAt(caps, "supportsTerminateRequest")
+        && trueAt(caps, "supportsEvaluateForHovers") && trueAt(caps, "supportsLoadedSourcesRequest"), dump(caps));
+    check(c, label + ":initialized", event(d, "initialized") != None, "");
+    return d;
+}
+
+function path(c: Ref<Ctx>, name: string): string {
+    return nat(join(c.tmp, name));
+}
+
+function write(c: Ref<Ctx>, name: string, text: string): void {
+    writeFile(path(c, name), text) catch (e) {
+        eprint("写不了 " + name + "：" + e.message);
+    };
+}
+
+function stopDesc(ev: Ref<Jv>?, reason: string, prefix: string): bool {
+    return ev != None && (len(reason) == 0 || textIs(at(ev, "body"), "reason", reason)) && startsWith(textOf(at(ev, "body"), "description"), prefix);
+}
+
+function success(r: Ref<Jv>?): bool {
+    return r != None && trueAt(r, "success");
+}
+
+function refused(r: Ref<Jv>?, needle: string): bool {
+    return r != None && falseAt(r, "success") && contains(textOf(r, "message"), needle);
+}
+
+// ---------------------------------------------------------------- 场景
+
+function scMain(c: Ref<Ctx>): void | Error {
+    const p = path(c, "main.tx");
+    const d = startDap(c, "main")?;
+    let r = request(d, "configurationDone", "");
+    check(c, "main:configurationDone-first", success(r), dump(r));
+    r = request(d, "setBreakpoints", "{\"source\": {\"name\": \"main.tx\", \"path\": " + jQuote(p) + "}, \"breakpoints\": [{\"line\": 11}, {\"line\": 2}]}");
+    const bp = body(r, "breakpoints");
+    const id0 = at(item(bp, 0), "id");
+    const id1 = at(item(bp, 1), "id");
+    check(c, "main:pending", count(bp) == 2 && !truthy(at(item(bp, 0), "verified")) && !truthy(at(item(bp, 1), "verified")) && !sameJv(id0, id1), dump(bp));
+    r = request(d, "launch", "{\"program\": \"main.tx\"}");
+    check(c, "main:launch", success(r), dump(r));
+    const e1 = waitFor(d, (m: Ref<Jv>): bool => textIs(m, "type", "event") && textIs(m, "event", "breakpoint")
+        && sameJv(at(body(m, "breakpoint"), "id"), id0), TIMEOUT_MS);
+    const e2 = waitFor(d, (m: Ref<Jv>): bool => textIs(m, "type", "event") && textIs(m, "event", "breakpoint")
+        && sameJv(at(body(m, "breakpoint"), "id"), id1), TIMEOUT_MS);
+    check(c, "main:changed", e1 != None && trueAt(body(e1, "breakpoint"), "verified") && e2 != None && falseAt(body(e2, "breakpoint"), "verified")
+        && contains(textOf(body(e2, "breakpoint"), "message"), "该行没有可停的语句"), "(" + dump(e1) + ", " + dump(e2) + ")");
+    let ev = event(d, "stopped");
+    check(c, "main:stopped", stopDesc(ev, "breakpoint", "main@11:"), dump(ev));
+    r = request(d, "stackTrace", "{\"threadId\": 1}");
+    const frames = body(r, "stackFrames");
+    const f0 = item(frames, 0);
+    check(c, "main:stack", count(frames) == 1 && intIs(f0, "id", 1000) && textIs(f0, "name", "main") && intIs(f0, "line", 11)
+        && endsWith(lowerAscii(textOf(at(f0, "source"), "path")), "main.tx"), dump(frames));
+    r = request(d, "scopes", "{\"frameId\": 1000}");
+    const scopes = body(r, "scopes");
+    check(c, "main:scopes", fieldsOf(scopes, "name") == "局部变量 槽位" && count(scopes) == 2 && intIs(item(scopes, 0), "variablesReference", 1000000)
+        && intIs(item(scopes, 1), "variablesReference", 2000000), dump(scopes));
+    r = request(d, "variables", "{\"variablesReference\": 1000000}");
+    const vs = body(r, "variables");
+    const va = lastBy(vs, "name", "a");
+    const vp = lastBy(vs, "name", "p");
+    check(c, "main:locals", va != None && textIs(va, "value", "1") && textIs(va, "type", "int") && vp != None && textIs(vp, "value", "P（2 字段）")
+        && intOf(vp, "variablesReference") > 0 && lastBy(vs, "name", "b") == None, dump(vs));
+    r = request(d, "variables", "{\"variablesReference\": " + refText(vp) + "}");
+    const kids = body(r, "variables");
+    const kx = lastBy(kids, "name", "x");
+    check(c, "main:expand", textIs(kx, "value", "200") && textIs(kx, "type", "u8") && textIs(lastBy(kids, "name", "y"), "value", "5"), dump(kids));
+    r = request(d, "variables", "{\"variablesReference\": 2000000}");
+    const slots = body(r, "variables");
+    const s0 = firstBy(slots, "name", "s0");
+    check(c, "main:slots", s0 != None && textIs(s0, "type", "ref") && intOf(s0, "variablesReference") > 0, dump(slots));
+    r = request(d, "variables", "{\"variablesReference\": " + refText(s0) + "}");
+    const globals = body(r, "variables");
+    let hasG = false;
+    let i = 0;
+    while (i < count(globals)) {
+        if (textIs(item(globals, i), "name", "g") && textIs(item(globals, i), "value", "7")) {
+            hasG = true;
+        }
+        i = i + 1;
+    }
+    check(c, "main:global", hasG, dump(r));
+    r = request(d, "evaluate", "{\"expression\": \"a\", \"frameId\": 1000, \"context\": \"hover\"}");
+    check(c, "main:evaluate", textIs(at(r, "body"), "result", "1") && textIs(at(r, "body"), "type", "int"), dump(r));
+    r = request(d, "evaluate", "{\"expression\": \"a + 1\", \"frameId\": 1000}");
+    check(c, "main:evaluate-expr", refused(r, "只支持变量名"), dump(r));
+    r = request(d, "next", "{\"threadId\": 1}");
+    ev = event(d, "stopped");
+    check(c, "main:next", stopDesc(ev, "step", "main@12:"), dump(ev));
+    r = request(d, "setBreakpoints", "{\"source\": {\"name\": \"main.tx\", \"path\": " + jQuote(p) + "}, \"breakpoints\": [{\"line\": 13}]}");
+    const bp2 = body(r, "breakpoints");
+    check(c, "main:replace", count(bp2) == 1 && trueAt(item(bp2, 0), "verified") && intIs(item(bp2, 0), "line", 13), dump(bp2));
+    r = request(d, "continue", "{\"threadId\": 1}");
+    ev = event(d, "stopped");
+    check(c, "main:replaced-stop", stopDesc(ev, "", "main@13:"), dump(ev));
+    check(c, "main:stdout", outputs(d, "stdout") == "sum 15\n", jQuote(outputs(d, "stdout")));
+    r = request(d, "continue", "{\"threadId\": 1}");
+    const ex = event(d, "exited");
+    check(c, "main:exited", ex != None && intIs(at(ex, "body"), "exitCode", 10), dump(ex));
+    check(c, "main:terminated", event(d, "terminated") != None, "");
+    r = request(d, "continue", "{\"threadId\": 1}");
+    check(c, "main:after-end", refused(r, "调试目标已结束"), dump(r));
+    r = request(d, "disconnect", "");
+    check(c, "main:disconnect", success(r), dump(r));
+    const code = finish(d);
+    check(c, "main:exit0", code == 0 && listLen(d.p.bad) == 0, "(" + toStr(code) + ", " + jQuote(badHead(d)) + ")");
+}
+
+// 变量引用号的 JSON（缺席写 0，同 Python 的 .get('variablesReference', 0)）。
+function refText(v: Ref<Jv>?): string {
+    const x = at(v, "variablesReference");
+    if (x == None) {
+        return "0";
+    }
+    return jDump(x ?? jNull());
+}
+
+function scLive(c: Ref<Ctx>): void | Error {
+    const p = path(c, "loop.tx");
+    const d = startDap(c, "live")?;
+    let round = 1;
+    while (round <= 2) {
+        let r = request(d, "launch", "{\"program\": " + jQuote(p) + "}");
+        check(c, "live:launch" + toStr(round), success(r), dump(r));
+        r = request(d, "configurationDone", "");
+        peerIdle(d.p, 400);
+        if (round == 1) {
+            r = request(d, "setBreakpoints", "{\"source\": {\"path\": " + jQuote(p) + "}, \"breakpoints\": [{\"line\": 4}]}");
+            check(c, "live:set-running", trueAt(item(body(r, "breakpoints"), 0), "verified"), dump(r));
+            const ev = event(d, "stopped");
+            check(c, "live:hit", stopDesc(ev, "breakpoint", "main@4:"), dump(ev));
+            r = request(d, "setBreakpoints", "{\"source\": {\"path\": " + jQuote(p) + "}, \"breakpoints\": []}");
+            r = request(d, "continue", "{\"threadId\": 1}");
+            peerIdle(d.p, 400);
+        }
+        r = request(d, "pause", "{\"threadId\": 1}");
+        const ev = event(d, "stopped");
+        check(c, "live:pause" + toStr(round), success(r) && ev != None && textIs(at(ev, "body"), "reason", "pause"), "(" + dump(r) + ", " + dump(ev) + ")");
+        r = request(d, "stackTrace", "{\"threadId\": 1}");
+        const frames = body(r, "stackFrames");
+        check(c, "live:stack" + toStr(round), count(frames) == 1 && fieldsOf(frames, "name") == "main", dump(r));
+        if (round == 1) {
+            r = request(d, "terminate", "");
+            check(c, "live:terminate", success(r) && event(d, "terminated") != None, dump(r));
+        }
+        round = round + 1;
+    }
+    const last = request(d, "disconnect", "");
+    const code = finish(d);
+    check(c, "live:exit0", code == 0, toStr(code));
+}
+
+function scTrap(c: Ref<Ctx>): void | Error {
+    const d = startDap(c, "trap")?;
+    let r = request(d, "launch", "{\"program\": " + jQuote(path(c, "trap.tx")) + "}");
+    r = request(d, "configurationDone", "");
+    const ex = event(d, "exited");
+    const term = event(d, "terminated");
+    const err = outputs(d, "stderr");
+    check(c, "trap:events", ex != None && intIs(at(ex, "body"), "exitCode", 3) && term != None, "(" + dump(ex) + ", " + dump(term) + ")");
+    check(c, "trap:stderr", contains(err, "trap div_by_zero") && contains(err, "trap.tx:4:"), jQuote(err));
+    check(c, "trap:stdout", outputs(d, "stdout") == "before\n", jQuote(outputs(d, "stdout")));
+    r = request(d, "disconnect", "");
+    check(c, "trap:exit0", finish(d) == 0, "");
+}
+
+function scCompileFail(c: Ref<Ctx>): void | Error {
+    const d = startDap(c, "compile")?;
+    const r = request(d, "launch", "{\"program\": " + jQuote(path(c, "bad.tx")) + "}");
+    check(c, "compile:launch-fails", refused(r, "编译失败或早退"), dump(r));
+    const err = outputs(d, "stderr");
+    check(c, "compile:stderr", contains(err, "编译失败（调试目标未启动）") && contains(err, "bad.tx:2:"), jQuote(err));
+    check(c, "compile:terminated", event(d, "terminated") != None, "");
+    check(c, "compile:eof-exit0", finish(d) == 0, "");
+}
+
+function scFraming(c: Ref<Ctx>): void | Error {
+    framingCases(c.exe, "dap", c.tmp, (name: string, ok: bool, detail: string): bool => check(c, name, ok, detail));
+    const d = dapNew(c)?;
+    raw(d, bytesFromStr("Content-Length: abc\r\n\r\n{}"));
+    const code = finish(d);
+    check(c, "framing:bad-length", code == 3 && bytesHas(d.p.err, bytesFromStr("taixu dap: BadFrame")), "(" + toStr(code) + ", " + jQuote(lossyText(d.p.err)) + ")");
+}
+
+function scMisc(c: Ref<Ctx>): void | Error {
+    const d = startDap(c, "misc")?;
+    let r = request(d, "attach", "{}");
+    check(c, "misc:attach", refused(r, "attach"), dump(r));
+    r = request(d, "frobnicate", "{}");
+    check(c, "misc:unknown", r != None && falseAt(r, "success") && textIs(r, "message", "command not supported"), dump(r));
+    const ignored = sendSeq(d, "threads", "", "\"x7\"");
+    r = waitFor(d, (m: Ref<Jv>): bool => textIs(m, "type", "response") && textIs(m, "command", "threads"), TIMEOUT_MS);
+    check(c, "misc:string-seq", r != None && intIs(r, "request_seq", 0) && listLen(d.p.bad) == 0, "(" + dump(r) + ", " + jQuote(badHead(d)) + ")");
+    r = request(d, "disconnect", "");
+    check(c, "misc:exit0", finish(d) == 0, "");
+}
+
+// 建 link → real 的目录链接（Windows 目录联接、类 Unix 符号链接）；已有同名条目时不动。
+function makeLink(c: Ref<Ctx>, real: string, link: string): void {
+    if (kindOf(link) != 0 || entryKind(link) != 0) {
+        return;
+    }
+    const args: List<string> = listNew();
+    let exe = "";
+    if (onWindows()) {
+        exe = getEnv("ComSpec") ?? "C:\\Windows\\System32\\cmd.exe";
+        listPush(args, "/c");
+        listPush(args, "mklink");
+        listPush(args, "/J");
+        listPush(args, link);
+        listPush(args, real);
+    } else {
+        exe = findInPath("ln");
+        listPush(args, "-s");
+        listPush(args, real);
+        listPush(args, link);
+    }
+    const r = captureRaw(exe, args, c.tmp, 60 * SEC, 10 * SEC, 1048576) catch (e) {
+        eprint("建不了链接 " + link + "：" + e.message);
+        return;
+    };
+}
+
+function scLink(c: Ref<Ctx>): void | Error {
+    const real = path(c, "real");
+    const link = path(c, "link");
+    makeDir(real)?;
+    writeFile(nat(join(real, "main.tx")), MAIN_TX)?;
+    makeLink(c, real, link);
+    const labels: []string = ["link:bp-via-link", "link:launch-via-link"];
+    const programs: []string = [nat(join(real, "main.tx")), nat(join(link, "main.tx"))];
+    const bpPaths: []string = [nat(join(link, "main.tx")), nat(join(real, "main.tx"))];
+    let k = 0;
+    while (k < 2) {
+        const label = labels[k];
+        const d = startDap(c, label)?;
+        let r = request(d, "configurationDone", "");
+        r = request(d, "setBreakpoints", "{\"source\": {\"path\": " + jQuote(bpPaths[k]) + "}, \"breakpoints\": [{\"line\": 11}]}");
+        r = request(d, "launch", "{\"program\": " + jQuote(programs[k]) + "}");
+        const ev = event(d, "stopped");
+        check(c, label + ":stopped", success(r) && stopDesc(ev, "breakpoint", "main@11:"), "(" + dump(r) + ", " + dump(ev) + ")");
+        r = request(d, "disconnect", "");
+        const code = finish(d);
+        check(c, label + ":exit0", code == 0, toStr(code));
+        k = k + 1;
+    }
+}
+
+function runScenario(c: Ref<Ctx>, name: string): void | Error {
+    if (name == "main") {
+        return scMain(c);
+    }
+    if (name == "live") {
+        return scLive(c);
+    }
+    if (name == "trap") {
+        return scTrap(c);
+    }
+    if (name == "compile-fail") {
+        return scCompileFail(c);
+    }
+    if (name == "framing") {
+        return scFraming(c);
+    }
+    if (name == "misc") {
+        return scMisc(c);
+    }
+    if (name == "link") {
+        return scLink(c);
+    }
+    return err("KeyError(" + jQuote(name) + ")");
+}
+
+// 系统临时目录下新建的空目录（同 tempfile.mkdtemp），取真实路径：相对的 program 按 getcwd（物理路径）解析，断点路径须与之同形
+// （macOS 的临时目录在符号链接 /var 下）。
+function freshDir(prefix: string): string | Error {
+    const base = osRealPath(tempDir());
+    let k = 0;
+    while (k < 1000) {
+        const p = nat(join(base, prefix + toStr(monoNs() % 1000000000) + "-" + toStr(k)));
+        if (kindOf(p) == 0) {
+            makeDir(p)?;
+            return p;
+        }
+        k = k + 1;
+    }
+    return err("建不了临时目录 " + prefix);
+}
+
+function main(args: []string): int {
+    let compiler = "";
+    const chosen: List<string> = listNew();
+    let i = 0;
+    while (i < len(args)) {
+        const a = args[i];
+        if (i + 1 < len(args) && a == "--compiler") {
+            compiler = args[i + 1];
+            i = i + 2;
+        } else {
+            listPush(chosen, a);
+            i = i + 1;
+        }
+    }
+    if (len(compiler) == 0) {
+        eprint("用法：taixu run --toolchain scripts/test_dap_e2e.tx --compiler <原生 taixu> [场景…]");
+        return 2;
+    }
+    const tmp = freshDir("taixu-dap-e2e-") catch (e) {
+        eprint(e.message);
+        return 2;
+    };
+    const c = new Ctx { exe: absolute(nat(compiler)), tmp: tmp, fails: 0, total: 0 };
+    write(c, "main.tx", MAIN_TX);
+    write(c, "loop.tx", LOOP_TX);
+    write(c, "trap.tx", TRAP_TX);
+    write(c, "bad.tx", BAD_TX);
+    let todo = chosen;
+    if (listLen(todo) == 0) {
+        todo = words(SCENARIOS);
+    }
+    for (name in todo) {
+        runScenario(c, name) catch (e) {
+            check(c, name + ":crash", false, e.message);
+        };
+    }
+    deleteTree(tmp);
+    let verdict = "PASS";
+    if (c.fails > 0) {
+        verdict = "FAIL=" + toStr(c.fails);
+    }
+    print("SUMMARY " + verdict + " (" + toStr(c.total) + " checks)");
+    if (c.fails > 0) {
+        return 1;
+    }
+    return 0;
+}

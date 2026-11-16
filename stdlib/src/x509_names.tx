@@ -1,0 +1,75 @@
+// RFC 9525 的 HTTP TLS 身份匹配；仅 SAN，不代替证书路径验证。
+import { X509Certificate } from "./x509_types";
+import { derRead, derChildren, derContents } from "./crypto/der";
+import { parseIp } from "./ip";
+import { toLower } from "./string";
+
+export struct X509Names { dns: List<string>, ips: List<Bytes> }
+
+function ascii(data: Bytes): bool {
+    let i = 0; while (i < bytesLen(data)) { if ((bytesGet(data, i) catch 0) > 127) { return false; } i = i + 1; } return true;
+}
+
+export function x509SubjectAltNames(cert: Ref<X509Certificate>): X509Names | Error {
+    const names = X509Names { dns: listNew(), ips: listNew() }; let found = false; let data = bytesNew(0);
+    for (extension in cert.extensions) { if (extension.oidHex == "551d11") { found = true; data = extension.value; } }
+    if (!found) { return names; }
+    const root = derRead(data, 0, bytesLen(data))?;
+    if (root.tag != 48 || root.end != bytesLen(data)) { return err("x509: invalid subjectAltName sequence"); }
+    const entries = derChildren(data, root, 1024)?;
+    if (listLen(entries) == 0) { return err("x509: empty subjectAltName"); }
+    for (entry in entries) {
+        const raw = derContents(data, entry)?;
+        if (entry.tag == 130) {
+            if (!ascii(raw)) { return err("x509: non-IA5 DNS identity"); }
+            listPush(names.dns, bytesToStr(raw)?);
+        } else if (entry.tag == 135) {
+            if (bytesLen(raw) != 4 && bytesLen(raw) != 16) { return err("x509: invalid IP identity length"); } listPush(names.ips, raw);
+        } else if (entry.tag == 129 || entry.tag == 134) {
+            if (!ascii(raw)) { return err("x509: non-IA5 general name"); }
+        } else if (entry.tag != 160 && entry.tag != 163 && entry.tag != 164 && entry.tag != 165 && entry.tag != 136) {
+            return err("x509: invalid GeneralName tag");
+        }
+    }
+    return names;
+}
+
+function rootless(text: string): string { if (len(text) > 0 && byteAt(text, len(text) - 1) == 46) { return strSlice(text, 0, len(text) - 1); } return text; }
+
+function dnsOk(text: string, pattern: bool): bool {
+    if (len(text) < 1 || len(text) > 253) { return false; }
+    const labels = strSplit(text, "."); let index = 0;
+    for (label in labels) {
+        if (pattern && index == 0 && label == "*") { index = index + 1; continue; }
+        if (len(label) < 1 || len(label) > 63 || byteAt(label, 0) == 45 || byteAt(label, len(label) - 1) == 45) { return false; }
+        for (c in label) { if (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45)) { return false; } }
+        index = index + 1;
+    }
+    return true;
+}
+
+function match(host: string, presented: string): bool {
+    const pattern = rootless(presented);
+    // 裸通配符“*”不是合法名称（RFC 6125；Go 同样拒绝），只许替换最左边一个标签。
+    if (pattern == "*" || !dnsOk(pattern, true)) { return false; }
+    const h = strSplit(toLower(host), "."); const p = strSplit(toLower(pattern), ".");
+    if (listLen(h) != listLen(p)) { return false; }
+    let i = 0;
+    while (i < listLen(h)) {
+        if (!(i == 0 && listGet(p, i) == "*") && listGet(h, i) != listGet(p, i)) { return false; } i = i + 1;
+    }
+    return true;
+}
+
+export function x509VerifyHostname(cert: Ref<X509Certificate>, host: string): bool | Error {
+    if (len(host) == 0 || !ascii(bytesFromStr(host))) { return err("x509: hostname requires an ASCII DNS name or IP literal"); }
+    const names = x509SubjectAltNames(cert)?; const ip = parseIp(host) catch bytesNew(0);
+    if (bytesLen(ip) > 0) { for (candidate in names.ips) { if (bytesEqual(candidate, ip)) { return true; } } return false; }
+    const normalized = rootless(host);
+    if (!dnsOk(normalized, false)) { return err("x509: invalid DNS reference identity"); }
+    let numeric = true;
+    for (c in normalized) { if ((c < 48 || c > 57) && c != 46) { numeric = false; } }
+    if (numeric) { return err("x509: invalid numeric IP reference identity"); }
+    for (candidate in names.dns) { if (match(normalized, candidate)) { return true; } }
+    return false;
+}

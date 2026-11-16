@@ -9,38 +9,29 @@
 // R_X86_64_GLOB_DAT, bound at load time: DF_BIND_NOW). The entry stays the
 // kernel's own `_start`; the dynamic loader maps the libraries first.
 // 读入、放置、符号解析、拷节与重定位在公共核心 link_objects.tx（与 Mach-O 写出器共用）；本文件只管 ELF 的布局、头与动态段。
+// 目标由调用方给出（目标分层 X3a）；下面各架构的页长、解释器、GOT 槽重定位与 e_flags 的取值都在组合表 target_abi.tx。
 // 函数符号（v052-image-symbols）：可装载内容之后追加 .symtab、.strtab、.shstrtab 与节头表（不在任何 PT_LOAD 里）；
 // --strip 时不写，e_shnum 为 0。
-// aarch64：对象的 e_machine 为 183 时按 aarch64 写——重定位由公共核心的 a64Relocate 应用；段按 64 KiB 对齐
+// aarch64：目标为 aarch64-linux（对象的 e_machine 须为 183）时——重定位由公共核心的 a64Relocate 应用；段按 64 KiB 对齐
 // （aarch64 的 Linux 内核页可能是 4、16 或 64 KiB，权限不同的段不得共处一页，同 lld 的 max-page-size 与 Go 的 arm64 链接器），
 // 解释器 /lib/ld-linux-aarch64.so.1，GOT 槽的重定位为 R_AARCH64_GLOB_DAT（1025）。TLS 是 Variant I：可执行文件的 TLS 块在
 // 线程指针＋16（16 字节的线程控制块之后），PT_TLS 的对齐不超过 16 时加载器与内核约定都如此。
-// loongarch64：e_machine 258 按龙芯写——重定位由 la64Relocate 应用；段同样按 64 KiB 对齐（内核页缺省
+// loongarch64：目标为 loongarch64-linux（e_machine 258）时——重定位由 la64Relocate 应用；段同样按 64 KiB 对齐（内核页缺省
 // 16 KiB，也有 4、64 KiB）；e_flags 0x43（LP64D＋OBJABI v1）；解释器 /lib64/ld-linux-loongarch-lp64d.so.1；龙芯没有 GLOB_DAT，GOT 槽
 // 用 R_LARCH_64（2）。TLS 是 Variant I、线程控制块长 0：可执行文件的 TLS 块就在线程指针处。
-// riscv64：e_machine 243 按 RISC-V 写——重定位由 rv64Relocate 应用；段按 4 KiB 对齐（RISC-V Linux 只有
+// riscv64：目标为 riscv64-linux（e_machine 243）时——重定位由 rv64Relocate 应用；段按 4 KiB 对齐（RISC-V Linux 只有
 // 4 KiB 基本页，GNU ld 与 lld 缺省如此）；e_flags 0x4（LP64D）；解释器 /lib/ld-linux-riscv64-lp64d.so.1；没有 GLOB_DAT，GOT 槽用
 // R_RISCV_64（2）。TLS 同龙芯（Variant I、线程控制块长 0）。
 
 import { PTHREAD_HOOKS } from "./thread_block_abi";
 import { rawNameOf } from "./binary_name";
 import { linkMapSymbolsEnabled, linkMapEnabled, linkMapDone, linkMapSynthetic } from "./link_map_data";
+import { targetName, targetElfMachine, tElf } from "./target";
+import { targetAbi } from "./target_abi";
 import { ImageSymbol, linkSymbolsCollect, linkSymbolsStripped } from "./link_symbols";
-import { LKO_IMAGE_LIMIT, lkoObjectMachine, lkoReject, lkoFailure, lkoAlignUp, lkoLookup, lkoAddress, lkoAddGlobal, lkoGlobalCount, lkoGlobalName, lkoGlobalKind, lkoBegin, lkoPlace, lkoGroupSize, lkoGroupAlign, lkoSetGroupSize, lkoSetGroupAlign, lkoSetGroupBase, lkoDefineGlobals, lkoCacheSymbols, lkoCopySections, lkoRelocate, lkoCollectMap } from "./link_objects";
+import { LKO_IMAGE_LIMIT, lkoReject, lkoFailure, lkoAlignUp, lkoLookup, lkoAddress, lkoAddGlobal, lkoGlobalCount, lkoGlobalName, lkoGlobalKind, lkoBegin, lkoPlace, lkoGroupSize, lkoGroupAlign, lkoSetGroupSize, lkoSetGroupAlign, lkoSetGroupBase, lkoDefineGlobals, lkoDefined, lkoCacheSymbols, lkoCopySections, lkoRelocate, lkoCollectMap } from "./link_objects";
 
 const BASE: int = 4194304;
-const PAGE_X64: int = 4096;
-const PAGE_A64: int = 65536;
-const INTERP_X64: string = "/lib64/ld-linux-x86-64.so.2";
-const INTERP_A64: string = "/lib/ld-linux-aarch64.so.1";
-const GLOB_DAT_X64: int = 6;
-const GLOB_DAT_A64: int = 1025;
-const PAGE_LA64: int = 65536;
-const INTERP_LA64: string = "/lib64/ld-linux-loongarch-lp64d.so.1";
-const GLOB_DAT_LA64: int = 2;
-const PAGE_RV64: int = 4096;
-const INTERP_RV64: string = "/lib/ld-linux-riscv64-lp64d.so.1";
-const GLOB_DAT_RV64: int = 2;
 
 let out: Bytes = bytesNew(0);
 struct Shdr { name: string, kind: int, flags: int, off: int, size: int, link: int, info: int, align: int, entsize: int }
@@ -111,17 +102,21 @@ function segment(kind: int, flags: int, off: int, fileSize: int, memSize: int, a
     emit(fileSize, 8); emit(memSize, 8); emit(alignment, 8);
 }
 
-/// Link objects into a static executable; `entry` names the process entry symbol.
-export function linkElfObjects(objects: List<Bytes>, entry: string): int {
+/// Link objects into a static executable for target `t` (an ELF target); `entry` names the process entry symbol. The objects must be
+/// relocatables for t's machine (lkoBegin checks). Page size, interpreter, GOT relocation and e_flags come from the combination table
+/// (target_abi.tx), not from the objects: the target, not the object's machine, decides the operating system.
+export function linkElfObjects(objects: List<Bytes>, entry: string, t: int): int {
     out = bytesNew(0);
-    let firstMachine = -1;
-    if (listLen(objects) > 0) { firstMachine = lkoObjectMachine(listGet(objects, 0) catch bytesNew(0)); }
-    let mapTarget = "x86_64-linux"; let machineId = 62; let page = PAGE_X64; let interp = INTERP_X64; let globDat = GLOB_DAT_X64; let flags = 0;
-    if (firstMachine == 183) { mapTarget = "aarch64-linux"; machineId = 183; page = PAGE_A64; interp = INTERP_A64; globDat = GLOB_DAT_A64; }
-    if (firstMachine == 258) { mapTarget = "loongarch64-linux"; machineId = 258; page = PAGE_LA64; interp = INTERP_LA64; globDat = GLOB_DAT_LA64; flags = 67; }
-    if (firstMachine == 243) { mapTarget = "riscv64-linux"; machineId = 243; page = PAGE_RV64; interp = INTERP_RV64; globDat = GLOB_DAT_RV64; flags = 4; }
-    if (lkoBegin(objects, mapTarget) != 0) { return failed(); }
-    if (lkoPlace() != 0) { return failed(); }
+    if (lkoBegin(objects, targetName(t)) != 0) { return failed(); }
+    const abi = targetAbi(t);
+    if (!tElf(t) || abi.elfPage <= 0) { lkoReject("NotElfTarget:" + toStr(t)); return failed(); }
+    const machineId = targetElfMachine(t); const page = abi.elfPage; const interp = abi.elfInterp; const globDat = abi.elfGlobDat;
+    const flags = abi.elfFlags;
+    // 求可达的根：写出器按名字取用的符号（入口、TLS 模板、RISC-V 的动态产物标志、动态钩子槽）。
+    const roots: List<string> = listNew();
+    listPush(roots, entry); listPush(roots, "__tx_tls_template"); listPush(roots, "__tx_dynamic_image");
+    for (slot in dynHookSlots) { listPush(roots, slot); }
+    if (lkoPlace(roots) != 0) { return failed(); }
     const roSize = lkoGroupSize(1); const dataSize = lkoGroupSize(2);
     // Dynamic structures: .interp .hash .dynsym .dynstr .rela.dyn after rodata,
     // .dynamic and the GOT after data (both groups 8-aligned).
@@ -179,7 +174,7 @@ export function linkElfObjects(objects: List<Bytes>, entry: string): int {
     q = 0;
     while (dynamic && q < listLen(dynImports)) {
         const slotName = "__imp_" + (listGet(dynImports, q) catch "");
-        if (lkoLookup(slotName) >= 0) { return reject("DuplicateSymbol:" + slotName); }
+        if (lkoDefined(slotName)) { return reject("DuplicateSymbol:" + slotName); }
         lkoAddGlobal(slotName, BASE + dataOff + gotAt + 8 * q);
         if (linkMapSymbolsEnabled()) { linkMapSynthetic(rawNameOf(slotName), "got-slot", 2, BASE + dataOff + gotAt + 8 * q); }
         q = q + 1;

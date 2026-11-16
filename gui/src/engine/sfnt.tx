@@ -1,0 +1,611 @@
+// ============================================================================
+// engine/sfnt —— OpenType／TrueType 字体表（GUI 原生引擎 G1）。
+//
+// 收 TrueType（glyf）与 OpenType CFF（含 CID 键控），TTC 取第一个字体。用到的表：head（upem、
+// loca 格式）、hhea（上升、下降、度量条数）、maxp（字形数）、hmtx（前进量）、cmap（格式 4 与 12）、
+// loca／glyf 或 CFF、GSUB 的标准连字（ccmp、liga、rlig、clig 特性里的单替换与连字替换，同 HarfBuzz
+// 对拉丁文的缺省）、GPOS 的 kern 特性（PairPos 格式 1、2），都含扩展查找。不做上下文替换、竖排、
+// 本地化字形与复杂文字整形，可变字体取缺省实例。字体是不可信输入：越界读作 0，计数一律
+// 按剩余字节核对，结构不对即拒绝或当作无此字形。
+// ============================================================================
+
+import { u8, u16, i16, u32, tag } from "./bin";
+import { CffInfo, cffParse, cffOutline, cffNone } from "./cff";
+import { glyfOutline } from "./glyf";
+
+export struct Font {
+    data: Bytes,
+    upem: int,
+    asc: int,
+    desc: int,
+    numGlyphs: int,
+    hmtx: int,
+    nhm: int,
+    cmapFmt: int,
+    cmapOff: int,
+    loca: int,
+    glyf: int,
+    longLoca: bool,
+    cff: CffInfo,
+    kern: List<int>, // 每个 kern 查找：子表个数 n，随后 n 个 PairPos 子表的绝对偏移
+    gsub: List<int>, // 每个连字查找：子表个数 n，随后 n 组（类型 1 或 4，子表绝对偏移）
+}
+
+function tableOf(b: Bytes, dir: int, name: string, minLen: int): int {
+    const want: int = tag(name);
+    const n: int = u16(b, dir + 4);
+    let i: int = 0;
+    while (i < n && dir + 12 + i * 16 + 16 <= bytesLen(b)) {
+        const r: int = dir + 12 + i * 16;
+        if (u32(b, r) == want) {
+            const off: int = u32(b, r + 8);
+            const ln: int = u32(b, r + 12);
+            if (ln < minLen || off + ln > bytesLen(b)) {
+                return -1;
+            }
+            return off;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+function tableLen(b: Bytes, dir: int, name: string): int {
+    const want: int = tag(name);
+    const n: int = u16(b, dir + 4);
+    let i: int = 0;
+    while (i < n) {
+        const r: int = dir + 12 + i * 16;
+        if (u32(b, r) == want) {
+            return u32(b, r + 12);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// 解析字体（字体集合取第 0 个）；data 由调用方转交（不再修改）。
+export function fontParse(data: Bytes): Font | Error {
+    return fontParseFace(data, 0);
+}
+
+/// 解析字体集合（TTC／OTC）里第 index 个字体；单字体文件只收 index 0。
+export function fontParseFace(data: Bytes, index: int): Font | Error {
+    let dir: int = 0;
+    const magic: int = u32(data, 0);
+    if (magic == tag("ttcf")) {
+        if (index < 0 || index >= u32(data, 8)) {
+            return err("字体集合里没有第 " + toStr(index) + " 个字体");
+        }
+        dir = u32(data, 12 + index * 4);
+    } else if (index != 0) {
+        return err("不是字体集合，只有第 0 个字体");
+    }
+    const ver: int = u32(data, dir);
+    if (ver != 65536 && ver != tag("OTTO") && ver != tag("true")) {
+        return err("不是 TrueType／OpenType 字体");
+    }
+    const head: int = tableOf(data, dir, "head", 54);
+    const hhea: int = tableOf(data, dir, "hhea", 36);
+    const maxp: int = tableOf(data, dir, "maxp", 6);
+    const hmtx: int = tableOf(data, dir, "hmtx", 4);
+    const cmap: int = tableOf(data, dir, "cmap", 4);
+    if (head < 0 || hhea < 0 || maxp < 0 || hmtx < 0 || cmap < 0) {
+        return err("缺必需的表（head、hhea、maxp、hmtx、cmap）");
+    }
+    const upem: int = u16(data, head + 18);
+    if (upem < 16 || upem > 16384) {
+        return err("head.unitsPerEm 不在 16..16384");
+    }
+    const numGlyphs: int = u16(data, maxp + 4);
+    let nhm: int = u16(data, hhea + 34);
+    if (nhm < 1 || nhm * 4 > tableLen(data, dir, "hmtx")) {
+        return err("hmtx 与 hhea.numberOfHMetrics 不符");
+    }
+    let asc: int = i16(data, hhea + 4);
+    let desc: int = i16(data, hhea + 6);
+    const os2: int = tableOf(data, dir, "OS/2", 78);
+    if (asc == 0 && desc == 0 && os2 >= 0) {
+        asc = i16(data, os2 + 68);
+        desc = i16(data, os2 + 70);
+    }
+    const sub: List<int> = cmapPick(data, cmap);
+    const fmt: int = listTryGet(sub, 0) catch 0;
+    if (fmt == 0) {
+        return err("没有可用的 cmap 子表（格式 4 或 12）");
+    }
+    let cff: CffInfo = cffNone();
+    let loca: int = -1;
+    let glyf: int = -1;
+    const cffOff: int = tableOf(data, dir, "CFF ", 4);
+    if (cffOff >= 0) {
+        cff = cffParse(data, cffOff) catch (e) {
+            return err("CFF：" + e.message);
+        };
+    } else {
+        loca = tableOf(data, dir, "loca", 2);
+        glyf = tableOf(data, dir, "glyf", 0);
+        if (loca < 0 || glyf < 0) {
+            return err("既没有 CFF 也没有 glyf／loca");
+        }
+    }
+    const f: Font = {
+        data: data,
+        upem: upem,
+        asc: asc,
+        desc: desc,
+        numGlyphs: numGlyphs,
+        hmtx: hmtx,
+        nhm: nhm,
+        cmapFmt: fmt,
+        cmapOff: listTryGet(sub, 1) catch 0,
+        loca: loca,
+        glyf: glyf,
+        longLoca: i16(data, head + 50) == 1,
+        cff: cff,
+        kern: kernLookups(data, tableOf(data, dir, "GPOS", 10)),
+        gsub: ligaLookups(data, tableOf(data, dir, "GSUB", 10)),
+    };
+    return f;
+}
+
+// 选 cmap 子表：优先 (3,10)／(0,4)／(0,6) 的格式 12，其次 (3,1)／(0,3) 的格式 4，再次任一格式 4。
+// 得 [格式, 绝对偏移]，没有则 [0, 0]。
+function cmapPick(b: Bytes, cmap: int): List<int> {
+    const n: int = u16(b, cmap + 2);
+    let best: int = 0;
+    let bestOff: int = 0;
+    let bestRank: int = 0;
+    let i: int = 0;
+    while (i < n && cmap + 4 + i * 8 + 8 <= bytesLen(b)) {
+        const pid: int = u16(b, cmap + 4 + i * 8);
+        const eid: int = u16(b, cmap + 6 + i * 8);
+        const off: int = cmap + u32(b, cmap + 8 + i * 8);
+        const fmt: int = u16(b, off);
+        let rank: int = 0;
+        if (fmt == 12 && ((pid == 3 && eid == 10) || (pid == 0 && (eid == 4 || eid == 6)))) {
+            rank = 4;
+        } else if (fmt == 4 && ((pid == 3 && eid == 1) || (pid == 0 && eid == 3))) {
+            rank = 3;
+        } else if (fmt == 4) {
+            rank = 2;
+        }
+        if (rank > bestRank) {
+            bestRank = rank;
+            best = fmt;
+            bestOff = off;
+        }
+        i = i + 1;
+    }
+    const r: List<int> = listNew();
+    listPush(r, best);
+    listPush(r, bestOff);
+    return r;
+}
+
+/// 码位 → 字形号（没有得 0，即 .notdef）。
+export function glyphOf(f: Font, cp: int): int {
+    const b = f.data;
+    const o: int = f.cmapOff;
+    if (f.cmapFmt == 12) {
+        let lo: int = 0;
+        let hi: int = u32(b, o + 12) - 1;
+        if ((hi + 1) * 12 + 16 > bytesLen(b) - o) {
+            return 0;
+        }
+        while (lo <= hi) {
+            const mid: int = (lo + hi) / 2;
+            const g: int = o + 16 + mid * 12;
+            const start: int = u32(b, g);
+            if (cp < start) {
+                hi = mid - 1;
+            } else if (cp > u32(b, g + 4)) {
+                lo = mid + 1;
+            } else {
+                return gidOk(f, u32(b, g + 8) + cp - start);
+            }
+        }
+        return 0;
+    }
+    if (cp > 65535) {
+        return 0;
+    }
+    const segX2: int = u16(b, o + 6);
+    const segs: int = segX2 / 2;
+    const ends: int = o + 14;
+    const starts: int = ends + segX2 + 2;
+    const deltas: int = starts + segX2;
+    const ranges: int = deltas + segX2;
+    let lo: int = 0;
+    let hi: int = segs - 1;
+    while (lo <= hi) {
+        const mid: int = (lo + hi) / 2;
+        if (cp > u16(b, ends + mid * 2)) {
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if (lo >= segs) {
+        return 0;
+    }
+    const start: int = u16(b, starts + lo * 2);
+    if (cp < start) {
+        return 0;
+    }
+    const delta: int = u16(b, deltas + lo * 2);
+    const ro: int = u16(b, ranges + lo * 2);
+    if (ro == 0) {
+        return gidOk(f, (cp + delta) & 65535);
+    }
+    const g: int = u16(b, ranges + lo * 2 + ro + (cp - start) * 2);
+    if (g == 0) {
+        return 0;
+    }
+    return gidOk(f, (g + delta) & 65535);
+}
+
+function gidOk(f: Font, g: int): int {
+    if (g < 0 || g >= f.numGlyphs) {
+        return 0;
+    }
+    return g;
+}
+
+/// 前进量（字体单位）。
+export function advanceOf(f: Font, gid: int): int {
+    let i: int = gid;
+    if (i >= f.nhm) {
+        i = f.nhm - 1;
+    }
+    return u16(f.data, f.hmtx + i * 4);
+}
+
+/// 字形轮廓（字体单位，y 向上）追加到 path：0 移到 (x,y)、1 直线到 (x,y)、2 二次 (cx,cy,x,y)、
+/// 3 三次 (c1x,c1y,c2x,c2y,x,y)；每个轮廓隐含闭合。失败（数据损坏、超出预算）得 false。
+export function outlineOf(f: Font, gid: int, path: List<float>): bool {
+    if (gid < 0 || gid >= f.numGlyphs) {
+        return false;
+    }
+    if (f.glyf < 0) {
+        return cffOutline(f.data, f.cff, gid, path);
+    }
+    return glyfOutline(f.data, f.loca, f.glyf, f.longLoca, f.numGlyphs, gid, path);
+}
+
+// —— GPOS kern ——
+
+// 收集 kern 特性引用的查找（去重、按查找号升序，同 HarfBuzz 的应用次序），展开扩展查找，
+// 只留 PairPos 格式 1、2 的子表。
+function kernLookups(b: Bytes, gpos: int): List<int> {
+    const out: List<int> = listNew();
+    if (gpos < 0) {
+        return out;
+    }
+    const fl: int = gpos + u16(b, gpos + 6);
+    const ll: int = gpos + u16(b, gpos + 8);
+    const want: List<bool> = listNew();
+    const nl: int = u16(b, ll);
+    let i: int = 0;
+    while (i < nl) {
+        listPush(want, false);
+        i = i + 1;
+    }
+    const nf: int = u16(b, fl);
+    i = 0;
+    while (i < nf) {
+        if (u32(b, fl + 2 + i * 6) == tag("kern")) {
+            const fo: int = fl + u16(b, fl + 6 + i * 6);
+            const nidx: int = u16(b, fo + 2);
+            let j: int = 0;
+            while (j < nidx) {
+                const li: int = u16(b, fo + 4 + j * 2);
+                if (li < nl) {
+                    listSet(want, li, true);
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < nl) {
+        if (listTryGet(want, i) catch false) {
+            const lo: int = ll + u16(b, ll + 2 + i * 2);
+            const ltype: int = u16(b, lo);
+            const nsub: int = u16(b, lo + 4);
+            const subs: List<int> = listNew();
+            let j: int = 0;
+            while (j < nsub) {
+                let so: int = lo + u16(b, lo + 6 + j * 2);
+                let st: int = ltype;
+                if (st == 9 && u16(b, so) == 1) {
+                    st = u16(b, so + 2);
+                    so = so + u32(b, so + 4);
+                }
+                const fmt: int = u16(b, so);
+                if (st == 2 && (fmt == 1 || fmt == 2)) {
+                    listPush(subs, so);
+                }
+                j = j + 1;
+            }
+            if (listLen(subs) > 0) {
+                listPush(out, listLen(subs));
+                for (s in subs) {
+                    listPush(out, s);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// —— GSUB 标准连字 ——
+
+// 收集 ccmp、liga、rlig、clig 特性引用的查找（去重、按查找号升序），展开扩展查找，只留单替换
+//（类型 1）与连字替换（类型 4）的子表。
+function ligaLookups(b: Bytes, gsub: int): List<int> {
+    const out: List<int> = listNew();
+    if (gsub < 0) {
+        return out;
+    }
+    const fl: int = gsub + u16(b, gsub + 6);
+    const ll: int = gsub + u16(b, gsub + 8);
+    const want: List<bool> = listNew();
+    const nl: int = u16(b, ll);
+    let i: int = 0;
+    while (i < nl) {
+        listPush(want, false);
+        i = i + 1;
+    }
+    const nf: int = u16(b, fl);
+    i = 0;
+    while (i < nf) {
+        const t: int = u32(b, fl + 2 + i * 6);
+        if (t == tag("ccmp") || t == tag("liga") || t == tag("rlig") || t == tag("clig")) {
+            const fo: int = fl + u16(b, fl + 6 + i * 6);
+            const nidx: int = u16(b, fo + 2);
+            let j: int = 0;
+            while (j < nidx) {
+                const li: int = u16(b, fo + 4 + j * 2);
+                if (li < nl) {
+                    listSet(want, li, true);
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < nl) {
+        if (listTryGet(want, i) catch false) {
+            const lo: int = ll + u16(b, ll + 2 + i * 2);
+            const ltype: int = u16(b, lo);
+            const nsub: int = u16(b, lo + 4);
+            const subs: List<int> = listNew();
+            let j: int = 0;
+            while (j < nsub) {
+                let so: int = lo + u16(b, lo + 6 + j * 2);
+                let st: int = ltype;
+                if (st == 7 && u16(b, so) == 1) {
+                    st = u16(b, so + 2);
+                    so = so + u32(b, so + 4);
+                }
+                const fmt: int = u16(b, so);
+                if ((st == 1 && (fmt == 1 || fmt == 2)) || (st == 4 && fmt == 1)) {
+                    listPush(subs, st);
+                    listPush(subs, so);
+                }
+                j = j + 1;
+            }
+            if (listLen(subs) > 0) {
+                listPush(out, listLen(subs) / 2);
+                for (v in subs) {
+                    listPush(out, v);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// 单替换：命中得新字形号，否则 -1。
+export function singleSubst(f: Font, sub: int, g: int): int {
+    const b = f.data;
+    const ci: int = coverageIndex(b, sub + u16(b, sub + 2), g);
+    if (ci < 0) {
+        return -1;
+    }
+    if (u16(b, sub) == 1) {
+        return (g + u16(b, sub + 4)) & 65535;
+    }
+    if (ci >= u16(b, sub + 4)) {
+        return -1;
+    }
+    return u16(b, sub + 6 + ci * 2);
+}
+
+/// 连字替换：从 gids 的第 i 个起匹配（同一连字集里先列出的先试），命中得 [连字字形号, 分量数]，
+/// 否则得空表。
+export function ligatureSubst(f: Font, sub: int, gids: List<int>, i: int): List<int> {
+    const b = f.data;
+    const r: List<int> = listNew();
+    const ci: int = coverageIndex(b, sub + u16(b, sub + 2), listTryGet(gids, i) catch 0);
+    if (ci < 0 || ci >= u16(b, sub + 4)) {
+        return r;
+    }
+    const ls: int = sub + u16(b, sub + 6 + ci * 2);
+    const nlig: int = u16(b, ls);
+    let k: int = 0;
+    while (k < nlig) {
+        const lig: int = ls + u16(b, ls + 2 + k * 2);
+        const comps: int = u16(b, lig + 2);
+        if (comps >= 1 && i + comps <= listLen(gids)) {
+            let m: int = 1;
+            while (m < comps && (listTryGet(gids, i + m) catch -1) == u16(b, lig + 2 + m * 2)) {
+                m = m + 1;
+            }
+            if (m == comps) {
+                listPush(r, u16(b, lig));
+                listPush(r, comps);
+                return r;
+            }
+        }
+        k = k + 1;
+    }
+    return r;
+}
+
+function coverageIndex(b: Bytes, cov: int, g: int): int {
+    const fmt: int = u16(b, cov);
+    const n: int = u16(b, cov + 2);
+    let lo: int = 0;
+    let hi: int = n - 1;
+    if (fmt == 1) {
+        while (lo <= hi) {
+            const mid: int = (lo + hi) / 2;
+            const v: int = u16(b, cov + 4 + mid * 2);
+            if (g < v) {
+                hi = mid - 1;
+            } else if (g > v) {
+                lo = mid + 1;
+            } else {
+                return mid;
+            }
+        }
+        return -1;
+    }
+    if (fmt == 2) {
+        while (lo <= hi) {
+            const mid: int = (lo + hi) / 2;
+            const r: int = cov + 4 + mid * 6;
+            if (g < u16(b, r)) {
+                hi = mid - 1;
+            } else if (g > u16(b, r + 2)) {
+                lo = mid + 1;
+            } else {
+                return u16(b, r + 4) + g - u16(b, r);
+            }
+        }
+    }
+    return -1;
+}
+
+function classOf(b: Bytes, cd: int, g: int): int {
+    const fmt: int = u16(b, cd);
+    if (fmt == 1) {
+        const start: int = u16(b, cd + 2);
+        const n: int = u16(b, cd + 4);
+        if (g >= start && g < start + n) {
+            return u16(b, cd + 6 + (g - start) * 2);
+        }
+        return 0;
+    }
+    if (fmt == 2) {
+        let lo: int = 0;
+        let hi: int = u16(b, cd + 2) - 1;
+        while (lo <= hi) {
+            const mid: int = (lo + hi) / 2;
+            const r: int = cd + 4 + mid * 6;
+            if (g < u16(b, r)) {
+                hi = mid - 1;
+            } else if (g > u16(b, r + 2)) {
+                lo = mid + 1;
+            } else {
+                return u16(b, r + 4);
+            }
+        }
+    }
+    return 0;
+}
+
+function valueSize(vf: int): int {
+    let n: int = 0;
+    let bit: int = 1;
+    while (bit <= 128) {
+        if ((vf & bit) != 0) {
+            n = n + 2;
+        }
+        bit = bit * 2;
+    }
+    return n;
+}
+
+// 读 ValueRecord 的一个字段（bit 为 1 XPlacement、4 XAdvance），没有该字段得 0。
+function valueField(b: Bytes, rec: int, vf: int, bit: int): int {
+    if ((vf & bit) == 0) {
+        return 0;
+    }
+    let off: int = 0;
+    let k: int = 1;
+    while (k < bit) {
+        if ((vf & k) != 0) {
+            off = off + 2;
+        }
+        k = k * 2;
+    }
+    return i16(b, rec + off);
+}
+
+/// 一对字形在一个 PairPos 子表里的调整。命中得 [第一字形 XPlacement, 第一字形 XAdvance,
+/// 第二字形 XPlacement, 第二字形 XAdvance, 第二字形是否有值记录（1/0）]，未命中得空表。
+export function pairAdjust(f: Font, sub: int, g1: int, g2: int): List<int> {
+    const b = f.data;
+    const r: List<int> = listNew();
+    const ci: int = coverageIndex(b, sub + u16(b, sub + 2), g1);
+    if (ci < 0) {
+        return r;
+    }
+    const vf1: int = u16(b, sub + 4);
+    const vf2: int = u16(b, sub + 6);
+    const s1: int = valueSize(vf1);
+    const s2: int = valueSize(vf2);
+    let rec1: int = -1;
+    if (u16(b, sub) == 1) {
+        if (ci >= u16(b, sub + 8)) {
+            return r;
+        }
+        const ps: int = sub + u16(b, sub + 10 + ci * 2);
+        const step: int = 2 + s1 + s2;
+        let lo: int = 0;
+        let hi: int = u16(b, ps) - 1;
+        while (lo <= hi) {
+            const mid: int = (lo + hi) / 2;
+            const at: int = ps + 2 + mid * step;
+            const v: int = u16(b, at);
+            if (g2 < v) {
+                hi = mid - 1;
+            } else if (g2 > v) {
+                lo = mid + 1;
+            } else {
+                rec1 = at + 2;
+                lo = hi + 1;
+            }
+        }
+    } else {
+        const c1: int = classOf(b, sub + u16(b, sub + 8), g1);
+        const c2: int = classOf(b, sub + u16(b, sub + 10), g2);
+        const n1: int = u16(b, sub + 12);
+        const n2: int = u16(b, sub + 14);
+        if (c1 >= n1 || c2 >= n2) {
+            return r;
+        }
+        rec1 = sub + 16 + (c1 * n2 + c2) * (s1 + s2);
+    }
+    if (rec1 < 0) {
+        return r;
+    }
+    const rec2: int = rec1 + s1;
+    listPush(r, valueField(b, rec1, vf1, 1));
+    listPush(r, valueField(b, rec1, vf1, 4));
+    listPush(r, valueField(b, rec2, vf2, 1));
+    listPush(r, valueField(b, rec2, vf2, 4));
+    let has2: int = 0;
+    if (vf2 != 0) {
+        has2 = 1;
+    }
+    listPush(r, has2);
+    return r;
+}

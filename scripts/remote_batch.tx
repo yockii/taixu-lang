@@ -1,0 +1,347 @@
+// 在测试机上批量运行产物。语料运行器 scripts/test_nrt_products.tx 在本宿主跑不了
+// 产物时用它：macOS 产物送 macOS 测试机，aarch64-windows 产物送 Windows ARM64 测试机。
+//
+// 一批：用给定的编译器把执行器 scripts/remote_exec.tx 交叉编成测试机的目标；产物（各放一个子目录、保留文件名，程序可按名字认出
+// 自己）、执行器、清单与用例目录树（trees/<名字>，产物在其中运行——同本地在用例目录里运行，夹具按相对路径找到）打成一个 tar；
+// scp 送到测试机的家目录，ssh 在新建的临时目录里解开、运行执行器（逐项带时限），结果（退出码、stdout、stderr 的十六进制）经标准
+// 输出取回；结束后临时目录移入废纸篓（macOS，不做不可恢复的删除）或删掉（Windows，本批自己建的目录）。测试机上不需要解释器。
+//
+// 主机写法：macOS 为 ssh 主机名；Windows ARM64 为 ssh 的实参串（按空白切分，接在 `ssh -o BatchMode=yes` 之后；scp 用同一串，端口 -p
+// 换成 -P），例如经跳板机连到虚拟机：-J <跳板机> -p <端口> -i <密钥> -o StrictHostKeyChecking=accept-new <用户>@<地址>。
+// 测试机须能免交互登录；macOS 用自带的 tar（bsdtar），Windows 用自带的 tar.exe（Windows 10 1803 起）与 OpenSSH 服务端的缺省外壳 cmd。
+import { baseOf, findInPath, join, mkdirs, nat, onWindows, readBytes } from "./build_lib";
+import { Raw, captureRaw } from "./test_lib";
+import { escField, hexBytes, unhex } from "./remote_exec";
+
+const DRAIN_NS: int = 10000000000;
+const MAX_OUTPUT: int = 1073741824;
+const SSH_NS: int = 1800000000000;
+
+export struct RemoteItem {
+    key: string,
+    exe: string,
+    argv: List<string>,
+    tree: string,
+}
+
+// ---- tar（ustar；名字超过 100 字节的经 pax 扩展头写 path）----
+
+function putText(h: Bytes, at: int, s: string): void {
+    const b = bytesFromStr(s);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        bytesSet(h, at + i, bytesGet(b, i) ?? 0);
+        i = i + 1;
+    }
+}
+
+// width 字节的八进制字段：width−1 位数字加 NUL。
+function octalField(v: int, width: int): string {
+    let s = "";
+    let x = v;
+    while (len(s) < width - 1) {
+        s = toStr(x & 7) + s;
+        x = x >> 3;
+    }
+    return s;
+}
+
+function header(name: string, size: int, mode: int, typ: int): Bytes {
+    const h = bytesNew(512);
+    putText(h, 0, name);
+    putText(h, 100, octalField(mode, 8));
+    putText(h, 108, octalField(0, 8));
+    putText(h, 116, octalField(0, 8));
+    putText(h, 124, octalField(size, 12));
+    putText(h, 136, octalField(0, 12));
+    bytesSet(h, 156, typ);
+    putText(h, 257, "ustar");
+    putText(h, 263, "00");
+    // 校验和：校验和字段按 8 个空格计，所有字节相加，写 6 位八进制、NUL、空格。
+    putText(h, 148, "        ");
+    let sum = 0;
+    let i = 0;
+    while (i < 512) {
+        sum = sum + (bytesGet(h, i) ?? 0);
+        i = i + 1;
+    }
+    putText(h, 148, octalField(sum, 7));
+    bytesSet(h, 154, 0);
+    bytesSet(h, 155, 32);
+    return h;
+}
+
+function pad(out: Bytes, n: int): void {
+    let k = n % 512;
+    if (k == 0) {
+        return;
+    }
+    while (k < 512) {
+        bytesPush(out, 0);
+        k = k + 1;
+    }
+}
+
+function addEntry(out: Bytes, name: string, data: Bytes, mode: int, typ: int): void {
+    if (len(name) > 100) {
+        // pax 记录：“<总长> path=<名字>\n”，总长连同它自己的位数。
+        const body = " path=" + name + "\n";
+        let n = len(body) + 1;
+        while (len(toStr(n)) + len(body) != n) {
+            n = n + 1;
+        }
+        const rec = bytesFromStr(toStr(n) + body);
+        bytesAppend(out, header("PaxHeader/entry", bytesLen(rec), 420, 120));
+        bytesAppend(out, rec);
+        pad(out, bytesLen(rec));
+        bytesAppend(out, header(shortName(name), bytesLen(data), mode, typ));
+    } else {
+        bytesAppend(out, header(name, bytesLen(data), mode, typ));
+    }
+    bytesAppend(out, data);
+    pad(out, bytesLen(data));
+}
+
+// 名字的末 100 字节以内、从组件边界起的部分（只作扩展头之后的回退名）。
+function shortName(name: string): string {
+    const b = bytesFromStr(name);
+    let from = bytesLen(b) - 100;
+    while (from < bytesLen(b) && ((bytesGet(b, from) ?? 0) & 0xC0) == 0x80) {
+        from = from + 1;
+    }
+    return bytesToStr(bytesSlice(b, from, bytesLen(b) - from)) catch "entry";
+}
+
+// 目录树整棵进 tar（目录 0755，文件 0644；不跟随链接）。
+function addTree(out: Bytes, dir: string, arc: string): void {
+    addEntry(out, arc + "/", bytesNew(0), 493, 53);
+    const names = localListDir(nat(dir), "") catch noNames();
+    for (n in names) {
+        const k = localEntryKind(nat(dir), n);
+        if (k == 2) {
+            addTree(out, join(dir, n), arc + "/" + n);
+        } else if (k == 1) {
+            const data = readBytes(join(dir, n)) catch bytesNew(0);
+            addEntry(out, arc + "/" + n, data, 420, 48);
+        }
+    }
+}
+
+function noNames(): List<string> {
+    const xs: List<string> = listNew();
+    return xs;
+}
+
+// ---- ssh／scp ----
+
+// 按空白切分（单双引号内的空白不切）。
+function words(s: string): List<string> {
+    const out: List<string> = listNew();
+    let cur = bytesNew(0);
+    let quote = 0;
+    let any = false;
+    const b = bytesFromStr(s);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) ?? 0;
+        if (quote != 0) {
+            if (c == quote) {
+                quote = 0;
+            } else {
+                bytesPush(cur, c);
+            }
+        } else if (c == 39 || c == 34) {
+            quote = c;
+            any = true;
+        } else if (c == 32 || c == 9) {
+            if (any) {
+                listPush(out, bytesToStr(cur) catch "");
+                cur = bytesNew(0);
+                any = false;
+            }
+        } else {
+            bytesPush(cur, c);
+            any = true;
+        }
+        i = i + 1;
+    }
+    if (any) {
+        listPush(out, bytesToStr(cur) catch "");
+    }
+    return out;
+}
+
+function sshBase(): List<string> {
+    const a: List<string> = listNew();
+    listPush(a, "-o");
+    listPush(a, "BatchMode=yes");
+    listPush(a, "-o");
+    listPush(a, "ConnectTimeout=15");
+    return a;
+}
+
+function tool(name: string): string | Error {
+    const p = findInPath(name);
+    if (len(p) == 0) {
+        return err("PATH 里没有 " + name);
+    }
+    return p;
+}
+
+function tailText(b: Bytes, n: int): string {
+    let from = bytesLen(b) - n;
+    if (from < 0) {
+        from = 0;
+    }
+    while (from < bytesLen(b) && ((bytesGet(b, from) ?? 0) & 0xC0) == 0x80) {
+        from = from + 1;
+    }
+    return bytesToStr(bytesSlice(b, from, bytesLen(b) - from)) catch "";
+}
+
+// 在测试机上运行一批。kind 为 macos 或 windows；target 为产物的目标（执行器按它交叉构建）。
+// 得 {键: 结果}；缺的键表示这一批中途断了（调用方记 REMOTE_MISSING）。
+export function remoteBatch(compiler: string, root: string, kind: string, target: string, host: string, items: List<RemoteItem>,
+    trees: Map<string, string>, work: string, envName: string, envValue: string, limitNs: int): Map<string, Ref<Raw>> | Error {
+    const win = kind == "windows";
+    // 1. 执行器。
+    const execDir = join(work, "remote-exec");
+    const ba: List<string> = listNew();
+    listPush(ba, "build");
+    listPush(ba, "--toolchain");
+    listPush(ba, nat(join(root, "scripts/remote_exec.tx")));
+    listPush(ba, "--target=" + target);
+    listPush(ba, "--out");
+    listPush(ba, nat(execDir));
+    const built = captureRaw(nat(compiler), ba, nat(root), SSH_NS, DRAIN_NS, MAX_OUTPUT)?;
+    let execName = "remote_exec";
+    if (win) {
+        execName = "remote_exec.exe";
+    }
+    if (built.code != 0) {
+        return err("编不出远端执行器：" + tailText(built.err, 600));
+    }
+    // 2. tar：用例目录树、产物、执行器、清单。
+    const tar = bytesNew(0);
+    for (t in mapKeys(trees)) {
+        addTree(tar, mapGet(trees, t) ?? "", "trees/" + t);
+    }
+    let manifest = "E\t" + escField(envName) + "\t" + escField(envValue) + "\n";
+    const secs = limitNs / 1000000000;
+    let n = 0;
+    for (it in items) {
+        let num = toStr(n);
+        while (len(num) < 4) {
+            num = "0" + num;
+        }
+        const name = "p" + num + "/" + baseOf(it.exe);
+        addEntry(tar, name, readBytes(it.exe)?, 493, 48);
+        manifest = manifest + "I\t" + escField(it.key) + "\t" + escField(name) + "\t" + escField(it.tree) + "\t" + toStr(secs);
+        for (a in it.argv) {
+            manifest = manifest + "\t" + escField(a);
+        }
+        manifest = manifest + "\n";
+        n = n + 1;
+    }
+    addEntry(tar, execName, readBytes(join(execDir, execName))?, 493, 48);
+    addEntry(tar, "manifest.txt", bytesFromStr(manifest), 420, 48);
+    bytesAppend(tar, bytesNew(1024));
+    const stamp = toStr(monoNs());
+    const tarName = "taixu-remote-" + stamp + ".tar";
+    writeFileBytes(join(work, tarName), tar)?;
+    // 3. scp 送到测试机的家目录（scp 以工作目录运行、给相对名，免得 Windows 盘符被当成主机名）。
+    const ws = words(host);
+    if (listLen(ws) == 0) {
+        return err("没有测试机");
+    }
+    const dest = listGet(ws, listLen(ws) - 1) catch "";
+    const scpArgs = sshBase();
+    let i = 0;
+    while (i < listLen(ws) - 1) {
+        const w = listGet(ws, i) catch "";
+        if (w == "-p") {
+            listPush(scpArgs, "-P");
+        } else {
+            listPush(scpArgs, w);
+        }
+        i = i + 1;
+    }
+    listPush(scpArgs, "-q");
+    listPush(scpArgs, tarName);
+    listPush(scpArgs, dest + ":" + tarName);
+    const sent = captureRaw(nat(tool("scp")?), scpArgs, nat(work), SSH_NS, DRAIN_NS, MAX_OUTPUT)?;
+    removeFile(join(work, tarName)) catch (e) {
+        eprint("删不掉本地的 " + tarName + "：" + e.message);
+    };
+    if (sent.code != 0) {
+        return err("scp 失败（退出码 " + toStr(sent.code) + "）：" + tailText(sent.err, 600));
+    }
+    // 4. ssh：解开、运行执行器、收拾临时目录。
+    let cmd = "";
+    if (win) {
+        const d = "%TEMP%\\taixu-remote-" + stamp;
+        const t = "%USERPROFILE%\\" + tarName;
+        cmd = "mkdir \"" + d + "\" && tar -x -f \"" + t + "\" -C \"" + d + "\" && del \"" + t + "\" && \"" + d + "\\" + execName + "\" \""
+        + d + "\" & rmdir /s /q \"" + d + "\"";
+    } else {
+        cmd = "d=$(mktemp -d /tmp/taixu-remote.XXXXXX) && tar -x -C \"$d\" -f \"$HOME/" + tarName + "\" && rm -f \"$HOME/" + tarName
+        + "\" && \"$d/" + execName + "\" \"$d\"; rc=$?; cd /; mv \"$d\" ~/.Trash/ 2>/dev/null || true; exit $rc";
+    }
+    const sshArgs = sshBase();
+    for (w in ws) {
+        listPush(sshArgs, w);
+    }
+    listPush(sshArgs, cmd);
+    let wait = limitNs * listLen(items) + 600000000000;
+    if (wait < SSH_NS) {
+        wait = SSH_NS;
+    }
+    const ran = captureRaw(nat(tool("ssh")?), sshArgs, nat(work), wait, DRAIN_NS, MAX_OUTPUT)?;
+    // 5. 结果行：R <键> <退出码> <stdout> <stderr>（后三者十六进制）。
+    const results: Map<string, Ref<Raw>> = mapNew();
+    const text = bytesToStr(ran.out) catch "";
+    for (line in strSplit(text, "\n")) {
+        const xs = strSplit(stripCr(line), "\t");
+        if (listLen(xs) < 5 || (listGet(xs, 0) catch "") != "R") {
+            continue;
+        }
+        const key = bytesToStr(unhex(listGet(xs, 1) catch "")) catch "";
+        const code = signedInt(listGet(xs, 2) catch "");
+        const out = unhex(listGet(xs, 3) catch "");
+        const errb = unhex(listGet(xs, 4) catch "");
+        mapSet(results, key, new Raw { code: code, out: out, err: errb, timedOut: false });
+    }
+    if (ran.code != 0 && mapLen(results) < listLen(items)) {
+        return err("测试机上的一批中途失败（退出码 " + toStr(ran.code) + "）：" + tailText(ran.err, 600));
+    }
+    return results;
+}
+
+function stripCr(s: string): string {
+    if (len(s) > 0 && (byteAt(s, len(s) - 1) ?? 0) == 13) {
+        return bytesToStr(bytesSlice(bytesFromStr(s), 0, len(s) - 1)) catch s;
+    }
+    return s;
+}
+
+function signedInt(s: string): int {
+    let i = 0;
+    let neg = false;
+    if (len(s) > 0 && (byteAt(s, 0) ?? 0) == 45) {
+        neg = true;
+        i = 1;
+    }
+    let v = 0;
+    while (i < len(s)) {
+        const c = byteAt(s, i) ?? 0;
+        if (c < 48 || c > 57) {
+            break;
+        }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    if (neg) {
+        return 0 - v;
+    }
+    return v;
+}

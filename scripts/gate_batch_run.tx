@@ -1,0 +1,171 @@
+// 固定快照的多宿主批次。只共享成功见证相同的交叉构建；失败尝试保留，里程碑各宿主仍完整执行。
+import { absolute, byteSub, finishRunDir, freshRunDir, join, list1, mkdirs, nat, parseDigits, plus, readBytes, startsWith } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { GateResult, GateTask, gatePool } from "./gate_pool";
+import { BatchHost, BatchSpec, RECEIPT, choose, checkReceipt, contains, crossTargets, field, nativeSteps, parseSpec, shareKey, stringArray, txt } from "./gate_batch_model";
+import { Jv, jArray, jDump, jNull, jNumber, jObject, jParseUnique, jPretty, jPush, jSet, jString } from "./test_json";
+import { linesOf } from "./test_lib";
+
+const STAGE_NS: int = 21600000000000;
+const DRAIN_NS: int = 30000000000;
+
+struct State {
+    spec: Ref<BatchSpec>, work: string, runId: string, report: Ref<Jv>, attempts: Ref<Jv>, coverage: Ref<Jv>,
+    receipts: List<Ref<Jv>>, passed: List<bool>, failed: int,
+}
+struct Parsed { value: Ref<Jv>, error: string, }
+struct Captured { value: Ref<Jv>, }
+function emptyHost(): BatchHost { return BatchHost { id: "", target: "", resource: "", exe: "", args: listNew(), cwd: "", work: "" }; }
+function comma(xs: List<string>): string { let s = ""; for (x in xs) { if (len(s) > 0) { s = s + ","; } s = s + x; } return choose(len(s) > 0, s, "none"); }
+function save(s: Ref<State>): void {
+    jSet(s.report, "failed_attempts", jNumber(s.failed));
+    writeFile(join(s.work, "report.json"), jPretty(s.report, 2) + "\n") catch (e) { panic(e.message); };
+}
+
+function task(s: Ref<State>, h: BatchHost, phase: string, requested: List<string>, witness: bool, deps: List<string>): GateTask {
+    const a: List<string> = listNew(); for (x in h.args) { listPush(a, x); }
+    for (x in ["--phase", phase, "--work", join(h.work, s.runId), "--run-id", s.runId, "--host", h.target,
+            "--steps", comma(requested), "--witness", choose(witness, "on", "off")]) { listPush(a, x); }
+    return GateTask { name: h.id + "-" + phase, exe: h.exe, args: a, cwd: h.cwd, deps: deps, exclusive: false };
+}
+
+function receipt(log: Bytes): Ref<Jv> | Error {
+    const marker = bytesFromStr(RECEIPT); const size = bytesLen(log); const width = bytesLen(marker);
+    let start = -1; let i = 0;
+    while (i + width <= size) {
+        if ((i == 0 || (bytesGet(log, i - 1) ?? 0) == 10) && (bytesGet(log, i) ?? 0) == 84) {
+            let equal = true; let k = 0;
+            while (k < width) { if ((bytesGet(log, i + k) ?? 0) != (bytesGet(marker, k) ?? 1)) { equal = false; break; } k = k + 1; }
+            if (equal) { start = i + width; }
+        }
+        i = i + 1;
+    }
+    if (start < 0) { return err("缺少阶段收据"); }
+    let end = start;
+    while (end < size && (bytesGet(log, end) ?? 0) != 10) { end = end + 1; }
+    if (end > start && (bytesGet(log, end - 1) ?? 0) == 13) { end = end - 1; }
+    if (end == start || end - start > 2097152) { return err("空或超长的阶段收据"); }
+    return jParseUnique(bytesSlice(log, start, end - start));
+}
+function parsed(log: Bytes): Ref<Parsed> {
+    const v = receipt(log) catch (e) { return new Parsed { value: jNull(), error: e.message }; };
+    return new Parsed { value: v, error: "" };
+}
+
+function completed(s: Ref<State>, idx: int, phase: string, requested: List<string>, witness: bool, result: Ref<GateResult>): Ref<Jv> {
+    const h = listGet(s.spec.hosts, idx) ?? emptyHost();
+    const row = jObject(); jSet(row, "host", jString(h.id)); jSet(row, "phase", jString(phase));
+    jSet(row, "exit", jNumber(result.code)); jSet(row, "elapsed_ms", jNumber(result.elapsedMs));
+    jSet(row, "log", jString(join(s.work, h.id + "-" + phase + ".log")));
+    const p = parsed(result.log);
+    let error = p.error;
+    const v = p.value;
+    if (len(error) == 0) { checkReceipt(v, h, phase, s.runId, requested, result.code, witness) catch (e) { error = e.message; }; }
+    if (len(error) == 0 && (phase == "cross" || phase == "shared-cross")) {
+        const n = listGet(s.receipts, idx) ?? jNull();
+        if (txt(n, "input_id") != txt(v, "input_id") || txt(n, "compiler_sha256") != txt(v, "compiler_sha256")) { error = "交叉阶段与 native 输入／编译器身份不符"; }
+    }
+    jSet(row, "receipt", v);
+    jSet(row, "status", jString(choose(len(error) == 0, "PASS", "FAIL")));
+    if (len(error) > 0) { s.failed = s.failed + 1; jSet(row, "error", jString(error)); }
+    jPush(s.attempts, row); save(s);
+    print("END_BATCH " + h.id + " " + phase + " " + choose(len(error) == 0, "PASS", "FAIL " + error));
+    if (len(error) == 0) { return v; } return jNull();
+}
+
+function native(s: Ref<State>, width: int): void {
+    const tasks: List<GateTask> = listNew();
+    const previous: Map<string, string> = mapNew();
+    const requested = nativeSteps(s.spec);
+    const phase = choose(s.spec.mode == "milestone", "full", "native");
+    for (h in s.spec.hosts) {
+        const deps: List<string> = listNew(); const prev = mapGet(previous, h.resource);
+        if (prev != None) { listPush(deps, prev ?? ""); }
+        const t = task(s, h, phase, requested, s.spec.dedup, deps); listPush(tasks, t); mapSet(previous, h.resource, t.name);
+        listPush(s.receipts, jNull()); listPush(s.passed, false);
+    }
+    gatePool(tasks, width, s.work, listNew(), STAGE_NS, DRAIN_NS, (name: string, r: Ref<GateResult>): void => {
+            let i = 0;
+            while (i < listLen(tasks)) {
+                const t = listGet(tasks, i) ?? GateTask { name: "", exe: "", args: listNew(), cwd: "", deps: listNew(), exclusive: false };
+                if (t.name == name) {
+                    const v = completed(s, i, phase, requested, s.spec.dedup, r);
+                    listSet(s.receipts, i, v); listSet(s.passed, i, txt(v, "status") == "PASS");
+                    return;
+                }
+                i = i + 1;
+            }
+        });
+}
+
+function cross(s: Ref<State>, idx: int, shared: bool): Ref<Jv> {
+    const h = listGet(s.spec.hosts, idx) ?? emptyHost();
+    const phase = choose(shared, "shared-cross", "cross");
+    const requested: List<string> = listNew(); listPush(requested, "cross-products");
+    const tasks: List<GateTask> = listNew(); listPush(tasks, task(s, h, phase, requested, false, listNew()));
+    const result = new Captured { value: jNull() };
+    gatePool(tasks, 1, s.work, listNew(), STAGE_NS, DRAIN_NS, (name: string, r: Ref<GateResult>): void => { result.value = completed(s, idx, phase, requested, false, r); });
+    return result.value;
+}
+
+function covered(s: Ref<State>, idx: int, provider: string, state: string): void {
+    const h = listGet(s.spec.hosts, idx) ?? emptyHost();
+    const row = jObject(); jSet(row, "state", jString(state)); jSet(row, "provider", jString(provider));
+    jSet(row, "required_targets", stringArray(crossTargets(h.target, false)));
+    const actual: List<string> = listNew();
+    if (len(provider) > 0) { for (target in crossTargets(h.target, false)) { listPush(actual, target); } }
+    jSet(row, "targets", stringArray(actual));
+    const n = listGet(s.receipts, idx) ?? jNull();
+    jSet(row, "input_id", field(n, "input_id")); jSet(row, "witness_sha256", field(n, "witness_sha256"));
+    jSet(s.coverage, h.id, row); save(s);
+}
+
+function crosses(s: Ref<State>): void {
+    if (s.spec.mode == "milestone" || !contains(s.spec.steps, "cross-products")) { return; }
+    const visited: List<int> = listNew();
+    for (h in s.spec.hosts) { listPush(visited, 0); }
+    let i = 0;
+    while (i < listLen(s.spec.hosts)) {
+        if ((listGet(visited, i) ?? 1) != 0) { i = i + 1; continue; }
+        if (!(listGet(s.passed, i) ?? false)) { listSet(visited, i, 1); covered(s, i, "", "not-run-native-failed"); i = i + 1; continue; }
+        const members: List<int> = listNew();
+        const key = shareKey(listGet(s.receipts, i) ?? jNull());
+        let j = i;
+        while (j < listLen(s.spec.hosts)) {
+            if ((listGet(visited, j) ?? 1) == 0 && (listGet(s.passed, j) ?? false)
+                && (j == i || (s.spec.dedup && len(key) > 0 && key == shareKey(listGet(s.receipts, j) ?? jNull())))) {
+                listPush(members, j); listSet(visited, j, 1);
+            }
+            j = j + 1;
+        }
+        const shared = listLen(members) > 1;
+        let provider = "";
+        for (idx in members) {
+            const v = cross(s, idx, shared);
+            if (txt(v, "status") == "PASS") { provider = (listGet(s.spec.hosts, idx) ?? emptyHost()).id; break; }
+        }
+        for (idx in members) { covered(s, idx, provider, choose(len(provider) == 0, "uncovered", choose(shared, "shared-build-only", "executed-build-only"))); }
+        i = i + 1;
+    }
+}
+
+export function runBatch(spec: Ref<BatchSpec>, work: string, runId: string, width: int): int {
+    const report = jObject(); const attempts = jArray(); const coverage = jObject();
+    jSet(report, "schema", jString("gate-batch-report/1")); jSet(report, "mode", jString(spec.mode));
+    jSet(report, "run_id", jString(runId)); jSet(report, "status", jString("RUNNING"));
+    jSet(report, "requested", stringArray(spec.steps)); jSet(report, "attempts", attempts); jSet(report, "cross_coverage", coverage);
+    const s = new State { spec: spec, work: work, runId: runId, report: report, attempts: attempts, coverage: coverage, receipts: listNew(), passed: listNew(), failed: 0 };
+    save(s); native(s, width); crosses(s);
+    // 里程碑须是同一快照：各宿主的输入身份必须两两相同，否则即使各自完整门都过也判 FAIL。
+    if (spec.mode == "milestone") {
+        let first = ""; let i = 0;
+        while (i < listLen(s.receipts)) {
+            const id = txt(listGet(s.receipts, i) ?? jNull(), "input_id");
+            if (len(first) == 0) { first = id; } else if (id != first) { s.failed = s.failed + 1; jSet(report, "input_mismatch", jString("milestone hosts tested different inputs")); }
+            i = i + 1;
+        }
+    }
+    jSet(report, "status", jString(choose(s.failed == 0, "PASS", "FAIL"))); save(s);
+    print("STATUS " + txt(report, "status") + " " + spec.mode + " report " + join(work, "report.json"));
+    if (s.failed == 0) { return 0; } return 1;
+}

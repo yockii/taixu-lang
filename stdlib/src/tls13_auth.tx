@@ -1,0 +1,94 @@
+import { Tls13Client, tls13Fail } from "./tls13_state";
+import { tls13Cursor, tls13Read, tls13Take, tls13Vector, tls13End, tls13Extensions } from "./tls13_wire";
+import { x509VerifyServer } from "./x509_verify";
+import { x509ParseCertificate } from "./x509";
+import { x509TlsRsaPublicKey, x509P256PublicKey } from "./x509_keys";
+import { rsaPssSha256Verify } from "./crypto/rsa";
+import { ecdsaP256Sha256Verify } from "./crypto/ecdsa_p256";
+import { parseIp } from "./ip";
+import { sha256Sum } from "./hash";
+import { derRead, derBitString } from "./crypto/der";
+
+export function tls13EncryptedExtensions(state: Ref<Tls13Client>, body: Bytes): void | Error {
+    const cursor = tls13Cursor(body); const extensions = tls13Extensions(tls13Vector(cursor, 2)?)?; tls13End(cursor)?;
+    for (extension in extensions) {
+        const value = tls13Cursor(extension.data);
+        if (extension.kind == 0) {
+            if (bytesLen(parseIp(state.host) catch bytesNew(0)) > 0) { return err("tls13: unsolicited server_name acknowledgement"); }
+        } else if (extension.kind == 16) {
+            const protocols = tls13Cursor(tls13Vector(value, 2)?);
+            if (!bytesEqual(tls13Vector(protocols, 1)?, bytesFromStr("http/1.1"))) { return err("tls13: unoffered ALPN protocol"); } tls13End(protocols)?;
+        } else if (extension.kind == 10) {
+            const groups = tls13Cursor(tls13Vector(value, 2)?); const seen: Map<int, bool> = mapNew();
+            if (bytesLen(groups.data) == 0) { return err("tls13: empty server supported_groups"); }
+            while (groups.offset < bytesLen(groups.data)) {
+                const group = tls13Read(groups, 2)?; if (mapHas(seen, group)) { return err("tls13: duplicate server group"); } mapSet(seen, group, true);
+            }
+        } else { return err("tls13: unexpected EncryptedExtensions extension"); }
+        tls13End(value)?;
+    }
+    return done();
+}
+
+export function tls13CertificateRequest(body: Bytes): void | Error {
+    const cursor = tls13Cursor(body);
+    if (bytesLen(tls13Vector(cursor, 1)?) != 0) { return err("tls13: initial certificate request context must be empty"); }
+    const extensions = tls13Extensions(tls13Vector(cursor, 2)?)?; tls13End(cursor)?; let signatures = false;
+    for (extension in extensions) {
+        if (extension.kind == 13 || extension.kind == 50) {
+            const value = tls13Cursor(extension.data); const algorithms = tls13Vector(value, 2)?; tls13End(value)?;
+            if (bytesLen(algorithms) == 0 || bytesLen(algorithms) % 2 != 0) { return err("tls13: invalid requested signature algorithms"); }
+            if (extension.kind == 13) { signatures = true; }
+        }
+        // 未识别的 CertificateRequest 扩展按 RFC 8446 忽略；客户端响应空证书集合。
+    }
+    if (!signatures) { return err("tls13: missing CertificateRequest signature_algorithms"); } return done();
+}
+
+export function tls13ServerCertificate(state: Ref<Tls13Client>, body: Bytes): void | Error {
+    const cursor = tls13Cursor(body);
+    if (bytesLen(tls13Vector(cursor, 1)?) != 0) { return err("tls13: server certificate context must be empty"); }
+    const entries = tls13Cursor(tls13Vector(cursor, 3)?); tls13End(cursor)?; const chain: List<Bytes> = listNew();
+    while (entries.offset < bytesLen(entries.data)) {
+        if (listLen(chain) >= 16) { return err("tls13: certificate count limit"); }
+        const cert = tls13Vector(entries, 3)?;
+        if (bytesLen(cert) == 0 || bytesLen(cert) > 1048576) { return err("tls13: invalid certificate length"); }
+        const extensions = tls13Extensions(tls13Vector(entries, 2)?)?;
+        if (listLen(extensions) != 0) { return err("tls13: unsolicited certificate extension"); } listPush(chain, cert);
+    }
+    if (listLen(chain) == 0) { return err("tls13: server supplied no certificate"); }
+    x509VerifyServer(chain, state.host, state.nowSecs, state.roots)?;
+    const leaf = x509ParseCertificate(listGet(chain, 0))?;
+    for (extension in leaf.extensions) {
+        if (extension.oidHex != "551d0f") { continue; }
+        const data = extension.value; const value = derRead(data, 0, bytesLen(data))?;
+        if (value.end != bytesLen(data)) { return err("tls13: trailing KeyUsage bytes"); }
+        const bits = derBitString(data, value)?;
+        if (bytesLen(bits.data) == 0 || ((bytesGet(bits.data, 0) catch 0) & 128) == 0) { return err("tls13: leaf KeyUsage excludes digitalSignature"); }
+    }
+    state.certificate = leaf; return done();
+}
+
+export function tls13ServerCertificateVerify(state: Ref<Tls13Client>, body: Bytes): void | Error {
+    const cursor = tls13Cursor(body); const algorithm = tls13Read(cursor, 2)?; const signature = tls13Vector(cursor, 2)?; tls13End(cursor)?;
+    const cert = state.certificate; if (cert == None) { return tls13Fail(state, "CertificateVerify before certificate"); }
+    const signed = bytesNew(64); let i = 0; while (i < 64) { bytesSet(signed, i, 32); i = i + 1; }
+    bytesAppend(signed, bytesFromStr("TLS 1.3, server CertificateVerify")); listPush(bytesAsList(signed), 0 as u8); bytesAppend(signed, sha256Sum(state.transcript));
+    let verified = false;
+    if (algorithm == 2052) { verified = rsaPssSha256Verify(x509TlsRsaPublicKey(cert)?, signed, signature); }
+    else if (algorithm == 1027) { verified = ecdsaP256Sha256Verify(x509P256PublicKey(cert)?, signed, signature)?; }
+    else { return err("tls13: unoffered CertificateVerify algorithm"); }
+    if (!verified) { return err("tls13: invalid CertificateVerify signature"); } return done();
+}
+
+export function tls13NewSessionTicket(body: Bytes): void | Error {
+    const cursor = tls13Cursor(body); tls13Read(cursor, 4)?; tls13Read(cursor, 4)?; tls13Vector(cursor, 1)?;
+    if (bytesLen(tls13Vector(cursor, 2)?) == 0) { return err("tls13: empty session ticket"); }
+    const extensions = tls13Extensions(tls13Vector(cursor, 2)?)?; tls13End(cursor)?;
+    for (extension in extensions) {
+        if (extension.kind == 42) { const value = tls13Cursor(extension.data); tls13Read(value, 4)?; tls13End(value)?; }
+    }
+    return done();
+}
+
+function done(): void {}

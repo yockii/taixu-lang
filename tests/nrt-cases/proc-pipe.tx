@@ -1,6 +1,7 @@
 // 工具链进程与标准输入内建（仅 --toolchain，伴文件 proc-pipe.toolchain）。程序以子模式启动
 // 自身，核对：回声往返与分段读、stdinRead 超时、stdoutWrite 不补换行、大载荷同时排干 stdout 与 stderr（不死锁、
-// 两路分离）、选中的流都已读完时 ioWait 立即返回、超时等待与 kill、stdin 接空设备时读到 EOF、程序不存在、
+// 两路分离）、选中的流都已读完时 ioWait 立即返回、超时等待与 kill、stdin 接空设备时读到 EOF、procCloseStream 关 stdin 后子进程
+// 读到 EOF 而 stdout 照读、关 stdout 读端后子进程写坏管道而退出、关 stderr 与控制通道、坏流号（D3 v0.54）、procPid 的进程号（正、两个同时活着的子进程不同、回收后不变，D3 v0.54）、程序不存在、
 // 工作目录（有效与无效）、控制通道的环境变量与对端关闭后的读写。
 const CHANNEL: string = "TAIXU_DEBUG_CHANNEL";
 const MARKER: string = "taixu-proc-pipe-cwd.txt";
@@ -74,9 +75,36 @@ function childBlock(): int {
     return 40 + r;
 }
 
+// 不停写 stdout 直到写不出去（父进程关了读端），以 3 退出；写满上限仍能写为 9。
+function childSpew(): int {
+    const a = bytesNew(4096);
+    let k = 0;
+    while (k < 100000) {
+        if (stdoutWrite(a) != 4096) { return 3; }
+        k = k + 1;
+    }
+    return 9;
+}
+
 function childEof(): int {
     const r = stdinRead(bytesNew(8), 5000);
     return out("eof=" + toStr(r) + "\n");
+}
+
+// 读 stdin 到流尾，报收到的字节数（父进程 procCloseStream 关 stdin 之后才结束）。
+function childDrain(): int {
+    const buf = bytesNew(64);
+    let total = 0;
+    while (true) {
+        const n = stdinRead(buf, 10000);
+        if (n < 0) { break; }
+        if (n == 0) {
+            out("drain timeout\n");
+            return 4;
+        }
+        total = total + n;
+    }
+    return out("drained=" + toStr(total) + "\n");
 }
 
 function childCwd(): int {
@@ -223,7 +251,70 @@ function testEof(me: string): void {
     print("stdin eof: " + toStr(readUntil(h, "<never>", buf) == "eof=-1\n<eof>"));
     print("eof exit: " + toStr(procWait(h, 10000) catch -999));
     print("write to null stdin: " + toStr(procWrite(h, 0, bytesFromStr("x"))));
+    procCloseStream(h, 0);
+    print("close null stdin: done");
     procClose(h);
+}
+
+function testCloseStdin(me: string): void {
+    const h = procSpawn(me, argvOf("drain"), "", 1) catch (e) {
+        print("drain spawn failed: " + e.message);
+        return;
+    };
+    const buf = bytesNew(64);
+    print("drain write: " + toStr(procWrite(h, 0, bytesFromStr("abc"))) + " " + toStr(procWrite(h, 0, bytesFromStr("defg"))));
+    print("drain before close: " + toStr(ioWait(h, 2, 200)));
+    procCloseStream(h, 0);
+    print("drain output: " + toStr(readUntil(h, "<never>", buf) == "drained=7\n<eof>"));
+    print("drain exit: " + toStr(procWait(h, 10000) catch -999));
+    print("write after close: " + toStr(procWrite(h, 0, bytesFromStr("x"))) + " " + toStr(procTryWrite(h, 0, bytesFromStr("x"))));
+    procCloseStream(h, 0);
+    print("close twice: done");
+    procClose(h);
+}
+
+// procCloseStream 关 stdout、stderr 的读端：读得 −1、ioWait 立即返回 0，子进程写坏管道后以 3 退出；重复关闭无动作。
+function testCloseOutput(me: string): void {
+    const h = procSpawn(me, argvOf("spew"), "", 0) catch (e) {
+        print("spew spawn failed: " + e.message);
+        return;
+    };
+    const buf = bytesNew(4096);
+    print("spew first read: " + toStr(ioWait(h, 2, 10000) == 2 && procRead(h, 1, buf) > 0));
+    procCloseStream(h, 1);
+    procCloseStream(h, 2);
+    print("read after close: " + toStr(procRead(h, 1, buf)) + " " + toStr(procRead(h, 2, buf)));
+    const t0 = monoNs();
+    print("wait after close: " + toStr(ioWait(h, 6, 5000)) + " " + toStr(monoNs() - t0 < 1000000000));
+    print("spew exit: " + toStr(procWait(h, 10000) catch -999));
+    procCloseStream(h, 1);
+    print("close output twice: done");
+    procClose(h);
+}
+
+// procPid：系统进程号为正，两个同时活着的子进程不同，回收之后照旧得原来的号。
+function testPid(me: string): void {
+    const a = procSpawn(me, argvOf("drain"), "", 1) catch (e) {
+        print("pid spawn failed: " + e.message);
+        return;
+    };
+    const b = procSpawn(me, argvOf("drain"), "", 1) catch (e) {
+        print("pid spawn failed: " + e.message);
+        procClose(a);
+        return;
+    };
+    const pa = procPid(a);
+    const pb = procPid(b);
+    print("pid positive: " + toStr(pa > 0 && pb > 0));
+    print("pid distinct: " + toStr(pa != pb));
+    procCloseStream(a, 0);
+    procCloseStream(b, 0);
+    const buf = bytesNew(64);
+    print("pid drained: " + toStr(readUntil(a, "<never>", buf) == "drained=0\n<eof>") + " " + toStr(readUntil(b, "<never>", buf) == "drained=0\n<eof>"));
+    print("pid exit: " + toStr(procWait(a, 10000) catch -999) + " " + toStr(procWait(b, 10000) catch -999));
+    print("pid after wait: " + toStr(procPid(a) == pa && procPid(b) == pb));
+    procClose(a);
+    procClose(b);
 }
 
 function testCwd(me: string, tmp: string): void {
@@ -288,6 +379,8 @@ function testChannel(me: string): void {
     print("channel exit: " + toStr(procWait(h, 10000) catch -999));
     print("channel read after exit: " + toStr(procRead(h, 3, buf)));
     print("channel write after exit: " + toStr(procWrite(h, 3, bytesFromStr("x"))));
+    procCloseStream(h, 3);
+    print("channel close: " + toStr(procRead(h, 3, buf)) + " " + toStr(procWrite(h, 3, bytesFromStr("x"))));
     procClose(h);
     const g = procSpawn(me, argvOf("env"), "", 0) catch (e) {
         print("plain spawn failed: " + e.message);
@@ -305,6 +398,8 @@ function main(args: []string): int {
         if (mode == "big") { return childBig(); }
         if (mode == "block") { return childBlock(); }
         if (mode == "eof") { return childEof(); }
+        if (mode == "spew") { return childSpew(); }
+        if (mode == "drain") { return childDrain(); }
         if (mode == "cwd") { return childCwd(); }
         if (mode == "env") { return childEnv(); }
         return 99;
@@ -315,6 +410,9 @@ function main(args: []string): int {
     testBig(me);
     testKill(me);
     testEof(me);
+    testCloseStdin(me);
+    testCloseOutput(me);
+    testPid(me);
     testCwd(me, tmp);
     testChannel(me);
     const m = spawnError(tmp + sep() + "taixu-proc-pipe-no-such-program", "x", "");

@@ -1,0 +1,129 @@
+// 浏览器网络线程的 Linux stub resolver；不使用 libc，不接管系统 DNS 配置。
+import { BrowserAddress, dnsCheckpoint, dnsLiteral, dnsAdd, dnsReadFile } from "./dns_common";
+import { DnsConfig, DnsServer, dnsParseConfig, dnsSearchNames, dnsHosts } from "std/dns_config";
+import { DnsReply, dnsQuery, dnsParseReply } from "std/dns_wire";
+import { ByteSocket, socketOpen, socketClose, socketConnect, socketFinishConnect, socketRead, socketWrite, socketPoll } from "std/net_socket";
+import { deadlineAfterMs, deadlineRemainingMs } from "std/deadline";
+import { randomBytes } from "std/crypto/rand";
+import { fsExists } from "std/fs";
+
+struct Flight { socket: Ref<ByteSocket>, name: string, kind: int, id: int, query: Bytes, sent: bool, done: bool, code: int, addresses: List<Bytes>, aliases: List<string>, ignored: int }
+struct Pair { addresses: List<BrowserAddress>, definitive: bool }
+
+function identifier(): int | Error { const data = randomBytes(2)?; return (bytesGet(data, 0) catch 0) * 256 + (bytesGet(data, 1) catch 0); }
+function wait(socket: Ref<ByteSocket>, writable: bool, deadline: int, cancelled: () => bool): void | Error {
+    dnsCheckpoint(deadline, cancelled)?; let left = deadlineRemainingMs(deadline)?; if (left > 25) { left = 25; } socketPoll(socket, writable, left)?; dnsCheckpoint(deadline, cancelled)?; return done();
+}
+function connected(server: DnsServer, datagram: bool, deadline: int, cancelled: () => bool): Ref<ByteSocket> | Error {
+    let version = 4; if (bytesLen(server.ip) == 16) { version = 6; }
+    const socket = socketOpen(version, datagram)?; let owned = false; defer { if (!owned) { socketClose(socket); } }
+    dnsCheckpoint(deadline, cancelled)?;
+    if (!socketConnect(socket, server.ip, server.port)?) { while (!socketFinishConnect(socket)?) { wait(socket, true, deadline, cancelled)?; } }
+    owned = true; return socket;
+}
+function tcp(server: DnsServer, query: Bytes, deadline: int, cancelled: () => bool): Bytes | Error {
+    const socket = connected(server, false, deadline, cancelled)?; defer { socketClose(socket); }
+    const wire = bytesNew(2); bytesSet(wire, 0, bytesLen(query) / 256); bytesSet(wire, 1, bytesLen(query) % 256); bytesAppend(wire, query); let offset = 0;
+    while (offset < bytesLen(wire)) {
+        dnsCheckpoint(deadline, cancelled)?; const result = socketWrite(socket, bytesSlice(wire, offset, bytesLen(wire) - offset))?;
+        if (result.wouldBlock) { wait(socket, true, deadline, cancelled)?; } else { offset = offset + result.written; }
+    }
+    const response = bytesNew(0); let length = -1;
+    while (true) {
+        dnsCheckpoint(deadline, cancelled)?; let needed = 2 - bytesLen(response); if (length >= 0) { needed = length + 2 - bytesLen(response); }
+        if (needed == 0) { return bytesSlice(response, 2, length); }
+        const result = socketRead(socket, needed)?;
+        if (result.wouldBlock) { wait(socket, false, deadline, cancelled)?; continue; }
+        if (result.eof) { return err("browser dns: truncated TCP response"); } bytesAppend(response, result.data);
+        if (length < 0 && bytesLen(response) == 2) {
+            length = (bytesGet(response, 0) catch 0) * 256 + (bytesGet(response, 1) catch 0); if (length < 12) { return err("browser dns: invalid TCP message length"); }
+        }
+    } return err("browser dns: unreachable TCP state");
+}
+function flight(server: DnsServer, name: string, kind: int, deadline: int, cancelled: () => bool): Ref<Flight> | Error {
+    const id = identifier()?; const query = dnsQuery(name, kind, id)?; const socket = connected(server, true, deadline, cancelled)?;
+    const aliases: List<string> = listNew(); listPush(aliases, name);
+    return new Flight { socket: socket, name: name, kind: kind, id: id, query: query, sent: false, done: false, code: -1, addresses: listNew(), aliases: aliases, ignored: 0 };
+}
+function acceptReply(flight: Ref<Flight>, reply: DnsReply): void | Error {
+    if (reply.code == 0 && listLen(reply.addresses) == 0 && reply.canonical != flight.name) {
+        if (listLen(flight.aliases) >= 17) { return err("browser dns: CNAME depth limit"); }
+        for (seen in flight.aliases) { if (seen == reply.canonical) { return err("browser dns: CNAME loop"); } }
+        listPush(flight.aliases, reply.canonical); flight.name = reply.canonical; flight.id = identifier()?;
+        flight.query = dnsQuery(flight.name, flight.kind, flight.id)?; flight.sent = false; return done();
+    }
+    flight.addresses = reply.addresses; flight.code = reply.code; flight.done = true; return done();
+}
+function advance(item: Ref<Flight>, server: DnsServer, config: DnsConfig, deadline: int, cancelled: () => bool): void | Error {
+    if (config.tcp) {
+        const wire = tcp(server, item.query, deadline, cancelled)?; const reply = dnsParseReply(wire, item.name, item.kind, item.id)?;
+        if (reply.truncated) { return err("browser dns: truncated TCP DNS message"); } return acceptReply(item, reply);
+    }
+    if (!item.sent) {
+        const result = socketWrite(item.socket, item.query)?;
+        if (result.wouldBlock) { return done(); } if (result.written != bytesLen(item.query)) { return err("browser dns: partial UDP datagram"); } item.sent = true;
+    }
+    const result = socketRead(item.socket, 65535)?; if (result.wouldBlock) { return done(); }
+    let reply = dnsParseReply(result.data, item.name, item.kind, item.id) catch (e) {
+        item.ignored = item.ignored + 1; if (item.ignored > 32) { return err("browser dns: too many malformed replies"); } return done();
+    };
+    if (reply.truncated) {
+        reply = dnsParseReply(tcp(server, item.query, deadline, cancelled)?, item.name, item.kind, item.id)?;
+        if (reply.truncated) { return err("browser dns: truncated TCP DNS message"); }
+    } return acceptReply(item, reply);
+}
+function pair(server: DnsServer, name: string, config: DnsConfig, overall: int, cancelled: () => bool): Pair | Error {
+    let deadline = deadlineAfterMs(config.timeoutMs)?; if (deadline > overall) { deadline = overall; }
+    const flights: List<Ref<Flight>> = listNew(); defer { for (item in flights) { socketClose(item.socket); } }
+    listPush(flights, flight(server, name, 1, deadline, cancelled)?); listPush(flights, flight(server, name, 28, deadline, cancelled)?);
+    while (true) {
+        dnsCheckpoint(overall, cancelled)?; if (deadlineRemainingMs(deadline)? == 0) { break; } let complete = true; let waiting: Ref<Flight>? = None;
+        for (item in flights) {
+            if (item.done) { continue; } complete = false; waiting = item;
+            // 一族失败不丢掉另一族已有的有效地址；总体取消与截止在外层仍须传播。
+            advance(item, server, config, deadline, cancelled) catch (e) { item.done = true; item.code = 2; };
+        }
+        if (complete) { break; }
+        const pending = waiting;
+        if (pending != None && !pending.done) {
+            let left = deadlineRemainingMs(deadline)?; if (left > 25) { left = 25; } socketPoll(pending.socket, !pending.sent, left)?;
+        }
+    }
+    const addresses: List<BrowserAddress> = listNew(); let definitive = true;
+    for (item in flights) {
+        for (ip in item.addresses) { dnsAdd(addresses, ip, 0)?; }
+        if (!item.done || (item.code != 0 && item.code != 3)) { definitive = false; }
+    }
+    return Pair { addresses: addresses, definitive: definitive };
+}
+
+export function browserResolveConfig(host: string, deadline: int, cancelled: () => bool, config: DnsConfig, hosts: string): List<BrowserAddress> | Error {
+    dnsCheckpoint(deadline, cancelled)?; const literal = dnsLiteral(host)?; if (listLen(literal) > 0) { return literal; }
+    if (config.timeoutMs < 1 || config.timeoutMs > 30000 || config.attempts < 1 || config.attempts > 5 || listLen(config.servers) < 1 || listLen(config.servers) > 32) { return err("browser dns: invalid resolver configuration"); }
+    const local = dnsHosts(hosts, host)?; const addresses: List<BrowserAddress> = listNew();
+    for (ip in local) { dnsAdd(addresses, ip, 0)?; } if (listLen(addresses) > 0) { return addresses; }
+    const names = dnsSearchNames(host, config)?; let lastError = "browser dns: name has no usable addresses"; let start = 0;
+    if (config.rotate) { start = identifier()? % listLen(config.servers); }
+    for (name in names) {
+        let attempt = 0; let negative = false;
+        while (attempt < config.attempts && !negative) {
+            let server = 0;
+            while (server < listLen(config.servers)) {
+                dnsCheckpoint(deadline, cancelled)?;
+                const answer = pair(listGet(config.servers, (start + server) % listLen(config.servers)), name, config, deadline, cancelled) catch (e) { lastError = e.message; server = server + 1; continue; };
+                dnsCheckpoint(deadline, cancelled)?; if (listLen(answer.addresses) > 0) { return answer.addresses; }
+                if (answer.definitive) { negative = true; break; } server = server + 1;
+            } attempt = attempt + 1;
+        }
+    }
+    dnsCheckpoint(deadline, cancelled)?; return err(lastError);
+}
+export function browserResolve(host: string, deadline: int, cancelled: () => bool): List<BrowserAddress> | Error {
+    dnsCheckpoint(deadline, cancelled)?; const literal = dnsLiteral(host)?; if (listLen(literal) > 0) { return literal; }
+    let hosts = ""; if (fsExists("/etc/hosts")) { hosts = dnsReadFile("/etc/hosts")?; }
+    const local: List<BrowserAddress> = listNew(); for (ip in dnsHosts(hosts, host)?) { dnsAdd(local, ip, 0)?; }
+    if (listLen(local) > 0) { return local; }
+    const config = dnsParseConfig(dnsReadFile("/etc/resolv.conf")?)?;
+    return browserResolveConfig(host, deadline, cancelled, config, hosts);
+}
+function done(): void {}

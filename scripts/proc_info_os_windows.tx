@@ -1,0 +1,282 @@
+// 门按进程号取另一个进程的资源用量（procPid，D3 v0.54）的 Windows 部分（导出面同 proc_info_os_linux.tx、proc_info_os_macos.tx）：
+// 以 PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ 打开，工作集取 K32GetProcessMemoryInfo 的 WorkingSetSize、CPU 时间取
+// GetProcessTimes 的内核加用户时间。后代进程取 Toolhelp 快照：按父进程号逐层找，子进程的创建时间不得早于父进程（父进程号可能
+// 指向已退出、号被复用的进程）；存活看 GetExitCodeProcess 是否为 STILL_ACTIVE。结构体按 x64／ARM64 的布局写在 Bytes 里。
+declare function OpenProcess(access: u32, inherit: i32, pid: u32): isize from "kernel32";
+declare function CreateToolhelp32Snapshot(flags: u32, pid: u32): isize from "kernel32";
+declare function Process32FirstW(snap: isize, entry: Bytes): i32 from "kernel32";
+declare function Process32NextW(snap: isize, entry: Bytes): i32 from "kernel32";
+declare function GetExitCodeProcess(h: isize, code: Bytes): i32 from "kernel32";
+declare function K32GetProcessMemoryInfo(h: isize, counters: Bytes, cb: u32): i32 from "kernel32";
+declare function GetProcessTimes(h: isize, created: Bytes, exited: Bytes, kernel: Bytes, user: Bytes): i32 from "kernel32";
+declare function CloseHandle(h: isize): i32 from "kernel32";
+declare function QueryFullProcessImageNameW(h: isize, flags: u32, name: Bytes, size: Bytes): i32 from "kernel32";
+declare function TerminateProcess(h: isize, code: u32): i32 from "kernel32";
+
+// PROCESS_QUERY_LIMITED_INFORMATION（0x1000）| PROCESS_VM_READ（0x10）。
+const ACCESS: int = 4112;
+// PROCESS_MEMORY_COUNTERS：cb、PageFaultCount 各 4 字节，PeakWorkingSetSize@8，WorkingSetSize@16；整个结构 72 字节。
+const COUNTERS_SIZE: int = 72;
+const WORKING_AT: int = 16;
+
+// pid 的常驻内存（工作集，字节）；打不开或取不到得 −1。
+export function procRss(pid: int): int {
+    const h = OpenProcess(ACCESS as u32, 0, pid as u32);
+    if (h == 0) {
+        return -1;
+    }
+    const counters = bytesNew(COUNTERS_SIZE);
+    bytesSetLE<u32>(counters, 0, COUNTERS_SIZE as u32);
+    let rss = -1;
+    if (K32GetProcessMemoryInfo(h, counters, COUNTERS_SIZE as u32) != 0) {
+        rss = bytesGetLE<int>(counters, WORKING_AT) ?? -1;
+    }
+    const closed = CloseHandle(h);
+    return rss;
+}
+
+// pid 用掉的 CPU 时间（内核加用户，微秒）；打不开或取不到得 −1。FILETIME 以 100 ns 计。
+export function procCpuUs(pid: int): int {
+    const h = OpenProcess(ACCESS as u32, 0, pid as u32);
+    if (h == 0) {
+        return -1;
+    }
+    const created = bytesNew(8);
+    const exited = bytesNew(8);
+    const kernel = bytesNew(8);
+    const user = bytesNew(8);
+    let us = -1;
+    if (GetProcessTimes(h, created, exited, kernel, user) != 0) {
+        us = ((bytesGetLE<int>(kernel, 0) ?? 0) + (bytesGetLE<int>(user, 0) ?? 0)) / 10;
+    }
+    const closed = CloseHandle(h);
+    return us;
+}
+
+// PROCESS_QUERY_LIMITED_INFORMATION（只够取时间与退出码）。
+const QUERY: int = 4096;
+const SNAPPROCESS: int = 2;
+const STILL_ACTIVE: int = 259;
+// PROCESSENTRY32W：dwSize@0、th32ProcessID@8、th32ParentProcessID@32、szExeFile@44（260 个 UTF-16 码元）；整个结构 568 字节。
+const ENTRY_SIZE: int = 568;
+
+// 创建时间（FILETIME 的 100 ns 计数）；打不开为 −1。
+function created(pid: int): int {
+    const h = OpenProcess(QUERY as u32, 0, pid as u32);
+    if (h == 0) {
+        return -1;
+    }
+    const c = bytesNew(8);
+    const e = bytesNew(8);
+    const k = bytesNew(8);
+    const u = bytesNew(8);
+    let t = -1;
+    if (GetProcessTimes(h, c, e, k, u) != 0) {
+        t = bytesGetLE<int>(c, 0) ?? -1;
+    }
+    const closed = CloseHandle(h);
+    return t;
+}
+
+// 可执行文件名的小写（只转 ASCII 字母；比较 conhost.exe 用）。
+function exeLower(entry: Bytes): string {
+    const out = bytesNew(0);
+    let i = 0;
+    while (i < 260) {
+        const c = (bytesGetLE<u16>(entry, 44 + 2 * i) ?? 0) as int;
+        if (c == 0) {
+            break;
+        }
+        if (c >= 65 && c <= 90) {
+            bytesPush(out, c + 32);
+        } else if (c < 128) {
+            bytesPush(out, c);
+        } else {
+            bytesPush(out, 63);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(out) catch "";
+}
+
+// pid 的后代进程号（不含 pid 自己）。hosts 为假时去掉控制台宿主 conhost.exe（它随 worker 生灭）。
+export function procDescendants(pid: int, hosts: bool): List<int> {
+    const pids: List<int> = listNew();
+    const ppids: List<int> = listNew();
+    const names: List<string> = listNew();
+    const snap = CreateToolhelp32Snapshot(SNAPPROCESS as u32, 0);
+    if (snap != -1 && snap != 0) {
+        const entry = bytesNew(ENTRY_SIZE);
+        bytesSetLE<u32>(entry, 0, ENTRY_SIZE as u32);
+        let ok = Process32FirstW(snap, entry);
+        while (ok != 0) {
+            listPush(pids, (bytesGetLE<u32>(entry, 8) ?? 0) as int);
+            listPush(ppids, (bytesGetLE<u32>(entry, 32) ?? 0) as int);
+            listPush(names, exeLower(entry));
+            ok = Process32NextW(snap, entry);
+        }
+        const closed = CloseHandle(snap);
+    }
+    const out: List<int> = listNew();
+    const outNames: List<string> = listNew();
+    const todo: List<int> = listNew();
+    const todoBorn: List<int> = listNew();
+    listPush(todo, pid);
+    listPush(todoBorn, created(pid));
+    while (listLen(todo) > 0) {
+        const p = listGet(todo, listLen(todo) - 1) catch 0;
+        const pb = listGet(todoBorn, listLen(todoBorn) - 1) catch -1;
+        listRemoveAt(todo, listLen(todo) - 1);
+        listRemoveAt(todoBorn, listLen(todoBorn) - 1);
+        let i = 0;
+        while (i < listLen(pids)) {
+            const child = listGet(pids, i) catch 0;
+            if ((listGet(ppids, i) catch -1) == p && child != pid && !inList(out, child)) {
+                const c = created(child);
+                if (c >= 0 && pb >= 0 && c >= pb) {
+                    listPush(out, child);
+                    listPush(outNames, listGet(names, i) catch "");
+                    listPush(todo, child);
+                    listPush(todoBorn, c);
+                }
+            }
+            i = i + 1;
+        }
+    }
+    if (hosts) {
+        return out;
+    }
+    const kept: List<int> = listNew();
+    let k = 0;
+    while (k < listLen(out)) {
+        if ((listGet(outNames, k) catch "") != "conhost.exe") {
+            listPush(kept, listGet(out, k) catch 0);
+        }
+        k = k + 1;
+    }
+    return kept;
+}
+
+function inList(xs: List<int>, v: int): bool {
+    for (x in xs) {
+        if (x == v) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 进程仍在运行。
+export function procAlive(pid: int): bool {
+    const h = OpenProcess(QUERY as u32, 0, pid as u32);
+    if (h == 0) {
+        return false;
+    }
+    const code = bytesNew(4);
+    const got = GetExitCodeProcess(h, code);
+    const closed = CloseHandle(h);
+    return ((bytesGetLE<u32>(code, 0) ?? 0) as int) == STILL_ACTIVE;
+}
+
+// 启动标记（创建时间的十进制；打不开为空串）。
+export function procStartMark(pid: int): string {
+    const c = created(pid);
+    if (c < 0) {
+        return "";
+    }
+    return toStr(c);
+}
+
+// 进程映像的完整路径（小写、/ 换成 \；比较用）；取不到得空串。
+function imageOf(h: isize): string {
+    const name = bytesNew(65536);
+    const size = bytesNew(4);
+    bytesSetLE<u32>(size, 0, 32768 as u32);
+    if (QueryFullProcessImageNameW(h, 0, name, size) == 0) {
+        return "";
+    }
+    const n = (bytesGetLE<u32>(size, 0) ?? 0) as int;
+    const out = bytesNew(0);
+    let i = 0;
+    while (i < n) {
+        const c = (bytesGetLE<u16>(name, 2 * i) ?? 0) as int;
+        appendUtf8(out, c);
+        i = i + 1;
+    }
+    return lowerPath(bytesToStr(out) catch "");
+}
+
+// 只编 BMP 的码元（代理对按原样各编三字节；路径比较两边同法即可）。
+function appendUtf8(out: Bytes, c: int): void {
+    if (c < 128) {
+        bytesPush(out, c);
+    } else if (c < 2048) {
+        bytesPush(out, 192 | (c >> 6));
+        bytesPush(out, 128 | (c & 63));
+    } else {
+        bytesPush(out, 224 | (c >> 12));
+        bytesPush(out, 128 | ((c >> 6) & 63));
+        bytesPush(out, 128 | (c & 63));
+    }
+}
+
+function lowerPath(p: string): string {
+    const b = bytesFromStr(p);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const c = bytesGet(b, i) ?? 0;
+        if (c >= 65 && c <= 90) {
+            bytesSet(b, i, c + 32);
+        } else if (c == 47) {
+            bytesSet(b, i, 92);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(b) catch p;
+}
+
+// 只终止私有 MCP 实例 parent 的那个 worker：Toolhelp 快照里 parent 的直接子进程
+// （不计控制台宿主 conhost.exe——工具链子进程不继承控制台，服务另有一个随它生灭的宿主）恰有一个才动手；以 PROCESS_TERMINATE |
+// PROCESS_QUERY_LIMITED_INFORMATION 打开、映像即 compiler（不分大小写）才 TerminateProcess(125)；持有句柄期间核对，不盲发 PID。
+export function killOwnedWorker(parent: int, compiler: string): bool {
+    const matches: List<int> = listNew();
+    const snap = CreateToolhelp32Snapshot(SNAPPROCESS as u32, 0);
+    if (snap == -1 || snap == 0) {
+        return false;
+    }
+    const entry = bytesNew(ENTRY_SIZE);
+    bytesSetLE<u32>(entry, 0, ENTRY_SIZE as u32);
+    let ok = Process32FirstW(snap, entry);
+    while (ok != 0) {
+        if (((bytesGetLE<u32>(entry, 32) ?? 0) as int) == parent && exeLower(entry) != "conhost.exe") {
+            listPush(matches, (bytesGetLE<u32>(entry, 8) ?? 0) as int);
+        }
+        ok = Process32NextW(snap, entry);
+    }
+    const closedSnap = CloseHandle(snap);
+    if (listLen(matches) != 1) {
+        return false;
+    }
+    const h = OpenProcess(4097 as u32, 0, (listGet(matches, 0) catch 0) as u32);
+    if (h == 0) {
+        return false;
+    }
+    let done = false;
+    if (imageOf(h) == lowerPath(compiler)) {
+        done = TerminateProcess(h, 125 as u32) != 0;
+    }
+    const closed = CloseHandle(h);
+    return done;
+}
+
+// 创建时间仍是 mark 时结束它（失败收尾用，不误杀复用了号的进程）。
+export function killIfSame(pid: int, mark: string): void {
+    if (len(mark) == 0 || procStartMark(pid) != mark) {
+        return;
+    }
+    const h = OpenProcess(4097 as u32, 0, pid as u32);
+    if (h != 0) {
+        const t = TerminateProcess(h, 9 as u32);
+        const closed = CloseHandle(h);
+    }
+}

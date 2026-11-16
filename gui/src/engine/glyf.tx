@@ -1,0 +1,305 @@
+// ============================================================================
+// engine/glyf —— TrueType 字形轮廓（GUI 原生引擎 G1）。
+//
+// 简单字形：二次 B 样条，相邻两个曲外点之间补隐含的曲上中点；复合字形：按分量的平移与 2×2
+// 变换（F2Dot14）组合，偏移按微软约定不随缩放（标志 0x800 时才缩放），按点号对齐的分量取零偏移。
+// 不执行 hinting 指令，可变字体取缺省实例（不读 gvar）。复合嵌套不超过 8 层、每个字形至多 65536
+// 个点，防恶意数据。
+// ============================================================================
+
+import { u8, u16, i16, u32 } from "./bin";
+
+struct Budget {
+    left: int,
+}
+
+function glyphStart(b: Bytes, loca: int, longLoca: bool, gid: int): int {
+    if (longLoca) {
+        return u32(b, loca + gid * 4);
+    }
+    return u16(b, loca + gid * 2) * 2;
+}
+
+function i8(b: Bytes, o: int): int {
+    const v: int = u8(b, o);
+    if (v > 127) {
+        return v - 256;
+    }
+    return v;
+}
+
+function f2(b: Bytes, o: int): float {
+    return (i16(b, o) as float) / 16384.0;
+}
+
+function put(path: List<float>, xf: List<float>, cmd: float, x: float, y: float): void {
+    const a: float = listTryGet(xf, 0) catch 1.0;
+    const bb: float = listTryGet(xf, 1) catch 0.0;
+    const c: float = listTryGet(xf, 2) catch 0.0;
+    const d: float = listTryGet(xf, 3) catch 1.0;
+    const e: float = listTryGet(xf, 4) catch 0.0;
+    const f: float = listTryGet(xf, 5) catch 0.0;
+    if (cmd >= 0.0) {
+        listPush(path, cmd);
+    }
+    listPush(path, a * x + c * y + e);
+    listPush(path, bb * x + d * y + f);
+}
+
+// 一个轮廓：points 为 [x, y, 曲上(1/0)]×n。
+function contour(path: List<float>, xf: List<float>, pts: List<int>, s: int, e: int): void {
+    const n: int = e - s + 1;
+    if (n < 1) {
+        return;
+    }
+    const sx: int = listTryGet(pts, s * 3) catch 0;
+    const sy: int = listTryGet(pts, s * 3 + 1) catch 0;
+    const ex: int = listTryGet(pts, e * 3) catch 0;
+    const ey: int = listTryGet(pts, e * 3 + 1) catch 0;
+    let startX: float = sx as float;
+    let startY: float = sy as float;
+    let from: int = s + 1;
+    let to: int = e;
+    if ((listTryGet(pts, s * 3 + 2) catch 0) == 0) {
+        if ((listTryGet(pts, e * 3 + 2) catch 0) == 1) {
+            startX = ex as float;
+            startY = ey as float;
+            from = s;
+            to = e - 1;
+        } else {
+            startX = ((sx + ex) as float) / 2.0;
+            startY = ((sy + ey) as float) / 2.0;
+            from = s;
+            to = e;
+        }
+    }
+    put(path, xf, 0.0, startX, startY);
+    let haveOff: bool = false;
+    let offX: float = 0.0;
+    let offY: float = 0.0;
+    let lastX: float = startX;
+    let lastY: float = startY;
+    let i: int = from;
+    while (i <= to) {
+        const x: float = (listTryGet(pts, i * 3) catch 0) as float;
+        const y: float = (listTryGet(pts, i * 3 + 1) catch 0) as float;
+        if ((listTryGet(pts, i * 3 + 2) catch 0) == 1) {
+            if (haveOff) {
+                put(path, xf, 2.0, offX, offY);
+                put(path, xf, -1.0, x, y);
+                haveOff = false;
+            } else {
+                put(path, xf, 1.0, x, y);
+            }
+            lastX = x;
+            lastY = y;
+        } else {
+            if (haveOff) {
+                const mx: float = (offX + x) / 2.0;
+                const my: float = (offY + y) / 2.0;
+                put(path, xf, 2.0, offX, offY);
+                put(path, xf, -1.0, mx, my);
+                lastX = mx;
+                lastY = my;
+            }
+            offX = x;
+            offY = y;
+            haveOff = true;
+        }
+        i = i + 1;
+    }
+    if (haveOff) {
+        put(path, xf, 2.0, offX, offY);
+        put(path, xf, -1.0, startX, startY);
+    } else if (lastX != startX || lastY != startY) {
+        put(path, xf, 1.0, startX, startY);
+    }
+}
+
+function simple(b: Bytes, o: int, end: int, nc: int, path: List<float>, xf: List<float>, bud: Ref<Budget>): bool {
+    if (nc == 0) {
+        return true;
+    }
+    const npts: int = u16(b, o + 10 + (nc - 1) * 2) + 1;
+    bud.left = bud.left - npts;
+    if (bud.left < 0) {
+        return false;
+    }
+    let p: int = o + 12 + nc * 2;
+    p = p + u16(b, p - 2);
+    const flags: List<int> = listNew();
+    while (listLen(flags) < npts) {
+        if (p >= end) {
+            return false;
+        }
+        const fl: int = u8(b, p);
+        p = p + 1;
+        listPush(flags, fl);
+        if ((fl & 8) != 0) {
+            let r: int = u8(b, p);
+            p = p + 1;
+            while (r > 0 && listLen(flags) < npts) {
+                listPush(flags, fl);
+                r = r - 1;
+            }
+        }
+    }
+    const pts: List<int> = listNew();
+    let x: int = 0;
+    let i: int = 0;
+    while (i < npts) {
+        const fl: int = listTryGet(flags, i) catch 0;
+        if ((fl & 2) != 0) {
+            let d: int = u8(b, p);
+            p = p + 1;
+            if ((fl & 16) == 0) {
+                d = -d;
+            }
+            x = x + d;
+        } else if ((fl & 16) == 0) {
+            x = x + i16(b, p);
+            p = p + 2;
+        }
+        listPush(pts, x);
+        listPush(pts, 0);
+        listPush(pts, fl & 1);
+        i = i + 1;
+    }
+    let y: int = 0;
+    i = 0;
+    while (i < npts) {
+        const fl: int = listTryGet(flags, i) catch 0;
+        if ((fl & 4) != 0) {
+            let d: int = u8(b, p);
+            p = p + 1;
+            if ((fl & 32) == 0) {
+                d = -d;
+            }
+            y = y + d;
+        } else if ((fl & 32) == 0) {
+            y = y + i16(b, p);
+            p = p + 2;
+        }
+        listSet(pts, i * 3 + 1, y);
+        i = i + 1;
+    }
+    if (p > end) {
+        return false;
+    }
+    let s: int = 0;
+    let c: int = 0;
+    while (c < nc) {
+        const e: int = u16(b, o + 10 + c * 2);
+        if (e < s - 1 || e >= npts) {
+            return false;
+        }
+        contour(path, xf, pts, s, e);
+        s = e + 1;
+        c = c + 1;
+    }
+    return true;
+}
+
+function glyph(b: Bytes, loca: int, glyf: int, longLoca: bool, numGlyphs: int, gid: int, path: List<float>, xf: List<float>, depth: int, bud: Ref<Budget>): bool {
+    if (gid < 0 || gid >= numGlyphs || depth > 8) {
+        return false;
+    }
+    const s: int = glyphStart(b, loca, longLoca, gid);
+    const e: int = glyphStart(b, loca, longLoca, gid + 1);
+    if (e <= s) {
+        return true;
+    }
+    const o: int = glyf + s;
+    const end: int = glyf + e;
+    if (end > bytesLen(b) || e - s < 10) {
+        return false;
+    }
+    const nc: int = i16(b, o);
+    if (nc >= 0) {
+        return simple(b, o, end, nc, path, xf, bud);
+    }
+    let p: int = o + 10;
+    while (true) {
+        bud.left = bud.left - 1;
+        if (bud.left < 0 || p + 4 > end) {
+            return false;
+        }
+        const fl: int = u16(b, p);
+        const g: int = u16(b, p + 2);
+        p = p + 4;
+        let dx: float = 0.0;
+        let dy: float = 0.0;
+        if ((fl & 1) != 0) {
+            if ((fl & 2) != 0) {
+                dx = i16(b, p) as float;
+                dy = i16(b, p + 2) as float;
+            }
+            p = p + 4;
+        } else {
+            if ((fl & 2) != 0) {
+                dx = i8(b, p) as float;
+                dy = i8(b, p + 1) as float;
+            }
+            p = p + 2;
+        }
+        let a: float = 1.0;
+        let bb: float = 0.0;
+        let c: float = 0.0;
+        let d: float = 1.0;
+        if ((fl & 8) != 0) {
+            a = f2(b, p);
+            d = a;
+            p = p + 2;
+        } else if ((fl & 64) != 0) {
+            a = f2(b, p);
+            d = f2(b, p + 2);
+            p = p + 4;
+        } else if ((fl & 128) != 0) {
+            a = f2(b, p);
+            bb = f2(b, p + 2);
+            c = f2(b, p + 4);
+            d = f2(b, p + 6);
+            p = p + 8;
+        }
+        let ox: float = dx;
+        let oy: float = dy;
+        if ((fl & 2048) != 0) {
+            ox = a * dx + c * dy;
+            oy = bb * dx + d * dy;
+        }
+        const pa: float = listTryGet(xf, 0) catch 1.0;
+        const pb: float = listTryGet(xf, 1) catch 0.0;
+        const pc: float = listTryGet(xf, 2) catch 0.0;
+        const pd: float = listTryGet(xf, 3) catch 1.0;
+        const pe: float = listTryGet(xf, 4) catch 0.0;
+        const pf: float = listTryGet(xf, 5) catch 0.0;
+        const sub: List<float> = listNew();
+        listPush(sub, pa * a + pc * bb);
+        listPush(sub, pb * a + pd * bb);
+        listPush(sub, pa * c + pc * d);
+        listPush(sub, pb * c + pd * d);
+        listPush(sub, pa * ox + pc * oy + pe);
+        listPush(sub, pb * ox + pd * oy + pf);
+        if (!glyph(b, loca, glyf, longLoca, numGlyphs, g, path, sub, depth + 1, bud)) {
+            return false;
+        }
+        if ((fl & 32) == 0) {
+            return true;
+        }
+    }
+    return true;
+}
+
+/// 字形 gid 的轮廓追加到 path（字体单位，y 向上）；失败得 false（path 可能已追加了部分轮廓，
+/// 调用方应弃用）。
+export function glyfOutline(b: Bytes, loca: int, glyf: int, longLoca: bool, numGlyphs: int, gid: int, path: List<float>): bool {
+    const xf: List<float> = listNew();
+    listPush(xf, 1.0);
+    listPush(xf, 0.0);
+    listPush(xf, 0.0);
+    listPush(xf, 1.0);
+    listPush(xf, 0.0);
+    listPush(xf, 0.0);
+    const bud = new Budget { left: 65536 };
+    return glyph(b, loca, glyf, longLoca, numGlyphs, gid, path, xf, 0, bud);
+}

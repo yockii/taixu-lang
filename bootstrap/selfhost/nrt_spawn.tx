@@ -17,22 +17,14 @@
 //
 // 进程级的存活线程数 __tx_thread_live：创建时加一、线程结束时减一；main 返回后等它归零再退出（§十三-4）。
 // 句柄被释放时线程照常运行到结束（§十三-5）。线程里 trap 经进程级致命锁终止整个进程（§四-2）。
-import { Operand, StructuredBuffer, asBufferLabel, asBufferZero, asBufferInstruction, asBufferBoundaryBegin, asBufferFunctionBegin, asBufferFunctionPrologueEnd, asBufferFunctionEpilogueStart, asBufferFrame, asBufferFunctionEnd, asManualBegin, asManualLeaf, asStructuredMissing, asStructuredReg, asStructuredImm, asStructuredTarget, asStructuredMem, A64_OS_WINDOWS } from "./assemble";
+import { Operand, StructuredBuffer, asBufferLabel, asBufferZero, asBufferInstruction, asBufferFunctionEnd, asManualBegin, asManualLeaf, asStructuredMissing, asStructuredReg, asStructuredMem } from "./assemble";
 import { RtFn, RtOp, L, I, A, G, GAcq } from "./rtfn_base";
 import { rtBegin, rtSet, rtSetGlobal, rtSetRbx, rtOp, rtShift, rtLoad, rtStore, rtAddrOf, rtLabel, rtJump, rtIf, rtIf32, rtCall0, rtCall1, rtCall2, rtCall3, rtCall4, rtCall5, rtCall6, rtCallC, rtSyscall, rtAtomicAdd, rtRet, rtRetVoid } from "./rtfn";
-import { a64Emit, a64B, a64Mem, a64MovImm } from "./a64_asm";
-import { a64AddSubImm, a64LdStPair, a64BranchReg } from "./a64_encode";
-import { la64Emit, la64B, la64MovImm } from "./la64_asm";
-import { la64Si12, la64Jirl, LA64_ADDI_D, LA64_LD_D, LA64_ST_D } from "./la64_encode";
-import { check, text, arity, argTag, trapText, trapAt, ARITY, nrtTarget } from "./nrt_base";
-import { tSysV, tRawSyscall, tKernel32, tUnix, tMacos, tA64, tGenericLinux, ISA_A64, ISA_LA64, ISA_RV64, T_LA64_LINUX, T_RV64_LINUX } from "./target";
-import { linuxA64ThreadStubs } from "./linux_a64";
-import { windowsA64ThreadEntry } from "./windows_a64";
-import { linuxLa64ThreadStubs } from "./linux_la64";
-import { rv64Emit, rv64Br, rv64MovImm, rv64Mem } from "./rv64_asm";
-import { rv64I, RV64_ADDI, RV64_LD, RV64_SD, RV64_JALR } from "./rv64_encode";
-import { linuxRv64ThreadStubs } from "./linux_rv64";
+import { check, text, arity, argTag, trapText, trapAt, ARITY, nrtTarget, nrtFailWith } from "./nrt_base";
+import { tSysV, tRawSyscall, tKernel32, tUnix, tMacos, tA64, tGenericLinux, ISA_X86_64 } from "./target";
+import { TP_TCB, TP_AFTER_TCB16, TP_SLOT, targetAbi } from "./target_abi";
 import { uxSys, uxMac, uxMapFlags } from "./unix_sys";
+import { abiThreadStubs } from "./abi_emit";
 import { TB_REGION, TB_RESERVATION, TB_MEM_PAGES, TB_BIG_CACHE, TB_BIG_LIST, PTHREAD_HOOKS } from "./thread_block_abi";
 
 const TAG_THREAD: int = 19;
@@ -51,6 +43,15 @@ const REC_TCB: int = 80;
 const REC_TP_A64: int = 96;
 // loongarch64 与 riscv64：线程指针指向槽本身（线程控制块长 0，linux_la64.tx、linux_rv64.tx），槽在 112。
 const REC_TP_LA64: int = 112;
+
+// clone 新线程时线程指针指向记录的哪一处：按组合表（target_abi.tx）的取法换成记录里的偏移。
+function threadPointerAt(t: int): int {
+    const k = targetAbi(t).threadPointer;
+    if (k == TP_AFTER_TCB16) { return REC_TP_A64; }
+    if (k == TP_SLOT) { return REC_TP_LA64; }
+    if (k != TP_TCB) { nrtFailWith("NoThreadPointerLayout:" + toStr(t)); }
+    return REC_TCB;
+}
 const REC_MODE: int = 88;
 // 第 3 步（发送，§十八）：f 是闭包时的参数转移块@512、堆引用结果的转移块@520（远离 Linux 线程控制块附近的偏移）。
 const REC_ARGBLK: int = 512;
@@ -91,161 +92,28 @@ function ins(b: Ref<StructuredBuffer>, mn: string, n: int, a: Ref<Operand>, c: R
     asBufferInstruction(b, mn, n, a, c, asStructuredMissing(), 1);
 }
 function r64(n: int): Ref<Operand> { return asStructuredReg(0, n); }
-function r32(n: int): Ref<Operand> { return asStructuredReg(1, n); }
 function none(): Ref<Operand> { return asStructuredMissing(); }
-function callTo(b: Ref<StructuredBuffer>, name: string): void { ins(b, "call", 1, asStructuredTarget(name), none()); }
-
-// A64：原子加用 rtfn（LDADDAL）。线程入口是 pthread 以 C 约定调用的外壳：x0＝记录（同私有
-// 约定的第一个实参），存帧记录与 x19（__tx_thread_main 把它设为本线程的值槽窗口，C 约定要求被调方保存）后调用，返回 NULL。
-// Windows 的线程入口带帧事件（windows_a64.tx）。
-function stubsA64(b: Ref<StructuredBuffer>, t: int): void {
-    const f = rtBegin(b, "__tx_atomic_add", "p d", "old", 0, "bootstrap/selfhost/nrt_spawn.tx");
-    rtAtomicAdd(f, "old", L("p"), 0, L("d"));
-    rtRet(f, L("old")); check(f);
-    if (b.a64Os == A64_OS_WINDOWS) { windowsA64ThreadEntry(b); return; }
-    asBufferBoundaryBegin(b, "bootstrap/selfhost/nrt_spawn.tx", "__tx_thread_entry", "thread-entry");
-    asBufferLabel(b, "__tx_thread_entry", 1);
-    a64Emit(b, a64LdStPair(2, 0, 0, 29, 30, 31, -32, 3), "stp x29, x30, [sp, #-32]!");
-    a64Emit(b, a64AddSubImm(1, 0, 0, 29, 31, 0, 0), "mov x29, sp");
-    a64Mem(b, 3, 0, 19, 31, 16);
-    a64B(b, 1, "__tx_thread_main");
-    a64Mem(b, 3, 1, 19, 31, 16);
-    a64Emit(b, a64LdStPair(2, 0, 1, 29, 30, 31, 32, 1), "ldp x29, x30, [sp], #32");
-    a64MovImm(b, 0, 0);
-    a64Emit(b, a64BranchReg(2, 30), "ret");
-    asBufferFunctionEnd(b);
-    if (tRawSyscall(t)) { linuxA64ThreadStubs(b); }
-}
-
-// 龙芯：原子加用 rtfn；线程入口同 A64 的外壳——pthread 以 LP64D 调用，a0＝记录（同私有约定的第一个
-// 实参），存 ra、fp 与 s0（__tx_thread_main 把它设为本线程的值槽窗口，C 约定要求被调方保存）后调用，返回 NULL。
-// 帧记录同 rtfn：fp 指向 [旧 fp, ra] 这一对。
-function stubsLa64(b: Ref<StructuredBuffer>, t: int): void {
-    const f = rtBegin(b, "__tx_atomic_add", "p d", "old", 0, "bootstrap/selfhost/nrt_spawn.tx");
-    rtAtomicAdd(f, "old", L("p"), 0, L("d"));
-    rtRet(f, L("old")); check(f);
-    asBufferBoundaryBegin(b, "bootstrap/selfhost/nrt_spawn.tx", "__tx_thread_entry", "thread-entry");
-    asBufferLabel(b, "__tx_thread_entry", 1);
-    la64Emit(b, la64Si12(LA64_ADDI_D, 3, 3, -32), "addi.d sp, sp, -32");
-    la64Emit(b, la64Si12(LA64_ST_D, 1, 3, 24), "st.d ra, sp, 24");
-    la64Emit(b, la64Si12(LA64_ST_D, 22, 3, 16), "st.d fp, sp, 16");
-    // fp 为进入时的 sp（帧记录在 fp−16、fp−8，psABI 的约定）。
-    la64Emit(b, la64Si12(LA64_ADDI_D, 22, 3, 32), "addi.d fp, sp, 32");
-    la64Emit(b, la64Si12(LA64_ST_D, 23, 3, 8), "st.d s0, sp, 8");
-    la64B(b, 1, "__tx_thread_main");
-    la64Emit(b, la64Si12(LA64_LD_D, 23, 3, 8), "ld.d s0, sp, 8");
-    la64Emit(b, la64Si12(LA64_LD_D, 22, 3, 16), "ld.d fp, sp, 16");
-    la64Emit(b, la64Si12(LA64_LD_D, 1, 3, 24), "ld.d ra, sp, 24");
-    la64Emit(b, la64Si12(LA64_ADDI_D, 3, 3, 32), "addi.d sp, sp, 32");
-    la64MovImm(b, 4, 0);
-    la64Emit(b, la64Jirl(0, 1, 0), "ret");
-    asBufferFunctionEnd(b);
-    if (tRawSyscall(t)) { linuxLa64ThreadStubs(b); }
-}
-
-/// RISC-V 的线程入口蹦床：同龙芯，帧记录在进入时的 sp 下方（s0＝进入时的 sp），另存值槽窗口 s1。
-function stubsRv64(b: Ref<StructuredBuffer>, t: int): void {
-    const f = rtBegin(b, "__tx_atomic_add", "p d", "old", 0, "bootstrap/selfhost/nrt_spawn.tx");
-    rtAtomicAdd(f, "old", L("p"), 0, L("d"));
-    rtRet(f, L("old")); check(f);
-    asBufferBoundaryBegin(b, "bootstrap/selfhost/nrt_spawn.tx", "__tx_thread_entry", "thread-entry");
-    asBufferLabel(b, "__tx_thread_entry", 1);
-    rv64Emit(b, rv64I(RV64_ADDI, 2, 2, -32), "addi sp, sp, -32");
-    rv64Mem(b, RV64_SD, 1, 2, 24);
-    rv64Mem(b, RV64_SD, 8, 2, 16);
-    rv64Emit(b, rv64I(RV64_ADDI, 8, 2, 32), "addi s0, sp, 32");
-    rv64Mem(b, RV64_SD, 9, 2, 8);
-    rv64Br(b, 1, "__tx_thread_main");
-    rv64Mem(b, RV64_LD, 9, 2, 8);
-    rv64Mem(b, RV64_LD, 8, 2, 16);
-    rv64Mem(b, RV64_LD, 1, 2, 24);
-    rv64Emit(b, rv64I(RV64_ADDI, 2, 2, 32), "addi sp, sp, 32");
-    rv64MovImm(b, 10, 0);
-    rv64Emit(b, rv64I(RV64_JALR, 0, 1, 0), "ret");
-    asBufferFunctionEnd(b);
-    if (tRawSyscall(t)) { linuxRv64ThreadStubs(b); }
-}
 
 function sysArgs(a: Ref<RtOp>, c: Ref<RtOp>): List<Ref<RtOp>> {
     const xs: List<Ref<RtOp>> = listNew(); listPush(xs, a); listPush(xs, c); return xs;
 }
 
-/// 手写的入口与原语：原子加、线程入口蹦床、clone、自解映射退出。
+/// 手写的入口与原语：原子加（按指令集）；线程入口蹦床与 Linux 的 clone、自解映射退出（按目标，abi_emit.tx）。
 function emitStubs(b: Ref<StructuredBuffer>, t: int): void {
-    if (b.isa == ISA_A64) { stubsA64(b, t); return; }
-    if (b.isa == ISA_LA64) { stubsLa64(b, t); return; }
-    if (b.isa == ISA_RV64) { stubsRv64(b, t); return; }
-    // __tx_atomic_add(p, d) → 旧值（lock xadd，全屏障）。手写叶函数（登记为 runtime-manual，PE 规范化 P3）。
-    asManualBegin(b, "bootstrap/selfhost/nrt_spawn.tx", "__tx_atomic_add"); asManualLeaf(b);
-    ins(b, "mov", 2, r64(0), r64(2));
-    ins(b, "lockxadd", 2, asStructuredMem(2, 1, -1, 0, 0, 0, ""), r64(0));
-    ins(b, "ret", 0, none(), none());
-    asBufferFunctionEnd(b);
-    // 线程入口：系统以平台 ABI 调用（Windows rcx＝记录；SysV rdi＝记录），保存 rbx 后转入
-    // __tx_thread_main（私有约定 rcx＝记录），返回 0。入口 rsp≡8，push 后 sub 32 使调用点 16 对齐。
-    // Windows 上是按平台约定调用、返回到系统的普通函数：带帧事件（返回值在尾声之前置 0，尾声是 x64 展开器认得的
-    // add／pop／ret），同 aarch64-windows 的线程入口（PE 规范化 P3）。
-    if (tKernel32(t)) {
-        asBufferFunctionBegin(b, "bootstrap/selfhost/nrt_spawn.tx", "__tx_thread_entry", "process-thread-entry");
-        asBufferLabel(b, "__tx_thread_entry", 1);
-        asBufferFrame(b, "push-nonvolatile", 3, 8);
-        asBufferFrame(b, "allocate-stack", 4, 32);
-        asBufferFunctionPrologueEnd(b);
-        callTo(b, "__tx_thread_main");
-        ins(b, "xor", 2, r32(0), r32(0));
-        asBufferFunctionEpilogueStart(b);
-        asBufferFrame(b, "release-stack", 4, 32);
-        asBufferFrame(b, "pop-nonvolatile", 3, 8);
-        asBufferFrame(b, "return", -1, 8);
+    if (b.isa == ISA_X86_64) {
+        // __tx_atomic_add(p, d) → 旧值（lock xadd，全屏障）。手写叶函数（登记为 runtime-manual，PE 规范化 P3）。
+        asManualBegin(b, "bootstrap/selfhost/nrt_spawn.tx", "__tx_atomic_add"); asManualLeaf(b);
+        ins(b, "mov", 2, r64(0), r64(2));
+        ins(b, "lockxadd", 2, asStructuredMem(2, 1, -1, 0, 0, 0, ""), r64(0));
+        ins(b, "ret", 0, none(), none());
         asBufferFunctionEnd(b);
-        return;
+    } else {
+        // 别的指令集用 rtfn（A64 的 LDADDAL 等）。
+        const f = rtBegin(b, "__tx_atomic_add", "p d", "old", 0, "bootstrap/selfhost/nrt_spawn.tx");
+        rtAtomicAdd(f, "old", L("p"), 0, L("d"));
+        rtRet(f, L("old")); check(f);
     }
-    asBufferBoundaryBegin(b, "bootstrap/selfhost/nrt_spawn.tx", "__tx_thread_entry", "thread-entry");
-    asBufferLabel(b, "__tx_thread_entry", 1);
-    ins(b, "push", 1, r64(3), none());
-    if (tSysV(t)) { ins(b, "mov", 2, r64(1), r64(7)); }
-    ins(b, "sub", 2, r64(4), asStructuredImm(32));
-    callTo(b, "__tx_thread_main");
-    ins(b, "add", 2, r64(4), asStructuredImm(32));
-    ins(b, "pop", 1, r64(3), none());
-    ins(b, "xor", 2, r32(0), r32(0));
-    ins(b, "ret", 0, none(), none());
-    asBufferFunctionEnd(b);
-    if (!tRawSyscall(t)) { return; }
-    // __tx_thread_clone(flags, top, ptid, ctid, tls) → 子线程号或 −errno（父线程）。子线程在新栈上
-    // 从 syscall 之后继续：[rsp]＝记录（父线程预先写好），调用 __tx_thread_main，它以 exit 结束、不返回。
-    asBufferBoundaryBegin(b, "bootstrap/selfhost/nrt_spawn.tx", "__tx_thread_clone", "stack-transition");
-    asBufferLabel(b, "__tx_thread_clone", 1);
-    ins(b, "mov", 2, r64(7), r64(1));
-    ins(b, "mov", 2, r64(6), r64(2));
-    ins(b, "mov", 2, r64(2), r64(8));
-    ins(b, "mov", 2, r64(10), r64(9));
-    ins(b, "mov", 2, r64(8), asStructuredMem(2, 4, -1, 0, 40, 0, ""));
-    ins(b, "mov", 2, r32(0), asStructuredImm(56));
-    asBufferInstruction(b, "syscall", 0, none(), none(), none(), 1);
-    ins(b, "test", 2, r64(0), r64(0));
-    ins(b, "je", 1, asStructuredTarget("__tx_thread_clone_child"), none());
-    ins(b, "ret", 0, none(), none());
-    asBufferLabel(b, "__tx_thread_clone_child", 1);
-    ins(b, "xor", 2, r32(5), r32(5));
-    ins(b, "mov", 2, r64(1), asStructuredMem(2, 4, -1, 0, 0, 0, ""));
-    ins(b, "sub", 2, r64(4), asStructuredImm(32));
-    callTo(b, "__tx_thread_main");
-    asBufferInstruction(b, "ud2", 0, none(), none(), none(), 1);
-    asBufferFunctionEnd(b);
-    // __tx_thread_unmap_exit(base, size)：归还自己正在用的栈后立即以 exit 结束本线程——munmap 之后
-    // 只用寄存器、不再碰栈。
-    asBufferBoundaryBegin(b, "bootstrap/selfhost/nrt_spawn.tx", "__tx_thread_unmap_exit", "stack-disposal");
-    asBufferLabel(b, "__tx_thread_unmap_exit", 1);
-    ins(b, "mov", 2, r64(7), r64(1));
-    ins(b, "mov", 2, r64(6), r64(2));
-    ins(b, "mov", 2, r32(0), asStructuredImm(11));
-    asBufferInstruction(b, "syscall", 0, none(), none(), none(), 1);
-    ins(b, "xor", 2, r32(7), r32(7));
-    ins(b, "mov", 2, r32(0), asStructuredImm(60));
-    asBufferInstruction(b, "syscall", 0, none(), none(), none(), 1);
-    asBufferInstruction(b, "ud2", 0, none(), none(), none(), 1);
-    asBufferFunctionEnd(b);
+    abiThreadStubs(b, t);
 }
 
 /// 归还一段映射：Windows VirtualFree(p, 0, MEM_RELEASE)；Linux munmap(p, n)。
@@ -331,8 +199,7 @@ export function emitNrtSpawn(b: Ref<StructuredBuffer>): void {
         rtOp(f, "top", L("st"), "add", I(STACK_BYTES + GUARD_BYTES - 16));
         rtStore(f, L("top"), 0, L("rec"), 8);
         rtOp(f, "ct", L("rec"), "add", I(REC_CTID));
-        if (tA64(t)) { rtOp(f, "tl", L("rec"), "add", I(REC_TP_A64)); }
-        else if (t == T_LA64_LINUX || t == T_RV64_LINUX) { rtOp(f, "tl", L("rec"), "add", I(REC_TP_LA64)); } else { rtOp(f, "tl", L("rec"), "add", I(REC_TCB)); }
+        rtOp(f, "tl", L("rec"), "add", I(threadPointerAt(t)));
         rtCall5(f, "h", "__tx_thread_clone", I(CLONE_FLAGS), L("top"), L("ct"), L("ct"), L("tl"));
         rtIf(f, L("h"), "lt", I(0), "unstack");
         rtRet(f, I(0));

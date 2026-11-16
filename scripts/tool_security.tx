@@ -1,0 +1,365 @@
+// toolchain-contract 的工具安全增量：工具链内建的本地文件句柄与根约束、进程硬限额、回收器、procTryWrite、标准输出读端关闭后的
+// 行为、工具链专用内建对普通程序的拒绝，以及服务一侧的策略样本（service-policy、mount-policy、worker-proof、scratch、proxy-stop、
+// binary-context）；Linux 上另以 seccomp 屏蔽 waitid 复现沙箱，核对 procWait 退回 wait4 并按组补杀。全部在私有工作目录与受控样本上
+// 进行；最后跑服务边界（service_security.tx）。
+//
+// Windows 上样本经 procSpawnLimited 起（作业对象：内存 2 GiB、CPU 60 s、至多 32 个进程）；类 Unix 上“子进程继承 SIG_IGN”经 /bin/sh
+// 的 trap '' 再 exec 交下；屏蔽 waitid 用 scripts/run_without_syscall.tx。
+import { exeName, join, mkdirs, nat } from "./build_lib";
+import { captureLimited, captureRaw, makeDirLink } from "./test_lib";
+import { nap } from "./test_proto";
+import { Ctx, SEC, Run, chk, cut, runAt, runC, strs, text } from "./contract_lib";
+import { serviceSecurity } from "./service_security";
+
+const DRAIN_NS: int = 10000000000;
+const MAX_OUTPUT: int = 268435456;
+const GIB: int = 1073741824;
+const FIXTURES: []string = ["local-files", "process-budget", "reaper", "try-write"];
+const MARKERS: []string = ["PASS_LOCAL_BINARY_METADATA_BOUNDARY_RECOVERY", "PASS_HARD_CPU_OOM_RECOVERY", "PASS_REAPER_PROTECTED_STATUS_AND_DRAIN",
+    "PASS_TRY_WRITE_STOPPED_READER_FULL_RECOVERY_BLOCKING_WRITE_CLOSED_PEER"];
+const SERVICE_FIXTURES: []string = ["service-policy", "mount-policy", "worker-proof", "scratch", "proxy-stop", "binary-context"];
+const SERVICE_MARKERS: []string = ["PASS_POLICY_ROOT_BINARY_OUTSIDE_LINK_NETWORK", "PASS_MOUNT_POLICY_DEFAULT_OPTIN_NETWORK_NESTED_ESCAPE_SHADOW_FAILCLOSED",
+    "PASS_ACTUAL_WORKER_LIMITS", "PASS_SCRATCH_EXCLUSIVE_CAPACITY_REUSE_CONSERVATIVE_CLEANUP", "PASS_STOPPED_READER_FULL_PIPE_DEADLINE_REAP_RECOVERY",
+    "PASS_BINARY_CONTEXT_EXACT_BYTES_RECOVERY"];
+
+function windows(): bool {
+    return hostTarget() == "windows";
+}
+
+// 起样本：Windows 经硬限额起，类 Unix 直接起；至多 35 秒。
+function runFixture(c: Ref<Ctx>, program: string, args: List<string>): Ref<Run> {
+    if (windows()) {
+        const r = captureLimited(program, args, c.root, 35 * SEC, DRAIN_NS, MAX_OUTPUT, 2 * GIB, 60) catch (e) {
+            return new Run { code: -2, out: bytesNew(0), err: bytesFromStr(e.message) };
+        };
+        return new Run { code: r.code, out: r.out, err: r.err };
+    }
+    return runAt(program, args, c.root, 35);
+}
+
+function row(r: Ref<Run>): string {
+    return "{'exit': " + toStr(r.code) + ", 'stdout': " + text(r.out) + ", 'stderr': " + text(r.err) + "}";
+}
+
+function tailText(r: Ref<Run>, n: int): string {
+    const s = text(r.out) + text(r.err);
+    if (len(s) <= n) {
+        return s;
+    }
+    let k = len(s) - n;
+    while (k < len(s) && ((byteAt(s, k) ?? 0) & 192) == 128) {
+        k = k + 1;
+    }
+    return bytesToStr(bytesSlice(bytesFromStr(s), k, len(s) - k)) catch "";
+}
+
+function writeBytesTo(path: string, b: Bytes): void {
+    writeFileBytes(path, b) catch (e) {
+        eprint("写不了 " + path + "：" + e.message);
+    };
+}
+
+function writeTextTo(path: string, s: string): void {
+    writeFile(path, s) catch (e) {
+        eprint("写不了 " + path + "：" + e.message);
+    };
+}
+
+function exists(path: string): bool {
+    return (fileSize(path) catch -1) >= 0 || isDir(path);
+}
+
+function isDir(path: string): bool {
+    const xs = listDir(path) catch (e) {
+        return false;
+    };
+    return true;
+}
+
+function plusList(xs: List<string>, ys: List<string>): List<string> {
+    const out: List<string> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+    }
+    for (y in ys) {
+        listPush(out, y);
+    }
+    return out;
+}
+
+// 在 /bin/sh 里把 sig 设成忽略再 exec program（被忽略的信号跨 exec 保持忽略，POSIX）。
+function ignoring(sig: string, program: string, args: List<string>): List<string> {
+    const out = strs(["-c", "trap '' " + sig + "; exec \"$0\" \"$@\"", program]);
+    for (a in args) {
+        listPush(out, a);
+    }
+    return out;
+}
+
+export function toolSecurity(c0: Ref<Ctx>): void {
+    const work = jn(c0.work, "tool-security");
+    mkdirs(work);
+    const root = jn(work, "local-root");
+    const outside = jn(work, "outside");
+    mkdirs(root);
+    mkdirs(outside);
+    const okBin = bytesNew(3);
+    bytesSet(okBin, 0, 0);
+    bytesSet(okBin, 1, 255);
+    bytesSet(okBin, 2, 97);
+    writeBytesTo(jn(root, "ok.bin"), okBin);
+    writeBytesTo(jn(root, "empty.bin"), bytesNew(0));
+    // localListDir：大小写与中文名按字节排序。
+    mkdirs(jn(root, "sub"));
+    writeBytesTo(jn(jn(root, "sub"), "Case.tx"), bytesNew(0));
+    writeBytesTo(jn(jn(root, "sub"), "中文 名.tx"), bytesNew(0));
+    writeBytesTo(jn(outside, "secret.bin"), bytesFromStr("controlled-outside-marker"));
+    writeTextTo(jn(outside, "variant.tx"), "export function value(): int { return 1; }\n");
+    for (target in ["windows", "linux", "macos"]) {
+        writeTextTo(jn(outside, "variant_" + target + ".tx"), "export function controlledOutsideExport(): int { return 1; }\n");
+    }
+    const junction = jn(root, "junction");
+    if (!exists(junction)) {
+        makeDirLink(nat(outside), nat(junction), work) catch (e) {
+            eprint(e.message);
+        };
+    }
+    const c = new Ctx { t: c0.t, rows: c0.rows, compiler: c0.compiler, root: c0.root, work: work };
+
+    for (mode in ["normal", "leak", "debug"]) {
+        let flags: List<string> = listNew();
+        if (mode == "leak") {
+            flags = strs(["--leak-check"]);
+        } else if (mode == "debug") {
+            flags = strs(["--debug"]);
+        }
+        let k = 0;
+        while (k < len(FIXTURES)) {
+            const fixture = FIXTURES[k];
+            const marker = MARKERS[k];
+            const out = jn(work, fixture + "-" + mode);
+            const p = runC(c, plusList(plusList(strs(["build", jn(c.root, "tests/tool-security/" + fixture + ".tx"), "--toolchain"]), flags),
+                    strs(["--out", out])), 180);
+            chk(c, "security:build:" + fixture + ":" + mode, p.code == 0, tailText(p, 1000));
+            if (p.code != 0) {
+                k = k + 1;
+                continue;
+            }
+            const exe = jn(out, exeName(fixture));
+            let first = exe;
+            if (fixture == "local-files") {
+                first = root;
+            }
+            const r = runFixture(c, exe, strs([first]));
+            chk(c, "security:run:" + fixture + ":" + mode, r.code == 0 && strFind(text(r.out), marker) >= 0 && strFind(text(r.err), "[runtime:leak]") < 0, row(r));
+            if (fixture == "reaper" && !windows()) {
+                const q = runAt("/bin/sh", ignoring("CHLD", exe, strs([exe])), c.root, 15);
+                chk(c, "security:reaper-inherited-ignore-restored:" + mode, q.code == 0 && strFind(text(q.out), marker) >= 0
+                    && strFind(text(q.err), "[runtime:leak]") < 0, row(q));
+            }
+            if (fixture == "process-budget" || fixture == "try-write") {
+                const v = runFixture(c, exe, strs([exe, "invalid"]));
+                let name = "procTryWrite";
+                if (fixture == "process-budget") {
+                    name = "procSpawnLimited";
+                }
+                chk(c, "security:invalid-budget:" + mode, v.code == 3 && strFind(text(v.err), name) >= 0, row(v));
+            }
+            k = k + 1;
+        }
+    }
+
+    printPipe(c);
+
+    // 工具链专用内建：普通构建里是未定义符号（3001），报出名字。
+    const names: []string = ["procTryWrite", "procSpawnLimited", "readLocalFileBytes", "localEntryKind", "localFileSize", "localListDir"];
+    const exprs: []string = ["procTryWrite(0, 0, bytesNew(0))", "procSpawnLimited(\"x\", listNew(), \"\", 0, 1, 1)", "readLocalFileBytes(\"/\", \"x\", 1)",
+        "localEntryKind(\"/\", \"x\")", "localFileSize(\"/\", \"x\")", "localListDir(\"/\", \"x\")"];
+    let n = 0;
+    while (n < len(names)) {
+        const src = jn(work, "deny-" + names[n] + ".tx");
+        writeTextTo(src, "function main(args: []string): int { " + exprs[n] + "; return 0; }\n");
+        const p = runC(c, strs(["build", src, "--out", jn(work, "deny-out-" + names[n])]), 30);
+        const all = text(p.out) + text(p.err);
+        chk(c, "security:toolchain-only:" + names[n], p.code == 1 && strFind(all, "3001") >= 0 && strFind(all, names[n]) >= 0, cut(all, 800));
+        n = n + 1;
+    }
+
+    // 服务一侧的策略样本：复用同一门与受限执行驱动；协议测试另设私有源码根，不接触真实数据。
+    const binary = jn(work, "binary");
+    mkdirs(binary);
+    const all = bytesNew(256);
+    let b = 0;
+    while (b < 256) {
+        bytesSet(all, b, b);
+        b = b + 1;
+    }
+    writeBytesTo(jn(binary, "all.bin"), all);
+    writeBytesTo(jn(binary, "empty.bin"), bytesNew(0));
+    const main = jn(binary, "main.tx");
+    writeTextTo(main, "const a: Bytes = embedBytes(\"all.bin\");\nconst b: Bytes = embedBytes(\"all.bin\");\nconst c: Bytes = embedBytes(\"empty.bin\");\n"
+        + "function main(args: []string): int { return bytesLen(a) + bytesLen(b) + bytesLen(c); }\n");
+    let s = 0;
+    while (s < len(SERVICE_FIXTURES)) {
+        const fixture = SERVICE_FIXTURES[s];
+        const out = jn(work, fixture + "-normal");
+        const p = runC(c, strs(["build", jn(c.root, "tests/tool-security/" + fixture + ".tx"), "--toolchain", "--out", out]), 300);
+        chk(c, "security:service-build:" + fixture, p.code == 0, tailText(p, 1200));
+        if (p.code != 0) {
+            s = s + 1;
+            continue;
+        }
+        const executable = jn(out, exeName(fixture));
+        let args: List<string> = listNew();
+        if (fixture == "service-policy") {
+            args = strs([root]);
+        } else if (fixture == "worker-proof") {
+            args = strs([executable]);
+        } else if (fixture == "binary-context") {
+            args = strs([binary, main]);
+        }
+        const r = runFixture(c, executable, args);
+        chk(c, "security:service-run:" + fixture, r.code == 0 && strFind(text(r.out), SERVICE_MARKERS[s]) >= 0, row(r));
+        s = s + 1;
+    }
+    if (hostTarget() == "linux") {
+        waitWithoutWaitid(c);
+    }
+    serviceSecurity(c);
+}
+
+// 标准输出读端已关闭：stdoutWrite 得 −1；之后的 print 在 Unix 上按 SIGPIPE 结束（macOS 的工具链例程装过空
+// 处理函数也一样），父进程交下 SIG_IGN 时继续执行；Windows 没有 SIGPIPE，继续执行。
+function printPipe(c: Ref<Ctx>): void {
+    const out = jn(c.work, "print-pipe");
+    const p = runC(c, strs(["build", jn(c.root, "tests/tool-security/print-pipe.tx"), "--toolchain", "--out", out]), 180);
+    chk(c, "security:build:print-pipe", p.code == 0, tailText(p, 1000));
+    if (p.code != 0) {
+        return;
+    }
+    const exe = jn(out, exeName("print-pipe"));
+    const labels: List<string> = listNew();
+    listPush(labels, "default");
+    if (!windows()) {
+        listPush(labels, "ignored");
+    }
+    for (label in labels) {
+        let program = exe;
+        let args: List<string> = listNew();
+        if (label == "ignored") {
+            program = "/bin/sh";
+            args = ignoring("PIPE", exe, listNew());
+        }
+        let code = -2;
+        let errs = bytesNew(0);
+        const h = procSpawn(program, args, c.root, 1) catch (e) {
+            chk(c, "security:print-pipe:" + label, false, e.message);
+            continue;
+        };
+        procCloseStream(h, 1);
+        procCloseStream(h, 0);
+        const buf = bytesNew(65536);
+        const deadline = monoNs() + 30 * SEC;
+        while (monoNs() < deadline) {
+            const ready = ioWait(h, 4, 100);
+            if ((ready & 4) != 0) {
+                const got = procRead(h, 2, buf);
+                if (got < 0) {
+                    break;
+                }
+                bytesAppend(errs, bytesSlice(buf, 0, got));
+            }
+            if (ready < 0) {
+                break;
+            }
+        }
+        code = procWait(h, 30000) ?? -1;
+        procClose(h);
+        const e = text(errs);
+        const wrote = strFind(e, "stdoutWrite -1") >= 0;
+        const survived = strFind(e, "PASS_PRINT_PIPE_SURVIVED") >= 0;
+        let ok = code == 0 && wrote && survived;
+        if (!windows() && label == "default") {
+            ok = code == -13 && wrote && !survived;
+        }
+        chk(c, "security:print-pipe:" + label, ok, "(" + toStr(code) + ", " + e + ")");
+    }
+}
+
+// waitid 不可用（沙箱的 ENOSYS）时 procWait 须退回 wait4 得到真实退出码，并按组补杀同组后代；用 seccomp 屏蔽 waitid 复现。
+function waitWithoutWaitid(c: Ref<Ctx>): void {
+    const out = jn(c.work, "wait-nopeek");
+    const p = runC(c, strs(["build", jn(c.root, "tests/tool-security/wait-nopeek.tx"), "--toolchain", "--out", out]), 180);
+    chk(c, "security:build:wait-nopeek", p.code == 0, tailText(p, 1000));
+    if (p.code != 0) {
+        return;
+    }
+    const runner = jn(c.work, "run-without-syscall");
+    const q = runC(c, strs(["build", jn(c.root, "scripts/run_without_syscall.tx"), "--toolchain", "--out", runner]), 180);
+    chk(c, "security:build:run-without-syscall", q.code == 0, tailText(q, 1000));
+    if (q.code != 0) {
+        return;
+    }
+    const pidfile = jn(c.work, "wait-nopeek.pid");
+    removeFile(pidfile) catch (e) {};
+    const r = runAt(jn(runner, "run_without_syscall"), strs(["waitid", "--", jn(out, "wait-nopeek"), pidfile]), c.root, 60);
+    const raw = readFile(pidfile) catch "";
+    let pid = 0;
+    let i = 0;
+    let digits = true;
+    const trimmed = trimSpace(raw);
+    while (i < len(trimmed)) {
+        const ch = byteAt(trimmed, i) ?? 0;
+        if (ch < 48 || ch > 57) {
+            digits = false;
+        } else {
+            pid = pid * 10 + (ch - 48);
+        }
+        i = i + 1;
+    }
+    if (!digits || len(trimmed) == 0) {
+        pid = 0;
+    }
+    nap(500);
+    // 按命令行认人：PID 若已被复用，不算存活，也不误杀。
+    const cmdline = readFileBytes("/proc/" + toStr(pid) + "/cmdline") catch bytesNew(0);
+    const status = readFile("/proc/" + toStr(pid) + "/status") catch "";
+    const sleepArgv = bytesFromStr("sleep");
+    let isSleep = bytesLen(cmdline) > bytesLen(sleepArgv) && (bytesGet(cmdline, bytesLen(sleepArgv)) ?? 1) == 0;
+    let j = 0;
+    while (isSleep && j < bytesLen(sleepArgv)) {
+        if ((bytesGet(cmdline, j) ?? -1) != (bytesGet(sleepArgv, j) ?? -2)) {
+            isSleep = false;
+        }
+        j = j + 1;
+    }
+    const alive = pid > 0 && isSleep && strFind(status, "State:\tZ") < 0;
+    chk(c, "security:wait-without-waitid-reaps-group", r.code == 0 && strFind(text(r.out), "wait 0") >= 0 && pid > 0 && !alive,
+        "(" + toStr(r.code) + ", " + text(r.out) + ", " + text(r.err) + ", " + toStr(pid) + ", " + toStr(alive) + ")");
+    if (alive) {
+        // 失败时不把这个 sleep 留在机器上：它是本检查的夹具起的，已按命令行核对过。
+        killPid(pid);
+    }
+}
+
+function trimSpace(s: string): string {
+    let a = 0;
+    let b = len(s);
+    while (a < b && ((byteAt(s, a) ?? 0) == 32 || (byteAt(s, a) ?? 0) == 10 || (byteAt(s, a) ?? 0) == 13 || (byteAt(s, a) ?? 0) == 9)) {
+        a = a + 1;
+    }
+    while (b > a && ((byteAt(s, b - 1) ?? 0) == 32 || (byteAt(s, b - 1) ?? 0) == 10 || (byteAt(s, b - 1) ?? 0) == 13 || (byteAt(s, b - 1) ?? 0) == 9)) {
+        b = b - 1;
+    }
+    return bytesToStr(bytesSlice(bytesFromStr(s), a, b - a)) catch "";
+}
+
+// 结束一个本检查自己起的进程（经 kill 命令，避免为这一处在三端各写一份系统调用）。
+function killPid(pid: int): void {
+    const r = runAt("/bin/kill", strs(["-9", toStr(pid)]), "/", 10);
+}
+
+// 本地写法的路径拼接（Windows 上分隔符一律为 \）。
+function jn(a: string, b: string): string {
+    return nat(join(a, b));
+}

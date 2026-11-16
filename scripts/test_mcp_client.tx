@@ -1,0 +1,340 @@
+// 原生 `taixu mcp` 的测试客户端（从 test_mcp_e2e.tx 抽出，mcp-e2e 与 toolchain-contract 的服务边界检查共用）：以 stdio 起服务
+// （一行一个 JSON-RPC 消息），回复以独立的 test_json.tx 严格解析（没有 NaN、没有重名键；不与服务端共用 json_parse.tx），
+// 输入流尾经 procCloseStream（D3 v0.54）。
+import { J_NULL, J_OBJ, Jv, jDump, jGet, jIsBool, jIsTrue, jLen, jNull, jObject, jParseUnique, jQuote, jText } from "./test_json";
+import { at, dump, eqJson, has, isArr, isObj, item, sameJv, textIs, textOf, trueAt } from "./test_jv";
+import { MODE_LINES, Peer, peerClose, peerExited, peerFinish, peerPump, peerSend, peerStart } from "./test_proto";
+
+export const TIMEOUT_MS: int = 60000;
+const SEC: int = 1000000000;
+
+export function parseStrict(text: string): Ref<Jv>? {
+    const v = jParseUnique(bytesFromStr(text)) catch (e) {
+        return None;
+    };
+    return v;
+}
+
+export struct Mcp {
+    p: Ref<Peer>,
+    nextId: int,
+    sessions: List<string>,
+}
+
+// 一次 tools/call 的结果：structuredContent、isError（−1 无回复或协议错误，0 假或缺席，1 真，2 其他值）与错误（0 无、1 文本、2 JSON-RPC
+// error 对象）。
+export struct Res {
+    sc: Ref<Jv>?,
+    e: int,
+    kind: int,
+    text: string,
+    obj: Ref<Jv>?,
+}
+
+export function res(sc: Ref<Jv>?, e: int, kind: int, text: string, obj: Ref<Jv>?): Ref<Res> {
+    return new Res { sc: sc, e: e, kind: kind, text: text, obj: obj };
+}
+
+export function show(r: Ref<Res>): string {
+    let err = "None";
+    if (r.kind == 1) {
+        err = jQuote(r.text);
+    } else if (r.kind == 2) {
+        err = dump(r.obj);
+    }
+    return "(" + dump(r.sc) + ", " + eText(r) + ", " + err + ")";
+}
+
+export function eText(r: Ref<Res>): string {
+    if (r.e == 0) {
+        return "False";
+    }
+    if (r.e == 1) {
+        return "True";
+    }
+    if (r.e == 2) {
+        return "other";
+    }
+    return "None";
+}
+
+// Python 的 not e、e is True、e（真值）、err is None、err == 文本、err == {code, message}。
+export function notE(r: Ref<Res>): bool {
+    return r.e == 0 || r.e == -1;
+}
+
+export function isE(r: Ref<Res>): bool {
+    return r.e == 1;
+}
+
+export function errNone(r: Ref<Res>): bool {
+    return r.kind == 0;
+}
+
+export function errIs(r: Ref<Res>, want: string): bool {
+    return r.kind == 1 && r.text == want;
+}
+
+export function rpcErrIs(r: Ref<Res>, code: int, message: string): bool {
+    return r.kind == 2 && eqJson(r.obj, rpcErr(code, message));
+}
+
+export function rpcErr(code: int, message: string): string {
+    return "{\"code\": " + toStr(code) + ", \"message\": " + jQuote(message) + "}";
+}
+
+export function raw(m: Ref<Mcp>, text: string): bool {
+    return peerSend(m.p, bytesFromStr(text));
+}
+
+export function send(m: Ref<Mcp>, json: string): void {
+    const ok = raw(m, json + "\n");
+}
+
+// 回复 id 等于 rid（JSON 原文；"null" 同时认缺席的 id）的那条消息，取走。
+export function takeId(m: Ref<Mcp>, rid: string): Ref<Jv>? {
+    let i = 0;
+    while (i < listLen(m.p.msgs)) {
+        const msg = listGet(m.p.msgs, i) catch jNull();
+        if (idMatches(msg, rid)) {
+            listRemoveAt(m.p.msgs, i);
+            return msg;
+        }
+        i = i + 1;
+    }
+    return None;
+}
+
+export function idMatches(msg: Ref<Jv>, rid: string): bool {
+    if (msg.kind != J_OBJ) {
+        return false;
+    }
+    const id = jGet(msg, "id");
+    if (rid == "null") {
+        return id == None || (id ?? msg).kind == J_NULL;
+    }
+    if (id == None) {
+        return false;
+    }
+    return jDump(id ?? msg) == rid;
+}
+
+export function waitId(m: Ref<Mcp>, rid: string, limitMs: int): Ref<Jv>? {
+    const end = monoNs() + limitMs * 1000000;
+    while (true) {
+        const hit = takeId(m, rid);
+        if (hit != None) {
+            return hit;
+        }
+        if (peerExited(m.p)) {
+            // 服务已退出：读完管道里余下的输出（至多 1 秒）再找一次。
+            const drain = monoNs() + SEC;
+            while (m.p.outOpen && monoNs() < drain) {
+                peerPump(m.p, 50);
+            }
+            return takeId(m, rid);
+        }
+        const left = (end - monoNs()) / 1000000;
+        if (left <= 0) {
+            return None;
+        }
+        let wait = left;
+        if (wait > 100) {
+            wait = 100;
+        }
+        peerPump(m.p, wait);
+    }
+    return None;
+}
+
+// 发一个请求（params 为 JSON 原文，空串表示不带），等 id 为 rid 的回复。
+export function callRid(m: Ref<Mcp>, method: string, params: string, rid: string): Ref<Jv>? {
+    let msg = "{\"jsonrpc\": \"2.0\", \"id\": " + rid + ", \"method\": " + jQuote(method);
+    if (len(params) > 0) {
+        msg = msg + ", \"params\": " + params;
+    }
+    send(m, msg + "}");
+    return waitId(m, rid, TIMEOUT_MS);
+}
+
+export function call(m: Ref<Mcp>, method: string, params: string): Ref<Jv>? {
+    m.nextId = m.nextId + 1;
+    return callRid(m, method, params, toStr(m.nextId));
+}
+
+export function tool(m: Ref<Mcp>, name: string, args: string): Ref<Res> {
+    m.nextId = m.nextId + 1;
+    send(m, "{\"jsonrpc\": \"2.0\", \"id\": " + toStr(m.nextId) + ", \"method\": \"tools/call\", \"params\": {\"name\": " + jQuote(name)
+        + ", \"arguments\": " + args + "}}");
+    const r = waitId(m, toStr(m.nextId), TIMEOUT_MS);
+    if (r == None) {
+        return res(None, -1, 1, "no reply", None);
+    }
+    const reply = r ?? jNull();
+    const error = jGet(reply, "error");
+    if (error != None) {
+        return res(None, -1, 2, "", error);
+    }
+    const result = jGet(reply, "result") ?? jObject();
+    const content = jGet(result, "content");
+    if (result.kind != J_OBJ || !has(result, "structuredContent")) {
+        const first = item(content, 0);
+        if (result.kind == J_OBJ && trueAt(result, "isError") && isArr(content) && jLen(content ?? result) == 1 && textIs(first, "type", "text")
+            && jText(at(first, "text")) != None) {
+            return res(None, 1, 1, textOf(first, "text"), None);
+        }
+        return res(None, -1, 1, "invalid text-only error result: " + jDump(result), None);
+    }
+    const sc = jGet(result, "structuredContent");
+    const text = jText(at(item(content, 0), "text"));
+    if (text == None || !sameJv(parseStrict(text ?? ""), sc)) {
+        return res(None, -1, 1, "content text does not match structuredContent: " + jDump(result), None);
+    }
+    if (name == "debug_start" && isObj(sc) && jText(at(sc, "session")) != None) {
+        listPush(m.sessions, textOf(sc, "session"));
+    }
+    const flag = jGet(result, "isError");
+    let e = 0;
+    if (jIsTrue(flag)) {
+        e = 1;
+    } else if (flag != None && !jIsBool(flag)) {
+        e = 2;
+    }
+    return res(sc, e, 0, "", None);
+}
+
+export function session(m: Ref<Mcp>, n: int): string {
+    return listGet(m.sessions, n - 1) catch ("<missing-session-" + toStr(n) + ">");
+}
+
+// 同 session 实参的 JSON：{"session": "<第 n 个会话>"}。
+export function sid(m: Ref<Mcp>, n: int): string {
+    return "{\"session\": " + jQuote(session(m, n)) + "}";
+}
+
+// 会话 ID 形如 <代>.<n>、在本进程内两两不同，同一代内 n 递增（回复里的 ID 不能只和自己比）。
+export function idsValid(m: Ref<Mcp>): bool {
+    const gens: List<int> = listNew();
+    const lasts: List<int> = listNew();
+    let i = 0;
+    while (i < listLen(m.sessions)) {
+        const s = listGet(m.sessions, i) catch "";
+        let j = 0;
+        while (j < i) {
+            if ((listGet(m.sessions, j) catch "") == s) {
+                return false;
+            }
+            j = j + 1;
+        }
+        const dot = indexOfByte(s, 46);
+        if (dot < 0) {
+            return false;
+        }
+        const g = posInt(byteText(s, 0, dot));
+        const n = posInt(byteText(s, dot + 1, len(s) - dot - 1));
+        if (g <= 0 || n <= 0) {
+            return false;
+        }
+        let k = 0;
+        let found = false;
+        while (k < listLen(gens)) {
+            if ((listGet(gens, k) catch 0) == g) {
+                found = true;
+                if (n <= (listGet(lasts, k) catch 0)) {
+                    return false;
+                }
+                listSet(lasts, k, n);
+            }
+            k = k + 1;
+        }
+        if (!found) {
+            listPush(gens, g);
+            listPush(lasts, n);
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+export function indexOfByte(s: string, b: int): int {
+    let i = 0;
+    while (i < len(s)) {
+        if ((byteAt(s, i) ?? 0) == b) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+export function byteText(s: string, from: int, n: int): string {
+    return bytesToStr(bytesSlice(bytesFromStr(s), from, n)) catch "";
+}
+
+// [1-9][0-9]* 的值；不是得 −1。
+export function posInt(s: string): int {
+    if (len(s) == 0 || len(s) > 18 || (byteAt(s, 0) ?? 48) == 48) {
+        return -1;
+    }
+    let v = 0;
+    let i = 0;
+    while (i < len(s)) {
+        const d = byteAt(s, i) ?? 0;
+        if (d < 48 || d > 57) {
+            return -1;
+        }
+        v = v * 10 + (d - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+export function finish(m: Ref<Mcp>): int {
+    const code = peerFinish(m.p, 30000);
+    peerClose(m.p);
+    return code ?? -100000;
+}
+
+export function badHead(m: Ref<Mcp>): string {
+    return listGet(m.p.bad, 0) catch "";
+}
+
+export function hardTimeout(s: Ref<Jv>?): bool {
+    return isObj(s) && textIs(s, "schema", "tool-error/1") && textIs(s, "reason", "request_timeout") && trueAt(s, "termination_requested")
+    && trueAt(s, "reaped") && trueAt(s, "artifacts_cleaned");
+}
+
+// 在 cwd 里起 `exe mcp <serverArgs…>`，TMP、TEMP、TMPDIR 指向 tmpdir（只在起进程时设，随即恢复；原先没有的恢复成空串——运行时把空的
+// TMPDIR 当作未设）。
+export function mcpOpen(exe: string, cwd: string, tmpdir: string, serverArgs: List<string>): Ref<Mcp> | Error {
+    const names: []string = ["TMP", "TEMP", "TMPDIR"];
+    const old: List<string> = listNew();
+    for (n in names) {
+        listPush(old, getEnv(n) ?? "");
+        setEnv(n, tmpdir)?;
+    }
+    const args: List<string> = listNew();
+    listPush(args, "mcp");
+    for (a in serverArgs) {
+        listPush(args, a);
+    }
+    const p = peerStart(exe, args, cwd, MODE_LINES, true);
+    let k = 0;
+    for (n in names) {
+        setEnv(n, listGet(old, k) catch "")?;
+        k = k + 1;
+    }
+    const peer = p?;
+    const sessions: List<string> = listNew();
+    return new Mcp { p: peer, nextId: 0, sessions: sessions };
+}
+
+// 尚未取走的消息。
+export function pending(m: Ref<Mcp>): List<Ref<Jv>> {
+    return m.p.msgs;
+}
+
+// 服务进程号。
+export function mcpPid(m: Ref<Mcp>): int {
+    return procPid(m.p.h);
+}

@@ -9,28 +9,72 @@
 //   进入（rtfn 里是 rtCall0）。手写版先把栈按 16 字节对齐，以便手写汇编从任意栈状态跳入；rtfn 的例程不自己对齐——x86 上蹦床
 //   会再对齐（unix_sys.tx 的 enter），A64 的 sp 始终 16 字节对齐，所以从手写汇编跳入同样安全。
 import { StructuredBuffer, asBufferSection } from "./assemble";
-import { RtFn, RtOp, L, I, A } from "./rtfn_base";
-import { rtBegin, rtEnd, rtFailed, rtLabel, rtIf, rtSet, rtRet, rtRetVoid, rtRdataBytes } from "./rtfn";
+import { RtFn, RtOp, L, I, A, G } from "./rtfn_base";
+import { rtBegin, rtEnd, rtFailed, rtLabel, rtIf, rtSet, rtSetGlobal, rtShift, rtAddrOf, rtCall0, rtRet, rtRetVoid, rtRdataBytes } from "./rtfn";
 import { uxMac, uxSys } from "./unix_sys";
 
 const MODULE: string = "bootstrap/selfhost/unix_sys_generic.tx";
 // macOS 的 PROT_READ|PROT_WRITE、MAP_PRIVATE|MAP_ANON（0x1002）。
 const PROT_RW: int = 3;
 const MAP_PRIVATE_ANON: int = 4098;
+/// 单次取页上限只查超过它的请求（1 GiB；上限为物理内存的 4 倍，支持的 Mac 物理内存都在 4 GiB 以上），小请求不付 sysctl 与比较
+/// （docs/design/v052-macos-huge-alloc-v0.1-20261111.md 乙案）。
+export const MAC_PAGE_CAP_FLOOR: int = 1073741824;
+// sysctl 的 {CTL_HW 6, HW_MEMSIZE 24}（<sys/sysctl.h>），两个 int 按小端拼成一个 8 字节局部量。
+const MIB_HW_MEMSIZE: int = 103079215110;
+// 上限 = 物理内存 << 2（4 倍：Windows 系统管理的页面文件最大为 3 倍内存，缺省配置下提交上限约为 4 倍内存；macOS 的交换区随用
+// 随增，与之同类）。物理内存超过 2^61 时左移会越出无符号 64 位，按“不设上限”处理。
+const MAC_PAGE_CAP_SHIFT: int = 2;
+const MAC_PAGE_CAP_MEM_MAX: int = 2305843009213693952;
 
 function done(f: Ref<RtFn>, failures: List<string>): void {
     rtEnd(f);
     if (len(rtFailed(f)) > 0) { listPush(failures, rtFailed(f)); }
 }
 
-/// 发出 macOS 的页适配器；rtfn 的失败记进 failures。t 为目标编号（只有 macOS 用）。
+/// 发出 __tx_mac_page_cap() → 单次取页的上限（字节）：物理内存 hw.memsize 的 4 倍，首次经 sysctl 取得后记进 .bss 的
+/// __tx_mac_page_cap_bytes（多个线程同时首次取到同一个值，重复写无害，同 kernel_alloc_check.tx 的页长）；取不到、取得 0 或物理内存
+/// 超过 2^61 时记 −1（无符号最大，不设上限，只由 mmap 判定）。x86 手写版与可移植版的页适配器共用它。
+export function macPageCapEmit(b: Ref<StructuredBuffer>, failures: List<string>): void {
+    asBufferSection(b, 0, 1);
+    const f = rtBegin(b, "__tx_mac_page_cap", "", "cap mib v n mp vp np r", 6, MODULE);
+    rtSet(f, "cap", G("__tx_mac_page_cap_bytes"));
+    rtIf(f, L("cap"), "ne", I(0), "out");
+    rtSet(f, "mib", I(MIB_HW_MEMSIZE));
+    rtSet(f, "v", I(0));
+    rtSet(f, "n", I(8));
+    rtAddrOf(f, "mp", "mib");
+    rtAddrOf(f, "vp", "v");
+    rtAddrOf(f, "np", "n");
+    const sargs: List<Ref<RtOp>> = listNew();
+    listPush(sargs, L("mp")); listPush(sargs, I(2)); listPush(sargs, L("vp")); listPush(sargs, L("np")); listPush(sargs, I(0)); listPush(sargs, I(0));
+    uxMac(f, "r", "sysctl", sargs);
+    rtSet(f, "cap", I(-1));
+    rtIf(f, L("r"), "ne", I(0), "keep");
+    rtIf(f, L("v"), "eq", I(0), "keep");
+    rtIf(f, L("v"), "ugt", I(MAC_PAGE_CAP_MEM_MAX), "keep");
+    rtShift(f, "cap", L("v"), "shl", MAC_PAGE_CAP_SHIFT);
+    rtLabel(f, "keep");
+    rtSetGlobal(f, "__tx_mac_page_cap_bytes", L("cap"));
+    rtLabel(f, "out");
+    rtRet(f, L("cap"));
+    done(f, failures);
+}
+
+/// 发出 macOS 的页适配器；rtfn 的失败记进 failures。t 为目标编号（只有 macOS 用）。超过 MAC_PAGE_CAP_FLOOR 的请求先与
+/// __tx_mac_page_cap() 比较，超出即得 0（同 mmap 失败）：macOS 不做提交计费，映射几乎总成功、触碰时才由系统杀掉进程。
 export function macPageAdaptersGenericEmit(b: Ref<StructuredBuffer>, failures: List<string>, t: int): void {
     asBufferSection(b, 0, 1);
     let f = rtBegin(b, "__tx_mac_page_alloc", "a size c d", "r", 6, MODULE);
+    rtIf(f, L("size"), "ule", I(MAC_PAGE_CAP_FLOOR), "map");
+    rtCall0(f, "r", "__tx_mac_page_cap");
+    rtIf(f, L("size"), "ugt", L("r"), "none");
+    rtLabel(f, "map");
     const margs: List<Ref<RtOp>> = listNew();
     listPush(margs, I(0)); listPush(margs, L("size")); listPush(margs, I(PROT_RW)); listPush(margs, I(MAP_PRIVATE_ANON)); listPush(margs, I(-1)); listPush(margs, I(0));
     uxMac(f, "r", "mmap", margs);
     rtIf(f, L("r"), "ult", I(-4095), "ok");
+    rtLabel(f, "none");
     rtRet(f, I(0));
     rtLabel(f, "ok");
     rtRet(f, L("r"));

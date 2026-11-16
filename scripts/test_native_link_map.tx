@@ -1,0 +1,1275 @@
+// 链接映射（link-map/7）的门（gate.tx 的 link-map 步）：生产链接器的映射对照独立构造的 ELF64／COFF 夹具与
+// 产物头——探针 bootstrap/native_link_map_probe.tx（--leak-check）核对所有权、重入与无泄漏，映射的符号、地址、重定位字节、BSS
+// 范围与人读文本；单字段损坏的夹具须干净拒绝（不出部分映射），COFF 重定位的隐式加数越界与回绕；七个目标的 CLI 映射对照
+// 实际 ELF／PE／Mach-O 头与产物符号表（--strip 产物另核），以及写入失败、与产物同名、用法错误。
+// 运行（仓根）：taixu run --toolchain scripts/test_native_link_map.tx --compiler <taixu> --work <目录> [--root <仓库>]
+// FAIL 行与报告里的细节写成本文件的文字；映射不是 JSON、映像头读不全时记该项失败。
+import { absolute, exeName, join, kindOf, mkdirs, nat, readBytes } from "./build_lib";
+import { osRealPath } from "./build_os";
+import { hexOf, lossyText, sha256Of } from "./check_lib";
+import { ESCAPED, Fixture, Layout, Seg, UNICODE, coffObject, elfObject, fileAt, getLE, hexVal, imageLayout, rawName, sameSegs, segsText, setLE,
+    ult } from "./check_obj";
+import { allTargets, productName } from "./targets";
+import { captureRaw } from "./test_lib";
+import { J_BOOL, J_NUM, Jv, jArray, jDump, jNull, jObject, jParseBytes, jPretty, jPush, jSet, jString } from "./test_json";
+import { at, count, dump, isNull, item, textIs, textOf, truthy } from "./test_jv";
+import { contains, headChars, reprBytes } from "./test_text";
+
+const SEC: int = 1000000000;
+const MAX_OUTPUT: int = 67108864;
+const U64_DEC: string = "18446744073709551615";
+
+struct Ctx {
+    compiler: string,
+    root: string,
+    work: string,
+    rows: Ref<Jv>,
+    total: int,
+    failures: int,
+}
+
+struct Res {
+    code: int,
+    out: Bytes,
+    err: Bytes,
+}
+
+function check(c: Ref<Ctx>, name: string, ok: bool, detail: string): bool {
+    const row = jObject();
+    jSet(row, "name", jString(name));
+    jSet(row, "ok", boolJv(ok));
+    jSet(row, "detail", jString(headChars(detail, 1500)));
+    jPush(c.rows, row);
+    c.total = c.total + 1;
+    if (ok) {
+        print("PASS " + name + " ");
+    } else {
+        c.failures = c.failures + 1;
+        print("FAIL " + name + " " + headChars(detail, 500));
+    }
+    return ok;
+}
+
+function boolJv(b: bool): Ref<Jv> {
+    return new Jv { kind: J_BOOL, text: "", truth: b, items: listNew(), keys: listNew() };
+}
+
+function numJv(n: int): Ref<Jv> {
+    return new Jv { kind: J_NUM, text: toStr(n), truth: false, items: listNew(), keys: listNew() };
+}
+
+function sh(c: Ref<Ctx>, exe: string, args: List<string>, limit: int): Res {
+    const r = captureRaw(exe, args, c.work, limit * SEC, 10 * SEC, MAX_OUTPUT) catch (e) {
+        return Res { code: -2, out: bytesNew(0), err: bytesFromStr(e.message) };
+    };
+    return Res { code: r.code, out: r.out, err: r.err };
+}
+
+function tx(c: Ref<Ctx>, args: List<string>): Res {
+    return sh(c, c.compiler, args, 300);
+}
+
+function strs(a: []string): List<string> {
+    const xs: List<string> = listNew();
+    for (x in a) {
+        listPush(xs, x);
+    }
+    return xs;
+}
+
+function plusL(xs: List<string>, ys: List<string>): List<string> {
+    const out: List<string> = listNew();
+    for (x in xs) {
+        listPush(out, x);
+    }
+    for (y in ys) {
+        listPush(out, y);
+    }
+    return out;
+}
+
+function resText(r: Res): string {
+    return "(" + toStr(r.code) + ", " + reprBytes(r.out, 300) + ", " + reprBytes(r.err, 300) + ")";
+}
+
+function parseOr(b: Bytes): Ref<Jv>? {
+    const v = jParseBytes(b) catch (e) {
+        return None;
+    };
+    return v;
+}
+
+function readOr(path: string): Bytes {
+    return readBytes(path) catch bytesNew(0);
+}
+
+function shaHex(d: Bytes): string {
+    return hexOf(sha256Of(d, 0, bytesLen(d)));
+}
+
+function hexOfStr(s: string): string {
+    return "0x" + hexOf(bytesFromStr(s));
+}
+
+function hexOfBytes(b: Bytes): string {
+    return "0x" + hexOf(b);
+}
+
+// 映射里名字字节为 nameHex（"0x…"）的第一个符号，objIndex ≥ 0 时还须在该对象里；没有得 None。
+function named(syms: Ref<Jv>?, nameHex: string, objIndex: int): Ref<Jv>? {
+    let i = 0;
+    while (i < count(syms)) {
+        const s = item(syms, i);
+        if (textIs(s, "name_bytes", nameHex) && (objIndex < 0 || numIs(at(s, "object_index"), objIndex))) {
+            return s;
+        }
+        i = i + 1;
+    }
+    return None;
+}
+
+function numIs(v: Ref<Jv>?, want: int): bool {
+    if (v == None) {
+        return false;
+    }
+    const x = v ?? jNull();
+    return x.kind == J_NUM && x.text == toStr(want);
+}
+
+function hexAt(v: Ref<Jv>?, key: string): int {
+    return hexVal(textOf(v, key)) ?? 0;
+}
+
+function decAt(v: Ref<Jv>?, key: string): int {
+    const t = textOf(v, key);
+    let n = 0;
+    let i = 0;
+    while (i < len(t)) {
+        n = wrapAdd(wrapMul(n, 10), (byteAt(t, i) ?? 48) - 48);
+        i = i + 1;
+    }
+    return n;
+}
+
+// 0x 加 16 位小写十六进制。
+function isHex16(t: string): bool {
+    if (len(t) != 18 || (byteAt(t, 0) ?? 0) != 48 || (byteAt(t, 1) ?? 0) != 120) {
+        return false;
+    }
+    let i = 2;
+    while (i < 18) {
+        const d = byteAt(t, i) ?? 0;
+        if (!((d >= 48 && d <= 57) || (d >= 97 && d <= 102))) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 产物函数符号的期望名（v052-image-symbols）：程序函数 <模块>.<函数>，模块去掉开头的 ./ 与结尾的 .tx；其余为链接名。
+function symbolName(f: Ref<Jv>?): string {
+    if (!textIs(f, "origin", "tx-generated")) {
+        return textOf(f, "link_name");
+    }
+    let module = textOf(f, "module");
+    if (module == "<prelude>") {
+        return "prelude." + textOf(f, "name");
+    }
+    while (len(module) >= 2 && (byteAt(module, 0) ?? 0) == 46 && (byteAt(module, 1) ?? 0) == 47) {
+        module = bytesToStr(bytesSlice(bytesFromStr(module), 2, len(module) - 2)) catch module;
+    }
+    if (len(module) > 3 && endsWithTx(module)) {
+        module = bytesToStr(bytesSlice(bytesFromStr(module), 0, len(module) - 3)) catch module;
+    }
+    return module + "." + textOf(f, "name");
+}
+
+function endsWithTx(s: string): bool {
+    const n = len(s);
+    return (byteAt(s, n - 3) ?? 0) == 46 && (byteAt(s, n - 2) ?? 0) == 116 && (byteAt(s, n - 1) ?? 0) == 120;
+}
+
+// image 里 at 起到 NUL 之前的 UTF-8 串；没有 NUL 或不是合法 UTF-8 得 None。
+function cstrAt(image: Bytes, at: int): string? {
+    if (at < 0 || at >= bytesLen(image)) {
+        return None;
+    }
+    let end = at;
+    while (end < bytesLen(image) && (bytesGet(image, end) ?? 0) != 0) {
+        end = end + 1;
+    }
+    if (end >= bytesLen(image)) {
+        return None;
+    }
+    const s = bytesToStr(bytesSlice(image, at, end - at)) catch (e) {
+        return None;
+    };
+    return s;
+}
+
+struct Verdict {
+    ok: bool,
+    why: string,
+}
+
+function bad(why: string): Verdict {
+    return Verdict { ok: false, why: why };
+}
+
+function masked(b: Bytes, end: int): Bytes {
+    const out = bytesNew(0);
+    bytesAppend(out, bytesSlice(b, 0, 40));
+    bytesAppend(out, bytesSlice(b, 48, 10));
+    if (end > 64) {
+        bytesAppend(out, bytesSlice(b, 64, end - 64));
+    }
+    return out;
+}
+
+// 独立解析 ELF 节头与 .symtab：节头与符号表在全部 PT_LOAD 之后；每个函数恰有一个同名、同址、同大小的本地 STT_FUNC（大小为 0 的
+// 是函数表以外的代码标号，不计）；--strip 的产物没有节头，可装载部分与带符号的逐字节相同（只差 ELF 头的 e_shoff／e_shentsize／
+// e_shnum／e_shstrndx）。
+function elfSymbolCheck(image: Bytes, stripped: Bytes, functions: Ref<Jv>?): Verdict {
+    if (bytesLen(image) < 64) {
+        return bad("short image");
+    }
+    const phoff = getLE(image, 32, 8);
+    const shoff = getLE(image, 40, 8);
+    const phnum = getLE(image, 56, 2);
+    const shentsize = getLE(image, 58, 2);
+    const shnum = getLE(image, 60, 2);
+    const shstrndx = getLE(image, 62, 2);
+    let end = 0;
+    let i = 0;
+    const lOff: List<int> = listNew();
+    const lFile: List<int> = listNew();
+    while (i < phnum) {
+        const p = phoff + 56 * i;
+        if (getLE(image, p, 4) == 1) {
+            const off = getLE(image, p + 8, 8);
+            const file = getLE(image, p + 32, 8);
+            listPush(lOff, off);
+            listPush(lFile, file);
+            if (off + file > end) {
+                end = off + file;
+            }
+        }
+        i = i + 1;
+    }
+    if (shentsize != 64 || shnum == 0 || shoff < end) {
+        return bad("section headers " + toStr(shoff) + " " + toStr(shentsize) + " " + toStr(shnum) + " " + toStr(end));
+    }
+    if (shoff + 64 * shnum > bytesLen(image) || shstrndx >= shnum) {
+        return bad("section header table outside the file");
+    }
+    const names: List<string> = listNew();
+    const shstr = getLE(image, shoff + 64 * shstrndx + 24, 8);
+    i = 0;
+    while (i < shnum) {
+        const h = shoff + 64 * i;
+        const name = cstrAt(image, shstr + getLE(image, h, 4));
+        if (name == None) {
+            return bad("section name " + toStr(i));
+        }
+        listPush(names, name ?? "");
+        i = i + 1;
+    }
+    let symtab = -1;
+    let text = -1;
+    i = 0;
+    while (i < shnum) {
+        const h = shoff + 64 * i;
+        const name = listGet(names, i) catch "";
+        const kind = getLE(image, h + 4, 4);
+        const flags = getLE(image, h + 8, 8);
+        const addr = getLE(image, h + 16, 8);
+        const off = getLE(image, h + 24, 8);
+        const size = getLE(image, h + 32, 8);
+        if ((flags & 2) != 0 && kind != 8) {
+            let inside = false;
+            let k = 0;
+            while (k < listLen(lOff)) {
+                const o = listGet(lOff, k) catch 0;
+                const f = listGet(lFile, k) catch 0;
+                if (o <= off && off + size <= o + f) {
+                    inside = true;
+                }
+                k = k + 1;
+            }
+            if (addr != 4194304 + off || !inside) {
+                return bad("allocated section outside its load segment " + name);
+            }
+        }
+        if ((flags & 2) == 0 && kind != 0 && off < end) {
+            return bad("symbol tables overlap the loaded image " + name);
+        }
+        if (symtab < 0 && name == ".symtab") {
+            symtab = i;
+        }
+        if (text < 0 && name == ".text") {
+            text = i;
+        }
+        i = i + 1;
+    }
+    if (symtab < 0 || text < 0) {
+        return bad(".symtab or .text missing");
+    }
+    const sh = shoff + 64 * symtab;
+    const off = getLE(image, sh + 24, 8);
+    const size = getLE(image, sh + 32, 8);
+    const link = getLE(image, sh + 40, 4);
+    const info = getLE(image, sh + 44, 4);
+    const entsize = getLE(image, sh + 56, 8);
+    if (link >= shnum) {
+        return bad("symtab link");
+    }
+    const strings = getLE(image, shoff + 64 * link + 24, 8);
+    const nsyms = size / 24;
+    let zero = true;
+    let k = 0;
+    while (k < 24) {
+        if ((bytesGet(image, off + k) ?? 1) != 0) {
+            zero = false;
+        }
+        k = k + 1;
+    }
+    if (entsize != 24 || info != nsyms || !zero) {
+        return bad("symtab header " + toStr(entsize) + " " + toStr(info) + " " + toStr(nsyms));
+    }
+    const th = shoff + 64 * text;
+    const tlo = getLE(image, th + 16, 8);
+    const tsize = getLE(image, th + 32, 8);
+    const funcs: Map<string, int> = mapNew();
+    let funcKeys = 0;
+    let s = 1;
+    while (s < nsyms) {
+        const at = off + 24 * s;
+        const sname = getLE(image, at, 4);
+        const sinfo = getLE(image, at + 4, 1);
+        const shndx = getLE(image, at + 6, 2);
+        const value = getLE(image, at + 8, 8);
+        const ssize = getLE(image, at + 16, 8);
+        const nm = cstrAt(image, strings + sname);
+        if (nm == None) {
+            return bad("symbol name");
+        }
+        if ((sinfo >> 4) != 0) {
+            return bad("non-local symbol " + (nm ?? ""));
+        }
+        if ((sinfo & 15) == 2) {
+            if (shndx != text || !(tlo <= value && value + ssize <= tlo + tsize)) {
+                return bad("function symbol outside .text " + (nm ?? ""));
+            }
+            if (ssize != 0) {
+                const key = (nm ?? "") + "\n" + toStr(value) + "\n" + toStr(ssize);
+                const old = mapGet(funcs, key) ?? 0;
+                if (old == 0) {
+                    funcKeys = funcKeys + 1;
+                }
+                mapSet(funcs, key, old + 1);
+            }
+        }
+        s = s + 1;
+    }
+    let total = 0;
+    let wantCount = 0;
+    const wantSet: Map<string, int> = mapNew();
+    let distinct = 0;
+    let missing = "";
+    let nmissing = 0;
+    i = 0;
+    while (i < count(functions)) {
+        const f = item(functions, i);
+        const key = symbolName(f) + "\n" + toStr(hexAt(f, "link_va")) + "\n" + toStr(decAt(f, "bytes"));
+        if ((mapGet(funcs, key) ?? 0) != 1) {
+            if (nmissing < 5) {
+                missing = missing + " " + symbolName(f);
+            }
+            nmissing = nmissing + 1;
+        }
+        if ((mapGet(wantSet, key) ?? 0) == 0) {
+            distinct = distinct + 1;
+            mapSet(wantSet, key, 1);
+        }
+        wantCount = wantCount + 1;
+        i = i + 1;
+    }
+    // 函数符号的总数（重复的也算）须等于函数个数。
+    s = 1;
+    while (s < nsyms) {
+        const at = off + 24 * s;
+        if ((getLE(image, at + 4, 1) & 15) == 2 && getLE(image, at + 16, 8) != 0) {
+            total = total + 1;
+        }
+        s = s + 1;
+    }
+    if (nmissing > 0 || funcKeys != distinct || total != wantCount) {
+        return bad("functions missing" + missing + " " + toStr(funcKeys) + " " + toStr(wantCount));
+    }
+    if (bytesLen(stripped) == 0) {
+        return bad("no --strip product");
+    }
+    const sShoff = getLE(stripped, 40, 8);
+    const sShnum = getLE(stripped, 60, 2);
+    if (sShoff != 0 || sShnum != 0 || bytesLen(stripped) != end || !bytesEqual(masked(stripped, end), masked(image, end))) {
+        return bad("--strip product " + toStr(sShoff) + " " + toStr(sShnum) + " " + toStr(bytesLen(stripped)) + " " + toStr(end));
+    }
+    return Verdict { ok: true, why: toStr(wantCount) };
+}
+
+struct MachSec {
+    name: string,
+    n: int,
+    addr: int,
+    data: Bytes,
+}
+
+struct MachSyms {
+    ok: bool,
+    secs: List<MachSec>,
+    names: List<string>,
+    types: List<int>,
+    sects: List<int>,
+    values: List<int>,
+}
+
+function machParse(data: Bytes): MachSyms {
+    const r = MachSyms { ok: false, secs: listNew(), names: listNew(), types: listNew(), sects: listNew(), values: listNew() };
+    if (bytesLen(data) < 32) {
+        return r;
+    }
+    const ncmds = getLE(data, 16, 4);
+    let at = 32;
+    let n = 0;
+    let symoff = -1;
+    let stroff = 0;
+    let ilocal = 0;
+    let nlocal = 0;
+    let haveDysym = false;
+    let k = 0;
+    while (k < ncmds) {
+        if (at + 8 > bytesLen(data)) {
+            return r;
+        }
+        const cmd = getLE(data, at, 4);
+        const size = getLE(data, at + 4, 4);
+        if (cmd == 25) {
+            const nsects = getLE(data, at + 64, 4);
+            let j = 0;
+            while (j < nsects) {
+                const h = at + 72 + 80 * j;
+                n = n + 1;
+                const addr = getLE(data, h + 32, 8);
+                const length = getLE(data, h + 40, 8);
+                const off = getLE(data, h + 48, 4);
+                let body = bytesNew(0);
+                if (off != 0) {
+                    if (off + length > bytesLen(data)) {
+                        body = bytesSlice(data, off, bytesLen(data) - off);
+                    } else {
+                        body = bytesSlice(data, off, length);
+                    }
+                }
+                const nb = bytesSlice(data, h, 16);
+                let e = 16;
+                while (e > 0 && (bytesGet(nb, e - 1) ?? 1) == 0) {
+                    e = e - 1;
+                }
+                listPush(r.secs, MachSec { name: bytesToStr(bytesSlice(nb, 0, e)) catch "", n: n, addr: addr, data: body });
+                j = j + 1;
+            }
+        }
+        if (cmd == 2) {
+            symoff = getLE(data, at + 8, 4);
+            stroff = getLE(data, at + 16, 4);
+        }
+        if (cmd == 11) {
+            ilocal = getLE(data, at + 8, 4);
+            nlocal = getLE(data, at + 12, 4);
+            haveDysym = true;
+        }
+        at = at + size;
+        k = k + 1;
+    }
+    if (symoff < 0 || !haveDysym) {
+        return r;
+    }
+    let i = 0;
+    while (i < nlocal) {
+        const p = symoff + 16 * (ilocal + i);
+        if (p + 16 > bytesLen(data)) {
+            return r;
+        }
+        const nm = cstrAt(data, stroff + getLE(data, p, 4));
+        if (nm == None) {
+            return r;
+        }
+        listPush(r.names, nm ?? "");
+        listPush(r.types, getLE(data, p + 4, 1));
+        listPush(r.sects, getLE(data, p + 5, 1));
+        listPush(r.values, getLE(data, p + 8, 8));
+        i = i + 1;
+    }
+    return MachSyms { ok: true, secs: r.secs, names: r.names, types: r.types, sects: r.sects, values: r.values };
+}
+
+function machSec(m: MachSyms, name: string): MachSec? {
+    let found: MachSec? = None;
+    for (s in m.secs) {
+        if (s.name == name) {
+            found = s;
+        }
+    }
+    return found;
+}
+
+// 独立解析 Mach-O 的本地符号：每个函数有一个同名同址的 __text 本地符号；--strip 的产物没有本地符号，__text、__const、__data 的
+// 地址与内容与带符号的相同。
+function machoSymbolCheck(image: Bytes, stripped: Bytes, functions: Ref<Jv>?): Verdict {
+    const m = machParse(image);
+    const textSec = machSec(m, "__text");
+    if (!m.ok || textSec == None) {
+        return bad("unparseable Mach-O");
+    }
+    const text = (textSec ?? MachSec { name: "", n: 0, addr: 0, data: bytesNew(0) }).n;
+    const have: Map<string, int> = mapNew();
+    let i = 0;
+    while (i < listLen(m.names)) {
+        const name = listGet(m.names, i) catch "";
+        if (((listGet(m.types, i) catch 0) & 1) != 0) {
+            return bad("external symbol among locals " + name);
+        }
+        if ((listGet(m.sects, i) catch 0) == text) {
+            const key = name + "\n" + toStr(listGet(m.values, i) catch 0);
+            mapSet(have, key, (mapGet(have, key) ?? 0) + 1);
+        }
+        i = i + 1;
+    }
+    let missing = "";
+    let nmissing = 0;
+    i = 0;
+    while (i < count(functions)) {
+        const f = item(functions, i);
+        const key = symbolName(f) + "\n" + toStr(hexAt(f, "link_va"));
+        if ((mapGet(have, key) ?? 0) != 1) {
+            if (nmissing < 5) {
+                missing = missing + " " + symbolName(f);
+            }
+            nmissing = nmissing + 1;
+        }
+        i = i + 1;
+    }
+    if (nmissing > 0) {
+        return bad("functions missing" + missing + " of " + toStr(count(functions)));
+    }
+    if (bytesLen(stripped) == 0) {
+        return bad("no --strip product");
+    }
+    const s = machParse(stripped);
+    let same = s.ok;
+    for (name in ["__text", "__const", "__data"]) {
+        const a = machSec(s, name);
+        const b = machSec(m, name);
+        if (a == None || b == None) {
+            same = false;
+        } else {
+            const x = a ?? MachSec { name: "", n: 0, addr: 0, data: bytesNew(0) };
+            const y = b ?? MachSec { name: "", n: 0, addr: 1, data: bytesNew(0) };
+            if (x.addr != y.addr || !bytesEqual(x.data, y.data)) {
+                same = false;
+            }
+        }
+    }
+    if (listLen(s.names) != 0 || !same) {
+        return bad("--strip product " + toStr(listLen(s.names)) + " " + toStr(same));
+    }
+    return Verdict { ok: true, why: toStr(count(functions)) };
+}
+
+function writeObj(path: string, d: Bytes): void {
+    writeFileBytes(path, d) catch (e) {};
+}
+
+function probeRun(c: Ref<Ctx>, probe: string, args: List<string>, limit: int): Res {
+    return sh(c, probe, args, limit);
+}
+
+function fixtureChecks(c: Ref<Ctx>, probe: string): void {
+    const work = c.work;
+    const elf0 = elfObject(false);
+    const elf1 = elfObject(true);
+    const pe0 = coffObject(false);
+    const pe1 = coffObject(true);
+    writeObj(nat(join(work, "elf0.o")), elf0.data);
+    writeObj(nat(join(work, "elf1.o")), elf1.data);
+    writeObj(nat(join(work, "pe0.o")), pe0.data);
+    writeObj(nat(join(work, "pe1.o")), pe1.data);
+    for (mode in ["elf", "elf-dynamic", "pe"]) {
+        let first = nat(join(work, "elf0.o"));
+        let second = nat(join(work, "elf1.o"));
+        if (mode == "pe") {
+            first = nat(join(work, "pe0.o"));
+            second = nat(join(work, "pe1.o"));
+        }
+        const output = nat(join(work, mode + ".image"));
+        const args: List<string> = listNew();
+        listPush(args, mode);
+        listPush(args, output);
+        listPush(args, first);
+        listPush(args, second);
+        const p = probeRun(c, probe, args, 120);
+        writeObj(nat(join(work, mode + ".stdout")), p.out);
+        writeObj(nat(join(work, mode + ".stderr")), p.err);
+        check(c, "native ownership/reentry/leak:" + mode, p.code == 0 && bytesLen(p.err) == 0, resText(p));
+        if (p.code != 0) {
+            continue;
+        }
+        const doc = parseOr(p.out);
+        if (doc == None) {
+            check(c, "probe output is JSON:" + mode, false, reprBytes(p.out, 300));
+            continue;
+        }
+        modeChecks(c, mode, doc, output);
+    }
+    rejectChecks(c, probe, elf0, pe0);
+    addendChecks(c, probe, pe0);
+}
+
+function modeChecks(c: Ref<Ctx>, mode: string, doc: Ref<Jv>?, output: string): void {
+    const x = at(doc, "map");
+    const syms = at(x, "symbols");
+    const image = readOr(output);
+    const lay = imageLayout(image);
+    const img = at(x, "image");
+    check(c, "image identity and headers:" + mode, textIs(doc, "schema", "link-map/7") && isTrue(at(doc, "ok")) && lay.ok
+        && decAt(img, "bytes") == bytesLen(image) && textIs(img, "sha256", shaHex(image)) && hexAt(img, "entry") == lay.entry
+        && hexAt(img, "preferred_base") == lay.base, lay.why);
+    const cov = at(x, "coverage");
+    let ids = true;
+    let i = 0;
+    while (i < count(syms)) {
+        if (!numIs(at(item(syms, i), "id"), i)) {
+            ids = false;
+        }
+        i = i + 1;
+    }
+    check(c, "explicit unknowns/full rows:" + mode, isNull(at(img, "runtime_load_bias")) && isNull(at(cov, "function_ranges"))
+        && isNull(at(cov, "unwind")) && isNull(at(cov, "cpu_profile")) && !truthy(at(cov, "truncated"))
+        && decAt(x, "symbols_total") == count(syms) && ids, "");
+    const s80 = named(syms, "0x80", -1);
+    const s81 = named(syms, "0x81", -1);
+    check(c, "lossless opaque identities:" + mode, isNullOrMissing(at(s80, "name_utf8")) && isNullOrMissing(at(s81, "name_utf8"))
+        && textOf(s80, "value") != textOf(s81, "value"), "");
+    check(c, "unicode/control escaping:" + mode, textIs(named(syms, hexOfStr(UNICODE), -1), "name_utf8", UNICODE)
+        && textIs(named(syms, hexOfStr(ESCAPED), -1), "name_utf8", ESCAPED), "");
+    let dups = 0;
+    let objs = 0;
+    let locals = true;
+    let firstVal = "";
+    let secondVal = "";
+    i = 0;
+    while (i < count(syms)) {
+        const s = item(syms, i);
+        if (textIs(s, "name_bytes", "0x647570")) {
+            dups = dups + 1;
+            if (numIs(at(s, "object_index"), 0)) {
+                objs = objs | 1;
+            } else if (numIs(at(s, "object_index"), 1)) {
+                objs = objs | 2;
+            } else {
+                objs = objs | 4;
+            }
+            if (!textIs(s, "binding", "local")) {
+                locals = false;
+            }
+            if (dups == 1) {
+                firstVal = textOf(s, "value");
+            } else if (dups == 2) {
+                secondVal = textOf(s, "value");
+            }
+        }
+        i = i + 1;
+    }
+    check(c, "local object provenance:" + mode, dups == 2 && objs == 3 && locals && firstVal != secondVal, "");
+    const text = lossyText(readOr(output + ".txt"));
+    let rowsIn = true;
+    i = 0;
+    while (i < count(syms)) {
+        const s = item(syms, i);
+        let value = textOf(s, "value");
+        if (len(value) == 0) {
+            value = "-";
+        }
+        if (!contains(text, numText(at(s, "id")) + "  " + textOf(s, "value_kind") + "  " + value + "  " + textOf(s, "state") + "  ")) {
+            rowsIn = false;
+        }
+        i = i + 1;
+    }
+    check(c, "human text same snapshot:" + mode, contains(text, textOf(img, "sha256")) && contains(text, "未截断") && rowsIn
+        && contains(text, "0x80") && contains(text, "\\nname"), "");
+    let exact = true;
+    i = 0;
+    while (i < count(syms)) {
+        const s = item(syms, i);
+        const v = at(s, "value");
+        if (!isNullOrMissing(v) && !isHex16(textOf(s, "value"))) {
+            exact = false;
+        }
+        if (!textIs(s, "value_kind", "link-va")) {
+            if (!isNullOrMissing(at(s, "image_relative_va"))) {
+                exact = false;
+            }
+        } else if (hexAt(s, "image_relative_va") != wrapSub(hexAt(s, "value"), lay.base)) {
+            exact = false;
+        }
+        i = i + 1;
+    }
+    check(c, "exact addresses and separate RVA:" + mode, exact, "");
+    const slots = hexAt(named(syms, "0x736c6f7473", 0), "value");
+    const where = fileAt(lay.segs, slots);
+    const targets: List<string> = listNew();
+    listPush(targets, "0x80");
+    if (mode == "pe") {
+        listPush(targets, hexOfStr(UNICODE));
+        listPush(targets, "0x647570");
+        listPush(targets, hexOfStr("co_tail"));
+    } else {
+        listPush(targets, hexOfStr("edge"));
+        listPush(targets, hexOfStr(UNICODE));
+    }
+    let relocs = where >= 0;
+    i = 0;
+    while (i < listLen(targets)) {
+        if (getLE(image, where + 8 * i, 8) != hexAt(named(syms, listGet(targets, i) catch "", -1), "value")) {
+            relocs = false;
+        }
+        i = i + 1;
+    }
+    check(c, "independent relocation bytes:" + mode, relocs, "");
+    const zs = named(syms, hexOfStr("zeros"), -1);
+    const zeros = hexAt(zs, "value");
+    let inBss = false;
+    for (g in lay.segs) {
+        if (!ult(zeros, g.va) && !ult(g.mem, wrapSub(zeros, g.va)) && !ult(wrapSub(g.mem, wrapSub(zeros, g.va)), 37)) {
+            inBss = true;
+        }
+    }
+    check(c, "BSS virtual extent:" + mode, inBss && textIs(zs, "input_section_offset", "0"), "");
+    const uu = named(syms, hexOfStr("unused_undefined"), -1);
+    check(c, "undefined stays unknown:" + mode, isNull(at(uu, "value")) && textIs(uu, "value_kind", "undefined"), "");
+    if (mode == "pe") {
+        check(c, "COFF aux/provenance/metadata", textIs(named(syms, hexOfStr(".file"), -1), "state", "metadata")
+            && numIs(at(named(syms, "0x647570", 0), "symbol_index"), 2)
+            && textIs(named(syms, hexOfStr("absolute"), -1), "value_kind", "absolute")
+            && isNull(at(named(syms, hexOfStr("absolute"), -1), "declared_size"))
+            && textIs(named(syms, hexOfStr("dead"), -1), "state", "discarded"), "");
+        check(c, "unused program labels retained", textIs(named(syms, hexOfStr("未引用标签"), -1), "origin", "program"), "");
+        // 两个 2 字节的 .text 输入节都是 IMAGE_SCN_ALIGN_16BYTES（半字节 5 即 2^4）：相邻放置恰差 16（此前按 2^5 解成 32）。
+        const root = hexAt(named(syms, hexOfStr("co_root"), 0), "value");
+        const tail = hexAt(named(syms, hexOfStr("co_tail"), 1), "value") - 1;
+        check(c, "COFF input section alignment is 2^(n-1)", root - tail == 16 || tail - root == 16, "(" + toStr(root) + ", " + toStr(tail) + ")");
+        check(c, "PE actual section headers", textIs(cov, "layout", "pe-sections") && sameSegs(mapSegs(at(x, "sections")), lay.segs), "");
+        return;
+    }
+    const edge = named(syms, hexOfStr("edge"), 0);
+    const reference = named(syms, hexOfStr("edge"), 1);
+    check(c, "all 64 bits and resolved absolute:" + mode, textIs(edge, "value", "0xffffffffffffffff")
+        && textIs(reference, "value", "0xffffffffffffffff") && textIs(edge, "declared_size", U64_DEC)
+        && textIs(reference, "value_kind", "absolute") && textIs(reference, "state", "resolved-reference")
+        && textIs(named(syms, hexOfStr("zero"), -1), "value", "0x0000000000000000"), "");
+    const meta = named(syms, hexOfStr("meta"), -1);
+    check(c, "nonplaced metadata:" + mode, textIs(meta, "value_kind", "section-relative") && textIs(meta, "state", "not-placed")
+        && isNull(at(meta, "output_section")), "");
+    const secs = at(x, "sections");
+    let groups = textIs(cov, "layout", "elf-load-groups-with-separate-bss-tail") && count(secs) == 4;
+    i = 0;
+    while (i < 3 && i + 1 < listLen(lay.segs)) {
+        const g = listGet(lay.segs, i + 1) catch Seg { va: 0, off: 0, hasOff: false, file: 0, mem: 0 };
+        if (hexAt(item(secs, i), "link_va") != g.va || decAt(item(secs, i), "file_offset") != g.off) {
+            groups = false;
+        }
+        i = i + 1;
+    }
+    check(c, "ELF load groups:" + mode, groups && isNull(at(item(secs, 3), "file_offset")) && textIs(item(secs, 3), "file_bytes", "0"), "");
+    if (mode == "elf-dynamic") {
+        const got = named(syms, hexOfStr("__imp_getenv"), -1);
+        check(c, "synthetic GOT slot", textIs(got, "symbol_type", "got-slot") && textIs(got, "origin", "synthetic"), "");
+    }
+}
+
+function numText(v: Ref<Jv>?): string {
+    if (v == None) {
+        return "None";
+    }
+    return (v ?? jNull()).text;
+}
+
+function isTrue(v: Ref<Jv>?): bool {
+    if (v == None) {
+        return false;
+    }
+    const x = v ?? jNull();
+    return x.kind == J_BOOL && x.truth;
+}
+
+function isFalse(v: Ref<Jv>?): bool {
+    if (v == None) {
+        return false;
+    }
+    const x = v ?? jNull();
+    return x.kind == J_BOOL && !x.truth;
+}
+
+function isNullOrMissing(v: Ref<Jv>?): bool {
+    return v == None || isNull(v);
+}
+
+// 映射的节表写成段（file_offset 为 null 即零填充）。
+function mapSegs(secs: Ref<Jv>?): List<Seg> {
+    const out: List<Seg> = listNew();
+    let i = 0;
+    while (i < count(secs)) {
+        const s = item(secs, i);
+        if (isNull(at(s, "file_offset"))) {
+            listPush(out, Seg { va: hexAt(s, "link_va"), off: 0, hasOff: false, file: decAt(s, "file_bytes"), mem: decAt(s, "memory_bytes") });
+        } else {
+            listPush(out, Seg { va: hexAt(s, "link_va"), off: decAt(s, "file_offset"), hasOff: true, file: decAt(s, "file_bytes"),
+                    mem: decAt(s, "memory_bytes") });
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ELF 产物的映射：前三组（text、rodata、data）依次对上 PT_LOAD 的第 1～3 段（第 0 段装文件头），地址、文件偏移与文件字节都同；
+// 第四组是 BSS 虚拟尾，没有文件偏移与文件字节，从 data 组之后开始，止于第 3 段内存的末端。
+function elfGroupsMatch(secs: Ref<Jv>?, loads: List<Seg>): bool {
+    const m = mapSegs(secs);
+    if (listLen(m) != 4 || listLen(loads) != 4) {
+        return false;
+    }
+    const zero = Seg { va: 0, off: 0, hasOff: false, file: 0, mem: 0 };
+    let i = 0;
+    while (i < 3) {
+        const a = listGet(m, i) catch zero;
+        const b = listGet(loads, i + 1) catch zero;
+        if (!a.hasOff || a.va != b.va || a.off != b.off || a.file != b.file) {
+            return false;
+        }
+        i = i + 1;
+    }
+    const data = listGet(m, 2) catch zero;
+    const bss = listGet(m, 3) catch zero;
+    const tail = listGet(loads, 3) catch zero;
+    return !bss.hasOff && bss.file == 0 && bss.va >= data.va + data.mem && bss.va + bss.mem == tail.va + tail.mem;
+}
+
+function copyOf(d: Bytes): Bytes {
+    return bytesSlice(d, 0, bytesLen(d));
+}
+
+// 单字段损坏的夹具：探针须干净拒绝（退出 1、stderr 空、ok 为 false、map 为 null、带原因），几条另核对原因。
+function rejectChecks(c: Ref<Ctx>, probe: string, elf0: Fixture, pe0: Fixture): void {
+    const work = c.work;
+    const elfChanges: []string = ["header", "string", "strtab-unterminated", "shstrtab-unterminated", "section-name", "section", "tls",
+        "tls-symbol", "rel-symbol", "rel-site", "align-npot"];
+    const peChanges: []string = ["header", "string", "section", "aux", "rel-symbol", "rel-site", "align-reserved", "align-large"];
+    for (mode in ["elf", "pe"]) {
+        let changes = elfChanges;
+        let source = elf0;
+        if (mode == "pe") {
+            changes = peChanges;
+            source = pe0;
+        }
+        for (change in changes) {
+            let data = copyOf(source.data);
+            let reason = "";
+            if (change == "header") {
+                data = bytesSlice(data, 0, 17);
+            } else if (mode == "elf") {
+                const shoff = source.shoff;
+                const offs = source.offsets;
+                if (change == "string") {
+                    setLE(data, (listGet(offs, 7) catch 0) + 24, 4, 4294967295);
+                    reason = "BadSymbolName";
+                } else if (change == "strtab-unterminated") {
+                    bytesSet(data, (listGet(offs, 6) catch 0) + getLE(data, shoff + 64 * 6 + 32, 8) - 1, 65);
+                    reason = "BadStringTable";
+                } else if (change == "shstrtab-unterminated") {
+                    bytesSet(data, (listGet(offs, 8) catch 0) + getLE(data, shoff + 64 * 8 + 32, 8) - 1, 65);
+                    reason = "BadSectionNames";
+                } else if (change == "section-name") {
+                    setLE(data, shoff + 64, 4, 65535);
+                    reason = "BadSectionName";
+                } else if (change == "section") {
+                    setLE(data, shoff + 64 + 32, 8, -1);
+                } else if (change == "tls") {
+                    setLE(data, shoff + 64 + 8, 8, 1030);
+                } else if (change == "tls-symbol") {
+                    bytesSet(data, (listGet(offs, 7) catch 0) + 24 + 4, 6);
+                } else if (change == "rel-symbol") {
+                    setLE(data, (listGet(offs, 9) catch 0) + 8, 8, (4294967295 << 32) | 1);
+                } else if (change == "rel-site") {
+                    setLE(data, listGet(offs, 9) catch 0, 8, 24);
+                } else if (change == "align-npot") {
+                    // gABI：只能是 0 或 2 的幂。
+                    setLE(data, shoff + 64 + 48, 8, 3);
+                    reason = "UnsupportedSectionAlignment";
+                }
+            } else {
+                const sym = source.symptr;
+                if (change == "string") {
+                    setLE(data, sym + 18 * getLE(data, 12, 4), 4, 4294967295);
+                } else if (change == "section") {
+                    setLE(data, sym + 18 * 2 + 12, 2, 32000);
+                } else if (change == "aux") {
+                    bytesSet(data, sym + 17, 255);
+                }
+                const rel = getLE(data, 20 + 40 * 2 + 24, 4);
+                if (change == "rel-symbol") {
+                    // 指向辅助记录。
+                    setLE(data, rel + 4, 4, 1);
+                } else if (change == "rel-site") {
+                    setLE(data, rel, 4, 32);
+                }
+                // IMAGE_SCN_ALIGN_*：15 保留；14 即 8192 字节，超过映像节对齐 4096（对象 fuzz F5 查出此前都被接受）。
+                const flags = getLE(data, 20 + 36, 4) & 0xFF0FFFFF;
+                if (change == "align-reserved") {
+                    setLE(data, 20 + 36, 4, flags | 0x00F00000);
+                    reason = "UnsupportedSectionAlignment";
+                } else if (change == "align-large") {
+                    setLE(data, 20 + 36, 4, flags | 0x00E00000);
+                    reason = "UnsupportedSectionAlignment";
+                }
+            }
+            const badPath = nat(join(work, mode + "-bad-" + change + ".o"));
+            writeObj(badPath, data);
+            const args: List<string> = listNew();
+            listPush(args, mode);
+            listPush(args, nat(join(work, "bad.image")));
+            listPush(args, badPath);
+            const p = probeRun(c, probe, args, 30);
+            const doc = parseOr(p.out);
+            const error = at(doc, "error");
+            let errText = "";
+            if (error != None) {
+                errText = jDump(error ?? jNull());
+            }
+            check(c, "reject:" + mode + ":" + change, p.code == 1 && bytesLen(p.err) == 0 && isFalse(at(doc, "ok")) && isNull(at(doc, "map"))
+                && truthy(error) && contains(errText, reason), resText(p));
+        }
+    }
+}
+
+// COFF 重定位的隐式加数（对象 fuzz F3 查出）：REL32 的位移须落在 i32 内——此前截断写回，越界即成错误产物；ADDR64 按模 2^64 回绕
+// （同 link.exe 与 ELF 侧）——此前加数近 2^63 时整数溢出 trap。.data 首个重定位的目标 \x80 在 .text（更低地址）。
+function addendChecks(c: Ref<Ctx>, probe: string, pe0: Fixture): void {
+    const work = c.work;
+    const source = pe0.data;
+    const rel = getLE(source, 20 + 40 * 2 + 24, 4);
+    const site = listGet(pe0.offsets, 2) catch 0;
+    let data = copyOf(source);
+    setLE(data, rel + 8, 2, 4);
+    setLE(data, site, 4, 2147483648);
+    let badPath = nat(join(work, "pe-rel32-range.o"));
+    writeObj(badPath, data);
+    const second = nat(join(work, "pe1.o"));
+    const a1: List<string> = listNew();
+    listPush(a1, "pe");
+    listPush(a1, nat(join(work, "bad.image")));
+    listPush(a1, badPath);
+    listPush(a1, second);
+    let p = probeRun(c, probe, a1, 30);
+    check(c, "reject:pe:rel32-range", p.code == 1 && bytesLen(p.err) == 0 && contains(lossyText(p.out), "RelativeRelocationOutOfRange"), resText(p));
+    data = copyOf(source);
+    setLE(data, site, 8, 9223372036854775807);
+    badPath = nat(join(work, "pe-addr64-wrap.o"));
+    writeObj(badPath, data);
+    const image = nat(join(work, "wrap.image"));
+    const a2: List<string> = listNew();
+    listPush(a2, "pe");
+    listPush(a2, image);
+    listPush(a2, badPath);
+    listPush(a2, second);
+    p = probeRun(c, probe, a2, 30);
+    let ok = p.code == 0 && bytesLen(p.err) == 0;
+    if (ok) {
+        const doc = parseOr(p.out);
+        const body = readOr(image);
+        const lay = imageLayout(body);
+        const syms = at(at(doc, "map"), "symbols");
+        // 对象 0 里已定义的同名符号以后一个为准。
+        let slots = 0;
+        let x80 = 0;
+        let i = 0;
+        while (i < count(syms)) {
+            const s = item(syms, i);
+            if (numIs(at(s, "object_index"), 0) && textIs(s, "state", "defined")) {
+                if (textIs(s, "name_bytes", "0x736c6f7473")) {
+                    slots = hexAt(s, "value");
+                }
+                if (textIs(s, "name_bytes", "0x80")) {
+                    x80 = hexAt(s, "value");
+                }
+            }
+            i = i + 1;
+        }
+        const where = fileAt(lay.segs, slots);
+        ok = where >= 0 && getLE(body, where, 8) == wrapAdd(9223372036854775807, x80);
+    }
+    check(c, "ADDR64 implicit addend wraps modulo 2^64", ok, resText(p));
+}
+
+function writeText(path: string, text: string): void | Error {
+    writeFileBytes(path, bytesFromStr(text))?;
+}
+
+function upper(s: string): string {
+    const b = bytesFromStr(s);
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const ch = bytesGet(b, i) ?? 0;
+        if (ch >= 97 && ch <= 122) {
+            bytesSet(b, i, ch - 32);
+        }
+        i = i + 1;
+    }
+    return bytesToStr(b) catch s;
+}
+
+function stemOf(path: string): string {
+    const b = bytesFromStr(path);
+    let start = 0;
+    let i = 0;
+    while (i < bytesLen(b)) {
+        const ch = bytesGet(b, i) ?? 0;
+        if (ch == 47 || ch == 92) {
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    let end = bytesLen(b);
+    i = bytesLen(b) - 1;
+    while (i > start) {
+        if ((bytesGet(b, i) ?? 0) == 46) {
+            end = i;
+            break;
+        }
+        i = i - 1;
+    }
+    return bytesToStr(bytesSlice(b, start, end - start)) catch path;
+}
+
+struct Flavor {
+    name: string,
+    entry: string,
+    flags: List<string>,
+}
+
+// 全部产物目标（scripts/targets.tx）在任何宿主上交叉构建，映射对照实际 PE／ELF／Mach-O 头。目标写三元组：不带架构的 linux 在
+// arm64 宿主上取 aarch64-linux，windows 同理取 aarch64-windows。
+function cliChecks(c: Ref<Ctx>, source: string): void | Error {
+    const work = c.work;
+    for (tg in allTargets()) {
+        const target = tg.triple;
+        const triple = tg.triple;
+        let lib = "libSystem";
+        if (tg.os == "windows") {
+            lib = "ucrtbase";
+        } else if (tg.os == "linux") {
+            lib = "libc.so.6";
+        }
+        const ffi = nat(join(work, "ffi-" + target + ".tx"));
+        writeText(ffi, "declare function strlen(s: string): usize from \"" + lib
+            + "\";\nexport function main(args: []string): int { print(toStr(strlen(\"abc\"))); return 0; }\n")?;
+        const flavors: List<Flavor> = listNew();
+        listPush(flavors, Flavor { name: "normal", entry: source, flags: listNew() });
+        listPush(flavors, Flavor { name: "debug", entry: nat(join(c.root, "tests/debug/basic.tx")), flags: strs(["--debug"]) });
+        listPush(flavors, Flavor { name: "leak", entry: source, flags: strs(["--leak-check"]) });
+        listPush(flavors, Flavor { name: "ffi", entry: ffi, flags: listNew() });
+        listPush(flavors, Flavor { name: "thread", entry: nat(join(c.root, "tests/nrt-cases/thread-basic.tx")), flags: listNew() });
+        for (fl in flavors) {
+            const dest = nat(join(work, target + "-" + fl.name));
+            const mapping = nat(join(work, target + "-" + fl.name + ".json"));
+            const args = plusL(strs(["build", fl.entry, "--target=" + triple, "--out", dest]), fl.flags);
+            const p = tx(c, plusL(args, strs(["--map", mapping, "--map-format=json", "--map-scope=all"])));
+            check(c, "CLI map:" + target + ":" + fl.name, p.code == 0 && kindOf(mapping) == 1, reprBytes(p.err, 500));
+            if (p.code != 0) {
+                continue;
+            }
+            const doc = parseOr(readOr(mapping));
+            const x = at(doc, "map");
+            const exe = productName(tg, stemOf(fl.entry));
+            const product = nat(join(dest, exe));
+            const image = readOr(product);
+            const ordinary = tx(c, args);
+            check(c, "CLI map preserves product:" + target + ":" + fl.name, ordinary.code == 0 && bytesEqual(readOr(product), image)
+                && textIs(at(x, "image"), "sha256", shaHex(image)) && textIs(x, "target", triple), "");
+            if (tg.format != "pe") {
+                // 产物函数符号（v052-image-symbols）对照映射的函数表与 --strip 产物。
+                const bare = nat(join(work, target + "-" + fl.name + "-strip"));
+                const s = tx(c, plusL(plusL(strs(["build", fl.entry, "--target=" + triple, "--out", bare]), fl.flags), strs(["--strip"])));
+                let stripped = bytesNew(0);
+                if (s.code == 0) {
+                    stripped = readOr(nat(join(bare, exe)));
+                }
+                // 只按目标解一种格式：ELF 头当 Mach-O 读时 ncmds 落在 e_type／e_machine 上（上千万），白转几秒。
+                let v = Verdict { ok: false, why: "" };
+                if (tg.format == "elf") {
+                    v = elfSymbolCheck(image, stripped, at(x, "functions"));
+                } else {
+                    v = machoSymbolCheck(image, stripped, at(x, "functions"));
+                }
+                check(c, "image symbols:" + target + ":" + fl.name, v.ok, v.why);
+            }
+            if (tg.format == "macho") {
+                const lay = imageLayout(image);
+                check(c, "CLI Mach-O producer sections and entry:" + target + ":" + fl.name, lay.ok
+                    && textIs(at(x, "coverage"), "layout", "macho-producer-sections") && hexAt(at(x, "image"), "preferred_base") == lay.base
+                    && hexAt(at(x, "image"), "entry") == lay.entry && sameSegs(mapSegs(at(x, "sections")), lay.segs),
+                    dump(at(x, "sections")) + " " + segsText(lay.segs));
+            }
+            if (tg.format == "pe") {
+                const lay = imageLayout(image);
+                check(c, "CLI PE section headers and entry:" + target + ":" + fl.name, lay.ok && textIs(at(x, "coverage"), "layout", "pe-sections")
+                    && hexAt(at(x, "image"), "preferred_base") == lay.base && hexAt(at(x, "image"), "entry") == lay.entry
+                    && sameSegs(mapSegs(at(x, "sections")), lay.segs), dump(at(x, "sections")) + " " + segsText(lay.segs));
+            }
+            if (tg.format == "elf") {
+                const lay = imageLayout(image);
+                check(c, "CLI ELF load groups and entry:" + target + ":" + fl.name, lay.ok
+                    && textIs(at(x, "coverage"), "layout", "elf-load-groups-with-separate-bss-tail") && hexAt(at(x, "image"), "preferred_base") == lay.base
+                    && hexAt(at(x, "image"), "entry") == lay.entry && elfGroupsMatch(at(x, "sections"), lay.segs),
+                    dump(at(x, "sections")) + " " + segsText(lay.segs));
+            }
+            if (fl.name == "ffi") {
+                let slot = false;
+                const syms = at(x, "symbols");
+                let i = 0;
+                while (i < count(syms)) {
+                    const s = item(syms, i);
+                    if (textIs(s, "origin", "synthetic") && textIs(s, "value_kind", "link-va")
+                        && (textIs(s, "symbol_type", "got-slot") || textIs(s, "symbol_type", "iat-slot"))) {
+                        slot = true;
+                    }
+                    i = i + 1;
+                }
+                check(c, "CLI generated import slots:" + target, slot, "");
+            }
+            if (fl.name == "normal") {
+                const human = nat(join(work, target + ".txt"));
+                const t = tx(c, plusL(args, strs(["--map", human])));
+                check(c, "CLI default human:" + target, t.code == 0 && contains(lossyText(readOr(human)), "link-map/7"), "");
+                const failed = tx(c, plusL(args, strs(["--map", nat(join(join(work, "missing-parent"), "map.json")), "--map-format=json"])));
+                check(c, "CLI write failure:" + target, failed.code == 1 && contains(lossyText(failed.err), "map.json"), "");
+                const before = readOr(product);
+                const alias = nat(join(join(join(dest, ".."), target + "-" + fl.name), exe));
+                const exact = tx(c, plusL(args, strs(["--map", product])));
+                check(c, "CLI collision:" + target + ":exact", exact.code == 64 && bytesEqual(readOr(product), before), "");
+                const normalized = tx(c, plusL(args, strs(["--map", alias])));
+                check(c, "CLI collision:" + target + ":normalized", normalized.code == 64 && bytesEqual(readOr(product), before), "");
+                if (hostTarget() == "windows") {
+                    const collision = tx(c, plusL(args, strs(["--map", upper(product)])));
+                    check(c, "CLI case collision:" + target, collision.code == 64 && bytesEqual(readOr(product), before), "");
+                }
+            }
+        }
+    }
+    const usages: List<List<string>> = listNew();
+    listPush(usages, strs(["--map-format=json"]));
+    listPush(usages, strs(["--map-format=bogus"]));
+    listPush(usages, strs(["--map"]));
+    listPush(usages, strs(["--map", "--debug"]));
+    for (flags in usages) {
+        const p = tx(c, plusL(strs(["build", source, "--out", nat(join(work, "usage"))]), flags));
+        let label = "";
+        for (f in flags) {
+            if (len(label) > 0) {
+                label = label + " ";
+            }
+            label = label + f;
+        }
+        check(c, "CLI usage:" + label, p.code == 64, reprBytes(p.err, 500));
+    }
+}
+
+function arrHas(v: Ref<Jv>?, want: string): bool {
+    let i = 0;
+    while (i < count(v)) {
+        const s = item(v, i);
+        if (s != None && (s ?? jNull()).kind == 3 && (s ?? jNull()).text == want) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+function body(c: Ref<Ctx>): void | Error {
+    const work = c.work;
+    const capRes = tx(c, strs(["capabilities", "--format=json"]));
+    const cap = at(parseOr(capRes.out), "capabilities");
+    check(c, "discovery", textIs(cap, "link_map", "text,json") && textIs(cap, "link_map_schema", "link-map/7")
+        && arrHas(at(cap, "schemas"), "link-map/7"), dump(cap));
+    const built = tx(c, strs(["build", nat(join(c.root, "bootstrap/native_link_map_probe.tx")), "--toolchain", "--leak-check", "--out",
+                nat(join(work, "probe"))]));
+    check(c, "owned map probe build", built.code == 0, reprBytes(built.err, 500));
+    if (built.code == 0) {
+        fixtureChecks(c, nat(join(join(work, "probe"), exeName("native_link_map_probe"))));
+        // 固定种子的结构化变异在 scripts/test_object_fuzz.tx（安全审查攻关第 3 项：受限进程、字段组合、页堆探针、函数元数据）。
+    }
+    const source = nat(join(work, "映射.tx"));
+    writeText(source, "export function main(args: []string): int { print(\"map\"); return 0; }\n")?;
+    cliChecks(c, source)?;
+}
+
+function run(argv: []string): int | Error {
+    let compiler = "";
+    let work = "";
+    let root = "";
+    let i = 0;
+    while (i + 1 < len(argv)) {
+        if (argv[i] == "--compiler") {
+            compiler = argv[i + 1];
+        } else if (argv[i] == "--work") {
+            work = argv[i + 1];
+        } else if (argv[i] == "--root") {
+            root = argv[i + 1];
+        } else {
+            return err("未知参数：" + argv[i]);
+        }
+        i = i + 2;
+    }
+    if (len(compiler) == 0 || len(work) == 0 || i != len(argv)) {
+        return err("用法：taixu run --toolchain scripts/test_native_link_map.tx --compiler <taixu> --work <目录> [--root <仓库>]");
+    }
+    if (len(root) == 0) {
+        root = currentDir() catch ".";
+    }
+    root = osRealPath(absolute(nat(root)));
+    compiler = osRealPath(absolute(nat(compiler)));
+    if (!mkdirs(absolute(nat(work)))) {
+        return err("建不了工作目录：" + work);
+    }
+    work = osRealPath(absolute(nat(work)));
+    const c = new Ctx { compiler: compiler, root: root, work: work, rows: jArray(), total: 0, failures: 0 };
+    body(c)?;
+    const report = jObject();
+    jSet(report, "rows", c.rows);
+    jSet(report, "failures", numJv(c.failures));
+    writeText(nat(join(work, "report.json")), jPretty(report, 2) + "\n")?;
+    if (c.failures == 0) {
+        print("SUMMARY PASS " + toStr(c.total) + " checks 0 failures");
+        return 0;
+    }
+    print("SUMMARY FAIL " + toStr(c.total) + " checks " + toStr(c.failures) + " failures");
+    return 1;
+}
+
+function main(argv: []string): int {
+    return run(argv) catch (e) {
+        eprint("test_native_link_map: " + e.message);
+        return 1;
+    };
+}

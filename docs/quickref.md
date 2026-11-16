@@ -235,7 +235,7 @@ const (a, b) = xs;                           // 解构声明：每个都是 T?
 
 ---
 
-## 3. 诊断码（`taixu explain [码]` 同源，共 70 个）
+## 3. 诊断码（`taixu explain [码]` 同源，共 72 个，含已退役的 4015）
 
 编译期诊断形如 `文件:行:列: error 3006: 消息`，并提示
 `处置详见: taixu explain 3006`；运行期错误形如
@@ -298,6 +298,7 @@ const (a, b) = xs;                           // 解构声明：每个都是 T?
 | 3033 | bad_ffi | 外部函数（FFI）的声明、封送或目标不合法（含没有 `from` 的 declare function） |
 | 3034 | fixed_width | 定宽数值用法不合法（字面量越界、无公共类型、无符号取负等） |
 | 3035 | not_sendable | 值不能跨线程发送（含 Weak、Future、Gen、Thread、平台句柄等） |
+| 3036 | dead_copy_write | 对 struct 拷贝的字段写入之后再没读取、传出或返回（拷贝不写回原处） |
 
 ### 代码生成 31xx
 

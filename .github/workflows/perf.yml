@@ -1,0 +1,104 @@
+# 各版运算效率对照：在同一台 GitHub 托管的 Windows x64 机器上、同一次作业里，把 0.3.0-beta.1 起各发布版（正式发布包）编出的
+# bench/algo 九项负载与 C、Go、Rust 对照实现交错测量（scripts/perf_history.tx），比值写进作业摘要，完整结果（含每个样本）存为
+# perf-history 产物。每次都把各版整段重测，版本之间的比较总在同一台机器上。手动触发。
+name: perf-history
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: 每项样本数
+        required: false
+        default: "11"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-history
+  cancel-in-progress: false
+
+jobs:
+  history:
+    runs-on: windows-2025
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 取各发布版与它们的负载源码
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rels = @(gh release list --repo $env:GITHUB_REPOSITORY --exclude-drafts --limit 200 --json tagName,publishedAt | ConvertFrom-Json |
+            Sort-Object publishedAt)
+          $tags = @($rels | ForEach-Object { $_.tagName })
+          $start = [array]::IndexOf($tags, 'v0.3.0-beta.1')
+          if ($start -lt 0) { throw '找不到 v0.3.0-beta.1 的发布' }
+          $list = @()
+          foreach ($tag in $tags[$start..($tags.Count - 1)]) {
+            $ver = $tag.Substring(1)
+            $zip = "taixu-$ver-x86_64-windows.zip"
+            $dir = Join-Path $env:RUNNER_TEMP "pk\$ver"
+            gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern $zip --pattern SHA256SUMS --dir $dir
+            if ($LASTEXITCODE -ne 0) { throw "下载不了 $tag 的 $zip" }
+            $want = ''
+            foreach ($line in Get-Content (Join-Path $dir 'SHA256SUMS')) {
+              $f = $line -split '\s+'
+              if ($f.Count -ge 2 -and $f[1].TrimStart('*') -eq $zip) { $want = $f[0].ToLower() }
+            }
+            $got = (Get-FileHash (Join-Path $dir $zip) -Algorithm SHA256).Hash.ToLower()
+            if ($want -eq '' -or $got -ne $want) { throw "$zip 的 SHA-256 与 SHA256SUMS 不符" }
+            Expand-Archive (Join-Path $dir $zip) -DestinationPath (Join-Path $dir 'unpack')
+            $exe = (Get-ChildItem (Join-Path $dir 'unpack') -Recurse -Filter taixu.exe | Select-Object -First 1).FullName
+            if (-not $exe) { throw "$zip 里没有 taixu.exe" }
+            $loads = Join-Path $env:RUNNER_TEMP "loads\$ver"
+            New-Item -ItemType Directory -Force $loads | Out-Null
+            $tar = Join-Path $env:RUNNER_TEMP "loads-$ver.tar"
+            git archive --format=tar -o $tar $tag bench/algo
+            if ($LASTEXITCODE -ne 0) { throw "取不了 $tag 的 bench/algo" }
+            tar -x -f $tar -C $loads --strip-components=2
+            if ($LASTEXITCODE -ne 0) { throw "解不开 $tar" }
+            $list += @('--taixu', $ver, $exe, $loads)
+            Set-Content (Join-Path $env:RUNNER_TEMP 'newest.txt') $exe
+            "$ver  $exe" | Write-Output
+          }
+          Set-Content (Join-Path $env:RUNNER_TEMP 'versions.txt') $list
+
+      - name: 对照语言的工具链
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $gcc = 'C:\mingw64\bin\gcc.exe'
+          if (-not (Test-Path $gcc)) { $gcc = (Get-Command gcc -ErrorAction Stop).Source }
+          "TAIXU_TEST_CC=$gcc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          & $gcc --version | Select-Object -First 1
+          go version
+          rustc --version
+          try { Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled, AntivirusEnabled | Format-List } catch { 'Defender 状态取不到' }
+
+      - name: 测量
+        shell: pwsh
+        env:
+          RUNS: ${{ inputs.runs }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNS -notmatch '^[1-9][0-9]{0,2}$') { throw "样本数须为 1～999 的整数：$env:RUNS" }
+          $cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name.Trim()
+          $versions = @(Get-Content (Join-Path $env:RUNNER_TEMP 'versions.txt'))
+          $newest = (Get-Content (Join-Path $env:RUNNER_TEMP 'newest.txt')).Trim()
+          $url = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          & $newest run --toolchain scripts/perf_history.tx @versions --runs $env:RUNS --out perf-history.json `
+            --summary $env:GITHUB_STEP_SUMMARY --cpu $cpu --run-url $url
+          exit $LASTEXITCODE
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-history
+          path: perf-history.json
+          if-no-files-found: warn
+          retention-days: 90
